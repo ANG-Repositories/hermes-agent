@@ -348,3 +348,39 @@ def test_reopen_to_review_resumes_the_review_cycle(kanban_home: SimpleNamespace)
         _tick(kanban_home)
         assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
         assert kb.get_task(conn, tid).assignee == "dev"
+
+
+def test_reopen_to_review_implicit_reviewer_counts(kanban_home: SimpleNamespace, monkeypatch) -> None:
+    """Prism c8c3b1ada8ab: `reopen_task(to_status="review")` assigns kanban.review_assignee itself (no `assigned`
+    event). That reviewer belongs to the resumed cycle, so the demoted card's sendback restores the implementer."""
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: "apollo-review")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="reopened, implicit reviewer", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(conn, tid, summary="PR ready", reviewer="human",
+                                 expected_run_id=claimed.current_run_id)
+        with kb.write_txn(conn):   # the review lane closed it (status only; the event history is the subject)
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+        _tick(kanban_home)
+        ok, why = kb.reopen_task(conn, tid, actor="operator", reason="retry", to_status="review")
+        assert ok, why
+        assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).assignee) == ("review", "apollo-review")
+        assert "apollo-review" in kb._review_cycle_reviewers(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        assert kb.claim_review_task(conn, tid) is None
+        assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).assignee) == ("todo", "apollo-review")
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        assert kb.get_task(conn, tid).assignee == "dev"
+        # a reopen with no configured reviewer leaves the assignee alone and names none
+        monkeypatch.setattr(kb, "configured_review_assignee", lambda: None)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+        assert kb.reopen_task(conn, tid, actor="operator", reason="again", to_status="review")[0]
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "reopened"][-1]
+        assert "assignee" not in (ev.payload or {})
