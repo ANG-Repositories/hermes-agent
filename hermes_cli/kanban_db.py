@@ -14514,6 +14514,13 @@ def request_review(
             _why = "review_policy=none" if _policy == "none" else "non-milestone card"
             return _ret(True, f"review skipped ({_why}, kanban.review_policy={_policy}) — card completed; CI is the gate")
 
+    if _neg_result is not None:
+        # t_5c6c67c5: this route never reaches complete_task's freshness gate, so the
+        # worker's own draft was left draft (24 of 24 in 24 h). Flip it, or refuse.
+        _neg_fresh = _negative_result_draft_flip(conn, task_id, summary=summary, metadata=metadata)
+        if _neg_fresh:
+            metadata = dict(metadata or {}, handoff_freshness=_neg_fresh)
+
     # Branch-base guard for handoffs that reach a review session (milestone
     # cards); the policy path above is gated inside complete_task (t_18e781d0).
     _bb_task = get_task(conn, task_id) if not force else None
@@ -14551,6 +14558,37 @@ def request_review(
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
+
+
+def _negative_result_draft_flip(conn, task_id, *, summary, metadata) -> Optional[dict]:
+    """Own-draft flip for a ``review_negative_result`` handback (t_5c6c67c5).
+
+    Runs :func:`kanban_pr_freshness.flip_own_drafts` on the fleet PRs the handoff names. A flip
+    is recorded as ``handoff_draft_flipped`` (the same event complete_task's gate writes, so a
+    later handback reads it as flip evidence). A refusal records ``completion_blocked_draft_pr``
+    with ``path: review_negative_result`` and re-raises :class:`DraftPrError`: nothing else is
+    mutated and the card stays in-flight. Returns the report when it saw a PR, else None.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    from hermes_cli import kanban_pr_freshness as _fresh
+
+    refs = _open_pr.split_fleet(_open_pr.extract_pr_refs(summary, metadata=metadata))[0]
+    if not refs:
+        return None
+    armable = {f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(metadata=metadata)}
+    try:
+        out = _fresh.flip_own_drafts(refs, task_id=task_id, armable=armable)
+    except _fresh.DraftPrError as err:
+        with write_txn(conn):
+            if err.flipped:
+                _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": err.flipped})
+            _append_event(conn, task_id, "completion_blocked_draft_pr",
+                          {"prs": err.prs, "path": "review_negative_result"})
+        raise
+    if out.get("draft_flipped_at"):
+        with write_txn(conn):
+            _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": out["draft_flipped_at"]})
+    return out if out.get("prs") else None
 
 
 def _enforce_handback_head(conn, task_id, *, summary, metadata, result=None, survivor_pr=None):

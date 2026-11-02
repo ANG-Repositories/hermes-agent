@@ -42,7 +42,9 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
 Fail-OPEN everywhere except (a): a GitHub lookup error, an update-branch
 failure or a missing fleet-merge.sh is recorded and the handoff proceeds —
 the pre-existing behavior. A draft is only refused on a positive ``draft: true``
-read. Kill switches: ``KANBAN_HANDOFF_FRESHNESS=0`` disables the whole gate,
+read, with one exception (t_5c6c67c5): the PR lookup is retried once, and the card's
+own handoff PR in a ``config/worker-pr-draft.json`` repo that is still unreadable
+raises :class:`DraftLookupError` (it may be a draft). Kill switches: ``KANBAN_HANDOFF_FRESHNESS=0`` disables the whole gate,
 ``KANBAN_HANDOFF_AUTOMERGE=0`` only (c).
 
 Per-card override for (a) (t_f38605be): ``check(..., draft_ok=True)`` does not
@@ -91,6 +93,26 @@ class DraftPrError(ValueError):
             f"--draft-ok/draft_ok \"<reason>\" (audited). "
             f"{task_id} is still in-flight (no state change)."
         )
+
+
+class DraftLookupError(DraftPrError):
+    """The card's own PR in a worker-draft repo could not be read, twice (t_5c6c67c5).
+
+    Those repos open worker PRs as drafts, so an unreadable PR there may be a draft; passing it
+    through fail-open sent hermes-home#8231 to review still draft. Subclass of
+    :class:`DraftPrError` so every caller's draft refusal handling applies unchanged."""
+
+    def __init__(self, task_id: str, prs: list, flipped: Optional[dict] = None):
+        ValueError.__init__(
+            self,
+            f"handoff refused: GitHub lookup of {', '.join(prs)} failed twice, so the gate cannot "
+            f"tell whether {'it is' if len(prs) == 1 else 'they are'} still a worker DRAFT. Retry "
+            f"the handoff; if the PR is INTENTIONALLY left draft, complete with "
+            f"--draft-ok/draft_ok \"<reason>\" (audited). {task_id} is still in-flight (no state change).",
+        )
+        self.task_id = task_id
+        self.prs = list(prs)
+        self.flipped = dict(flipped or {})
 
 
 def enabled() -> bool:
@@ -387,6 +409,98 @@ def _default_ready() -> Optional[ReadyFn]:
     return ace_gate_ready
 
 
+LOOKUP_RETRY_DELAY_S = 2.0
+
+
+def _lookup_pr(gh: GhFn, ref) -> Optional[dict]:
+    """``pulls/N`` for ``ref``, retried ONCE after :data:`LOOKUP_RETRY_DELAY_S` (t_5c6c67c5). None = unreadable."""
+    path = f"repos/{ref.repo}/pulls/{ref.number}"
+    pr = gh(path)
+    if isinstance(pr, dict):
+        return pr
+    time.sleep(LOOKUP_RETRY_DELAY_S)
+    pr = gh(path)
+    return pr if isinstance(pr, dict) else None
+
+
+def _unread_refuses(ref, key: str, armable_keys) -> bool:
+    """An unreadable PR refuses (instead of failing open) only where a worker PR may be a draft: the card's own
+    handoff PR (``armable_keys``; None = every ref) in a ``config/worker-pr-draft.json`` repo (t_5c6c67c5)."""
+    if not worker_draft_flip_enabled() or ref.repo.casefold() not in worker_draft_repos():
+        return False
+    return armable_keys is None or key.lower() in armable_keys
+
+
+def _flip_ready(own_drafts, ready: Optional[ReadyFn]):
+    """``ace_gate.py ready`` each ``(ref, key, pr, entry)``. -> (flipped_now {key: {head, at}}, failed keys, views)."""
+    failed, flipped_now, views = [], {}, []
+    for ref, key, pr, entry in own_drafts:
+        at = int(time.time())  # BEFORE the flip: every post-ready run starts after it
+        rc = ready(ref.repo, ref.number) if ready is not None else None
+        entry["draft_flip"] = f"ready via ace_gate.py (rc={rc})"
+        if rc != 0:
+            failed.append(key)
+            continue
+        entry["draft"] = False
+        flipped_now[key] = {"head": str(((pr.get("head") or {}).get("sha")) or ""), "at": at}
+        views.append((ref, key, dict(pr, draft=False), entry))
+    return flipped_now, failed, views
+
+
+def flip_own_drafts(refs, *, task_id: str, armable=None, gh: Optional[GhFn] = None,
+                    ready: Optional[ReadyFn] = None) -> dict:
+    """The draft half of :func:`check` for a handback that never reaches it (t_5c6c67c5).
+
+    A ``review_negative_result`` handback goes straight to the human review lane through
+    ``request_review``, so (a) never ran: 24 of 24 such handbacks in 24 h left the worker's own
+    draft draft. Here: the card's OWN open draft (same rule as (a)) is flipped ready via
+    ``ace_gate.py ready``; a failed flip (review hold rc=21, Ace gate rc=20, read failure) raises
+    :class:`DraftPrError`, and an own handoff PR in a worker-draft repo that cannot be read twice
+    raises :class:`DraftLookupError`. A foreign draft is a mention here (the human lane decides):
+    recorded, never flipped, never refused. No update-branch, no arm: the handback says it did
+    not land. Returns ``{"prs": {...}, "draft_flipped": [...], "draft_flipped_at": {...}}``."""
+    report: dict = {"prs": {}, "checked_at": int(time.time())}
+    from hermes_cli.kanban_open_pr import is_fleet_ref
+    refs = [ref for ref in (refs or []) if is_fleet_ref(ref)]
+    if not refs or not enabled():
+        return report
+    if gh is None:
+        gh = _default_gh()
+        if gh is None:
+            return report
+    armable_keys = None if armable is None else {str(k).lower() for k in armable}
+    own, unreadable = [], []
+    for ref in refs:
+        key = f"{ref.repo}#{ref.number}"
+        entry: dict = {}
+        report["prs"][key] = entry
+        pr = _lookup_pr(gh, ref)
+        if pr is None:
+            if _unread_refuses(ref, key, armable_keys):
+                entry["lookup"] = "failed after retry (refused)"
+                unreadable.append(key)
+            else:
+                entry["lookup"] = "failed after retry (fail-open)"
+            continue
+        if str(pr.get("state") or "open") != "open" or pr.get("draft") is not True:
+            continue
+        entry["draft"] = True
+        if worker_draft_flip_enabled() and _owns_draft(ref, pr, task_id):
+            own.append((ref, key, pr, entry))
+        else:
+            entry["draft_flip"] = "not flipped: not this card's own worker draft"
+    if unreadable:
+        raise DraftLookupError(task_id, unreadable)
+    if not own:
+        return report
+    flipped_now, failed, _views = _flip_ready(own, ready or _default_ready())
+    if failed:
+        raise DraftPrError(task_id, failed, flipped_now)
+    report["draft_flipped"] = sorted(flipped_now)
+    report["draft_flipped_at"] = flipped_now
+    return report
+
+
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
@@ -433,14 +547,19 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
 
     views = []
     drafts = []
+    unreadable = []
     own_drafts: dict = {}
     for ref in refs:
         key = f"{ref.repo}#{ref.number}"
-        pr = gh(f"repos/{ref.repo}/pulls/{ref.number}")
+        pr = _lookup_pr(gh, ref)   # t_5c6c67c5: one retry before failing open
         entry: dict = {}
         report["prs"][key] = entry
         if not isinstance(pr, dict):
-            entry["lookup"] = "failed (fail-open)"
+            if not draft_ok and _unread_refuses(ref, key, armable_keys):
+                entry["lookup"] = "failed after retry (refused)"
+                unreadable.append(key)
+            else:
+                entry["lookup"] = "failed (fail-open)"
             continue
         if pr.get("draft") is True:
             drafts.append(key)
@@ -449,6 +568,10 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
                 own_drafts[key] = (ref, key, pr, entry)
             continue
         views.append((ref, key, pr, entry))
+    if unreadable:
+        # t_5c6c67c5 (hermes-home#8231): an own PR in a worker-draft repo that GitHub would not return
+        # twice may still be a draft; refuse before any mutation rather than pass it through.
+        raise DraftLookupError(task_id, unreadable)
     if drafts and not draft_ok:
         # t_c1ee61ae: the worker's OWN draft (head branch names this card, repo listed in
         # config/worker-pr-draft.json) is flipped ready through ace_gate.py instead of refused.
@@ -458,19 +581,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         foreign = [k for k in drafts if k not in own]
         if foreign or not own:
             raise DraftPrError(task_id, drafts)
-        ready = ready or _default_ready()
-        failed = []
-        flipped_now: dict = {}
-        for ref, key, pr, entry in own_drafts.values():
-            at = int(time.time())  # BEFORE the flip: every post-ready run starts after it
-            rc = ready(ref.repo, ref.number) if ready is not None else None
-            entry["draft_flip"] = f"ready via ace_gate.py (rc={rc})"
-            if rc != 0:
-                failed.append(key)
-                continue
-            entry["draft"] = False
-            flipped_now[key] = {"head": str(((pr.get("head") or {}).get("sha")) or ""), "at": at}
-            views.append((ref, key, dict(pr, draft=False), entry))
+        flipped_now, failed, flipped_views = _flip_ready(own_drafts.values(), ready or _default_ready())
+        views.extend(flipped_views)
         if failed:
             raise DraftPrError(task_id, failed, flipped_now)
         report["draft_flipped"] = sorted(own)
