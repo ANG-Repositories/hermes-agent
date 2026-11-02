@@ -292,7 +292,7 @@ def test_served_call_posts_the_held_banner(monkeypatch):
     monkeypatch.setattr(cch, "_note_billed_response", lambda *a, **k: None)
     monkeypatch.setattr(cch, "_note_api_call_recording_failure", lambda *a, **k: None)
     pooled = sorted(cch._POOLED_PROVIDERS)[0]   # no pool_headers: returns after the settle
-    monkeypatch.setattr(cch, "_serving_route", lambda a: {"provider": pooled, "api_mode": "x"})
+    monkeypatch.setattr(cch, "_serving_route", lambda a, dispatch=None: {"provider": pooled, "api_mode": "x"})
     agent = _SettleAgent()
     msg = _held(agent)
     cch._record_successful_api_call(agent, types.SimpleNamespace())
