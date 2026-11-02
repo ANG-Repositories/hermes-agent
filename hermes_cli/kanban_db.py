@@ -10985,8 +10985,15 @@ def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
                 swaps.append(a)
             continue
         resume_key = _REVIEW_RESUME_KINDS.get(kind)
-        if resume_key and _json_dict(row["payload"]).get(resume_key) == "review":
+        payload = _json_dict(row["payload"])
+        if resume_key and payload.get(resume_key) == "review":
             in_review = True
+            # a resume that assigned the reviewer itself (``reopen_task`` sets kanban.review_assignee with no
+            # ``assigned`` event) is an assignment made in review (Prism c8c3b1ada8ab)
+            a = payload.get("assignee") if kind == "reopened" else None
+            if _nonblank_str(a):
+                last_in_review = True
+                swaps.append(a)
         elif kind in _REVIEW_EXIT_KINDS:
             in_review = False
     return swaps, last_in_review
@@ -15735,6 +15742,9 @@ def reopen_task(
                 "to_status": to_status,
                 "voided_run_id": voided_run,
                 "voided_result": (row["result"] or "")[:500] or None,
+                # the reviewer this reopen assigned implicitly (no ``assigned`` event): a reviewer of the
+                # resumed cycle for :func:`_review_cycle_scan` (Prism c8c3b1ada8ab)
+                **({"assignee": review_assignee} if review_assignee else {}),
             },
         )
 
