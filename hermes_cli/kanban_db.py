@@ -14514,13 +14514,6 @@ def request_review(
             _why = "review_policy=none" if _policy == "none" else "non-milestone card"
             return _ret(True, f"review skipped ({_why}, kanban.review_policy={_policy}) — card completed; CI is the gate")
 
-    if _neg_result is not None:
-        # t_5c6c67c5: this route never reaches complete_task's freshness gate, so the
-        # worker's own draft was left draft (24 of 24 in 24 h). Flip it, or refuse.
-        _neg_fresh = _negative_result_draft_flip(conn, task_id, summary=summary, metadata=metadata)
-        if _neg_fresh:
-            metadata = dict(metadata or {}, handoff_freshness=_neg_fresh)
-
     # Branch-base guard for handoffs that reach a review session (milestone
     # cards); the policy path above is gated inside complete_task (t_18e781d0).
     _bb_task = get_task(conn, task_id) if not force else None
@@ -14528,6 +14521,24 @@ def request_review(
         _enforce_branch_base(conn, _bb_task, metadata)
         if expected_run_id is not None:
             _enforce_handback_head(conn, task_id, summary=summary, metadata=metadata)
+
+    _neg_flipped: Optional[dict] = None
+    if _neg_result is not None:
+        # t_5c6c67c5: this route never reaches complete_task's freshness gate, so the
+        # worker's own draft was left draft (24 of 24 in 24 h). Flip it, or refuse.
+        # Prism 7e5a5b543755: no side effect for a run before its ownership is proven. Read-only
+        # check here (no write txn held across the gh call); _request_review_txn re-checks.
+        _own_refusal = _review_handoff_refusal(
+            conn, task_id, expected_run_id=expected_run_id, force=force)[1]
+        if _own_refusal is not None:
+            return _ret(False, _own_refusal)
+        _neg_fresh = _negative_result_draft_flip(
+            conn, task_id, summary=summary, metadata=metadata,
+            expected_run_id=expected_run_id, force=force,
+        )
+        if _neg_fresh:
+            metadata = dict(metadata or {}, handoff_freshness=_neg_fresh)
+            _neg_flipped = _neg_fresh.get("draft_flipped_at") or None
 
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
@@ -14544,14 +14555,24 @@ def request_review(
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
     staged_copies: list[Path] = []
+    _txn_ret = _ret
+    if _neg_flipped:
+        def _txn_ret(ok: bool, reason: Optional[str] = None):
+            # Ownership lost between the pre-check and this txn: the flip already happened and
+            # ace_gate ready is idempotent, so it is reported, not undone (Prism 7e5a5b543755).
+            if not ok:
+                reason = (f"{reason}; note: own draft(s) {', '.join(sorted(_neg_flipped))} were "
+                          "already flipped ready via ace_gate.py before this refusal (not undone)")
+            return _ret(ok, reason)
     try:
         result = _request_review_txn(
             conn, task_id, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=expected_run_id, force=force, allow_same_actor=allow_same_actor,
-            now=now, staged_copies=staged_copies, _ret=_ret,
+            now=now, staged_copies=staged_copies, _ret=_txn_ret,
             negative_result=(
                 {"policy": _policy, "match": _neg_result} if _neg_result is not None else None
             ),
+            draft_flipped=_neg_flipped,
         )
         return result
     except Exception:
@@ -14560,14 +14581,17 @@ def request_review(
         raise
 
 
-def _negative_result_draft_flip(conn, task_id, *, summary, metadata) -> Optional[dict]:
+def _negative_result_draft_flip(conn, task_id, *, summary, metadata, expected_run_id=None,
+                                force=False) -> Optional[dict]:
     """Own-draft flip for a ``review_negative_result`` handback (t_5c6c67c5).
 
-    Runs :func:`kanban_pr_freshness.flip_own_drafts` on the fleet PRs the handoff names. A flip
-    is recorded as ``handoff_draft_flipped`` (the same event complete_task's gate writes, so a
-    later handback reads it as flip evidence). A refusal records ``completion_blocked_draft_pr``
-    with ``path: review_negative_result`` and re-raises :class:`DraftPrError`: nothing else is
-    mutated and the card stays in-flight. Returns the report when it saw a PR, else None.
+    The caller has already proven run ownership (:func:`_review_handoff_refusal`). Runs
+    :func:`kanban_pr_freshness.flip_own_drafts` on the fleet PRs the handoff names. A successful
+    flip is NOT recorded here: ``_request_review_txn`` writes ``handoff_draft_flipped`` in the
+    txn that moves the card, so a handoff refused there leaves no event. A refusal records
+    ``completion_blocked_draft_pr`` with ``path: review_negative_result`` (plus any partial flip),
+    only if ownership still holds inside that write txn, and re-raises :class:`DraftPrError`;
+    the card stays in-flight. Returns the report when it saw a PR, else None.
     """
     from hermes_cli import kanban_open_pr as _open_pr
     from hermes_cli import kanban_pr_freshness as _fresh
@@ -14580,15 +14604,46 @@ def _negative_result_draft_flip(conn, task_id, *, summary, metadata) -> Optional
         out = _fresh.flip_own_drafts(refs, task_id=task_id, armable=armable)
     except _fresh.DraftPrError as err:
         with write_txn(conn):
-            if err.flipped:
-                _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": err.flipped})
-            _append_event(conn, task_id, "completion_blocked_draft_pr",
-                          {"prs": err.prs, "path": "review_negative_result"})
+            if _review_handoff_refusal(conn, task_id, expected_run_id=expected_run_id,
+                                       force=force)[1] is None:
+                if err.flipped:
+                    _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": err.flipped})
+                _append_event(conn, task_id, "completion_blocked_draft_pr",
+                              {"prs": err.prs, "path": "review_negative_result"})
         raise
-    if out.get("draft_flipped_at"):
-        with write_txn(conn):
-            _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": out["draft_flipped_at"]})
     return out if out.get("prs") else None
+
+
+def _review_handoff_refusal(conn, task_id, *, expected_run_id, force):
+    """``(task row, refusal reason | None)`` for a review handoff: parents, the row, the live-claim
+    fence and status/expected_run_id. The ONE ownership check: :func:`request_review` runs it
+    read-only before any side effect (Prism 7e5a5b543755) and :func:`_request_review_txn` re-runs
+    it in its write txn (its guarded UPDATE stays the atomic fence)."""
+    if not _parents_satisfied(conn, task_id):
+        return None, "parent dependencies are not satisfied"
+    trow = conn.execute(
+        "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
+        "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if trow is None:
+        return None, "task not found"
+    # Refuse to clear a live worker's claim without proof of ownership
+    # (expected_run_id) or an explicit human override (force=True);
+    # the same fence as complete_task (_claim_is_live, #111764).
+    if expected_run_id is None and not force and _claim_is_live(trow):
+        return trow, (
+            "task is running under a live claim; pass expected_run_id "
+            "(worker ownership) or force=True (explicit operator "
+            "override) instead of clearing the live run's claim"
+        )
+    if trow["status"] not in ("running", "ready") or (
+        expected_run_id is not None and trow["current_run_id"] != int(expected_run_id)
+    ):
+        return trow, (
+            "task is not in running/ready (or expected_run_id did not "
+            "match the current run)"
+        )
+    return trow, None
 
 
 def _enforce_handback_head(conn, task_id, *, summary, metadata, result=None, survivor_pr=None):
@@ -14614,31 +14669,18 @@ def _enforce_handback_head(conn, task_id, *, summary, metadata, result=None, sur
 
 def _request_review_txn(
     conn: sqlite3.Connection, task_id: str, *, summary, metadata, reviewer, expected_run_id,
-    force, allow_same_actor, now, staged_copies, _ret, negative_result=None,
+    force, allow_same_actor, now, staged_copies, _ret, negative_result=None, draft_flipped=None,
 ):
     """The transactional half of :func:`request_review` (artifact staging rides
     inside the txn; the caller discards staged copies on rollback).
-    ``negative_result`` ({policy, match}) is recorded in the same txn so a
-    failed audit write rolls the transition back instead of orphaning it."""
+    ``negative_result`` ({policy, match}) and ``draft_flipped`` (the negative-result
+    own-draft flip, t_5c6c67c5) are recorded in the same txn so a failed audit write
+    rolls the transition back, and a refused handoff writes neither."""
     with write_txn(conn):
-        if not _parents_satisfied(conn, task_id):
-            return _ret(False, "parent dependencies are not satisfied")
-        trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-            "worker_started_at FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if trow is None:
-            return _ret(False, "task not found")
-        # Refuse to clear a live worker's claim without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True);
-        # the same fence as complete_task (_claim_is_live, #111764).
-        if expected_run_id is None and not force and _claim_is_live(trow):
-            return _ret(
-                False,
-                "task is running under a live claim; pass expected_run_id "
-                "(worker ownership) or force=True (explicit operator "
-                "override) instead of clearing the live run's claim",
-            )
+        trow, refusal = _review_handoff_refusal(
+            conn, task_id, expected_run_id=expected_run_id, force=force)
+        if refusal is not None:
+            return _ret(False, refusal)
         # The actor is the run that did the work. ``assignee`` is the actor
         # only while a worker holds the card; on a never-claimed card it is
         # whoever the operator assigned -- possibly the reviewer itself, which
@@ -14743,6 +14785,8 @@ def _request_review_txn(
         if staged:
             payload["artifacts"] = staged
         _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+        if draft_flipped:
+            _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": draft_flipped})
         if negative_result is not None:
             _append_event(
                 conn, task_id, "review_negative_result",

@@ -74,23 +74,34 @@ _GREEN = {"success", "skipped", "neutral"}
 GhFn = Callable[..., Optional[dict]]
 
 
-class DraftPrError(ValueError):
-    """A handoff named an OPEN PR that GitHub reports as a draft."""
+REQUEST_REVIEW_DRAFT_HINT = (
+    "request_review takes no draft_ok, and complete --draft-ok would close a NOT-met card done: "
+    "fix the hold (a reviewer releases rc=21, Ace clears rc=20) and retry, or kanban_block "
+    "kind=needs_input naming the PR and the hold."
+)
 
-    def __init__(self, task_id: str, prs: list, flipped: Optional[dict] = None):
+
+class DraftPrError(ValueError):
+    """A handoff named an OPEN PR that GitHub reports as a draft.
+
+    ``via="request_review"``: raised on the negative-result request_review path, which has no
+    ``draft_ok``; the message names what works there instead (Prism P2, t_5c6c67c5)."""
+
+    def __init__(self, task_id: str, prs: list, flipped: Optional[dict] = None, via: str = "complete"):
         self.task_id = task_id
         self.prs = list(prs)
         # PRs this call DID flip ready before another failed: {key: {"head", "at"}}; persist them.
         self.flipped = dict(flipped or {})
+        how = (REQUEST_REVIEW_DRAFT_HINT if via == "request_review" else
+               "rc=21 = a reviewer review-hold: leave it draft and complete with --draft-ok "
+               "'reviewer hold: <who>'. If the draft is otherwise INTENTIONALLY left open, complete "
+               "with --draft-ok/draft_ok \"<reason>\" (audited).")
         super().__init__(
             f"handoff refused: {', '.join(self.prs)} "
             f"{'is a DRAFT PR' if len(self.prs) == 1 else 'are DRAFT PRs'}. "
             f"A draft is not landable and must not enter the review lane. "
             f"Run `~/.hermes/scripts/ace_gate.py ready <owner/repo> <n>` (or name "
-            f"the right PR), then retry; rc=21 = a reviewer review-hold: leave it "
-            f"draft and complete with --draft-ok 'reviewer hold: <who>'. "
-            f"If the draft is otherwise INTENTIONALLY left open, complete with "
-            f"--draft-ok/draft_ok \"<reason>\" (audited). "
+            f"the right PR), then retry; {how} "
             f"{task_id} is still in-flight (no state change)."
         )
 
@@ -102,13 +113,15 @@ class DraftLookupError(DraftPrError):
     through fail-open sent hermes-home#8231 to review still draft. Subclass of
     :class:`DraftPrError` so every caller's draft refusal handling applies unchanged."""
 
-    def __init__(self, task_id: str, prs: list, flipped: Optional[dict] = None):
+    def __init__(self, task_id: str, prs: list, flipped: Optional[dict] = None, via: str = "complete"):
+        how = ("request_review takes no draft_ok; retry when GitHub answers." if via == "request_review"
+               else "if the PR is INTENTIONALLY left draft, complete with "
+                    "--draft-ok/draft_ok \"<reason>\" (audited).")
         ValueError.__init__(
             self,
             f"handoff refused: GitHub lookup of {', '.join(prs)} failed twice, so the gate cannot "
             f"tell whether {'it is' if len(prs) == 1 else 'they are'} still a worker DRAFT. Retry "
-            f"the handoff; if the PR is INTENTIONALLY left draft, complete with "
-            f"--draft-ok/draft_ok \"<reason>\" (audited). {task_id} is still in-flight (no state change).",
+            f"the handoff; {how} {task_id} is still in-flight (no state change).",
         )
         self.task_id = task_id
         self.prs = list(prs)
@@ -490,12 +503,12 @@ def flip_own_drafts(refs, *, task_id: str, armable=None, gh: Optional[GhFn] = No
         else:
             entry["draft_flip"] = "not flipped: not this card's own worker draft"
     if unreadable:
-        raise DraftLookupError(task_id, unreadable)
+        raise DraftLookupError(task_id, unreadable, via="request_review")
     if not own:
         return report
     flipped_now, failed, _views = _flip_ready(own, ready or _default_ready())
     if failed:
-        raise DraftPrError(task_id, failed, flipped_now)
+        raise DraftPrError(task_id, failed, flipped_now, via="request_review")
     report["draft_flipped"] = sorted(flipped_now)
     report["draft_flipped_at"] = flipped_now
     return report

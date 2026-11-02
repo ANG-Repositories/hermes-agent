@@ -132,7 +132,9 @@ def test_flip_own_drafts_failed_flip_refuses(rc):
     with pytest.raises(fr.DraftPrError) as exc:
         fr.flip_own_drafts(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", armable={"o/r#5"},
                            gh=_gh("daedalus/t_5c6c67c5-x"), ready=lambda r, n: rc)
-    assert exc.value.prs == ["o/r#5"] and "--draft-ok" in str(exc.value)
+    # Prism P2: request_review takes no draft_ok, so the message names what works on that path.
+    assert exc.value.prs == ["o/r#5"] and fr.REQUEST_REVIEW_DRAFT_HINT in str(exc.value)
+    assert "complete with --draft-ok" not in str(exc.value)
 
 
 # --- (1) E2E through request_review on a temp board ------------------------
@@ -214,6 +216,50 @@ def test_e2e_negative_result_lookup_failure_refuses(board, monkeypatch):
         with pytest.raises(fr.DraftLookupError):
             kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL}, expected_run_id=run)
         assert _status(conn, tid) == "running"
+
+
+def test_e2e_stale_run_negative_result_makes_no_flip_and_no_event(board, monkeypatch):
+    """Prism 7e5a5b543755 repro, red at 4dc90c161b: a handback from a run that no longer owns the
+    card flipped the current worker's draft and wrote events before the ownership check refused it."""
+    box = []
+    monkeypatch.setattr(fr, "_default_gh", lambda: _gh(f"daedalus/{box[0]}-fix"))
+    monkeypatch.setattr(fr, "_default_ready",
+                        lambda: (lambda r, n: pytest.fail("stale run flipped the draft")))
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        box.append(tid)
+        before = conn.execute("SELECT count(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
+        ok, reason = kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL},
+                                       expected_run_id=run + 1, with_reason=True)
+        assert ok is False and "expected_run_id" in reason
+        assert _status(conn, tid) == "running"
+        after = conn.execute("SELECT count(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
+        assert after == before
+
+
+def test_e2e_ownership_lost_during_flip_refuses_and_reports_the_flip(board, monkeypatch):
+    """Check, release, flip, re-check: a run that loses the card while ace_gate runs is refused,
+    its flip is named in the refusal, and no event lands on the card."""
+    box, ready = [], []
+
+    def _ready(r, n):
+        ready.append((r, n))
+        box[1].execute("UPDATE tasks SET status='blocked' WHERE id=?", (box[0],))
+        box[1].commit()
+        return 0
+
+    monkeypatch.setattr(fr, "_default_gh", lambda: _gh(f"daedalus/{box[0]}-fix"))
+    monkeypatch.setattr(fr, "_default_ready", lambda: _ready)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        box += [tid, conn]
+        ok, reason = kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL},
+                                       expected_run_id=run, with_reason=True)
+        assert ok is False
+        assert "o/r#5" in reason and "already flipped ready" in reason
+        assert _events(conn, tid, "handoff_draft_flipped") == []
+        assert _events(conn, tid, "review_negative_result") == []
+    assert ready == [("o/r", 5)]
 
 
 def test_e2e_negative_result_foreign_draft_mention_still_routes(board, monkeypatch):
