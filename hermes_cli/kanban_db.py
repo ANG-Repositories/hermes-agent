@@ -18604,6 +18604,72 @@ def _member_birth(pid: int) -> Optional[float]:
         return None
 
 
+# Boot epoch for _ownership_birth: wall - CLOCK_BOOTTIME, SAMPLED AT EVERY READ.
+# Not cached: a wall-clock step after import (NTP) would leave a cached epoch
+# permanently off by the step and backdate every birth (Prism 43625d259e07's
+# sibling 0b2ea4c3282f / 0bf3a31c1041). A fresh sample tracks the wall clock the
+# run's event times are written in, like psutil's per-read btime but not
+# floored to a second.
+#
+# One sample reads the two clocks at two instants, and a pause between them
+# shifts the epoch by its length (Prism 43625d259e07). So each sample BRACKETS
+# the wall read between two BOOTTIME reads: the true BOOTTIME at the wall read
+# lies in [b1, b2], the epoch is wall - (b1 + b2) / 2 give or take
+# (b2 - b1) / 2. The tightest of a bounded number of samples is kept; if none
+# spans under _BOOT_EPOCH_MAX_SPAN_S the read is UNKNOWN (no ownership, no
+# reap), never a guess. The early-read margin below therefore uses the bound
+# _BOOT_EPOCH_MAX_SPAN_S / 2, which every accepted sample is within.
+_BOOT_EPOCH_SAMPLES = 32
+_BOOT_EPOCH_MAX_SPAN_S = 0.005
+
+
+def _sample_boot_epoch(wall=None, boot=None) -> Optional[tuple[float, float]]:
+    """``(epoch, uncertainty)`` from the tightest bracketed sample, or None.
+    The clocks are resolved at call time (``time.time`` / CLOCK_BOOTTIME)."""
+    wall = wall or time.time
+    boot = boot or (lambda: time.clock_gettime(time.CLOCK_BOOTTIME))
+    best: Optional[tuple[float, float]] = None
+    for _ in range(_BOOT_EPOCH_SAMPLES):
+        b1 = boot()
+        w = wall()
+        b2 = boot()
+        span = b2 - b1
+        if span < 0:
+            continue
+        if best is None or span / 2 < best[1]:
+            best = (w - (b1 + b2) / 2, span / 2)
+    if best is None or best[1] * 2 > _BOOT_EPOCH_MAX_SPAN_S:
+        return None
+    return best
+
+
+_PRECISE_BIRTH = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME")
+
+
+def _ownership_birth(pid: int) -> Optional[float]:
+    """Epoch birth of ``pid`` for the ownership window, or None when gone/unreadable.
+
+    Linux: /proc/<pid>/stat starttime (CLOCK_BOOTTIME ticks) + a boot epoch
+    sampled now (_sample_boot_epoch; None when no tight sample), so
+    it reads at most one tick (10 ms) early instead of psutil's up to ~1 s
+    (integer btime): Prism 44b9db65242a / 85caf8bcd837. Elsewhere _member_birth.
+    Only _owned_identities uses it; _member_birth's other callers compare
+    births for equality and keep psutil's value.
+    """
+    if _PRECISE_BIRTH:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                stat = fh.read()
+            ticks = int(stat[stat.rindex(b")") + 2:].split()[19])
+        except (OSError, ValueError, IndexError):
+            return None
+        sample = _sample_boot_epoch()
+        if sample is None:
+            return None   # no tight sample now: unknown, so not an ownership witness
+        return sample[0] + ticks / os.sysconf("SC_CLK_TCK")
+    return _member_birth(pid)
+
+
 # The session reap orders member births against moments a member was proved
 # alive, so both must come from one clock whose birth reading cannot run early
 # by more than the slack (Prism fe32a904b73f). Linux psutil adds /proc/stat
@@ -18616,6 +18682,15 @@ _REAP_LINUX_CLOCK = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BO
 _REAP_BIRTH_SLACK_SECONDS = (
     0.1 if _REAP_LINUX_CLOCK or sys.platform == "darwin" else 2.0
 )
+# The most an EPOCH birth (_ownership_birth, compared with the run's epoch
+# event times) can read early. Linux: one starttime tick (10 ms) plus the
+# largest uncertainty an accepted boot-epoch sample can have
+# (_BOOT_EPOCH_MAX_SPAN_S / 2). macOS: microseconds from p_starttime.
+# Otherwise (psutil's integer btime): the same 2 s bound as above.
+_EPOCH_BIRTH_EARLY_S = (
+    0.01 + _BOOT_EPOCH_MAX_SPAN_S / 2 if _PRECISE_BIRTH
+    else 0.01 if sys.platform == "darwin" else 2.0
+)
 
 
 def _reap_now() -> float:
@@ -18625,26 +18700,123 @@ def _reap_now() -> float:
     return time.time()
 
 
-def _reap_birth(pid: int) -> Optional[float]:
-    """Birth of ``pid`` on the :func:`_reap_now` clock, or None when gone."""
-    if not _REAP_LINUX_CLOCK:
-        return _member_birth(pid)
+def _proc_stat_record(pid: int) -> Optional[tuple[int, int, float]]:
+    """``(sid, pgid, birth)`` of ``pid`` from ONE read of /proc/<pid>/stat
+    (fields session, pgrp, starttime; birth on CLOCK_BOOTTIME), or None."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
             stat = fh.read()
         # comm may hold spaces and parens; fields resume after the LAST ')'.
-        # starttime is field 22, i.e. index 19 counting from field 3.
-        ticks = int(stat[stat.rindex(b")") + 2:].split()[19])
-        return ticks / os.sysconf("SC_CLK_TCK")
+        # Counting from field 3: pgrp 5 -> [2], session 6 -> [3], starttime 22 -> [19].
+        fields = stat[stat.rindex(b")") + 2:].split()
+        return (int(fields[3]), int(fields[2]),
+                int(fields[19]) / os.sysconf("SC_CLK_TCK"))
     except (OSError, ValueError, IndexError):
         return None
 
 
-def _session_owned_by_run(
-    members: list[tuple[int, int]], born_after: float, born_before: float,
-) -> bool:
-    """True when some member of the session was created inside the recorded
+def _darwin_bsd_record(pid: int) -> Optional[tuple[int, int, int, int]]:
+    """``(pid, pgid, start_sec, start_usec)`` from one macOS
+    ``proc_pidinfo(PROC_PIDTBSDINFO)`` record, or None. The record has no
+    numeric session id (``e_tpgid`` is the tty's group, not the session)."""
+    import ctypes
+    import ctypes.util
+
+    class _BsdInfo(ctypes.Structure):  # sys/proc_info.h struct proc_bsdinfo
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "libproc.dylib",
+                              use_errno=True)
+        info = _BsdInfo()
+        size = ctypes.sizeof(info)
+        got = libproc.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(3),  # PROC_PIDTBSDINFO
+                                   ctypes.c_uint64(0), ctypes.byref(info), ctypes.c_int(size))
+    except (OSError, AttributeError):
+        return None
+    if got != size:
+        return None
+    return (int(info.pbi_pid), int(info.pbi_pgid),
+            int(info.pbi_start_tvsec), int(info.pbi_start_tvusec))
+
+
+def _bracketed_member(
+    pid: int, sid: int, read=None,
+) -> Optional[tuple[int, float]]:
+    """``(pgid, birth)`` of ``pid`` when a bracketed observation shows it in
+    session ``sid``, else None (UNKNOWN). No native record carries a numeric
+    session id, so: native record, getsid + getpgid, native record again.
+    Accepted only if both records name exactly ``pid`` with the same
+    full-resolution birth and pgid, that pgid equals getpgid(pid), and
+    getsid(pid) == sid (operator ruling t_75c9bac4-macos-membership-primitive).
+    """
+    read = read or _darwin_bsd_record
+    first = read(pid)
+    try:
+        got_sid, got_pgid = os.getsid(pid), os.getpgid(pid)
+    except OSError as exc:
+        _log.info("kanban: reap skips pid %d: getsid/getpgid failed (%s)", pid, exc)
+        return None
+    second = read(pid)
+    if first is None or second is None:
+        _log.info("kanban: reap skips pid %d: no native process record", pid)
+        return None
+    if first != second or first[0] != pid or first[1] != got_pgid:
+        _log.info("kanban: reap skips pid %d: records disagree (%r, %r, pgid %d)",
+                  pid, first, second, got_pgid)
+        return None
+    if got_sid != sid:
+        return None  # another session's process: not a member
+    return first[1], first[2] + first[3] / 1e6
+
+
+def _reap_record(pid: int, sid: int) -> Optional[tuple[int, float]]:
+    """``(pgid, birth)`` of ``pid`` when one validated observation shows it
+    in session ``sid``, else None. Membership, group and birth come from the
+    same observation, so a pid reused outside ``sid`` is never read as a
+    member with the replacement's group and birth (Prism 8c1178a4f868).
+    Linux: one /proc/<pid>/stat read. macOS: :func:`_bracketed_member`.
+    Elsewhere: no verifiable record, so nothing is a member."""
+    if sys.platform.startswith("linux"):
+        rec = _proc_stat_record(pid)
+        if rec is None or rec[0] != sid:
+            return None
+        return rec[1], rec[2]
+    if sys.platform == "darwin":
+        return _bracketed_member(pid, sid)
+    return None
+
+
+def _reap_birth(pid: int) -> Optional[float]:
+    """Birth of ``pid`` on the :func:`_reap_now` clock, or None when gone."""
+    if not _REAP_LINUX_CLOCK:
+        return _member_birth(pid)
+    rec = _proc_stat_record(pid)
+    return rec[2] if rec is not None else None
+
+
+def _owned_identities(
+    members: list[tuple[int, int]], sid: int, born_after: float, born_before: float,
+) -> dict[tuple[int, float], int]:
+    """``{(pid, birth): pgid}`` of the members created inside the recorded
     run, i.e. between its claim and its last liveness evidence.
+
+    Ownership and identity come from ONE bracketed observation per pid:
+    :func:`_reap_record`, the wall birth, :func:`_reap_record` again; both
+    records must be identical (Prism 3dfe1baa6ab0). A pid that fails the
+    bracket is UNKNOWN and left out; an empty result means no reap.
 
     A worker pid can be recycled once its whole session is gone; a new
     session leader on that pid, exited with children left behind, looks
@@ -18658,15 +18830,27 @@ def _session_owned_by_run(
     from a recycled session's child and is left alone. Paths that verified
     the worker alive before signalling it bound on that moment instead.
     """
+    owned: dict[tuple[int, float], int] = {}
     for pid, _ in members:
-        created = _member_birth(pid)
-        # No upper slack: a recycled leader (and every child of it) is
-        # created after the worker died, i.e. strictly after its last
-        # evidence, and event times are floored, so ``<= born_before`` can
-        # never admit one. The lower bound only needs claim-time slack.
-        if created is not None and born_after - 1.0 <= created <= born_before:
-            return True
-    return False
+        first = _reap_record(pid, sid)
+        if first is None:
+            continue
+        created = _ownership_birth(pid)
+        if _reap_record(pid, sid) != first:
+            _log.info("kanban: reap skips pid %d: replaced during the ownership read", pid)
+            continue
+        # A recycled leader (and every child of it) is created after the
+        # worker died, i.e. strictly after its last evidence, and event times
+        # are floored, so its TRUE birth is > born_before. Its epoch birth can
+        # read up to _EPOCH_BIRTH_EARLY_S early (see _ownership_birth), so the
+        # upper bound subtracts that error: an early-read replacement can never
+        # pass (Prism 44b9db65242a). The cost is the safe direction: a member
+        # born in that last interval before the evidence is not an ownership
+        # witness. The lower bound only needs claim-time slack.
+        if created is not None and born_after - 1.0 <= created and \
+                created + _EPOCH_BIRTH_EARLY_S <= born_before:
+            owned[(pid, first[1])] = first[0]
+    return owned
 
 
 def _reap_worker_session(
@@ -18680,14 +18864,17 @@ def _reap_worker_session(
     ``grace`` seconds, then SIGKILL the survivors. Returns the groups signalled.
 
     Call only once the worker is gone. Signals nothing unless the session is
-    proved to be the recorded run's (:func:`_session_owned_by_run`, with
+    proved to be the recorded run's (:func:`_owned_identities`, with
     ``born_after`` = claim time and ``born_before`` = the last moment the
     worker was known alive); unknown bounds mean no reap. Every later scan
     must hold a member born before a moment some earlier-proved member was
     seen alive (re-checked during each scan), so a session that empties and
     has its sid reused mid-reap is never signalled.
     Groups that appear DURING the reap (a member forking into a new group on
-    SIGTERM) are signalled while that continuity holds. Never targets sid <= 1, the caller's own session, or the
+    SIGTERM) are signalled while that continuity holds, on the Linux clock
+    only: on the wall clock (macOS) they are left alone, the safe direction.
+    Membership is always read from one validated record (:func:`_reap_record`)
+    and revalidated right before each signal. Never targets sid <= 1, the caller's own session, or the
     caller's own process group. POSIX only; a no-op elsewhere.
     """
     import signal
@@ -18705,7 +18892,8 @@ def _reap_worker_session(
     members = _worker_session_members(sid)
     if not members:
         return 0
-    if not _session_owned_by_run(members, float(born_after), float(born_before)):
+    known = _owned_identities(members, sid, float(born_after), float(born_before))
+    if not known:
         _log.info(
             "kanban: session %d has %d member(s) but none from the recorded run; not reaped",
             sid, len(members),
@@ -18713,46 +18901,65 @@ def _reap_worker_session(
         return 0
 
     signalled: set[int] = set()
+    # identity (pid, birth) -> pgid, every entry read by :func:`_reap_record`.
+    Members = dict[tuple[int, float], int]
 
-    def _term(groups: set[int]) -> None:
-        for pgid in sorted(groups - signalled):
+    def _signal(accepted: Members, sig, *, again: bool = False) -> None:
+        # Last-moment revalidation: a group is signalled only while one of its
+        # accepted identities still reads as a member with the same group.
+        for pgid in sorted(set(accepted.values())):
+            if pgid in signalled and not again:
+                continue
+            if not any(
+                pg == pgid and _reap_record(pid, sid) == (pgid, born)
+                for (pid, born), pg in accepted.items()
+            ):
+                _log.info("kanban: reap skips group %d of session %d: "
+                          "no member revalidated", pgid, sid)
+                continue
             try:
-                os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX-gated above)
+                os.killpg(pgid, sig)  # windows-footgun: ok (POSIX-gated above)
             except OSError:
                 pass
             signalled.add(pgid)
 
-    def _identities(found: list[tuple[int, int]]) -> set[tuple[int, float]]:
-        out = set()
+    def _identities(found: list[tuple[int, int]]) -> Members:
+        out: Members = {}
         for pid, _ in found:
-            created = _reap_birth(pid)
-            if created is not None:
-                out.add((pid, created))
+            rec = _reap_record(pid, sid)
+            if rec is not None:
+                out[(pid, rec[1])] = rec[0]
         return out
 
-    def _proved(found: set[tuple[int, float]]) -> Optional[float]:
+    proofs = 0
+
+    def _proved(found: Members) -> Optional[float]:
         # A moment some identified member was alive AND still in ``sid``, or
-        # None. getsid first, then the birth check: the same (pid, create
-        # time) after getsid means that pid was this process at getsid, so it
-        # was a member at ``checked``. A member that setsid()'d away proves
-        # nothing about the session it left.
+        # None: the same identity read as a member after ``checked`` was this
+        # process, in ``sid``, at ``checked`` (setsid only ever leaves).
+        nonlocal proofs
         checked = _reap_now()
         for pid, created in found:
-            try:
-                if os.getsid(pid) != sid:
-                    continue
-            except OSError:
-                continue
-            if _reap_birth(pid) == created:
+            rec = _reap_record(pid, sid)
+            if rec is not None and rec[1] == created:
+                proofs += 1
                 return checked
         return None
 
-    known = _identities(members)
-    proved = _proved(known)
+    # Every validated member of the initial snapshot, its record read BEFORE the
+    # proof below (Prism 72790abed13c / 0d19e75007b0).
+    snapshot = _identities(members)
+    proved = _proved(known)  # after every ownership AND snapshot record was read
     if proved is None:  # the session emptied (sid reusable) since ownership was checked
         _log.info("kanban: session %d emptied before the reap; not reaped", sid)
         return 0
     proved_at = proved
+    # An owned identity read as a member AFTER the snapshot's records (the proof
+    # above) was alive across them, so the session never emptied and its sid was
+    # never reusable in between: every snapshot member is this session's, born
+    # inside the run window or not (a child started after the last heartbeat).
+    # Only identities FIRST seen after this point stay restricted (_left).
+    known = {**snapshot, **known}
 
     def _scan() -> list[tuple[int, int]]:
         # One snapshot, re-proving a known member alive every 50 ms while it
@@ -18773,40 +18980,61 @@ def _reap_worker_session(
             if not scan.is_alive():
                 return box[0] if box else []
 
-    def _left() -> Optional[set[int]]:
+    def _left() -> Optional[Members]:
         # Ownership is re-established on EVERY snapshot, never assumed. While
         # a proven member lives the session cannot empty, so its sid cannot
-        # be reused; a process in that sid born before ``proved_at`` was born
-        # into this session. A snapshot holding such a member is this
-        # session, groups created in answer to SIGTERM included.
-        # "Born before" only counts with the clock's read error on the safe
-        # side: a birth inside the slack may postdate the proof, so it waits
-        # for a later proof (one every 50 ms while a member lives).
+        # be reused. An identity already in ``known`` is a member by identity
+        # (Prism f5b8e6a3daaf). On the Linux clock a member first seen in
+        # this snapshot is also this session's when it was born more than the
+        # slack before ``proved_at``. On the fallback (wall) clock no birth
+        # is ever ordered against a proof: only identities proven at the
+        # start are signalled, and later ones are left alone and logged
+        # (operator ruling, Prism a7748c722865 / be979415d495).
         # None -> unprovable and no member was seen alive meanwhile: stop.
-        nonlocal known
-        before = proved_at
+        nonlocal known, proved_at
+        before = proofs
         current = _scan()
         ids = _identities(current)
-        if not any(created + _REAP_BIRTH_SLACK_SECONDS <= proved_at for _, created in ids):
-            return set() if proved_at > before else None
+        if not _REAP_LINUX_CLOCK:
+            new = sorted(pid for pid, _ in ids.keys() - known.keys())
+            if new:
+                _log.info("kanban: session %d: pid(s) %s first seen after the reap "
+                          "began; not signalled on the wall clock", sid, new)
+            keep = {i: pg for i, pg in ids.items() if i in known}
+            if not keep:
+                return {} if proofs > before else None
+            return keep
+        # An identity is accepted only under a continuity proof taken AFTER
+        # its record was read: a known identity re-read as a member now
+        # covers every record above (Prism 023d7bc5df9b). Without one, only
+        # known identities and births before the pre-snapshot proof count.
+        post = _proved({i: pg for i, pg in ids.items() if i in known})
+        if post is None:
+            ids = {
+                i: pg for i, pg in ids.items()
+                if i in known or i[1] + _REAP_BIRTH_SLACK_SECONDS <= proved_at
+            }
+        else:
+            # The proof's own moment is the newest continuity witness: later
+            # snapshots order births against it, not an older one (Prism
+            # 7e958a6f57d4: a descendant forked between the last in-scan proof
+            # and this one was otherwise rejected once its parents exited).
+            proved_at = max(proved_at, post)
+        if not ids:
+            return {} if proofs > before else None
         known = ids
-        return {pgid for _, pgid in current}
+        return ids
 
-    _term({pgid for _, pgid in members})
+    _signal(known, signal.SIGTERM)
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         left = _left()
         if left is None:
             break
         if left:  # empty while a member lived: its fork may postdate the snapshot, rescan
-            _term(left)  # groups born during the reap get their SIGTERM too
+            _signal(left, signal.SIGTERM)  # groups born during the reap get their SIGTERM too
         time.sleep(0.1)
-    for pgid in sorted(_left() or ()):
-        try:
-            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
-        except OSError:
-            pass
-        signalled.add(pgid)
+    _signal(_left() or {}, signal.SIGKILL, again=True)
     _log.warning(
         "kanban: reaped %d leftover process group(s) of worker session %d",
         len(signalled), sid,
@@ -18930,7 +19158,7 @@ def _run_env_escapees(task_id: str, run_id: int) -> list[tuple[int, int]]:
 #: ``create_time`` from ``/proc/stat`` ``btime``, an INTEGER second, so a
 #: process can read as born up to 1 s before it was (ACE-AI: btime fraction
 #: 0.0855 s, child births read 0.093 s early). Same slack as
-#: :func:`_session_owned_by_run`.
+#: :func:`_owned_identities`.
 _BIRTH_SLACK_SECONDS = 1.0
 
 
