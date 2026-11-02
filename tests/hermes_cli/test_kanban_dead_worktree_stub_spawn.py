@@ -1,5 +1,5 @@
-"""A dead linked-worktree stub at a card's worktree target is moved aside or
-held, and never burns the retry budget (t_42e59999).
+"""A dead linked-worktree stub at a card's worktree target is held, uncharged,
+and never burns the retry budget (t_42e59999).
 
 Regression for t_5c6c67c5: ``.worktrees/<id>`` was a directory whose ``.git``
 gitfile pointed at a pruned ``.git/worktrees/<id>``. Every ``git worktree add``
@@ -7,13 +7,14 @@ refused "already exists", and the card burned all 3 spawns to ``gave_up``.
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
 
+import gateway.kanban_watchers as kw
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_worktree_stub as stubs
@@ -47,8 +48,6 @@ def repo(tmp_path):
     git(repo, "config", "user.name", "Test")
     git(repo, "config", "user.email", "test@example.invalid")
     (repo / "a.txt").write_text("a\n")
-    (repo / "pkg").mkdir()
-    (repo / "pkg" / "b.py").write_text("b = 1\n")
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "a")
     return repo
@@ -66,10 +65,12 @@ def card_with_dead_stub(conn, repo):
     return tid, stub
 
 
-def row(conn, tid):
-    return conn.execute(
-        "SELECT status, consecutive_failures FROM tasks WHERE id=?", (tid,),
-    ).fetchone()
+def snapshot(root: Path) -> dict[str, str]:
+    return {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        if p.is_file() else "dir"
+        for p in sorted(root.rglob("*"))
+    }
 
 
 def spawned_into(record):
@@ -79,99 +80,63 @@ def spawned_into(record):
     return spawn
 
 
-def test_dead_stub_holding_nothing_unique_is_moved_aside_and_spawn_proceeds(conn, repo):
-    tid, stub = card_with_dead_stub(conn, repo)
+def test_dead_stub_is_held_uncharged_untouched_and_pages_once(conn, repo, monkeypatch):
+    tid, stub = card_with_dead_stub(conn, repo)  # holds nothing unique: still held
+    before = snapshot(stub)
+    pages = []
+    monkeypatch.setattr(kw, "_send_workspace_refusal_alert",
+                        lambda board, summary: pages.append(summary) or True)
+    notifier = kw._WorkspaceRefusalOutageNotifier()
     launched = []
 
-    result = kbd.dispatch_once(conn, spawn_fn=spawned_into(launched))
-
-    assert tid not in result.spawn_failed
-    assert launched == [stub.resolve()] or launched == [stub]
-    assert git(stub, "branch", "--show-current") == f"wt/{tid}"
-    aside = list((repo / ".worktrees" / ".aside").glob(f"{tid}-stub-*"))
-    assert len(aside) == 1 and (aside[0] / "a.txt").read_text() == "a\n"
-    assert row(conn, tid)["consecutive_failures"] == 0
-
-
-def test_dead_stub_with_one_modified_file_is_held_untouched_and_uncharged(conn, repo):
-    tid, stub = card_with_dead_stub(conn, repo)
-    (stub / "pkg" / "b.py").write_text("b = 2  # unpushed work\n")
-    before = sorted(p.relative_to(stub) for p in stub.rglob("*"))
-
     for _ in range(4):  # more ticks than the default retry budget
-        result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
+        result = kbd.dispatch_once(conn, spawn_fn=spawned_into(launched))
+        kw._observe_workspace_refusal_outages(notifier, [("default", result)])
         assert tid not in result.spawn_failed
-        refused = dict(result.workspace_refused)
-        assert refused[tid].startswith(f"{stubs.DEAD_STUB_HELD}: {stub}")
-        assert "modified file pkg/b.py" in refused[tid]
-        assert "mv " in refused[tid]  # names the operator command
+        assert dict(result.workspace_refused)[tid].startswith(f"{stubs.DEAD_STUB_HELD}: {stub}")
 
-    assert (stub / "pkg" / "b.py").read_text() == "b = 2  # unpushed work\n"
-    assert sorted(p.relative_to(stub) for p in stub.rglob("*")) == before
-    assert not (repo / ".worktrees" / ".aside").exists()
-    state = row(conn, tid)
-    assert state["status"] == "ready" and state["consecutive_failures"] == 0
+    assert launched == []
+    assert snapshot(stub) == before
+    assert not (stub.parent / ".aside").exists()
+    row = conn.execute(
+        "SELECT status, consecutive_failures FROM tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["status"] == "ready" and row["consecutive_failures"] == 0
     assert not conn.execute(
         "SELECT 1 FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
     ).fetchone()
+    assert len(pages) == 1 and tid in pages[0]
 
 
-def test_untracked_file_in_stub_is_held(conn, repo):
-    tid, stub = card_with_dead_stub(conn, repo)
-    (stub / "notes.md").write_text("draft\n")
-
-    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
-
-    assert "untracked file notes.md" in dict(result.workspace_refused)[tid]
-    assert (stub / "notes.md").exists()
-
-
-def assert_held(conn, tid, stub, result, reason):
-    refused = dict(result.workspace_refused)[tid]
-    assert refused.startswith(f"{stubs.DEAD_STUB_HELD}: {stub}") and reason in refused
-    assert tid not in result.spawn_failed
-    assert not (stub.parent / ".aside").exists()
-    state = row(conn, tid)
-    assert state["status"] == "ready" and state["consecutive_failures"] == 0
-
-
-def test_tracked_file_deleted_from_stub_is_held(conn, repo):
-    tid, stub = card_with_dead_stub(conn, repo)
-    (stub / "pkg" / "b.py").unlink()
-
-    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
-
-    assert_held(conn, tid, stub, result, "deleted tracked file pkg/b.py")
-    assert (stub / "a.txt").exists()
-
-
-def test_chmod_only_change_in_stub_is_held(conn, repo):
-    tid, stub = card_with_dead_stub(conn, repo)
-    (stub / "a.txt").chmod(0o755)
-
-    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
-
-    assert_held(conn, tid, stub, result, "mode change a.txt (100644 -> 100755)")
-    assert (stub / "a.txt").stat().st_mode & 0o100
-
-
-def test_staged_blob_only_in_registered_index_is_held(repo):
-    """Prism 8d54cfe00a58: the staged blob lives only in the admin dir's index."""
+def test_hold_message_names_the_stub_its_gitfile_and_a_targeted_recovery(repo):
     stub = repo / ".worktrees" / "t_x"
     git(repo, "worktree", "add", "-q", "--detach", str(stub), "HEAD")
-    (stub / "a.txt").write_text("staged only\n")
-    git(stub, "add", "a.txt")
-    git(stub, "restore", "--source=HEAD", "--worktree", "a.txt")
-    (stub / ".git").write_text("gitdir: /nonexistent/admin\n")
-    admin = repo / ".git" / "worktrees" / "t_x"
-    index_before = (admin / "index").read_bytes()
+    admin = (repo / ".git" / "worktrees" / "t_x").resolve()
+    (stub / ".git").write_text("gitdir: /nonexistent/admin\n")  # dead gitfile, admin kept
 
-    with pytest.raises(stubs.WorkspaceUnavailable, match="staged changes in"):
-        stubs.clear_dead_stub(repo, stub, "HEAD")
+    msg = str(stubs.dead_stub_hold(repo, stub))
 
-    assert (admin / "index").read_bytes() == index_before
-    assert not (repo / ".git" / "worktrees.aside").exists()
-    assert (stub / "a.txt").read_text() == "a\n" and not (stub.parent / ".aside").exists()
+    assert msg.startswith(f"{stubs.DEAD_STUB_HELD}: {stub} ")
+    assert "its .git points at /nonexistent/admin, which does not exist" in msg
+    assert f"registered to it: {admin}" in msg
+    assert f"mv '{stub}'" in msg
+    assert f"'{admin}' still points at it" in msg and "removing ONLY that dir" in msg
+    assert "worktree prune" not in msg
+    assert msg == str(stubs.dead_stub_hold(repo, stub))  # stable: the page latch's key
+
+
+def test_relative_gitdir_registration_is_named(repo):
+    """Prism P2 c309eaeb9e7c: `--relative-paths` registrations resolve against the admin dir."""
+    stub = repo / ".worktrees" / "t_r"
+    git(repo, "worktree", "add", "-q", "--detach", str(stub), "HEAD")
+    admin = repo / ".git" / "worktrees" / "t_r"
+    (admin / "gitdir").write_text("../../../.worktrees/t_r/.git\n")
+    (stub / ".git").write_text("gitdir: ../../.git/worktrees/t_r\n")
+
+    msg = str(stubs.dead_stub_hold(repo, stub))
+
+    assert f"registered to it: {admin.resolve()}" in msg
+    assert f"its .git points at {admin.resolve()}, which exists" in msg
 
 
 def test_unreadable_target_is_held_not_charged(conn, repo):
@@ -182,41 +147,14 @@ def test_unreadable_target_is_held_not_charged(conn, repo):
     finally:
         stub.chmod(0o755)
 
-    assert_held(conn, tid, stub, result, "unreadable")
-    assert (stub / "a.txt").read_text() == "a\n"
-
-
-def test_stub_check_over_budget_is_held_and_the_tick_stays_bounded(conn, repo, monkeypatch):
-    """A stub too big to check in budget (a full checkout) is UNKNOWN: held, never moved."""
-    tid, stub = card_with_dead_stub(conn, repo)
-    budget, hash_s = 0.5, 30.0
-    monkeypatch.setattr(stubs, "STUB_CHECK_BUDGET_S", budget)
-    real_git = stubs._git
-
-    def slow_hasher(repo_root, *args, input=None, timeout=120):
-        if args and args[0] == "hash-object":  # a huge tree; honours its timeout like subprocess
-            if timeout < hash_s:
-                time.sleep(timeout)
-                raise subprocess.TimeoutExpired(["git", *args], timeout)
-            time.sleep(hash_s)
-        return real_git(repo_root, *args, input=input, timeout=timeout)
-
-    monkeypatch.setattr(stubs, "_git", slow_hasher)
-    before = sorted(p.relative_to(stub) for p in stub.rglob("*"))
-
-    started = time.monotonic()
-    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
-    elapsed = time.monotonic() - started
-
-    assert elapsed < budget + 5.0
     refused = dict(result.workspace_refused)[tid]
-    assert refused.startswith(f"{stubs.DEAD_STUB_HELD}: {stub}")
-    assert f"check exceeded {budget:g}s" in refused
+    assert refused.startswith(f"{stubs.DEAD_STUB_HELD}: {stub}") and "unreadable" in refused
     assert tid not in result.spawn_failed
-    assert sorted(p.relative_to(stub) for p in stub.rglob("*")) == before
-    assert not (repo / ".worktrees" / ".aside").exists()
-    state = row(conn, tid)
-    assert state["status"] == "ready" and state["consecutive_failures"] == 0
+    row = conn.execute(
+        "SELECT status, consecutive_failures FROM tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["status"] == "ready" and row["consecutive_failures"] == 0
+    assert (stub / "a.txt").read_text() == "a\n"
 
 
 def test_live_worktree_at_target_is_reused_unchanged(conn, repo):
@@ -232,18 +170,3 @@ def test_live_worktree_at_target_is_reused_unchanged(conn, repo):
     assert tid not in result.spawn_failed and not result.workspace_refused
     assert len(launched) == 1
     assert (target / "wip.txt").read_text() == "in-flight\n"
-    assert not (repo / ".worktrees" / ".aside").exists()
-
-
-def test_still_registered_admin_dir_is_moved_out_of_worktrees(tmp_path, repo):
-    """A stub whose registration survived (pointing at it) must not block the add."""
-    stub = repo / ".worktrees" / "t_x"
-    git(repo, "worktree", "add", "-q", "--detach", str(stub), "HEAD")
-    (stub / ".git").write_text("gitdir: /nonexistent/admin\n")  # dead gitfile, admin kept
-
-    aside = stubs.clear_dead_stub(repo, stub, "HEAD")
-
-    assert not stub.exists() and (aside / "a.txt").exists()
-    assert not (repo / ".git" / "worktrees" / "t_x").exists()
-    assert list((repo / ".git" / "worktrees.aside").glob("t_x-*"))
-    git(repo, "worktree", "add", "-q", "--detach", str(stub), "HEAD")

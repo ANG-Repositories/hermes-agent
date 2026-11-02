@@ -17167,6 +17167,23 @@ def workspace_refusal_state(conn, task_ids) -> dict[str, dict]:
 _REFUSAL_PAGED_KIND = "workspace_refusal_paged"
 
 
+def _claim_was_refused(conn, payload) -> bool:
+    """True when the run a ``claimed`` event opened ended ``workspace_refused``.
+
+    A refusal raised after the claim (a dead worktree stub, a mount lost in
+    the claim/resolve window) claims the card on every tick; those claims must
+    not end the refusal episode, or the same hold pages every tick.
+    """
+    try:
+        run_id = (json.loads(payload) or {}).get("run_id")
+    except (TypeError, ValueError):
+        return False
+    row = run_id and conn.execute(
+        "SELECT outcome FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    return bool(row) and row[0] == "workspace_refused"
+
+
 def claim_workspace_refusal_pages(conn, refused, *, channel: str = "alerts"):
     """Claim the (card, reason) refusals that have not been paged yet.
 
@@ -17197,6 +17214,8 @@ def claim_workspace_refusal_pages(conn, refused, *, channel: str = "alerts"):
                 f"AND kind IN ({marks}) ORDER BY id DESC",
                 (task_id, *kinds),
             ):
+                if kind == "claimed" and _claim_was_refused(conn, payload):
+                    continue  # refused after the claim: never admitted, same episode
                 if kind != _REFUSAL_PAGED_KIND:
                     break  # episode boundary
                 try:

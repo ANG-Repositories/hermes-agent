@@ -880,7 +880,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
-        args, ref = ["worktree", "add", str(target), branch_name], branch_name
+        args = ["worktree", "add", str(target), branch_name]
     else:
         # Branch off the freshly fetched remote trunk, never the anchor's
         # local HEAD: a long-lived anchor checkout lags its remote by hundreds
@@ -894,15 +894,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
                 "kanban worktree %s: no remote trunk in %s; branching from local HEAD",
                 target, repo_root,
             )
-        ref = base or "HEAD"
-        args = ["worktree", "add", "--no-track", "-b", branch_name, str(target), ref]
+        args = ["worktree", "add", "--no-track", "-b", branch_name, str(target), base or "HEAD"]
     # Anything non-empty at the target that is not a live worktree of this
     # repo (the branch above already reused those) makes `worktree add` refuse
     # "already exists" on every retry (t_5c6c67c5 burned 3 spawns to gave_up).
-    from hermes_cli.kanban_worktree_stub import clear_dead_stub, target_occupied
+    # It is held (uncharged, card stays ready) for the operator, never moved.
+    from hermes_cli.kanban_worktree_stub import dead_stub_hold, target_occupied
 
     if target_occupied(repo_root, target):
-        clear_dead_stub(repo_root, target, ref)
+        raise dead_stub_hold(repo_root, target)
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
