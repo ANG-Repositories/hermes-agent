@@ -28,9 +28,26 @@ from typing import Optional
 from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
 
 DEAD_STUB_HELD = "dead_worktree_stub_held"
+# One wall budget for the whole check (tree read, walk, hashing). It runs inline
+# in the dispatcher's spawn path, and a stub can be a full checkout: past the
+# budget the answer is UNKNOWN, so the stub is held, never moved or charged.
+STUB_CHECK_BUDGET_S = 60.0
+# Files per `hash-object` call, so the budget is checked between batches.
+HASH_BATCH = 256
 
 
-def _git(repo: Path, *args: str, input: Optional[bytes] = None, timeout: int = 120):
+class _OverBudget(Exception):
+    pass
+
+
+def _remaining(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise _OverBudget
+    return left
+
+
+def _git(repo: Path, *args: str, input: Optional[bytes] = None, timeout: float = 120):
     return subprocess.run(
         ["git", "-C", str(repo), *args], input=input,
         stdin=None if input is not None else subprocess.DEVNULL,
@@ -38,8 +55,9 @@ def _git(repo: Path, *args: str, input: Optional[bytes] = None, timeout: int = 1
     )
 
 
-def _tree_blobs(repo_root: Path, ref: str) -> Optional[dict[str, str]]:
-    out = _git(repo_root, "ls-tree", "-r", "-z", "--full-tree", ref)
+def _tree_blobs(repo_root: Path, ref: str, deadline: float) -> Optional[dict[str, str]]:
+    out = _git(repo_root, "ls-tree", "-r", "-z", "--full-tree", ref,
+               timeout=_remaining(deadline))
     if out.returncode != 0:
         return None
     blobs: dict[str, str] = {}
@@ -52,17 +70,21 @@ def _tree_blobs(repo_root: Path, ref: str) -> Optional[dict[str, str]]:
     return blobs
 
 
-def _first_difference(repo_root: Path, stub: Path, ref: str) -> Optional[str]:
-    """``None`` when every file in *stub* matches *ref*'s tree, else a reason."""
+def _first_difference(repo_root: Path, stub: Path, ref: str, deadline: float) -> Optional[str]:
+    """``None`` when every file in *stub* matches *ref*'s tree, else a reason.
+
+    Raises :class:`_OverBudget` once *deadline* (``time.monotonic``) passes.
+    """
     if stub.is_symlink() or not stub.is_dir():
         return "not a directory"
-    blobs = _tree_blobs(repo_root, ref)
+    blobs = _tree_blobs(repo_root, ref, deadline)
     if blobs is None:
         return f"cannot read the tree of {ref}"
     files: list[str] = []
     links: list[str] = []
     errors: list[OSError] = []
     for dirpath, dirnames, filenames in os.walk(stub, onerror=errors.append):
+        _remaining(deadline)
         rel_dir = os.path.relpath(dirpath, stub)
         if rel_dir == ".":
             # The stub's own gitfile (or a gitdir) is the stub, not work.
@@ -75,21 +97,23 @@ def _first_difference(repo_root: Path, stub: Path, ref: str) -> Optional[str]:
             (links if os.path.islink(os.path.join(dirpath, name)) else files).append(rel)
     if errors:
         return f"unreadable: {errors[0]}"
-    if files:
+    for start in range(0, len(files), HASH_BATCH):
+        batch = files[start:start + HASH_BATCH]
         hashed = _git(
             repo_root, "hash-object", "--stdin-paths",
-            input="\n".join(str(stub / rel) for rel in files).encode() + b"\n",
-            timeout=600,
+            input="\n".join(str(stub / rel) for rel in batch).encode() + b"\n",
+            timeout=_remaining(deadline),
         )
         shas = hashed.stdout.decode().split()
-        if hashed.returncode != 0 or len(shas) != len(files):
+        if hashed.returncode != 0 or len(shas) != len(batch):
             return "cannot hash the stub's files"
-        for rel, sha in zip(files, shas):
+        for rel, sha in zip(batch, shas):
             if not blobs[rel].endswith(f":{sha}") or blobs[rel].startswith("120000:"):
                 return f"modified file {rel}"
     for rel in links:
         hashed = _git(repo_root, "hash-object", "--stdin",
-                      input=os.fsencode(os.readlink(stub / rel)))
+                      input=os.fsencode(os.readlink(stub / rel)),
+                      timeout=_remaining(deadline))
         if hashed.returncode != 0 or blobs[rel] != f"120000:{hashed.stdout.decode().strip()}":
             return f"modified symlink {rel}"
     return None
@@ -121,8 +145,11 @@ def clear_dead_stub(repo_root: Path, stub: Path, ref: str) -> Path:
     """
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     aside = stub.parent / ".aside" / f"{stub.name}-stub-{stamp}"
+    budget = STUB_CHECK_BUDGET_S
     try:
-        difference = _first_difference(repo_root, stub, ref)
+        difference = _first_difference(repo_root, stub, ref, time.monotonic() + budget)
+    except (_OverBudget, subprocess.TimeoutExpired):
+        difference = f"check exceeded {budget:g}s"
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         difference = f"unreadable: {exc}"
     if difference is not None:

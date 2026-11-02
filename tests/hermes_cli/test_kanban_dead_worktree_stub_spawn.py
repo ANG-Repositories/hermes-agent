@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -123,6 +124,39 @@ def test_untracked_file_in_stub_is_held(conn, repo):
 
     assert "untracked file notes.md" in dict(result.workspace_refused)[tid]
     assert (stub / "notes.md").exists()
+
+
+def test_stub_check_over_budget_is_held_and_the_tick_stays_bounded(conn, repo, monkeypatch):
+    """A stub too big to check in budget (a full checkout) is UNKNOWN: held, never moved."""
+    tid, stub = card_with_dead_stub(conn, repo)
+    budget, hash_s = 0.5, 30.0
+    monkeypatch.setattr(stubs, "STUB_CHECK_BUDGET_S", budget)
+    real_git = stubs._git
+
+    def slow_hasher(repo_root, *args, input=None, timeout=120):
+        if args and args[0] == "hash-object":  # a huge tree; honours its timeout like subprocess
+            if timeout < hash_s:
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired(["git", *args], timeout)
+            time.sleep(hash_s)
+        return real_git(repo_root, *args, input=input, timeout=timeout)
+
+    monkeypatch.setattr(stubs, "_git", slow_hasher)
+    before = sorted(p.relative_to(stub) for p in stub.rglob("*"))
+
+    started = time.monotonic()
+    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < budget + 5.0
+    refused = dict(result.workspace_refused)[tid]
+    assert refused.startswith(f"{stubs.DEAD_STUB_HELD}: {stub}")
+    assert f"check exceeded {budget:g}s" in refused
+    assert tid not in result.spawn_failed
+    assert sorted(p.relative_to(stub) for p in stub.rglob("*")) == before
+    assert not (repo / ".worktrees" / ".aside").exists()
+    state = row(conn, tid)
+    assert state["status"] == "ready" and state["consecutive_failures"] == 0
 
 
 def test_live_worktree_at_target_is_reused_unchanged(conn, repo):
