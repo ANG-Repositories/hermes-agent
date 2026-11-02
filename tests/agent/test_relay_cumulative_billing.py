@@ -1,0 +1,129 @@
+"""Multi-request relay responses bill every request's prompt (t_9f190074, claude-bpx#564).
+
+The wire payloads are claude-bpx#564's AU-3 shape (bridge/test/unit-tui-arrival-usage.test.js),
+built through the openai SDK's own response constructor so the relay fields arrive as
+``model_extra`` exactly as they do live:
+
+- the arrival publish: ``usage`` all null + ``unavailable`` + ``usage_deferred: true``;
+- the next response of the turn: prompt = the LAST request's own prompt (214,822), output summed,
+  ``upstream_requests: 2``, ``cumulative_prompt_tokens_details`` = the billed sum by field.
+
+Contract: the bill (session counters, cost, Blackbox token columns) is the cumulative split; the
+context size (compressor) stays the last request; the deferred row bills zero, marked as deferred,
+not unknown, and nothing is counted twice.
+"""
+import sqlite3
+
+import pytest
+from openai._models import construct_type
+from openai.types.chat import ChatCompletion
+
+from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+LAST = {"input_tokens": 2, "cache_read_tokens": 213_805, "cache_write_tokens": 1_015}
+BILLED = {"input_tokens": 4, "cache_read_tokens": 426_128, "cache_write_tokens": 2_497}
+OUTPUT = 669
+
+_DEFERRED_USAGE = {
+    "prompt_tokens": None, "completion_tokens": None, "total_tokens": None, "unavailable": True,
+    "prompt_tokens_unavailable": True, "output_tokens_unavailable": True,
+    "total_tokens_unavailable": True,
+    "prompt_tokens_details": {"cached_tokens": None, "cache_creation_tokens": None},
+    "usage_deferred": True,
+}
+_CARRYING_USAGE = {
+    "prompt_tokens": sum(LAST.values()), "completion_tokens": OUTPUT,
+    "total_tokens": sum(LAST.values()) + OUTPUT,
+    "prompt_tokens_details": {"cached_tokens": LAST["cache_read_tokens"],
+                              "cache_creation_tokens": LAST["cache_write_tokens"]},
+    "upstream_requests": 2, "carried_requests": 1, "cumulative_prompt_tokens": sum(BILLED.values()),
+    "cumulative_prompt_tokens_details": {"input_tokens": BILLED["input_tokens"],
+                                         "cached_tokens": BILLED["cache_read_tokens"],
+                                         "cache_creation_tokens": BILLED["cache_write_tokens"]},
+}
+
+
+def _response(usage):
+    return construct_type(type_=ChatCompletion, value={
+        "id": "chatcmpl-r", "object": "chat.completion", "created": 1, "model": "claude-fable-5.1",
+        "choices": [{"index": 0, "finish_reason": "tool_calls",
+                     "message": {"role": "assistant", "content": ""}}],
+        "usage": usage,
+    })
+
+
+def _agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from run_agent import AIAgent
+
+    a = AIAgent(api_key="k", base_url="https://inference-api.nousresearch.com/v1", provider="nous",
+                api_mode="chat_completions", model="anthropic/claude-fable-5.1", session_id="t",
+                platform="cli", quiet_mode=True, skip_context_files=True, skip_memory=True,
+                save_trajectories=False, enabled_toolsets=["file"])
+    a.context_compressor.context_length = 1_000_000
+    return a
+
+
+def _record(agent, resp, n, turn_calls):
+    from agent import turn_usage
+
+    msgs = [{"role": "user", "content": "go"}]
+    turn_usage.record_response_usage(agent, resp, messages=msgs, api_call_count=n, api_duration=1.0,
+                                     compression_attempts=0, max_compression_attempts=3,
+                                     turn_calls=turn_calls)
+
+
+def test_agent_bills_the_cumulative_split_and_keeps_last_request_context(tmp_path, monkeypatch):
+    a = _agent(tmp_path, monkeypatch)
+    try:
+        calls: list = []
+        _record(a, _response(_DEFERRED_USAGE), 1, calls)
+        # Deferred is not unknown: the session stays fully measured, nothing billed yet.
+        assert not any(getattr(a, f"session_{k}", False) for k in (
+            "input_tokens_unknown", "output_tokens_unknown", "cache_read_tokens_unknown",
+            "cache_write_tokens_unknown", "usage_unknown"))
+        assert a.session_cache_read_tokens == 0 and a.session_estimated_cost_usd == 0
+
+        _record(a, _response(_CARRYING_USAGE), 2, calls)
+        assert a.session_input_tokens == BILLED["input_tokens"]
+        assert a.session_cache_read_tokens == BILLED["cache_read_tokens"]
+        assert a.session_cache_write_tokens == BILLED["cache_write_tokens"]
+        assert a.session_output_tokens == OUTPUT
+        assert a.session_prompt_tokens == sum(BILLED.values())
+        expected = estimate_usage_cost(
+            "anthropic/claude-fable-5.1", CanonicalUsage(output_tokens=OUTPUT, **BILLED),
+            provider="nous", base_url="https://inference-api.nousresearch.com/v1", api_key="k")
+        assert expected.amount_usd
+        assert a.session_estimated_cost_usd == pytest.approx(float(expected.amount_usd))
+        # The Blackbox turn rollup sums these: billed once, never the deferred row's nothing twice.
+        assert sum(c["cache_read_tokens"] for c in calls) == BILLED["cache_read_tokens"]
+        assert sum(c["cache_write_tokens"] for c in calls) == BILLED["cache_write_tokens"]
+        # Context size stays the last request's own prompt.
+        assert a.context_compressor.last_prompt_tokens == sum(LAST.values())
+    finally:
+        a.close()
+
+
+def test_blackbox_rows_store_billed_columns_and_mark_the_deferred_row(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from plugins import blackbox
+    from plugins.blackbox import store
+
+    store._connect().close()
+    monkeypatch.setattr(blackbox, "_config", lambda: {
+        "enabled": True, "alerts_enabled": False, "record_subagents": True, "retention_days": 3650,
+    })
+    for seq, usage in enumerate((_DEFERRED_USAGE, _CARRYING_USAGE)):
+        blackbox.record_api_call(
+            turn_id="t-arrival", seq=seq, ts=100.0 + seq, provider="claude-dtlr",
+            model="claude-opus-5-5", usage=_response(usage).usage, api_mode="chat_completions",
+            sub_key=None, attribution="inferred", http_status=200, relay_synthetic=False,
+            route_id=None,
+        )
+    with sqlite3.connect(store._db_path()) as conn:
+        rows = conn.execute(
+            "SELECT input_tokens, cache_read, cache_write, output_tokens, usage_deferred, "
+            "upstream_requests FROM turn_api_calls WHERE turn_id='t-arrival' ORDER BY seq").fetchall()
+    assert rows[0] == (0, 0, 0, 0, 1, None)
+    assert rows[1] == (BILLED["input_tokens"], BILLED["cache_read_tokens"],
+                       BILLED["cache_write_tokens"], OUTPUT, None, 2)
