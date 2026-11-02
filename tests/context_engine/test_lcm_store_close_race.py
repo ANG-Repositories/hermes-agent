@@ -91,7 +91,7 @@ def test_close_racing_writers_never_crashes_or_leaks_untyped_errors(tmp_path):
     env["PYTHONPATH"] = str(REPO_ROOT)
     proc = subprocess.run(
         [sys.executable, "-X", "faulthandler", "-c", _HAMMER, str(tmp_path / "lcm.db"), "40"],
-        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=300,
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
     )
     assert proc.returncode != -11, f"SIGSEGV: close() freed the connection under a live execute\n{proc.stderr[-2000:]}"
     assert proc.returncode == 0, (
