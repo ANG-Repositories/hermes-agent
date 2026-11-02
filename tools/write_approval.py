@@ -312,7 +312,7 @@ def skill_pending_diff(
     if action == "batch":
         return _batch_pending_diff(payload)
     if action == "create":
-        return _create_preview(payload)
+        return _create_preview(payload, staged)
     if action not in {"edit", "patch", "write_file"}:
         return {"remove_file": f"remove file: {payload.get('file_path')} from skill '{name}'",
                 "delete": f"delete skill '{name}'"}.get(action, f"({action} on '{name}')")
@@ -340,20 +340,39 @@ def skill_pending_diff(
     return "".join(diff) or "(no textual change)"
 
 
-def _create_preview(op: Dict[str, Any]) -> str:
+def _create_preview(op: Dict[str, Any], staged: Optional[Dict[str, Dict[str, str]]] = None) -> str:
     """The SKILL.md a staged create will actually write. A ``justification`` makes the near-duplicate gate add
     ``metadata.hermes.distinct_from`` to the frontmatter at approve time, so the preview runs the same
     ``check_create`` (d879f184cd83); a create it would refuse renders as an explicit failure note. No ledger row:
     check_create appends one only for an unjustified refusal, which this path never asks for. The gate failing
-    open (no scorer, scorer error) previews the content unchanged, exactly what approve would write."""
+    open (no scorer, scorer error) previews the content unchanged, exactly what approve would write.
+
+    In a batch, approve scores op *i* after ops 1..*i-1* have landed, so the SKILL.md files those ops leave in
+    ``staged`` are scored in place of the on-disk copies (a4cf78828e81, e485146dd10e). They go in a temp
+    root that is searched first; the scorer keeps the first copy of each name."""
     content = op.get("content") or ""
     why = op.get("justification")
     if why is None or (isinstance(why, str) and not why.strip()):
         return content
+    import shutil
+    import tempfile
     from tools import skill_manager_neardup as _neardup
     from tools.skill_manager_tool import _active_profile_name, _shared_skills_root
-    refusal, _payload, annotated, _row = _neardup.check_create(
-        op.get("name") or "", content, why, shared_root=_shared_skills_root(), profile=_active_profile_name())
+    overlay = None
+    try:
+        skill_mds = {nm: files["SKILL.md"] for nm, files in (staged or {}).items()
+                     if nm and "SKILL.md" in files and nm != op.get("name")}
+        if skill_mds:
+            overlay = Path(tempfile.mkdtemp(prefix="skill_preview_"))
+            for nm, text in skill_mds.items():
+                (overlay / nm).mkdir()
+                (overlay / nm / "SKILL.md").write_text(text, encoding="utf-8")
+        refusal, _payload, annotated, _row = _neardup.check_create(
+            op.get("name") or "", content, why, shared_root=_shared_skills_root(), profile=_active_profile_name(),
+            overlay_roots=[overlay] if overlay else ())
+    finally:
+        if overlay is not None:
+            shutil.rmtree(overlay, ignore_errors=True)
     return f"(create would fail: {refusal})" if refusal else annotated
 
 
@@ -389,7 +408,7 @@ def _fold_staged(staged: Dict[str, Dict[str, str]], action: str, name: str,
     label = "SKILL.md" if action == "edit" else (op.get("file_path") or "SKILL.md")
     files = staged.setdefault(name, {})
     if action == "create":
-        files["SKILL.md"] = _create_preview(op)
+        files["SKILL.md"] = _create_preview(op, staged)
     elif action == "edit":
         files["SKILL.md"] = op.get("content") or ""
     elif action == "write_file":

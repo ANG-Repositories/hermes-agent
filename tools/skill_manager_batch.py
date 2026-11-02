@@ -201,14 +201,17 @@ def _rollback(snapshots, find_skill, results, create_targets=None):
     tell an adopted dir's rollback which files were the batch's). A skill the batch CREATED is
     located by its ``create_targets`` dir, never ``find_skill`` (loaded roots only): a create into an
     unsubscribed shared group is invisible to it and would survive the rollback (f26dc060e98b).
+    Only a create that SUCCEEDED in ``results`` owns that dir: a create that failed or never ran
+    may point at a foreign skill find_skill cannot see, which rollback must not touch (ccb4d869f7f9).
     Returns (note, failed)."""
     create_targets = create_targets or {}
+    created = {r["name"] for r in results if r["action"] == "create" and r.get("success")}
     notes = []
     for nm, (pre_dir, snap, dir_pre_existed) in snapshots.items():
         written = [posixpath.normpath(r["file_path"].lstrip("/")) for r in results
                    if r["name"] == nm and r["action"] == "write_file" and r["file_path"]]
         try:
-            if pre_dir is None and nm in create_targets:
+            if pre_dir is None and nm in create_targets and nm in created:
                 post_dir = Path(create_targets[nm])
             else:
                 post = find_skill(nm)

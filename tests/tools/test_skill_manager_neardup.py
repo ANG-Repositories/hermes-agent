@@ -433,3 +433,42 @@ def test_pending_diff_renders_the_justified_content(tmp_path):
         plain = skill_pending_diff({"payload": {**op, "justification": None}})
         assert plain == NEAR
         assert _ledger(home) == [], "a preview must not write ledger rows"
+
+
+# --- Prism round 1 on agent#2541 (t_7c67781d) ------------------------------------------------------
+
+@pytest.mark.parametrize("lead", [[], [{"action": "patch", "name": "postgres-vacuum-tuning",
+                                        "old_string": "NO SUCH TEXT", "new_string": "x"}]])
+def test_failed_batch_create_never_touches_a_foreign_skill_in_an_unsubscribed_group(tmp_path, lead):
+    """ccb4d869f7f9: devops-aux/garage-door-lockout predates the batch and find_skill cannot see it. A create
+    that fails ('already exists') or never runs must not let rollback unlink that skill's SKILL.md."""
+    with _fleet_home(tmp_path) as (home, shared):
+        foreign = shared / "devops-aux" / "garage-door-lockout"
+        foreign.mkdir()
+        (foreign / "SKILL.md").write_text(DISTINCT)
+        res = json.loads(skill_manage("", "", operations=lead + [
+            {"action": "create", "name": "garage-door-lockout", "category": "devops-aux", "content": DISTINCT}]))
+        assert res["success"] is False, res
+        assert (foreign / "SKILL.md").read_text() == DISTINCT, "rollback deleted a skill the batch never wrote"
+
+
+def test_batch_create_preview_scores_against_the_earlier_ops_staged_tree(tmp_path):
+    """a4cf78828e81 / e485146dd10e: approve scores op 2 after op 1 has rewritten the only near match, so the
+    preview must too: no distinct_from for a skill that will no longer be near. And a skill an earlier op
+    CREATES is a near match the preview must see."""
+    from tools.write_approval import skill_pending_diff
+    rewritten = DISTINCT.replace("garage-door-lockout", "postgres-vacuum-tuning")
+    create = {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general",
+              "justification": "ops runbook"}
+    with _fleet_home(tmp_path) as (home, shared):
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "edit", "name": "postgres-vacuum-tuning", "content": rewritten}, create]}})
+        op2 = batch.split("## op 2/2")[1]
+        assert "distinct_from" not in op2, batch
+        (shared / "devops" / "postgres-vacuum-tuning" / "SKILL.md").unlink()
+        sibling = NEAR.replace("pg-autovacuum", "pg-vacuum-ops")
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "create", "name": "pg-vacuum-ops", "content": sibling, "category": "general"}, create]}})
+        op2 = batch.split("## op 2/2")[1]
+        assert "distinct_from" in op2 and "pg-vacuum-ops" in op2, batch
+        assert _ledger(home) == []

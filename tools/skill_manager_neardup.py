@@ -17,7 +17,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import hermes_yaml as yaml
 
@@ -79,12 +79,14 @@ def _gate_settings(default_threshold: float) -> Tuple[bool, float]:
     return enabled, threshold
 
 
-def _skill_roots(shared_root: Path) -> List[Path]:
+def _skill_roots(shared_root: Path, overlay_roots: Sequence[Path] = ()) -> List[Path]:
     """Every loaded skill root, the trusted project dirs (``.agents/skills``, ``.hermes/skills``: they outrank
-    the others at load time, 9393a1595eda) and the whole shared tree (unsubscribed groups, ``*-aux``)."""
+    the others at load time, 9393a1595eda) and the whole shared tree (unsubscribed groups, ``*-aux``).
+    ``overlay_roots`` go first: the scorer keeps the first SKILL.md per name, so a batch preview's staged
+    content shadows the on-disk copy of a skill an earlier op created or rewrote (e485146dd10e)."""
     from agent.skill_utils import get_all_skills_dirs, get_project_skills_dirs
     roots = [Path(p) for p in get_project_skills_dirs()] + [Path(p) for p in get_all_skills_dirs()]
-    return roots + [shared_root]
+    return [Path(p) for p in overlay_roots] + roots + [shared_root]
 
 
 def add_distinct_from(content: str, entries: List[Dict[str, Any]]) -> str:
@@ -125,7 +127,7 @@ def create_lock(shared_root: Path):
 
 
 def check_create(name: str, content: str, justification: Optional[str], *, shared_root: Path,
-                 profile: str) -> Tuple[Optional[str], Optional[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
+                 profile: str, overlay_roots: Sequence[Path] = ()) -> Tuple[Optional[str], Optional[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
     """-> (refusal message or None, refusal payload, content to write, ledger row to append on success).
 
     Fails open (no gate) when the scorer is absent or raises: a create is reversible, a crashed
@@ -138,7 +140,7 @@ def check_create(name: str, content: str, justification: Optional[str], *, share
         enabled, threshold = _gate_settings(scorer.THRESHOLD)
         if not enabled:
             return None, None, content, None
-        verdict = scorer.check(name, content, roots=_skill_roots(shared_root), threshold=threshold)
+        verdict = scorer.check(name, content, roots=_skill_roots(shared_root, overlay_roots), threshold=threshold)
     except Exception:  # noqa: BLE001
         logger.warning("near-duplicate gate unavailable for create of %s; allowing", name, exc_info=True)
         return None, None, content, None
