@@ -2902,7 +2902,9 @@ CREATE TABLE IF NOT EXISTS task_events (
     payload    TEXT,
     created_at INTEGER NOT NULL,
     actor_profile    TEXT,
-    actor_session_id TEXT
+    actor_session_id TEXT,
+    boottime   REAL,
+    boot_id    TEXT
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -8913,10 +8915,13 @@ def _append_event(
             "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
+    boot = _boot_evidence() if kind in _BOOT_EVIDENCE_KINDS else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
-        "actor_profile, actor_session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, _json_or_null(payload), int(time.time()), actor_profile, actor_session_id),
+        "actor_profile, actor_session_id, boottime, boot_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, run_id, kind, _json_or_null(payload), int(time.time()), actor_profile, actor_session_id,
+         boot[0] if boot else None, boot[1] if boot else None),
     )
     # Append-only mutation journal (card t_357330bf). This is the single choke
     # point every lifecycle mutation already flows through, so journaling here
@@ -9653,6 +9658,88 @@ def _boot_id() -> Optional[str]:
             return fh.read().strip() or None
     except OSError:
         return None
+
+
+# Liveness evidence the session reap orders member births against (t_29dee3c8).
+# On Linux each of these events also records CLOCK_BOOTTIME + the boot id, the
+# clock /proc/<pid>/stat starttime is on, so ownership compares the two
+# directly and a wall-clock step between evidence and reap moves nothing.
+_BOOT_EVIDENCE_KINDS = frozenset({"claimed", "spawned", "heartbeat"})
+# One starttime tick: /proc births are floored to it (and recorded with it).
+_BOOT_TICK_S = (
+    1.0 / os.sysconf("SC_CLK_TCK")
+    if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME") else 0.01
+)
+
+
+def _boot_evidence() -> Optional[tuple[float, str]]:
+    """``(CLOCK_BOOTTIME seconds, boot_id)`` now; None off Linux (macOS has no
+    BOOTTIME and keeps its microsecond p_starttime wall path)."""
+    if not _PRECISE_BIRTH:
+        return None
+    boot_id = _boot_id()
+    if not boot_id:
+        return None
+    return (time.clock_gettime(time.CLOCK_BOOTTIME), boot_id)
+
+
+def _boot_window(
+    after: Optional[tuple], before: Optional[tuple],
+) -> tuple[str, Optional[tuple[float, float]]]:
+    """How the reap orders births against a run's ``(boottime, boot_id)`` bounds.
+
+    ``("direct", (lo, hi))``: both bounds are from THIS boot; a /proc starttime
+    birth ``b`` (BOOTTIME, floored to a tick) is the run's iff ``lo <= b <= hi``,
+    i.e. one tick of slack each way and no epoch. ``("other_boot", None)``: a
+    bound was recorded under another boot id; nothing alive now can be that
+    run's (a worker does not survive a reboot), so NO ownership.
+    ``("wall", None)``: a bound has no BOOTTIME (old row, non-Linux writer) or
+    this host has none; the caller keeps the wall conversion.
+    """
+    current = _boot_id() if _PRECISE_BIRTH else None
+    if current is None:
+        return "wall", None
+    if any(ev is not None and ev[1] != current for ev in (after, before)):
+        return "other_boot", None
+    if after is None or before is None:
+        return "wall", None
+    return "direct", (float(after[0]) - _BOOT_TICK_S, float(before[0]) - _BOOT_TICK_S)
+
+
+def _event_boot(row) -> Optional[tuple[float, str]]:
+    """``(boottime, boot_id)`` of a task_events row, or None when unrecorded."""
+    if row is None or row["boottime"] is None or not row["boot_id"]:
+        return None
+    return (float(row["boottime"]), str(row["boot_id"]))
+
+
+def _run_boot_evidence(
+    conn: Optional[sqlite3.Connection], task_id: Optional[str],
+    run_id: Optional[int] = None,
+) -> tuple[Optional[tuple[float, str]], Optional[tuple[float, str]]]:
+    """BOOTTIME twins of the run's ownership bounds: the ``claimed`` event (as
+    :func:`_worker_owner_window`'s lower bound) and the newest ``heartbeat``/
+    ``spawned`` event (:func:`_run_last_evidence_at`). Newest by insertion id,
+    never by the wall ``created_at`` a backward step can reorder."""
+    if conn is None or task_id is None:
+        return None, None
+    if run_id is None:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = row[0] if row else None
+    if run_id is None:
+        return None, None
+    claim = conn.execute(
+        "SELECT boottime, boot_id FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'claimed' ORDER BY id ASC LIMIT 1", (task_id, int(run_id)),
+    ).fetchone()
+    last = conn.execute(
+        "SELECT boottime, boot_id FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind IN ('heartbeat', 'spawned') ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    return _event_boot(claim), _event_boot(last)
 
 
 def _spawn_start_token(payload: Any) -> Any:
@@ -18391,11 +18478,12 @@ def _record_worker_returncode(pid: int, code: int) -> None:
     if not pid or pid <= 0:
         return
     now = time.time()
-    _recent_worker_exits[int(pid)] = (int(code), now)
+    # (code, wall, boot evidence): the reap's upper bound on both clocks.
+    _recent_worker_exits[int(pid)] = (int(code), now, _boot_evidence())
     # Age-based trim: drop entries older than the TTL.
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
         cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
-        for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
+        for _pid in [p for p, e in _recent_worker_exits.items() if e[1] < cutoff]:
             _recent_worker_exits.pop(_pid, None)
     # Size cap as a final guard.
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
@@ -18809,6 +18897,7 @@ def _reap_birth(pid: int) -> Optional[float]:
 
 def _owned_identities(
     members: list[tuple[int, int]], sid: int, born_after: float, born_before: float,
+    *, after_boot: Optional[tuple] = None, before_boot: Optional[tuple] = None,
 ) -> dict[tuple[int, float], int]:
     """``{(pid, birth): pgid}`` of the members created inside the recorded
     run, i.e. between its claim and its last liveness evidence.
@@ -18829,11 +18918,31 @@ def _owned_identities(
     a child the worker started after its last heartbeat is indistinguishable
     from a recycled session's child and is left alone. Paths that verified
     the worker alive before signalling it bound on that moment instead.
+
+    Clock (t_29dee3c8): when both bounds carry CLOCK_BOOTTIME from this boot
+    (``after_boot``/``before_boot``, see :func:`_boot_window`), the record's
+    own /proc starttime birth is compared with them directly: no epoch, so a
+    wall-clock step after the evidence cannot move a birth into the window.
+    A bound from another boot is no ownership. Otherwise (old row, macOS,
+    another writer) the wall conversion below decides, and says so.
     """
+    mode, window = _boot_window(after_boot, before_boot)
+    if mode == "other_boot":
+        _log.info("kanban: session %d: run evidence is from another boot; "
+                  "no member can be the run's, not reaped", sid)
+        return {}
+    if mode == "wall" and _PRECISE_BIRTH:
+        _log.info("kanban: session %d: run evidence has no CLOCK_BOOTTIME bound "
+                  "(old row or another writer); ownership uses the wall conversion", sid)
     owned: dict[tuple[int, float], int] = {}
     for pid, _ in members:
         first = _reap_record(pid, sid)
         if first is None:
+            continue
+        if window is not None:
+            # ONE record carries membership, group and the BOOTTIME birth.
+            if window[0] <= first[1] <= window[1]:
+                owned[(pid, first[1])] = first[0]
             continue
         created = _ownership_birth(pid)
         if _reap_record(pid, sid) != first:
@@ -18859,6 +18968,8 @@ def _reap_worker_session(
     born_after: Optional[float],
     born_before: Optional[float],
     grace: float = 3.0,
+    after_boot: Optional[tuple] = None,
+    before_boot: Optional[tuple] = None,
 ) -> int:
     """SIGTERM every process group left in worker session ``sid``, wait up to
     ``grace`` seconds, then SIGKILL the survivors. Returns the groups signalled.
@@ -18866,7 +18977,9 @@ def _reap_worker_session(
     Call only once the worker is gone. Signals nothing unless the session is
     proved to be the recorded run's (:func:`_owned_identities`, with
     ``born_after`` = claim time and ``born_before`` = the last moment the
-    worker was known alive); unknown bounds mean no reap. Every later scan
+    worker was known alive; ``after_boot``/``before_boot`` are the same two
+    moments as ``(CLOCK_BOOTTIME, boot_id)``, see :func:`_boot_window`);
+    unknown bounds mean no reap. Every later scan
     must hold a member born before a moment some earlier-proved member was
     seen alive (re-checked during each scan), so a session that empties and
     has its sid reused mid-reap is never signalled.
@@ -18892,7 +19005,8 @@ def _reap_worker_session(
     members = _worker_session_members(sid)
     if not members:
         return 0
-    known = _owned_identities(members, sid, float(born_after), float(born_before))
+    known = _owned_identities(members, sid, float(born_after), float(born_before),
+                              after_boot=after_boot, before_boot=before_boot)
     if not known:
         _log.info(
             "kanban: session %d has %d member(s) but none from the recorded run; not reaped",
@@ -19169,12 +19283,16 @@ def _reap_run_env_escapees(
     born_after: Optional[float],
     born_before: Optional[float],
     grace: float = 3.0,
+    after_boot: Optional[tuple] = None,
+    before_boot: Optional[tuple] = None,
 ) -> int:
     """Second sweep after :func:`_reap_worker_session`: SIGTERM (then SIGKILL)
     the process groups of run-identified processes that escaped the worker's
     session (see :func:`_run_env_escapees`). Same proof as the session reap:
     only members born inside ``[born_after, born_before]`` — the recorded
-    run's window — are signalled; unknown bounds mean no reap. Call only once
+    run's window — are signalled; unknown bounds mean no reap. With BOOTTIME
+    bounds from this boot the /proc birth is compared directly
+    (:func:`_boot_window`); another boot's bounds reap nothing. Call only once
     the worker is gone. POSIX only; a no-op elsewhere."""
     import signal
 
@@ -19182,10 +19300,16 @@ def _reap_run_env_escapees(
         return 0
     if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
         return 0
+    mode, window = _boot_window(after_boot, before_boot)
+    if mode == "other_boot":
+        return 0
+    birth = _member_birth
     lo, hi = float(born_after) - _BIRTH_SLACK_SECONDS, float(born_before)
+    if window is not None:
+        birth, (lo, hi) = _reap_birth, window
     matched: list[tuple[int, int, bool]] = []
     for pid, pgid, by_env in _run_env_escapees_detailed(task_id, run_id):
-        born = _member_birth(pid)
+        born = birth(pid)
         if born is None or not (lo <= born <= hi):
             continue
         matched.append((pid, pgid, by_env))
@@ -19257,10 +19381,12 @@ _ORPHAN_SWEEP_CARD_RE = re.compile(r"t_[0-9a-f]+")
 
 def _register_worker_identity(
     pid: int, task_id: str, run_id: Optional[int], spawned_at: float,
+    spawned_boot: Optional[tuple[float, str]] = None,
 ) -> None:
-    """Remember which card/run a spawned worker pid belongs to."""
+    """Remember which card/run a spawned worker pid belongs to, and when it was
+    spawned on both clocks (``spawned_boot`` = :func:`_boot_evidence`)."""
     with _worker_processes_lock:
-        _worker_identities[int(pid)] = (str(task_id), run_id, float(spawned_at))
+        _worker_identities[int(pid)] = (str(task_id), run_id, float(spawned_at), spawned_boot)
 
 
 def reap_exited_worker_leftovers(
@@ -19290,15 +19416,21 @@ def reap_exited_worker_leftovers(
             ident = _worker_identities.pop(int(pid), None)
         if ident is None:
             continue
-        task_id, run_id, spawned_at = ident
+        task_id, run_id, spawned_at = ident[:3]
+        boot = {"after_boot": ident[3] if len(ident) > 3 else None}
         exit_entry = _recent_worker_exits.get(int(pid))
-        now = exit_entry[1] if exit_entry else time.time()
+        if exit_entry:
+            now = exit_entry[1]
+            boot["before_boot"] = exit_entry[2] if len(exit_entry) > 2 else None
+        else:
+            now = time.time()
+            boot["before_boot"] = _boot_evidence()
         try:
             groups = _reap_worker_session(
-                int(pid), born_after=spawned_at, born_before=now, grace=grace,
+                int(pid), born_after=spawned_at, born_before=now, grace=grace, **boot,
             )
             escaped = _reap_run_env_escapees(
-                task_id, run_id, born_after=spawned_at, born_before=now, grace=grace,
+                task_id, run_id, born_after=spawned_at, born_before=now, grace=grace, **boot,
             )
         except Exception as exc:  # never break a dispatcher tick
             _log.warning("kanban: leftover reap of worker %s failed: %s", pid, exc)
@@ -19530,6 +19662,7 @@ def _reap_terminated_worker_session(
     pid, info: dict, signal_fn, owner_window: tuple,
     verified_alive_at: Optional[float], conn, task_id,
     run_id: Optional[int] = None,
+    *, verified_alive_boot: Optional[tuple[float, str]] = None,
 ) -> None:
     """Reap the leftovers of a worker ``_terminate_reclaimed_worker`` just
     proved gone. Session members must date from the recorded run: claimed
@@ -19541,19 +19674,22 @@ def _reap_terminated_worker_session(
     use fake or borrowed pids)."""
     if signal_fn is not None:
         return
-    born_before = verified_alive_at
+    claim_boot, last_boot = _run_boot_evidence(conn, task_id, run_id) \
+        if run_id is not None else (None, None)
+    born_before, before_boot = verified_alive_at, verified_alive_boot
     if born_before is None and run_id is not None:
         born_before = _run_last_evidence_at(conn, task_id, run_id)
+        before_boot = last_boot
     reaped = _reap_worker_session(
         pid, born_after=owner_window[0] if owner_window else None,
-        born_before=born_before,
+        born_before=born_before, after_boot=claim_boot, before_boot=before_boot,
     )
     if reaped:
         info["session_groups_reaped"] = reaped
     escaped = _reap_run_env_escapees(
         task_id, run_id,
         born_after=owner_window[0] if owner_window else None,
-        born_before=born_before,
+        born_before=born_before, after_boot=claim_boot, before_boot=before_boot,
     )
     if escaped:
         info["env_escapees_reaped"] = escaped

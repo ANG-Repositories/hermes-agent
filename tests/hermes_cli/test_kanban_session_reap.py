@@ -146,7 +146,8 @@ def test_recycled_session_is_not_reaped(conn, monkeypatch):
     tid, worker, sleep_pid = _worker_card(conn, "exit")
     with kb.write_txn(conn):  # the recorded run ended 2 h ago
         conn.execute(
-            "UPDATE task_events SET created_at = created_at - 7200 "
+            "UPDATE task_events SET created_at = created_at - 7200, "
+            "boottime = boottime - 7200 "  # NULL (no BOOTTIME here) stays NULL
             "WHERE task_id = ? AND kind IN ('claimed', 'spawned', 'heartbeat')", (tid,),
         )
         conn.execute(

@@ -555,7 +555,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
 # leaves in its own log (``KANBAN_WORKER_EXIT_TRAILER``).
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
-_recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_recent_worker_exits: "dict[int, tuple]" = {}  # pid -> (code, wall, boot evidence)
 
 # Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
 # through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
@@ -613,7 +613,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     entry = _kb._recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
-    code, _ = entry
+    code = entry[0]
     if code < 0:
         return ("signaled", -code)
     if code == 0:
@@ -1077,6 +1077,7 @@ def _terminate_reclaimed_worker(
         return info
 
     verified_alive_at: Optional[float] = None
+    verified_alive_boot: Optional[tuple] = None  # the same moment on CLOCK_BOOTTIME
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
@@ -1094,6 +1095,7 @@ def _terminate_reclaimed_worker(
         return info
     if _kb._pid_alive(pid):
         verified_alive_at = time.time()
+        verified_alive_boot = _kb._boot_evidence()
         identity = _kb._owner_identity(int(pid), *owner_window)
         info["owner_identity"] = identity
         if identity == "recycled":
@@ -1141,6 +1143,7 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         _kb._reap_terminated_worker_session(
             pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
+            verified_alive_boot=verified_alive_boot,
         )
         return info
     except PermissionError:
@@ -1158,6 +1161,7 @@ def _terminate_reclaimed_worker(
             info["terminated"] = True
             _kb._reap_terminated_worker_session(
                 pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
+                verified_alive_boot=verified_alive_boot,
             )
             return info
         time.sleep(0.5)
@@ -1176,6 +1180,7 @@ def _terminate_reclaimed_worker(
     if info["terminated"]:
         _kb._reap_terminated_worker_session(
             pid, info, signal_fn, owner_window, verified_alive_at, conn, task_id, run_id,
+            verified_alive_boot=verified_alive_boot,
         )
     return info
 
@@ -2488,14 +2493,19 @@ def detect_crashed_workers(
                 _born_before = _kb._run_last_evidence_at(
                     conn, row["id"], row["current_run_id"],
                 )
+                _after_boot, _before_boot = _kb._run_boot_evidence(
+                    conn, row["id"], row["current_run_id"],
+                )
                 _kb._reap_worker_session(
                     pid, born_after=_born_after, born_before=_born_before,
+                    after_boot=_after_boot, before_boot=_before_boot,
                 )
                 # ...and whatever setsid()'d OUT of that session but still
                 # carries the run's identity (browser harness daemons).
                 _kb._reap_run_env_escapees(
                     row["id"], row["current_run_id"],
                     born_after=_born_after, born_before=_born_before,
+                    after_boot=_after_boot, before_boot=_before_boot,
                 )
         # N workers ending externally in the same tick while all were still
         # heartbeating is ONE event (something outside killed them), not N
@@ -4361,6 +4371,12 @@ def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> Non
         except OSError:
             group = None
     born = _kb._member_birth(proc.pid) if group is not None else None
+    # The leader's birth on CLOCK_BOOTTIME too (Linux), so the sweep below
+    # orders members against it without a wall conversion (t_29dee3c8).
+    born_boot = _kb._boot_evidence() if born is not None else None
+    if born_boot is not None:
+        leader_boot = _kb._reap_birth(proc.pid)
+        born_boot = (leader_boot, born_boot[1]) if leader_boot is not None else None
 
     def _signal(sig) -> None:
         try:
@@ -4386,7 +4402,8 @@ def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> Non
         # A tool that setpgid()s out of the group is still in the worker's session (Prism
         # ffe521cbbb21). Swept while the leader is unreaped (its pid, so the sid, is not
         # reusable), bounded by the leader's own birth: there is no spawned event yet.
-        _kb._reap_worker_session(proc.pid, born_after=born, born_before=time.time())
+        _kb._reap_worker_session(proc.pid, born_after=born, born_before=time.time(),
+                                 after_boot=born_boot, before_boot=_kb._boot_evidence())
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
@@ -9171,6 +9188,7 @@ def _default_spawn(
         nproc_limit if nproc_limit is not None else "-",
     )
     spawned_at = time.time()
+    spawned_boot = _kb._boot_evidence()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             spawn_cmd,
@@ -9196,7 +9214,7 @@ def _default_spawn(
     with _kb._worker_processes_lock:
         _kb._recent_worker_exits.pop(proc.pid, None)
         _kb._worker_processes[proc.pid] = proc
-    _kb._register_worker_identity(proc.pid, task.id, task.current_run_id, spawned_at)
+    _kb._register_worker_identity(proc.pid, task.id, task.current_run_id, spawned_at, spawned_boot)
     return proc.pid
 
 
