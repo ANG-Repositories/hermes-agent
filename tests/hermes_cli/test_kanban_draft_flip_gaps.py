@@ -238,8 +238,9 @@ def test_e2e_stale_run_negative_result_makes_no_flip_and_no_event(board, monkeyp
 
 
 def test_e2e_ownership_lost_during_flip_refuses_and_reports_the_flip(board, monkeypatch):
-    """Check, release, flip, re-check: a run that loses the card while ace_gate runs is refused,
-    its flip is named in the refusal, and no event lands on the card."""
+    """Check, release, flip, re-check: a run that loses the card while ace_gate runs is refused and
+    its flip is named in the refusal. The flip receipt still lands (it is the truth about the PR,
+    Prism fc2d40f0a267); the review events do not."""
     box, ready = [], []
 
     def _ready(r, n):
@@ -257,8 +258,9 @@ def test_e2e_ownership_lost_during_flip_refuses_and_reports_the_flip(board, monk
                                        expected_run_id=run, with_reason=True)
         assert ok is False
         assert "o/r#5" in reason and "already flipped ready" in reason
-        assert _events(conn, tid, "handoff_draft_flipped") == []
+        assert [list(e["flipped"]) for e in _events(conn, tid, "handoff_draft_flipped")] == [["o/r#5"]]
         assert _events(conn, tid, "review_negative_result") == []
+        assert _events(conn, tid, "review_requested") == []
     assert ready == [("o/r", 5)]
 
 
@@ -284,3 +286,99 @@ def test_e2e_positive_handback_untouched(board, monkeypatch):
         tid, run = _claimed(conn)
         assert kb.request_review(conn, tid, summary="shipped; 3 tests pass", expected_run_id=run) is True
     assert calls == []
+
+
+# --- Prism round 2 at 6741d1deb7 -------------------------------------------
+
+
+def test_e2e_flip_disabled_own_draft_is_refused_not_passed(board, monkeypatch):
+    """Prism 6632d57be41c repro, red at 6741d1deb7: with KANBAN_HANDOFF_DRAFT_FLIP=0 an OWNED open
+    draft fell into the foreign-mention branch and the negative-result handback went to review."""
+    box = []
+    monkeypatch.setenv("KANBAN_HANDOFF_DRAFT_FLIP", "0")
+    monkeypatch.setattr(fr, "_default_gh", lambda: _gh(f"daedalus/{box[0]}-fix"))
+    monkeypatch.setattr(fr, "_default_ready", lambda: (lambda r, n: pytest.fail("flipped with the switch off")))
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        box.append(tid)
+        with pytest.raises(fr.DraftPrError) as exc:
+            kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL}, expected_run_id=run)
+        assert exc.value.prs == ["o/r#5"]
+        assert _status(conn, tid) == "running"
+        assert _events(conn, tid, "completion_blocked_draft_pr") == [
+            {"prs": ["o/r#5"], "path": "review_negative_result"}]
+        assert _events(conn, tid, "review_requested") == []
+
+
+def test_flip_disabled_foreign_draft_is_still_a_mention(monkeypatch):
+    monkeypatch.setenv("KANBAN_HANDOFF_DRAFT_FLIP", "0")
+    rep = fr.flip_own_drafts(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", armable=set(),
+                             gh=_gh("daedalus/t_deadbeef-parent"), ready=lambda r, n: pytest.fail("flipped"))
+    assert "not this card" in rep["prs"]["o/r#5"]["draft_flip"]
+
+
+def test_flip_disabled_unreadable_own_pr_still_refuses(monkeypatch):
+    monkeypatch.setenv("KANBAN_HANDOFF_DRAFT_FLIP", "0")
+    with pytest.raises(fr.DraftLookupError):
+        fr.flip_own_drafts(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", armable={"o/r#5"},
+                           gh=_gh("daedalus/t_5c6c67c5-x", fail_first=2), ready=lambda r, n: 0)
+
+
+def test_e2e_no_github_client_refuses_own_draft_in_worker_draft_repo(board, monkeypatch):
+    """Prism 6a3d114dfec9, red at 6741d1deb7: _default_gh() None returned early and the handback went
+    to review with its own draft unread."""
+    monkeypatch.setattr(fr, "_default_gh", lambda: None)
+    monkeypatch.setattr(fr, "_default_ready", lambda: (lambda r, n: pytest.fail("flipped unread")))
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        with pytest.raises(fr.DraftLookupError):
+            kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL}, expected_run_id=run)
+        assert _status(conn, tid) == "running"
+
+
+def test_no_github_client_mentioned_or_unlisted_ref_fails_open():
+    rep = fr.flip_own_drafts(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", armable=set(),
+                             gh=None, ready=lambda r, n: pytest.fail("flipped"))
+    assert rep["prs"]["o/r#5"]["lookup"] == "failed after retry (fail-open)"
+
+
+def test_e2e_flip_receipt_survives_review_txn_rollback_and_retry_does_not_double(board, monkeypatch):
+    """Prism fc2d40f0a267 + f6417357f257, red at 6741d1deb7: the receipt rode the review txn, so an
+    ArtifactPreservationError after a successful flip lost it, and the retry saw a non-draft PR."""
+    box, ready, state = [], [], {"draft": True}
+
+    def _gh_live(*args):
+        return _gh(f"daedalus/{box[0]}-fix", draft=state["draft"])(*args)
+
+    def _ready(r, n):
+        ready.append((r, n))
+        state["draft"] = False
+        return 0
+
+    monkeypatch.setattr(fr, "_default_gh", lambda: _gh_live)
+    monkeypatch.setattr(fr, "_default_ready", lambda: _ready)
+    real_txn = kb._request_review_txn
+    fails = {"n": 1}
+
+    def _txn(*a, **k):
+        if fails["n"]:
+            fails["n"] -= 1
+            raise kb.ArtifactPreservationError("staging failed")
+        return real_txn(*a, **k)
+
+    monkeypatch.setattr(kb, "_request_review_txn", _txn)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        box.append(tid)
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL}, expected_run_id=run)
+        rows = conn.execute("SELECT run_id, payload FROM task_events WHERE task_id=? AND "
+                            "kind='handoff_draft_flipped'", (tid,)).fetchall()
+        assert len(rows) == 1 and rows[0][0] == run
+        assert list(json.loads(rows[0][1])["flipped"]) == ["o/r#5"]
+        assert _status(conn, tid) == "running"
+        assert kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL},
+                                 expected_run_id=run) is True
+        assert _status(conn, tid) == "review"
+        assert len(_events(conn, tid, "handoff_draft_flipped")) == 1
+    assert ready == [("o/r", 5)]

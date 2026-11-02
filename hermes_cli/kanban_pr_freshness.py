@@ -439,7 +439,9 @@ def _lookup_pr(gh: GhFn, ref) -> Optional[dict]:
 def _unread_refuses(ref, key: str, armable_keys) -> bool:
     """An unreadable PR refuses (instead of failing open) only where a worker PR may be a draft: the card's own
     handoff PR (``armable_keys``; None = every ref) in a ``config/worker-pr-draft.json`` repo (t_5c6c67c5)."""
-    if not worker_draft_flip_enabled() or ref.repo.casefold() not in worker_draft_repos():
+    # Not gated on worker_draft_flip_enabled(): that switch decides only whether we flip, never
+    # whether the draft gate opens (Prism 6632d57be41c).
+    if ref.repo.casefold() not in worker_draft_repos():
         return False
     return armable_keys is None or key.lower() in armable_keys
 
@@ -478,16 +480,16 @@ def flip_own_drafts(refs, *, task_id: str, armable=None, gh: Optional[GhFn] = No
     if not refs or not enabled():
         return report
     if gh is None:
+        # Prism 6a3d114dfec9: no GitHub client is an unreadable lookup, not a pass. Every ref goes
+        # through the unread rule below (own PR in a worker-draft repo refuses, the rest fail open).
         gh = _default_gh()
-        if gh is None:
-            return report
     armable_keys = None if armable is None else {str(k).lower() for k in armable}
-    own, unreadable = [], []
+    own, unreadable, unflippable = [], [], []
     for ref in refs:
         key = f"{ref.repo}#{ref.number}"
         entry: dict = {}
         report["prs"][key] = entry
-        pr = _lookup_pr(gh, ref)
+        pr = _lookup_pr(gh, ref) if gh is not None else None
         if pr is None:
             if _unread_refuses(ref, key, armable_keys):
                 entry["lookup"] = "failed after retry (refused)"
@@ -498,12 +500,19 @@ def flip_own_drafts(refs, *, task_id: str, armable=None, gh: Optional[GhFn] = No
         if str(pr.get("state") or "open") != "open" or pr.get("draft") is not True:
             continue
         entry["draft"] = True
-        if worker_draft_flip_enabled() and _owns_draft(ref, pr, task_id):
+        # Prism 6632d57be41c: ownership is classified independently of the auto-flip switch; the
+        # switch decides only whether we flip. An owned draft with flipping off is refused.
+        if not _owns_draft(ref, pr, task_id):
+            entry["draft_flip"] = "not flipped: not this card's own worker draft"
+        elif worker_draft_flip_enabled():
             own.append((ref, key, pr, entry))
         else:
-            entry["draft_flip"] = "not flipped: not this card's own worker draft"
+            entry["draft_flip"] = "not flipped: KANBAN_HANDOFF_DRAFT_FLIP=0 (refused)"
+            unflippable.append(key)
     if unreadable:
         raise DraftLookupError(task_id, unreadable, via="request_review")
+    if unflippable:
+        raise DraftPrError(task_id, unflippable, via="request_review")
     if not own:
         return report
     flipped_now, failed, _views = _flip_ready(own, ready or _default_ready())
