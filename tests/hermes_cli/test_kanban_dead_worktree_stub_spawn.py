@@ -126,6 +126,66 @@ def test_untracked_file_in_stub_is_held(conn, repo):
     assert (stub / "notes.md").exists()
 
 
+def assert_held(conn, tid, stub, result, reason):
+    refused = dict(result.workspace_refused)[tid]
+    assert refused.startswith(f"{stubs.DEAD_STUB_HELD}: {stub}") and reason in refused
+    assert tid not in result.spawn_failed
+    assert not (stub.parent / ".aside").exists()
+    state = row(conn, tid)
+    assert state["status"] == "ready" and state["consecutive_failures"] == 0
+
+
+def test_tracked_file_deleted_from_stub_is_held(conn, repo):
+    tid, stub = card_with_dead_stub(conn, repo)
+    (stub / "pkg" / "b.py").unlink()
+
+    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
+
+    assert_held(conn, tid, stub, result, "deleted tracked file pkg/b.py")
+    assert (stub / "a.txt").exists()
+
+
+def test_chmod_only_change_in_stub_is_held(conn, repo):
+    tid, stub = card_with_dead_stub(conn, repo)
+    (stub / "a.txt").chmod(0o755)
+
+    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
+
+    assert_held(conn, tid, stub, result, "mode change a.txt (100644 -> 100755)")
+    assert (stub / "a.txt").stat().st_mode & 0o100
+
+
+def test_staged_blob_only_in_registered_index_is_held(repo):
+    """Prism 8d54cfe00a58: the staged blob lives only in the admin dir's index."""
+    stub = repo / ".worktrees" / "t_x"
+    git(repo, "worktree", "add", "-q", "--detach", str(stub), "HEAD")
+    (stub / "a.txt").write_text("staged only\n")
+    git(stub, "add", "a.txt")
+    git(stub, "restore", "--source=HEAD", "--worktree", "a.txt")
+    (stub / ".git").write_text("gitdir: /nonexistent/admin\n")
+    admin = repo / ".git" / "worktrees" / "t_x"
+    index_before = (admin / "index").read_bytes()
+
+    with pytest.raises(stubs.WorkspaceUnavailable, match="staged changes in"):
+        stubs.clear_dead_stub(repo, stub, "HEAD")
+
+    assert (admin / "index").read_bytes() == index_before
+    assert not (repo / ".git" / "worktrees.aside").exists()
+    assert (stub / "a.txt").read_text() == "a\n" and not (stub.parent / ".aside").exists()
+
+
+def test_unreadable_target_is_held_not_charged(conn, repo):
+    tid, stub = card_with_dead_stub(conn, repo)
+    stub.chmod(0o000)
+    try:
+        result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
+    finally:
+        stub.chmod(0o755)
+
+    assert_held(conn, tid, stub, result, "unreadable")
+    assert (stub / "a.txt").read_text() == "a\n"
+
+
 def test_stub_check_over_budget_is_held_and_the_tick_stays_bounded(conn, repo, monkeypatch):
     """A stub too big to check in budget (a full checkout) is UNKNOWN: held, never moved."""
     tid, stub = card_with_dead_stub(conn, repo)
