@@ -6021,7 +6021,8 @@ class _StreamingCall(StreamingWaitMonitor):
         stale_timeout = self._stream_stale_timeout
         self._stream_stale_timeout = float("inf")  # no chunks arrive during the probe
         try:
-            probe = interruptible_api_call(self.agent, probe_kwargs)
+            # The probe belongs to this stream's dispatch, not the agent's live route.
+            probe = interruptible_api_call(self.agent, probe_kwargs, dispatch=self._dispatch)
         except (KeyboardInterrupt, InterruptedError):
             raise  # the outer handler routes user interrupts; never swallow them
         except Exception as probe_err:
