@@ -21,6 +21,7 @@ from agent.usage_pricing import (
     USAGE_UNKNOWN_FIELDS, cache_stats_line, estimate_usage_cost, prompt_tokens_unknown,
     verbose_token_usage_log_args, with_served_service_tier,
 )
+from agent.usage_pricing_relay import relay_billed_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -136,6 +137,11 @@ def record_response_usage(
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage
     _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls = _fold_moa_usage(agent, canonical_usage)
+    # t_9f190074: a multi-request relay payload bills every request's prompt; a deferred one bills
+    # zero (its tokens ride the next response). Context consumers below keep ``canonical_usage``.
+    billed_aggregator = relay_billed_usage(getattr(response, "usage", None), aggregator_usage)
+    billed_usage = billed_aggregator if aggregator_usage is canonical_usage else canonical_usage
+    billed_flags = {key: bool(getattr(billed_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
     total_tokens = canonical_usage.total_tokens
@@ -257,18 +263,18 @@ def record_response_usage(
         compressor._context_probe_persistable = False
 
     _loop._record_served_service_tier(agent, response)
-    agent.session_prompt_tokens += prompt_tokens
-    agent.session_completion_tokens += completion_tokens
-    agent.session_total_tokens += total_tokens
-    agent.session_input_tokens += canonical_usage.input_tokens
-    agent.session_output_tokens += canonical_usage.output_tokens
-    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
-    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    agent.session_prompt_tokens += billed_usage.prompt_tokens
+    agent.session_completion_tokens += billed_usage.output_tokens
+    agent.session_total_tokens += billed_usage.total_tokens
+    agent.session_input_tokens += billed_usage.input_tokens
+    agent.session_output_tokens += billed_usage.output_tokens
+    agent.session_cache_read_tokens += billed_usage.cache_read_tokens
+    agent.session_cache_write_tokens += billed_usage.cache_write_tokens
+    agent.session_reasoning_tokens += billed_usage.reasoning_tokens
     # ABSORBING per-bucket session unknown latches, in lockstep with the counters above: a plain int
     # total leaves no trace of an unmeasured call; once a session has missed a measurement no later
     # call restores it (cleared with the counters in reset_session_state).
-    for _flag, _set in usage_flags.items():
+    for _flag, _set in billed_flags.items():
         if _set:
             setattr(agent, f"session_{_flag}", True)
     # Last successful provider-call snapshot for /context, /usage (cumulative counters above).
@@ -286,7 +292,11 @@ def record_response_usage(
         try:
             turn_calls.append({
                 **usage_dict,
-                "output_tokens_unknown": output_unknown,
+                **billed_flags,
+                "input_tokens": billed_usage.input_tokens,
+                "output_tokens": billed_usage.output_tokens,
+                "cache_read_tokens": billed_usage.cache_read_tokens,
+                "cache_write_tokens": billed_usage.cache_write_tokens,
                 "latency_s": api_duration,
                 "composition": call_composition,
                 "provider": _route["provider"],
@@ -370,7 +380,7 @@ def record_response_usage(
         except Exception:
             pass  # telemetry must never break the conversation loop
     cost_result = estimate_usage_cost(
-        _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
+        _agg_cost_model, billed_aggregator, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
     )
     _cost_status = _loop._session_cost_status_with_known_spend(
@@ -410,11 +420,11 @@ def record_response_usage(
             agent._session_db.queue_token_counts(
                 agent.session_id,
                 source=_agent_session_source(agent),
-                input_tokens=canonical_usage.input_tokens,
-                output_tokens=canonical_usage.output_tokens,
-                cache_read_tokens=canonical_usage.cache_read_tokens,
-                cache_write_tokens=canonical_usage.cache_write_tokens,
-                reasoning_tokens=canonical_usage.reasoning_tokens,
+                input_tokens=billed_usage.input_tokens,
+                output_tokens=billed_usage.output_tokens,
+                cache_read_tokens=billed_usage.cache_read_tokens,
+                cache_write_tokens=billed_usage.cache_write_tokens,
+                reasoning_tokens=billed_usage.reasoning_tokens,
                 estimated_cost_usd=_cost_delta,
                 cost_status=_cost_status,
                 cost_source=cost_result.source,
@@ -427,7 +437,7 @@ def record_response_usage(
                 **_loop._last_turn_snapshot_kwargs(canonical_usage),
                 # UNKNOWN != 0: the cumulative flags are ABSORBING in the store; the last_turn_* ones
                 # move WITH the snapshot they qualify (withheld -> None -> COALESCE keeps the prior split).
-                **usage_flags,
+                **billed_flags,
                 **{
                     f"last_turn_{key}": (None if bool(canonical_usage.total_tokens_unknown) else value)
                     for key, value in usage_flags.items()
