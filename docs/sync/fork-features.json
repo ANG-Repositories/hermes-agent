@@ -1298,6 +1298,29 @@
     ]
   },
   {
+    "feature": "LCM MessageStore.close() is mutually exclusive with every connection use (typed StoreClosed after close), and an AIAgent's context-engine shutdown requested mid-turn is deferred to the end of that turn",
+    "tests": [
+      "tests/context_engine/test_lcm_store_close_race.py::test_close_racing_writers_never_crashes_or_leaks_untyped_errors",
+      "tests/context_engine/test_lcm_store_close_race.py::test_closed_store_raises_typed_error_and_never_touches_dead_conn",
+      "tests/context_engine/test_lcm_store_close_race.py::test_release_clients_mid_turn_defers_engine_shutdown_to_turn_end",
+      "tests/context_engine/test_lcm_store_close_race.py::test_stop_releases_engine_of_a_still_running_turn"
+    ],
+    "paths": [
+      "plugins/context_engine/lcm/store.py",
+      "agent/context_engine_owners.py",
+      "agent/turn_facade.py"
+    ],
+    "why": "2026-11-02 06:50:30 PST Apollo gateway pid 42841 SIGSEGV (EXC_BAD_ACCESS 0x8 in _pysqlite_query_execute): /stop's _drop_turn_slot cleared turn.agent before _evict_cached_agent, so the mid-turn guard missed and release_clients -> _shutdown_context_engine -> LCMEngine.shutdown closed MessageStore's check_same_thread=False connection on a daemon thread while the still-draining turn ran _append_protected_batch and write_metadata_json on it. Fix (t_055f9d8d): store methods run under _write_lock against a live conn or raise StoreClosed (sqlite3.Error subclass), close() takes the same lock; run_conversation owns the engine (agent/context_engine_owners.py) and a shutdown requested inside a turn runs at its exit. Upstream has no _shutdown_context_engine and no vendored LCM store: fork-permanent; repro = the hammer test (N writers + a close() loop) segfaults the old store.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "cron"
+    ]
+  },
+  {
     "feature": "SessionDB periodic PASSIVE WAL checkpoint runs on its own connection, off SessionDB._lock",
     "tests": [
       "tests/hermes_state/test_wal_checkpoint_strategy.py::TestCheckpointNeverHoldsTheWriteLock"

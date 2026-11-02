@@ -1080,7 +1080,13 @@ class AIAgent(
 
     def _shutdown_context_engine(self) -> None:
         """Release the per-agent context engine's resources (idempotent). Engines without ``shutdown()``
-        (the built-in compressor) just get dropped; a rebuilt agent gets a fresh engine from init_agent."""
+        (the built-in compressor) just get dropped; a rebuilt agent gets a fresh engine from init_agent.
+        A turn still inside ``run_conversation`` owns the engine: the shutdown then runs when it exits
+        (``agent/context_engine_owners.py``, t_055f9d8d)."""
+        from agent.context_engine_owners import shutdown_or_defer
+        shutdown_or_defer(self, self._shutdown_context_engine_now)
+
+    def _shutdown_context_engine_now(self) -> None:
         engine = getattr(self, "context_compressor", None)
         if engine is None:
             return
