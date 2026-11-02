@@ -26,18 +26,29 @@ ROOTS_SEEN = []
 def _words(t):
     return set(re.findall(r"[a-z0-9]+", t.lower()))
 
-def check(name, content, roots=None, threshold=None):
+class Corpus:
+    def __init__(self, docs):
+        self.docs = docs
+
+    @classmethod
+    def load(cls, roots=None):
+        docs, seen = [], set()
+        for root in roots or []:
+            for p in sorted(Path(root).rglob("SKILL.md")):
+                if p.parent.name not in seen:
+                    seen.add(p.parent.name)
+                    docs.append({"name": p.parent.name, "path": str(p), "text": p.read_text()})
+        return cls(docs)
+
+def check(name, content, roots=None, threshold=None, corpus=None):
     thr = THRESHOLD if threshold is None else threshold
     ROOTS_SEEN.append([str(r) for r in roots or []])
-    cand, seen, matches = _words(content), set(), []
-    for root in roots or []:
-        for p in sorted(Path(root).rglob("SKILL.md")):
-            n = p.parent.name
-            if n == name or n in seen:
-                continue
-            seen.add(n)
-            w = _words(p.read_text())
-            matches.append({"name": n, "path": str(p), "score": round(len(cand & w) / len(cand | w), 3)})
+    cand, matches = _words(content), []
+    for d in (corpus or Corpus.load(roots)).docs:
+        if d["name"] == name:
+            continue
+        w = _words(d["text"])
+        matches.append({"name": d["name"], "path": d["path"], "score": round(len(cand & w) / len(cand | w), 3)})
     matches.sort(key=lambda m: -m["score"])
     return {"near_duplicate": bool(matches) and matches[0]["score"] >= thr, "threshold": thr,
             "matches": matches[:3]}
@@ -472,3 +483,33 @@ def test_batch_create_preview_scores_against_the_earlier_ops_staged_tree(tmp_pat
         op2 = batch.split("## op 2/2")[1]
         assert "distinct_from" in op2 and "pg-vacuum-ops" in op2, batch
         assert _ledger(home) == []
+
+
+def test_batch_create_preview_does_not_score_a_skill_an_earlier_op_deletes(tmp_path):
+    """8377c7154a79 / aaa4ebf59b72: approve deletes postgres-vacuum-tuning before it scores the create, so the
+    preview must not annotate distinct_from against it. Control: the same create after deleting an unrelated name
+    IS annotated (the exclusion did not just make the gate fail open)."""
+    from tools.write_approval import skill_pending_diff
+    create = {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general",
+              "justification": "ops runbook"}
+    with _fleet_home(tmp_path) as (home, shared):
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "delete", "name": "postgres-vacuum-tuning"}, create]}})
+        assert "distinct_from" not in batch.split("## op 2/2")[1], batch
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "delete", "name": "garage-door-lockout"}, create]}})
+        op2 = batch.split("## op 2/2")[1]
+        assert "distinct_from" in op2 and "postgres-vacuum-tuning" in op2, batch
+        assert _ledger(home) == []
+
+
+def test_create_preview_never_writes_outside_its_overlay(tmp_path):
+    """92bc336dabf3: a staged name that is not a valid skill name (absolute, `..`) is never a path."""
+    from tools.write_approval import _create_preview
+    escape = tmp_path / "preview-escape"
+    with _fleet_home(tmp_path):
+        out = _create_preview({"name": "next", "content": NEAR, "justification": "reason"},
+                              {str(escape): {"SKILL.md": "unapproved"}, "../up": {"SKILL.md": "unapproved"}})
+    assert not escape.exists(), "preview wrote outside its temp overlay"
+    assert not (tmp_path / "up").exists()
+    assert out.startswith("---")

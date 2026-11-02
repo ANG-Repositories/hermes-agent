@@ -127,8 +127,12 @@ def create_lock(shared_root: Path):
 
 
 def check_create(name: str, content: str, justification: Optional[str], *, shared_root: Path,
-                 profile: str, overlay_roots: Sequence[Path] = ()) -> Tuple[Optional[str], Optional[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
+                 profile: str, overlay_roots: Sequence[Path] = (), exclude_names: Sequence[str] = ()
+                 ) -> Tuple[Optional[str], Optional[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
     """-> (refusal message or None, refusal payload, content to write, ledger row to append on success).
+
+    ``exclude_names``: skills an earlier op of the same batch deletes. Their on-disk copies are dropped from the
+    corpus, so a preview scores what approve will (8377c7154a79, aaa4ebf59b72).
 
     Fails open (no gate) when the scorer is absent or raises: a create is reversible, a crashed
     create path is not a safety property."""
@@ -140,7 +144,12 @@ def check_create(name: str, content: str, justification: Optional[str], *, share
         enabled, threshold = _gate_settings(scorer.THRESHOLD)
         if not enabled:
             return None, None, content, None
-        verdict = scorer.check(name, content, roots=_skill_roots(shared_root, overlay_roots), threshold=threshold)
+        roots = _skill_roots(shared_root, overlay_roots)
+        corpus = None
+        if exclude_names:
+            gone = set(exclude_names)
+            corpus = scorer.Corpus([d for d in scorer.Corpus.load(roots).docs if d["name"] not in gone])
+        verdict = scorer.check(name, content, roots=roots, threshold=threshold, corpus=corpus)
     except Exception:  # noqa: BLE001
         logger.warning("near-duplicate gate unavailable for create of %s; allowing", name, exc_info=True)
         return None, None, content, None

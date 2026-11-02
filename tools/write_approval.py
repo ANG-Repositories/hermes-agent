@@ -340,6 +340,11 @@ def skill_pending_diff(
     return "".join(diff) or "(no textual change)"
 
 
+# Key in a batch's ``staged`` view holding the names earlier ops deleted. Not a valid skill name, so it never
+# collides with one (8377c7154a79).
+_DELETED = "\x00deleted"
+
+
 def _create_preview(op: Dict[str, Any], staged: Optional[Dict[str, Dict[str, str]]] = None) -> str:
     """The SKILL.md a staged create will actually write. A ``justification`` makes the near-duplicate gate add
     ``metadata.hermes.distinct_from`` to the frontmatter at approve time, so the preview runs the same
@@ -349,7 +354,9 @@ def _create_preview(op: Dict[str, Any], staged: Optional[Dict[str, Dict[str, str
 
     In a batch, approve scores op *i* after ops 1..*i-1* have landed, so the SKILL.md files those ops leave in
     ``staged`` are scored in place of the on-disk copies (a4cf78828e81, e485146dd10e). They go in a temp
-    root that is searched first; the scorer keeps the first copy of each name."""
+    root that is searched first; the scorer keeps the first copy of each name. Skills an earlier op deletes are
+    excluded from the corpus (8377c7154a79). Only valid skill names are written into the overlay, and each path is
+    checked to stay inside it (92bc336dabf3): approve rejects any other name before it scores anything."""
     content = op.get("content") or ""
     why = op.get("justification")
     if why is None or (isinstance(why, str) and not why.strip()):
@@ -357,19 +364,24 @@ def _create_preview(op: Dict[str, Any], staged: Optional[Dict[str, Dict[str, str
     import shutil
     import tempfile
     from tools import skill_manager_neardup as _neardup
-    from tools.skill_manager_tool import _active_profile_name, _shared_skills_root
+    from tools.skill_manager_tool import VALID_NAME_RE, _active_profile_name, _shared_skills_root
     overlay = None
+    staged = staged or {}
     try:
-        skill_mds = {nm: files["SKILL.md"] for nm, files in (staged or {}).items()
-                     if nm and "SKILL.md" in files and nm != op.get("name")}
+        skill_mds = {nm: files["SKILL.md"] for nm, files in staged.items()
+                     if nm != _DELETED and isinstance(nm, str) and VALID_NAME_RE.fullmatch(nm)
+                     and "SKILL.md" in files and nm != op.get("name")}
         if skill_mds:
-            overlay = Path(tempfile.mkdtemp(prefix="skill_preview_"))
+            overlay = Path(tempfile.mkdtemp(prefix="skill_preview_")).resolve()
             for nm, text in skill_mds.items():
-                (overlay / nm).mkdir()
-                (overlay / nm / "SKILL.md").write_text(text, encoding="utf-8")
+                d = (overlay / nm).resolve()
+                if d.parent != overlay:
+                    continue
+                d.mkdir()
+                (d / "SKILL.md").write_text(text, encoding="utf-8")
         refusal, _payload, annotated, _row = _neardup.check_create(
             op.get("name") or "", content, why, shared_root=_shared_skills_root(), profile=_active_profile_name(),
-            overlay_roots=[overlay] if overlay else ())
+            overlay_roots=[overlay] if overlay else (), exclude_names=sorted(staged.get(_DELETED) or ()))
     finally:
         if overlay is not None:
             shutil.rmtree(overlay, ignore_errors=True)
@@ -404,7 +416,10 @@ def _fold_staged(staged: Dict[str, Dict[str, str]], action: str, name: str,
         return
     if action == "delete":
         staged.pop(name, None)
+        staged.setdefault(_DELETED, {})[name] = ""
         return
+    if action == "create":
+        (staged.get(_DELETED) or {}).pop(name, None)
     label = "SKILL.md" if action == "edit" else (op.get("file_path") or "SKILL.md")
     files = staged.setdefault(name, {})
     if action == "create":
