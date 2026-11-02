@@ -38,6 +38,7 @@ def _make_call(api_kwargs, *, deltas_sent=False, api_mode="chat_completions"):
     call.first_delta_fired = {"done": True}
     call.on_first_delta = None
     call._stream_stale_timeout = 180.0
+    call._dispatch = None
     call.api_kwargs = api_kwargs
     call.result = {"response": None, "error": None, "partial_tool_names": []}
     call.deltas_were_sent = {"yes": deltas_sent}
