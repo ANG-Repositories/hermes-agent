@@ -1,0 +1,62 @@
+# Public-repo workflow load guard (plan 2026-11-01 public-repo-actions-migration §3a step 5, card t_a4fdb8ba).
+# Ruling: Apollo 2026-11-02 14:30 (ruling:t_a4fdb8ba-archive-perm-loadguard-set-gbrain-home).
+#
+# GitHub disabled Actions on ANG-Ventures/hermes-agent for run volume (1,906 runs on 10-05). On the public
+# repo only the correctness + security floor runs. Every workflow file with a trigger of its own (anything but
+# `workflow_call`) is classified here; scripts/ci/public_workflow_allowlist_lint.py fails a PR that adds one
+# without a line, and `--live` fails when GitHub's state for the repo below disagrees with this file.
+#
+# Line forms:
+#   live: <file>                 stays active on the public repo (pull_request + push:main)
+#   callee: <file>  # <why>      has its own trigger but a live workflow calls it; stays active, reason required
+#   disabled: <file>             kept `disabled_manually` on the public repo until re-enabled with a reason
+# Files whose only trigger is `workflow_call` need no line (they cannot start a run on their own).
+# Re-enabling a workflow = move its line to `live:` in a reviewed PR, then `--live --apply`.
+
+repo: ANG-Repositories/hermes-agent
+
+live: ci.yaml
+live: lint.yml
+live: js-tests.yml
+live: override-lint.yml
+live: docs-site-checks.yml
+live: case-collision-check.yml
+live: contributor-check.yml
+live: history-check.yml
+live: fleet-secret-scan.yml
+live: fleet-sast.yml
+live: cancel-superseded-pr-ci.yml
+
+callee: windows-install-update-e2e.yml  # ci.yaml -> tests-os.yml calls it; own push trigger is wine2e-install/** only
+
+disabled: archive-inputs.yml
+disabled: attribution-merge-group.yml
+disabled: bootstrap-installer-build.yml
+disabled: canary-release.yml
+disabled: ci-local.yaml
+disabled: ci-placement-probe.yml
+disabled: deploy-site.yml
+disabled: desktop-bundled-release.yml
+disabled: docker.yml
+disabled: flake-quarantine-digest.yml
+disabled: fleet-ci-fail-alert.yml
+disabled: fork-canary-lane.yml
+disabled: install-e2e-red.yml
+disabled: install-e2e.yml
+disabled: js-autofix.yml
+disabled: label-rerun.yml
+disabled: live-providers.yml
+disabled: nix.yml
+disabled: osv-scanner.yml
+disabled: plugin-catalog-ci.yml
+disabled: pm-bundle.yml
+disabled: regression-test-lint.yml
+disabled: sandbox-image.yml
+disabled: skills-index-freshness.yml
+disabled: skills-index.yml
+disabled: stable-release-publication.yml
+disabled: stable-release.yml
+disabled: termux-verify.yml
+disabled: warm-selfhosted-cache.yml
+disabled: windows-bundle-sdk.yml
+disabled: windows-venv-e2e.yml

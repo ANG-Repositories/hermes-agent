@@ -212,6 +212,11 @@ jobs:
           uv run --no-project --python 3.11 --with pyyaml==6.0.3 python scripts/ci/workflow_trigger_storm_lint.py --selftest
           uv run --no-project --python 3.11 --with pyyaml==6.0.3 python scripts/ci/workflow_trigger_storm_lint.py --repo .
 
+      # Public-repo load guard (t_a4fdb8ba): every workflow that can start a run by itself is classified in
+      # .github/ci/public-workflow-allowlist.txt (live / callee / disabled). A new one without a line is red.
+      - name: Refuse unclassified workflows (public-repo allowlist)
+        run: uv run --no-project --python 3.11 --with pyyaml==6.0.3 python scripts/ci/public_workflow_allowlist_lint.py --repo .
+
       # /tmp is not portable (Termux has none, native Windows has none, macOS aliases it to
       # /private/tmp, Linux mounts it as a small tmpfs). Production code resolves scratch space
       # through the scratch-dir helper; skills, docs and prompts must not teach the model a
