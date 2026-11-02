@@ -13,7 +13,9 @@ install) has no gate: creation behaves as before.
 import importlib.util
 import logging
 import re
+import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +26,8 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 _SCORER_REL = ("scripts", "lib", "skill_similarity.py")
+_SCORER_MODULE = "_hermes_skill_similarity"
+_COMPARE_LOCK = ("state", "skill-neardup-create.lock")
 _scorer_cache: Dict[Tuple[str, int], Any] = {}
 # Same closing fence as skill_manager_tool._validate_frontmatter: a whole ``---`` line, not a ``---key``.
 _FRONTMATTER_END_RE = re.compile(r"\n---\s*\n")
@@ -42,11 +46,22 @@ def _load_scorer(root: Path):
         return None
     mod = _scorer_cache.get(key)
     if mod is None:
-        spec = importlib.util.spec_from_file_location("_hermes_skill_similarity", path)
+        spec = importlib.util.spec_from_file_location(_SCORER_MODULE, path)
         if spec is None or spec.loader is None:
             raise ImportError(f"cannot load {path}")
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        # Registered BEFORE exec (a51c70d89c38): dataclasses/typing/pickle inside the scorer resolve their own
+        # module through sys.modules; a failed exec must not leave a half-initialised module behind.
+        prior = sys.modules.get(_SCORER_MODULE)
+        sys.modules[_SCORER_MODULE] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            if prior is not None:
+                sys.modules[_SCORER_MODULE] = prior
+            else:
+                sys.modules.pop(_SCORER_MODULE, None)
+            raise
         _scorer_cache.clear()
         _scorer_cache[key] = mod
     return mod
@@ -65,9 +80,10 @@ def _gate_settings(default_threshold: float) -> Tuple[bool, float]:
 
 
 def _skill_roots(shared_root: Path) -> List[Path]:
-    """Every loaded skill root plus the whole shared tree (unsubscribed groups and ``*-aux`` folders)."""
-    from agent.skill_utils import get_all_skills_dirs
-    roots = [Path(p) for p in get_all_skills_dirs()]
+    """Every loaded skill root, the trusted project dirs (``.agents/skills``, ``.hermes/skills``: they outrank
+    the others at load time, 9393a1595eda) and the whole shared tree (unsubscribed groups, ``*-aux``)."""
+    from agent.skill_utils import get_all_skills_dirs, get_project_skills_dirs
+    roots = [Path(p) for p in get_project_skills_dirs()] + [Path(p) for p in get_all_skills_dirs()]
     return roots + [shared_root]
 
 
@@ -98,6 +114,16 @@ def add_distinct_from(content: str, entries: List[Dict[str, Any]]) -> str:
     return "---\n" + dumped + content[body_start + 1:]
 
 
+@contextmanager
+def create_lock(shared_root: Path):
+    """Cross-process lock held from the compare through the write of a create (adbf7b9e2588): two concurrent
+    creates of near-identical skills must not both score against a tree that holds neither. One lock per fleet
+    root, next to the ledger; creates are rare, so the serialisation costs nothing."""
+    from tools.skill_usage import skill_file_lock
+    with skill_file_lock(shared_root.parent.joinpath(*_COMPARE_LOCK)):
+        yield
+
+
 def check_create(name: str, content: str, justification: Optional[str], *, shared_root: Path,
                  profile: str) -> Tuple[Optional[str], Optional[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
     """-> (refusal message or None, refusal payload, content to write, ledger row to append on success).
@@ -125,10 +151,15 @@ def check_create(name: str, content: str, justification: Optional[str], *, share
         return (f"justification must be a string, got {type(justification).__name__}.",
                 {"near_duplicates": verdict["matches"]}, content, None)
     why = (justification or "").strip()
+    try:  # scorer code: same fail-open boundary as check() (aada50d66930)
+        message = None if why else scorer.refusal_message(name, verdict)
+        entries = scorer.distinct_from_entries(verdict, why) if why else None
+    except Exception:  # noqa: BLE001
+        logger.warning("near-duplicate gate unavailable for create of %s; allowing", name, exc_info=True)
+        return None, None, content, None
     if not why:
         _append_ledger(scorer, root, {**row, "event": "refuse"})
-        return scorer.refusal_message(name, verdict), {"near_duplicates": verdict["matches"]}, content, None
-    entries = scorer.distinct_from_entries(verdict, why)
+        return message, {"near_duplicates": verdict["matches"]}, content, None
     try:
         content = add_distinct_from(content, entries)
     except DistinctFromError as e:

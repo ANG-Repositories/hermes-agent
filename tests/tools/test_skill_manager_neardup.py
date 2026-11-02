@@ -114,6 +114,7 @@ def _fleet_home(tmp_path, *, scorer=True, config=None, existing_group="devops"):
          patch.object(smt, "_author_to_shared_setting", return_value=None), \
          patch("agent.skill_utils.get_all_skills_dirs",
                return_value=[local, shared / "devops", shared / "general"]), \
+         patch("agent.skill_utils.get_project_skills_dirs", return_value=[]), \
          patch("hermes_cli.config.load_config", return_value=config or {}):
         yield home, shared
 
@@ -332,3 +333,103 @@ def test_distinct_from_does_not_leak_through_yaml_aliases():
     assert "distinct_from" not in fm["metadata"]["template"], out
     assert fm["metadata"]["hermes"]["distinct_from"] == [{"name": "existing"}]
     assert fm["metadata"]["template"] == {"tag": "keep"}
+
+
+# --- Carried Prism residue from agent#2513 (t_7c67781d) -------------------------------------------
+
+def test_scorer_is_registered_in_sys_modules_while_it_executes(tmp_path):
+    """a51c70d89c38: a scorer that resolves its own module (dataclasses, pickle) during import must load."""
+    import sys
+    from tools import skill_manager_neardup as nd
+    with _fleet_home(tmp_path) as (home, shared):
+        lib = home / "scripts" / "lib" / "skill_similarity.py"
+        lib.write_text("import sys\nassert sys.modules[__name__] is not None\n" + STUB_SCORER)
+        nd._scorer_cache.clear()
+        res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is False and res["near_duplicates"], res
+
+
+def test_failed_scorer_import_leaves_no_module_behind(tmp_path):
+    import sys
+    from tools import skill_manager_neardup as nd
+    with _fleet_home(tmp_path) as (home, shared):
+        (home / "scripts" / "lib" / "skill_similarity.py").write_text("raise RuntimeError('broken scorer')\n")
+        nd._scorer_cache.clear()
+        sys.modules.pop(nd._SCORER_MODULE, None)
+        res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is True, res             # fail-open, as before
+        assert nd._SCORER_MODULE not in sys.modules
+
+
+def test_trusted_project_skills_are_compared(tmp_path):
+    """9393a1595eda: a trusted project .agents/skills dir outranks the others at load time, so it is compared."""
+    proj = tmp_path / "proj" / ".agents" / "skills"
+    (proj / "pg-proj").mkdir(parents=True)
+    (proj / "pg-proj" / "SKILL.md").write_text(EXISTING.replace("postgres-vacuum-tuning", "pg-proj"))
+    with _fleet_home(tmp_path) as (home, shared), \
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[proj]):
+        (shared / "devops" / "postgres-vacuum-tuning" / "SKILL.md").unlink()
+        res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is False, res
+        assert res["near_duplicates"][0]["name"] == "pg-proj"
+
+
+def test_compare_and_write_run_under_one_cross_process_lock(tmp_path):
+    """adbf7b9e2588: while another process holds <root>/state/skill-neardup-create.lock, a create waits."""
+    import fcntl
+    import threading
+    import time
+    with _fleet_home(tmp_path) as (home, shared):
+        lock = home / "state" / "skill-neardup-create.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        done = []
+        with open(lock, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            t = threading.Thread(target=lambda: done.append(_create("garage-door-lockout", DISTINCT)))
+            t.start()
+            time.sleep(0.8)
+            assert not done and not (shared / "general" / "garage-door-lockout").exists()
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        t.join(20)
+        assert done and done[0]["success"] is True, done
+
+
+def test_batch_rollback_removes_a_create_in_an_unsubscribed_group(tmp_path):
+    """f26dc060e98b: devops-aux is not a loaded root, so _find_skill cannot see the create; rollback must."""
+    with _fleet_home(tmp_path) as (home, shared):
+        res = json.loads(skill_manage("", "", operations=[
+            {"action": "create", "name": "garage-door-lockout", "category": "devops-aux", "content": DISTINCT},
+            {"action": "patch", "name": "postgres-vacuum-tuning", "old_string": "NO SUCH TEXT", "new_string": "x"}]))
+        assert res["success"] is False, res
+        assert not (shared / "devops-aux" / "garage-door-lockout").exists(), "batch create survived rollback"
+
+
+@pytest.mark.parametrize("broken", ["refusal_message", "distinct_from_entries"])
+def test_scorer_message_helpers_fail_open(tmp_path, broken):
+    """aada50d66930: refusal_message / distinct_from_entries raising is scorer failure: fail open."""
+    with _fleet_home(tmp_path) as (home, shared):
+        lib = home / "scripts" / "lib" / "skill_similarity.py"
+        lib.write_text(STUB_SCORER + f"\ndef {broken}(*a, **k):\n    raise KeyError('boom')\n")
+        from tools import skill_manager_neardup as nd
+        nd._scorer_cache.clear()
+        res = _create("pg-autovacuum", NEAR, **({"justification": "why"} if broken == "distinct_from_entries" else {}))
+        assert res["success"] is True, res
+
+
+def test_pending_diff_renders_the_justified_content(tmp_path):
+    """d879f184cd83: with skills.write_approval on, the staged create preview is what approve will write:
+    the justification's distinct_from rows included, in a batch too (later ops diff against it)."""
+    from tools.write_approval import skill_pending_diff
+    with _fleet_home(tmp_path) as (home, shared):
+        op = {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general",
+              "justification": "ops runbook"}
+        single = skill_pending_diff({"payload": op})
+        assert "distinct_from" in single and "postgres-vacuum-tuning" in single, single
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            op, {"action": "patch", "name": "pg-autovacuum", "old_string": "watch freeze age.",
+                 "new_string": "watch freeze age closely."}]}})
+        assert "distinct_from" in batch.split("## op 2/2")[0], batch
+        assert "(patch would fail" not in batch, batch
+        plain = skill_pending_diff({"payload": {**op, "justification": None}})
+        assert plain == NEAR
+        assert _ledger(home) == [], "a preview must not write ledger rows"

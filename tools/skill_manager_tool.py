@@ -679,6 +679,13 @@ def _create_skill(name: str, content: str, category: str = None, *, local: bool 
     if existing := _find_existing_skill_anywhere(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
     from tools import skill_manager_neardup as _neardup
+    with _neardup.create_lock(_shared_skills_root()):   # compare + write under one lock (adbf7b9e2588)
+        return _create_skill_locked(name, content, category, local=local, justification=justification,
+                                    _neardup=_neardup)
+
+
+def _create_skill_locked(name: str, content: str, category: str = None, *, local: bool, justification,
+                         _neardup) -> Dict[str, Any]:
     refusal, payload, content, neardup_row = _neardup.check_create(
         name, content, justification, shared_root=_shared_skills_root(), profile=_active_profile_name())
     if refusal:

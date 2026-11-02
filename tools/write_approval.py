@@ -312,7 +312,7 @@ def skill_pending_diff(
     if action == "batch":
         return _batch_pending_diff(payload)
     if action == "create":
-        return payload.get("content") or ""
+        return _create_preview(payload)
     if action not in {"edit", "patch", "write_file"}:
         return {"remove_file": f"remove file: {payload.get('file_path')} from skill '{name}'",
                 "delete": f"delete skill '{name}'"}.get(action, f"({action} on '{name}')")
@@ -338,6 +338,23 @@ def skill_pending_diff(
     diff = difflib.unified_diff(current.splitlines(keepends=True), new.splitlines(keepends=True),
                                 fromfile=f"a/{target_label}", tofile=f"b/{target_label}")
     return "".join(diff) or "(no textual change)"
+
+
+def _create_preview(op: Dict[str, Any]) -> str:
+    """The SKILL.md a staged create will actually write. A ``justification`` makes the near-duplicate gate add
+    ``metadata.hermes.distinct_from`` to the frontmatter at approve time, so the preview runs the same
+    ``check_create`` (d879f184cd83); a create it would refuse renders as an explicit failure note. No ledger row:
+    check_create appends one only for an unjustified refusal, which this path never asks for. The gate failing
+    open (no scorer, scorer error) previews the content unchanged, exactly what approve would write."""
+    content = op.get("content") or ""
+    why = op.get("justification")
+    if why is None or (isinstance(why, str) and not why.strip()):
+        return content
+    from tools import skill_manager_neardup as _neardup
+    from tools.skill_manager_tool import _active_profile_name, _shared_skills_root
+    refusal, _payload, annotated, _row = _neardup.check_create(
+        op.get("name") or "", content, why, shared_root=_shared_skills_root(), profile=_active_profile_name())
+    return f"(create would fail: {refusal})" if refusal else annotated
 
 
 def _fold_patch(base: str, old_string: str, new_string: str, replace_all: Any = False
@@ -371,7 +388,9 @@ def _fold_staged(staged: Dict[str, Dict[str, str]], action: str, name: str,
         return
     label = "SKILL.md" if action == "edit" else (op.get("file_path") or "SKILL.md")
     files = staged.setdefault(name, {})
-    if action in {"create", "edit"}:
+    if action == "create":
+        files["SKILL.md"] = _create_preview(op)
+    elif action == "edit":
         files["SKILL.md"] = op.get("content") or ""
     elif action == "write_file":
         files[label] = op.get("file_content") or ""
