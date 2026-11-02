@@ -798,15 +798,14 @@ def _attempt_id(delegation_id: str, generation: int) -> str:
     return f"{delegation_id}:g{generation}:{uuid.uuid4().hex[:8]}"
 
 
-_SECRET_FIELD_PARTS = (
-    "api_key",
-    "apikey",
-    "password",
-    "secret",
-    "authorization",
-    "access_token",
-    "refresh_token",
-)
+# Identifier fields this store writes itself. Their names contain vocabulary words (``credential``,
+# ``session_id``), but they hold references and ids, never a secret.
+_NONSECRET_IDENTIFIER_FIELDS = frozenset({
+    "credential_ref",
+    "parent_session_id",
+    "origin_session_id",
+    "origin_ui_session_id",
+})
 
 
 def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
@@ -816,8 +815,7 @@ def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
     def _walk(value: Any, path: str) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
-                normalized = str(key).lower().replace("-", "_")
-                if any(part in normalized for part in _SECRET_FIELD_PARTS):
+                if _sensitive_query_key(str(key)):
                     raise RegistryError(
                         f"secret-shaped field cannot be persisted: {path}.{key}"
                     )
@@ -845,9 +843,104 @@ def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
                 raise RegistryError(f"credential-bearing route.{field} cannot be persisted")
 
 
+def persistable_fallback_chain(chain: Any) -> list[dict[str, Any]] | None:
+    """The dispatching parent's fallback chain for ``execution.fallback_chain``, or None.
+
+    A recovered unit rebuilds its parent from this field, and its children resolve their chain from
+    that parent exactly as the in-process children do (``fallback_providers: auto``). A rung carrying a
+    credential-shaped key or a credential-bearing URL in any field is dropped (a chain left empty is
+    None, the unit runs without fallback): recording it would fail the whole spec closed and force
+    the call synchronous.
+
+    Rungs are copied field by field, keeping only JSON scalars: a live chain is never deep-copied,
+    because a rung may hold client/lock-bearing objects and a raise here would take the durable
+    spec down with it. A chain that cannot be represented records None with a warning."""
+    if chain is None:
+        return None
+    if not isinstance(chain, (list, tuple)):
+        logger.warning("async_delegation fallback chain not persisted: %s is not a list", type(chain).__name__)
+        return None
+    rungs = [
+        {str(key): value for key, value in rung.items() if isinstance(value, (str, int, float, bool, type(None)))}
+        for rung in chain
+        if isinstance(rung, dict)
+    ]
+    # The same sanitizer as the declared policy, over every kept field (not just ``base_url``): a
+    # credential URL in any scalar (``proxy_url``, ``endpoint``, ...) drops its rung (Prism a2c6b8a0230f).
+    kept = [rung for rung in rungs if not _carries_credential(rung)]
+    if len(kept) != len(rungs):
+        logger.info("async_delegation fallback chain: %d rung(s) carrying a credential not persisted", len(rungs) - len(kept))
+    return kept or None
+
+
+def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:
+    """``execution.fallback_policy``: the ``fallback_providers`` of the block that owned the route.
+
+    A recovered unit is rebuilt without its dispatch-time ``credentials_cfg`` (e.g. ``auxiliary.review``),
+    so without this its children would take the GLOBAL delegation block's fallback policy, and a pinned
+    child under ``fallback_providers: auto`` would fail over onto the parent's lanes that its own block
+    excluded (Prism 3de445560b2a). ``None`` and ``"auto"`` persist as-is. A declared chain persists
+    through the same credential filter as the parent chain. If that filter withholds it, ``[]`` is
+    recorded (no fallback), never ``None``, which would widen the policy to the inherited chain.
+    A bare provider name carries no credential and persists verbatim, so the recovered value resolves
+    exactly as the declared one did (Prism 75587d571cd7)."""
+    declared = routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None
+    # The WHOLE declared value is checked before any early return (a URL string, string or dict rungs,
+    # nested values such as ``options.base_url``), and what persists is a JSON-safe copy of exactly
+    # what was checked (Prism c6cb98245680).
+    if _carries_credential(declared):
+        logger.info("async_delegation fallback policy not persisted: a declared rung carries a credential")
+        return {"fallback_providers": []}
+    if declared is None or isinstance(declared, str) or declared == []:
+        return {"fallback_providers": declared}
+    entries = [declared] if isinstance(declared, dict) else declared if isinstance(declared, list) else []
+    kept = [_json_safe(entry) for entry in entries if isinstance(entry, (dict, str))]
+    # Nothing usable resolves to the owner's default at dispatch; None resolves to the same default.
+    return {"fallback_providers": kept or None}
+
+
+def _carries_credential(value: Any) -> bool:
+    """True when a credential-shaped key or a credential-bearing URL appears anywhere inside ``value``."""
+    if isinstance(value, dict):
+        return any(_sensitive_query_key(str(key)) or url_has_credentials(str(key)) or _carries_credential(child) for key, child in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_carries_credential(child) for child in value)
+    return isinstance(value, str) and url_has_credentials(value)
+
+
+def _json_safe(value: Any) -> Any:
+    """A copy of ``value`` holding only JSON data: dicts, lists and scalars; anything else is dropped."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(child) for key, child in value.items() if _is_json_data(child)}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(child) for child in value if _is_json_data(child)]
+    return value
+
+
+def _is_json_data(value: Any) -> bool:
+    return isinstance(value, (dict, list, tuple, str, int, float, bool, type(None)))
+
+
 def _sensitive_query_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    return any(part in normalized for part in _SECRET_FIELD_PARTS) or normalized in {"key", "token"}
+    """True when a field or query-parameter NAME is credential-shaped.
+
+    One vocabulary, the house persistence one (``tools.url_safety.SENSITIVE_PERSIST_PARAM_NAMES``, the
+    browsing set plus signing names such as SAS ``sig``, Prism 6690b5ad7061): a name trips when a
+    vocabulary name occurs in it as a whole run of ``_``/``-``/``.``-separated words (``auth_token``,
+    ``x-api-key``, ``options.passwd``, ``credentials``, ``client_secret_value``), so nobody lists one more
+    name here again (Prism c01c5615ab04, eb64a1dae508). Word runs, not raw substrings, so ``max_tokens``
+    stays clean. The store's own identifier fields are the only exemption: they are references, not secrets."""
+    from urllib.parse import unquote
+
+    from tools.url_safety import SENSITIVE_PERSIST_PARAM_NAMES
+
+    normalized = unquote(key).lower().replace("-", "_").replace(".", "_")
+    if normalized in _NONSECRET_IDENTIFIER_FIELDS:
+        return False
+    if normalized == "key":
+        return True
+    words = f"_{normalized}_"
+    return any(f"_{name.replace('-', '_')}_" in words for name in SENSITIVE_PERSIST_PARAM_NAMES)
 
 
 def url_has_credentials(url: Any) -> bool:
@@ -857,12 +950,14 @@ def url_has_credentials(url: Any) -> bool:
         return False
     from urllib.parse import parse_qsl, urlsplit
 
+    from tools.url_safety import sensitive_query_param_name
+
     try:
         parsed = urlsplit(text)
         userinfo = bool(parsed.username or parsed.password)
     except ValueError:
         return True  # unparseable: fail closed
-    return userinfo or any(_sensitive_query_key(k) for k, _ in parse_qsl(parsed.query, keep_blank_values=True))
+    return userinfo or sensitive_query_param_name(text) is not None or any(_sensitive_query_key(k) for k, _ in parse_qsl(parsed.query, keep_blank_values=True))
 
 
 def redact_url(url: Any) -> str:
