@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
+import fnmatch
 import hashlib
 import itertools
 import json
@@ -405,6 +406,35 @@ _DERIVED_DIRS = frozenset({
     "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     ".venv", ".venvs", "venv",
 })
+
+# Probe/test RESIDUE (t_71ed4ae8): an UNTRACKED entry under one of these directories, or a file matching
+# one of these names, is not work. A tree whose ONLY dirt is residue is clean for survivorship: the
+# residue is rmtree'd with the tree and never preserved. `_REMOTE_PROOF` inlines the same two tuples
+# (pinned by tests/hermes_cli/test_kanban_survivor_residue.py); the fleet copy with the reaper's wider
+# list is hermes-home scripts/lib/tree_residue.py.
+_RESIDUE_DIRS = ("__pycache__", ".pytest_cache", ".venv", "node_modules", ".mypy_cache", ".ruff_cache")
+_RESIDUE_FILES = ("*.pyc", ".coverage")
+
+
+def _is_residue(path):
+    """A status path is residue when a DIRECTORY component is a residue dir, or a file's name matches.
+    A plain FILE named `__pycache__` or `.venv` is a real edit."""
+    parts = [p for p in path.rstrip("/").split("/") if p]
+    dirs = parts if path.endswith("/") else parts[:-1]
+    return bool(parts) and (any(p in _RESIDUE_DIRS for p in dirs) or (
+        not path.endswith("/") and any(fnmatch.fnmatchcase(parts[-1], f) for f in _RESIDUE_FILES)))
+
+
+def _residue_only(repo):
+    """True when `repo` is dirty ONLY with untracked residue: no tracked change, no other untracked
+    entry, no skip-worktree / assume-unchanged flag (status cannot see edits behind those)."""
+    flags = _git(repo, "ls-files", "-v", "-z").stdout.decode("utf-8", "surrogateescape")
+    if any(rec[:1] == "S" or rec[:1].islower() for rec in flags.split("\0") if len(rec) > 2):
+        return False
+    out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+               "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
+    recs = [rec for rec in out.split("\0") if rec]
+    return bool(recs) and all(rec[:2] == "??" and _is_residue(rec[3:]) for rec in recs)
 
 # Hard ceiling on directories inspected by one enumeration. A gate that cannot
 # finish must SAY so rather than hang: unbounded, this walk visited 850,853
@@ -2148,7 +2178,7 @@ def _capture(repo, key, workspace, recorded=None):
     published = list(_published_refs(repo, workspace, storage_cache))
     head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
     dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
-    if not dirty and head.returncode == 0:
+    if (not dirty or _residue_only(repo)) and head.returncode == 0:
         sha = head.stdout.decode().strip()
         # A rewriting mirror republishes the same content under a new sha, so
         # sha equality can never hold for a home clone. The fallback is the
@@ -3782,36 +3812,34 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         raise _refusal(reason) from exc
 
 
-def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False, remote_host=None):
-    """The only Kanban directory deleter: inspect the exact target, then remove.
-
-    Board hard-delete may remove only empty workspace/attachment storage. Archive
-    a board with retained work instead: deleting its recovery artifacts would
-    defeat survivorship. Linked worktrees retain Git's no-force dirty check.
-    """
-    try:
-        if remote_host is not None:
-            import shlex
-            from hermes_cli.kanban_worker_pool import _ssh_argv
-            # Only independently durable CLEAN repositories (or an empty dir)
-            # may be removed remotely. Untracked scratch/dirty work is held,
-            # never mistaken for the Studio's empty copy of the same path.
-            script = '''import os,sys,subprocess,shutil
+# The remote deleter's proof, shipped as ONE argv over ssh (keep it < 4 KB: fleet-nas seccomp note).
+# Only independently durable CLEAN repositories (or an empty dir) may be removed remotely. Untracked
+# scratch/dirty work is held, never mistaken for the Studio's empty copy of the same path. Dirt that is
+# all residue (R/F == _RESIDUE_DIRS/_RESIDUE_FILES, untracked or ignored, no hidden-edit flag) is clean.
+_REMOTE_PROOF = r'''import os,sys,subprocess,shutil,fnmatch
 from pathlib import Path
+R=("__pycache__", ".pytest_cache", ".venv", "node_modules", ".mypy_cache", ".ruff_cache")
+F=("*.pyc", ".coverage")
 p=Path(sys.argv[1])
 if not p.is_absolute() or str(p.resolve())!=str(p) or p.is_symlink(): sys.exit(12)
 if not p.exists(): sys.exit(0)
 def git(repo,*args):
  r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,text=True,timeout=12,stdin=subprocess.DEVNULL)
  if r.returncode: raise RuntimeError('git proof failed')
- return r.stdout.strip()
+ return r.stdout
+def res(s):
+ q=[x for x in s.rstrip('/').split('/') if x]
+ ds=q if s.endswith('/') else q[:-1]
+ return bool(q) and (any(x in R for x in ds) or (not s.endswith('/') and any(fnmatch.fnmatchcase(q[-1],f) for f in F)))
 def prove(d):
  if (d/'.git').exists():
   if (d/'.git').is_file(): raise RuntimeError('registered worktree requires git worktree remove')
-  if git(d,'status','--porcelain','--untracked-files=all','--ignored'): raise RuntimeError('dirty, ignored or untracked work')
+  st=[r for r in git(d,'status','--porcelain=v1','-z','--untracked-files=all','--ignored','--ignore-submodules=none').split('\0') if r]
+  if st and not all(r[:2] in('??','!!') and res(r[3:]) for r in st): raise RuntimeError('dirty, ignored or untracked work')
+  if st and any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
   if git(d,'stash','list'): raise RuntimeError('stashes')
   if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')
-  sha=git(d,'rev-parse','HEAD')
+  sha=git(d,'rev-parse','HEAD').strip()
   remotes=git(d,'remote').splitlines()
   if not any(any(line.split()[0]==sha for line in git(d,'ls-remote',remote).splitlines()) for remote in remotes):
    raise RuntimeError('HEAD has no independently durable ref')
@@ -3826,8 +3854,21 @@ try:
 except Exception as e:
  print(str(e),file=sys.stderr); sys.exit(13)
 '''
+
+
+def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False, remote_host=None):
+    """The only Kanban directory deleter: inspect the exact target, then remove.
+
+    Board hard-delete may remove only empty workspace/attachment storage. Archive
+    a board with retained work instead: deleting its recovery artifacts would
+    defeat survivorship. Linked worktrees retain Git's no-force dirty check.
+    """
+    try:
+        if remote_host is not None:
+            import shlex
+            from hermes_cli.kanban_worker_pool import _ssh_argv
             proc = subprocess.run(
-                _ssh_argv(remote_host, 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(str(path))),
+                _ssh_argv(remote_host, 'python3 -c ' + shlex.quote(_REMOTE_PROOF) + ' ' + shlex.quote(str(path))),
                 capture_output=True, text=True, encoding="utf-8", timeout=60, stdin=subprocess.DEVNULL,
                 cwd=_ext.neutral_cwd(),
             )
@@ -3848,7 +3889,8 @@ except Exception as e:
             # capture to an invented task: allow only independently durable refs.
             repos = _repos(workspace)
             if not repos or any(
-                _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+                (_git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+                 and not _residue_only(repo))
                 or not _remote_survivor(repo, _git(repo, "rev-parse", "HEAD").stdout.decode().strip(),
                                         list(_published_refs(repo, workspace)))
                 for repo in repos
