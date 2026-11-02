@@ -40,6 +40,65 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 )
 
 
+def _live_dispatched_worker_roots(procs: list) -> set[int]:
+    """Only dispatcher-recorded live runs can escape a caller's tree cleanup.
+
+    Environment and argv are child-controlled, not lifecycle authority. Read the
+    board once, without migrations or writes, and fail closed on unavailable state.
+    """
+    try:
+        import sqlite3
+        from hermes_cli.kanban_db import kanban_db_path
+        from hermes_cli.kanban_db_dispatch import _fingerprints_agree, _process_fingerprint
+
+        uri = kanban_db_path().resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+        try:
+            rows = conn.execute(
+                "SELECT r.worker_pid, r.worker_started_at FROM task_runs r "
+                "JOIN tasks t ON t.current_run_id = r.id "
+                "WHERE r.ended_at IS NULL AND r.worker_pid = t.worker_pid"
+            ).fetchall()
+        finally:
+            conn.close()
+        candidates = {proc.pid for proc in procs}
+        return {
+            pid for pid, started_at in rows
+            if pid in candidates and started_at
+            and _fingerprints_agree(str(started_at), _process_fingerprint(pid))
+        }
+    except Exception:
+        return set()
+
+
+def spare_dispatched_workers(procs: list) -> list:
+    """Drop dispatched Kanban workers and their subtrees from a tree-kill snapshot.
+
+    A worker is a child of whatever process ran the dispatcher tick: a
+    ``hermes kanban dispatch`` started from a terminal-tool call, a cron script,
+    code_execution. ``start_new_session=True`` keeps it out of that process's
+    group, but every tree-kill that snapshots ``children(recursive=True)`` still
+    finds it by ancestry, so a timed-out dispatch call SIGKILLed the 47 workers it
+    had spawned (2026-11-02 07:08, t_4d4b30ff). A worker outlives its spawner;
+    its own lifecycle (max_runtime, reclaim, reap) belongs to the board.
+    """
+    roots = _live_dispatched_worker_roots(procs)
+    if not roots:
+        return procs
+
+    def protected(proc) -> bool:
+        if proc.pid in roots:
+            return True
+        try:
+            if os.getsid(proc.pid) in roots:
+                return True
+            return any(a.pid in roots for a in proc.parents())
+        except Exception:
+            return False
+
+    return [proc for proc in procs if not protected(proc)]
+
+
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity. Even a context
