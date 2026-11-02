@@ -1,0 +1,155 @@
+"""A dead linked-worktree stub at a card's worktree target is moved aside or
+held, and never burns the retry budget (t_42e59999).
+
+Regression for t_5c6c67c5: ``.worktrees/<id>`` was a directory whose ``.git``
+gitfile pointed at a pruned ``.git/worktrees/<id>``. Every ``git worktree add``
+refused "already exists", and the card burned all 3 spawns to ``gave_up``.
+"""
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_worktree_stub as stubs
+
+
+def git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def conn(tmp_path, monkeypatch, all_assignees_spawnable):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.discard(str(kb.kanban_db_path(board="default").resolve()))
+    kb.init_db()
+    with kb.connect() as c:
+        yield c
+
+
+@pytest.fixture
+def repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "a.txt").write_text("a\n")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "b.py").write_text("b = 1\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "a")
+    return repo
+
+
+def card_with_dead_stub(conn, repo):
+    """The incident shape: branch wt/<id> at main tip, its worktree's admin dir pruned."""
+    tid = kb.create_task(conn, title="dead stub", assignee="daedalus-opus",
+                         workspace_kind="worktree", workspace_path=str(repo))
+    stub = repo / ".worktrees" / tid
+    git(repo, "worktree", "add", "-q", "-b", f"wt/{tid}", str(stub), "HEAD")
+    shutil.rmtree(repo / ".git" / "worktrees" / tid)
+    with pytest.raises(subprocess.CalledProcessError):  # git itself refuses it now
+        git(stub, "rev-parse", "--git-dir")
+    return tid, stub
+
+
+def row(conn, tid):
+    return conn.execute(
+        "SELECT status, consecutive_failures FROM tasks WHERE id=?", (tid,),
+    ).fetchone()
+
+
+def spawned_into(record):
+    def spawn(task, workspace, board=None):
+        record.append(Path(workspace))
+        return 4242
+    return spawn
+
+
+def test_dead_stub_holding_nothing_unique_is_moved_aside_and_spawn_proceeds(conn, repo):
+    tid, stub = card_with_dead_stub(conn, repo)
+    launched = []
+
+    result = kbd.dispatch_once(conn, spawn_fn=spawned_into(launched))
+
+    assert tid not in result.spawn_failed
+    assert launched == [stub.resolve()] or launched == [stub]
+    assert git(stub, "branch", "--show-current") == f"wt/{tid}"
+    aside = list((repo / ".worktrees" / ".aside").glob(f"{tid}-stub-*"))
+    assert len(aside) == 1 and (aside[0] / "a.txt").read_text() == "a\n"
+    assert row(conn, tid)["consecutive_failures"] == 0
+
+
+def test_dead_stub_with_one_modified_file_is_held_untouched_and_uncharged(conn, repo):
+    tid, stub = card_with_dead_stub(conn, repo)
+    (stub / "pkg" / "b.py").write_text("b = 2  # unpushed work\n")
+    before = sorted(p.relative_to(stub) for p in stub.rglob("*"))
+
+    for _ in range(4):  # more ticks than the default retry budget
+        result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
+        assert tid not in result.spawn_failed
+        refused = dict(result.workspace_refused)
+        assert refused[tid].startswith(f"{stubs.DEAD_STUB_HELD}: {stub}")
+        assert "modified file pkg/b.py" in refused[tid]
+        assert "mv " in refused[tid]  # names the operator command
+
+    assert (stub / "pkg" / "b.py").read_text() == "b = 2  # unpushed work\n"
+    assert sorted(p.relative_to(stub) for p in stub.rglob("*")) == before
+    assert not (repo / ".worktrees" / ".aside").exists()
+    state = row(conn, tid)
+    assert state["status"] == "ready" and state["consecutive_failures"] == 0
+    assert not conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
+    ).fetchone()
+
+
+def test_untracked_file_in_stub_is_held(conn, repo):
+    tid, stub = card_with_dead_stub(conn, repo)
+    (stub / "notes.md").write_text("draft\n")
+
+    result = kbd.dispatch_once(conn, spawn_fn=spawned_into([]))
+
+    assert "untracked file notes.md" in dict(result.workspace_refused)[tid]
+    assert (stub / "notes.md").exists()
+
+
+def test_live_worktree_at_target_is_reused_unchanged(conn, repo):
+    tid = kb.create_task(conn, title="live", assignee="daedalus-opus",
+                         workspace_kind="worktree", workspace_path=str(repo))
+    target = repo / ".worktrees" / tid
+    git(repo, "worktree", "add", "-q", "-b", f"wt/{tid}", str(target), "HEAD")
+    (target / "wip.txt").write_text("in-flight\n")
+    launched = []
+
+    result = kbd.dispatch_once(conn, spawn_fn=spawned_into(launched))
+
+    assert tid not in result.spawn_failed and not result.workspace_refused
+    assert len(launched) == 1
+    assert (target / "wip.txt").read_text() == "in-flight\n"
+    assert not (repo / ".worktrees" / ".aside").exists()
+
+
+def test_still_registered_admin_dir_is_moved_out_of_worktrees(tmp_path, repo):
+    """A stub whose registration survived (pointing at it) must not block the add."""
+    stub = repo / ".worktrees" / "t_x"
+    git(repo, "worktree", "add", "-q", "--detach", str(stub), "HEAD")
+    (stub / ".git").write_text("gitdir: /nonexistent/admin\n")  # dead gitfile, admin kept
+
+    aside = stubs.clear_dead_stub(repo, stub, "HEAD")
+
+    assert not stub.exists() and (aside / "a.txt").exists()
+    assert not (repo / ".git" / "worktrees" / "t_x").exists()
+    assert list((repo / ".git" / "worktrees.aside").glob("t_x-*"))
+    git(repo, "worktree", "add", "-q", "--detach", str(stub), "HEAD")
