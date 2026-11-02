@@ -1303,7 +1303,8 @@
       "tests/context_engine/test_lcm_store_close_race.py::test_close_racing_writers_never_crashes_or_leaks_untyped_errors",
       "tests/context_engine/test_lcm_store_close_race.py::test_closed_store_raises_typed_error_and_never_touches_dead_conn",
       "tests/context_engine/test_lcm_store_close_race.py::test_release_clients_mid_turn_defers_engine_shutdown_to_turn_end",
-      "tests/context_engine/test_lcm_store_close_race.py::test_stop_releases_engine_of_a_still_running_turn"
+      "tests/context_engine/test_lcm_store_close_race.py::test_stop_releases_engine_of_a_still_running_turn",
+      "tests/context_engine/test_lcm_store_close_race.py::test_turn_admitted_during_shutdown_waits_for_it"
     ],
     "paths": [
       "plugins/context_engine/lcm/store.py",

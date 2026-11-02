@@ -6,6 +6,10 @@ cached agent, so the mid-turn guard in ``_evict_cached_agent`` misses the still-
 Shutting LCM's stores down then freed the SQLite connection the turn was executing on (gateway
 SIGSEGV 2026-11-02 06:50, t_055f9d8d). Each ``run_conversation`` is an owner for its duration; a
 release requested while an owner is inside is recorded and run by the last owner to leave.
+
+Teardown runs while ``lock`` is held, so turn admission (``enter_turn``) cannot interleave with
+it: a turn that arrives during a shutdown waits for it, then sees the engine already released
+(``context_compressor is None``) instead of claiming an engine that is being closed.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ class _Owners:
     __slots__ = ("lock", "turns", "pending")
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.turns = 0
         self.pending = False
 
@@ -46,11 +50,9 @@ def exit_turn(agent: Any, shutdown: Callable[[], None]) -> None:
     owners = _owners(agent)
     with owners.lock:
         owners.turns = max(0, owners.turns - 1)
-        run = owners.pending and owners.turns == 0
-        if run:
+        if owners.pending and owners.turns == 0:
             owners.pending = False
-    if run:
-        shutdown()
+            shutdown()  # under the lock: no turn can be admitted mid-teardown
 
 
 def shutdown_or_defer(agent: Any, shutdown: Callable[[], None]) -> bool:
@@ -62,5 +64,5 @@ def shutdown_or_defer(agent: Any, shutdown: Callable[[], None]) -> bool:
         if owners.turns > 0:
             owners.pending = True
             return False
-    shutdown()
+        shutdown()  # under the lock: no turn can be admitted mid-teardown
     return True

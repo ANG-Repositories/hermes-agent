@@ -218,3 +218,45 @@ def test_stop_releases_engine_of_a_still_running_turn(lcm_home, monkeypatch):
     runner._agent_cache[key] = (agent, "sig")
     runner._drop_turn_slot(key)
     assert released_agents == [agent], "the /stop path releases the still-running turn's agent"
+
+
+@pytest.mark.parametrize("path", ["immediate", "deferred"])
+def test_turn_admitted_during_shutdown_waits_for_it(path):
+    """Prism cbdcad969e21 / d6e160ee056a: shutdown and turn admission are atomic. A turn that
+    enters while the engine is being torn down must not start until the teardown is finished."""
+    from agent.context_engine_owners import enter_turn, exit_turn, shutdown_or_defer
+
+    class _A:
+        pass
+
+    agent = _A()
+    in_shutdown, let_finish = threading.Event(), threading.Event()
+    log: list[str] = []
+
+    def shutdown():
+        in_shutdown.set()
+        assert let_finish.wait(10)
+        log.append("shutdown-done")
+
+    if path == "immediate":
+        teardown = threading.Thread(target=shutdown_or_defer, args=(agent, shutdown))
+    else:
+        enter_turn(agent)
+        assert shutdown_or_defer(agent, shutdown) is False  # deferred to the turn's exit
+        teardown = threading.Thread(target=exit_turn, args=(agent, shutdown))
+    teardown.start()
+    assert in_shutdown.wait(10)
+
+    def second_turn():
+        enter_turn(agent)
+        log.append("turn-admitted")
+        exit_turn(agent, shutdown)
+
+    turn = threading.Thread(target=second_turn)
+    turn.start()
+    turn.join(0.3)
+    assert turn.is_alive(), "a turn was admitted while the engine was being shut down"
+    let_finish.set()
+    teardown.join(10)
+    turn.join(10)
+    assert log == ["shutdown-done", "turn-admitted"]
