@@ -9,6 +9,7 @@ row identity (`store_id`) for DAG/source lookup.
 """
 
 
+import functools
 import json
 import logging
 import math
@@ -59,6 +60,31 @@ from .storage_security import RowCipher, ensure_lcm_file_permissions
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
+
+
+class StoreClosed(sqlite3.Error):
+    """The store's connection was closed; the call never touched SQLite.
+
+    Subclasses ``sqlite3.Error`` so existing fail-open ``except sqlite3.Error`` callers keep working.
+    """
+
+
+def _open_conn(method):
+    """Run ``method`` under ``_write_lock`` against a live connection, else raise ``StoreClosed``.
+
+    ``close()`` takes the same lock, so it can never run while another thread is inside an
+    ``execute`` on the shared ``check_same_thread=False`` connection: closing a connection mid-
+    execute is a use-after-free in ``_sqlite3`` (gateway SIGSEGV 2026-11-02 06:50, t_055f9d8d).
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._write_lock:
+            if self._conn is None:
+                raise StoreClosed(f"LCM message store {self.db_path} is closed")
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _coerce_ts(value: Any) -> float:
@@ -621,6 +647,7 @@ class MessageStore:
 
     # -- Write operations ---------------------------------------------------
 
+    @_open_conn
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",
                conversation_id: str = "") -> int:
@@ -689,6 +716,7 @@ class MessageStore:
             conversation_id=conversation_id,
         )
 
+    @_open_conn
     def _append_protected_batch(self, session_id: str,
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
@@ -759,6 +787,7 @@ class MessageStore:
         ensure_lcm_file_permissions(self.db_path)
         return ids
 
+    @_open_conn
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
@@ -771,6 +800,7 @@ class MessageStore:
             self._conn.commit()
             return cur.rowcount if cur.rowcount is not None else 0
 
+    @_open_conn
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         with self._write_lock:
@@ -782,6 +812,7 @@ class MessageStore:
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted
 
+    @_open_conn
     def gc_externalized_tool_result(
         self,
         store_id: int,
@@ -834,6 +865,7 @@ class MessageStore:
             ensure_lcm_file_permissions(self.db_path)
             return True
 
+    @_open_conn
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
@@ -843,6 +875,7 @@ class MessageStore:
             )
             self._conn.commit()
 
+    @_open_conn
     def unpin(self, store_id: int) -> None:
         with self._write_lock:
             self._conn.execute(
@@ -852,6 +885,7 @@ class MessageStore:
 
     # -- Read operations ----------------------------------------------------
 
+    @_open_conn
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
         row = self._conn.execute(
@@ -859,6 +893,7 @@ class MessageStore:
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
+    @_open_conn
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.
 
@@ -873,6 +908,7 @@ class MessageStore:
         ).fetchall()
         return {row[0]: self._row_to_dict(row) for row in rows}
 
+    @_open_conn
     def scan_evidence_rows(self, *, limit: int = 4096) -> Dict[str, Any]:
         """Return one bounded, read-only whole-corpus evidence snapshot.
 
@@ -922,6 +958,7 @@ class MessageStore:
             "observed_at_missing_rows": observed_at_missing_rows,
         }
 
+    @_open_conn
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
                   limit: int = 1000,
@@ -967,6 +1004,7 @@ class MessageStore:
             args.append(time_to)
         return where, args
 
+    @_open_conn
     def count_session_load_messages(
         self,
         session_id: str,
@@ -989,6 +1027,7 @@ class MessageStore:
             ).fetchone()[0]
         )
 
+    @_open_conn
     def load_session_page(
         self,
         session_id: str,
@@ -1020,6 +1059,7 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    @_open_conn
     def load_session_window(
         self,
         session_id: str,
@@ -1048,6 +1088,7 @@ class MessageStore:
         rows = list(reversed(prior)) + list(following)
         return [self._row_to_dict(row) for row in rows]
 
+    @_open_conn
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
@@ -1059,6 +1100,7 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    @_open_conn
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
                                    limit: int = 10000) -> List[Dict[str, Any]]:
@@ -1071,6 +1113,7 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    @_open_conn
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
@@ -1089,6 +1132,7 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    @_open_conn
     def get_session_count(self, session_id: str) -> int:
         """Count visible (non-superseded) messages in a session."""
         row = self._conn.execute(
@@ -1097,6 +1141,7 @@ class MessageStore:
         ).fetchone()
         return row[0] if row else 0
 
+    @_open_conn
     def get_session_token_total(self, session_id: str) -> int:
         """Sum of token estimates for a session's visible messages."""
         row = self._conn.execute(
@@ -1105,6 +1150,7 @@ class MessageStore:
         ).fetchone()
         return row[0] if row else 0
 
+    @_open_conn
     def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
         """Return raw source-bucket counts for diagnostics."""
         where = ""
@@ -1137,6 +1183,7 @@ class MessageStore:
             "effective_unknown_messages": normalized_unknown + legacy_blank,
         }
 
+    @_open_conn
     def scan_session_cleanup_stats(self) -> List[tuple]:
         """Per-session ``(session_id, message_count, token_total, node_count)``
         rows across messages and summary nodes, for ``/lcm doctor clean``
@@ -1171,6 +1218,7 @@ class MessageStore:
             """
         ).fetchall()
 
+    @_open_conn
     def scan_session_retention_stats(self, session_id: str) -> List[tuple]:
         """Per-session activity/token stats for one session (messages + summary
         nodes), for ``/lcm doctor retention`` scanning. Callers own the
@@ -1218,6 +1266,7 @@ class MessageStore:
             (session_id,),
         ).fetchall()
 
+    @_open_conn
     def get_source_normalization_plan(self) -> Dict[str, Any]:
         """Return a dry-run plan for normalizing legacy blank source values."""
         stats_before = self.get_source_stats()
@@ -1239,6 +1288,7 @@ class MessageStore:
             "stats_before": stats_before,
         }
 
+    @_open_conn
     def normalize_legacy_blank_sources(self) -> Dict[str, Any]:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
@@ -1257,6 +1307,7 @@ class MessageStore:
             "stats_after": stats_after,
         }
 
+    @_open_conn
     def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
         if not store_ids:
             return None, None
@@ -1278,16 +1329,16 @@ class MessageStore:
         stored value is empty. JSON decoding is deliberately *not* wrapped: a
         malformed value raises, so callers keep the ``try``/``except`` scoping
         that decides whether one bad key aborts a multi-key load or is skipped.
-        Reads are unlocked, matching the store's other read paths (``_write_lock``
-        guards writes only).
+        The read runs under ``_write_lock`` so ``close()`` cannot free the connection under it.
         """
-        conn = self._conn
-        if conn is None:
-            return None
-        row = conn.execute(
-            "SELECT value FROM metadata WHERE key = ?",
-            (key,),
-        ).fetchone()
+        with self._write_lock:
+            conn = self._conn
+            if conn is None:
+                return None
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
         if not row or not row[0]:
             return None
         return json.loads(str(row[0]))
@@ -1308,11 +1359,11 @@ class MessageStore:
         -- the ingest-hot-path optimization used by the placeholder count/ordinal
         writers. Returns ``True`` if any key was written.
         """
-        conn = self._conn
-        if conn is None:
-            return False
         wrote = False
         with self._write_lock:
+            conn = self._conn
+            if conn is None:
+                return False
             for key in keys:
                 if skip_unchanged:
                     existing = conn.execute(
@@ -1370,6 +1421,7 @@ class MessageStore:
 
     # -- Search -------------------------------------------------------------
 
+    @_open_conn
     def _message_fts_flagged(self) -> bool:
         """True while a background scan's integrity-failed flag is set for
         ``messages_fts``. Read-only; no metadata table means no flag."""
@@ -1384,6 +1436,7 @@ class MessageStore:
             return False
         return bool(row and row[0])
 
+    @_open_conn
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
                source: str | None = None,
@@ -1528,6 +1581,7 @@ class MessageStore:
                 return results[:limit]
             fetch_limit = min(fetch_limit * 2, remaining)
 
+    @_open_conn
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
                      source: str | None = None,
@@ -1832,9 +1886,12 @@ class MessageStore:
         queries the store does not wrap in a purpose-built method. Callers must
         treat it as read-only and tolerate ``None``; writes still go through the
         store's own methods so the ``_write_lock`` contract stays in one place.
+        A raw handle is outside the close() exclusion: only diagnostics on an
+        engine that is not being shut down may use it.
         """
         return self._conn
 
+    @_open_conn
     def commit(self) -> None:
         """Commit pending writes on the store connection.
 
@@ -1844,6 +1901,7 @@ class MessageStore:
         """
         self._conn.commit()
 
+    @_open_conn
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
 
@@ -1856,8 +1914,17 @@ class MessageStore:
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
+        lock = getattr(self, "_write_lock", None)
+        if lock is None:  # __init__ failed before the lock existed: nothing was opened
+            return
+        # Same lock as every method that touches the connection: close waits for an in-flight
+        # execute instead of freeing the connection under it (t_055f9d8d).
+        with lock:
+            conn = getattr(self, "_conn", None)
+            if conn is None:
+                return
+            # Unpublish first so nothing re-enters the connection while it is being torn down.
+            self._conn = None
             # Graceful shutdown hygiene: checkpoint committed WAL frames before
             # releasing the connection.  This does not run on crash/kill, and
             # PASSIVE can leave frames behind when another reader is active.
@@ -1866,7 +1933,6 @@ class MessageStore:
             except sqlite3.Error:
                 pass  # best-effort only; don't let this mask the real close()
             conn.close()
-            self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
