@@ -428,6 +428,9 @@ def _fmt_review_requested(ev, n) -> tuple:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
         wake_handoff = _first_line(summary, 200)
+    note = _payload(ev, "draft_note")   # t_5c6c67c5: negative-result PR left as-is; flip command on accept
+    if note:
+        handoff += f"\n{str(note)[:300]}"
     return t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 

@@ -40,3 +40,20 @@ def negative_result_match(summary: Optional[str], metadata: Any = None) -> Optio
             meta_text = str(metadata)
     m = NEG_RESULT_RE.search((summary or "") + "\n" + meta_text)
     return m.group(0) if m else None
+
+
+def draft_note(summary: Optional[str], metadata: Any = None) -> Optional[str]:
+    """Reviewer line for a negative-result handback's own fleet PRs, or None (t_5c6c67c5).
+
+    A NOT-met handback leaves its PR exactly as it is: a worker draft stays draft, which keeps
+    self-declared-unfinished work out of every lander until the human lane decides. The line
+    says so and names the flip for when the reviewer accepts. No network read: parsed refs only.
+    """
+    from hermes_cli.kanban_open_pr import extract_pr_refs, split_fleet
+
+    meta = metadata if isinstance(metadata, dict) else None
+    refs = split_fleet(extract_pr_refs(metadata=meta))[0] or split_fleet(extract_pr_refs(summary))[0]
+    if not refs:
+        return None
+    cmds = "; ".join(f"ace_gate.py ready {r.repo} {r.number}" for r in refs)
+    return f"negative result: PR left as-is (a worker draft stays draft); on accept flip it: {cmds}"
