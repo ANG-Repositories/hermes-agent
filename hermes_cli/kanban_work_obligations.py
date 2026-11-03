@@ -43,7 +43,11 @@ EVENT_KINDS = (
 # OBSERVED outcome. ``handed:`` and ``dropped:`` are decisions, so they need operator authority.
 OBSERVED_RESOLUTIONS = ("requeued-green", "superseded", "merged", "card-closed")
 OPERATOR_RESOLUTIONS = ("handed", "dropped")
-WORKER_ENV_MARKERS = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_LINEAGE")
+# Presence of any marker only REFUSES operator authority (worker_refusal); it never grants a card.
+WORKER_ENV_MARKERS = (
+    "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_LINEAGE",  # lineage-reader: ok — fail-closed refusal marker, not ownership
+)
 
 # Exit codes (docs/kanban-obligations.md).
 RC_OK, RC_ERROR, RC_REFUSED, RC_CONFLICT = 0, 1, 2, 3

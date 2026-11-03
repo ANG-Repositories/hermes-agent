@@ -47,7 +47,7 @@ def test_tilde_pin_subscribes_into_the_expanded_db_not_under_cwd(tmp_path, monke
     cwd.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — exercises the unsandboxed ~/x.db path resolution under a tmp HERMES_HOME (no live root)
     for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HERMES_KANBAN_DB", "~/x.db")
