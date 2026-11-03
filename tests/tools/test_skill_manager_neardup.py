@@ -513,3 +513,27 @@ def test_create_preview_never_writes_outside_its_overlay(tmp_path):
     assert not escape.exists(), "preview wrote outside its temp overlay"
     assert not (tmp_path / "up").exists()
     assert out.startswith("---")
+
+
+_OLD_SCORER = STUB_SCORER.replace(
+    "def check(name, content, roots=None, threshold=None, corpus=None):",
+    "def check(name, content, roots=None, threshold=None):").replace(
+    "(corpus or Corpus.load(roots))", "Corpus.load(roots)")
+
+
+@pytest.mark.parametrize("batch_delete", [None, "garage-door-lockout"])
+def test_scorer_without_corpus_kwarg_still_gates(tmp_path, batch_delete):
+    """370d9676504e: the root's scorer may predate check(corpus=). Passing corpus= to it raised TypeError, which the
+    fail-open boundary turned into NO gate: every near-duplicate create went through. Plain and batch-with-delete."""
+    assert "corpus" not in _OLD_SCORER.split("def check(")[1].split(")")[0]
+    with _fleet_home(tmp_path) as (home, shared):
+        (home / "scripts" / "lib" / "skill_similarity.py").write_text(_OLD_SCORER)
+        if batch_delete:
+            ops = [{"action": "delete", "name": batch_delete},
+                   {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general"}]
+            res = json.loads(skill_manage(action="", name="", operations=ops))
+        else:
+            res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is False, res
+        assert "postgres-vacuum-tuning" in json.dumps(res)
+        assert not (shared / "general" / "pg-autovacuum").exists()
