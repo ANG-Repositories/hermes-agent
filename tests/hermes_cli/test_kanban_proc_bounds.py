@@ -44,6 +44,54 @@ def _track(*pids: int) -> None:
             _STARTED.append((pid, born))
 
 
+#: load1 / online threads above which the timing drills cannot prove anything.
+#: ci-box at load1 > ~250 on 256 threads red-flaked them in 37/243 receipts
+#: (t_fc88c6ff). The drills SKIP as a named prerequisite, never pass green, and
+#: the caps and timeouts they test stay as they are.
+_SATURATED_LOAD_RATIO = 0.9
+
+#: The REAL os.getloadavg, bound at import (collection). conftest's autouse
+#: _quiet_host_loadavg pins os.getloadavg to 0.0 inside every test, which
+#: would make this guard inert.
+_host_loadavg = getattr(os, "getloadavg", None)
+
+
+def _skip_if_host_saturated() -> None:
+    if _host_loadavg is None:
+        return  # no load average on this platform: run the drill
+    try:
+        load1 = _host_loadavg()[0]
+    except OSError:
+        return
+    threads = os.cpu_count() or 1
+    ratio = load1 / threads
+    if ratio > _SATURATED_LOAD_RATIO:
+        pytest.skip(
+            f"PREREQ: host saturated load1/threads={load1:.1f}/{threads}"
+            f"={ratio:.2f} > {_SATURATED_LOAD_RATIO}"
+        )
+
+
+def test_guard_reads_the_real_load_not_the_conftest_pin():
+    # conftest pins os.getloadavg to 0.0; the guard must not read that one.
+    assert os.getloadavg() == (0.0, 0.0, 0.0)
+    assert _host_loadavg is not os.getloadavg
+
+
+def test_saturated_host_skips_the_drill(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_host_loadavg", lambda: (250.0, 240.0, 230.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 256)
+    with pytest.raises(pytest.skip.Exception, match=r"^PREREQ: host saturated"):
+        _skip_if_host_saturated()
+
+
+@pytest.mark.parametrize("load1", [10.0, 230.0])  # 230/256 = 0.898: at the edge, still runs
+def test_unsaturated_host_runs_the_drill(monkeypatch, load1):
+    monkeypatch.setattr(sys.modules[__name__], "_host_loadavg", lambda: (load1, 0.0, 0.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 256)
+    _skip_if_host_saturated()  # does not raise
+
+
 def _gone(pid: int, timeout: float = 15.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -216,6 +264,7 @@ def _run_bomb(preexec) -> tuple[int, str]:
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
                     reason="root bypasses RLIMIT_NPROC")
 def test_drill_fork_bomb_stops_at_the_cap():
+    _skip_if_host_saturated()
     # Control arm (the mutant: no preexec): the same bomb gets every fork.
     kids, err = _run_bomb(None)
     assert (kids, err) == (_ATTEMPTS, "-"), "control bomb was limited; drill proves nothing"
@@ -428,6 +477,7 @@ def _chrome_procs(profile: str, exclude: int | None = None) -> list[int]:
 
 @pytest.mark.skipif(not POSIX, reason="POSIX sessions only")
 def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
+    _skip_if_host_saturated()
     chrome = _headless_chrome()
     if chrome is None:
         pytest.skip("no headless Chrome on this host")
