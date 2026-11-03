@@ -1586,7 +1586,11 @@ def _handle_create(args: dict, **kw) -> str:
                        conn, new_tid,
                        # boomerang wake is a wake level: it always subscribes as a waker.
                        wake=(True if boomerang
-                             else args.get("wake") if isinstance(args.get("wake"), bool) else None)),
+                             else args.get("wake") if isinstance(args.get("wake"), bool) else None),
+                       # t_ea40ff83: an explicit foreign home subscribes the home, not this chat.
+                       explicit_home=((session_id, _current_session_id()
+                                       or get_session_env("HERMES_SESSION_ID", "") or None)
+                                      if args.get("session_id") and session_id else None)),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
@@ -1679,7 +1683,8 @@ def _auto_wake(wake: Optional[bool]) -> bool:
         return True
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = None) -> bool:
+def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = None,
+                          explicit_home: Optional[tuple[str, Optional[str]]] = None) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
@@ -1692,7 +1697,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = Non
                 return False
         except Exception:
             pass  # unreadable config keeps the user-friendly default (True)
-    return subscribe_calling_session(conn, task_id, wake=wake)
+    return subscribe_calling_session(conn, task_id, wake=wake, explicit_home=explicit_home)
 
 
 def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],

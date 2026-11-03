@@ -93,3 +93,28 @@ def test_foreign_home_in_another_thread_never_reaches_caller(kanban_home, monkey
 def test_unknown_home_session_subscribes_nobody(kanban_home):
     tid = _create("20260101_000000_gone")
     assert _chats(tid) == []
+
+
+def test_tool_create_with_foreign_session_id_subscribes_home(kanban_home, monkeypatch):
+    """Same rule on the agent-tool path (kanban_create with an explicit session_id)."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: False)
+    monkeypatch.setattr(kt, "_persisted_session_id", lambda v: v or None)
+    created = json.loads(kt._handle_create(
+        {"board": "default", "title": "tool card", "assignee": "peer", "session_id": HOME_SID}))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, created["task_id"]).session_id == HOME_SID
+    assert created["ok"], created
+    assert _chats(created["task_id"]) == ["chat-home"]
+
+
+def test_tool_create_without_session_id_subscribes_caller(kanban_home, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: False)
+    monkeypatch.setattr(kt, "_persisted_session_id", lambda v: v or None)
+    created = json.loads(kt._handle_create(
+        {"board": "default", "title": "tool card 2", "assignee": "peer"}))
+    assert created["ok"], created
+    assert _chats(created["task_id"]) == ["chat-caller"]
