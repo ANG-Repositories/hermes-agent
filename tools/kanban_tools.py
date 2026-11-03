@@ -1695,6 +1695,63 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = Non
     return subscribe_calling_session(conn, task_id, wake=wake)
 
 
+def _home_target(conn: Any, task_id: str, target: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The sub to write for a card whose HOME may not be the calling chat (t_ea40ff83).
+
+    A cron job run from one chat (a detached-run queued in #github-alternatives) can
+    mint a card with ``--session <another chat's session>``. Subscribing the CALLING
+    chat then delivers every handoff of a foreign card to a session that must not act
+    on it, while the home hears nothing. Rule: a card homed to a session that is not
+    the caller's subscribes its home's origin chat (same delivery mode), never the
+    caller's. An unhomed card keeps the caller (nothing else names a home). A home
+    with no routable chat (operator pseudo-home, unknown session, CLI origin) or an
+    unreadable state.db subscribes nobody: the card's lifecycle/owner-wake fallback
+    owns it, and a misroute is worse than a #logs line."""
+    from hermes_cli import kanban_db as _kb
+    from gateway import kanban_home_route as _hr
+    from gateway.session_context import get_session_env
+
+    task = _kb.get_task(conn, task_id)
+    home_sid = str(getattr(task, "session_id", "") or "").strip()
+    if not home_sid:
+        return target
+    caller_sid = (get_session_env("HERMES_SESSION_ID", "") or "").strip()
+    if caller_sid and home_sid in _kb.home_ids(caller_sid):
+        return target
+    if _kb.is_operator_home(home_sid):
+        row = None
+    else:
+        try:
+            row = _hr.read_session_row(home_sid)
+        except _hr.SessionLookupError as exc:
+            logger.warning("kanban: %s home %s unreadable (%s); not subscribing caller chat %s",
+                           task_id, home_sid, exc, target["chat_id"])
+            return None
+    home = _hr.home_from_row(home_sid, row)
+    if home.target is None:
+        logger.info("kanban: %s homed to %s (%s); caller chat %s not subscribed",
+                    task_id, home_sid, home.reason, target["chat_id"])
+        return None
+    if _hr.same_chat(home.target, target["platform"], target["chat_id"], target["thread_id"]):
+        return target
+    try:
+        origin = json.loads((row or {}).get("origin_json") or "{}")
+    except (TypeError, ValueError):
+        origin = {}
+    origin = origin if isinstance(origin, dict) else {}
+    logger.info("kanban: %s homed to %s; subscribing home chat %s instead of caller chat %s",
+                task_id, home_sid, home.target.chat_id, target["chat_id"])
+    return dict(
+        platform=home.target.platform, chat_id=home.target.chat_id,
+        thread_id=home.target.thread_id or None,
+        chat_type=origin.get("chat_type") or None,
+        user_id=origin.get("user_id") or None,
+        scope_id=origin.get("scope_id") or None,
+        notifier_profile=origin.get("profile") or target.get("notifier_profile"),
+        delivery_mode=target.get("delivery_mode"),
+    )
+
+
 def subscribe_calling_session(
     conn: Any, task_id: str, *, require_platform_identity: bool = False,
     wake: Optional[bool] = None, takeover: bool = False,
@@ -1703,13 +1760,17 @@ def subscribe_calling_session(
     Shared by the agent-tool auto-subscribe path (:func:`_maybe_auto_subscribe`) and
     the CLI create path (``hermes kanban create``, gated by ``kanban.cli_auto_subscribe``
     in ``hermes_cli.kanban._cmd_create``). See ``_resolve_notify_target`` for the
-    identity rules. Any exception is logged at WARNING and swallowed (False)."""
+    identity rules; a card homed elsewhere subscribes its home (:func:`_home_target`).
+    Any exception is logged at WARNING and swallowed (False)."""
     target = None
     try:
         target = _resolve_notify_target(
             require_platform_identity=require_platform_identity, wake=wake)
         if target is None:
             return False  # CLI / cron / test — no persistent channel
+        target = _home_target(conn, task_id, target)
+        if target is None:
+            return False
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake; an
