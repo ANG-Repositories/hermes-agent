@@ -39,6 +39,7 @@ def _stash_texts(w: G.World, rel: str) -> list[str]:
     return out
 
 
+@pytest.mark.slow_test(600, reason="PROVISIONAL t_b92e2833: call time being measured on ci-priv")
 def test_non_conflicting_edits_and_untracked_files_are_restored(w):
     w.reset_clean()
     readme = w.checkout / "README.md"
@@ -56,6 +57,7 @@ def test_non_conflicting_edits_and_untracked_files_are_restored(w):
     assert not w.git("stash", "list"), f"restored changes still parked in a stash:\n{w.diag(cp)}"
 
 
+@pytest.mark.slow_test(600, reason="PROVISIONAL t_b92e2833: call time being measured on ci-priv")
 def test_conflicting_patch_is_recoverable_and_never_reported_complete(w):
     w.reset_clean()
     readme = w.checkout / "README.md"

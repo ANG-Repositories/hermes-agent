@@ -636,6 +636,7 @@ def clean_leg(tmp_path_factory, template_home):
     return lg, _update(lg)
 
 
+@pytest.mark.slow_test(600, reason="PROVISIONAL t_b92e2833: call time being measured on ci-priv")
 def test_clean_update(clean_leg, provider):
     leg, final = clean_leg
     assert_healthy_at_head(leg, provider, final)

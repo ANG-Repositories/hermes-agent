@@ -105,6 +105,7 @@ def _kill_update_at(sb: I.Sandbox, phase: str) -> dict:
             "pending_at_kill": P.pending_marker(sb).exists(), "log": log.read_text(errors="replace")}
 
 
+@pytest.mark.slow_test(600, reason="PROVISIONAL t_b92e2833: call time being measured on ci-priv")
 @pytest.mark.parametrize("phase", ["stage", "publish"])
 def test_sigkill_mid_dependency_update_recovers(home, provider, phase):
     sb = home["sb"]

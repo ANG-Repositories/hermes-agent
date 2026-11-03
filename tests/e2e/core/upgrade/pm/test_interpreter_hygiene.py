@@ -168,6 +168,7 @@ def test_execute_code_after_update_imports_third_party_deps(updated, provider):
     assert not hits, f"execute_code loaded a stray venv: {hits}"
 
 
+@pytest.mark.slow_test(600, reason="PROVISIONAL t_b92e2833: call time being measured on ci-priv")
 def test_kanban_worker_spawned_after_update_boots(updated, provider):
     sb, mark = updated["sb"], _marks(updated["logs"])
     n = len(provider.main_requests())
