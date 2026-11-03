@@ -1624,7 +1624,32 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
         if require_platform_identity or not session_key:
             return None
         platform, chat_id = "tui", session_key
-    chat_type = env("HERMES_SESSION_CHAT_TYPE", "") or None
+    return resolve_notify_target_for_source({
+        "platform": platform, "chat_id": chat_id,
+        "chat_type": env("HERMES_SESSION_CHAT_TYPE", ""),
+        "thread_id": env("HERMES_SESSION_THREAD_ID", ""),
+        "user_id": env("HERMES_SESSION_USER_ID", ""),
+        "user_id_alt": env("HERMES_SESSION_USER_ID_ALT", ""),
+        "scope_id": env("HERMES_SESSION_SCOPE_ID", ""),
+        "parent_chat_id": env("HERMES_SESSION_PARENT_CHAT_ID", ""),
+        "message_id": env("HERMES_SESSION_MESSAGE_ID", ""),
+        "profile": env("HERMES_SESSION_PROFILE", ""),
+    }, wake=wake)
+
+
+def resolve_notify_target_for_source(source: dict[str, Any], *,
+                                     wake: Optional[bool] = None) -> dict[str, Any]:
+    """``add_notify_sub`` kwargs for a session identified by its ``SessionSource`` dict
+    (``SessionSource.to_dict()`` shape: the persisted ``sessions.origin_json``, or the
+    calling turn's bound vars). The ONE resolver: the calling session and a foreign home
+    (t_ea40ff83, operator ruling 14:0x) both go through it, so a home's sub is exactly
+    what the home session itself would write. Pure apart from config/profile reads."""
+    def _s(key: str) -> str:
+        value = source.get(key)
+        return "" if value is None else str(value)
+
+    platform, chat_id = _s("platform"), _s("chat_id")
+    chat_type = _s("chat_type") or None
     if chat_type:
         # Canonicalize on WRITE, not only on read: a Discord guild chat is keyed
         # 'group' by build_session_key; persisting the raw envelope spelling
@@ -1637,17 +1662,17 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
             chat_type = canonical_chat_type(platform, chat_type)
         except Exception:  # never block a subscription
             pass
-    thread_id = env("HERMES_SESSION_THREAD_ID", "") or None
-    message_id = env("HERMES_SESSION_MESSAGE_ID", "") or ""
-    notifier_profile = env("HERMES_SESSION_PROFILE", "")
+    thread_id = _s("thread_id") or None
+    message_id = _s("message_id")
+    notifier_profile = _s("profile")
     if not notifier_profile:
         from hermes_cli.profiles import current_profile_name
         notifier_profile = current_profile_name("default")
     delivery_metadata: dict[str, Any] = {
         k: v for k, v in (
             ("thread_id", thread_id), ("chat_type", chat_type),
-            ("scope_id", env("HERMES_SESSION_SCOPE_ID", "")),
-            ("parent_chat_id", env("HERMES_SESSION_PARENT_CHAT_ID", "")),
+            ("scope_id", _s("scope_id") or _s("guild_id")),
+            ("parent_chat_id", _s("parent_chat_id")),
         ) if v}
     if (platform.lower() == "telegram" and thread_id
             and (chat_type or "").lower() in {"dm", "direct", "private"}):
@@ -1658,8 +1683,8 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
             delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
     return dict(
         platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=thread_id,
-        user_id=env("HERMES_SESSION_USER_ID", "") or None,
-        user_id_alt=env("HERMES_SESSION_USER_ID_ALT", "") or None,
+        user_id=_s("user_id") or None,
+        user_id_alt=_s("user_id_alt") or None,
         notifier_profile=notifier_profile,
         # None -> add_notify_sub's platform default: 'notify' everywhere except
         # api_server, whose only delivery mechanism is the wake self-post.
@@ -1704,17 +1729,19 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = Non
 
 
 def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
-                 target: dict[str, Any]) -> Optional[dict[str, Any]]:
+                 target: dict[str, Any], *, wake: Optional[bool] = None) -> Optional[dict[str, Any]]:
     """The sub to write when a create names an explicit home (t_ea40ff83).
 
     A cron job run from one chat (a detached-run queued in #github-alternatives)
     minted main-red cards with ``--session <the SLA lane's #apollo session>``, and
     the create subscribed the CALLING chat: every handoff of those foreign cards
     reached a session that must not act on them, and the home heard nothing.
-    Rule: a home outside the caller's lineage subscribes the home's origin chat
-    (same delivery mode), never the caller's. An operator pseudo-home keeps the
-    caller (any operator session may act on it). A real home with no routable chat
-    (unknown session, CLI origin) or an unreadable state.db subscribes nobody: the
+    Rule: a home outside the caller's lineage subscribes what the HOME session itself
+    would subscribe: :func:`resolve_notify_target_for_source` over its persisted
+    origin, with the requested ``wake``. Nothing is copied from the caller's target
+    (operator ruling 14:0x; Prism 227e930fa156, ef5ec124c1bf). An operator pseudo-home
+    keeps the caller (any operator session may act on it). A real home with no routable
+    chat (unknown session, CLI origin) or an unreadable state.db subscribes nobody: the
     lifecycle/owner-wake fallback owns it, and a misroute is worse than #logs."""
     from hermes_cli import kanban_db as _kb
     from gateway import kanban_home_route as _hr
@@ -1734,36 +1761,11 @@ def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
         logger.info("kanban: %s homed to %s (%s); caller chat %s not subscribed",
                     task_id, home_sid, home.reason, target["chat_id"])
         return None
-    # Operator ruling 13:4x (Prism b594b6ccfed9, 99063f040047): the target is the home
-    # session's FULL stored routing record. No "same chat" shortcut: two per-user group
-    # sessions share a chat and differ only in participant, so the caller's target is
-    # never reused for a foreign home.
-    try:
-        origin = json.loads((row or {}).get("origin_json") or "{}")
-    except (TypeError, ValueError):
-        origin = {}
-    origin = origin if isinstance(origin, dict) else {}
-    chat_type = origin.get("chat_type") or None
-    thread_id = home.target.thread_id or None
-    scope_id = origin.get("scope_id") or origin.get("guild_id") or None
-    delivery_metadata = {k: v for k, v in (
-        ("thread_id", thread_id), ("chat_type", chat_type), ("scope_id", scope_id),
-        ("parent_chat_id", origin.get("parent_chat_id")),
-    ) if v}
-    if isinstance(origin.get("delivery_metadata"), dict):
-        delivery_metadata.update(origin["delivery_metadata"])
+    # home_from_row already proved origin_json parses to a routable dict.
+    origin = json.loads(row["origin_json"])
     logger.info("kanban: %s homed to %s; subscribing home %s (caller chat %s)",
                 task_id, home_sid, home.target.chat_id, target["chat_id"])
-    return dict(
-        platform=home.target.platform, chat_id=home.target.chat_id,
-        thread_id=thread_id, chat_type=chat_type,
-        user_id=origin.get("user_id") or None,
-        user_id_alt=origin.get("user_id_alt") or None,
-        scope_id=scope_id,
-        notifier_profile=origin.get("profile") or target.get("notifier_profile"),
-        delivery_mode=target.get("delivery_mode"),
-        delivery_metadata=delivery_metadata or None,
-    )
+    return resolve_notify_target_for_source(origin, wake=wake)
 
 
 def subscribe_calling_session(
@@ -1785,7 +1787,8 @@ def subscribe_calling_session(
         if target is None:
             return False  # CLI / cron / test — no persistent channel
         if explicit_home is not None:
-            target = _home_target(task_id, explicit_home[0], explicit_home[1], target)
+            target = _home_target(task_id, explicit_home[0], explicit_home[1], target,
+                                  wake=wake)
         if target is None:
             return False
         from hermes_cli import kanban_db_notify as _kbn

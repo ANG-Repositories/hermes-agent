@@ -178,3 +178,68 @@ def test_tool_idempotency_hit_subscribes_persisted_home(kanban_home, monkeypatch
                                           "idempotency_key": "K1"}))
     assert again["task_id"] == first["task_id"]
     assert "chat-other" not in _chats(first["task_id"])
+
+
+def _meta(sub: dict) -> dict:
+    meta = sub["delivery_metadata"]
+    return (json.loads(meta) if isinstance(meta, str) else meta) or {}
+
+
+def test_tui_caller_discord_home_wake_true_registers_waker(kanban_home, monkeypatch):
+    """Prism 227e930fa156 repro: the wake mode is resolved for the HOME's platform, not
+    copied from the TUI caller (whose own target suppresses the wake)."""
+    from tools import kanban_tools as kt
+
+    for var in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID",
+                "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_USER_ID"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-key")
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: False)
+    monkeypatch.setattr(kt, "_persisted_session_id", lambda v: v or None)
+    created = json.loads(kt._handle_create({
+        "board": "default", "title": "foreign home callback", "assignee": "peer",
+        "session_id": HOME_SID, "wake": True, "boomerang_wake": False}))
+    assert created["ok"], created
+    (sub,) = _subs(created["task_id"])
+    assert (sub["platform"], sub["chat_id"]) == ("discord", "chat-home")
+    assert sub["delivery_mode"] in kbn.NOTIFY_WAKE_MODES
+
+
+def test_telegram_dm_topic_home_keeps_private_topic_flags(kanban_home):
+    """Prism ef5ec124c1bf repro: the home's private-topic flags and reply anchor are
+    derived from its stored origin (``message_id``), as the home itself would."""
+    _add_session("20261103_000000_tg", {
+        "platform": "telegram", "chat_id": "123", "chat_type": "dm",
+        "thread_id": "20197", "message_id": "462"})
+    tid = _create("20261103_000000_tg")
+    (sub,) = _subs(tid)
+    assert (sub["platform"], sub["chat_id"], sub["thread_id"]) == ("telegram", "123", "20197")
+    meta = _meta(sub)
+    assert meta["telegram_dm_topic_reply_fallback"] is True
+    assert meta["direct_messages_topic_id"] == "20197"
+    assert meta["telegram_reply_to_message_id"] == "462"
+
+
+@pytest.mark.parametrize("wake", [None, True, False])
+def test_redirect_target_equals_what_the_home_itself_subscribes(kanban_home, monkeypatch, wake):
+    """The redirect and the home's own create go through ONE resolver: a create from the
+    home session with the same wake flag yields the identical sub kwargs."""
+    from gateway.session import SessionSource
+    from tools import kanban_tools as kt
+
+    origin = {"platform": "telegram", "chat_id": "123", "chat_type": "dm",
+              "thread_id": "20197", "message_id": "462", "user_id": "u9",
+              "user_id_alt": "alt9", "scope_id": "s9", "parent_chat_id": "p9", "profile": "apollo"}
+    _add_session("20261103_000000_eq", origin)
+    redirected = kt._home_target("t_x", "20261103_000000_eq", CALLER_SID,
+                                 {"chat_id": "chat-caller", "delivery_mode": None}, wake=wake)
+
+    src = SessionSource.from_dict(origin)
+    for name, value in (("PLATFORM", src.platform.value), ("CHAT_ID", src.chat_id),
+                        ("CHAT_TYPE", src.chat_type), ("THREAD_ID", src.thread_id),
+                        ("USER_ID", src.user_id), ("USER_ID_ALT", src.user_id_alt),
+                        ("SCOPE_ID", src.scope_id), ("PARENT_CHAT_ID", src.parent_chat_id),
+                        ("MESSAGE_ID", src.message_id), ("PROFILE", src.profile)):
+        monkeypatch.setenv(f"HERMES_SESSION_{name}", value)
+    as_home = kt._resolve_notify_target(require_platform_identity=True, wake=wake)
+    assert redirected == as_home
