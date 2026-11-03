@@ -18,9 +18,9 @@ name: Label rerun
 # The live review-comment poller (ci-review-comment.yml) was retired on
 # 2026-09-25 (CI efficiency spec L10); it had been disabled since before then.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request); dispatch-only until re-enabled on a card.
 on:
-  pull_request:
-    types: [labeled]
+  workflow_dispatch:
 
 permissions:
   actions: write

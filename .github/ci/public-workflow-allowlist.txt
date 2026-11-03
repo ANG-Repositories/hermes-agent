@@ -1,0 +1,18 @@
+# Public-mirror workflow allowlist for ANG-Repositories/hermes-agent (card t_868e850a).
+# Ruling: Apollo 2026-11-02 14:30 on t_a4fdb8ba (ruling:t_a4fdb8ba-archive-perm-loadguard-set-gbrain-home).
+#
+# Only these workflows may start runs on their own (push / pull_request / schedule / merge_group / ...).
+# Every other file under .github/workflows/ must be triggered by workflow_dispatch and/or workflow_call only;
+# scripts/lints/public-workflow-allowlist-lint.py fails CI otherwise. Re-enabling a workflow = add its path
+# here AND restore its triggers in the same reviewed PR, with the reason on a card.
+.github/workflows/ci.yaml
+.github/workflows/lint.yml
+.github/workflows/js-tests.yml
+.github/workflows/override-lint.yml
+.github/workflows/docs-site-checks.yml
+.github/workflows/case-collision-check.yml
+.github/workflows/contributor-check.yml
+.github/workflows/history-check.yml
+.github/workflows/fleet-secret-scan.yml
+.github/workflows/fleet-sast.yml
+.github/workflows/cancel-superseded-pr-ci.yml

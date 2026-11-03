@@ -2,19 +2,8 @@ name: Windows bundle SDK
 # The desktop signing adapter downloads and executes the pinned Windows SDK
 # tools. The vitest halves under js-tests run on Linux and skip every
 # runIf(win32) leg, so this is the only lane that runs the real downloader.
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request); dispatch-only until re-enabled on a card.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'apps/desktop/scripts/windows-bundle-tools.mjs'
-      - 'apps/desktop/scripts/windows-bundle-tools.test.mjs'
-      - 'scripts/msix-shared.mjs'
-      - 'apps/desktop/scripts/msix-shared.test.mjs'
-      - 'apps/desktop/scripts/sign-msix.mjs'
-      - 'apps/desktop/scripts/sign-msix.test.mjs'
-      - 'apps/desktop/scripts/batch-sign-binaries.mjs'
-      - 'apps/desktop/scripts/batch-sign-binaries.test.mjs'
-      - '.github/workflows/windows-bundle-sdk.yml'
   workflow_dispatch:
 permissions:
   contents: read

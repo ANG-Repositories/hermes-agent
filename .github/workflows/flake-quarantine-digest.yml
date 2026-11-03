@@ -6,9 +6,8 @@
 # silently, a human assigns the card + owner (flake_ledger.py scan --apply --assign).
 name: Flake quarantine digest
 
+# t_868e850a: public mirror load guard -- self-triggers removed (schedule); dispatch-only until re-enabled on a card.
 on:
-  schedule:
-    - cron: '17 16 * * 1' # Mondays 16:17 UTC
   workflow_dispatch:
 
 permissions:

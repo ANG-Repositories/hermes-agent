@@ -1,20 +1,7 @@
 name: Termux verification
 
+# t_868e850a: public mirror load guard -- self-triggers removed (push, pull_request); dispatch-only until re-enabled on a card.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'scripts/termux/**'
-      - 'pm/**'
-      - 'tests/scripts/test_termux*'
-      - '.github/workflows/termux-verify.yml'
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'scripts/termux/**'
-      - 'pm/**'
-      - 'tests/scripts/test_termux*'
-      - '.github/workflows/termux-verify.yml'
   workflow_dispatch:
   workflow_call:
     inputs:

@@ -38,17 +38,8 @@ name: auto-fix lint issues & formatting
 #      the PR is auto-closed and the branch deleted — the next run re-applies
 #      on the current state.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (push); dispatch-only until re-enabled on a card.
 on:
-  push:
-    branches: [main]
-    paths:
-      - '**/*.js'
-      - '**/*.cjs'
-      - '**/*.mjs'
-      - '**/*.ts'
-      - '**/*.tsx'
-      - 'package.json'
-      - 'package-lock.json'
   workflow_dispatch:
 
 permissions:

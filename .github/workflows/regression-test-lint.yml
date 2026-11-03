@@ -14,9 +14,9 @@ name: regression-test-lint
 # satisfies a code change anywhere), and GitHub drops a filtered workflow on a >3,000-file diff whose
 # matches sort late. It reads only the REST file list (no checkout) and finishes in seconds. Not a
 # required check (making it one is Apollo's call).
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request); dispatch-only until re-enabled on a card.
 on:
-  pull_request:  # no-paths-ok: reads the PR title/body/file list, not the tree; see path-filter-exempt above
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
 
 permissions:
   contents: read

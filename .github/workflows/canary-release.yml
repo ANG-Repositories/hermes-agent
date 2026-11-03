@@ -11,9 +11,8 @@ name: Canary Release
 # running canary has conclusion=cancelled if a newer one supersedes it; only
 # conclusion=failure is a canary failure signal.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (schedule); dispatch-only until re-enabled on a card.
 on:
-  schedule:
-    - cron: "41 6 * * *" # daily, 06:41 UTC
   workflow_dispatch:
 
 permissions:

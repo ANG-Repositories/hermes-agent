@@ -10,11 +10,9 @@ name: Plugin Catalog CI
 #                            at that exact commit must pass
 #                            `hermes plugins validate`.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request); dispatch-only until re-enabled on a card.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "plugin-catalog/**"
+  workflow_dispatch:
 
 permissions:
   contents: read

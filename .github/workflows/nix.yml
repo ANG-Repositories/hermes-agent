@@ -10,22 +10,9 @@ name: Nix flake check
 # in progress. One slow advisory job in the CI lane blocks every rerun of the
 # fast required jobs beside it. A separate run reruns and cancels on its own.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request, push); dispatch-only until re-enabled on a card.
 on:
-  # PRs run only when the flake's own inputs change (spec L6, 2026-09-25).
-  # `Nix flake check` is NOT a required context, so this filter cannot strand
-  # a merge. A source-only change that breaks the flake is caught by the full
-  # run on push to main below, which fleet-ci-fail-alert.yml pages on.
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - flake.nix
-      - flake.lock
-      - "nix/**"
-      - pyproject.toml
-      - uv.lock
-      - .github/workflows/nix.yml
-  push:
-    branches: [main]
+  workflow_dispatch:
   workflow_call:
     inputs:
       release:

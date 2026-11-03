@@ -7,18 +7,8 @@
 # deliver_only, so this is a pure notification, never an agent run.
 name: Fleet CI-fail alert
 
+# t_868e850a: public mirror load guard -- self-triggers removed (schedule); dispatch-only until re-enabled on a card.
 on:
-  # SWEEP, not a workflow_run listener (t_8ca8c919, ci-redundancy-audit class I). A listener is one run
-  # of this workflow per upstream run: 2026-10-04 it was 1,039 runs, 967 skipped at the job `if:`, 38 %
-  # of the 2,762 runs GitHub counted the day before it disabled this repo's Actions (its abuse
-  # heuristics count runs). Every 15 minutes the sweep job lists the CFA_WATCHED workflows' red runs
-  # and runs the unchanged route + POST steps once per red (`notify <run id>#<attempt>` matrix legs).
-  schedule:
-    - cron: '*/15 * * * *'
-  # Proof path (t_957f5398): replay an EXISTING upstream run through the same
-  # gate + POST code. The run is fetched from the API and fed to the identical
-  # route step, so a replayed red merge_group run pages exactly as it would
-  # live, and a replayed branch red stays silent. Nothing is re-run.
   workflow_dispatch:
     inputs:
       run_id:
