@@ -8,12 +8,8 @@ name: fork-canary-lane
 
 # path-filter-exempt: a registry `paths` glob can match any file, so the scope decision is the lane's own
 # (`canary-lane --changed-file-list`, rc 0 "not affected"), never a static paths: filter.
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request, merge_group); dispatch-only until re-enabled on a card.
 on:
-  pull_request:
-    # edited: a retitle can turn a PR into a parity PR (title-classified), which must re-run the full lane
-    # and parity-pr-check without a new push
-    types: [opened, synchronize, reopened, edited, ready_for_review]
-  merge_group:
   workflow_dispatch:
 
 permissions:

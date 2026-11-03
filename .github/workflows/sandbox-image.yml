@@ -11,15 +11,8 @@ name: Sandbox desktop image
 # Deliberately NOT on every main push: two 4 GB multi-arch builds per commit
 # for an image that changes a few times a year.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request, release); dispatch-only until re-enabled on a card.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - docker/sandbox-desktop.Dockerfile
-      - docker/sandbox-desktop-smoke.sh
-      - .github/workflows/sandbox-image.yml
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       publish:

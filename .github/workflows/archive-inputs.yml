@@ -1,21 +1,14 @@
 name: Archive pinned PM inputs
 
+# t_868e850a: public mirror load guard -- self-triggers removed (push); dispatch-only until re-enabled on a card.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'pm/lock.json'
-      - 'pm/artifact-mirror.json'
-      - 'scripts/termux/runtime_libs.json'
-      - 'scripts/ci/archive_inputs.py'
-      - '.github/workflows/archive-inputs.yml'
+  workflow_dispatch:
   workflow_call:
     inputs:
       sha:
         description: 'The admitted commit whose pins are archived.'
         required: true
         type: string
-  workflow_dispatch:
 
 permissions:
   contents: read

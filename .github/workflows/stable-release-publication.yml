@@ -1,5 +1,6 @@
 name: Stable Release Publication
 
+# t_868e850a: public mirror load guard -- self-triggers removed (workflow_run); dispatch-only until re-enabled on a card.
 on:
   workflow_dispatch:
     inputs:
@@ -10,12 +11,6 @@ on:
         default: ''
   # The success path publishes from Stable Release's own final job; only a
   # failed run needs this pass, which reruns its failed jobs immediately.
-  workflow_run:
-    workflows: ['Stable Release']
-    types: [completed]
-    # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
-    branches-ignore:
-      - ci-overflow-ledger
 
 # Shared with Stable Release so publication never races a build. The requested
 # rerun waits as pending behind this job instead of deadlocking it: the

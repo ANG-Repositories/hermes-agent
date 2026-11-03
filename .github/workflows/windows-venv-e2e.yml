@@ -12,16 +12,9 @@ name: Windows venv-holder live E2E
 # wine2e/** working branches, so it costs nothing on normal PRs. Delete or
 # keep dormant after the venv-holder work lands.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (push); dispatch-only until re-enabled on a card.
 on:
-  push:
-    branches:
-      - "wine2e/**"
-    # Fail-open filter (ci-speed-lint R3): paths-IGNORE, so only a docs-only
-    # push skips; any other path, including ones added later, still runs.
-    paths-ignore:
-      - "website/**"
-      - "docs/**"
-      - "**/*.md"
+  workflow_dispatch:
   workflow_call:
     inputs:
       release:

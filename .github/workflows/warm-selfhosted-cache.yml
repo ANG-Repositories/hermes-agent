@@ -15,9 +15,8 @@ name: Warm self-hosted caches
 # never delays or reds the main gate.
 # Rollback: vars.CI_SELFHOSTED_CACHE_WARM=off.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (push); dispatch-only until re-enabled on a card.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

@@ -7,9 +7,8 @@ name: Skills Index Freshness Check
 #
 # Triggered every 4 hours so we catch a stuck cron within one tick.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (schedule); dispatch-only until re-enabled on a card.
 on:
-  schedule:
-    - cron: '0 */4 * * *'
   workflow_dispatch:
 
 permissions:
