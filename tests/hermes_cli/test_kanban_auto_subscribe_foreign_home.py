@@ -77,9 +77,17 @@ def test_own_home_subscribes_caller_chat(kanban_home):
     assert _chats(tid) == ["chat-caller"]
 
 
-def test_operator_home_subscribes_nobody(kanban_home):
+def test_operator_home_keeps_caller(kanban_home):
+    """Any operator session may act on an operator pseudo-home: the minting chat stays."""
     tid = _create("operator:apollo")
-    assert _chats(tid) == []
+    assert _chats(tid) == ["chat-caller"]
+
+
+def test_foreign_home_in_another_thread_never_reaches_caller(kanban_home, monkeypatch):
+    """The acceptance shape: N cards minted from chat-caller for a foreign home
+    put zero subscriptions on chat-caller."""
+    tids = [_create(HOME_SID) for _ in range(3)]
+    assert all("chat-caller" not in _chats(t) for t in tids)
 
 
 def test_unknown_home_session_subscribes_nobody(kanban_home):
