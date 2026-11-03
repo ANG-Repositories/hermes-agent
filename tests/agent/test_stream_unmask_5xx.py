@@ -38,6 +38,7 @@ def _make_call(api_kwargs, *, deltas_sent=False, api_mode="chat_completions"):
     call.first_delta_fired = {"done": True}
     call.on_first_delta = None
     call._stream_stale_timeout = 180.0
+    call._dispatch = None
     call.api_kwargs = api_kwargs
     call.result = {"response": None, "error": None, "partial_tool_names": []}
     call.deltas_were_sent = {"yes": deltas_sent}
@@ -70,7 +71,7 @@ def test_stream_5xx_probe_success_delivers_response_without_latch(monkeypatch):
     call = _make_call({"model": "m", "stream": True, "stream_options": {"x": 1}, "messages": []})
     seen_kwargs = []
 
-    def fake_probe(agent, kwargs):
+    def fake_probe(agent, kwargs, **_kw):
         seen_kwargs.append((kwargs, call._stream_stale_timeout))
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", reasoning_content=None))])
 
@@ -95,7 +96,7 @@ def test_stream_5xx_unmasked_by_probe_4xx(monkeypatch):
     call = _make_call({"model": "m", "messages": []})
     real = _ProbeErr(400)
 
-    def fake_probe(agent, kwargs):
+    def fake_probe(agent, kwargs, **_kw):
         raise real
 
     monkeypatch.setattr(h, "interruptible_api_call", fake_probe)
@@ -105,3 +106,23 @@ def test_stream_5xx_unmasked_by_probe_4xx(monkeypatch):
     assert not handled  # loop stops, error propagates
     assert call.result["error"] is real  # the REAL validation error replaces the opaque 500
     assert call.result["response"] is None
+
+
+def test_stream_5xx_probe_is_ledgered_on_the_stream_dispatch(monkeypatch):
+    """t_beeca1dd: the probe can run on an orphaned stream thread after the turn
+    failed over (claude-btpr -> cpa); it must be recorded on the stream's own
+    dispatch, never on the agent's live route at probe time."""
+    call = _make_call({"model": "m", "messages": []})
+    call._dispatch = {"provider": "claude-btpr", "model": "claude-opus-5-5"}
+    call.agent._inflight_request_route = {"provider": "cpa", "model": "gpt-6.1-sol"}
+    seen = []
+
+    def fake_probe(agent, kwargs, *, dispatch=None):
+        seen.append(dispatch)
+        raise _ProbeErr(503)
+
+    monkeypatch.setattr(h, "interruptible_api_call", fake_probe)
+
+    _run_handle_stream_error(call, _StreamErr(503))
+
+    assert seen == [call._dispatch]
