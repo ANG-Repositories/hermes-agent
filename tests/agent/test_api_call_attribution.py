@@ -603,3 +603,39 @@ def test_aux_row_without_pool_headers_kwarg_stays_backward_compatible(recorded):
 def test_pooled_or_unpinned_lane_is_never_pinned(recorded, provider):
     cch._record_successful_api_call(_agent("turn-np", provider), SimpleNamespace(usage=_usage(10, 5), pool_headers={}))
     assert recorded[0]["sub_key"] is None
+
+
+def test_call_outliving_its_dispatch_keeps_its_own_route(recorded, monkeypatch):
+    """Regression for t_beeca1dd: the streaming 5xx unmask probe on claude-btpr
+    was still on the wire when the turn failed over to cpa; its Claude-relay
+    503 (``x-pool-served-by: sub-vps-24``) was then recorded as provider=cpa.
+    A physical call is ledgered on the route it was dispatched on."""
+    agent = _agent("turn-orphan", "claude-btpr")
+    agent._inflight_request_route = cch._dispatch_route_snapshot(agent, cch._live_route(agent))
+    relay_503 = SimpleNamespace(
+        status_code=503,
+        headers={"x-pool-served-by": "sub-vps-24", "x-pool-route-id": "route-503"},
+    )
+
+    class Relay503(RuntimeError):
+        status_code = 503
+        response = relay_503
+
+    def _slow_btpr_call(agent_, api_kwargs):
+        # The loop failed over to cpa while this request was in flight.
+        agent_.provider, agent_.model = "cpa", "gpt-6.1-sol"
+        agent_._inflight_request_route = cch._dispatch_route_snapshot(agent_, cch._live_route(agent_))
+        raise Relay503("upstream unreachable on every box")
+
+    for name in ("stamp_call_id", "stamp_correlation_headers", "stamp_bridge_lane"):
+        monkeypatch.setattr(cch, name, lambda *a, **k: None)
+    monkeypatch.setattr(cch, "should_use_direct_api_call", lambda a: True)
+    monkeypatch.setattr(cch, "direct_api_call", _slow_btpr_call)
+
+    with pytest.raises(Relay503):
+        cch.interruptible_api_call(agent, {"model": "claude-opus-4-8"})
+
+    (row,) = recorded
+    assert (row["provider"], row["sub_key"], row["http_status"]) == ("claude-btpr", "sub-vps-24", 503)
+    # The invariant the card names: a non-Claude row never carries a Claude seat.
+    assert not (row["provider"] == "cpa" and row["sub_key"] == "sub-vps-24")

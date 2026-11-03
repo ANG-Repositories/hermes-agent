@@ -9,12 +9,16 @@ Refusals:    ``--why`` prints what would refuse this call and the command that c
              example (:func:`schema_text`), never one field.
 Coverage:    ``request-changes --finding TEXT`` (repeatable) + ``--lens NAME=STATE`` BUILD the
              review_coverage JSON (findings = count, items, review_minutes from the review run's
-             clock, head_sha from the card's routed PR, batch_id). The JSON is an output.
+             clock, head_sha and pr (owner/repo#N) from the card's routed PR, batch_id).
+             hermes-home's review_of_record.other_pr reads pr to scope send-backs to their PR.
+             The JSON is an output; explicit --json keys override computed defaults.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -66,6 +70,64 @@ def _read(path: str) -> str:
     return Path(path).expanduser().read_text(encoding="utf-8-sig")
 
 
+# ------------------------------------------------------------------ inline prose with shell shapes
+# hermes-home card t_b67cbb31 (ruling no-prose-exceptions-in-shell-scanners). The fleet's terminal guard hooks
+# scan the COMMAND TEXT, and a shell-text scanner cannot carry a prose allowlist: `-> .` inside a comment body
+# reads as a redirect into the live tree. So prose with shell shapes does not travel inline. It goes through
+# --body-file PATH, which no hook scans. Only a command an agent typed into a shell is refused here (the shape
+# the hooks read); a program that passes argv directly never meets a hook and is unaffected.
+SHELL_SHAPES = ("->", ">", "|", "$(", "`")
+INLINE_PROSE_VERBS = ("comment", "create", "request-changes")
+
+
+def shell_shapes_in(text: str) -> list:
+    """The SHELL_SHAPES `text` contains, in table order."""
+    return [s for s in SHELL_SHAPES if s in text]
+
+
+# The terminal tool runs each command as `bash -c '<wrapper>'`, and the wrapper exports this marker before it
+# `eval`s the command text (tools/environments/base_session_env._wrap_command_script). A hermes typed straight
+# into that command has the wrapper shell as its parent; one called from a script the command ran does not.
+_AGENT_WRAPPER_MARKS = ('HERMES_AGENT="${HERMES_AGENT:-true}"', "eval '")
+
+
+def _parent_args() -> str:
+    ppid = os.getppid()
+    try:
+        with open(f"/proc/{ppid}/cmdline", "rb") as fh:
+            return fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        pass
+    return subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(ppid)], capture_output=True,
+                          text=True, timeout=5).stdout
+
+
+def _typed_in_agent_shell() -> bool:
+    """True when this process is a command an agent typed into its terminal tool (the parent is the tool's
+    wrapper shell). Any error answers False: this is a nudge toward --body-file, never a security boundary
+    (the hooks are)."""
+    if str(os.environ.get("HERMES_AGENT", "")).strip().lower() not in ("1", "true", "yes"):
+        return False
+    try:
+        args = _parent_args()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return all(m in args for m in _AGENT_WRAPPER_MARKS)
+
+
+def inline_prose_refusal(verb: str, source: str, text: Optional[str]) -> Optional[str]:
+    """The refusal message for inline prose with shell shapes typed in an agent shell, else None."""
+    if verb not in INLINE_PROSE_VERBS or source == "--body-file" or not text:
+        return None
+    found = shell_shapes_in(text)
+    if not found or not _typed_in_agent_shell():
+        return None
+    return (f"prose with shell shapes: use --body-file ({source} contains "
+            + ", ".join(f"`{s}`" for s in found)
+            + "; the terminal guard hooks read those as shell. Write the text to a file and pass "
+              "--body-file PATH)")
+
+
 def resolve_text(args, verb: str, *, words_attr: Optional[str] = None,
                  alias_attr: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """``(text, error)`` from ``--body`` / ``--body-file`` / positional words / a legacy alias flag.
@@ -94,6 +156,9 @@ def resolve_text(args, verb: str, *, words_attr: Optional[str] = None,
                       + "); pass it ONE way, not both")
     if not sources:
         return None, None
+    refusal = inline_prose_refusal(verb, sources[0][0], sources[0][1])
+    if refusal:
+        return None, refusal
     return sources[0][1].strip(), None
 
 
@@ -189,15 +254,18 @@ def build_coverage(conn, task_id: str, *, findings: list, lens_specs: list,
     items = [str(f).strip() for f in findings or [] if str(f).strip()]
     if items:
         record["findings"], record["items"] = len(items), items
-    if "head_sha" not in overrides:
+    if "head_sha" not in overrides or "pr" not in overrides:
         head, pr = _routed_pr_head(conn, task_id)
-        if head:
-            record["head_sha"] = head
-        elif pr is None:
-            record["head_sha"] = "n/a: card routes no PR"
-        else:
-            errors.append(f"head_sha: could not read the head of {pr} (gh REST); "
-                          f"pass --json '{{\"head_sha\": \"<sha>\"}}'")
+        if pr is not None and "pr" not in overrides:
+            record["pr"] = pr
+        if "head_sha" not in overrides:
+            if head:
+                record["head_sha"] = head
+            elif pr is None:
+                record["head_sha"] = "n/a: card routes no PR"
+            else:
+                errors.append(f"head_sha: could not read the head of {pr} (gh REST); "
+                              f"pass --json '{{\"head_sha\": \"<sha>\"}}'")
     if "review_minutes" not in overrides:
         record["review_minutes"] = _review_minutes(conn, task_id)
     record.setdefault("batch_id", "n/a: request-changes flat form, no delegate_task batch")

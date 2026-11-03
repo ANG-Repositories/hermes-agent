@@ -196,17 +196,27 @@ def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()
     shutil.rmtree(aside, ignore_errors=True)
 
 
-def _rollback(snapshots, find_skill, results):
+def _rollback(snapshots, find_skill, results, create_targets=None):
     """Restore every snapshot. ``results`` are the ops applied so far (their name/file_path
-    tell an adopted dir's rollback which files were the batch's). Returns (note, failed)."""
+    tell an adopted dir's rollback which files were the batch's). A skill the batch CREATED is
+    located by its ``create_targets`` dir, never ``find_skill`` (loaded roots only): a create into an
+    unsubscribed shared group is invisible to it and would survive the rollback (f26dc060e98b).
+    Only a create that SUCCEEDED in ``results`` owns that dir: a create that failed or never ran
+    may point at a foreign skill find_skill cannot see, which rollback must not touch (ccb4d869f7f9).
+    Returns (note, failed)."""
+    create_targets = create_targets or {}
+    created = {r["name"] for r in results if r["action"] == "create" and r.get("success")}
     notes = []
     for nm, (pre_dir, snap, dir_pre_existed) in snapshots.items():
         written = [posixpath.normpath(r["file_path"].lstrip("/")) for r in results
                    if r["name"] == nm and r["action"] == "write_file" and r["file_path"]]
         try:
-            post = find_skill(nm)
-            _restore_snapshot(pre_dir, snap, Path(post["path"]) if post else None,
-                              dir_pre_existed, written)
+            if pre_dir is None and nm in create_targets and nm in created:
+                post_dir = Path(create_targets[nm])
+            else:
+                post = find_skill(nm)
+                post_dir = Path(post["path"]) if post else None
+            _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed, written)
         except Exception as exc:  # noqa: BLE001
             notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
                          + (f"; snapshot preserved at '{snap}'" if snap is not None else ""))
@@ -278,7 +288,7 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
                 except Exception:  # noqa: BLE001
                     parsed = {"success": False, "error": "unparseable op result"}
                 if not parsed.get("success"):
-                    note, rollback_failed = _rollback(snapshots, _smt._find_skill, results)
+                    note, rollback_failed = _rollback(snapshots, _smt._find_skill, results, create_targets)
                     fail = {  # key order is wire-visible
                         "success": False,
                         "error": (f"operations[{i}] ({op['action']} on '{names[i]}') failed: "

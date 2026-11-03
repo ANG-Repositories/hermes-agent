@@ -78,6 +78,10 @@ class TurnFacadeMixin:
         task_started = task_finished = False
         relay_outcome = "failed"
 
+        # This turn owns the context engine until its finally: an eviction release_clients() on another
+        # thread defers the engine shutdown to exit_turn instead of closing stores under it (t_055f9d8d).
+        from agent.context_engine_owners import enter_turn, exit_turn
+        enter_turn(self)
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
             _review_queue.note_turn_started()
@@ -243,6 +247,8 @@ class TurnFacadeMixin:
                         from tools.delegate_tool_sign_grant import revoke_turn_grants
 
                         revoke_turn_grants(self)
+                    with suppress(Exception):
+                        exit_turn(self, self._shutdown_context_engine_now)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """Final response string of one turn; ``stream_callback`` receives each text delta."""

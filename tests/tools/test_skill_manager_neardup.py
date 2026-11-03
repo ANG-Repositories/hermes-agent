@@ -26,18 +26,29 @@ ROOTS_SEEN = []
 def _words(t):
     return set(re.findall(r"[a-z0-9]+", t.lower()))
 
-def check(name, content, roots=None, threshold=None):
+class Corpus:
+    def __init__(self, docs):
+        self.docs = docs
+
+    @classmethod
+    def load(cls, roots=None):
+        docs, seen = [], set()
+        for root in roots or []:
+            for p in sorted(Path(root).rglob("SKILL.md")):
+                if p.parent.name not in seen:
+                    seen.add(p.parent.name)
+                    docs.append({"name": p.parent.name, "path": str(p), "text": p.read_text()})
+        return cls(docs)
+
+def check(name, content, roots=None, threshold=None, corpus=None):
     thr = THRESHOLD if threshold is None else threshold
     ROOTS_SEEN.append([str(r) for r in roots or []])
-    cand, seen, matches = _words(content), set(), []
-    for root in roots or []:
-        for p in sorted(Path(root).rglob("SKILL.md")):
-            n = p.parent.name
-            if n == name or n in seen:
-                continue
-            seen.add(n)
-            w = _words(p.read_text())
-            matches.append({"name": n, "path": str(p), "score": round(len(cand & w) / len(cand | w), 3)})
+    cand, matches = _words(content), []
+    for d in (corpus or Corpus.load(roots)).docs:
+        if d["name"] == name:
+            continue
+        w = _words(d["text"])
+        matches.append({"name": d["name"], "path": d["path"], "score": round(len(cand & w) / len(cand | w), 3)})
     matches.sort(key=lambda m: -m["score"])
     return {"near_duplicate": bool(matches) and matches[0]["score"] >= thr, "threshold": thr,
             "matches": matches[:3]}
@@ -114,6 +125,7 @@ def _fleet_home(tmp_path, *, scorer=True, config=None, existing_group="devops"):
          patch.object(smt, "_author_to_shared_setting", return_value=None), \
          patch("agent.skill_utils.get_all_skills_dirs",
                return_value=[local, shared / "devops", shared / "general"]), \
+         patch("agent.skill_utils.get_project_skills_dirs", return_value=[]), \
          patch("hermes_cli.config.load_config", return_value=config or {}):
         yield home, shared
 
@@ -332,3 +344,204 @@ def test_distinct_from_does_not_leak_through_yaml_aliases():
     assert "distinct_from" not in fm["metadata"]["template"], out
     assert fm["metadata"]["hermes"]["distinct_from"] == [{"name": "existing"}]
     assert fm["metadata"]["template"] == {"tag": "keep"}
+
+
+# --- Carried Prism residue from agent#2513 (t_7c67781d) -------------------------------------------
+
+def test_scorer_is_registered_in_sys_modules_while_it_executes(tmp_path):
+    """a51c70d89c38: a scorer that resolves its own module (dataclasses, pickle) during import must load."""
+    import sys
+    from tools import skill_manager_neardup as nd
+    with _fleet_home(tmp_path) as (home, shared):
+        lib = home / "scripts" / "lib" / "skill_similarity.py"
+        lib.write_text("import sys\nassert sys.modules[__name__] is not None\n" + STUB_SCORER)
+        nd._scorer_cache.clear()
+        res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is False and res["near_duplicates"], res
+
+
+def test_failed_scorer_import_leaves_no_module_behind(tmp_path):
+    import sys
+    from tools import skill_manager_neardup as nd
+    with _fleet_home(tmp_path) as (home, shared):
+        (home / "scripts" / "lib" / "skill_similarity.py").write_text("raise RuntimeError('broken scorer')\n")
+        nd._scorer_cache.clear()
+        sys.modules.pop(nd._SCORER_MODULE, None)
+        res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is True, res             # fail-open, as before
+        assert nd._SCORER_MODULE not in sys.modules
+
+
+def test_trusted_project_skills_are_compared(tmp_path):
+    """9393a1595eda: a trusted project .agents/skills dir outranks the others at load time, so it is compared."""
+    proj = tmp_path / "proj" / ".agents" / "skills"
+    (proj / "pg-proj").mkdir(parents=True)
+    (proj / "pg-proj" / "SKILL.md").write_text(EXISTING.replace("postgres-vacuum-tuning", "pg-proj"))
+    with _fleet_home(tmp_path) as (home, shared), \
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[proj]):
+        (shared / "devops" / "postgres-vacuum-tuning" / "SKILL.md").unlink()
+        res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is False, res
+        assert res["near_duplicates"][0]["name"] == "pg-proj"
+
+
+def test_compare_and_write_run_under_one_cross_process_lock(tmp_path):
+    """adbf7b9e2588: while another process holds <root>/state/skill-neardup-create.lock, a create waits."""
+    import fcntl
+    import threading
+    import time
+    with _fleet_home(tmp_path) as (home, shared):
+        lock = home / "state" / "skill-neardup-create.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        done = []
+        with open(lock, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            t = threading.Thread(target=lambda: done.append(_create("garage-door-lockout", DISTINCT)))
+            t.start()
+            time.sleep(0.8)
+            assert not done and not (shared / "general" / "garage-door-lockout").exists()
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        t.join(20)
+        assert done and done[0]["success"] is True, done
+
+
+def test_batch_rollback_removes_a_create_in_an_unsubscribed_group(tmp_path):
+    """f26dc060e98b: devops-aux is not a loaded root, so _find_skill cannot see the create; rollback must."""
+    with _fleet_home(tmp_path) as (home, shared):
+        res = json.loads(skill_manage("", "", operations=[
+            {"action": "create", "name": "garage-door-lockout", "category": "devops-aux", "content": DISTINCT},
+            {"action": "patch", "name": "postgres-vacuum-tuning", "old_string": "NO SUCH TEXT", "new_string": "x"}]))
+        assert res["success"] is False, res
+        assert not (shared / "devops-aux" / "garage-door-lockout").exists(), "batch create survived rollback"
+
+
+@pytest.mark.parametrize("broken", ["refusal_message", "distinct_from_entries"])
+def test_scorer_message_helpers_fail_open(tmp_path, broken):
+    """aada50d66930: refusal_message / distinct_from_entries raising is scorer failure: fail open."""
+    with _fleet_home(tmp_path) as (home, shared):
+        lib = home / "scripts" / "lib" / "skill_similarity.py"
+        lib.write_text(STUB_SCORER + f"\ndef {broken}(*a, **k):\n    raise KeyError('boom')\n")
+        from tools import skill_manager_neardup as nd
+        nd._scorer_cache.clear()
+        res = _create("pg-autovacuum", NEAR, **({"justification": "why"} if broken == "distinct_from_entries" else {}))
+        assert res["success"] is True, res
+
+
+def test_pending_diff_renders_the_justified_content(tmp_path):
+    """d879f184cd83: with skills.write_approval on, the staged create preview is what approve will write:
+    the justification's distinct_from rows included, in a batch too (later ops diff against it)."""
+    from tools.write_approval import skill_pending_diff
+    with _fleet_home(tmp_path) as (home, shared):
+        op = {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general",
+              "justification": "ops runbook"}
+        single = skill_pending_diff({"payload": op})
+        assert "distinct_from" in single and "postgres-vacuum-tuning" in single, single
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            op, {"action": "patch", "name": "pg-autovacuum", "old_string": "watch freeze age.",
+                 "new_string": "watch freeze age closely."}]}})
+        assert "distinct_from" in batch.split("## op 2/2")[0], batch
+        assert "(patch would fail" not in batch, batch
+        plain = skill_pending_diff({"payload": {**op, "justification": None}})
+        assert plain == NEAR
+        assert _ledger(home) == [], "a preview must not write ledger rows"
+
+
+# --- Prism round 1 on agent#2541 (t_7c67781d) ------------------------------------------------------
+
+@pytest.mark.parametrize("lead", [[], [{"action": "patch", "name": "postgres-vacuum-tuning",
+                                        "old_string": "NO SUCH TEXT", "new_string": "x"}]])
+def test_failed_batch_create_never_touches_a_foreign_skill_in_an_unsubscribed_group(tmp_path, lead):
+    """ccb4d869f7f9: devops-aux/garage-door-lockout predates the batch and find_skill cannot see it. A create
+    that fails ('already exists') or never runs must not let rollback unlink that skill's SKILL.md."""
+    with _fleet_home(tmp_path) as (home, shared):
+        foreign = shared / "devops-aux" / "garage-door-lockout"
+        foreign.mkdir()
+        (foreign / "SKILL.md").write_text(DISTINCT)
+        res = json.loads(skill_manage("", "", operations=lead + [
+            {"action": "create", "name": "garage-door-lockout", "category": "devops-aux", "content": DISTINCT}]))
+        assert res["success"] is False, res
+        assert (foreign / "SKILL.md").read_text() == DISTINCT, "rollback deleted a skill the batch never wrote"
+
+
+def test_batch_create_preview_scores_against_the_earlier_ops_staged_tree(tmp_path):
+    """a4cf78828e81 / e485146dd10e: approve scores op 2 after op 1 has rewritten the only near match, so the
+    preview must too: no distinct_from for a skill that will no longer be near. And a skill an earlier op
+    CREATES is a near match the preview must see."""
+    from tools.write_approval import skill_pending_diff
+    rewritten = DISTINCT.replace("garage-door-lockout", "postgres-vacuum-tuning")
+    create = {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general",
+              "justification": "ops runbook"}
+    with _fleet_home(tmp_path) as (home, shared):
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "edit", "name": "postgres-vacuum-tuning", "content": rewritten}, create]}})
+        op2 = batch.split("## op 2/2")[1]
+        assert "distinct_from" not in op2, batch
+        (shared / "devops" / "postgres-vacuum-tuning" / "SKILL.md").unlink()
+        sibling = NEAR.replace("pg-autovacuum", "pg-vacuum-ops")
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "create", "name": "pg-vacuum-ops", "content": sibling, "category": "general"}, create]}})
+        op2 = batch.split("## op 2/2")[1]
+        assert "distinct_from" in op2 and "pg-vacuum-ops" in op2, batch
+        assert _ledger(home) == []
+
+
+def test_batch_create_preview_does_not_score_a_skill_an_earlier_op_deletes(tmp_path):
+    """8377c7154a79 / aaa4ebf59b72: approve deletes postgres-vacuum-tuning before it scores the create, so the
+    preview must not annotate distinct_from against it. Control: the same create after deleting an unrelated name
+    IS annotated (the exclusion did not just make the gate fail open)."""
+    from tools.write_approval import skill_pending_diff
+    create = {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general",
+              "justification": "ops runbook"}
+    with _fleet_home(tmp_path) as (home, shared):
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "delete", "name": "postgres-vacuum-tuning"}, create]}})
+        assert "distinct_from" not in batch.split("## op 2/2")[1], batch
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "delete", "name": "garage-door-lockout"}, create]}})
+        op2 = batch.split("## op 2/2")[1]
+        assert "distinct_from" in op2 and "postgres-vacuum-tuning" in op2, batch
+        assert _ledger(home) == []
+
+
+def test_create_preview_never_writes_outside_its_overlay(tmp_path):
+    """92bc336dabf3: a staged name that is not a valid skill name (absolute, `..`) is never a path."""
+    from tools.write_approval import _create_preview
+    escape = tmp_path / "preview-escape"
+    with _fleet_home(tmp_path):
+        out = _create_preview({"name": "next", "content": NEAR, "justification": "reason"},
+                              {str(escape): {"SKILL.md": "unapproved"}, "../up": {"SKILL.md": "unapproved"}})
+    assert not escape.exists(), "preview wrote outside its temp overlay"
+    assert not (tmp_path / "up").exists()
+    assert out.startswith("---")
+
+
+_OLD_SCORER = STUB_SCORER.replace(
+    "def check(name, content, roots=None, threshold=None, corpus=None):",
+    "def check(name, content, roots=None, threshold=None):").replace(
+    "(corpus or Corpus.load(roots))", "Corpus.load(roots)")
+
+
+def test_scorer_without_corpus_kwarg_still_gates(tmp_path):
+    """370d9676504e: the root's scorer may predate check(corpus=). Passing corpus= to it raised TypeError, which the
+    fail-open boundary turned into NO gate: every near-duplicate create went through."""
+    assert "corpus" not in _OLD_SCORER.split("def check(")[1].split(")")[0]
+    with _fleet_home(tmp_path) as (home, shared):
+        (home / "scripts" / "lib" / "skill_similarity.py").write_text(_OLD_SCORER)
+        res = _create("pg-autovacuum", NEAR)
+        assert res["success"] is False, res
+        assert "postgres-vacuum-tuning" in res["error"]
+        assert not (shared / "general" / "pg-autovacuum").exists()
+
+
+def test_scorer_without_corpus_kwarg_still_gates_a_batch_preview_with_a_delete(tmp_path):
+    """370d9676504e, exclude_names path: an older scorer cannot take the filtered corpus, so the preview scores the
+    on-disk tree (stricter) instead of failing open; the justified create is still annotated."""
+    from tools.write_approval import skill_pending_diff
+    create = {"action": "create", "name": "pg-autovacuum", "content": NEAR, "category": "general",
+              "justification": "ops runbook"}
+    with _fleet_home(tmp_path) as (home, shared):
+        (home / "scripts" / "lib" / "skill_similarity.py").write_text(_OLD_SCORER)
+        batch = skill_pending_diff({"payload": {"action": "batch", "operations": [
+            {"action": "delete", "name": "garage-door-lockout"}, create]}})
+        op2 = batch.split("## op 2/2")[1]
+        assert "distinct_from" in op2 and "postgres-vacuum-tuning" in op2, batch

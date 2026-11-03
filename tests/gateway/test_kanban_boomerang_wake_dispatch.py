@@ -38,9 +38,15 @@ class Adapter:
     def __init__(self) -> None:
         self.sent: list = []
         self.handled: list = []
+        self.fail_sends = 0   # next N sends report success=False (no receipt)
 
     async def send(self, chat_id, text, metadata=None):
+        from gateway.platforms.base import SendResult
+        if self.fail_sends:
+            self.fail_sends -= 1
+            return SendResult(success=False, error="injected")
         self.sent.append(text)
+        return SendResult(success=True, message_id=str(len(self.sent)))
 
     async def handle_message(self, event):
         event._gateway_accepted = True
@@ -334,8 +340,8 @@ def test_child_handoff_renders_one_boomerang_wake_line(env):
     _worker_close(tid)
     entry = _claimed_entry(env, tid)
     _run(env, entry, "completed", _verdict(entry, "complete", summary="verified: PR merged, tests green"))
-    lines = [s for s in env["adapter"].sent if s.startswith("[boomerang-wake]")]
-    assert lines and lines[0].splitlines()[0] == f"[boomerang-wake] {tid} — verified: PR merged, tests green"
+    lines = [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
+    assert lines == [f"boomerang handled {tid} (completed): verified: PR merged, tests green"]
     assert env["adapter"].handled == []
 
 
@@ -363,12 +369,15 @@ def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
     assert "ci-shard-4 red is INHERITED from main" in head
     assert "gh run view 1 --log-failed: mutate_anchor_lint" in head
     assert tail == f"Task {tid} wake"
+    assert env["adapter"].sent == [
+        f"boomerang handled {tid} (own_repo_review_red): ci-shard-4 red is INHERITED from main"]
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["resurface_delivered"] is True
     _run(env, ah.BoomerangWakeState().get_claim(entry["key"]), "completed", final)   # replay
     assert ah.record_surface(entry, "again") is False
     with kb.connect_closing() as conn:
         ours = [c.body for c in kb.list_comments(conn, tid) if c.body.startswith("[boomerang-wake] surfaced:")]
     assert len(ours) == 1 and "ci-shard-4 red is INHERITED from main" in ours[0], ours
-    assert len(env["adapter"].handled) == 1
+    assert len(env["adapter"].handled) == 1 and len(env["adapter"].sent) == 1
 
 
 def test_surface_with_malformed_evidence_still_resurfaces(env):
@@ -378,6 +387,25 @@ def test_surface_with_malformed_evidence_still_resurfaces(env):
     _run(env, entry, "completed", _verdict(entry, "surface", summary="needs operator review", evidence=True))
     [turn] = [t.text for t in env["adapter"].handled]
     assert turn.startswith(f"[boomerang-wake] child surfaced {tid}") and "needs operator review" in turn
+    assert env["adapter"].sent == [f"boomerang handled {tid} (own_repo_review_red): needs operator review"]
+
+
+def test_ok_verdict_failed_line_is_retried_by_the_replay_not_nooped(env):
+    """Prism d74bf844f9a4: an ok verdict whose line got no receipt leaves a pending row; the
+    replayed (terminal) handoff retries it, and only one line ever lands."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    final = _verdict(entry, "complete", summary="verified: PR merged")
+    env["adapter"].fail_sends = 1
+    _run(env, entry, "completed", final)
+    assert env["adapter"].sent == []
+    assert entry["delegation_id"] in ah.BoomerangWakeState().handbacks()
+    _run(env, ah.BoomerangWakeState().get_claim(entry["key"]), "completed", final)   # replay
+    assert env["adapter"].sent == [f"boomerang handled {tid} (completed): verified: PR merged"]
+    assert ah.BoomerangWakeState().handbacks() == {}
+    _run(env, ah.BoomerangWakeState().get_claim(entry["key"]), "completed", final)   # replay again
+    assert len(env["adapter"].sent) == 1
 
 
 def test_surfaced_dedup_ignores_a_tag_quoted_inside_another_summary(env):
