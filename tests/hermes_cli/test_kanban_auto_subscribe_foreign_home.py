@@ -118,3 +118,63 @@ def test_tool_create_without_session_id_subscribes_caller(kanban_home, monkeypat
         {"board": "default", "title": "tool card 2", "assignee": "peer"}))
     assert created["ok"], created
     assert _chats(created["task_id"]) == ["chat-caller"]
+
+
+def _add_session(sid: str, origin: dict) -> None:
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        db.create_session(session_id=sid, source=origin["platform"], origin_json=json.dumps(origin))
+    finally:
+        db.close()
+
+
+def _subs(task_id: str) -> list[dict]:
+    conn = kb.connect()
+    try:
+        return [dict(s) for s in kbn.list_notify_subs(conn, task_id)]
+    finally:
+        conn.close()
+
+
+def test_home_sub_carries_full_routing_identity(kanban_home):
+    """Prism 99063f040047: alt participant id and delivery anchors come from the home."""
+    _add_session("20261103_000000_feishu", {
+        "platform": "feishu", "chat_id": "group-B", "chat_type": "group",
+        "user_id": "open-1", "user_id_alt": "union-1", "parent_chat_id": "parent-B"})
+    tid = _create("20261103_000000_feishu")
+    (sub,) = _subs(tid)
+    assert (sub["chat_id"], sub["user_id"], sub["user_id_alt"]) == ("group-B", "open-1", "union-1")
+    meta = sub["delivery_metadata"]
+    meta = json.loads(meta) if isinstance(meta, str) else meta
+    assert meta["parent_chat_id"] == "parent-B"
+
+
+def test_same_chat_other_participant_home_keeps_home_user(kanban_home):
+    """Prism b594b6ccfed9: a home in the caller's chat but another user's session is
+    subscribed with the HOME's participant, never the caller's."""
+    _add_session("20261103_000000_u2", {
+        "platform": "discord", "chat_id": "chat-caller", "chat_type": "group",
+        "user_id": "u2", "scope_id": "g1"})
+    tid = _create("20261103_000000_u2")
+    (sub,) = _subs(tid)
+    assert (sub["chat_id"], sub["user_id"]) == ("chat-caller", "u2")
+
+
+def test_tool_idempotency_hit_subscribes_persisted_home(kanban_home, monkeypatch):
+    """Prism 8efbb3c7ece2: a retry that names another session but hits an existing
+    card subscribes that card's real home, never the argument's chat."""
+    from tools import kanban_tools as kt
+
+    _add_session("20261103_000000_other", {
+        "platform": "discord", "chat_id": "chat-other", "chat_type": "group", "user_id": "u3"})
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: False)
+    monkeypatch.setattr(kt, "_persisted_session_id", lambda v: v or None)
+    first = json.loads(kt._handle_create({"board": "default", "title": "idem", "assignee": "peer",
+                                          "session_id": HOME_SID, "idempotency_key": "K1"}))
+    again = json.loads(kt._handle_create({"board": "default", "title": "idem", "assignee": "peer",
+                                          "session_id": "20261103_000000_other",
+                                          "idempotency_key": "K1"}))
+    assert again["task_id"] == first["task_id"]
+    assert "chat-other" not in _chats(first["task_id"])

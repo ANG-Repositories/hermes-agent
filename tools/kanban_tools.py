@@ -1588,7 +1588,10 @@ def _handle_create(args: dict, **kw) -> str:
                        wake=(True if boomerang
                              else args.get("wake") if isinstance(args.get("wake"), bool) else None),
                        # t_ea40ff83: an explicit foreign home subscribes the home, not this chat.
-                       explicit_home=((session_id, _current_session_id()
+                       # Prism 8efbb3c7ece2: the PERSISTED home (an idempotency hit or an
+                       # inherited home can differ from the session_id argument).
+                       explicit_home=((kb.get_task(conn, new_tid).session_id or "",
+                                       _current_session_id()
                                        or get_session_env("HERMES_SESSION_ID", "") or None)
                                       if args.get("session_id") and session_id else None)),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
@@ -1731,23 +1734,35 @@ def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
         logger.info("kanban: %s homed to %s (%s); caller chat %s not subscribed",
                     task_id, home_sid, home.reason, target["chat_id"])
         return None
-    if _hr.same_chat(home.target, target["platform"], target["chat_id"], target["thread_id"]):
-        return target
+    # Operator ruling 13:4x (Prism b594b6ccfed9, 99063f040047): the target is the home
+    # session's FULL stored routing record. No "same chat" shortcut: two per-user group
+    # sessions share a chat and differ only in participant, so the caller's target is
+    # never reused for a foreign home.
     try:
         origin = json.loads((row or {}).get("origin_json") or "{}")
     except (TypeError, ValueError):
         origin = {}
     origin = origin if isinstance(origin, dict) else {}
-    logger.info("kanban: %s homed to %s; subscribing home chat %s instead of caller chat %s",
+    chat_type = origin.get("chat_type") or None
+    thread_id = home.target.thread_id or None
+    scope_id = origin.get("scope_id") or origin.get("guild_id") or None
+    delivery_metadata = {k: v for k, v in (
+        ("thread_id", thread_id), ("chat_type", chat_type), ("scope_id", scope_id),
+        ("parent_chat_id", origin.get("parent_chat_id")),
+    ) if v}
+    if isinstance(origin.get("delivery_metadata"), dict):
+        delivery_metadata.update(origin["delivery_metadata"])
+    logger.info("kanban: %s homed to %s; subscribing home %s (caller chat %s)",
                 task_id, home_sid, home.target.chat_id, target["chat_id"])
     return dict(
         platform=home.target.platform, chat_id=home.target.chat_id,
-        thread_id=home.target.thread_id or None,
-        chat_type=origin.get("chat_type") or None,
+        thread_id=thread_id, chat_type=chat_type,
         user_id=origin.get("user_id") or None,
-        scope_id=origin.get("scope_id") or None,
+        user_id_alt=origin.get("user_id_alt") or None,
+        scope_id=scope_id,
         notifier_profile=origin.get("profile") or target.get("notifier_profile"),
         delivery_mode=target.get("delivery_mode"),
+        delivery_metadata=delivery_metadata or None,
     )
 
 
