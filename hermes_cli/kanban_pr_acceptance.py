@@ -295,7 +295,8 @@ def _operator_lane_attribution(repo: str, number: int, sha: str, status: dict,
     Every link must hold, else None (the context stays ``missing``):
     - the latest user-posted status for the context is ``success`` on this head;
     - its description is fleet-merge's ``by <agent> lane <review|operator> gate <kind>``;
-    - ``<agent>`` is in ``<hermes root>/config/operator-approvers.json`` ``approvers``;
+    - ``<agent>`` is in ``<hermes root>/config/operator-approvers.json`` ``approvers`` AND the posting
+      GitHub login is in its ``operator_logins`` (Prism de7aacbaa810: the text alone is spoofable);
     - the SAME account posted fleet-merge's ``🤖 merged-by: <agent> · lane: <lane> ·`` comment.
     The caller only asks when GitHub says the PR is merged at this head.
     """
@@ -313,6 +314,12 @@ def _operator_lane_attribution(repo: str, number: int, sha: str, status: dict,
     except (OSError, ValueError):
         return None
     if not isinstance(approvers, list) or agent not in approvers:
+        return None
+    # Prism de7aacbaa810: bind the GitHub LOGIN to the operator, not just the agent name in the text any
+    # write-access user could post. `operator_logins` lists the accounts fleet-merge posts as on the
+    # operator lanes; absent or empty -> no user-posted attribution is ever accepted (fail closed).
+    logins = cfg.get("operator_logins") if isinstance(cfg, dict) else None
+    if not isinstance(logins, list) or login not in logins:
         return None
     pages = _api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True, profile_home=profile_home)
     for comment in (c for page in pages for c in page):

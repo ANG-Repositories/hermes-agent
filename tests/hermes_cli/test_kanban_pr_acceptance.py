@@ -678,11 +678,14 @@ _ATTR = "fleet/attribution"
 
 def _operator_lane(tmp_path, *, desc="by apollo lane review gate ADVISORY", state="success",
                    creator="Kyzcreig", author="Kyzcreig", comment_lane="review", comment_agent="apollo",
-                   approvers=("apollo", "apollo/operator"), retracted=False):
+                   approvers=("apollo", "apollo/operator"), retracted=False, logins=("Kyzcreig",)):
     cfg = tmp_path / "home" / "config" / "operator-approvers.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     if approvers is not None:
-        cfg.write_text(json.dumps({"approvers": list(approvers)}), encoding="utf-8")
+        body_cfg = {"approvers": list(approvers)}
+        if logins is not None:
+            body_cfg["operator_logins"] = list(logins)
+        cfg.write_text(json.dumps(body_cfg), encoding="utf-8")
     statuses = [{"id": 10, "context": _ATTR, "state": state, "description": desc, "target_url": None,
                  "creator": {"login": creator, "type": "User", "id": 9063726}}]
     if retracted:
@@ -722,7 +725,7 @@ def test_operator_lane_card_completes_through_complete_task(github, tmp_path):
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("case", ["open_pr", "not_approver", "no_approvers_file", "bad_lane", "not_fleet_merge_desc",
-                                  "failed_status", "retracted", "comment_by_other", "comment_other_agent",
+                                  "failed_status", "retracted", "comment_by_other", "spoofed_login", "no_operator_logins", "comment_other_agent",
                                   "comment_other_lane", "no_comment"])
 def test_operator_lane_negatives_stay_missing(github, tmp_path, case):
     from hermes_cli import kanban_pr_acceptance as acc
@@ -741,6 +744,10 @@ def test_operator_lane_negatives_stay_missing(github, tmp_path, case):
         kw["retracted"] = True
     elif case == "comment_by_other":
         kw["author"] = "mallory"
+    elif case == "spoofed_login":        # de7aacbaa810: a write-access user posts BOTH artifacts under its own login
+        kw.update(creator="mallory", author="mallory")
+    elif case == "no_operator_logins":
+        kw["logins"] = None
     elif case == "comment_other_agent":
         kw["comment_agent"] = "aegis/breakglass-ops"
     elif case == "comment_other_lane":
