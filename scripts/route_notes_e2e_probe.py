@@ -282,7 +282,7 @@ def main() -> int:
     rig = _load_drain_rig()
     tree = a.runtime_tree.resolve()
     live = (Path.home() / ".hermes/runtime/hermes-agent").resolve()
-    scratch_root = Path(os.environ.get("TMPDIR") or "/tmp")
+    scratch_root = Path(tempfile.gettempdir())  # honours TMPDIR, same fallback, no literal
     work = claim_out(a.out, scratch_root)
     log(f"tree={tree} (live runtime tree: {'YES, read-only' if tree == live else 'no'}) out={work} pinned={pinned}")
 

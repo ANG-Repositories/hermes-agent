@@ -43,6 +43,7 @@ from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
+from hermes_cli.kanban_parser import create_default_priority
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
@@ -928,6 +929,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             args.body = _read_body_file(body_file)
         except OSError as exc:
             return kvi.refuse("create", f"--body-file: {exc}")
+    else:
+        inline = kvi.inline_prose_refusal("create", "--body", args.body)
+        if inline:
+            return kvi.refuse("create", inline)
     if getattr(args, "why", False):
         problems = [] if (args.title or "").strip() else ["title: missing or empty"]
         if not getattr(args, "assignee", None):
@@ -981,6 +986,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             return 2
     try:
         with kb.connect_closing() as conn:
+            from hermes_cli.config import cfg_get as _cfg_get, load_config as _load_config
+            from tools.kanban_tools import _auto_boomerang, _auto_wake, _resolve_notify_target
+            # Scripts and cron drive the CLI: the boomerang default only follows a CLI create
+            # that kanban.cli_auto_subscribe (default False) would subscribe (Prism 1aec29b63c57).
+            boomerang = _auto_boomerang(
+                getattr(args, "boomerang_wake", None),
+                worker=is_dispatcher_owned_worker_context(),
+                subscribed=bool(_cfg_get(_load_config(), "kanban", "cli_auto_subscribe", default=False)
+                                and _auto_wake(None)
+                                and _resolve_notify_target(require_platform_identity=True)))
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
@@ -993,7 +1008,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 branch_name=branch_name,
                 project_id=getattr(args, "project", None),
                 tenant=args.tenant,
-                priority=args.priority,
+                priority=(args.priority if args.priority is not None
+                          else create_default_priority(args.created_by)),
                 parents=tuple(args.parent or ()),
                 parents_kind=getattr(args, "parent_kind", None),
                 continues=getattr(args, "continues", None),
@@ -1015,7 +1031,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
-                boomerang_wake=True if getattr(args, "boomerang_wake", False) else None,
+                boomerang_wake=boomerang,
                 initial_status=getattr(args, "initial_status", "running"),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
@@ -1042,7 +1058,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 conn, task_id, after_event_id=_event_mark))
             dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(
-                conn, task_id, boomerang_wake=bool(getattr(args, "boomerang_wake", False)))
+                conn, task_id, boomerang_wake=bool(boomerang))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2

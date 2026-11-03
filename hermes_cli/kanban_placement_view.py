@@ -228,9 +228,9 @@ def format_fleet(rep: Mapping) -> List[str]:
     for name, h in _map(rep.get("hosts")).items():
         flags = (" HOT" if h.get("hot") else "") + ("" if h.get("in_pool") else " (not in pool)")
         # A pool host with no count (t_c834e0d8) reads ``uncounted``; '?' = not in the pool files.
-        slots_txt = (h.get("slots") if h.get("slots") is not None
+        slots_txt = (h.get("slots") if h.get("slots") is not None  # slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458)
                      else "uncounted" if h.get("in_pool") else "?")
-        out.append(f"  {name}: running={h['running']} slots={slots_txt} "
+        out.append(f"  {name}: running={h['running']} slots={slots_txt} "  # slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458)
                    f"free={h.get('free') if h.get('free') is not None else '?'} band={h['band']}{flags}")
         if h.get("pressure"):
             out.append(f"    pressure: {h['pressure']}")

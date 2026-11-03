@@ -10985,8 +10985,15 @@ def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
                 swaps.append(a)
             continue
         resume_key = _REVIEW_RESUME_KINDS.get(kind)
-        if resume_key and _json_dict(row["payload"]).get(resume_key) == "review":
+        payload = _json_dict(row["payload"])
+        if resume_key and payload.get(resume_key) == "review":
             in_review = True
+            # a resume that assigned the reviewer itself (``reopen_task`` sets kanban.review_assignee with no
+            # ``assigned`` event) is an assignment made in review (Prism c8c3b1ada8ab)
+            a = payload.get("assignee") if kind == "reopened" else None
+            if _nonblank_str(a):
+                last_in_review = True
+                swaps.append(a)
         elif kind in _REVIEW_EXIT_KINDS:
             in_review = False
     return swaps, last_in_review
@@ -15735,6 +15742,9 @@ def reopen_task(
                 "to_status": to_status,
                 "voided_run_id": voided_run,
                 "voided_result": (row["result"] or "")[:500] or None,
+                # the reviewer this reopen assigned implicitly (no ``assigned`` event): a reviewer of the
+                # resumed cycle for :func:`_review_cycle_scan` (Prism c8c3b1ada8ab)
+                **({"assignee": review_assignee} if review_assignee else {}),
             },
         )
 
@@ -19034,7 +19044,7 @@ def _reap_worker_session(
         if left:  # empty while a member lived: its fork may postdate the snapshot, rescan
             _signal(left, signal.SIGTERM)  # groups born during the reap get their SIGTERM too
         time.sleep(0.1)
-    _signal(_left() or {}, signal.SIGKILL, again=True)
+    _signal(_left() or {}, getattr(signal, "SIGKILL", signal.SIGTERM), again=True)
     _log.warning(
         "kanban: reaped %d leftover process group(s) of worker session %d",
         len(signalled), sid,
@@ -19386,7 +19396,7 @@ def sweep_terminal_workspace_orphans(
     except Exception:
         return {}
     me, uid = os.getpid(), os.getuid()  # windows-footgun: ok (hasattr-gated above)
-    candidates: dict[str, list] = {}
+    orphans: list = []
     for proc in psutil.process_iter(["pid", "ppid", "uids"]):
         info = proc.info
         pid = info.get("pid") or 0
@@ -19395,12 +19405,17 @@ def sweep_terminal_workspace_orphans(
         # (a 12.8k-process shared host spent seconds per tick on other users' parents).
         if pid <= 1 or pid == me or uids is None or uids.real != uid:
             continue
-        if not _init_parented(proc, info.get("ppid")):
-            continue
-        try:
-            cwd = proc.cwd()
-        except (psutil.Error, OSError):
-            continue
+        if _init_parented(proc, info.get("ppid")):
+            orphans.append(proc)
+    if not orphans:
+        return {}
+    # Out of process: a cwd on a dead NFS mount blocks psutil's cwd() with the GIL held.
+    from hermes_proc_cwd import probe_cwds
+
+    cwds = probe_cwds(p.pid for p in orphans)
+    candidates: dict[str, list] = {}
+    for proc in orphans:
+        cwd = cwds.get(proc.pid)
         if not cwd:
             continue
         try:

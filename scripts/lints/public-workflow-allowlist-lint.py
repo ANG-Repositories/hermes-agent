@@ -36,7 +36,7 @@ LOCAL_USES = re.compile(r"^\./\.github/workflows/([^@\s]+)$")
 
 def load_allowlist(root: pathlib.Path) -> list[str]:
     out = []
-    for ln in (root / ALLOWLIST).read_text(encoding="utf-8").splitlines():
+    for ln in (root / ALLOWLIST).read_text(encoding="utf-8-sig").splitlines():
         ln = ln.split("#", 1)[0].strip()
         if ln:
             out.append(ln)
@@ -77,7 +77,7 @@ def lint(root: pathlib.Path) -> list[str]:
     docs: dict[str, dict] = {}
     for f in sorted(list(wf_dir.glob("*.yml")) + list(wf_dir.glob("*.yaml"))):
         try:
-            docs[f.name] = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+            docs[f.name] = yaml.safe_load(f.read_text(encoding="utf-8-sig")) or {}
         except (OSError, yaml.YAMLError) as e:
             raise SystemExit(f"public-workflow-allowlist-lint: cannot parse {f}: {e}") from None
 

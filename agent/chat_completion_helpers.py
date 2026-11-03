@@ -258,19 +258,22 @@ _WIRE_ACCOUNT_KEY_FNS = {
 
 def _api_call_identity(
     agent: Any, headers: dict[str, str], provider: Optional[str] = None,
+    dispatch: Optional[dict] = None,
 ) -> tuple[Optional[str], str]:
     """Identity of the main-lane call. ``provider`` is the route the call was
     DISPATCHED on; defaults to the serving route, never a bare live read, so a
     provider switch while the call is in flight cannot re-attribute it to the
     new provider's subscription (FleetReview 73d9dc1df836)."""
     if provider is None:
-        provider = _serving_route(agent)["provider"]
-    return _route_identity(str(provider or "").strip().lower(), headers, agent)
+        provider = _serving_route(agent, dispatch)["provider"]
+    return _route_identity(
+        str(provider or "").strip().lower(), headers, agent, dispatch=dispatch,
+    )
 
 
 def _route_identity(
     provider: str, headers: dict[str, str], agent: Any = None,
-    *, codex_from_agent: bool = True,
+    *, codex_from_agent: bool = True, dispatch: Optional[dict] = None,
 ) -> tuple[Optional[str], str]:
     """``(sub_key, attribution)`` for one call on ``provider``.
 
@@ -290,7 +293,7 @@ def _route_identity(
     if provider in _PINNED_PROVIDER_KEYS:
         return _PINNED_PROVIDER_KEYS[provider], "pinned"
     if provider in _WIRE_ACCOUNT_KEY_FNS and codex_from_agent and agent is not None:
-        return _dispatched_wire_sub_key(agent, provider), "wire"
+        return _dispatched_wire_sub_key(agent, provider, dispatch), "wire"
     return None, "wire"
 
 
@@ -317,10 +320,12 @@ def _dispatch_route_snapshot(agent: Any, route: dict) -> dict:
     return snap
 
 
-def _dispatched_wire_sub_key(agent: Any, provider: str) -> Optional[str]:
+def _dispatched_wire_sub_key(
+    agent: Any, provider: str, dispatch: Optional[dict] = None,
+) -> Optional[str]:
     """Credential account of the in-flight request; live read only outside a
     stamped dispatch (where the live credential IS the one in use)."""
-    snap = getattr(agent, "_inflight_request_route", None)
+    snap = dispatch if isinstance(dispatch, dict) else getattr(agent, "_inflight_request_route", None)
     if isinstance(snap, dict) and _DISPATCH_SUB_KEY in snap:
         return snap[_DISPATCH_SUB_KEY]
     return _WIRE_ACCOUNT_KEY_FNS[provider](agent)
@@ -368,7 +373,22 @@ def _live_route(agent: Any) -> dict[str, str]:
     }
 
 
-def _serving_route(agent: Any) -> dict[str, str]:
+def _call_dispatch(agent: Any) -> Optional[dict]:
+    """The dispatch snapshot a physical call STARTS under, held by the call.
+
+    A physical call can outlive its dispatch: the streaming 5xx unmask probe
+    ran on an orphaned worker thread after the wall-budget cut, failed over
+    to cpa, and returned the Claude relay's 503 (``x-pool-served-by:
+    sub-vps-24``) 2 min later, when the agent's in-flight route was cpa; the
+    row was stamped provider=cpa with a Claude seat (t_beeca1dd). Recording
+    against this snapshot keeps the row on the route that made the request.
+    None outside a stamped dispatch: the live route is then the route.
+    """
+    snap = getattr(agent, "_inflight_request_route", None)
+    return dict(snap) if isinstance(snap, dict) else None
+
+
+def _serving_route(agent: Any, dispatch: Optional[dict] = None) -> dict[str, str]:
     """The route (provider/model/base_url/api_mode) the in-flight main request
     was DISPATCHED on.
 
@@ -379,7 +399,7 @@ def _serving_route(agent: Any) -> dict[str, str]:
     be recorded and priced at a model it never used (FleetReview 65e315f38776).
     Outside a stamped dispatch the live attributes ARE the route.
     """
-    snap = getattr(agent, "_inflight_request_route", None)
+    snap = dispatch if isinstance(dispatch, dict) else getattr(agent, "_inflight_request_route", None)
     if isinstance(snap, dict):
         return {k: v for k, v in snap.items() if k != _DISPATCH_SUB_KEY}
     return _live_route(agent)
@@ -392,6 +412,7 @@ def _emit_api_call_record(
     headers: Optional[dict[str, str]] = None,
     http_status: Optional[int] = None,
     api_kwargs: Optional[dict] = None,
+    dispatch: Optional[dict] = None,
 ) -> Optional[int]:
     """Fail-open bridge from the inference chokepoint to Blackbox.
 
@@ -404,11 +425,11 @@ def _emit_api_call_record(
         turn_id = str(getattr(agent, "_current_turn_id", "") or "")
         if not turn_id:
             return None
-        route = _serving_route(agent)
+        route = _serving_route(agent, dispatch)
         provider = route["provider"]
         model = route["model"]
         pool_headers = dict(headers or {})
-        sub_key, attribution = _api_call_identity(agent, pool_headers, provider)
+        sub_key, attribution = _api_call_identity(agent, pool_headers, provider, dispatch)
         seq = _next_api_call_seq(agent, turn_id)
         # Prefix-stability guard inputs (card t_c07124ab): the session the
         # request belongs to, and the one-shot marker the compressor leaves
@@ -514,7 +535,7 @@ def _emit_aux_api_call_record(
         logger.warning("blackbox aux API-call insert failed", exc_info=True)
 
 
-def _note_billed_response(agent: Any, response: Any) -> None:
+def _note_billed_response(agent: Any, response: Any, dispatch: Optional[dict] = None) -> None:
     """Register a transport-accepted (billed) response for loop accounting.
 
     The per-call ledger row is written HERE, at the transport chokepoint, for
@@ -539,14 +560,17 @@ def _note_billed_response(agent: Any, response: Any) -> None:
             agent._billed_unaccounted = pending
         pending.append({
             "response": response,
-            **_serving_route(agent),
+            **_serving_route(agent, dispatch),
             "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
         })
     except Exception:
         logger.debug("billed-response registration failed", exc_info=True)
 
 
-def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[dict] = None) -> None:
+def _record_successful_api_call(
+    agent: Any, response: Any, api_kwargs: Optional[dict] = None,
+    dispatch: Optional[dict] = None,
+) -> None:
     if response is None or getattr(response, "_api_call_failure_recorded", False):
         return
     # Idempotent per response object: upstream's streaming-5xx unmask probe obtains its
@@ -564,7 +588,7 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     disarm(agent)
     # Registered BEFORE the pooled-header guard below: a response whose ledger
     # row cannot be attributed was still billed and must still be counted.
-    _note_billed_response(agent, response)
+    _note_billed_response(agent, response, dispatch)
     # A served call means the last stashed API error recovered in place; it
     # must not be attributed to a later, unrelated failover.
     agent._pending_fallback_error = None
@@ -574,7 +598,7 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     # The route the call went out on, not the live agent (FleetReview
     # 73d9dc1df836): a switch to/from a pooled provider mid-flight must not
     # drop or mis-gate this call's ledger row.
-    _route = _serving_route(agent)
+    _route = _serving_route(agent, dispatch)
     provider = _route["provider"].strip().lower()
     if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
         _note_api_call_recording_failure(agent)
@@ -598,6 +622,7 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
         headers=headers if isinstance(headers, dict) else {},
         http_status=200,
         api_kwargs=api_kwargs,
+        dispatch=dispatch,
     )
     # The latest successful row is the one the loop's accept site commits; a
     # composite (MoA) call hangs its physical children off it.
@@ -666,7 +691,10 @@ def _emit_composite_api_call_records(
         return 0
 
 
-def _record_failed_api_call(agent: Any, error: BaseException, api_kwargs: Optional[dict] = None) -> None:
+def _record_failed_api_call(
+    agent: Any, error: BaseException, api_kwargs: Optional[dict] = None,
+    dispatch: Optional[dict] = None,
+) -> None:
     response = getattr(error, "response", None)
     status = getattr(error, "status_code", None)
     if status is None:
@@ -677,6 +705,7 @@ def _record_failed_api_call(agent: Any, error: BaseException, api_kwargs: Option
         headers=_snapshot_pool_headers(response),
         http_status=int(status) if isinstance(status, int) else None,
         api_kwargs=api_kwargs,
+        dispatch=dispatch,
     )
 
 
@@ -2055,7 +2084,7 @@ def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
 
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(agent, api_kwargs: dict, *, dispatch: Optional[dict] = None):
     """Run the API call on a worker thread so the caller can detect interrupts
     without waiting for the full HTTP round-trip. Each worker gets its own
     per-request client (interrupts close only that one); a stale-call detector
@@ -2066,6 +2095,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # One fresh correlation id per HTTP attempt (bridge lanes only); the ledger
     # row for this attempt reads the same value back off api_kwargs.
     stamp_call_id(agent, api_kwargs)
+    if dispatch is None:
+        dispatch = _call_dispatch(agent)
     # S7 D1: harness-minted route id (pinned lanes) + lane-src (bpr/pinned).
     stamp_correlation_headers(agent, api_kwargs)
     stamp_bridge_lane(agent, api_kwargs)
@@ -2073,9 +2104,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         try:
             response = direct_api_call(agent, api_kwargs)
         except Exception as exc:
-            _record_failed_api_call(agent, exc, api_kwargs)
+            _record_failed_api_call(agent, exc, api_kwargs, dispatch)
             raise
-        _record_successful_api_call(agent, response, api_kwargs)
+        _record_successful_api_call(agent, response, api_kwargs, dispatch)
         return response
     _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
     from agent.chat_completion_nonstream import _NonStreamRequest
@@ -2083,10 +2114,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     try:
         response = _NonStreamRequest(agent, api_kwargs).run()
     except Exception as exc:
-        _record_failed_api_call(agent, exc, api_kwargs)
+        _record_failed_api_call(agent, exc, api_kwargs, dispatch)
         raise
     if response is not None:
-        _record_successful_api_call(agent, response, api_kwargs)
+        _record_successful_api_call(agent, response, api_kwargs, dispatch)
     return response
 
 
@@ -4976,6 +5007,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
         # The route ``api_kwargs`` was assembled for; a retry must not replay it on another one.
         self._request_route = self._live_route()
+        self._dispatch = _call_dispatch(agent)  # ledger route; outlives a failover
 
     # ── shared small helpers ────────────────────────────────────────────
 
@@ -5848,7 +5880,7 @@ class _StreamingCall(StreamingWaitMonitor):
             return False
         # The transport made a real attempt: append its zero-token blackbox row before
         # retry/failover classification (interrupt-forced closes above are excluded).
-        _record_failed_api_call(self.agent, e, self.api_kwargs)
+        _record_failed_api_call(self.agent, e, self.api_kwargs, self._dispatch)
         self.result["failure_recorded"] = True
         _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout))
         # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader,
@@ -5989,7 +6021,8 @@ class _StreamingCall(StreamingWaitMonitor):
         stale_timeout = self._stream_stale_timeout
         self._stream_stale_timeout = float("inf")  # no chunks arrive during the probe
         try:
-            probe = interruptible_api_call(self.agent, probe_kwargs)
+            # The probe belongs to this stream's dispatch, not the agent's live route.
+            probe = interruptible_api_call(self.agent, probe_kwargs, dispatch=self._dispatch)
         except (KeyboardInterrupt, InterruptedError):
             raise  # the outer handler routes user interrupts; never swallow them
         except Exception as probe_err:
@@ -6355,7 +6388,7 @@ class _StreamingCall(StreamingWaitMonitor):
             # recovered via continuation, NOT a failover — drop the pending stream-error
             # reason so it can't leak a stale "(connection dropped)" rider onto a later failover.
             self.agent._pending_stream_error_reason = None
-            _record_successful_api_call(self.agent, self.result["response"], self.api_kwargs)
+            _record_successful_api_call(self.agent, self.result["response"], self.api_kwargs, self._dispatch)
         # Propagate first-chunk timing for the ``post_api_request`` hook.
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])

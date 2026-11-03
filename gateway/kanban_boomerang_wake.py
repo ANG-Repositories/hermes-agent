@@ -1,7 +1,8 @@
 """Boomerang wake: persisted state, auto-dispatch, verdict executor, reconciler (Boomerang v2).
 
 A card at subscription level ``boomerang wake`` (``tasks.boomerang_wake``; its waker row stays
-``notify+wake`` / ``wake``) lets a background boomerang child take its mechanical wakes. The card is the ONLY setting: there is no config knob, session toggle or board default.
+``notify+wake`` / ``wake``) lets a background boomerang child take its mechanical wakes. The card stores the level; operator auto-subscriptions default to it via
+``kanban.auto_subscribe_boomerang`` (false restores plain wake).
 The emergency stop is the file ``<HERMES_HOME>/state/boomerang-wake.disabled`` (:func:`enabled`).
 
 ``<HERMES_HOME>/gateway/kanban_boomerang_wake.json`` holds ``retries[task_id]``: how many
@@ -170,12 +171,20 @@ class BoomerangWakeState:
             entry = self._claims_of(self._read()).get(key)
         return dict(entry) if isinstance(entry, dict) else None
 
-    def update_claim(self, key: str, **fields) -> Optional[dict]:
+    def update_claim(self, key: str, *, handback: Optional[tuple] = None, **fields) -> Optional[dict]:
+        """``handback=(delegation_id, row)`` persists that pending row (unless one exists) in the
+        SAME file write as the claim fields: a claim never turns terminal without its handback."""
         with _LOCK:
             data = self._read()
+            if handback is not None:
+                rows = self._handbacks_of(data)
+                rows.setdefault(handback[0], dict(handback[1]))
+                data["handbacks"] = rows
             claims = self._claims_of(data)
             entry = claims.get(key)
             if not isinstance(entry, dict):
+                if handback is not None:
+                    self._write(data)
                 return None
             entry = {**entry, **fields}
             claims[key] = entry
@@ -188,6 +197,49 @@ class BoomerangWakeState:
             return {}
         with _LOCK:
             return {k: dict(v) for k, v in self._claims_of(self._read()).items() if isinstance(v, dict)}
+
+    # --- pending handbacks: ``handbacks[delegation_id]`` = what the operator still has to receive.
+    # Written BEFORE any send; a part leaves the row only on its delivery receipt.
+
+    @staticmethod
+    def _handbacks_of(data: dict) -> dict:
+        raw = data.get("handbacks")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def put_handback(self, delegation_id: str, row: dict) -> bool:
+        """Persist ``row`` unless one exists for the delegation; True when written."""
+        with _LOCK:
+            data = self._read()
+            rows = self._handbacks_of(data)
+            if delegation_id in rows:
+                return False
+            rows[delegation_id] = dict(row)
+            data["handbacks"] = rows
+            self._write(data)
+            return True
+
+    def update_handback(self, delegation_id: str, **fields) -> None:
+        with _LOCK:
+            data = self._read()
+            rows = self._handbacks_of(data)
+            if isinstance(rows.get(delegation_id), dict):
+                rows[delegation_id] = {**rows[delegation_id], **fields}
+                data["handbacks"] = rows
+                self._write(data)
+
+    def drop_handback(self, delegation_id: str) -> None:
+        with _LOCK:
+            data = self._read()
+            rows = self._handbacks_of(data)
+            if rows.pop(delegation_id, None) is not None:
+                data["handbacks"] = rows
+                self._write(data)
+
+    def handbacks(self) -> dict:
+        if not self.path.exists():
+            return {}
+        with _LOCK:
+            return {k: dict(v) for k, v in self._handbacks_of(self._read()).items() if isinstance(v, dict)}
 
 
 # ==========================================================================================
@@ -209,6 +261,7 @@ MAX_MINUTES = 45            # ledger max_minutes; the reconciler cancels a live 
 PARENT_BUSY_WAIT_S = 30.0   # §5.5: wait for a mid-turn parent, off the notifier loop
 CANCEL_WAIT_S = 60.0        # §5.7: bounded wait for a cancelled child to exit
 RECEIPT_KIND = "boomerang_wake_executed"
+DELIVERED_KIND = "boomerang_handback_delivered"  # chat-line delivered marker (per delegation)
 VIA = "boomerang-wake"
 # Compat: receipts written before the rename (a claim left EXECUTING across the deploy).
 LEGACY_RECEIPTS = frozenset({("auto_handle_executed", "auto-handle")})
@@ -849,12 +902,15 @@ def _verify_land_inherited(entry: dict, verdict: dict, kb: Any, conn: Any) -> Op
     return None
 
 
-def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[BoomerangWakeState] = None) -> dict:
+def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[BoomerangWakeState] = None,
+                    handback: bool = False) -> dict:
     """Validate the child's verdict and do at most ONE allowlisted board write (§5.8, D-19).
 
     Gateway process only (never a child context). Returns ``{"ok", "action", "reason",
     "summary"}``; ``ok`` False means nothing was written and the caller surfaces the wake.
-    ``noop`` marks a replayed handoff on a terminal entry."""
+    ``noop`` marks a replayed handoff on a terminal entry. ``handback`` (run_entry): the pending
+    handback row is persisted in the SAME state write that makes the claim terminal, so no exit
+    between the two can lose it (ruling t_e98f651e-handback-first-then-everything, Prism b967232e9f89)."""
     from hermes_cli import kanban_db as kb
 
     state = state or BoomerangWakeState()
@@ -880,7 +936,9 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     conn = kb.connect(board=live.get("board"))
     try:
         if _receipt_exists(conn, live["task_id"], live["delegation_id"]):
-            state.update_claim(key, state=STATE_TERMINAL, outcome=action)
+            state.update_claim(key, state=STATE_TERMINAL, outcome=action,
+                               handback=handback_row(live, {"summary": summary, "action": action})
+                               if handback else None)
             return {"ok": False, "action": action, "reason": "replay", "summary": summary, "noop": True}
         why = _moved(live, kb, conn)
         if why:
@@ -900,21 +958,184 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
             return {"ok": False, "action": action, "reason": f"write refused: {exc}", "summary": summary}
     finally:
         conn.close()
-    state.update_claim(key, state=STATE_TERMINAL, outcome=action, finished_at=_time.time())  # RC-5 (3)
+    state.update_claim(key, state=STATE_TERMINAL, outcome=action, finished_at=_time.time(),  # RC-5 (3)
+                       handback=handback_row(live, {"summary": summary or action, "action": action})
+                       if handback else None)
     return {"ok": True, "action": action, "reason": "", "summary": summary or action, "evidence": finding["evidence"]}
 
 
 # --- delivery (event loop) ----------------------------------------------------------------
 
+def deadman_owner_acted(entry: dict) -> bool:
+    """Check operator provenance since review began, not merely since child dispatch."""
+    if entry.get("row") != ROW_REVIEW_DEADMAN:
+        return False
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_wake_defer import owner_acted
+
+    conn = _readonly(kb, entry.get("board"))
+    try:
+        task = kb.get_task(conn, entry["task_id"])
+        review = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+            "AND id <= ? ORDER BY id DESC LIMIT 1",
+            (entry["task_id"], entry.get("event_id") or 0)).fetchone()
+        return bool(owner_acted(conn, {"task_id": entry["task_id"],
+                                     "owner": _field(task, "assignee"),
+                                     "home_sid": entry.get("home_sid"),
+                                     "cursor": review[0] if review else entry.get("event_id", 0)}))
+    finally:
+        conn.close()
+
+
+#: Handback parts: ``turn`` = resurface() into the home session (surface verdicts only),
+#: ``line`` = the passive ``boomerang handled`` chat line.
+PART_TURN, PART_LINE = "turn", "line"
+# Delegations whose pending row is being sent right now (the run_entry drain and the tick drain
+# share one event loop; the check-and-add below never awaits, so it is the whole mutex).
+_DELIVERING: set = set()
+
+
+def _delivered_parts(kb: Any, conn: Any, task_id: str, delegation_id: str) -> set:
+    """Parts whose delivery receipt is on the board (a marker with no ``part`` is the line)."""
+    return {(ev.payload or {}).get("part") or PART_LINE for ev in kb.list_events(conn, task_id)
+            if ev.kind == DELIVERED_KIND and (ev.payload or {}).get("delegation_id") == delegation_id}
+
+
+def handback_row(entry: dict, result: dict, *, turn_text: Optional[str] = None) -> tuple:
+    """``(delegation_id, row)``: the pending handback a verdict owes the operator. Parts already
+    receipted on the board are skipped at delivery (``_deliver_one``), so this needs no board read."""
+    summary = _first_line(result.get("summary")) or result.get("action") or "handled"
+    row = entry.get("row") or entry.get("kind") or "wake"
+    parts = ([PART_TURN] if turn_text is not None else []) + [PART_LINE]
+    return entry["delegation_id"], {
+        "task_id": entry["task_id"], "board": entry.get("board"), "route": dict(entry.get("route") or {}),
+        "home_sid": entry.get("home_sid") or "", "title": entry.get("title"), "kind": entry.get("kind"),
+        "event_ts": entry.get("event_ts"), "claim_key": entry.get("key"), "parts": parts,
+        "line": f"boomerang handled {entry['task_id']} ({row}): {summary}", "turn": turn_text,
+        "attempts": 0, "created_at": _time.time()}
+
+
+def _breadcrumb(entry: dict, result: dict) -> None:
+    """The card's ``boomerang:`` comment, once per delegation. Best-effort: a failure logs and never
+    raises past the handback (ruling t_e98f651e-handback-first-then-everything, Prism 9def48086ed1)."""
+    from hermes_cli import kanban_db as kb
+
+    summary = _first_line(result.get("summary")) or result.get("action") or "handled"
+    row = entry.get("row") or entry.get("kind") or "wake"
+    tag = f"(delegation {entry['delegation_id']})"
+    try:
+        conn = kb.connect(board=entry.get("board"))
+        try:
+            if not any(c.author == AUTHOR and c.body.startswith("boomerang: ") and c.body.endswith(tag)
+                       for c in kb.list_comments(conn, entry["task_id"])):
+                with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+                    kb.add_comment(conn, entry["task_id"], AUTHOR, f"boomerang: {row} {summary} {tag}")
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: breadcrumb on %s not written: %s", entry.get("task_id"), exc)
+
+
+def enqueue_handback(entry: dict, result: dict, *, state: BoomerangWakeState, stale: bool = False,
+                     turn_text: Optional[str] = None) -> None:
+    """Durable pending row FIRST, then the best-effort card breadcrumb. Idempotent per delegation.
+
+    ``stale`` (the operator already acted) writes only the breadcrumb: nothing to chat."""
+    if not stale:
+        did, row = handback_row(entry, result, turn_text=turn_text)
+        state.put_handback(did, row)
+    _breadcrumb(entry, result)
+
+
+def _board_delivered(board: Optional[str], task_id: str, delegation_id: str) -> set:
+    from hermes_cli import kanban_db as kb
+
+    conn = _readonly(kb, board)
+    try:
+        return _delivered_parts(kb, conn, task_id, delegation_id)
+    finally:
+        conn.close()
+
+
+def _mark_delivered(board: Optional[str], task_id: str, delegation_id: str, part: str) -> None:
+    """The delivered marker; written from a send receipt and nowhere else."""
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board=board)
+    try:
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"), kb.write_txn(conn):
+            kb._append_event(conn, task_id, DELIVERED_KIND,  # noqa: SLF001 -- the one event writer
+                             {"delegation_id": delegation_id, "part": part, "via": VIA})
+    finally:
+        conn.close()
+
+
+async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: str, row: dict) -> int:
+    entry = dict(row, delegation_id=delegation_id)
+    try:
+        done = await asyncio.to_thread(_board_delivered, row.get("board"), row["task_id"], delegation_id)
+    except Exception as exc:   # unreadable board: send; the state row still dedupes
+        logger.debug("kanban boomerang-wake: delivered read for %s failed (%s)", row.get("task_id"), exc)
+        done = set()
+    left = [p for p in row.get("parts") or [] if p not in done]
+    sent = 0
+    for part in list(left):
+        if part == PART_TURN:
+            ok = await resurface(runner, entry, row.get("turn"))
+        else:
+            ok = await post_line(runner, entry, str(row.get("line") or ""))
+        if not ok:
+            continue
+        left.remove(part)
+        sent += 1
+        try:
+            await asyncio.to_thread(_mark_delivered, row.get("board"), row["task_id"], delegation_id, part)
+        except Exception as exc:   # the state row below still records it
+            logger.warning("kanban boomerang-wake: delivered marker for %s not written: %s", row["task_id"], exc)
+        if part == PART_TURN and row.get("claim_key"):
+            await asyncio.to_thread(state.update_claim, row["claim_key"], resurface_delivered=True)
+    if left:
+        await asyncio.to_thread(state.update_handback, delegation_id, parts=left,
+                                attempts=int(row.get("attempts") or 0) + 1, last_attempt_at=_time.time())
+        logger.info("kanban boomerang-wake: %s handback pending parts=%s attempts=%d delegation=%s",
+                    row["task_id"], left, int(row.get("attempts") or 0) + 1, delegation_id)
+    else:
+        await asyncio.to_thread(state.drop_handback, delegation_id)
+    return sent
+
+
+async def deliver_handbacks(runner: Any, state: BoomerangWakeState, *,
+                            delegation_id: Optional[str] = None) -> int:
+    """Drain pending handbacks (all, or one delegation's); returns the parts delivered."""
+    rows = await asyncio.to_thread(state.handbacks)
+    sent = 0
+    for did, row in rows.items():
+        if (delegation_id is not None and did != delegation_id) or did in _DELIVERING:
+            continue
+        _DELIVERING.add(did)
+        try:
+            sent += await _deliver_one(runner, state, did, row)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: handback %s not delivered: %s", did, exc)
+        finally:
+            _DELIVERING.discard(did)
+    return sent
+
+
 async def post_line(runner: Any, entry: dict, text: str) -> bool:
-    """One line to the claim's origin chat (the subscription's chat, or the home session's)."""
+    """One line to the claim's origin chat (the subscription's chat, or the home session's).
+
+    True only on the adapter's receipt (``SendResult.success is True``)."""
     route = entry.get("route") or {}
     try:
         adapter = runner._kanban_route_adapter(route.get("platform"), route.get("profile"))  # noqa: SLF001
         if adapter is None:
             raise RuntimeError("no adapter")
         meta = {"thread_id": route["thread_id"]} if route.get("thread_id") else {}
-        await adapter.send(route.get("chat_id"), text, metadata=meta)
+        res = await adapter.send(route.get("chat_id"), text, metadata=meta)
+        if getattr(res, "success", None) is not True:
+            raise RuntimeError(f"send not confirmed: {getattr(res, 'error', None) or res!r}")
         return True
     except Exception as exc:
         logger.warning("kanban boomerang-wake: line for %s not posted (%s): %s", entry.get("task_id"), exc, text)
@@ -971,7 +1192,11 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
         card = {"board": entry.get("board"), "task_id": entry["task_id"], "title": entry.get("title"),
                 "items": [{"kind": entry.get("kind"), "trigger": "boomerang_wake_resurface",
                            "event_ts": entry.get("event_ts")}]}
-        await _ow.deliver_turn(runner, home, text if text is not None else str(entry.get("wake_text") or ""), [card])
+        ok = await _ow.deliver_turn(runner, home, text if text is not None else str(entry.get("wake_text") or ""),
+                                    [card])
+        if ok is not True:   # no admission receipt (busy queue at cap, no handler): not delivered
+            logger.warning("kanban boomerang-wake: turn for %s not admitted by the adapter", entry.get("task_id"))
+            return False
         return True
     except Exception as exc:
         logger.warning("kanban boomerang-wake: re-surface of %s failed: %s", entry.get("task_id"), exc)
@@ -1130,6 +1355,8 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
     live = await asyncio.to_thread(state.get_claim, key) or entry
     if live.get("state") in (STATE_CANCELLED, STATE_TERMINAL) or live.get("resurfaced"):
         logger.info("kanban boomerang-wake: %s %s late handoff dropped", LATE_TAG, live["task_id"])
+        # A replay never noops past a pending handback: it retries the send (Prism d74bf844f9a4).
+        await deliver_handbacks(runner, state, delegation_id=live.get("delegation_id"))
         return
     try:
         await asyncio.to_thread(ledger_append, {"event": "close", "delegation_id": live["delegation_id"],
@@ -1139,25 +1366,39 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
     if status != "completed":
         await _fail(runner, live, f"child {status}: {_first_line(final, 200)}", state)
         return
-    result = await asyncio.to_thread(execute_verdict, live, final, state=state)
+    if await asyncio.to_thread(deadman_owner_acted, live):
+        await asyncio.to_thread(enqueue_handback, live, {"summary": "operator already acted; stale wake ignored"},
+                                state=state, stale=True)
+        await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale")
+        return
+    # handback=True: the pending row commits with the terminal claim (one state write), then the
+    # best-effort breadcrumb, then the send (ruling t_e98f651e-handback-first-then-everything).
+    result = await asyncio.to_thread(execute_verdict, live, final, state=state, handback=True)
     if result.get("noop"):
+        if result.get("action"):   # receipt already on the board: its handback is still owed
+            await asyncio.to_thread(enqueue_handback, live, result, state=state)
+        await deliver_handbacks(runner, state, delegation_id=live["delegation_id"])
         return
     if result["ok"]:
-        detail = "".join(f"\n> {e}" for e in result.get("evidence") or [])
-        await post_line(runner, live, f"[boomerang-wake] {live['task_id']} — {result['summary']}{detail}")
+        await asyncio.to_thread(_breadcrumb, live, result)
+        await deliver_handbacks(runner, state, delegation_id=live["delegation_id"])
         logger.info("kanban boomerang-wake: %s handled action=%s delegation=%s",
                     live["task_id"], result["action"], live["delegation_id"])
         return
     if result.get("surface"):
-        if result.get("degraded"):
-            await post_line(runner, live, f"⚠️ boomerang-wake {live['task_id']}: {result['reason']}")
         try:
             await asyncio.to_thread(record_surface, live, result.get("summary") or "")
         except Exception as exc:
             logger.warning("kanban boomerang-wake: surfaced comment on %s not written: %s", live["task_id"], exc)
-        ok = await resurface(runner, live, finding_text(live, result, "child surfaced"))
+        # The operator turn (resurface) AND the passive line, both pending until their receipt;
+        # the tick retries whichever failed and flips resurface_delivered (Prism 03c34f4faffe).
+        # The pending row commits in the same state write as the terminal claim (Prism b967232e9f89).
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="surfaced",
-                                resurfaced=True, resurface_delivered=ok)
+                                resurfaced=True, resurface_delivered=False,
+                                handback=handback_row(live, result,
+                                                      turn_text=finding_text(live, result, "child surfaced")))
+        await asyncio.to_thread(_breadcrumb, live, result)
+        await deliver_handbacks(runner, state, delegation_id=live["delegation_id"])
         return
     text = finding_text(live, result, "child verdict refused") if result.get("refused") else None
     await _fail(runner, live, result["reason"], state, text)
@@ -1369,6 +1610,10 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
     state = state or BoomerangWakeState()
     if not state.path.exists():
         return 0
+    try:   # the one retry loop for undelivered handbacks
+        await deliver_handbacks(runner, state)
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: handback drain failed: %s", exc)
     now = _time.time() if now is None else now
     handled = 0
     claims = await asyncio.to_thread(state.claims)
@@ -1398,7 +1643,10 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
             continue
         if st == STATE_EXECUTING and await asyncio.to_thread(
                 board_has_receipt, entry.get("board"), entry["task_id"], entry["delegation_id"]):
-            await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome=entry.get("action"))
+            # The write landed before the exit: its handback is owed too, in the same state write.
+            await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome=entry.get("action"),
+                                    handback=handback_row(entry, {"action": entry.get("action")}))
+            await deliver_handbacks(runner, state, delegation_id=entry.get("delegation_id"))
             continue
         if not await _superseded_by_terminal(runner, entry, "gateway restart", state):
             await _restart_redispatch_or_lost(runner, entry, state, now)
