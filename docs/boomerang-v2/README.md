@@ -135,6 +135,16 @@ session `/autohandle` toggle and no board default (Ace 2026-10-22, t_7be18632).
 | `wake` | `notify+wake` / `wake` | Passive line + a turn in the subscribed session. |
 | `boomerang wake` | `notify+wake` / `wake` (+ `tasks.boomerang_wake = 1`) | Mechanical events go to a background boomerang child (§3 `auto`); everything else wakes as `wake`. |
 
+`kanban.auto_subscribe_boomerang` defaults to `true`: new operator-created cards with an
+originating gateway auto-subscription use boomerang wake. The tool's `boomerang_wake: false`
+or `kanban create --no-boomerang-wake` opts out for one card. Set the config knob to `false`
+to restore plain notify+wake for future cards; existing cards are unchanged. Worker-created
+cards do not inherit this default. A CLI create (`hermes kanban create`, which scripts and
+cron also drive) inherits it only when `kanban.cli_auto_subscribe` (default `false`) would
+subscribe it; `--boomerang-wake` still sets it explicitly. The knob is read on create;
+once this code is loaded, flipping it needs no restart. Loading this code into a running
+gateway does require a restart.
+
 `tasks.boomerang_wake` holds the level (`kanban show` prints `level: boomerang wake`). Set it with
 `hermes kanban create --boomerang-wake`, `kanban edit <id> --boomerang-wake` /
 `--no-boomerang-wake`, `kanban notify-subscribe <id> --boomerang-wake` (= `--delivery-mode
@@ -157,11 +167,19 @@ Scope: boomerang wake is armed for the `default` (Apollo) profile only (spec §2
 
 ## 5. Lines you will see in the origin chat
 
-**`[boomerang-wake] <card> — <Outcome>`**
-One line per boomerang-wake child, rendered from the child's structured handoff (Outcome / Changed
-/ Commands-validation / Blockers), with expandable detail (D-7, INV-6). What to do: read it; act
-only if the Outcome is wrong. If the child did something that needed you, revert it and treat it
-as a mis-disposition (it counts as a mis-disposition).
+**`boomerang handled <card> (<row>): <summary>`**
+One passive line when a child resolves or surfaces a wake, plus a card comment
+`boomerang: <row> <summary>`. This is not a deadman page or a system wake. A `surface` verdict
+also delivers the child's finding to the home session as a turn (`[boomerang-wake] child
+surfaced ...`). If the operator already commented since review began, only the card breadcrumb
+is written; chat stays silent.
+
+Delivery is durable: the gateway writes a pending handback (`handbacks[<delegation>]` in
+`gateway/kanban_boomerang_wake.json`) before any send. A line counts as delivered only on the
+adapter's `SendResult.success`, and a turn only when it is enqueued. Each delivered part writes a
+`boomerang_handback_delivered` event (`part: line|turn`). Every notifier tick retries the parts
+that are still pending, and a replayed verdict retries rather than doing nothing. A failed
+surface turn leaves the claim at `resurface_delivered: false` until a retry lands it.
 
 **`[boomerang-waking…]`**
 The passive event line for a wake that went to a child. A matching `[boomerang-wake]` or `⚠️` line
