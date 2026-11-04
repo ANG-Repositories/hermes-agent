@@ -474,13 +474,13 @@ class TestGatewayFlushMaintainsEffectiveLastActive:
                     lambda *_args, **_kwargs: None,
                 )
             recompute_calls = []
-            recompute = db.recompute_effective_last_active
+            recompute = db._recompute_last_active_best_effort
 
-            def _track_recompute(session_id):
+            def _track_recompute(conn, session_id):
                 recompute_calls.append(session_id)
-                recompute(session_id)
+                recompute(conn, session_id)
 
-            monkeypatch.setattr(db, "recompute_effective_last_active", _track_recompute)
+            monkeypatch.setattr(db, "_recompute_last_active_best_effort", _track_recompute)
 
             agent._flush_messages_to_session_db(
                 [
@@ -510,8 +510,8 @@ class TestGatewayFlushMaintainsEffectiveLastActive:
             recompute_calls = []
             monkeypatch.setattr(
                 db,
-                "recompute_effective_last_active",
-                lambda session_id: recompute_calls.append(session_id),
+                "_recompute_last_active_best_effort",
+                lambda _conn, session_id: recompute_calls.append(session_id),
             )
 
             agent._flush_messages_to_session_db(
@@ -531,12 +531,15 @@ class TestGatewayFlushMaintainsEffectiveLastActive:
         try:
             agent = self._make_agent(db, "recompute-failure")
 
-            def _raise_recompute(_session_id):
+            def _raise_recompute(_conn, _session_id):
                 raise RuntimeError("recompute failed")
 
+            # The recompute now runs inside the append txn: its failure must roll back only itself.
+            agent._ensure_db_session()  # session creation recomputes too; arm the failure after it
+            monkeypatch.setattr(db, "_bump_effective_last_active_for_message", lambda *_a, **_k: None)
             monkeypatch.setattr(
                 db,
-                "recompute_effective_last_active",
+                "_recompute_effective_last_active_for_session",
                 _raise_recompute,
             )
             messages = [{"role": "user", "content": "durable user turn"}]
