@@ -661,6 +661,8 @@ NOT_A_CARD_REFUSAL = {
     "continue: dry_run": "the --dry-run preview; admit never dry-runs",
     "return: _cap == 0": "`dispatch --max 0`, an operator argument; admit has no --max (spec item 5)",
     "continue: record_only is not None": "the tail behind an EARLIER row's wall; admit routes one row",
+    "break: spawn_budget is not None and spawned >= spawn_budget": "budget spent by EARLIER ready rows; admit routes one row",
+    "continue: route_first": "budget spent by EARLIER ready rows; admit routes one row",
     "rows: sorted": "orders the rows; admit has one",
     "rows: bool": "the placement-record gate snapshot",
     "rows: _capabilities_unplanned": "dry-run preview only",
@@ -706,12 +708,13 @@ def _site_triggers():
         ctx["kanban_cfg"] = {"max_spawn": 1}
         return "studio", "twin", "spawn_capped: max_spawn=1"
 
-    def review_reservation(m, ctx):
+    def review_ahead(m, ctx):
+        # A review card that outranks the card owns the one slot max_spawn leaves.
         with kb.connect_closing() as conn:
-            rid = kb.create_task(conn, title="review", assignee="alpha")
+            rid = kb.create_task(conn, title="review", assignee="alpha", priority=5)
             conn.execute("UPDATE tasks SET status='review' WHERE id=?", (rid,))
         ctx["kanban_cfg"] = {"max_spawn": 1}
-        return "studio", "twin", "total:ready_budget"
+        return "studio", "twin", "total:max_spawn"
 
     def no_worker(m, ctx):
         upd("UPDATE tasks SET no_worker=1 WHERE id=?", ctx)
@@ -990,8 +993,7 @@ def _site_triggers():
         "return: _kbudget.evaluate_board_budget(board, _kb.kanban_db_path(board=board), "
         "_kb.board_state_dir(board), cache=budget_cache)": budget,
         "return: running_count >= max_spawn": max_spawn,
-        "break: ready_budget is not None and spawned >= ready_budget": review_reservation,
-        "continue: route_first": review_reservation,
+        "continue: _ahead and spawn_budget is not None and spawned + _ahead >= spawn_budget": review_ahead,
         "rows: _kb._drop_no_worker_rows": no_worker,
         "rows: _drop_human_lane_rows": human_lane,
         "rows: _kph.held_routes": pause_pre,
