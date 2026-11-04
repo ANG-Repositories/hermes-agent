@@ -831,7 +831,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
-def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = False) -> bool:
+def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = False,
+                              explicit_home: Optional[str] = None) -> bool:
     """Subscribe the originating chat to ``task_id`` when configured.
 
     Gated by ``kanban.cli_auto_subscribe`` (default False). ``hermes kanban
@@ -847,6 +848,9 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
     gateway chat as its waker whatever the knob says (row ``notify+wake``; the level is
     ``tasks.boomerang_wake``).
 
+    ``explicit_home`` (the ``--session`` value, t_ea40ff83): a home that is not the
+    caller's own subscribes the HOME's chat, never the caller's.
+
     Returns True when a subscription row was written. Never raises — a
     notification bookkeeping failure must not fail the create.
     """
@@ -860,6 +864,8 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
         return subscribe_calling_session(
             conn, task_id, require_platform_identity=True,
             wake=True if boomerang_wake else None,
+            explicit_home=(None if explicit_home is None
+                           else (explicit_home, _caller_session_id())),
         )
     except Exception:
         return False
@@ -1058,7 +1064,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 conn, task_id, after_event_id=_event_mark))
             dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(
-                conn, task_id, boomerang_wake=bool(boomerang))
+                conn, task_id, boomerang_wake=bool(boomerang),
+                explicit_home=(task.session_id or "" if getattr(args, "session", None) is not None
+                               else None))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1429,15 +1437,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not task:
             return _err(f"no such task: {args.task_id}")
         comments = kb.list_comments(conn, args.task_id)
-        # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived
-        from hermes_cli import kanban_archive_read as kar
-        archived = kar.archived_rows(conn, args.task_id, **rsk)
         events = kb.list_events(conn, args.task_id)
         parent_links = kb.parent_links(conn, args.task_id)
         child_links = kb.child_links(conn, args.task_id)
         parents = [pid for pid, _kind in parent_links]
         children = [cid for cid, _kind in child_links]
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived. Read AFTER the
+        # live comments and runs, deduped by id, so a move committing in between cannot empty the history.
+        from hermes_cli import kanban_archive_read as kar
+        archived = kar.archived_rows(conn, args.task_id, **rsk, live_comment_ids=[c.id for c in comments],
+                                     live_run_ids=[r.id for r in runs])
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         refusal = (
@@ -5161,7 +5171,7 @@ _SLASH_KANBAN_HELP = """\
 **/kanban** — manage the shared task board.
 
 Common subcommands:
-  `list` (alias `ls`)   List tasks on the current board
+  `list` (alias `ls`)   List tasks on a board (`--board <slug>`)
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)
