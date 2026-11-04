@@ -198,6 +198,9 @@ def test_gate_forks_scale_with_repos_not_cards_across_ttl_expiry(
         path.mkdir(parents=True)
     ttl = getattr(prg, "_REPO_PROBE_TTL_SECONDS", 120)
     periods = 3
+    # The counter wrapped subprocess.run before the two _git_init calls above
+    # (init + remote add each); count only the probe forks from here on.
+    del git_spawns[:]
     for _ in range(periods):
         for path in scratch:
             assert prg.repo_context(workspace_path=str(path), body="see #12") is None
