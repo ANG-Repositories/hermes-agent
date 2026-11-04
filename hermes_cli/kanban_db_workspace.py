@@ -895,6 +895,14 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
                 target, repo_root,
             )
         args = ["worktree", "add", "--no-track", "-b", branch_name, str(target), base or "HEAD"]
+    # Anything non-empty at the target that is not a live worktree of this
+    # repo (the branch above already reused those) makes `worktree add` refuse
+    # "already exists" on every retry (t_5c6c67c5 burned 3 spawns to gave_up).
+    # It is held (uncharged, card stays ready) for the operator, never moved.
+    from hermes_cli.kanban_worktree_stub import dead_stub_hold, target_occupied
+
+    if target_occupied(repo_root, target):
+        raise dead_stub_hold(repo_root, target)
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()

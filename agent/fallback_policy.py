@@ -1461,15 +1461,34 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
         if "newly-activated" in t or "young" in t:
             return "young-seat ceiling"
         if "capacity" in t:
+            from agent.fork_ext.relay_quota import pool_pressure_label
+
+            pp = row.get("pool_pressure")
+            if isinstance(pp, Mapping):
+                return pool_pressure_label(pp)
             return "pool at capacity"
         if "overloaded" in t or row.get("http_status") == 529:
             return "upstream overloaded"
         if "drain" in t:
             return "seat drained"
-        return "relay busy"
+        from agent.fork_ext.relay_quota import pool_pressure_label
+
+        pp = row.get("pool_pressure")
+        if isinstance(pp, Mapping):
+            return pool_pressure_label(pp)
+        return "relay unavailable"
     if cls in ("quota_model", "quota_seat"):
         if "out of extra usage" in t:
             return EXTRA_USAGE_EXHAUSTED_CAUSE
+        if (row.get("class_source") == "text" and "no eligible sub" in t
+                and "requested model" not in t and not row.get("quota_window")
+                and "capped" not in t):
+            from agent.fork_ext.relay_quota import pool_pressure_label
+
+            pp = row.get("pool_pressure")
+            if isinstance(pp, Mapping):
+                return pool_pressure_label(pp)
+            return "relay unavailable"
         if "budget" in t and "capped" in t:
             return "model budget capped"
         windowed = _window_cause(row, t)
@@ -1698,6 +1717,17 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
         return f"{prefix}{_lane_incapable_body(row, seat)}, {window}", ()
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
+    if (cause in ("relay unavailable", "relay quota exhausted", "relay transport unavailable")
+            and not row.get("seat") and hop in (None, "relay")
+            and not is_direct_pin(row.get("from_provider"))):
+        from agent.fork_ext.relay_quota import pool_pressure_text
+
+        pp = row.get("pool_pressure")
+        if isinstance(pp, Mapping):
+            return f"{prefix}{pool_pressure_text(pp)}, {window}", ()
+        refusal = ("no eligible subscription" if "no eligible sub" in str(row.get("err_head") or "").lower()
+                   else "request refused")
+        return f"{prefix}{cause}: {refusal} (cause not stated), {window}", ()
     if _is_pool_wide_relay_busy(row, hop, cause):
         if cause == RELAY_DRAIN_CAUSE:
             return f"{prefix}{cause} (at the relay), {window}", ()
@@ -1928,6 +1958,10 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     cls = row.get("trigger_class")
     relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream")
                      or bool(row.get("relay_synthetic")))
+    cause = _cause_phrase(row)
+    if (cause in ("relay unavailable", "relay quota exhausted", "relay transport unavailable")
+            or (cause == "relay busy" and cls in ("quota_model", "quota_seat"))):
+        return cause
     bcode = _bridge_code(row)
     if bcode:
         # The bridge's machine code names what happened; the status-derived

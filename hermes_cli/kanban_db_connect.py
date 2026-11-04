@@ -1070,6 +1070,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "task_events", "actor_session_id", "actor_session_id TEXT"
         )
+    # CLOCK_BOOTTIME + boot id of liveness evidence (claimed/spawned/heartbeat),
+    # so the session reap compares births without a wall conversion
+    # (kanban_db._boot_window). NULL for historical rows and non-Linux writers.
+    if ev_cols and "boottime" not in ev_cols:
+        _add_column_if_missing(conn, "task_events", "boottime", "boottime REAL")
+    if ev_cols and "boot_id" not in ev_cols:
+        _add_column_if_missing(conn, "task_events", "boot_id", "boot_id TEXT")
 
     # task_comments gained per-run / per-session provenance. Two concurrent
     # sessions on the SAME profile used to be indistinguishable on the board
