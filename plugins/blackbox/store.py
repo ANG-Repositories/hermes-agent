@@ -255,6 +255,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             usage_invariant_violation TEXT,
             corrected_prompt_tokens INT,
             upstream_requests INT,
+            -- 1 = the relay deferred this call's usage to the next response
+            -- of the turn (claude-bpx#564 arrival publish): its zero token
+            -- columns are by design, the tokens are on that next row.
+            usage_deferred INT,
             -- Who minted route_id (S7 D1): relay | harness | cli, derived from
             -- the id's prefix by relay_headers.route_id_origin. NULL with it.
             route_id_origin TEXT,
@@ -447,7 +451,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                       ("vendor", "TEXT"), ("served_provider", "TEXT"),
                       ("usage_invariant_violation", "TEXT"),
                       ("corrected_prompt_tokens", "INT"),
-                      ("upstream_requests", "INT")):
+                      ("upstream_requests", "INT"), ("usage_deferred", "INT")):
         if col not in _api_existing:
             try:
                 conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
@@ -1307,6 +1311,7 @@ def insert_api_call(
     usage_invariant_violation: str | None = None,
     corrected_prompt_tokens: int | None = None,
     upstream_requests: int | None = None,
+    usage_deferred: bool = False,
 ) -> None:
     """Append one call, including zero-usage failures, without changing turn totals.
 
@@ -1335,9 +1340,9 @@ def insert_api_call(
                 cache_write_1h, cache_ttl_requested, lane_family, call_id,
                 route_id_origin, vendor, served_provider,
                 usage_invariant_violation, corrected_prompt_tokens,
-                upstream_requests
+                upstream_requests, usage_deferred
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?)
+                      ?, ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model,
              _measured(usage, "input_tokens"), _measured(usage, "output_tokens"),
@@ -1348,7 +1353,7 @@ def insert_api_call(
              AUX_LANE_FAMILY if aux else lane_family(provider), call_id,
              _route_id_origin(route_id), *_route_columns(provider, model)[1:],
              usage_invariant_violation, _int_or_none(corrected_prompt_tokens),
-             _int_or_none(upstream_requests)),
+             _int_or_none(upstream_requests), 1 if usage_deferred else None),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():

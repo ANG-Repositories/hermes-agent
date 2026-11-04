@@ -33,6 +33,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -241,6 +242,72 @@ def record_updated(job_id: str, fields: Dict[str, Dict[str, Any]], *, name: Opti
 def _default_actor() -> str:
     """Best-effort writer identity: which process asked for this."""
     return f"{os.path.basename(os.environ.get('HERMES_ACTOR', '') or 'hermes')}:{os.getpid()}"
+
+
+def caller_attribution() -> str:
+    """Who asked, in words that survive the asking process: kanban card, session, parent command line.
+
+    A bare ``hermes:<pid>`` names a process that is gone by the time anyone reads the journal
+    (t_9da8a02b: ten unowned pauses of one row). Best effort: any part that cannot be read is left out.
+    """
+    parts = [f"{label} {value}" for label, value in (
+        ("card", (os.environ.get("HERMES_KANBAN_TASK") or "").strip()),
+        ("session", (os.environ.get("HERMES_SESSION_ID") or "").strip()),
+    ) if value]
+    ppid = os.getppid()
+    try:
+        import psutil
+
+        label = parent_label(psutil.Process(ppid).cmdline())
+    except Exception:
+        label = ""
+    parts.append(f"parent pid {ppid}" + (f": {label}" if label else ""))
+    return "; ".join(parts)
+
+
+_SHELL = re.compile(r"^(?:ba|z|da|k)?sh$")
+_PYTHON = re.compile(r"^python[0-9.]*$")
+# Value-less options only (fail closed): -c/-s/-o/-O (shell) and -c/-m/-W/-X (python) are absent on
+# purpose, they mean inline code, a script on stdin, or an option whose next argv is a VALUE.
+_SHELL_SHORT = frozenset("abefhiklmnprtuvxBCEHPT")
+_SHELL_LONG = frozenset({"--login", "--noprofile", "--norc", "--posix", "--restricted",
+                         "--verbose", "--noediting"})
+_PYTHON_SHORT = frozenset("bBdEhiIOPqsSuvVx")
+_SCRIPT_NAME = re.compile(r"^[\w.+-]+\.(?:py|sh|bash|zsh)$")
+
+
+def parent_label(argv: List[str]) -> str:
+    """Executable basename, plus the script basename when it is a shell/python interpreter.
+
+    The label is persisted (row + journal) and read by other agents, and fleet command lines carry
+    secrets (``bash -c "export X_TOKEN=..."``, ``bash -s -- --token X``, tokens as argv). So no argv
+    CONTENT is kept. The script is named only when every option before it is a known value-less
+    option and its basename looks like a script; anything else (``-c``, ``-s``, ``-``, ``-m``, an
+    option taking a value, an unknown option) records the executable alone.
+    """
+    if not argv or not (argv[0] or "").strip():
+        return ""
+    exe = os.path.basename(argv[0].split()[0])[:64]
+    if _SHELL.match(exe.lower()):
+        short, long_ok = _SHELL_SHORT, _SHELL_LONG
+    elif _PYTHON.match(exe.lower()):
+        short, long_ok = _PYTHON_SHORT, frozenset()
+    else:
+        return exe
+    for arg in argv[1:]:
+        if arg == "--":
+            continue
+        if arg.startswith("--"):
+            if arg in long_ok:
+                continue
+            return exe
+        if arg.startswith("-"):
+            if len(arg) > 1 and set(arg[1:]) <= short:
+                continue
+            return exe  # "-" (stdin), -c/-s/-m, or an option that takes a value
+        name = os.path.basename(arg)
+        return f"{exe} {name}" if len(name) <= 64 and _SCRIPT_NAME.match(name) else exe
+    return exe
 
 
 def read_entries(*, window_hours: float = DEFAULT_WINDOW_HOURS) -> List[Dict[str, Any]]:

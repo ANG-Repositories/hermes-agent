@@ -170,6 +170,7 @@ def record_api_call(
     if cfg is None:
         return
     from agent.usage_pricing import CanonicalUsage, normalize_usage
+    from agent.usage_pricing_relay import relay_billed_usage, usage_is_deferred
     from plugins.blackbox import store
 
     canonical = (
@@ -181,13 +182,16 @@ def record_api_call(
     )
     tier_5m, tier_1h = _cache_creation_tiers(usage)
     violation, corrected_prompt, upstream = _relay_usage_invariant(usage)
+    # Token columns are the bill (t_9f190074); the prefix guard below keeps the context reading.
+    billed = canonical if isinstance(usage, CanonicalUsage) else relay_billed_usage(usage, canonical)
     store.insert_api_call(
         turn_id,
         seq,
         ts=ts,
         provider=provider,
         model=model,
-        usage=canonical,
+        usage=billed,
+        usage_deferred=usage_is_deferred(usage),
         sub_key=sub_key,
         attribution=attribution,
         http_status=http_status,

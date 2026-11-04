@@ -21,6 +21,7 @@ from agent.usage_pricing import (
     USAGE_UNKNOWN_FIELDS, cache_stats_line, estimate_usage_cost, prompt_tokens_unknown,
     verbose_token_usage_log_args, with_served_service_tier,
 )
+from agent.usage_pricing_relay import relay_billed_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -52,8 +53,11 @@ def _fold_moa_usage(agent, canonical_usage):
     """MoA: fold advisor fan-out usage into REPORTED token counts (only aggregator usage is
     returned, so advisor spend would be invisible) and flush the full-turn trace when
     ``moa.save_traces`` is on. Returns ``(client, canonical_usage, advisor_cost, advisor_pricing_calls)``;
-    the pricing calls ledger each physical advisor call under the composite row (card t_02323499)."""
+    the pricing calls ledger each physical advisor call under the composite row (card t_02323499).
+    The advisors' own usage (or None) is returned last so billing can fold it onto a relay-adjusted
+    aggregator bill (t_9f190074)."""
     _moa_ref_cost = None
+    _ref_usage = None
     _moa_ref_pricing_calls: list[dict[str, Any]] = []
     _moa_client = getattr(agent, "client", None)
     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
@@ -77,7 +81,7 @@ def _fold_moa_usage(agent, canonical_usage):
             )
         except Exception as _moa_trace_exc:  # pragma: no cover - defensive
             logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
-    return _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls
+    return _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls, _ref_usage
 
 
 def record_response_usage(
@@ -135,7 +139,14 @@ def record_response_usage(
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage
-    _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls = _fold_moa_usage(agent, canonical_usage)
+    _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls, _moa_ref_usage = (
+        _fold_moa_usage(agent, canonical_usage))
+    # t_9f190074: a multi-request relay payload bills every request's prompt; a deferred one bills
+    # zero (its tokens ride the next response). Context consumers below keep ``canonical_usage``.
+    # The relay adjustment applies to the aggregator, then the advisors' usage folds on top.
+    billed_aggregator = relay_billed_usage(getattr(response, "usage", None), aggregator_usage)
+    billed_usage = billed_aggregator if _moa_ref_usage is None else billed_aggregator + _moa_ref_usage
+    billed_flags = {key: bool(getattr(billed_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
     total_tokens = canonical_usage.total_tokens
@@ -257,18 +268,18 @@ def record_response_usage(
         compressor._context_probe_persistable = False
 
     _loop._record_served_service_tier(agent, response)
-    agent.session_prompt_tokens += prompt_tokens
-    agent.session_completion_tokens += completion_tokens
-    agent.session_total_tokens += total_tokens
-    agent.session_input_tokens += canonical_usage.input_tokens
-    agent.session_output_tokens += canonical_usage.output_tokens
-    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
-    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    agent.session_prompt_tokens += billed_usage.prompt_tokens
+    agent.session_completion_tokens += billed_usage.output_tokens
+    agent.session_total_tokens += billed_usage.total_tokens
+    agent.session_input_tokens += billed_usage.input_tokens
+    agent.session_output_tokens += billed_usage.output_tokens
+    agent.session_cache_read_tokens += billed_usage.cache_read_tokens
+    agent.session_cache_write_tokens += billed_usage.cache_write_tokens
+    agent.session_reasoning_tokens += billed_usage.reasoning_tokens
     # ABSORBING per-bucket session unknown latches, in lockstep with the counters above: a plain int
     # total leaves no trace of an unmeasured call; once a session has missed a measurement no later
     # call restores it (cleared with the counters in reset_session_state).
-    for _flag, _set in usage_flags.items():
+    for _flag, _set in billed_flags.items():
         if _set:
             setattr(agent, f"session_{_flag}", True)
     # Last successful provider-call snapshot for /context, /usage (cumulative counters above).
@@ -286,7 +297,21 @@ def record_response_usage(
         try:
             turn_calls.append({
                 **usage_dict,
-                "output_tokens_unknown": output_unknown,
+                **billed_flags,
+                # Every token field of the row is the bill, so prompt/total agree with the buckets.
+                "prompt_tokens": billed_usage.prompt_tokens,
+                "completion_tokens": billed_usage.output_tokens,
+                "total_tokens": billed_usage.total_tokens,
+                "reasoning_tokens": billed_usage.reasoning_tokens,
+                "input_tokens": billed_usage.input_tokens,
+                "output_tokens": billed_usage.output_tokens,
+                "cache_read_tokens": billed_usage.cache_read_tokens,
+                "cache_write_tokens": billed_usage.cache_write_tokens,
+                # The last request's own split: the finalizer's /context window decomposition
+                # reads these, never the multi-request bill above.
+                "context_input_tokens": usage_dict["input_tokens"],
+                "context_cache_read_tokens": usage_dict["cache_read_tokens"],
+                "context_cache_write_tokens": usage_dict["cache_write_tokens"],
                 "latency_s": api_duration,
                 "composition": call_composition,
                 "provider": _route["provider"],
@@ -352,8 +377,10 @@ def record_response_usage(
         _agg_cost_base_url = _agg_slot.get("base_url") or _route["base_url"] or None
         try:
             if _turn_call is not None:
+                # The physical aggregator row carries the relay bill: Blackbox prices these calls
+                # and sums them into the composite parent (t_9f190074).
                 _turn_call["pricing_calls"] = _loop._build_moa_pricing_calls(
-                    _moa_ref_pricing_calls, aggregator_usage, aggregator_model=_agg_cost_model,
+                    _moa_ref_pricing_calls, billed_aggregator, aggregator_model=_agg_cost_model,
                     aggregator_provider=_agg_cost_provider, aggregator_base_url=_agg_cost_base_url,
                 )
                 # Ledger each physical advisor/aggregator call as a child of this composite call's
@@ -370,7 +397,7 @@ def record_response_usage(
         except Exception:
             pass  # telemetry must never break the conversation loop
     cost_result = estimate_usage_cost(
-        _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
+        _agg_cost_model, billed_aggregator, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
     )
     _cost_status = _loop._session_cost_status_with_known_spend(
@@ -410,11 +437,11 @@ def record_response_usage(
             agent._session_db.queue_token_counts(
                 agent.session_id,
                 source=_agent_session_source(agent),
-                input_tokens=canonical_usage.input_tokens,
-                output_tokens=canonical_usage.output_tokens,
-                cache_read_tokens=canonical_usage.cache_read_tokens,
-                cache_write_tokens=canonical_usage.cache_write_tokens,
-                reasoning_tokens=canonical_usage.reasoning_tokens,
+                input_tokens=billed_usage.input_tokens,
+                output_tokens=billed_usage.output_tokens,
+                cache_read_tokens=billed_usage.cache_read_tokens,
+                cache_write_tokens=billed_usage.cache_write_tokens,
+                reasoning_tokens=billed_usage.reasoning_tokens,
                 estimated_cost_usd=_cost_delta,
                 cost_status=_cost_status,
                 cost_source=cost_result.source,
@@ -427,7 +454,7 @@ def record_response_usage(
                 **_loop._last_turn_snapshot_kwargs(canonical_usage),
                 # UNKNOWN != 0: the cumulative flags are ABSORBING in the store; the last_turn_* ones
                 # move WITH the snapshot they qualify (withheld -> None -> COALESCE keeps the prior split).
-                **usage_flags,
+                **billed_flags,
                 **{
                     f"last_turn_{key}": (None if bool(canonical_usage.total_tokens_unknown) else value)
                     for key, value in usage_flags.items()
