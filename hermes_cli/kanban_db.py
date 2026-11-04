@@ -11816,6 +11816,8 @@ def complete_task(
                 # draft is a mention, not a route to review that would wait
                 # on a merge nobody intends.
                 override = {"prs": list(overridden), "reason": draft_ok}
+                if freshness.get("draft_held"):
+                    override["held"] = freshness["draft_held"]  # t_62389c4f: the hold stays visible
                 with write_txn(conn):
                     _append_event(conn, task_id, "completion_draft_override", override)
                 metadata = dict(metadata or {}, draft_override=override)

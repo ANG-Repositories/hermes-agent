@@ -463,11 +463,13 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             held = _operator_hold(flip_records.get(key.lower()), pr)
             if held:
                 # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
-                entry["draft"] = True
                 entry["draft_held"] = held
                 report.setdefault("draft_held", {})[key] = held
                 _log.info("handoff freshness: %s %s", key, held)
-                continue
+                if not draft_ok:
+                    entry["draft"] = True
+                    continue
+                # An explicit draft_ok is the audited override path, unchanged (Prism 400b19850a8f).
             drafts.append(key)
             entry["draft"] = True
             if worker_draft_flip_enabled() and _owns_draft(ref, pr, task_id):

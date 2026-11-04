@@ -323,6 +323,29 @@ def test_e2e_operator_redraft_survives_next_handback(board, monkeypatch):
     assert ready == [] and armed == []
 
 
+def test_e2e_held_draft_with_draft_ok_takes_the_override_path(board, monkeypatch):
+    """Prism 400b19850a8f: an explicit --draft-ok on a held draft is the audited override, unchanged:
+    the card completes (not routed to review) and completion_draft_override is written."""
+    ready, armed, tid_box = [], [], []
+    _wire(monkeypatch, lambda: f"daedalus/{tid_box[0]}-fix", ready, armed)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        tid_box.append(tid)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_draft_flipped", {"flipped": RECORD})
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}", metadata={"pr_url": PR_URL},
+                                expected_run_id=run, draft_ok="intentionally left draft")
+        assert _status(conn, tid) == "done"
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='completion_draft_override'",
+                          (tid,)).fetchall()
+        assert len(ev) == 1
+        override = json.loads(ev[0][0])
+        assert override["prs"] == ["o/r#5"] and override["reason"] == "intentionally left draft"
+        assert "left draft as-is" in override["held"]["o/r#5"]
+        assert kb.latest_run(conn, tid).metadata["draft_override"] == override
+    assert ready == [] and armed == []
+
+
 def test_e2e_foreign_draft_still_refused(board, monkeypatch):
     ready, armed = [], []
     _wire(monkeypatch, lambda: "daedalus/t_deadbeef-other", ready, armed)
