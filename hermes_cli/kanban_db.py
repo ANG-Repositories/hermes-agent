@@ -11814,6 +11814,8 @@ def complete_task(
                 # draft is a mention, not a route to review that would wait
                 # on a merge nobody intends.
                 override = {"prs": list(overridden), "reason": draft_ok}
+                if freshness.get("draft_held"):
+                    override["held"] = freshness["draft_held"]  # t_62389c4f: the hold stays visible
                 with write_txn(conn):
                     _append_event(conn, task_id, "completion_draft_override", override)
                 metadata = dict(metadata or {}, draft_override=override)
@@ -11856,6 +11858,10 @@ def complete_task(
             return ok
         if still_open:
             note = _open_pr.route_note(still_open)
+            # t_62389c4f: an operator-drafted PR the gate left as-is says so in the handback.
+            held = freshness.get("draft_held") or {}
+            if held:
+                note = "\n".join([note, *(f"{k}: {why}" for k, why in sorted(held.items()))])
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
