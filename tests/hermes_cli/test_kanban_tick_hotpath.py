@@ -97,7 +97,8 @@ def test_walk_up_still_answers_not_toplevel_and_stays_cached(tmp_path, git_spawn
     for _ in range(5):
         assert prg._is_repo_toplevel(str(scratch)) is False
         assert prg._remotes_for(str(scratch)) == set()
-    assert len([c for c in git_spawns if "--show-toplevel" in c]) == 1
+    # No ``.git`` entry: answered structurally, never forked (t_38e057fb).
+    assert [c for c in git_spawns if "--show-toplevel" in c] == []
     # ...and becoming a checkout of its own is seen at once.
     subprocess.run(["git", "init", "-q"], cwd=scratch, check=True)
     subprocess.run(["git", "remote", "add", "origin", "git@github.com:o/own.git"],
