@@ -397,8 +397,13 @@ def test_secret_cache_ttl_and_single_mint():
     ex._secret_cache["op://x"] = (tok, _ts - ex._secret_ttl_s - 1)
     assert ex._secret("op://x") == "tok-2"
     assert len(mints) == 2
-    # invalidate_secret -> re-mint on demand (rotation heal path)
-    ex.invalidate_secret("op://x")
+    # invalidate_secret right after a read is refused: re-reading returns the same value
+    assert ex.invalidate_secret("op://x") is False
+    assert ex._secret("op://x") == "tok-2" and len(mints) == 2
+    # invalidate_secret on a value older than the retry window -> re-mint (rotation heal path)
+    tok, _ts = ex._secret_cache["op://x"]
+    ex._secret_cache["op://x"] = (tok, _ts - ex._secret_retry_s - 1)
+    assert ex.invalidate_secret("op://x") is True
     assert ex._secret("op://x") == "tok-3"
 
 
@@ -419,12 +424,39 @@ def test_auth_shaped_error_refreshes_secret_and_retries():
         inner = json.dumps({"candidates": []})
         return json.dumps({"choices": [{"message": {"content": inner}}], "usage": {}})
 
+    import time as _time
     ex = BridgeExtractor(auth_fn=fake_auth, http_fn=fake_http)
+    # rotation case: the primary token was read (and cached) longer ago than the retry window
+    mints.append(ex._primary_ref)
+    ex._secret_cache[ex._primary_ref] = ("tok-1", _time.time() - ex._secret_retry_s - 1)
     res = ex.extract("sys", "u", "a")
     assert res["provider"] == "codex-bridge"      # healed on primary, no fallback needed
     assert res["candidates"] == []
     assert calls == ["Bearer tok-1", "Bearer tok-2"]
     assert len(mints) == 2
+
+
+@pytest.mark.parametrize("readable", [True, False], ids=["secret_rejected", "op_read_fails"])
+def test_n_captures_against_a_rejecting_bridge_read_each_secret_once(readable):
+    """t_8ca13fd0: with a bridge answering 401 on every call, the 401 refresh path re-ran `op read`
+    on every capture (GIL profile: 24/996 samples were that fork). N captures must cost one read per
+    ref plus at most one rotation re-read, and every capture must still FAIL (never skip)."""
+    import urllib.error as _ue
+    reads = []
+
+    def fake_auth(ref):
+        reads.append(ref)
+        return "stale-token" if readable else ""
+
+    def always_401(url, body, headers, timeout):
+        raise _ue.HTTPError(url, 401, "unauthorized", None, None)
+
+    ex = BridgeExtractor(auth_fn=fake_auth, http_fn=always_401)
+    results = [ex.extract("sys", "u", "a") for _ in range(10)]
+    assert all(r["provider"] == "none" and "401" in r["error"] for r in results)
+    per_ref = {ref: reads.count(ref) for ref in set(reads)}
+    assert set(per_ref) == {ex._primary_ref, ex._fallback_ref}
+    assert max(per_ref.values()) <= (2 if readable else 1), per_ref
 
 
 # ---------------------------------------------------------------------------
