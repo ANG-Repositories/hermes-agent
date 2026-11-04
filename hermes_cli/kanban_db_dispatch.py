@@ -4444,8 +4444,12 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
         raise SpawnNowError(f"{task_id}: pause hold: {exc.reason}") from exc
     if claimed is None:
         raise SpawnNowError(f"{task_id}: not claimable (not ready, or already claimed)")
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
     try:
         workspace = _kbw.resolve_workspace(claimed, board=board)
+    except WorkspaceUnavailable as exc:
+        _kb._release_claim_for_workspace_refusal(conn, claimed.id, DispatchResult(), str(exc))
+        raise SpawnNowError(f"{task_id}: workspace: {exc}") from exc
     except Exception as exc:
         _record_task_failure(conn, claimed.id, f"workspace: {exc}", outcome="spawn_failed",
                              release_claim=True, end_run=True,
@@ -4602,6 +4606,10 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+        if isinstance(exc, WorkspaceUnavailable):  # a hold, never a charged failure
+            _kb._release_claim_for_workspace_refusal(conn, claimed.id, result, str(exc))
+            return False
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
