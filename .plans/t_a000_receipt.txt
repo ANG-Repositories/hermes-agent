@@ -1,0 +1,44 @@
+t_a00081df measurement receipt
+
+Source: 60 latest main CI runs on ANG-Ventures/hermes-agent-ci.
+59 run job inventories recovered; 1 exhausted HTTP 502 retries.
+1003 selected job logs; 15 API misses; 324 parsed per-file completion rows.
+File wall durations, NOT individual-test durations. Reds are censored by harness caps.
+Repeated file appearances across jobs are separate observations, not necessarily distinct runs.
+These measurements do NOT establish >=10 per-test runs on every venue.
+
+file | host | observations | distinct runs | green | p50 seconds | min..max seconds
+tests/gateway/test_post_turn_hooks_after_delivery.py | ci-box | 33 | 33 | 28 | 68.30 | 30.5..239.9
+tests/gateway/test_post_turn_hooks_after_delivery.py | ace-ai | 8 | 8 | 8 | 39.85 | 28.3..57.3
+tests/gateway/test_post_turn_hooks_after_delivery.py | ace-media | 17 | 17 | 17 | 26.30 | 14.5..47.9
+tests/hermes_cli/test_cron_run_wait_abandon_signal.py | ci-box | 37 | 37 | 37 | 46.30 | 42.7..63.4
+tests/hermes_cli/test_cron_run_wait_abandon_signal.py | ace-ai | 7 | 7 | 5 | 164.80 | 42.0..273.4
+tests/hermes_cli/test_cron_run_wait_abandon_signal.py | ace-media | 14 | 14 | 2 | 243.25 | 41.2..396.3
+tests/hermes_cli/test_desktop_build_lock.py | ci-box | 36 | 36 | 28 | 93.65 | 59.9..223.8
+tests/hermes_cli/test_desktop_build_lock.py | ace-ai | 13 | 13 | 13 | 28.80 | 22.5..66.8
+tests/hermes_cli/test_desktop_build_lock.py | ace-media | 9 | 9 | 9 | 36.80 | 27.9..67.7
+tests/hermes_cli/test_kanban_work_obligations.py | ci-box | 18 | 18 | 5 | 383.10 | 145.6..553.4
+tests/hermes_cli/test_kanban_work_obligations.py | ace-ai | 4 | 4 | 4 | 86.00 | 49.8..120.4
+tests/hermes_cli/test_kanban_work_obligations.py | ace-media | 10 | 10 | 10 | 83.45 | 47.8..91.9
+tests/scripts/test_fresh_source_install.py | ci-box | 75 | 54 | 29 | 154.00 | 96.3..347.2
+tests/scripts/test_fresh_source_install.py | ace-ai | 20 | 18 | 20 | 57.35 | 45.3..100.8
+tests/scripts/test_fresh_source_install.py | ace-media | 23 | 23 | 23 | 54.90 | 42.4..112.0
+
+Verified changes (no merges performed):
+#2577 b214a1b1a09b4cb18ddf986ad9357f9a2906a3b6: fresh install slow_test(200), operator-approved budget.
+ci-box managed Python3.14.7, affinity4: 3 passed in108.93s; missing-wheel62.35s, None28.45s, bad-hash16.74s.
+PR CI41750491151: all4 Python slices success. Slice4 job126316547217: fresh install3 passed,42.7s.
+#2579 f76edc4c6146aabcca968dfe7ed1bf32a0932e91: text=True beside encoding (scanner false positive).
+Footguns:1 before;0 after across2227 files. Related tests21 passed in29.21s. Ruff passes.
+#2580 db40990de3473c61b688294f0c055f15eebd6ff9: synchronous goal fixture DB warm-up.
+Baseline hooks+cron:3 failed,32 passed in169.29s; failed goal writes exceed cold-bootstrap window.
+After whole hooks file:29 passed in65.86s. No budget or production change.
+Unchanged probes: obligations CLI51.66s; desktop failure73.37s;2 passed in127.23s.
+
+Remaining:
+No green universal-ci main run. Mirror main52f53b68 is stale versus source58a5d53b.
+Main run41678439512 has35 ci-priv jobs queued; runner-admin API403 for worker.
+Cutover card t_868e850a is retiring this mirror; acceptance destination requires operator reconciliation.
+Need complete per-node >=10-run measurements for all3 venues before any further budget decision.
+No placement changes; no budgets changed except operator-approved fresh install.
+deviations: none (affinity only scoped to test subprocesses).

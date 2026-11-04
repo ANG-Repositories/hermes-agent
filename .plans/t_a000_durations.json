@@ -1,0 +1,3242 @@
+[
+  {
+    "run": 41678439512,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 126067662951,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 189.5,
+    "passed": false
+  },
+  {
+    "run": 41678439512,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 126075527704,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 207.8,
+    "passed": false
+  },
+  {
+    "run": 41678439512,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 126075527704,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 47.1,
+    "passed": true
+  },
+  {
+    "run": 41678439512,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 126075527728,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 548.1,
+    "passed": false
+  },
+  {
+    "run": 41678439512,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 126075527761,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 204.0,
+    "passed": true
+  },
+  {
+    "run": 41678439512,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 126075527928,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 323.2,
+    "passed": false
+  },
+  {
+    "run": 41677368617,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 126061823965,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 185.9,
+    "passed": false
+  },
+  {
+    "run": 41677368617,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 126067020621,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 203.6,
+    "passed": false
+  },
+  {
+    "run": 41677368617,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 126067020621,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 45.4,
+    "passed": true
+  },
+  {
+    "run": 41677368617,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 126067020638,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 553.4,
+    "passed": false
+  },
+  {
+    "run": 41677368617,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 126067020776,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 75.0,
+    "passed": true
+  },
+  {
+    "run": 41677368617,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 126067020857,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 196.2,
+    "passed": false
+  },
+  {
+    "run": 41654130998,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125980509542,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 164.8,
+    "passed": false
+  },
+  {
+    "run": 41654130998,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125982001160,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 276.5,
+    "passed": false
+  },
+  {
+    "run": 41654130998,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125982001198,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 451.6,
+    "passed": false
+  },
+  {
+    "run": 41654130998,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 125982001205,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 32.5,
+    "passed": true
+  },
+  {
+    "run": 41654130998,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125982001348,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 254.7,
+    "passed": false
+  },
+  {
+    "run": 41654130998,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125982001365,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 93.9,
+    "passed": true
+  },
+  {
+    "run": 41634427781,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125912172652,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 53.8,
+    "passed": true
+  },
+  {
+    "run": 41634427781,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125913002841,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 220.3,
+    "passed": false
+  },
+  {
+    "run": 41634427781,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125913003032,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 61.5,
+    "passed": true
+  },
+  {
+    "run": 41634427781,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125913003057,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 347.2,
+    "passed": false
+  },
+  {
+    "run": 41634427781,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 125913003103,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 239.9,
+    "passed": false
+  },
+  {
+    "run": 41634427781,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 125913003103,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 461.2,
+    "passed": false
+  },
+  {
+    "run": 41627930424,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125891646202,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 173.5,
+    "passed": true
+  },
+  {
+    "run": 41627930424,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125892606522,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 32.6,
+    "passed": true
+  },
+  {
+    "run": 41627930424,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125892606539,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 210.5,
+    "passed": true
+  },
+  {
+    "run": 41627930424,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125892606601,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 335.7,
+    "passed": false
+  },
+  {
+    "run": 41627930424,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 125892606694,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 45.8,
+    "passed": true
+  },
+  {
+    "run": 41627930424,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 125892606747,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 84.6,
+    "passed": true
+  },
+  {
+    "run": 41615616184,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125849154910,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 142.5,
+    "passed": false
+  },
+  {
+    "run": 41615616184,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125850933395,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 24.8,
+    "passed": true
+  },
+  {
+    "run": 41615616184,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125850933467,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 440.1,
+    "passed": false
+  },
+  {
+    "run": 41615616184,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125850933569,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 100.8,
+    "passed": true
+  },
+  {
+    "run": 41615616184,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125850933580,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 60.0,
+    "passed": true
+  },
+  {
+    "run": 41615616184,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125850933580,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 318.2,
+    "passed": false
+  },
+  {
+    "run": 41612631771,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125838466515,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 179.1,
+    "passed": false
+  },
+  {
+    "run": 41612631771,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125839527561,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 62.5,
+    "passed": true
+  },
+  {
+    "run": 41612631771,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125839527561,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.1,
+    "passed": true
+  },
+  {
+    "run": 41612631771,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125839527639,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 34.2,
+    "passed": true
+  },
+  {
+    "run": 41612631771,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125839527641,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 65.1,
+    "passed": true
+  },
+  {
+    "run": 41612631771,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125839527694,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 82.2,
+    "passed": true
+  },
+  {
+    "run": 41611200974,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125833577666,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 156.9,
+    "passed": false
+  },
+  {
+    "run": 41611200974,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125835067378,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 216.7,
+    "passed": false
+  },
+  {
+    "run": 41611200974,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125835067432,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 18.6,
+    "passed": true
+  },
+  {
+    "run": 41611200974,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125835067432,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 244.5,
+    "passed": false
+  },
+  {
+    "run": 41611200974,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125835067455,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 390.3,
+    "passed": false
+  },
+  {
+    "run": 41611200974,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125835067608,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 319.4,
+    "passed": false
+  },
+  {
+    "run": 41608862862,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125826105941,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 124.6,
+    "passed": true
+  },
+  {
+    "run": 41608862862,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125826565125,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 44.1,
+    "passed": true
+  },
+  {
+    "run": 41608862862,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125826565125,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 219.2,
+    "passed": false
+  },
+  {
+    "run": 41608862862,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125826565131,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 50.1,
+    "passed": true
+  },
+  {
+    "run": 41608862862,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125826565136,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 184.4,
+    "passed": true
+  },
+  {
+    "run": 41608862862,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125826565202,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 251.9,
+    "passed": false
+  },
+  {
+    "run": 41601708965,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125802785693,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 56.5,
+    "passed": true
+  },
+  {
+    "run": 41601708965,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125804706820,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 102.5,
+    "passed": true
+  },
+  {
+    "run": 41601708965,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125804706820,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 47.2,
+    "passed": true
+  },
+  {
+    "run": 41601708965,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125804706820,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 55.8,
+    "passed": true
+  },
+  {
+    "run": 41601708965,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125804706820,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 135.7,
+    "passed": true
+  },
+  {
+    "run": 41601708965,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125804707137,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 80.6,
+    "passed": true
+  },
+  {
+    "run": 41600102110,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125801315151,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 133.0,
+    "passed": false
+  },
+  {
+    "run": 41600102110,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125802023123,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 93.6,
+    "passed": true
+  },
+  {
+    "run": 41600102110,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125802023123,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 47.6,
+    "passed": true
+  },
+  {
+    "run": 41600102110,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125802023123,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 83.9,
+    "passed": true
+  },
+  {
+    "run": 41600102110,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125802023123,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 293.2,
+    "passed": false
+  },
+  {
+    "run": 41600102110,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125802023139,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 91.9,
+    "passed": true
+  },
+  {
+    "run": 41598131861,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125791824298,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 118.1,
+    "passed": true
+  },
+  {
+    "run": 41598131861,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125793181204,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 138.9,
+    "passed": true
+  },
+  {
+    "run": 41598131861,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125793181242,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 339.3,
+    "passed": true
+  },
+  {
+    "run": 41598131861,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125793181264,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.1,
+    "passed": true
+  },
+  {
+    "run": 41598131861,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125793181292,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 100.4,
+    "passed": true
+  },
+  {
+    "run": 41598131861,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125793181313,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 135.4,
+    "passed": true
+  },
+  {
+    "run": 41596158271,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125784365380,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 130.6,
+    "passed": false
+  },
+  {
+    "run": 41596158271,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 125784738283,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 59.7,
+    "passed": true
+  },
+  {
+    "run": 41596158271,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125784738337,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 54.9,
+    "passed": true
+  },
+  {
+    "run": 41596158271,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125784738377,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 323.2,
+    "passed": false
+  },
+  {
+    "run": 41596158271,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125784738377,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 51.9,
+    "passed": true
+  },
+  {
+    "run": 41596158271,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125784738447,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 82.6,
+    "passed": true
+  },
+  {
+    "run": 41593682111,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125776747992,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 148.0,
+    "passed": false
+  },
+  {
+    "run": 41593682111,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 125777927823,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 63.4,
+    "passed": true
+  },
+  {
+    "run": 41593682111,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125777927849,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 88.1,
+    "passed": true
+  },
+  {
+    "run": 41593682111,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125777927849,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 33.6,
+    "passed": true
+  },
+  {
+    "run": 41593682111,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125777927889,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 27.8,
+    "passed": true
+  },
+  {
+    "run": 41593682111,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125777927955,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 320.6,
+    "passed": false
+  },
+  {
+    "run": 41588155588,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125759984879,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 49.8,
+    "passed": true
+  },
+  {
+    "run": 41588155588,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125760847934,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 81.0,
+    "passed": true
+  },
+  {
+    "run": 41588155588,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125760847934,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 145.6,
+    "passed": true
+  },
+  {
+    "run": 41588155588,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125760847973,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 43.9,
+    "passed": true
+  },
+  {
+    "run": 41588155588,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125760847992,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 236.0,
+    "passed": true
+  },
+  {
+    "run": 41588155588,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125760847995,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 46.6,
+    "passed": true
+  },
+  {
+    "run": 41577808632,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125725766082,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 128.8,
+    "passed": true
+  },
+  {
+    "run": 41577808632,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125726387721,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 73.4,
+    "passed": true
+  },
+  {
+    "run": 41577808632,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125726387761,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 52.9,
+    "passed": true
+  },
+  {
+    "run": 41577808632,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125726387840,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 60.2,
+    "passed": true
+  },
+  {
+    "run": 41577808632,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125726387857,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 103.2,
+    "passed": true
+  },
+  {
+    "run": 41577808632,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 125726387951,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 329.2,
+    "passed": true
+  },
+  {
+    "run": 41573491279,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125712861327,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 49.0,
+    "passed": true
+  },
+  {
+    "run": 41573491279,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125713434360,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 93.7,
+    "passed": true
+  },
+  {
+    "run": 41573491279,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125713434360,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 77.3,
+    "passed": true
+  },
+  {
+    "run": 41573491279,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125713434369,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 357.8,
+    "passed": false
+  },
+  {
+    "run": 41573491279,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125713434386,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 271.8,
+    "passed": false
+  },
+  {
+    "run": 41573491279,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 125713434479,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 58.6,
+    "passed": true
+  },
+  {
+    "run": 41572179336,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125707470092,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 44.3,
+    "passed": true
+  },
+  {
+    "run": 41572179336,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 125708809510,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 96.3,
+    "passed": true
+  },
+  {
+    "run": 41572179336,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125708809599,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 81.8,
+    "passed": true
+  },
+  {
+    "run": 41572179336,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125708809649,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 33.4,
+    "passed": true
+  },
+  {
+    "run": 41572179336,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125708809649,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 242.0,
+    "passed": false
+  },
+  {
+    "run": 41572179336,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125708809683,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 23.0,
+    "passed": true
+  },
+  {
+    "run": 41569050793,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125698056182,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 52.5,
+    "passed": true
+  },
+  {
+    "run": 41569050793,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125698636761,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 85.7,
+    "passed": true
+  },
+  {
+    "run": 41569050793,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125698636763,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 58.1,
+    "passed": true
+  },
+  {
+    "run": 41569050793,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125698636774,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 93.3,
+    "passed": true
+  },
+  {
+    "run": 41569050793,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125698636793,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 301.1,
+    "passed": false
+  },
+  {
+    "run": 41569050793,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125698636890,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 60.0,
+    "passed": true
+  },
+  {
+    "run": 41565209427,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125686540021,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 133.2,
+    "passed": false
+  },
+  {
+    "run": 41565209427,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125687934071,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 42.0,
+    "passed": true
+  },
+  {
+    "run": 41565209427,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125687934073,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 204.1,
+    "passed": false
+  },
+  {
+    "run": 41565209427,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125687934132,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 401.4,
+    "passed": false
+  },
+  {
+    "run": 41565209427,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125687934192,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 223.8,
+    "passed": false
+  },
+  {
+    "run": 41565209427,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125687934211,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 264.6,
+    "passed": false
+  },
+  {
+    "run": 41564277199,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125683182750,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 120.3,
+    "passed": false
+  },
+  {
+    "run": 41564277199,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125686600618,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 35.9,
+    "passed": true
+  },
+  {
+    "run": 41564277199,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125686600631,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 84.7,
+    "passed": true
+  },
+  {
+    "run": 41564277199,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125686600740,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 302.2,
+    "passed": false
+  },
+  {
+    "run": 41564277199,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125686600845,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 58.1,
+    "passed": true
+  },
+  {
+    "run": 41564277199,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125686600869,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 213.2,
+    "passed": false
+  },
+  {
+    "run": 41557241667,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125659145463,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 135.5,
+    "passed": false
+  },
+  {
+    "run": 41557241667,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125659285496,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 54.3,
+    "passed": true
+  },
+  {
+    "run": 41557241667,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125659285531,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 78.2,
+    "passed": true
+  },
+  {
+    "run": 41557241667,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125659285596,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.0,
+    "passed": true
+  },
+  {
+    "run": 41557241667,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125659285597,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 372.0,
+    "passed": false
+  },
+  {
+    "run": 41557241667,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125659285750,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 70.9,
+    "passed": true
+  },
+  {
+    "run": 41545671687,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125620649624,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 52.0,
+    "passed": true
+  },
+  {
+    "run": 41545671687,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125621905664,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 29.2,
+    "passed": true
+  },
+  {
+    "run": 41545671687,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125621905717,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 375.9,
+    "passed": false
+  },
+  {
+    "run": 41545671687,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125621905717,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 236.2,
+    "passed": false
+  },
+  {
+    "run": 41545671687,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125621905909,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 38.0,
+    "passed": true
+  },
+  {
+    "run": 41545671687,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125621905963,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 55.4,
+    "passed": true
+  },
+  {
+    "run": 41533777129,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125584439824,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 154.0,
+    "passed": false
+  },
+  {
+    "run": 41533777129,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125587697804,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 54.2,
+    "passed": true
+  },
+  {
+    "run": 41533777129,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125587697804,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 90.2,
+    "passed": true
+  },
+  {
+    "run": 41528832067,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125567265619,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 57.9,
+    "passed": true
+  },
+  {
+    "run": 41528832067,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125567866758,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 41.5,
+    "passed": true
+  },
+  {
+    "run": 41528832067,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125567866840,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 78.5,
+    "passed": true
+  },
+  {
+    "run": 41528832067,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125567866901,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 44.9,
+    "passed": true
+  },
+  {
+    "run": 41528832067,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125567866918,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 101.1,
+    "passed": true
+  },
+  {
+    "run": 41528832067,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125567866963,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 87.2,
+    "passed": true
+  },
+  {
+    "run": 41526926450,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125557723151,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 68.7,
+    "passed": true
+  },
+  {
+    "run": 41526926450,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125562270780,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 332.7,
+    "passed": true
+  },
+  {
+    "run": 41526926450,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125562270786,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 45.5,
+    "passed": true
+  },
+  {
+    "run": 41526926450,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125562270890,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 41.2,
+    "passed": true
+  },
+  {
+    "run": 41526926450,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125562270930,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 100.2,
+    "passed": true
+  },
+  {
+    "run": 41526926450,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125562271071,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 87.7,
+    "passed": true
+  },
+  {
+    "run": 41523555309,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125547133494,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 100.8,
+    "passed": true
+  },
+  {
+    "run": 41523555309,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125548240618,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 179.7,
+    "passed": true
+  },
+  {
+    "run": 41523555309,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125548240642,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 461.7,
+    "passed": false
+  },
+  {
+    "run": 41523555309,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125548240700,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 66.8,
+    "passed": true
+  },
+  {
+    "run": 41523555309,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125548240752,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 45.8,
+    "passed": true
+  },
+  {
+    "run": 41523555309,
+    "job": "Python tests / Run tests slice 5/16",
+    "jid": 125548240951,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 283.6,
+    "passed": false
+  },
+  {
+    "run": 41477021136,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125385929664,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 151.3,
+    "passed": false
+  },
+  {
+    "run": 41477021136,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125387000004,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 111.4,
+    "passed": true
+  },
+  {
+    "run": 41477021136,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125387000013,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 59.2,
+    "passed": true
+  },
+  {
+    "run": 41477021136,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125387000202,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 320.5,
+    "passed": false
+  },
+  {
+    "run": 41477021136,
+    "job": "Python tests / Run tests slice 13/16",
+    "jid": 125387000204,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 456.2,
+    "passed": false
+  },
+  {
+    "run": 41477021136,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125387000329,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 57.3,
+    "passed": true
+  },
+  {
+    "run": 41459756962,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125327885505,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 138.8,
+    "passed": false
+  },
+  {
+    "run": 41459756962,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 125328450928,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 40.0,
+    "passed": true
+  },
+  {
+    "run": 41459756962,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 125328450928,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 28.2,
+    "passed": true
+  },
+  {
+    "run": 41459756962,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125328451004,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 120.4,
+    "passed": true
+  },
+  {
+    "run": 41459756962,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 125328451019,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 64.1,
+    "passed": true
+  },
+  {
+    "run": 41459756962,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125328451195,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 210.7,
+    "passed": false
+  },
+  {
+    "run": 41454760689,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125310038546,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 144.6,
+    "passed": false
+  },
+  {
+    "run": 41454760689,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125310577858,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.7,
+    "passed": true
+  },
+  {
+    "run": 41454760689,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125310577887,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 37.5,
+    "passed": true
+  },
+  {
+    "run": 41454760689,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125310577887,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 242.3,
+    "passed": true
+  },
+  {
+    "run": 41454760689,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125310577887,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 59.9,
+    "passed": true
+  },
+  {
+    "run": 41454760689,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 125310577975,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 49.8,
+    "passed": true
+  },
+  {
+    "run": 41452321454,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125300551529,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 49.1,
+    "passed": true
+  },
+  {
+    "run": 41452321454,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 125301217868,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 87.4,
+    "passed": true
+  },
+  {
+    "run": 41452321454,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125301217944,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 373.4,
+    "passed": false
+  },
+  {
+    "run": 41452321454,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125301218119,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 30.5,
+    "passed": true
+  },
+  {
+    "run": 41452321454,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125301218119,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 225.0,
+    "passed": true
+  },
+  {
+    "run": 41452321454,
+    "job": "Python tests / Run tests slice 7/16",
+    "jid": 125301218119,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 82.3,
+    "passed": true
+  },
+  {
+    "run": 41445541827,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125277796903,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 149.9,
+    "passed": false
+  },
+  {
+    "run": 41445541827,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125278176007,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 27.3,
+    "passed": true
+  },
+  {
+    "run": 41445541827,
+    "job": "Python tests / Run tests slice 12/16",
+    "jid": 125278176017,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 269.5,
+    "passed": false
+  },
+  {
+    "run": 41445541827,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125278176032,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 190.8,
+    "passed": true
+  },
+  {
+    "run": 41445541827,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125278176082,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 38.3,
+    "passed": true
+  },
+  {
+    "run": 41445541827,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125278176123,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_kanban_work_obligations.py",
+    "seconds": 47.8,
+    "passed": true
+  },
+  {
+    "run": 41432884724,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125235790897,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 122.8,
+    "passed": true
+  },
+  {
+    "run": 41432884724,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 125236375123,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 58.3,
+    "passed": true
+  },
+  {
+    "run": 41432884724,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125236375129,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 376.5,
+    "passed": false
+  },
+  {
+    "run": 41432884724,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125236375179,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 67.7,
+    "passed": true
+  },
+  {
+    "run": 41432884724,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125236375214,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 47.9,
+    "passed": true
+  },
+  {
+    "run": 41414616513,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125177686911,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 112.0,
+    "passed": true
+  },
+  {
+    "run": 41414616513,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125178528519,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 156.9,
+    "passed": true
+  },
+  {
+    "run": 41414616513,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125178528603,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 39.7,
+    "passed": true
+  },
+  {
+    "run": 41414616513,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125178528622,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 274.0,
+    "passed": true
+  },
+  {
+    "run": 41414616513,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125178528741,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 241.6,
+    "passed": false
+  },
+  {
+    "run": 41411310393,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125165189342,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 139.6,
+    "passed": false
+  },
+  {
+    "run": 41411310393,
+    "job": "Python tests / Run tests slice 8/16",
+    "jid": 125166127994,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 47.8,
+    "passed": true
+  },
+  {
+    "run": 41411310393,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125166128097,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 68.3,
+    "passed": true
+  },
+  {
+    "run": 41411310393,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125166128175,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 56.4,
+    "passed": true
+  },
+  {
+    "run": 41411310393,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125166128183,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 240.2,
+    "passed": true
+  },
+  {
+    "run": 41406991153,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125151785379,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 153.0,
+    "passed": false
+  },
+  {
+    "run": 41406991153,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125152690904,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 56.7,
+    "passed": true
+  },
+  {
+    "run": 41406991153,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125152690908,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 274.7,
+    "passed": false
+  },
+  {
+    "run": 41406991153,
+    "job": "Python tests / Run tests slice 11/16",
+    "jid": 125152690962,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 74.0,
+    "passed": true
+  },
+  {
+    "run": 41406991153,
+    "job": "Python tests / Run tests slice 10/16",
+    "jid": 125152690996,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 42.7,
+    "passed": true
+  },
+  {
+    "run": 41402817627,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125139308074,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 105.0,
+    "passed": true
+  },
+  {
+    "run": 41402817627,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125140232605,
+    "host": "ci-box",
+    "concl": "cancelled",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 58.0,
+    "passed": true
+  },
+  {
+    "run": 41402817627,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125140232623,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 73.9,
+    "passed": true
+  },
+  {
+    "run": 41402817627,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125140232739,
+    "host": "ci-box",
+    "concl": "cancelled",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 235.9,
+    "passed": true
+  },
+  {
+    "run": 41402817627,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 125140232768,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 28.0,
+    "passed": true
+  },
+  {
+    "run": 41401355477,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125133819205,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 141.2,
+    "passed": false
+  },
+  {
+    "run": 41401355477,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125134193619,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 288.3,
+    "passed": false
+  },
+  {
+    "run": 41401355477,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 125134193625,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 50.7,
+    "passed": true
+  },
+  {
+    "run": 41401355477,
+    "job": "Python tests / Run tests slice 6/16",
+    "jid": 125134193681,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 55.8,
+    "passed": true
+  },
+  {
+    "run": 41401355477,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 125134193767,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 27.9,
+    "passed": true
+  },
+  {
+    "run": 41377734490,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125062719152,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 147.2,
+    "passed": false
+  },
+  {
+    "run": 41377734490,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125063389478,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 45.7,
+    "passed": true
+  },
+  {
+    "run": 41377734490,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125063389516,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 19.0,
+    "passed": true
+  },
+  {
+    "run": 41377734490,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125063389517,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 122.9,
+    "passed": true
+  },
+  {
+    "run": 41377734490,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125063389641,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 203.3,
+    "passed": false
+  },
+  {
+    "run": 41365878211,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125026161253,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 58.4,
+    "passed": true
+  },
+  {
+    "run": 41365878211,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125026463677,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 250.7,
+    "passed": true
+  },
+  {
+    "run": 41365878211,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125026463714,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 139.8,
+    "passed": true
+  },
+  {
+    "run": 41365878211,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125026463775,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 227.0,
+    "passed": true
+  },
+  {
+    "run": 41365878211,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125026463787,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 207.1,
+    "passed": false
+  },
+  {
+    "run": 41357094358,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 125000926726,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 45.3,
+    "passed": true
+  },
+  {
+    "run": 41357094358,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 125001469035,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 37.2,
+    "passed": true
+  },
+  {
+    "run": 41357094358,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 125001469124,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 80.3,
+    "passed": true
+  },
+  {
+    "run": 41357094358,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 125001469132,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 24.0,
+    "passed": true
+  },
+  {
+    "run": 41357094358,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 125001469189,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 273.4,
+    "passed": false
+  },
+  {
+    "run": 41340562553,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124949805392,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 69.2,
+    "passed": true
+  },
+  {
+    "run": 41340562553,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 124950035427,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 28.8,
+    "passed": true
+  },
+  {
+    "run": 41340562553,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124950035451,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 26.3,
+    "passed": true
+  },
+  {
+    "run": 41340562553,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124950035458,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 187.5,
+    "passed": true
+  },
+  {
+    "run": 41340562553,
+    "job": "Python tests / Run tests slice 4/16",
+    "jid": 124950035499,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 284.5,
+    "passed": true
+  },
+  {
+    "run": 41336422524,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124937313309,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 49.5,
+    "passed": true
+  },
+  {
+    "run": 41336422524,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124938616550,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 31.5,
+    "passed": true
+  },
+  {
+    "run": 41336422524,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124938616580,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 225.1,
+    "passed": false
+  },
+  {
+    "run": 41336422524,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 124938616620,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 73.7,
+    "passed": true
+  },
+  {
+    "run": 41336422524,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 124938616620,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 282.7,
+    "passed": false
+  },
+  {
+    "run": 41335463547,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124934680898,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 48.7,
+    "passed": true
+  },
+  {
+    "run": 41335463547,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124936094169,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 42.7,
+    "passed": true
+  },
+  {
+    "run": 41335463547,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 124936094224,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 85.2,
+    "passed": true
+  },
+  {
+    "run": 41335463547,
+    "job": "Python tests / Run tests slice 3/16",
+    "jid": 124936094224,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 266.4,
+    "passed": false
+  },
+  {
+    "run": 41335463547,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124936094287,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 19.7,
+    "passed": true
+  },
+  {
+    "run": 41305616142,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124845443595,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 44.8,
+    "passed": true
+  },
+  {
+    "run": 41305616142,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124845678623,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 162.5,
+    "passed": true
+  },
+  {
+    "run": 41305616142,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124845678646,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 27.5,
+    "passed": true
+  },
+  {
+    "run": 41305616142,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124845678646,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 47.5,
+    "passed": true
+  },
+  {
+    "run": 41305616142,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124845678663,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 14.5,
+    "passed": true
+  },
+  {
+    "run": 41302523787,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124836498775,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 52.8,
+    "passed": true
+  },
+  {
+    "run": 41302523787,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124836700622,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 87.9,
+    "passed": true
+  },
+  {
+    "run": 41302523787,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124836700622,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 298.2,
+    "passed": false
+  },
+  {
+    "run": 41302523787,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124836700624,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 157.0,
+    "passed": true
+  },
+  {
+    "run": 41302523787,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124836700628,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.9,
+    "passed": true
+  },
+  {
+    "run": 41279723810,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124769094050,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 56.4,
+    "passed": true
+  },
+  {
+    "run": 41279723810,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124769398263,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 26.3,
+    "passed": true
+  },
+  {
+    "run": 41279723810,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124769398327,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 47.6,
+    "passed": true
+  },
+  {
+    "run": 41279723810,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124769398329,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 115.8,
+    "passed": true
+  },
+  {
+    "run": 41279723810,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124769398337,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 90.1,
+    "passed": true
+  },
+  {
+    "run": 41278758748,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124766275399,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 42.4,
+    "passed": true
+  },
+  {
+    "run": 41278758748,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124766404140,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 22.5,
+    "passed": true
+  },
+  {
+    "run": 41278758748,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124766404156,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 265.3,
+    "passed": true
+  },
+  {
+    "run": 41278758748,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124766404166,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 45.3,
+    "passed": true
+  },
+  {
+    "run": 41278758748,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124766404181,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 49.5,
+    "passed": true
+  },
+  {
+    "run": 41273955314,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124752359805,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 96.8,
+    "passed": true
+  },
+  {
+    "run": 41273955314,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124754380716,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 30.8,
+    "passed": true
+  },
+  {
+    "run": 41273955314,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124754380745,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 122.5,
+    "passed": true
+  },
+  {
+    "run": 41273955314,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124754380754,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 44.5,
+    "passed": true
+  },
+  {
+    "run": 41273955314,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124754380819,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 71.2,
+    "passed": true
+  },
+  {
+    "run": 41273274782,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124750334034,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 112.2,
+    "passed": true
+  },
+  {
+    "run": 41273274782,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124750475426,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 44.8,
+    "passed": true
+  },
+  {
+    "run": 41273274782,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124750475442,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 71.6,
+    "passed": true
+  },
+  {
+    "run": 41273274782,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124750475454,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 41.4,
+    "passed": true
+  },
+  {
+    "run": 41273274782,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124750475554,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 42.2,
+    "passed": true
+  },
+  {
+    "run": 41271593264,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124745446752,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 106.9,
+    "passed": true
+  },
+  {
+    "run": 41271593264,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124745660423,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 44.6,
+    "passed": true
+  },
+  {
+    "run": 41271593264,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124745660461,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 254.6,
+    "passed": true
+  },
+  {
+    "run": 41271593264,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124745660488,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 25.3,
+    "passed": true
+  },
+  {
+    "run": 41271593264,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124745660504,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 164.8,
+    "passed": false
+  },
+  {
+    "run": 41270537625,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124742364967,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 55.1,
+    "passed": true
+  },
+  {
+    "run": 41270537625,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124743809442,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 68.8,
+    "passed": true
+  },
+  {
+    "run": 41270537625,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124743809498,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 50.3,
+    "passed": true
+  },
+  {
+    "run": 41270537625,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124743809504,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 82.7,
+    "passed": true
+  },
+  {
+    "run": 41270537625,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124743809510,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.7,
+    "passed": true
+  },
+  {
+    "run": 41268138015,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124735343271,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 147.4,
+    "passed": false
+  },
+  {
+    "run": 41268138015,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124735827999,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 64.3,
+    "passed": true
+  },
+  {
+    "run": 41268138015,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124735828039,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 110.5,
+    "passed": true
+  },
+  {
+    "run": 41268138015,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124735828098,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 72.7,
+    "passed": true
+  },
+  {
+    "run": 41268138015,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124735828123,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 44.7,
+    "passed": true
+  },
+  {
+    "run": 41267971785,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124734860907,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 129.0,
+    "passed": false
+  },
+  {
+    "run": 41267971785,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124735057044,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 95.9,
+    "passed": true
+  },
+  {
+    "run": 41267971785,
+    "job": "Python tests / Run tests slice 1/16",
+    "jid": 124735057070,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 118.6,
+    "passed": true
+  },
+  {
+    "run": 41267971785,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124735057134,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 62.0,
+    "passed": true
+  },
+  {
+    "run": 41267971785,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124735057210,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.3,
+    "passed": true
+  },
+  {
+    "run": 41267683626,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124733966298,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 104.5,
+    "passed": true
+  },
+  {
+    "run": 41267683626,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124734232852,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 93.7,
+    "passed": true
+  },
+  {
+    "run": 41267683626,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124734232856,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 17.3,
+    "passed": true
+  },
+  {
+    "run": 41267683626,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124734232879,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 44.4,
+    "passed": true
+  },
+  {
+    "run": 41267683626,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 124734232890,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 51.1,
+    "passed": true
+  },
+  {
+    "run": 41264891879,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124725853244,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 58.9,
+    "passed": true
+  },
+  {
+    "run": 41264891879,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124726095856,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 40.4,
+    "passed": true
+  },
+  {
+    "run": 41264891879,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 124726095865,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 85.0,
+    "passed": true
+  },
+  {
+    "run": 41264891879,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124726095866,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 27.1,
+    "passed": true
+  },
+  {
+    "run": 41264891879,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124726095868,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 183.4,
+    "passed": false
+  },
+  {
+    "run": 41260354364,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124714240430,
+    "host": "ace-media",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 47.5,
+    "passed": true
+  },
+  {
+    "run": 41260354364,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124715308134,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 28.3,
+    "passed": true
+  },
+  {
+    "run": 41260354364,
+    "job": "Python tests / Run tests slice 15/16",
+    "jid": 124715308143,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 263.7,
+    "passed": false
+  },
+  {
+    "run": 41260354364,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124715308148,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 396.3,
+    "passed": false
+  },
+  {
+    "run": 41260354364,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124715308170,
+    "host": "ace-media",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 36.8,
+    "passed": true
+  },
+  {
+    "run": 41259869968,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124711697853,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 127.6,
+    "passed": false
+  },
+  {
+    "run": 41259869968,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124712011533,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 25.3,
+    "passed": true
+  },
+  {
+    "run": 41259869968,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124712011564,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 44.3,
+    "passed": true
+  },
+  {
+    "run": 41259869968,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 124712011583,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 46.1,
+    "passed": true
+  },
+  {
+    "run": 41259869968,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124712011981,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 137.0,
+    "passed": false
+  },
+  {
+    "run": 41257984796,
+    "job": "Bootstrap installer / install.sh protocol + small fresh-install E2E",
+    "jid": 124705378419,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 126.9,
+    "passed": false
+  },
+  {
+    "run": 41257984796,
+    "job": "Python tests / Run tests slice 16/16",
+    "jid": 124705567562,
+    "host": "ci-box",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_cron_run_wait_abandon_signal.py",
+    "seconds": 46.3,
+    "passed": true
+  },
+  {
+    "run": 41257984796,
+    "job": "Python tests / Run tests slice 2/16",
+    "jid": 124705567568,
+    "host": "ace-ai",
+    "concl": "failure",
+    "file": "tests/hermes_cli/test_desktop_build_lock.py",
+    "seconds": 43.0,
+    "passed": true
+  },
+  {
+    "run": 41257984796,
+    "job": "Python tests / Run tests slice 14/16",
+    "jid": 124705567623,
+    "host": "ci-box",
+    "concl": "success",
+    "file": "tests/scripts/test_fresh_source_install.py",
+    "seconds": 135.6,
+    "passed": true
+  },
+  {
+    "run": 41257984796,
+    "job": "Python tests / Run tests slice 9/16",
+    "jid": 124705567719,
+    "host": "ace-ai",
+    "concl": "success",
+    "file": "tests/gateway/test_post_turn_hooks_after_delivery.py",
+    "seconds": 42.0,
+    "passed": true
+  }
+]
