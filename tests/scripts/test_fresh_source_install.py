@@ -24,6 +24,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.platforms("linux")
+# Measured t_a00081df: 17-19 s locally; CI file time 124-144 s (ci-box, cgroup cpus=4,
+# workers=1), so [None] hit the default 60 s wall 6/12 runs on ci-box (0/7 on ace-ai/ace-media).
+# 200 s = ~1.4x the measured 144 s max.
+@pytest.mark.slow_test(200, reason="whole installer: real uv builds + PM publish on loopback; "
+                       "CI file time 124-144 s measured on ci-box (t_a00081df)")
 @pytest.mark.parametrize("fault", [None, "missing-wheel", "bad-hash"])
 def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, served, fault):
     uv = shutil.which("uv")
