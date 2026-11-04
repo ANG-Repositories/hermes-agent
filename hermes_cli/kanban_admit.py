@@ -200,7 +200,7 @@ def measure_local() -> Measure:
         allowance, paused = None, f"gate error: {exc}"
     return Measure(LOCAL, load1, threads, ctx.get("mem_available_gb"), reserve, extra={
         "band": gate.band, "gate_state": getattr(gate, "state", None), "spill_reason": gate.spill_reason,
-        "gate_allowance": allowance, "spawn_paused": paused, "admission": gate.admission,
+        "gate_allowance": allowance, "spawn_paused": paused, "admission": klg.ADMISSION,
     }, threshold_error=terr)
 
 
