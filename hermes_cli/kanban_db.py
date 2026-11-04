@@ -11858,6 +11858,10 @@ def complete_task(
             return ok
         if still_open:
             note = _open_pr.route_note(still_open)
+            # t_62389c4f: an operator-drafted PR the gate left as-is says so in the handback.
+            held = freshness.get("draft_held") or {}
+            if held:
+                note = "\n".join([note, *(f"{k}: {why}" for k, why in sorted(held.items()))])
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])

@@ -224,6 +224,28 @@ def test_own_pr_with_post_ready_ci_is_armed():
     assert len(armed) == 1 and "spawned" in rep["prs"]["o/r#5"]["automerge"]
 
 
+def test_operator_redraft_after_flip_is_left_draft():
+    """t_62389c4f (hermes-home#8702, 6x): this card flipped the PR ready at HEAD, and it is draft again at the
+    SAME head. The worker's own re-draft (worker-pr-redraft.py) only runs right before a push, so no new head means
+    someone else re-drafted it: leave it draft, do not refuse, do not arm."""
+    ready, armed = [], []
+    rep = fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
+                   arm=lambda *a: armed.append(a) or "log", ready=lambda r, n: ready.append((r, n)) or 0,
+                   flipped=RECORD)
+    assert ready == [] and armed == []
+    assert "o/r#5" in rep["draft_held"] and "left draft as-is" in rep["draft_held"]["o/r#5"]
+    assert rep["prs"]["o/r#5"]["draft"] is True and "draft_flipped" not in rep
+
+
+def test_worker_redraft_before_push_still_flips():
+    """The worker's own re-draft comes with a new head (pre-push hook): today's rule, flip it ready."""
+    ready = []
+    rep = fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
+                   arm=lambda *a: None, ready=lambda r, n: ready.append((r, n)) or 0,
+                   flipped={"o/r#5": {"head": "b" * 40, "at": FLIP_AT}})
+    assert ready == [("o/r", 5)] and rep["draft_flipped"] == ["o/r#5"] and "draft_held" not in rep
+
+
 def test_default_ready_disabled_under_pytest():
     assert fr._default_ready() is None
 
@@ -279,6 +301,26 @@ def test_e2e_own_draft_flipped_and_routed_to_review(board, monkeypatch):
         meta = kb.latest_run(conn, tid).metadata
         assert meta["handoff_freshness"]["draft_flipped"] == ["o/r#5"]
     assert ready == [("o/r", 5)] and armed == []
+
+
+def test_e2e_operator_redraft_survives_next_handback(board, monkeypatch):
+    """t_62389c4f through complete_task: an earlier handback of this card flipped #5 ready at HEAD (its
+    handoff_draft_flipped event); the operator re-drafted it with no push since. This handback leaves it draft,
+    routes the card to review and names the hold in the review summary."""
+    ready, armed, tid_box = [], [], []
+    _wire(monkeypatch, lambda: f"daedalus/{tid_box[0]}-fix", ready, armed)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        tid_box.append(tid)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_draft_flipped", {"flipped": RECORD})
+        assert kb.complete_task(conn, tid, summary=f"done again {PR_URL}", metadata={"pr_url": PR_URL},
+                                expected_run_id=run)
+        assert _status(conn, tid) == "review"
+        latest = kb.latest_run(conn, tid)
+        assert "o/r#5" in latest.metadata["handoff_freshness"]["draft_held"]
+        assert "o/r#5: left draft as-is" in (latest.summary or "")
+    assert ready == [] and armed == []
 
 
 def test_e2e_foreign_draft_still_refused(board, monkeypatch):
