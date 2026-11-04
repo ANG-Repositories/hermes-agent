@@ -431,8 +431,12 @@ def finish_text_response(
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
     # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.
+    # This flush is the first step of the turn tail: finalize_turn continues the same recorder.
+    from agent import turn_step_timing
+    _tail = turn_step_timing.start(agent, getattr(agent, "_current_turn_id", "") or "")
     try:
-        agent._flush_messages_to_session_db(messages, conversation_history)
+        with _tail.step("final_text_flush"):
+            agent._flush_messages_to_session_db(messages, conversation_history)
     except Exception:
         logger.warning(
             "final text-turn flush failed (session=%s) — reply is "
