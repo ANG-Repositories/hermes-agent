@@ -326,7 +326,10 @@ class BridgeExtractor:
             )
             if out.returncode == 0:
                 return out.stdout.strip()
-            logger.warning("capture-router: op read %s failed rc=%s", ref, out.returncode)
+            # op's stderr names the cause (unknown vault, no account, rate limit); t_f913395e
+            # spent a probe recovering it because this line used to drop it.
+            logger.warning("capture-router: op read %s failed rc=%s: %s", ref, out.returncode,
+                           ((out.stderr or "").strip().splitlines() or [""])[-1][:300])
         except Exception as e:
             logger.warning("capture-router: op read %s error: %s", ref, e)
         return ""
