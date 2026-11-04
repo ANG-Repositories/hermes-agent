@@ -7,7 +7,6 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sqlite3
@@ -156,6 +155,38 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
 
+    # Older processes may still finish attempts during a rolling upgrade. Queue their writes
+    # in SQLite too; the next pruning transaction consumes only these newly completed ids.
+    conn.execute("CREATE TABLE IF NOT EXISTS execution_proof_pending (id TEXT PRIMARY KEY)")
+    for event in ("INSERT", "UPDATE OF status"):
+        name = "insert" if event == "INSERT" else "update"
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS execution_proof_{name} AFTER {event} ON executions "
+            "WHEN NEW.status='completed' BEGIN "
+            "INSERT OR IGNORE INTO execution_proof_pending(id) VALUES (NEW.id); END"
+        )
+    # Publish the exemption column and its backfill atomically across process openers.
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        if add_column_if_missing(conn, "executions", "rewind_proof",
+                                 "rewind_proof INTEGER NOT NULL DEFAULT 0"):
+            conn.executemany("UPDATE executions SET rewind_proof=1 WHERE id=?",
+                             [(i,) for i in _rewind_proof_ids(conn)])
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_rewind_proof "
+        "ON executions(job_id) WHERE rewind_proof=1"
+    )
+    for name, predicate in (
+        ("terminal", "status IN ('completed','failed','unknown')"),
+        ("prunable", "status IN ('completed','failed','unknown') AND rewind_proof=0"),
+    ):
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_executions_{name}_finish ON executions "
+            "(julianday(finished_at) DESC, finished_at DESC, julianday(claimed_at) DESC, "
+            f"claimed_at DESC, id DESC) WHERE {predicate}"
+        )
+
 
 # What each thread's ledger transaction is doing right now, and who holds ``_lock``: the script
 # runner's watchdog reads both when a tick trips (t_302ab1e8). Four trips in 36 h all stopped in
@@ -236,7 +267,13 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:
     row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
-    return dict(row) if row is not None else None
+    return _public_record(row) if row is not None else None
+
+
+def _public_record(row: sqlite3.Row) -> Dict[str, Any]:
+    record = dict(row)
+    record.pop("rewind_proof", None)  # retention bookkeeping is not part of the audit API
+    return record
 
 
 def _emit_execution_state(
@@ -338,23 +375,51 @@ def _rewind_proof_ids(conn: sqlite3.Connection) -> List[str]:
     return list(keep.values())
 
 
+def _advance_rewind_proof(conn: sqlite3.Connection, execution_id: str) -> None:
+    from cron.occurrences import proves_slot, scheduled_instant
+
+    row = _fetch(conn, execution_id)
+    if row is None:  # an older process may already have pruned this pending completion
+        return
+    slot = scheduled_instant(row["scheduled_instant"])
+    if slot is None or not proves_slot(row["finished_at"] or row["claimed_at"], slot):
+        return
+    incumbent = conn.execute(
+        "SELECT id FROM executions WHERE job_id=? AND rewind_proof=1", (row["job_id"],)
+    ).fetchone()
+    if incumbent is not None:
+        winner = conn.execute(
+            "SELECT id FROM executions WHERE id IN (?,?) "
+            "ORDER BY julianday(scheduled_instant) DESC, id DESC LIMIT 1",
+            (execution_id, incumbent["id"]),
+        ).fetchone()
+        if winner["id"] != execution_id:
+            return
+        conn.execute("UPDATE executions SET rewind_proof=0 WHERE id=?", (incumbent["id"],))
+    conn.execute("UPDATE executions SET rewind_proof=1 WHERE id=?", (execution_id,))
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     # Each job's newest VALID completed occurrence survives the cap: it is the proof
     # completed_occurrence()/rewound_watermark() read when jobs.json is rewound to an older
     # snapshot. The cap is fleet-wide (~1.5 h of history on a busy host), so without this a daily
     # job's morning run was gone by evening and a rewound store re-fired it (2026-10-05 22:44,
     # 402 catch-ups).
+    pending = conn.execute("SELECT id FROM execution_proof_pending ORDER BY id").fetchall()
+    for row in pending:
+        _advance_rewind_proof(conn, row["id"])
+    conn.execute("DELETE FROM execution_proof_pending")
+    cap = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    # Indexed scans visit at most cap retained rows plus non-proof rows actually deleted,
+    # even when thousands of old per-job proofs survive outside the history cap.
     conn.execute(
-        """DELETE FROM executions WHERE id IN (
-             SELECT id FROM (
-               SELECT id FROM executions
-               WHERE status IN ('completed','failed','unknown')
-               ORDER BY julianday(finished_at) DESC, finished_at DESC,
-                        julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
-             )
-             WHERE id NOT IN (SELECT value FROM json_each(?))
-           )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)), json.dumps(_rewind_proof_ids(conn))),
+        "DELETE FROM executions WHERE id IN ("
+        "SELECT id FROM executions INDEXED BY idx_executions_prunable_finish "
+        "WHERE status IN ('completed','failed','unknown') AND rewind_proof=0 "
+        "AND id NOT IN (SELECT id FROM executions "
+        "WHERE status IN ('completed','failed','unknown') "
+        "ORDER BY julianday(finished_at) DESC, finished_at DESC, "
+        "julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT ?))", (cap,),
     )
 
 
@@ -698,7 +763,7 @@ def list_executions(
             + " ORDER BY julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT ?",
             params,
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [_public_record(row) for row in rows]
 
 
 def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
@@ -708,7 +773,7 @@ def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
             "SELECT * FROM executions WHERE id=?",
             (str(execution_id),),
         ).fetchone()
-    return dict(row) if row is not None else None
+    return _public_record(row) if row is not None else None
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
@@ -736,4 +801,4 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                   WHERE rn=1)""",
             clean,
         ).fetchall()
-    return {row["job_id"]: dict(row) for row in rows}
+    return {row["job_id"]: _public_record(row) for row in rows}
