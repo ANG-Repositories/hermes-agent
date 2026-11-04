@@ -12,6 +12,8 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
     those as drafts) -- is flipped ready via ``ace_gate.py ready`` (review hold /
     Ace gate still refuse) and not armed in the same handoff. Any foreign draft
     still refuses, before any flip. Kill switch ``KANBAN_HANDOFF_DRAFT_FLIP=0``.
+    Operator hold (t_62389c4f): a PR this card already flipped ready that is draft again at the
+    recorded head is left draft, not refused, not armed; ``report["draft_held"]`` says why.
     Each flip is recorded as ``{head, at}`` (``at`` = epoch taken BEFORE the
     flip call) in ``report["draft_flipped_at"]`` / ``DraftPrError.flipped``; the
     caller persists it and passes it back as ``flipped=`` on every later
@@ -390,6 +392,21 @@ def _owns_draft(ref, pr: dict, task_id: str) -> bool:
     return branch_names_card(head_ref, task_id) and ref.repo.casefold() in worker_draft_repos()
 
 
+def _operator_hold(record, pr: dict) -> str:
+    """Why a draft is an operator hold (t_62389c4f), or '' when it is not.
+
+    ``record`` is this card's own persisted flip (``handoff_draft_flipped``, written only by the kernel). A PR this
+    card already flipped ready that is draft again at the SAME head was re-drafted by someone else: the worker's own
+    re-draft (worker-pr-redraft.py) runs only right before a push, so it always comes with a new head. GitHub's
+    timeline cannot say who: an operator's ``gh pr ready --undo`` and the worker's flip both act as
+    ang-fleet-workers[bot] (hermes-home#8702, 2026-11-04)."""
+    head = str(((pr.get("head") or {}).get("sha")) or "")
+    if not isinstance(record, dict) or not head or str(record.get("head") or "") != head:
+        return ""
+    return (f"left draft as-is: re-drafted after this card flipped it ready at head {head[:12]} (no push since), "
+            f"so someone else holds it; not flipped, not armed")
+
+
 def ace_gate_ready(repo: str, number: int) -> Optional[int]:
     """``scripts/ace_gate.py ready <repo> <n>`` (the only sanctioned un-draft). rc, or None if not run."""
     from hermes_constants import get_default_hermes_root
@@ -509,6 +526,16 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
                 entry["lookup"] = "failed (fail-open)"
             continue
         if pr.get("draft") is True:
+            held = _operator_hold(flip_records.get(key.lower()), pr)
+            if held:
+                # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
+                entry["draft_held"] = held
+                report.setdefault("draft_held", {})[key] = held
+                _log.info("handoff freshness: %s %s", key, held)
+                if not draft_ok:
+                    entry["draft"] = True
+                    continue
+                # An explicit draft_ok is the audited override path, unchanged (Prism 400b19850a8f).
             drafts.append(key)
             entry["draft"] = True
             if worker_draft_flip_enabled() and _owns_draft(ref, pr, task_id):

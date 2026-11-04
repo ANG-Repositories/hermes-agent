@@ -286,6 +286,9 @@ class BridgeExtractor:
         # don't spawn duplicate `op read` subprocesses (Greptile #250 P2).
         self._secret_cache: Dict[str, Tuple[str, float]] = {}
         self._secret_ttl_s = 3600.0
+        # A failed read ("") is retried after this; an auth failure re-reads at most this often
+        # (t_8ca13fd0: a bridge 401ing every call forked `op read` once per capture).
+        self._secret_retry_s = 60.0
         self._secret_locks: Dict[str, threading.Lock] = {}
         self._secret_locks_guard = threading.Lock()
 
@@ -328,30 +331,38 @@ class BridgeExtractor:
             logger.warning("capture-router: op read %s error: %s", ref, e)
         return ""
 
-    def _secret(self, ref: str) -> str:
-        now = time.time()
+    def _cached_secret(self, ref: str) -> Optional[str]:
         hit = self._secret_cache.get(ref)
-        if hit is not None and (now - hit[1]) < self._secret_ttl_s:
-            return hit[0]
+        if hit is None:
+            return None
+        # failed fetch ("") is cached briefly so a down `op` doesn't stampede
+        ttl = self._secret_ttl_s if hit[0] else self._secret_retry_s
+        return hit[0] if (time.time() - hit[1]) < ttl else None
+
+    def _secret(self, ref: str) -> str:
+        hit = self._cached_secret(ref)
+        if hit is not None:
+            return hit
         with self._secret_locks_guard:
             lock = self._secret_locks.setdefault(ref, threading.Lock())
         with lock:
             # double-check under the lock — the other pass may have minted while we waited
-            hit = self._secret_cache.get(ref)
-            if hit is not None and (time.time() - hit[1]) < self._secret_ttl_s:
-                return hit[0]
+            hit = self._cached_secret(ref)
+            if hit is not None:
+                return hit
             secret = self._auth(ref) or ""
-            if secret:
-                self._secret_cache[ref] = (secret, time.time())
-            else:
-                # failed fetch: cache briefly (60s) so a down `op` doesn't stampede,
-                # but recover quickly once it's back
-                self._secret_cache[ref] = ("", time.time() - self._secret_ttl_s + 60.0)
+            self._secret_cache[ref] = (secret, time.time())
             return secret
 
-    def invalidate_secret(self, ref: str) -> None:
-        """Drop a cached secret (called on auth-shaped errors so rotation heals mid-process)."""
+    def invalidate_secret(self, ref: str) -> bool:
+        """Drop a cached secret (called on auth-shaped errors so rotation heals mid-process).
+        Refused (False) when the value was read less than `_secret_retry_s` ago: a fresh re-read
+        would return the same value, so the caller must fail instead of forking `op` again."""
+        hit = self._secret_cache.get(ref)
+        if hit is not None and (time.time() - hit[1]) < self._secret_retry_s:
+            return False
         self._secret_cache.pop(ref, None)
+        return True
 
     @staticmethod
     def _default_http(url: str, body: bytes, headers: Dict[str, str], timeout: float) -> str:
@@ -395,10 +406,9 @@ class BridgeExtractor:
         try:
             return self._call(url, secret_ref, model, system_prompt, user, assistant, extra_headers)
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
+            if e.code in (401, 403) and self.invalidate_secret(secret_ref):
                 logger.warning("capture-router: auth-shaped %s from %s — refreshing secret and retrying",
                                e.code, url)
-                self.invalidate_secret(secret_ref)
                 return self._call(url, secret_ref, model, system_prompt, user, assistant,
                                   extra_headers)
             raise
