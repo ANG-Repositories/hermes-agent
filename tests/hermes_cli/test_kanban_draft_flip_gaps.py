@@ -212,10 +212,71 @@ def test_e2e_negative_result_without_pr_has_no_note(board):
 def test_review_requested_ping_shows_the_draft_note():
     from types import SimpleNamespace
     from gateway import kanban_watchers_notifier as nt
-    note = "negative result: PR left as-is (a worker draft stays draft); on accept flip it: ace_gate.py ready o/r 5"
-    msg = nt._fmt_review_requested(SimpleNamespace(payload={"summary": "NOT met", "draft_note": note}),
+    msg = nt._fmt_review_requested(SimpleNamespace(payload={"summary": "NOT met",
+                                                            "draft_cmds": ["ace_gate.py ready o/r 5"]}),
                                    SimpleNamespace(head="h", title="T"))[0]
     assert "ace_gate.py ready o/r 5" in msg
     plain = nt._fmt_review_requested(SimpleNamespace(payload={"summary": "NOT met"}),
                                      SimpleNamespace(head="h", title="T"))[0]
     assert "ace_gate.py" not in plain
+
+
+# --- Prism d0bec1125a49: only the card's OWN handoff PRs become flip commands ------------------
+
+
+def test_draft_cmds_ignore_a_pr_the_summary_only_cites():
+    from hermes_cli import kanban_negative_result as neg
+    assert neg.draft_cmds(None) == []
+    assert neg.draft_cmds({"summary_only": "Blocked by https://github.com/o/r/pull/5"}) == []
+    assert neg.draft_cmds({"pr_url": "https://github.com/o/r/pull/6"}) == ["ace_gate.py ready o/r 6"]
+
+
+def test_e2e_negative_result_citing_another_cards_pr_has_no_command(board):
+    """Prism repro: a NOT-met summary citing o/r#5 (another task's dependency) yields no flip command."""
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.request_review(conn, tid, summary=f"Close-on read: NOT met. Blocked by {PR_URL}",
+                                 expected_run_id=run) is True
+        (req,) = _events(conn, tid, "review_requested")
+        assert "draft_note" not in req and "draft_cmds" not in req
+
+
+def test_armable_and_draft_cmds_share_one_ownership_filter():
+    meta = {"pr_urls": ["https://github.com/o/r/pull/7"], "notes": "see https://github.com/o/r/pull/8"}
+    assert [f"{r.repo}#{r.number}" for r in fr.handoff_refs(meta)] == ["o/r#7"]
+    assert [f"{r.repo}#{r.number}" for r in fr.handoff_refs(None, survivor_pr="o/r#9")] == ["o/r#9"]
+
+
+# --- Prism 11a86869f533: a ping never prints a sliced command ---------------------------------
+
+
+LONG_REPO = "o/" + "r" * 28
+LONG_URLS = [f"https://github.com/{LONG_REPO}/pull/{n}" for n in (12341, 12342, 12343, 12345)]
+
+
+def test_long_command_list_is_counted_in_the_ping_and_posted_whole_on_the_card(board):
+    import re
+    from types import SimpleNamespace
+    from gateway import kanban_watchers_notifier as nt
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.request_review(conn, tid, summary=NEG, metadata={"pr_urls": LONG_URLS},
+                                 expected_run_id=run) is True
+        (req,) = _events(conn, tid, "review_requested")
+        assert req["draft_cmds"] == [f"ace_gate.py ready {LONG_REPO} {n}" for n in (12341, 12342, 12343, 12345)]
+        msg = nt._fmt_review_requested(SimpleNamespace(payload=req), SimpleNamespace(head="h", title="T"))[0]
+        named = {int(n) for n in re.findall(r"ace_gate\.py ready \S+ (\d+)", msg)}
+        assert named <= {12341, 12342, 12343, 12345}
+        assert "4 flip commands, see the card" in msg
+        bodies = [b for (b,) in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (tid,))]
+        (body,) = [b for b in bodies if "flip each one" in b]
+        for c in req["draft_cmds"]:
+            assert c in body.splitlines()
+
+
+def test_short_command_list_prints_whole_and_posts_no_comment(board):
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.request_review(conn, tid, summary=NEG, metadata={"pr_url": PR_URL}, expected_run_id=run) is True
+        assert not [1 for (b,) in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (tid,))
+                    if "flip each one" in b]

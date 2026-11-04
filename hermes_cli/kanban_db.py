@@ -11627,9 +11627,7 @@ def complete_task(
             # Arm only the card's OWN handoff PR(s), never a PR the prose
             # merely mentions (FleetReview #1234 finding).
             armable = {
-                f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
-                    metadata=metadata, survivor_pr=survivor_pr,
-                )
+                f"{r.repo}#{r.number}" for r in _fresh.handoff_refs(metadata, survivor_pr=survivor_pr)
             }
             may_arm = not is_milestone_card(conn, task_id)
             # Ready-flip evidence from earlier handoffs of this card (t_c1ee61ae, Prism
@@ -14706,10 +14704,13 @@ def _request_review_txn(
             payload["artifacts"] = staged
         if negative_result is not None:
             # t_5c6c67c5: the PR is left exactly as it is; tell the reviewer how to flip it on accept.
-            from hermes_cli.kanban_negative_result import draft_note
-            note = draft_note(summary, metadata)
-            if note:
-                payload["draft_note"] = note
+            from hermes_cli import kanban_negative_result as _neg
+            cmds = _neg.draft_cmds(metadata)
+            if cmds:
+                payload["draft_cmds"] = cmds
+                payload["draft_note"] = _neg.draft_note_line(cmds)
+                if not _neg.draft_note_fits(cmds):
+                    _insert_comment(conn, task_id, "kanban", _neg.draft_note_comment(cmds), int(time.time()))
         _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
         if negative_result is not None:
             _append_event(

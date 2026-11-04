@@ -374,6 +374,15 @@ def worker_draft_repos(path: Optional[str] = None) -> set:
     return {r.casefold() for r in repos if isinstance(r, str)}
 
 
+def handoff_refs(metadata=None, survivor_pr=None) -> list:
+    """The card's OWN handoff PR refs: ``metadata.pr_url``/``pr_urls``/``pr``/``own_prs`` or
+    ``--survivor-pr``. A PR the summary/result prose merely mentions is context, never the card's
+    (FleetReview #1234). One filter for arming (complete_task) and the negative-result flip note."""
+    from hermes_cli.kanban_open_pr import extract_pr_refs
+    meta = metadata if isinstance(metadata, dict) else None
+    return extract_pr_refs(metadata=meta, survivor_pr=survivor_pr)
+
+
 def _owns_draft(ref, pr: dict, task_id: str) -> bool:
     """The worker's own draft: head branch names THIS card and the repo is a worker-draft repo."""
     from hermes_cli.kanban_open_pr import branch_names_card

@@ -42,18 +42,39 @@ def negative_result_match(summary: Optional[str], metadata: Any = None) -> Optio
     return m.group(0) if m else None
 
 
-def draft_note(summary: Optional[str], metadata: Any = None) -> Optional[str]:
-    """Reviewer line for a negative-result handback's own fleet PRs, or None (t_5c6c67c5).
+DRAFT_NOTE_PING_MAX = 300
+_DRAFT_HEAD = "negative result: PR left as-is (a worker draft stays draft); "
+
+
+def draft_cmds(metadata: Any = None) -> list:
+    """``ace_gate.py ready <repo> <n>`` for each of the card's OWN fleet handoff PRs (t_5c6c67c5).
 
     A NOT-met handback leaves its PR exactly as it is: a worker draft stays draft, which keeps
-    self-declared-unfinished work out of every lander until the human lane decides. The line
-    says so and names the flip for when the reviewer accepts. No network read: parsed refs only.
+    self-declared-unfinished work out of every lander until the human lane decides. Ownership is the
+    freshness gate's own filter (:func:`kanban_pr_freshness.handoff_refs`): a PR the summary merely
+    cites (another card's dependency) never becomes a command (Prism d0bec1125a49). No network read.
     """
-    from hermes_cli.kanban_open_pr import extract_pr_refs, split_fleet
+    from hermes_cli.kanban_open_pr import split_fleet
+    from hermes_cli.kanban_pr_freshness import handoff_refs
 
     meta = metadata if isinstance(metadata, dict) else None
-    refs = split_fleet(extract_pr_refs(metadata=meta))[0] or split_fleet(extract_pr_refs(summary))[0]
-    if not refs:
+    return [f"ace_gate.py ready {r.repo} {r.number}" for r in split_fleet(handoff_refs(meta))[0]]
+
+
+def draft_note_fits(cmds: list, limit: int = DRAFT_NOTE_PING_MAX) -> bool:
+    return len(_DRAFT_HEAD + "on accept flip it: " + "; ".join(cmds)) <= limit
+
+
+def draft_note_line(cmds: list, limit: int = DRAFT_NOTE_PING_MAX) -> Optional[str]:
+    """The review-ping line: every command whole, or a count pointing at the card comment. Never a
+    sliced command, which could name a different valid PR (Prism 11a86869f533)."""
+    if not cmds:
         return None
-    cmds = "; ".join(f"ace_gate.py ready {r.repo} {r.number}" for r in refs)
-    return f"negative result: PR left as-is (a worker draft stays draft); on accept flip it: {cmds}"
+    if draft_note_fits(cmds, limit):
+        return _DRAFT_HEAD + "on accept flip it: " + "; ".join(cmds)
+    return _DRAFT_HEAD + f"{len(cmds)} flip commands, see the card"
+
+
+def draft_note_comment(cmds: list) -> str:
+    """Card comment carrying the full command list when the ping line only counts them."""
+    return _DRAFT_HEAD + "on accept flip each one:\n" + "\n".join(cmds)
