@@ -176,12 +176,18 @@ def test_draining_or_shrunk_host_gets_no_stale_slots(root):
     assert rep["hosts"]["ace-media"]["enabled"] is False
     assert rep["rung"]["host"] == "ace-ai"
 
+    # t_b20850d2 (FWA-H): a lowered kanban-worker count no longer caps a host (it is membership only);
+    # the tick's own free count still does
     roles["hosts"]["ace-media"]["state"] = "active"
     roles["hosts"]["ace-ai"]["roles"]["kanban-worker"]["slots"] = 1
     _write(root / "fleet" / "fleet-roles.json", roles)
     busy = _row(1.0, "ok")
-    busy["running"] = 1  # 1 running against the new 1-slot cap: no room
+    busy["running"] = 1
     gate = _gate(**{"ace-ai": busy, "ace-media": _row(12.0, "warm")})
+    rep = kpd.compute(root, kanban_cfg={}, gate_state=gate, now=NOW, assignee="alpha")
+    assert rep["rung"]["host"] == "ace-ai"
+    full = dict(busy, free=0)
+    gate = _gate(**{"ace-ai": full, "ace-media": _row(12.0, "warm")})
     rep = kpd.compute(root, kanban_cfg={}, gate_state=gate, now=NOW, assignee="alpha")
     assert rep["rung"]["host"] == "ace-media"
 
