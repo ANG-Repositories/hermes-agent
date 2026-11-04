@@ -58,8 +58,8 @@ def pr_thread(repo: str, number: int) -> Optional[dict]:
     """``{"body": str, "comments": [{"body", "login", "assoc"}]}`` over REST, or None when unreadable."""
     def _gh(args):
         try:
-            proc = subprocess.run(["gh", "api", "--hostname", "github.com", *args], capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=QUERY_TIMEOUT_SECONDS, check=False)
+            proc = subprocess.run(["gh", "api", "--hostname", "github.com", *args], capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=QUERY_TIMEOUT_SECONDS, check=False)
         except (OSError, subprocess.SubprocessError, TimeoutError):
             return None
         return proc.stdout if proc.returncode == 0 else None
