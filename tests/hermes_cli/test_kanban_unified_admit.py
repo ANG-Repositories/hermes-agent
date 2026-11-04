@@ -266,7 +266,7 @@ def test_d9_no_memory_cap_on_the_plan_either_rule(home, monkeypatch, unified):
     f = Fleet(time.time())
     f.mem["ace-ai"] = 7.0
     plan = _plan_cfg(home, f, {"placement": {"admit_on_memory": True, "worker_reservation_gb": 6}})
-    assert plan.slots["ace-ai"] == 24 and not hasattr(plan, "admission")
+    assert plan.slots["ace-ai"] == kwp.UNCOUNTED_TICK_FREE and not hasattr(plan, "admission")
 
 
 def test_d7_pinned_take_passes_the_one_rule_too(home):
