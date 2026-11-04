@@ -993,7 +993,7 @@ def _site_triggers():
         "return: _kbudget.evaluate_board_budget(board, _kb.kanban_db_path(board=board), "
         "_kb.board_state_dir(board), cache=budget_cache)": budget,
         "return: running_count >= max_spawn": max_spawn,
-        "continue: _ahead and spawn_budget is not None and spawned + _ahead >= spawn_budget": review_ahead,
+        "continue: _ahead and spawn_budget is not None and (spawned + _ahead >= spawn_budget)": review_ahead,
         "rows: _kb._drop_no_worker_rows": no_worker,
         "rows: _drop_human_lane_rows": human_lane,
         "rows: _kph.held_routes": pause_pre,
