@@ -13439,8 +13439,12 @@ def safe_remove_workspace_dir(
     reason: str,
     conn: Optional[sqlite3.Connection] = None,
     remote_host=None,
+    reclaimed: Optional[dict] = None,
 ) -> bool:
     """THE choke point for removing a kanban-managed scratch workspace.
+
+    ``reclaimed`` is a verified capture from :mod:`hermes_cli.kanban_reclaim` (t_83c38f7b); it
+    replaces the survivor proof in the deleter and is accepted only with ``conn`` on a local tree.
 
     Every workspace deletion in Hermes goes through here. Three gates, in
     order, each of which independently refuses:
@@ -13604,7 +13608,10 @@ def safe_remove_workspace_dir(
     # does), so open one here rather than degrading into a hold -- the same
     # self-connect _task_has_live_run performs.
     try:
-        if conn is not None or not task_id:
+        if reclaimed is not None:
+            removed = conn is not None and bool(task_id) and bool(
+                remove_workspace_dir(conn, task_id, resolved, reclaimed=reclaimed))
+        elif conn is not None or not task_id:
             removed = bool(remove_workspace_dir(conn, task_id, resolved))
         else:
             with connect_closing() as own:
