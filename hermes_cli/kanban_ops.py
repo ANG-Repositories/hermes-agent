@@ -185,9 +185,17 @@ def _cli_utilization_gate(conn, args, gate, out, emit, load1):
     l1 = "?" if load1 is None else f"{load1:.1f}"
     busy = "?" if cpu_busy is None else f"{cpu_busy:.2f}"
     if getattr(args, "ignore_load_gate", False):
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+        except Exception:
+            profile = "unknown"
         out["override"] = {"source": "cli dispatch --ignore-load-gate", "admission": "utilization",
-                           "cpu_busy": cpu_busy, "gate_state": gate.state, "gate_allowance": allowance}
-        emit(f"Load gate: utilization OVERRIDE (--ignore-load-gate; would have allowed {allowance}; cpu_busy={busy})")
+                           "profile": profile, "cpu_busy": cpu_busy, "gate_state": gate.state,
+                           "gate_allowance": allowance}
+        info["override_by"] = profile
+        emit(f"Load gate: utilization OVERRIDE by {profile} (--ignore-load-gate; would have allowed {allowance}; "
+             f"cpu_busy={busy})")
         return out
     if reason:
         emit(f"Load gate: utilization SATURATED cpu_busy={busy} (load {l1} not read) - spawning 0 this call: {reason}")

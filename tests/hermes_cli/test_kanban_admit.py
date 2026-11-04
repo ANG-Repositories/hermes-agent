@@ -21,7 +21,7 @@ from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 
 TOKEN = "op-token-test"
-GATE = {"enabled": True, "pause_above": 64, "resume_below": 48, "max_spawn_per_tick": 16, "ecore_gate": "off"}
+GATE = {"enabled": True, "max_spawn_per_tick": 16}
 LOCAL_NAME = "admit-test-box"     # this machine's hostname in every test, whatever venue runs it
 POOL_HOST = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
                          absence="required", profiles=("alpha",), state="active", enabled=True, priority=0)
@@ -100,11 +100,18 @@ def _events(tid, kind=ka.EVENT):
             "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kind)).fetchall()]
 
 
-def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64):
-    """The Studio's LoadGate PAUSED (load1 66 > pause_above 64), memory and threads as given."""
+def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64, cpu_busy=0.99):
+    """The Studio's LoadGate SATURATED (cpu_busy 0.99: admit_class refuses), memory and threads as given."""
+    from hermes_cli.fleet_placement import admission as ad
+
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (load1, load1))
-    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.99, None))
-    monkeypatch.setattr(klg, "utilization_context", lambda: {"mem_available_gb": mem})
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (cpu_busy, None))
+    monkeypatch.setattr(klg, "sample_psi", lambda: {})
+    monkeypatch.setattr(klg, "utilization_context", lambda: {
+        "host": "mac-studio", "ceiling": None, "ceiling_reason": "",
+        "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), "limits": ad.Limits(),
+        "mem_available_gb": mem, "mem_total_gb": 512.0})
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
     monkeypatch.setattr(ka.os, "cpu_count", lambda: threads)
 
 
@@ -123,7 +130,8 @@ def test_admit_spawns_on_a_host_whose_band_is_hot_and_writes_the_event(board, mo
     assert SPAWNS == [(tid, None)] and _status(tid) == "running"
     [ev] = _events(tid)
     assert ev["actor"] == "apollo" and ev["host"] == "studio" and ev["reason"] == "Ace 21:3x: do both"
-    assert ev["band"] == "paused" and ev["gate_allowance"] == 0      # what it overrode
+    assert ev["band"] == "spilling" and ev["gate_allowance"] == 0    # what it overrode
+    assert ev["admission"] == "utilization"
     assert ev["load1"] == 66.0 and ev["load_limit"] == 96.0 and ev["mem_reserve_gb"] == 0.0
 
 
@@ -234,7 +242,7 @@ def test_a_local_admit_lowers_the_next_gateway_tick_allowance_by_one(board, monk
     budget on the very next tick, before its CPU shows in load1."""
     from gateway import kanban_gate_tick as kgt
 
-    _hot_local(monkeypatch, load1=40.0)        # (64 - 40) / cost 2 = 12 admitted, under the cap
+    _hot_local(monkeypatch, load1=40.0, mem=36.0, cpu_busy=0.05)   # 36 GB / 3 GB per worker = 12, under the cap
     monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
     cfg = {"dispatch_load_gate": dict(GATE)}
 

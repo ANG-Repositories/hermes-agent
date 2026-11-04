@@ -10,7 +10,7 @@ Red-first arms (each fails on the pre-t_3694ab3c dispatcher):
               admit_class holds them back (``held_back:kanban for prism 64 queued``).
   D7 replay   the same Prism queue published for ci-box: a pool take that today lands on ci-box (default_first)
               is held there and goes to the next host; with every host held, the take is refused, never forced.
-  D9          admit_on_memory's 6 GB/worker cap no longer cuts a host's slots under the unified rule.
+  D9          the 6 GB/worker memory cap is gone (t_b20850d2); admit_class owns the memory axis.
   demand      the tick publishes ready-card demand as var/placement/demand/kanban.json.
 Kill switch arms: KANBAN_UNIFIED_ADMIT=0 restores each old answer.
 """
@@ -61,7 +61,6 @@ def studio(tmp_path, monkeypatch):
 
 def _gate():
     g = klg.LoadGate({"max_spawn_per_tick": 4}, 32)
-    g.admission = "utilization"
     return g
 
 
@@ -259,31 +258,15 @@ def _plan_cfg(home, fleet, cfg):
     return b.plan_pool([], {})
 
 
-def test_d9_memory_cap_is_reported_not_enforced_under_unified(home):
-    f = Fleet(time.time())
-    f.mem["ace-ai"] = 7.0                                         # 6 GB/worker reservation: cap 1 < 24 free slots
-    cfg = {"placement": {"admit_on_memory": True}}
-    plan = _plan_cfg(home, f, cfg)
-    assert "ace-ai" in plan.admission                             # still computed and reported
-    assert plan.slots["ace-ai"] == 24                             # not enforced: admit_class owns the memory axis
-
-
-def test_d9_kill_switch_enforces_the_cap(home, monkeypatch):
-    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
+@pytest.mark.parametrize("unified", ["1", "0"])
+def test_d9_no_memory_cap_on_the_plan_either_rule(home, monkeypatch, unified):
+    """t_b20850d2 (red on base: KANBAN_UNIFIED_ADMIT=0 + admit_on_memory cut the slots to floor(7 / 6) = 1).
+    The 6 GB/worker cap is gone on every path; a stale admit_on_memory key in config is ignored."""
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", unified)
     f = Fleet(time.time())
     f.mem["ace-ai"] = 7.0
-    plan = _plan_cfg(home, f, {"placement": {"admit_on_memory": True}})
-    assert plan.slots["ace-ai"] == 1                              # today's floor(7 / 6)
-
-
-def test_d9_cap_still_binds_where_unified_filter_does_not_run(home):
-    """Prism f4d9c1273272: legacy admission mode (unified_filter inert) keeps the 6 GB/worker cap enforced even with
-    KANBAN_UNIFIED_ADMIT on, so no path loses its memory check."""
-    (home / "config.yaml").write_text("kanban:\n  admission: legacy\n", encoding="utf-8")
-    f = Fleet(time.time())
-    f.mem["ace-ai"] = 7.0
-    plan = _plan_cfg(home, f, {"placement": {"admit_on_memory": True}})
-    assert plan.slots["ace-ai"] == 1
+    plan = _plan_cfg(home, f, {"placement": {"admit_on_memory": True, "worker_reservation_gb": 6}})
+    assert plan.slots["ace-ai"] == 24 and not hasattr(plan, "admission")
 
 
 def test_d7_pinned_take_passes_the_one_rule_too(home):
@@ -649,32 +632,19 @@ def test_the_full_utilization_sample_reaches_admit_class(home, extra, why):
     assert keep == [] and held["ace-ai"].startswith(why), held
 
 
-@pytest.mark.parametrize("admit_on_memory", [True, False])
-def test_hot_band_with_slo_breach_is_refused_on_both_paths_under_unified(home, admit_on_memory):
+def test_hot_band_with_slo_breach_is_refused_on_both_paths_under_unified(home):
     """Prism ce581503f8d8 (card acceptance): a published hot band.kanban + slo_breach on ace-ai, KANBAN_UNIFIED_ADMIT=1.
-    The pinned and the unpinned take both refuse. With admit_on_memory the band axis still zeroes the slots (only the
-    memory axis is retired); without it (the live config) admit_class refuses on the SLO guard."""
+    The pinned and the unpinned take both refuse: admit_class refuses on the SLO guard."""
     t0 = time.time()
     f = Fleet(t0)
     f.band["ace-ai"] = "hot"
     f.extra["ace-ai"] = {"slo_breach": True}
-    cfg = {"placement": {"admit_on_memory": admit_on_memory}}
-    plan = _plan_cfg(home, f, cfg)
+    plan = _plan_cfg(home, f, {"placement": {}})
     plan.signal.clock = lambda: t0
-    if admit_on_memory:
-        assert plan.slots["ace-ai"] == 0 and "band.kanban hot" in plan.detail["ace-ai"]["pressure"]
     assert plan.take("alpha", pin="ace-ai") is None
     assert plan.refusal.startswith("pin_host_"), plan.refusal
     assert plan.take("alpha", only=["ace-ai"]) is None
     assert plan.refusal.startswith(("unified_admission", "pool_unavailable")), plan.refusal
-
-
-def test_hot_band_kill_switch_keeps_todays_cap(home, monkeypatch):
-    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
-    f = Fleet(time.time())
-    f.band["ace-ai"] = "hot"
-    plan = _plan_cfg(home, f, {"placement": {"admit_on_memory": True}})
-    assert plan.slots["ace-ai"] == 0                              # today's cap: band.kanban hot = 0
 
 
 def test_unified_refusal_code_is_in_the_shared_take_vocabulary(home):

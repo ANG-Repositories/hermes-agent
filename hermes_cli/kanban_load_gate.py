@@ -872,14 +872,13 @@ def format_state_line(state: Optional[dict], now: Optional[float] = None) -> str
     l5 = state.get("load5")
     l1_txt = "?" if l1 is None else f"{float(l1):.1f}"
     return (
-        f"Load gate: {state.get('state')} "
+        f"Load gate: {state.get('state')} admission={state.get('admission')} "
+        f"cpu_busy={state.get('cpu_busy')} "
         f"load1={l1_txt} "
         f"load5={'?' if l5 is None else f'{float(l5):.1f}'} "
-        f"(load {l1_txt} tasks / {_denom(state.get('ncpu'))}) "
-        f"pending_ramp={state.get('pending_ramp')} "
+        f"(load {l1_txt} tasks / {_denom(state.get('ncpu'))}, not read) "
         f"allowance={state.get('allowance')} "
         f"admitted_last_tick={state.get('admitted_last_tick')} "
-        f"pause_above={state.get('pause_above')} "
         f"max_spawn_per_tick={state.get('max_spawn_per_tick')} "
         f"procs={state.get('procs')}/{state.get('proc_limit')} "
         f"band={state.get('band')}/{state.get('spill_reason') or '-'} "

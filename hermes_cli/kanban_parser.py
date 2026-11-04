@@ -916,7 +916,7 @@ _SPECS = [
              help="Running-count ceiling for this board: spawn nothing once N are running "
                   "(default: kanban.max_spawn)"),
         _arg("--ignore-load-gate", action="store_true",
-             help="Bypass kanban.dispatch_load_gate for this call. Prints load1/pause_above "
+             help="Bypass kanban.dispatch_load_gate for this call. Prints the admission verdict "
                   "and records a load_gate_override event on every card it spawns"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "

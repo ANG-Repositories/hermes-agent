@@ -1,19 +1,18 @@
 """Wake -> notify downgrade under measured contention (t_74bf5296).
 
 Ace 13:40: "Wake is really nice as well, except if we have resource
-contention. In that case, we want to turn Wake off." The band is the
-dispatcher's (pause_above 64 / resume_below 48 on the Studio), with
-hysteresis, and it applies per EVENT, never to the subscription.
+contention. In that case, we want to turn Wake off." The host half is measured
+CPU busy (t_0e52c7ab); the load1 band (kill switch) is the wake gate's own
+(t_b20850d2: nothing inherits from dispatch_load_gate). Hysteresis, per EVENT,
+never the subscription.
 """
 from __future__ import annotations
 
 from hermes_cli.kanban_wake_gate import WakeGate, read_state
 
 # The load1 band (kill switch ``host_axis: load1``); the default axis is cpu (t_0e52c7ab).
-CFG = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                  "wake_load_gate": {"host_axis": "load1"}}}
-CPU_CFG = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "resume_below": 24,
-                                             "cpu_pause": 0.90}}}
+CFG = {"kanban": {"wake_load_gate": {"pause_above": 64, "resume_below": 48, "host_axis": "load1"}}}
+CPU_CFG = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90}}}
 
 
 class Load:
@@ -40,9 +39,19 @@ def _gate(load, tmp_path, cfg=CFG, lane=lambda p: None, cpu=None):
                     state_file=tmp_path / "wake_gate.json")
 
 
-def test_inherits_the_dispatch_band(tmp_path):
+def test_load1_band_is_the_wake_gates_own(tmp_path):
     g = _gate(Load(1), tmp_path)
     assert (g.pause_above, g.resume_below) == (64, 48)
+
+
+def test_dispatch_load_gate_keys_are_not_inherited(tmp_path):
+    """t_b20850d2: dispatch_load_gate's load/CPU keys are gone; a leftover one never drives the wake gate."""
+    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48, "cpu_pause": 0.50},
+                      "wake_load_gate": {"host_axis": "load1"}}}
+    g = _gate(Load(500), tmp_path, cfg=cfg)
+    assert g.pause_above is None and g.downgrade_reason(None, now=0) is None
+    g2 = _gate(Load(1), tmp_path, cfg={"kanban": {"dispatch_load_gate": {"cpu_pause": 0.50}}}, cpu=Cpu(0.60))
+    assert g2.cpu_pause == 0.90 and g2.downgrade_reason(None, now=0) is None
 
 
 def test_downgrade_fires_above_the_gate_and_not_below(tmp_path):
@@ -94,25 +103,22 @@ def test_lane_probe_error_fails_open_toward_wake(tmp_path):
 
 
 def test_disabled_gate_never_downgrades(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                      "wake_load_gate": {"enabled": False}}}
+    cfg = {"kanban": {"wake_load_gate": {"enabled": False, "pause_above": 64, "resume_below": 48}}}
     g = _gate(Load(200), tmp_path, cfg=cfg, lane=lambda p: "capped")
     assert g.downgrade_reason("athena", now=0) is None
 
 
-def test_no_configured_band_means_no_host_downgrade(tmp_path):
-    """The ncpu fallback is not a measured band: no pause_above, no host gate."""
-    g = _gate(Load(500), tmp_path, cfg={"kanban": {}})
+def test_no_configured_band_means_no_host_downgrade_on_the_load1_axis(tmp_path):
+    """The ncpu fallback is not a measured band: on the load1 axis, no pause_above = no host gate."""
+    g = _gate(Load(500), tmp_path, cfg={"kanban": {"wake_load_gate": {"host_axis": "load1"}}})
     assert g.downgrade_reason(None, now=0) is None
     assert g.snapshot()["mode"] == "off"
 
 
-def test_wake_gate_block_overrides_dispatch_band(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                      "wake_load_gate": {"pause_above": 20, "resume_below": 10,
-                                         "host_axis": "load1"}}}
-    g = _gate(Load(25), tmp_path, cfg=cfg)
-    assert g.downgrade_reason(None, now=0) == "host load 25"
+def test_cpu_axis_is_on_with_no_config_at_all(tmp_path):
+    """The default axis needs no band: an empty kanban block still downgrades at cpu_pause 0.90."""
+    g = _gate(Load(1), tmp_path, cfg={"kanban": {}}, cpu=Cpu(0.95))
+    assert g.downgrade_reason(None, now=0) == "host cpu 95% busy (load1 1)"
 
 
 # -- cpu axis (default; t_0e52c7ab, Ace 2026-10-18 22:22) ----------------------
@@ -151,18 +157,16 @@ def test_unreadable_cpu_sample_fails_open_toward_wake(tmp_path):
     assert g2.downgrade_reason(None, now=0) is None
 
 
-def test_cpu_pause_inherits_dispatch_and_wake_block_overrides(tmp_path):
+def test_cpu_pause_default_and_wake_block_overrides(tmp_path):
     assert _gate(Load(1), tmp_path, cfg=CPU_CFG).cpu_pause == 0.90
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
-                      "wake_load_gate": {"cpu_pause": 0.80}}}
+    cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.80}}}
     g = _gate(Load(1), tmp_path, cfg=cfg, cpu=Cpu(0.85))
     assert g.cpu_pause == 0.80
     assert g.downgrade_reason(None, now=0) == "host cpu 85% busy (load1 1)"
 
 
 def test_load1_kill_switch_restores_the_band(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "resume_below": 24},
-                      "wake_load_gate": {"host_axis": "load1"}}}
+    cfg = {"kanban": {"wake_load_gate": {"pause_above": 32, "resume_below": 24, "host_axis": "load1"}}}
     g = _gate(Load(172), tmp_path, cfg=cfg, cpu=Cpu(0.10))
     assert g.downgrade_reason(None, now=0) == "host load 172"
 
@@ -237,8 +241,7 @@ def test_raising_cpu_sampler_does_not_refresh_the_baseline_age(tmp_path):
 
 def test_max_interval_below_sample_cadence_still_trips(tmp_path):
     """Prism 6360f05606ba: cpu_max_interval < sample_seconds must not disable the CPU axis."""
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
-                      "wake_load_gate": {"cpu_max_interval": 1}}}
+    cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90, "cpu_max_interval": 1}}}
     g = _gate(Load(1), tmp_path, cfg=cfg, cpu=CpuDelta(0.95))
     assert g.cpu_max_interval >= 2 * g.sample_seconds
     results = [g.downgrade_reason(None, now=t) for t in range(1000, 1046)]
@@ -246,8 +249,7 @@ def test_max_interval_below_sample_cadence_still_trips(tmp_path):
 
 
 def test_cpu_max_interval_is_configurable(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
-                      "wake_load_gate": {"cpu_max_interval": 30}}}
+    cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90, "cpu_max_interval": 30}}}
     cpu = CpuDelta(0.95)
     g = _gate(Load(1), tmp_path, cfg=cfg, cpu=cpu)
     g.downgrade_reason(None, now=0)

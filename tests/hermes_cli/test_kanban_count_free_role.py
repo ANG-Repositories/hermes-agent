@@ -3,8 +3,9 @@ use, never a count).
 
 fleet-roles.json ``"kanban-worker": {}`` parses to ``PoolHost.slots = None``. The
 planner then never bounds that host by a count: running workers are not subtracted,
-and measured admission (allocd per take, the band and the memory cap per plan, the
-v0.1 load line) alone refuses. A legacy ``{"slots": N}`` is still a ceiling.
+and measured admission (allocd per take, the band per plan, the v0.1 load line) alone
+refuses. A legacy ``{"slots": N}`` is still a ceiling. The per-tick stand-in is the
+fleet runaway stop, 1000 (t_b20850d2): it never binds and the plan budget is never a slot sum.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import pytest
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_worker_pool as kwp
 
-from tests.hermes_cli.test_kanban_admission import Fleet as MemFleet
 from tests.hermes_cli.test_kanban_target_pressure import HOSTS, T0, sig  # noqa: F401  (fixture)
 
 AI = HOSTS[0]
@@ -69,28 +69,20 @@ def test_v01_count_free_host_admits_past_the_old_count_until_the_load_line():
     assert hot.budget == 0 and hot.take("alpha") is None and hot.refusal == "pool_full"
 
 
-# -- signal planner: band + memory cap decide ----------------------------------
+# -- signal planner: no count and no memory cap bound the plan ------------------
 
-def test_memory_cap_alone_bounds_a_count_free_host(sig):
-    fleet = MemFleet()
-    fleet.set("ace-ai", mem=60)  # cap floor(60 / 6) = 10 > the old count 4
-    sig.admit_on_memory = True
-    running = {"ace-ai": OLD_COUNT}
-    assert kwp.plan([AI], running, probe=fleet.probe, signal=sig).budget == 0  # count refuses
-    p = kwp.plan([FREE_AI], running, probe=fleet.probe, signal=sig)
-    assert p.slots == {"ace-ai": 10} and p.detail["ace-ai"]["slots"] is None
-    got = [p.take("alpha") for _ in range(10)]
-    assert all(h is not None for h in got)
-    assert p.take("alpha") is None and p.refusal == "pool_full"
+def _pressure(at, *, mem=4.0, band="ok"):
+    return json.dumps({"host": "ace-ai", "at": at, "ncpu": 24, "load1": 2.4, "load_ratio": 0.1,
+                       "mem_available_gb": mem, "band": {"kanban": band}, "band_reason": {"kanban": band}})
 
 
-def test_hot_band_refuses_a_count_free_host(sig):
-    fleet = MemFleet()
-    fleet.set("ace-ai", mem=100, band="hot", reason="psi_mem 12 >= 10")
-    sig.admit_on_memory = True
-    p = kwp.plan([FREE_AI], {}, probe=fleet.probe, signal=sig)
-    assert p.slots == {"ace-ai": 0}
-    assert p.take("alpha") is None and p.refusal.startswith("pool_unavailable (ace-ai: admission:")
+def test_signal_plan_budget_is_the_stand_in_not_a_slot_sum_or_memory_cap(sig):
+    """t_b20850d2 (red on base: the 6 GB/worker cap and the 64 stand-in shaped the plan budget). A count-free
+    host with 4 GB available plans the runaway stop; the measured rule (allocd / unified_filter) decides per take."""
+    probe = lambda h: kwp.HostSample(2.0, 24, T0, _pressure(T0))  # noqa: E731
+    p = kwp.plan([FREE_AI], {"ace-ai": 30}, probe=probe, signal=sig)
+    assert p.slots == {"ace-ai": kwp.UNCOUNTED_TICK_FREE} and p.budget == 1000
+    assert "admission" not in p.detail["ace-ai"]
 
 
 # -- allocd on: allocd alone decides -------------------------------------------
@@ -128,6 +120,7 @@ def test_allocd_admits_a_count_free_host_past_the_old_count_until_it_refuses(sig
 
 
 def test_count_free_and_legacy_free_counts():
+    assert kwp.UNCOUNTED_TICK_FREE == 1000        # the fleet's runaway stop (no new counts: a survivor is 1000)
     assert kwp.count_free(FREE_AI, 1000) == kwp.UNCOUNTED_TICK_FREE
     assert kwp.count_free(AI, 1) == OLD_COUNT - 1
     assert kwp.count_free(AI, OLD_COUNT + 5) == 0
