@@ -519,7 +519,7 @@ def test_e2e_read_signal_false_ignores_pressure_and_ledger(board):
     builder._probe = lambda h: (2.0, 24)
     fleet.set("ace-ai", 0.99)
     plan = builder.plan_pool([], {})
-    assert plan.signal is None and plan.budget == 8
+    assert plan.signal is None and plan.budget == 2 * kwp.UNCOUNTED_TICK_FREE
     builder.record_placements([("t_x", "ace-ai")])
     assert not (board / "var" / "placement").exists()
     assert not (board / "var" / kwp.TARGET_STATE_FILE).exists()

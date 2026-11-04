@@ -32,16 +32,38 @@ def _roles(spec):
 
 # -- parse / read ------------------------------------------------------------
 
-def test_kanban_worker_empty_spec_parses_to_none_and_legacy_count_is_kept():
+def test_kanban_worker_count_is_never_read_as_capacity():
+    """t_b20850d2 (FWA-H, red on base: a legacy {"slots": 12} parsed to 12 and capped the plan at the slot sum).
+    The dispatcher reads kanban-worker as membership only, ``{}`` or a legacy count alike; the shape is still
+    validated so a malformed file is refused, and a non-kanban role keeps its count."""
     assert kwp.parse_roles(_roles({})) == {"a": ({"kanban-worker": None}, "active")}
-    assert kwp.parse_roles(_roles({"slots": 3})) == {"a": ({"kanban-worker": 3}, "active")}
+    assert kwp.parse_roles(_roles({"slots": 3})) == {"a": ({"kanban-worker": None}, "active")}
     with pytest.raises(kwp.PoolError, match=r'kanban-worker must be \{\} or \{"slots": N\}'):
         kwp.parse_roles(_roles({"slots": 3, "x": 1}))
     with pytest.raises(kwp.PoolError, match="slots must be 1..64"):
         kwp.parse_roles(_roles({"slots": 0}))
+    other = {"schema": 1, "hosts": {"a": {"roles": {"review-worker": {"slots": 5}}, "state": "active"}}}
+    assert kwp.parse_roles(other) == {"a": ({"review-worker": 5}, "active")}
 
 
-def test_read_pool_carries_a_count_free_host(tmp_path):
+def test_live_slot_counts_do_not_shape_the_pool_budget(tmp_path):
+    """The live fleet-roles shape (kanban-worker 12 / 12 / 24): every host plans the runaway stop, never 12."""
+    (tmp_path / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {"slots": 12}, "ci-runner": {}}, "state": "active"},
+        "ace-media": {"roles": {"kanban-worker": {"slots": 12}}, "state": "active"},
+    }}), encoding="utf-8")
+    (tmp_path / kwp.SIDECAR_FILE).write_text(json.dumps({
+        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai", "ace-media"], "profiles": ["alpha"],
+        "hosts": {"ace-ai": {"enabled": True, "absence": "required"},
+                  "ace-media": {"enabled": True, "absence": "optional"}},
+    }), encoding="utf-8")
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert {h.name: h.slots for h in cfg.pool_hosts} == {"ace-ai": None, "ace-media": None}
+    p = kwp.plan(list(cfg.pool_hosts), {"ace-ai": 5, "ace-media": 0}, probe=lambda h: (1.0, 24))
+    assert p.budget == 2 * kwp.UNCOUNTED_TICK_FREE and p.budget != (12 - 5) + 12
+
+
+def test_read_pool_carries_count_free_hosts(tmp_path):
     (tmp_path / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
         "ace-ai": {"roles": {"kanban-worker": {}, "ci-runner": {}}, "state": "active"},
         "ace-media": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"},
@@ -53,7 +75,7 @@ def test_read_pool_carries_a_count_free_host(tmp_path):
     }), encoding="utf-8")
     cfg = kwp.read_pool(tmp_path, kanban_cfg={})
     assert cfg.refused is None and cfg.warnings == ()
-    assert {h.name: h.slots for h in cfg.pool_hosts} == {"ace-ai": None, "ace-media": 4}
+    assert {h.name: h.slots for h in cfg.pool_hosts} == {"ace-ai": None, "ace-media": None}
 
 
 # -- v0.1 planner: the load line decides --------------------------------------

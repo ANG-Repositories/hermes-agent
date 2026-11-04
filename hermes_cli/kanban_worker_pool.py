@@ -299,7 +299,8 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
             slots = spec["slots"]
             if isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64:
                 raise PoolError(f"fleet-roles.json: host {hid}: role {role} slots must be 1..64")
-            parsed[role] = slots
+            # t_b20850d2 (FWA-H): a legacy kanban-worker count is validated, never read as capacity
+            parsed[role] = None if role == ROLE else slots
         if row["state"] not in _STATES:
             raise PoolError(f"fleet-roles.json: host {hid}: state must be one of {_STATES}")
         out[hid] = (parsed, row["state"])

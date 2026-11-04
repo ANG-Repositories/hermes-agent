@@ -123,7 +123,8 @@ def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     assert [h.name for h in hosts] == ["ace-ai", "ace-media"] and warnings == []
     cfg = kwp.read_pool(tmp_path)
     assert cfg.disabled == ("ci-box",) and "ci-box" in cfg.hosts
-    assert all(h.ssh_user == "kanbanw" and h.slots == 4 for h in hosts)
+    # t_b20850d2: a legacy kanban-worker count is membership only, never capacity
+    assert all(h.ssh_user == "kanbanw" and h.slots is None for h in hosts)
 
 
 def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
@@ -147,8 +148,8 @@ def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_ro
         "ace-media": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"},
     }}
     _write_pool(tmp_path, roles=roles)
-    assert kwp.parse_roles(roles) == {"ace-ai": ({"kanban-worker": 4}, "draining"),
-                                      "ace-media": ({"kanban-worker": 4}, "active")}
+    assert kwp.parse_roles(roles) == {"ace-ai": ({"kanban-worker": None}, "draining"),
+                                      "ace-media": ({"kanban-worker": None}, "active")}
     hosts, _ = kwp.load_pool(tmp_path, kanban_cfg={})
     assert {h.name: h.state for h in hosts}.get("ace-media") == "active"
     roles["hosts"]["ace-media"]["note"] = "x"
@@ -179,7 +180,7 @@ def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path)
     cfg = kwp.read_pool(tmp_path, kanban_cfg={})
     assert cfg.refused is None
     assert sorted(h.name for h in cfg.pool_hosts) == ["ace-ai", "ace-media"]
-    assert {h.slots for h in cfg.pool_hosts} == {4}
+    assert {h.slots for h in cfg.pool_hosts} == {None}       # t_b20850d2: the legacy count is not read
 
 
 def _studio_registered(fleet: Path, policy_hosts=None):
@@ -213,7 +214,7 @@ def test_targets_false_host_is_dropped_and_never_gets_a_slot(tmp_path, policy_ho
     assert any("mac-studio" in w and "targets:false" in w for w in cfg.warnings)
     p = kwp.plan(list(cfg.pool_hosts), {}, probe=lambda h: (0.0, 16), config=cfg)
     taken = [p.take("alpha") for _ in range(8)]
-    assert [h.name for h in taken] == ["ace-ai"] * 4 + ["ace-media"] * 4
+    assert {h.name for h in taken} <= {"ace-ai", "ace-media"}     # no count: the dropped host never takes one
     assert "mac-studio" not in p.slots
     assert p.take("alpha", pin="mac-studio") is None and p.refusal == "pin_host_dropped"
 
@@ -992,6 +993,7 @@ def test_daemon_places_through_the_gateway_plan(kanban_home, monkeypatch):
     monkeypatch.setattr(_config, "load_config", lambda: {"kanban": V01})
     monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None: (1.0, 16))
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (146.0, 90.0))
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.99, object()))  # local saturated
     captured: dict = {}
     stop = threading.Event()
 
@@ -1004,7 +1006,7 @@ def test_daemon_places_through_the_gateway_plan(kanban_home, monkeypatch):
                    load_gate=klg.LoadGate({}, ncpu=32))
     plan = captured["spillover"]
     assert captured["spawn_limit"] == 0 and isinstance(plan, kwp.SpilloverPlan)
-    assert list(plan.hosts) == ["ace-ai", "ace-media"] and plan.budget == 8
+    assert list(plan.hosts) == ["ace-ai", "ace-media"] and plan.budget == 2 * kwp.UNCOUNTED_TICK_FREE
 
 
 def test_cli_dispatch_places_a_pin_through_the_gateway_plan(kanban_home, monkeypatch):
@@ -2113,7 +2115,7 @@ def test_admitting_band_plans_the_pool_for_a_bare_ready_card(kanban_home):
         _make(conn, 1, body="build the thing")
     gate, b = _admitting_builder(kanban_home / "fleet", V01)
     plan = b.plan_pool([{"slug": "default"}], {})
-    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False and plan.budget == 8
+    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False and plan.budget == 2 * kwp.UNCOUNTED_TICK_FREE
     # Remote-first (#2148, t_82b4db80): overflow off plans the same card too.
     gate, b = _admitting_builder(kanban_home / "fleet", {**V01, "worker_pool": {"overflow": False}})
     plan = b.plan_pool([{"slug": "default"}], {})
