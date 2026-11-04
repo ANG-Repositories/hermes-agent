@@ -831,7 +831,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
-def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = False) -> bool:
+def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = False,
+                              explicit_home: Optional[str] = None) -> bool:
     """Subscribe the originating chat to ``task_id`` when configured.
 
     Gated by ``kanban.cli_auto_subscribe`` (default False). ``hermes kanban
@@ -847,6 +848,9 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
     gateway chat as its waker whatever the knob says (row ``notify+wake``; the level is
     ``tasks.boomerang_wake``).
 
+    ``explicit_home`` (the ``--session`` value, t_ea40ff83): a home that is not the
+    caller's own subscribes the HOME's chat, never the caller's.
+
     Returns True when a subscription row was written. Never raises — a
     notification bookkeeping failure must not fail the create.
     """
@@ -860,6 +864,8 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
         return subscribe_calling_session(
             conn, task_id, require_platform_identity=True,
             wake=True if boomerang_wake else None,
+            explicit_home=(None if explicit_home is None
+                           else (explicit_home, _caller_session_id())),
         )
     except Exception:
         return False
@@ -1058,7 +1064,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 conn, task_id, after_event_id=_event_mark))
             dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(
-                conn, task_id, boomerang_wake=bool(boomerang))
+                conn, task_id, boomerang_wake=bool(boomerang),
+                explicit_home=(task.session_id or "" if getattr(args, "session", None) is not None
+                               else None))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
