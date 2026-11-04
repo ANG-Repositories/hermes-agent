@@ -173,8 +173,9 @@ async def test_ac14_one_plan_per_tick_shared_by_every_board(tick):
     assert sorted(tick.probes[:2]) == ["ace-ai", "ace-media"]
     # Two probes before board 1 and none added by boards 2 and 3 of that tick.
     assert tick.probes_at_entry[:3] == [2, 2, 2], tick.probes_at_entry
-    # Board 1 took ace-ai, board 2 ace-media, board 3 found the pool full.
-    assert first[0].budget == 0
+    # Every board's take lands on the ONE shared plan (t_b20850d2: no slot count, so the pool never reads "full";
+    # 3 takes leave the 2 x runaway-stop stand-in short by 3).
+    assert first[0].budget == 2 * kwp.UNCOUNTED_TICK_FREE - 3
     # Paused tick: every board gets an int local budget of 0, never None.
     assert [c[1] for c in tick.calls[:3]] == [0, 0, 0]
 
