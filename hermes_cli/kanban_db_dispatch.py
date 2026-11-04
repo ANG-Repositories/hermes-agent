@@ -5670,6 +5670,7 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
     # verdict in placement_caps only and is left to the ready loop exactly as today (it never spawns it).
     _exists = _profile_exists_fn()
     owned = {r["id"] for r in eff if r["assignee"] and (_exists is None or _exists(r["assignee"]))}
+    readiness = {}  # tick-local: a previous tick's healthy image/capacity is never trusted
     for tid, v in verdicts.items():
         caps = result.placement_caps.setdefault(tid, {})
         if tid not in owned:
@@ -5713,6 +5714,20 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
             caps["browser_lease_plan"] = [p.as_dict() for p in v.plans]
             wh = _pin_host(row_route.get(tid))
             if join and join_on and _relay_joinable(v.plans, wh, reg.local_ephemeral):
+                from hermes_cli import kanban_browser_readiness as _kbr
+                host = v.plans[0].host
+                # One probe per host per tick, failures included: an unreachable host must not
+                # cost a 25 s timeout for every card planned onto it.
+                if host not in readiness:
+                    readiness[host] = _kbr.probe(_kb.kanban_home(), host)
+                reply = readiness[host]
+                caps["browser_readiness"] = reply
+                if reply.get("ok") is not True:
+                    reason = "browser_capacity" if reply.get("refusal") == "BROWSER_HOST_AT_CAP" else "browser_not_ready"
+                    caps["browser_wait"] = {"reason": reason, "host": host,
+                                            "refusal": reply.get("refusal"), "detail": reply.get("detail", "")}
+                    row_route[tid] = ("wait", reason)
+                    continue
                 result.browser_joins[tid] = {"plans": [p.as_dict() for p in v.plans], "source_host": wh}
                 caps["browser_join"] = dict(result.browser_joins[tid])
             else:
