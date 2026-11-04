@@ -11769,9 +11769,7 @@ def complete_task(
             # Arm only the card's OWN handoff PR(s), never a PR the prose
             # merely mentions (FleetReview #1234 finding).
             armable = {
-                f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
-                    metadata=metadata, survivor_pr=survivor_pr,
-                )
+                f"{r.repo}#{r.number}" for r in _fresh.handoff_refs(metadata, survivor_pr=survivor_pr)
             }
             may_arm = not is_milestone_card(conn, task_id)
             # Ready-flip evidence from earlier handoffs of this card (t_c1ee61ae, Prism
@@ -11816,6 +11814,8 @@ def complete_task(
                 # draft is a mention, not a route to review that would wait
                 # on a merge nobody intends.
                 override = {"prs": list(overridden), "reason": draft_ok}
+                if freshness.get("draft_held"):
+                    override["held"] = freshness["draft_held"]  # t_62389c4f: the hold stays visible
                 with write_txn(conn):
                     _append_event(conn, task_id, "completion_draft_override", override)
                 metadata = dict(metadata or {}, draft_override=override)
@@ -11858,6 +11858,10 @@ def complete_task(
             return ok
         if still_open:
             note = _open_pr.route_note(still_open)
+            # t_62389c4f: an operator-drafted PR the gate left as-is says so in the handback.
+            held = freshness.get("draft_held") or {}
+            if held:
+                note = "\n".join([note, *(f"{k}: {why}" for k, why in sorted(held.items()))])
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
@@ -14866,6 +14870,15 @@ def _request_review_txn(
         staged = _cleaned_artifact_paths(metadata)
         if staged:
             payload["artifacts"] = staged
+        if negative_result is not None:
+            # t_5c6c67c5: the PR is left exactly as it is; tell the reviewer how to flip it on accept.
+            from hermes_cli import kanban_negative_result as _neg
+            cmds = _neg.draft_cmds(metadata)
+            if cmds:
+                payload["draft_cmds"] = cmds
+                payload["draft_note"] = _neg.draft_note_line(cmds)
+                if not _neg.draft_note_fits(cmds):
+                    _insert_comment(conn, task_id, "kanban", _neg.draft_note_comment(cmds), int(time.time()))
         _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
         if negative_result is not None:
             _append_event(

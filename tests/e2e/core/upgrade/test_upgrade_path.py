@@ -636,6 +636,7 @@ def clean_leg(tmp_path_factory, template_home):
     return lg, _update(lg)
 
 
+@pytest.mark.slow_test(80, reason="health probes against the updated install: 62.5 s call on ci-priv (workers=6), mirror run 41587306281")
 def test_clean_update(clean_leg, provider):
     leg, final = clean_leg
     assert_healthy_at_head(leg, provider, final)
