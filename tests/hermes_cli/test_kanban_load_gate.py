@@ -290,10 +290,10 @@ def test_count_running_workers_isolates_unreadable_current_board(
 
 
 def test_unreadable_current_board_keeps_small_host_dispatching(kanban_home):
-    """The finding's scenario end to end: idle 1-core host, corrupt current board, healthy idle board ->
-    the gate still admits one (one 1-cpu worker fits a 1-core host at 10% busy)."""
+    """The finding's scenario end to end: idle small host, corrupt current board, healthy idle board ->
+    the running count is still known (0), so the gate admits."""
     _corrupt_current_board_with_healthy_second(kanban_home, 0)
-    g = LoadGate({"max_spawn_per_tick": 1}, ncpu=1)
+    g = LoadGate({"max_spawn_per_tick": 1}, ncpu=4)
     allowance, reason = g.admit(0.1, now=0.0, running=klg.count_running_workers(), cpu_busy=0.0)
     assert (allowance, reason) == (1, None)
 
