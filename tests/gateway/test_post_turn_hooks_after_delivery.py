@@ -197,6 +197,9 @@ async def test_lease_rejection_returns_before_any_hook(monkeypatch, tmp_path):
 def goal_db(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     goals._DB_CACHE.clear()
+    # These cases test delivery/judge ordering, not the loop-thread cold-DB grace window.
+    # Warm synchronously so loaded CI cannot drop the first goal write after 1.5 s.
+    assert goals._get_session_db() is not None
     yield
     goals._DB_CACHE.clear()
 

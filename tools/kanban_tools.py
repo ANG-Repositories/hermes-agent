@@ -870,7 +870,8 @@ def _handle_show(args: dict, **kw) -> str:
         # capped like the live rows; every archived row is in ``hermes kanban show``.
         from hermes_cli import kanban_archive_read as kar
 
-        arch = kar.archived_rows(conn, tid)
+        arch = kar.archived_rows(conn, tid, live_comment_ids=[c.id for c in comments],   # live read first
+                                 live_run_ids=[r.id for r in runs])
         if kar.present(arch):
             c_last = arch["comments"][-1] if arch["comments"] else None
             r_last = arch["runs"][-1] if arch["runs"] else None
@@ -1586,7 +1587,14 @@ def _handle_create(args: dict, **kw) -> str:
                        conn, new_tid,
                        # boomerang wake is a wake level: it always subscribes as a waker.
                        wake=(True if boomerang
-                             else args.get("wake") if isinstance(args.get("wake"), bool) else None)),
+                             else args.get("wake") if isinstance(args.get("wake"), bool) else None),
+                       # t_ea40ff83: an explicit foreign home subscribes the home, not this chat.
+                       # Prism 8efbb3c7ece2: the PERSISTED home (an idempotency hit or an
+                       # inherited home can differ from the session_id argument).
+                       explicit_home=((kb.get_task(conn, new_tid).session_id or "",
+                                       _current_session_id()
+                                       or get_session_env("HERMES_SESSION_ID", "") or None)
+                                      if args.get("session_id") and session_id else None)),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
@@ -1617,7 +1625,32 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
         if require_platform_identity or not session_key:
             return None
         platform, chat_id = "tui", session_key
-    chat_type = env("HERMES_SESSION_CHAT_TYPE", "") or None
+    return resolve_notify_target_for_source({
+        "platform": platform, "chat_id": chat_id,
+        "chat_type": env("HERMES_SESSION_CHAT_TYPE", ""),
+        "thread_id": env("HERMES_SESSION_THREAD_ID", ""),
+        "user_id": env("HERMES_SESSION_USER_ID", ""),
+        "user_id_alt": env("HERMES_SESSION_USER_ID_ALT", ""),
+        "scope_id": env("HERMES_SESSION_SCOPE_ID", ""),
+        "parent_chat_id": env("HERMES_SESSION_PARENT_CHAT_ID", ""),
+        "message_id": env("HERMES_SESSION_MESSAGE_ID", ""),
+        "profile": env("HERMES_SESSION_PROFILE", ""),
+    }, wake=wake)
+
+
+def resolve_notify_target_for_source(source: dict[str, Any], *,
+                                     wake: Optional[bool] = None) -> dict[str, Any]:
+    """``add_notify_sub`` kwargs for a session identified by its ``SessionSource`` dict
+    (``SessionSource.to_dict()`` shape: the persisted ``sessions.origin_json``, or the
+    calling turn's bound vars). The ONE resolver: the calling session and a foreign home
+    (t_ea40ff83, operator ruling 14:0x) both go through it, so a home's sub is exactly
+    what the home session itself would write. Pure apart from config/profile reads."""
+    def _s(key: str) -> str:
+        value = source.get(key)
+        return "" if value is None else str(value)
+
+    platform, chat_id = _s("platform"), _s("chat_id")
+    chat_type = _s("chat_type") or None
     if chat_type:
         # Canonicalize on WRITE, not only on read: a Discord guild chat is keyed
         # 'group' by build_session_key; persisting the raw envelope spelling
@@ -1630,17 +1663,17 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
             chat_type = canonical_chat_type(platform, chat_type)
         except Exception:  # never block a subscription
             pass
-    thread_id = env("HERMES_SESSION_THREAD_ID", "") or None
-    message_id = env("HERMES_SESSION_MESSAGE_ID", "") or ""
-    notifier_profile = env("HERMES_SESSION_PROFILE", "")
+    thread_id = _s("thread_id") or None
+    message_id = _s("message_id")
+    notifier_profile = _s("profile")
     if not notifier_profile:
         from hermes_cli.profiles import current_profile_name
         notifier_profile = current_profile_name("default")
     delivery_metadata: dict[str, Any] = {
         k: v for k, v in (
             ("thread_id", thread_id), ("chat_type", chat_type),
-            ("scope_id", env("HERMES_SESSION_SCOPE_ID", "")),
-            ("parent_chat_id", env("HERMES_SESSION_PARENT_CHAT_ID", "")),
+            ("scope_id", _s("scope_id") or _s("guild_id")),
+            ("parent_chat_id", _s("parent_chat_id")),
         ) if v}
     if (platform.lower() == "telegram" and thread_id
             and (chat_type or "").lower() in {"dm", "direct", "private"}):
@@ -1651,8 +1684,8 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
             delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
     return dict(
         platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=thread_id,
-        user_id=env("HERMES_SESSION_USER_ID", "") or None,
-        user_id_alt=env("HERMES_SESSION_USER_ID_ALT", "") or None,
+        user_id=_s("user_id") or None,
+        user_id_alt=_s("user_id_alt") or None,
         notifier_profile=notifier_profile,
         # None -> add_notify_sub's platform default: 'notify' everywhere except
         # api_server, whose only delivery mechanism is the wake self-post.
@@ -1679,7 +1712,8 @@ def _auto_wake(wake: Optional[bool]) -> bool:
         return True
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = None) -> bool:
+def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = None,
+                          explicit_home: Optional[tuple[str, Optional[str]]] = None) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
@@ -1692,24 +1726,72 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = Non
                 return False
         except Exception:
             pass  # unreadable config keeps the user-friendly default (True)
-    return subscribe_calling_session(conn, task_id, wake=wake)
+    return subscribe_calling_session(conn, task_id, wake=wake, explicit_home=explicit_home)
+
+
+def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
+                 target: dict[str, Any], *, wake: Optional[bool] = None) -> Optional[dict[str, Any]]:
+    """The sub to write when a create names an explicit home (t_ea40ff83).
+
+    A cron job run from one chat (a detached-run queued in #github-alternatives)
+    minted main-red cards with ``--session <the SLA lane's #apollo session>``, and
+    the create subscribed the CALLING chat: every handoff of those foreign cards
+    reached a session that must not act on them, and the home heard nothing.
+    Rule: a home outside the caller's lineage subscribes what the HOME session itself
+    would subscribe: :func:`resolve_notify_target_for_source` over its persisted
+    origin, with the requested ``wake``. Nothing is copied from the caller's target
+    (operator ruling 14:0x; Prism 227e930fa156, ef5ec124c1bf). An operator pseudo-home
+    keeps the caller (any operator session may act on it). A real home with no routable
+    chat (unknown session, CLI origin) or an unreadable state.db subscribes nobody: the
+    lifecycle/owner-wake fallback owns it, and a misroute is worse than #logs."""
+    from hermes_cli import kanban_db as _kb
+    from gateway import kanban_home_route as _hr
+
+    home_sid = (home_sid or "").strip()
+    if (not home_sid or _kb.is_operator_home(home_sid)
+            or (caller_sid and home_sid in _kb.home_ids(caller_sid))):
+        return target
+    try:
+        row = _hr.read_session_row(home_sid)
+    except _hr.SessionLookupError as exc:
+        logger.warning("kanban: %s home %s unreadable (%s); not subscribing caller chat %s",
+                       task_id, home_sid, exc, target["chat_id"])
+        return None
+    home = _hr.home_from_row(home_sid, row)
+    if home.target is None:
+        logger.info("kanban: %s homed to %s (%s); caller chat %s not subscribed",
+                    task_id, home_sid, home.reason, target["chat_id"])
+        return None
+    # home_from_row already proved origin_json parses to a routable dict.
+    origin = json.loads(row["origin_json"])
+    logger.info("kanban: %s homed to %s; subscribing home %s (caller chat %s)",
+                task_id, home_sid, home.target.chat_id, target["chat_id"])
+    return resolve_notify_target_for_source(origin, wake=wake)
 
 
 def subscribe_calling_session(
     conn: Any, task_id: str, *, require_platform_identity: bool = False,
     wake: Optional[bool] = None, takeover: bool = False,
+    explicit_home: Optional[tuple[str, Optional[str]]] = None,
 ) -> bool:
     """Resolve the calling session's delivery identity and write a notify sub.
     Shared by the agent-tool auto-subscribe path (:func:`_maybe_auto_subscribe`) and
     the CLI create path (``hermes kanban create``, gated by ``kanban.cli_auto_subscribe``
     in ``hermes_cli.kanban._cmd_create``). See ``_resolve_notify_target`` for the
-    identity rules. Any exception is logged at WARNING and swallowed (False)."""
+    identity rules. ``explicit_home=(home_sid, caller_sid)``: the create named its home
+    explicitly; a home that is not the caller's subscribes the home (:func:`_home_target`).
+    Any exception is logged at WARNING and swallowed (False)."""
     target = None
     try:
         target = _resolve_notify_target(
             require_platform_identity=require_platform_identity, wake=wake)
         if target is None:
             return False  # CLI / cron / test — no persistent channel
+        if explicit_home is not None:
+            target = _home_target(task_id, explicit_home[0], explicit_home[1], target,
+                                  wake=wake)
+        if target is None:
+            return False
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake; an
