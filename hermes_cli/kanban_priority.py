@@ -23,7 +23,8 @@ def set_asap(conn, task_id: str, flag: bool, *, operator: str) -> bool:
     return True
 
 
-def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default_assignee=None):
+def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default_assignee=None,
+                    conn=None, caps=None, cap_only=None, worktree_ports=None):
     """Use the dispatcher's resolved routes, never its pressure-filtered slot budget.
 
     No age or workload ordering is decided here. The common publisher selects its
@@ -42,11 +43,20 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
             out[local_host].append(card)
         if plan is None or route == "local":
             continue
+        only = None
+        if route == "portable" and conn is not None:
+            from hermes_cli.kanban_db_dispatch import _portable_only
+            only, _ = _portable_only(conn, card, assignee, plan, caps,
+                                     (cap_only or {}).get(card["id"]),
+                                     (worktree_ports or {}).get(card["id"]))
         for name, host in plan.hosts.items():
             if route in ("pin", "origin") and name != arg:
                 continue
+            if only is not None and name.lower() not in {n.lower() for n in only}:
+                continue
             if (not host.enabled or host.state != "active" or name in plan.disabled
-                    or assignee not in host.profiles or plan.board_refusal(name, board)):
+                    or assignee not in host.profiles or plan.board_refusal(name, board)
+                    or plan.detail.get(name, {}).get("reachable") is False):
                 continue
             out[name].append(card)
     if plan is not None:
@@ -57,6 +67,36 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
             out[name] = ([r for r in rows if r["asap"]]
                          + [r for r in rows if not r["asap"]])[:capacity]
     return out
+
+
+def publish_waiting(conn, waiting, *, client=None):
+    """Merge only this board's acknowledged units; never replace a host queue."""
+    from hermes_cli import kanban_priority_door as door
+    if not door.enabled():
+        return
+    if client is None:
+        from hermes_cli import alloc_client as client
+    from hermes_cli.fleet_placement import placement
+    table = placement.load_hosts()
+    need = placement.need_of(table.footprint("kanban"))
+    key = conn.execute("PRAGMA database_list").fetchone()[2]
+    current = set()
+    for host, cards in waiting.items():
+        hid = table.resolve(host)
+        if not hid:
+            continue
+        for card in cards:
+            uid = door.unit_id(conn, card["id"])
+            client.enqueue("kanban", hid, uid, need.cpus, need.ram_gb)
+            current.add((hid, uid))
+            if card["asap"]:
+                client.mark_asap("kanban", hid, uid)
+    for hid, uid in _published.get(key, set()) - current:
+        client.withdraw("kanban", hid, uid)
+    _published[key] = current
+
+
+_published = {}
 
 
 def door_verdict(admittable: bool, binding: str, free, ncpu: float) -> dict:

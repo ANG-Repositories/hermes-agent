@@ -672,6 +672,11 @@ def run_reservation(conn, task_id: str, run_id: Optional[int]) -> Tuple[Optional
     is ``alloc_client`` for an allocd-path take, else None (the in-process ledger)."""
     if run_id is None:
         return None, None
+    # The shared door retags the same row to kanban@host. Its topical
+    # lifecycle now owns renew/release, including after a gateway restart.
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='door_authorized'",
+                    (task_id, run_id)).fetchone():
+        return None, None
     from hermes_cli import kanban_placement_reasons as _pr
     try:
         row = conn.execute(
@@ -764,6 +769,9 @@ def running_reservations(conn) -> List[Tuple[str, str, Optional[str]]]:
             "SELECT t.id, e.run_id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
             "WHERE t.status = 'running' AND e.kind = ? AND e.run_id IS NOT NULL "
             "AND e.run_id = t.current_run_id", (_pr.WORKER_PLACED_EVENT,)).fetchall():
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='door_authorized'",
+                        (tid, run_id)).fetchone():
+            continue
         try:
             doc = json.loads(payload or "{}")
             rid = doc.get(RESERVATION_KEY)

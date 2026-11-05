@@ -4268,6 +4268,11 @@ def dispatch_once(
 def _release_finished_resources(conn: sqlite3.Connection, board: Optional[str]) -> None:
     """Best-effort: a failing sweep is logged and retried next tick, never breaks dispatch."""
     try:
+        from hermes_cli.kanban_priority_door import maintain
+        maintain(conn)
+    except Exception as exc:
+        _kb._log.warning("kanban door lifecycle sweep failed: %s", exc)
+    try:
         from hermes_cli import kanban_resources
 
         kanban_resources.release_finished(conn, board=board)
@@ -4305,6 +4310,7 @@ def _launch_claimed(
     placement_record: Callable[[], dict],
     state: _LaunchState,
     after_launch: Optional[Callable[[Optional[int]], None]] = None,
+    reservation_id: Optional[str] = None,
 ) -> str:
     """Launch one claimed card's worker: fence the run, spawn, stamp the pid
     with its ``spawned`` + ``placement`` events, fire the spawned hook.
@@ -4318,7 +4324,9 @@ def _launch_claimed(
 
     if not record_placement(conn, claimed.id, claimed.current_run_id, host):
         return _LAUNCH_NOT_OWNED
-    pid = spawn(claimed, workspace, **spawn_kwargs)
+    from hermes_cli.kanban_priority_door import spawn as _priority_spawn
+    pid = _priority_spawn(conn, claimed, workspace, host=host, spawn=spawn,
+                          spawn_kwargs=spawn_kwargs, state=state, reservation_id=reservation_id)
     state.launched, state.pid = True, pid
     if after_launch is not None:
         after_launch(pid)
@@ -4481,6 +4489,7 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
     state = _LaunchState()
     if _accepts_kw(spawn, "on_popen"):
         kwargs["on_popen"] = lambda proc: setattr(state, "proc", proc)
+    from hermes_cli.kanban_priority_door import DoorHeld, defer
     try:
         outcome = _launch_claimed(
             conn, claimed, str(workspace), board=board, spawn=spawn, spawn_kwargs=kwargs,
@@ -4490,6 +4499,9 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
                 placed_host=None, plan=None, entry="spawn_now", gate={}, take_refusal=None,
             ),
         )
+    except DoorHeld as exc:
+        defer(conn, claimed)
+        raise SpawnNowError(f"{task_id}: {exc}") from exc
     except Exception as exc:
         # Failed after the process started (pid/placement write, or the spawner raising after
         # it handed over its Popen): stop it before the run is ended, so a reported failure
@@ -4642,11 +4654,16 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    state = _LaunchState()
+    from hermes_cli.kanban_priority_door import spawn as _priority_spawn, DoorHeld, defer
     try:
         from hermes_cli.kanban_continuation import record_placement
         if not record_placement(conn, claimed.id, claimed.current_run_id, None):
             return False
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = _priority_spawn(conn, claimed, str(workspace), host=None,
+                              spawn=lambda task, path: _call_spawn_fn(spawn, task, path, board),
+                              spawn_kwargs={}, state=state)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -4657,6 +4674,10 @@ def _dispatch_lane_task(
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
         return True
+    except DoorHeld as exc:
+        defer(conn, claimed)
+        result.placement_waits[claimed.id] = str(exc)
+        return False
     except Exception as exc:
         # The host refused the spawn (no restart-safe scope, no workspace
         # mount): nothing about the card ran, so it must not spend the card's
@@ -7805,6 +7826,7 @@ def _dispatch_once_locked(
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         _launch = _LaunchState()  # .launched: a worker process exists (refund guard)
         _joined = None  # (join, lease env) once the s7 join took a lease for this claim
+        from hermes_cli.kanban_priority_door import DoorHeld, defer
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -7885,7 +7907,7 @@ def _dispatch_once_locked(
                 conn, claimed, str(workspace), board=board, spawn=_spawn,
                 spawn_kwargs=spawn_kwargs, host=placed_host.name if placed_host else None,
                 pool=admitted_routes.get(claimed.id), state=_launch,
-                after_launch=_after_launch,
+                after_launch=_after_launch, reservation_id=_rid,
                 placement_record=lambda: _placement_payload(
                     run_id=claimed.current_run_id, route=route, arg=route_arg,
                     rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
@@ -7928,6 +7950,13 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except DoorHeld as exc:
+            defer(conn, claimed)
+            if placed_host is not None:
+                spillover.release(placed_host, _rid)
+            if _joined is not None:
+                _browser_release_joined(conn, claimed, *_joined, "door_held")
+            result.placement_waits[claimed.id] = str(exc)
         except Exception as exc:
             if placed_host is not None and not _launch.launched:
                 spillover.release(placed_host, _rid)  # pre-launch failure: refund

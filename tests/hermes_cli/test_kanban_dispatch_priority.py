@@ -10,6 +10,7 @@ def test_asap_is_explicit_persisted_and_never_inherited(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     kb.init_db()
     from hermes_cli.kanban_priority import set_asap
 
@@ -27,7 +28,7 @@ def test_asap_is_explicit_persisted_and_never_inherited(tmp_path, monkeypatch):
         assert kb.get_task(conn, parent).asap is False
 
 
-def test_waiting_uses_structural_capacity_not_pressure_band():
+def test_waiting_uses_structural_capacity_not_pressure_band(monkeypatch):
     from types import SimpleNamespace
     from hermes_cli.kanban_priority import waiting_by_host
 
@@ -49,6 +50,14 @@ def test_waiting_uses_structural_capacity_not_pressure_band():
     assert [r["id"] for r in waiting["ai"]] == ["urgent", "portable"]
     plan.detail["ai"]["running"] = 3
     assert waiting_by_host(cards, plan, routes=routes, local_host="studio")["ai"] == []
+    plan.detail["ai"]["running"] = 0
+    plan.detail["ai"]["reachable"] = False
+    assert waiting_by_host(cards, plan, routes=routes, local_host="studio")["ai"] == []
+    plan.detail["ai"]["reachable"] = True
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._portable_only",
+                        lambda *args: (("elsewhere",), None))
+    assert [r["id"] for r in waiting_by_host(
+        cards, plan, routes=routes, local_host="studio", conn=object())["ai"]] == ["urgent"]
 
 
 def test_binding_verdict_has_no_fictional_cpu_deficit():
