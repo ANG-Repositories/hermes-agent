@@ -256,7 +256,6 @@ class GateTickBuilder:
 
         return kwp.TargetSignal(
             policy=ppolicy.load(self._fleet_dir()),
-            state_path=root / "var" / kwp.TARGET_STATE_FILE,
             ledger_dir=pledger.ledger_dir(root),
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
             placement_table=kh.load_table(root),

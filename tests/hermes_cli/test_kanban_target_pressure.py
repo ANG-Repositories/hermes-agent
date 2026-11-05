@@ -66,8 +66,7 @@ class Fleet:
 @pytest.fixture
 def sig(tmp_path):
     clock = {"t": T0}
-    s = kwp.TargetSignal(policy=POLICY, state_path=tmp_path / "var" / kwp.TARGET_STATE_FILE,
-                         ledger_dir=tmp_path / "var" / "placement", clock=lambda: clock["t"])
+    s = kwp.TargetSignal(policy=POLICY, ledger_dir=tmp_path / "var" / "placement", clock=lambda: clock["t"])
     s.clock_box = clock  # type: ignore[attr-defined]
     return s
 
@@ -98,58 +97,44 @@ def test_stale_pressure_is_unknown_not_hot(sig):
         d = p.detail["ace-ai"]
         assert p.slots["ace-ai"] == 0 and d["reachable"] is False and d["band"] == kwp.BAND_UNKNOWN
         assert d["hot"] is False and d["pressure"] == "pressure unknown (stale 130s)"
-    state = json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]
-    assert state["hot"] is False and state["hot_run"] == 0
-    # The file turns fresh and hot: UNKNOWN built no streak, so one hot sample admits.
-    fleet.set("ace-ai", 0.95)
+    # The file turns fresh and ok: the host is back on that one sample (no streak to clear, t_5d7e7171).
+    fleet.set("ace-ai", 0.10)
     assert _plan(fleet, sig).slots["ace-ai"] == 4
 
 
-def _unknown(fleet, kind):
-    """One UNKNOWN tick of ``kind``: a stale file, or an unreachable host."""
-    if kind == "stale":
-        fleet.set("ace-ai", 0.95, age=130)
-    else:
-        fleet.text["ace-ai"] = ""  # empty probe text = pressure unreadable
-        fleet.now["ace-ai"] += 30.0
+# -- t_5d7e7171 (FWA-G): the published band IS admit_class's verdict; no second streak verdict ---------
 
-
-@pytest.mark.parametrize("kind", ["stale", "unreadable"])
-@pytest.mark.parametrize("seq, want", [
-    # An earned hot survives an UNKNOWN tick: the next hot sample still refuses.
-    (("hot", "hot", "unknown", "hot"), [4, 0, 0, 0]),
-    # Readmission after UNKNOWN still waits for 3 fresh non-hot samples.
-    (("hot", "hot", "unknown", "ok", "ok", "ok"), [4, 0, 0, 0, 0, 4]),
-    # A sampler flapping hot/unknown never admits once the streak is earned.
-    (("hot", "unknown", "hot", "unknown", "hot", "unknown", "hot"), [4, 0, 0, 0, 0, 0, 0]),
-])
-def test_unknown_does_not_erase_an_earned_hot(sig, kind, seq, want):
-    """QA t_1302fe6c: UNKNOWN used to reset {hot, hot_run, clear_run}, so a
-    hot host was readmitted on its next fresh hot sample (t_36840c8a)."""
+def test_one_hot_sample_closes_and_the_next_ok_sample_reopens(sig):
+    """The plan keeps no hot/clear streak: a hot band closes the host for THAT tick (the ONE rule's kill switch path)
+    and the next ok band reopens it. Red on main: [hot] admitted (streak 1), [hot, ok] still refused (clear 1/3)."""
     fleet = Fleet()
     seen = []
-    for step in seq:
-        if step == "unknown":
-            _unknown(fleet, kind)
-        else:
-            fleet.set("ace-ai", 0.95 if step == "hot" else 0.1)
+    for ratio in (0.95, 0.10, 0.95, 0.95, 0.10):
+        fleet.set("ace-ai", ratio)
         seen.append(_plan(fleet, sig).slots["ace-ai"])
-    assert seen == want, seen
+    assert seen == [0, 4, 0, 0, 4], seen
+    assert not (sig.ledger_dir.parent / "kanban-target-state.json").exists()   # no streak state is written
 
 
-def test_unknown_past_the_discard_window_starts_over(sig):
-    """The 3x-stale discard still bounds a host that stays UNKNOWN: UNKNOWN
-    does not refresh ``updated``, so the earned hot is dropped after 360 s."""
+def test_unified_admit_never_closes_a_host_on_its_band(sig, monkeypatch):
+    """Under KANBAN_UNIFIED_ADMIT the take asks may_start (the band's own formula), so the plan does not re-decide:
+    a hot band leaves the host's slots open and the refusal, if any, is the take's. Red on main: band hot (streak)
+    closed the host first; 613 `flapping (unified_admission|pool_unavailable)` waits came from the two verdicts."""
+    monkeypatch.setattr(kwp, "_kanban_unified_admit", lambda signal=None: True)
     fleet = Fleet()
-    for _ in range(2):
+    for _ in range(3):
         fleet.set("ace-ai", 0.95)
-        _plan(fleet, sig)
-    for _ in range(4):
-        sig.clock_box["t"] += 100
-        _unknown(fleet, "stale")
-        assert _plan(fleet, sig).slots["ace-ai"] == 0
+        p = _plan(fleet, sig)
+        assert p.slots["ace-ai"] == 4 and p.detail["ace-ai"]["hot"] is False, p.detail["ace-ai"]
+        assert "pressure" not in p.detail["ace-ai"]
+
+
+def test_hot_reason_quotes_the_admitter(sig):
+    fleet = Fleet()
     fleet.set("ace-ai", 0.95)
-    assert _plan(fleet, sig).slots["ace-ai"] == 4
+    p = _plan(fleet, sig)
+    assert p.detail["ace-ai"]["pressure"].startswith("band hot (admit_class: ")
+    assert "streak" not in p.detail["ace-ai"]["pressure"]
 
 
 def test_non_finite_pressure_is_unknown():
@@ -186,72 +171,22 @@ def test_non_finite_ledger_row_does_not_hide_other_consumers(tmp_path):
     assert pl.projected("ace-ai", 10.0, res, now=T0) == pytest.approx(12.0)
 
 
-def test_two_planners_on_one_root_do_not_lose_a_sample(sig):
-    """Planner B read the state before planner A committed: B still advances
-    from A's committed step, so two consecutive hot samples reach hot."""
+# -- take() only reads the plan ------------------------------------------------
+
+def test_two_takes_on_one_ok_probe_still_admit(sig):
     fleet = Fleet()
-    fleet.set("ace-ai", 0.95)
-    stale_view = kwp._load_state(sig.state_path)        # B's early read (empty)
-    _plan(fleet, sig)                                     # A commits hot_run=1
-    fleet.set("ace-ai", 0.95)
-    real = kwp._load_state
-    kwp._load_state = lambda path: stale_view            # B planned from the old view
-    try:
-        p = _plan(fleet, sig)
-    finally:
-        kwp._load_state = real
-    assert p.slots["ace-ai"] == 0
-    assert json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]["hot"] is True
-
-
-# -- F-5 / AC-11: hysteresis advances in plan(), take() only reads ------------
-
-def test_two_takes_on_one_hot_probe_still_admit(sig):
-    fleet = Fleet()
-    fleet.set("ace-ai", 0.95)
+    fleet.set("ace-ai", 0.10)
     p = _plan(fleet, sig)
     assert p.take("alpha", pin="ace-ai").name == "ace-ai"
     assert p.take("alpha", pin="ace-ai").name == "ace-ai"
-    assert json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]["hot_run"] == 1
-
-
-def test_hot_after_two_samples_clear_after_three(sig):
-    fleet = Fleet()
-    seen = []
-    for ratio in (0.95, 0.95, 0.75, 0.75, 0.75):
-        fleet.set("ace-ai", ratio)
-        p = _plan(fleet, sig)
-        seen.append(p.slots["ace-ai"])
-    # [hot] admits, [hot, hot] refuses, [warm, warm] still refuses, 3rd warm admits.
-    assert seen == [4, 0, 0, 0, 4], seen
-
-
-def test_repeated_remote_at_is_a_noop(sig):
-    fleet = Fleet()
-    fleet.set("ace-ai", 0.95)
-    for _ in range(4):  # same at four ticks running: one sample
-        p = _plan(fleet, sig)
-    assert p.slots["ace-ai"] == 4
-    assert json.loads(sig.state_path.read_text(encoding="utf-8-sig"))["hosts"]["ace-ai"]["hot_run"] == 1
-
-
-def test_streak_state_older_than_3x_stale_is_discarded(sig):
-    fleet = Fleet()
-    fleet.set("ace-ai", 0.95)
-    _plan(fleet, sig)
-    sig.clock_box["t"] += 361  # > STALE_AFTER_S x 3
-    fleet.set("ace-ai", 0.95)
-    p = _plan(fleet, sig)
-    assert p.slots["ace-ai"] == 4  # one fresh hot sample, not the second
 
 
 def test_refused_pin_names_the_band(sig):
     fleet = Fleet()
-    for _ in range(2):
-        fleet.set("ace-ai", 0.95)
-        p = _plan(fleet, sig)
+    fleet.set("ace-ai", 0.95)
+    p = _plan(fleet, sig)
     assert p.take("alpha", pin="ace-ai") is None
-    assert p.refusal.startswith("pin_host_hot (band hot")
+    assert p.refusal.startswith("pin_host_hot (band hot (admit_class: ")
 
 
 # -- warm rungs (RC7) ---------------------------------------------------------
@@ -279,14 +214,12 @@ def test_all_warm_picks_least_projected_and_rereads_the_ledger(sig):
     assert p.take("alpha").name == "ace-media"
 
 
-def test_first_hot_sample_is_not_preferred_over_a_warm_rung(sig):
-    """A host on its first hot sample is still admitted (streak 1) but never
-    ranks as cool: a warm rung of lower priority wins."""
+def test_a_hot_rung_is_closed_and_a_warm_rung_takes_the_card(sig):
     fleet = Fleet()
-    fleet.set("ace-ai", 0.95)     # priority 1, hot (streak 1)
+    fleet.set("ace-ai", 0.95)     # priority 1, hot: closed this tick (no streak 1 grace)
     fleet.set("ace-media", 0.75)  # priority 2, warm
     p = _plan(fleet, sig)
-    assert p.slots["ace-ai"] == 4
+    assert p.slots["ace-ai"] == 0
     assert p.take("alpha").name == "ace-media"
 
 
@@ -464,7 +397,7 @@ def test_e2e_hot_ace_ai_places_on_ace_media(board, caplog):
     for line in caplog.messages:
         if "kanban pool:" in line:
             print("E2E-LOG", line)
-    assert any(m.startswith("kanban pool: ace-ai refused: band hot") for m in caplog.messages)
+    assert any(m.startswith("kanban pool: ace-ai refused: band hot (admit_class: ") for m in caplog.messages)
 
 
 def test_e2e_both_hot_waits_pool_unavailable_naming_the_band(board, caplog):
@@ -522,7 +455,6 @@ def test_e2e_read_signal_false_ignores_pressure_and_ledger(board):
     assert plan.signal is None and plan.budget == 2 * kwp.UNCOUNTED_TICK_FREE
     builder.record_placements([("t_x", "ace-ai")])
     assert not (board / "var" / "placement").exists()
-    assert not (board / "var" / kwp.TARGET_STATE_FILE).exists()
 
 
 def test_standalone_daemon_writes_the_kanban_ledger(board, monkeypatch):
