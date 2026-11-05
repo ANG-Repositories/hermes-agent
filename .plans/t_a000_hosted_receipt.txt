@@ -1,0 +1,94 @@
+== failing files (count across runs)
+272 tests/agent/test_usage_unknown_persisted_export.py
+72 tests/hermes_cli/test_check_identifier_key_compare.py
+40 tests/ci/test_termux_input_archive.py
+30 tests/hermes_cli/test_subprocess_text_encoding.py
+20 tests/e2e/core/upgrade/test_fresh_process_entrypoints.py
+20 tests/e2e/core/upgrade/pm/test_interpreter_hygiene.py
+20 tests/ci/test_main_push_concurrency_and_selfhosted_cache.py
+20 tests/test_fleet_ci_fail_alert_gate.py
+20 tests/ci/test_stable_release_graph.py
+18 tests/e2e/core/upgrade/pm/test_interrupted_update.py
+14 tests/hermes_cli/test_kanban_model_override_validation.py
+14 tests/cron/test_cron_lanes.py
+8 tests/e2e/core/upgrade/test_upgrade_path.py
+6 tests/cron/test_cron_lane_handoff.py
+2 tests/gateway/test_api_notification_outcomes.py
+2 tests/e2e/core/chaos/test_gateway_turn_liveness.py
+2 tests/e2e/core/providers/test_fallback_providers.py
+2 tests/scripts/test_check_kanban_lineage_readers.py
+2 tests/hermes_cli/test_kanban_sub_pin_optin.py
+2 tests/plugins/image_gen/test_openrouter_compat_provider.py
+1 tests/tools/test_process_heartbeat.py
+1 tests/pm/test_downloader_integrity.py
+1 tests/tools/test_tree_kill_spares_kanban_workers.py
+1 tests/hermes_cli/test_flagship_model_guard.py
+1 tests/hermes_state/test_zeroed_state_db.py
+1 tests/gateway/test_sessions_json_write_off_loop.py
+1 tests/cron/test_cron_script_runner.py
+== target lines
+-- test_fresh_source_install 20
+   41922268091 failure 2026-11-04T23:05:01.6146899Z [  0.0% |     1/~3881 | ✓3 | ✗0] ✓ tests/scripts/test_fresh_source_install.py (3✓, 63.8s)
+   41922268091 failure 2026-11-04T23:14:12.9293893Z      63.83s  tests/scripts/test_fresh_source_install.py
+   41917245402 success 2026-11-04T22:07:08.2638916Z [  0.0% |     1/~3476 | ✓3 | ✗0] ✓ tests/scripts/test_fresh_source_install.py (3✓, 51.1s)
+   41917245402 success 2026-11-04T22:18:51.2515423Z      51.12s  tests/scripts/test_fresh_source_install.py
+   41893912611 success 2026-11-04T19:43:16.7337897Z [  0.6% |    25/~4199 | ✓27 | ✗ 0] ✓ tests/scripts/test_fresh_source_install.py (3✓, 75.5s)
+   41893912611 success 2026-11-04T19:55:03.5262856Z      75.53s  tests/scripts/test_fresh_source_install.py
+   41884669784 success 2026-11-04T19:00:49.6185254Z [  2.4% |    90/~3705 | ✓125 | ✗  0] ✓ tests/scripts/test_fresh_source_install.py (3✓, 71.8s)
+   41884669784 success 2026-11-04T19:17:43.7542260Z      71.77s  tests/scripts/test_fresh_source_install.py
+   41879720171 failure 2026-11-04T18:18:11.0324377Z [  0.0% |     1/~3880 | ✓3 | ✗0] ✓ tests/scripts/test_fresh_source_install.py (3✓, 68.4s)
+   41879720171 failure 2026-11-04T18:32:05.9827346Z      68.37s  tests/scripts/test_fresh_source_install.py
+   41869421130 success 2026-11-04T17:33:21.1460596Z [  1.1% |    45/~4147 | ✓60 | ✗ 0] ✓ tests/scripts/test_fresh_source_install.py (3✓, 63.2s)
+   41869421130 success 2026-11-04T17:46:52.8182656Z      63.19s  tests/scripts/test_fresh_source_install.py
+-- test_kanban_work_obligations 20
+   41922268091 success 2026-11-04T23:05:57.4881251Z [  2.5% |    89/~3498 | ✓146 | ✗  0] ✓ tests/hermes_cli/test_kanban_work_obligations.py (68✓, 96.1s)
+   41922268091 success 2026-11-04T23:16:19.0700030Z      96.08s  tests/hermes_cli/test_kanban_work_obligations.py
+   41917245402 failure 2026-11-04T22:10:09.1554090Z [  1.4% |    59/~4361 | ✓114 | ✗  0] ✓ tests/hermes_cli/test_kanban_work_obligations.py (68✓, 63.4s)
+   41917245402 failure 2026-11-04T22:19:35.5595948Z      63.42s  tests/hermes_cli/test_kanban_work_obligations.py
+   41893912611 failure 2026-11-04T19:43:53.4951532Z [  2.1% |    82/~3903 | ✓161 | ✗  0] ✓ tests/hermes_cli/test_kanban_work_obligations.py (68✓, 105.2s)
+   41893912611 failure 2026-11-04T20:05:23.4752376Z     105.21s  tests/hermes_cli/test_kanban_work_obligations.py
+   41884669784 failure 2026-11-04T19:00:53.6110864Z [  1.8% |    64/~3622 | ✓156 | ✗  0] ✓ tests/hermes_cli/test_kanban_work_obligations.py (68✓, 77.6s)
+   41884669784 failure 2026-11-04T19:12:20.6765151Z      77.59s  tests/hermes_cli/test_kanban_work_obligations.py
+   41879720171 failure 2026-11-04T18:18:42.4838764Z [  3.0% |   110/~3680 | ✓200 | ✗  0] ✓ tests/hermes_cli/test_kanban_work_obligations.py (68✓, 99.1s)
+   41879720171 failure 2026-11-04T18:33:34.5577642Z      99.11s  tests/hermes_cli/test_kanban_work_obligations.py
+   41869421130 failure 2026-11-04T17:30:37.9909975Z [  3.0% |   101/~3344 | ✓199 | ✗  0] ✓ tests/hermes_cli/test_kanban_work_obligations.py (68✓, 100.1s)
+   41869421130 failure 2026-11-04T17:43:48.6232242Z     100.12s  tests/hermes_cli/test_kanban_work_obligations.py
+-- desktop_build_lock 22
+   41922268091 failure 2026-11-04T23:04:45.8059189Z [  7.7% |   309/~4003 | ✓390 | ✗  0] ✓ tests/hermes_cli/test_desktop_build_lock.py (9✓, 34.5s)
+   41922268091 failure 2026-11-04T23:14:12.9394750Z tests/hermes_cli/test_subprocess_text_encoding.py::test_text_mode_subprocess_calls_pin_utf8[desktop_build_lock.py] PASSED [ 19%]
+   41917245402 success 2026-11-04T21:57:34.8639174Z [ 11.2% |   430/~3856 | ✓619 | ✗  0] ✓ tests/hermes_cli/test_desktop_build_lock.py (9✓, 33.4s)
+   41917245402 success 2026-11-04T22:11:58.5019096Z      33.39s  tests/hermes_cli/test_desktop_build_lock.py
+   41917245402 failure 2026-11-04T22:29:35.4198125Z tests/hermes_cli/test_subprocess_text_encoding.py::test_text_mode_subprocess_calls_pin_utf8[desktop_build_lock.py] PASSED [ 19%]
+   41893912611 failure 2026-11-04T19:45:39.0190591Z [  4.5% |   174/~3903 | ✓271 | ✗  0] ✓ tests/hermes_cli/test_desktop_build_lock.py (9✓, 37.0s)
+   41893912611 failure 2026-11-04T20:05:23.4891465Z tests/hermes_cli/test_subprocess_text_encoding.py::test_text_mode_subprocess_calls_pin_utf8[desktop_build_lock.py] PASSED [ 19%]
+   41884669784 failure 2026-11-04T19:12:20.6976938Z tests/hermes_cli/test_subprocess_text_encoding.py::test_text_mode_subprocess_calls_pin_utf8[desktop_build_lock.py] PASSED [ 19%]
+   41884669784 failure 2026-11-04T19:02:13.7003343Z [ 15.1% |   540/~3584 | ✓852 | ✗  0] ✓ tests/hermes_cli/test_desktop_build_lock.py (9✓, 31.1s)
+   41879720171 failure 2026-11-04T18:26:49.4060862Z tests/hermes_cli/test_subprocess_text_encoding.py::test_text_mode_subprocess_calls_pin_utf8[desktop_build_lock.py] PASSED [ 19%]
+   41879720171 failure 2026-11-04T18:22:04.3216618Z [  6.6% |   242/~3679 | ✓287 | ✗  0] ✓ tests/hermes_cli/test_desktop_build_lock.py (9✓, 23.4s)
+   41879720171 failure 2026-11-04T18:29:45.1153472Z      23.38s  tests/hermes_cli/test_desktop_build_lock.py
+-- post_turn_hooks 12
+   41922268091 failure 2026-11-04T23:05:12.8165291Z [  5.8% |   254/~4407 | ✓438 | ✗  0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 23.8s)
+   41917245402 failure 2026-11-04T22:14:22.8580915Z [  8.2% |   295/~3591 | ✓392 | ✗  0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 30.5s)
+   41917245402 failure 2026-11-04T22:29:35.4040729Z      30.55s  tests/gateway/test_post_turn_hooks_after_delivery.py
+   41893912611 success 2026-11-04T19:48:46.0765456Z [ 12.7% |   451/~3542 | ✓575 | ✗  0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 23.6s)
+   41884669784 success 2026-11-04T19:03:17.8170296Z [  9.7% |   345/~3563 | ✓495 | ✗  0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 21.8s)
+   41879720171 failure 2026-11-04T18:21:23.5264488Z [ 23.4% |   963/~4109 | ✓1203 | ✗   0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 26.7s)
+   41879720171 failure 2026-11-04T18:30:20.8848900Z      26.70s  tests/gateway/test_post_turn_hooks_after_delivery.py
+   41869421130 success 2026-11-04T17:32:41.0383499Z [ 16.4% |   595/~3636 | ✓818 | ✗  0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 22.6s)
+   41861696331 failure 2026-11-04T16:44:46.0168543Z [  9.3% |   366/~3917 | ✓518 | ✗  0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 20.2s)
+   41843641547 success 2026-11-04T15:40:24.8064569Z [ 23.7% |   952/~4015 | ✓1259 | ✗   0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 20.8s)
+   41739479378 success 2026-11-03T23:48:22.6758832Z [ 15.5% |   541/~3501 | ✓840 | ✗  0] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 19.8s)
+   41627588943 failure 2026-11-03T11:53:27.3641246Z [ 39.4% |  1443/~3663 | ✓1892 | ✗   2] ✓ tests/gateway/test_post_turn_hooks_after_delivery.py (29✓, 23.1s)
+-- cron_run_wait_abandon 20
+   41922268091 success 2026-11-04T23:03:51.0107017Z [  2.6% |    94/~3613 | ✓147 | ✗  0] ✓ tests/hermes_cli/test_cron_run_wait_abandon_signal.py (6✓, 52.8s)
+   41922268091 success 2026-11-04T23:21:09.9627386Z      52.85s  tests/hermes_cli/test_cron_run_wait_abandon_signal.py
+   41917245402 success 2026-11-04T22:11:37.5633190Z [  9.7% |   343/~3528 | ✓407 | ✗  0] ✓ tests/hermes_cli/test_cron_run_wait_abandon_signal.py (6✓, 47.2s)
+   41917245402 success 2026-11-04T22:19:22.6737080Z      47.21s  tests/hermes_cli/test_cron_run_wait_abandon_signal.py
+   41893912611 failure 2026-11-04T19:46:53.1816172Z [  6.4% |   237/~3707 | ✓282 | ✗  0] ✓ tests/hermes_cli/test_cron_run_wait_abandon_signal.py (6✓, 40.0s)
+   41893912611 failure 2026-11-04T20:00:13.4410080Z      39.98s  tests/hermes_cli/test_cron_run_wait_abandon_signal.py
+   41884669784 success 2026-11-04T19:02:55.9840290Z [  7.7% |   273/~3563 | ✓366 | ✗  0] ✓ tests/hermes_cli/test_cron_run_wait_abandon_signal.py (6✓, 40.9s)
+   41884669784 success 2026-11-04T19:14:43.0287401Z      40.94s  tests/hermes_cli/test_cron_run_wait_abandon_signal.py
+   41879720171 success 2026-11-04T18:20:18.0871578Z [  9.9% |   394/~3988 | ✓453 | ✗  0] ✓ tests/hermes_cli/test_cron_run_wait_abandon_signal.py (6✓, 40.2s)
+   41879720171 success 2026-11-04T18:31:24.5056850Z      40.23s  tests/hermes_cli/test_cron_run_wait_abandon_signal.py
+   41869421130 failure 2026-11-04T17:33:01.8252021Z [  2.6% |   100/~3871 | ✓137 | ✗  0] ✓ tests/hermes_cli/test_cron_run_wait_abandon_signal.py (6✓, 48.4s)
+   41869421130 failure 2026-11-04T17:43:03.3314791Z      48.39s  tests/hermes_cli/test_cron_run_wait_abandon_signal.py
