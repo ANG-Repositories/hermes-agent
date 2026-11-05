@@ -5824,6 +5824,70 @@ class NearDuplicateError(ValueError):
         self.duplicates = duplicates
 
 
+# Per-creator mint cap (Ace 2026-11-05 12:59 PT, "do this immediately"): measured 2026-11-05, 710 cards
+# minted in 24 h on the default board, 477 of them by automation (main-tip-red 177, pager-owner-card 120,
+# landing-queue 93, ci-red-owner 38, live-edit-card 32, prism-page-card 17) feeding ~1,640 worker runs and
+# ~2,500 CI runs on hermes-home alone; CI runners then starved the Prism review pool to 0 placeable hosts.
+# Every minter passes through ``create_task``, so the cap lives here, not per script. A creator that is
+# not a human (``created_by`` empty / ``user`` / ``human:*``) may mint at most ``MINT_CAP_PER_DAY`` cards
+# per rolling 24 h; the (N+1)th raises :class:`MintCapError`. ``force_reason`` (CLI ``--force``) overrides
+# it and is ledgered as a ``mint_cap_forced`` event on the new card. Kill switch:
+# ``HERMES_KANBAN_MINT_CAP=0`` (env; ``HERMES_KANBAN_MINT_CAP=<n>`` resizes). Idempotent re-mints that
+# return an existing card never count: the check runs after the idempotency lookup.
+MINT_CAP_PER_DAY = 24
+MINT_CAP_WINDOW_S = 24 * 3600
+MINT_CAP_HUMAN_PREFIXES = ("human:",)
+MINT_CAP_HUMAN_NAMES = frozenset({"", "user", "operator", "apollo", "aegis"})
+
+
+class MintCapError(ValueError):
+    """``create_task`` refused: ``created_by`` is over its rolling-24 h mint cap."""
+
+    def __init__(self, message: str, created_by: str, count: int, cap: int):
+        super().__init__(message)
+        self.created_by = created_by
+        self.count = count
+        self.cap = cap
+
+
+def mint_cap() -> int:
+    """The live cap (``HERMES_KANBAN_MINT_CAP`` env, else :data:`MINT_CAP_PER_DAY`); 0 = off."""
+    return _env_int("HERMES_KANBAN_MINT_CAP", MINT_CAP_PER_DAY, minimum=0)
+
+
+def mint_cap_applies(created_by: Optional[str]) -> bool:
+    """True for an automated creator; humans and the operator CLI default are never capped."""
+    by = (created_by or "").strip()
+    if by.lower() in MINT_CAP_HUMAN_NAMES:
+        return False
+    return not any(by.lower().startswith(p) for p in MINT_CAP_HUMAN_PREFIXES)
+
+
+def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int] = None) -> int:
+    """Cards this creator minted in the trailing window, archived ones included (a reaped card still cost a run)."""
+    now = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE created_by = ? AND created_at > ?",
+        (created_by, now - MINT_CAP_WINDOW_S),
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
+    """Raise :class:`MintCapError` when ``created_by`` is an automated creator at or over the cap."""
+    cap = mint_cap()
+    if cap <= 0 or not mint_cap_applies(created_by):
+        return
+    by = (created_by or "").strip()
+    n = mint_count_24h(conn, by, now)
+    if n >= cap:
+        raise MintCapError(
+            "mint cap: created_by=%r has minted %d cards in the last 24 h (cap %d). One card per distinct "
+            "failing signature, not one per occurrence: reuse the open card (idempotency_key) or wait for "
+            "the window. Override: --force \"<why this card must exist now>\"; kill switch "
+            "HERMES_KANBAN_MINT_CAP=0." % (by, n, cap), by, n, cap)
+
+
 def _near_dup_body(body: Optional[str]) -> str:
     kept = [
         line for line in (body or "").splitlines()
@@ -6367,6 +6431,17 @@ def create_task(
             pr_owner_forced = {"owner": exc.owner["task_id"], "pr": exc.owner["pr"],
                                "reason": force_reason}
 
+    # Per-creator mint cap (see MINT_CAP_PER_DAY): after the idempotency lookup, so a re-mint that returns the
+    # existing card never counts; before the write txn, so a refusal holds no lock.
+    mint_cap_forced: Optional[dict] = None
+    try:
+        check_mint_cap(conn, created_by)
+    except MintCapError as exc:
+        if not force_reason:
+            raise
+        mint_cap_forced = {"created_by": exc.created_by, "count": exc.count, "cap": exc.cap,
+                           "reason": force_reason}
+
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -6733,6 +6808,8 @@ def create_task(
                     })
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
+                if mint_cap_forced:
+                    _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
                 overlap_hits: list[dict] = []
                 # K5: a background delegation unit is not an incident a session
                 # mints; the gate would only comment and hold it for 10 min.
