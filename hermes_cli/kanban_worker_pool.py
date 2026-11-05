@@ -47,7 +47,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from hermes_cli import kanban_admission as _admission
 from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
@@ -64,9 +63,10 @@ COUNT_FREE_ROLES = frozenset({"ci-runner", ROLE})
 # A count-free kanban host's free slots for ONE plan (t_c834e0d8). A per-tick  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # stand-in so ``plan.slots`` / ``budget`` / load_gate.json stay finite ints; it is  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # not a concurrency count (running workers are not subtracted). Measured
-# admission decides: allocd / the placement ledger per take, the band and the
-# memory cap per plan. Equal to the fleet-roles slots maximum (1..64).  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
-UNCOUNTED_TICK_FREE = 64
+# admission decides: allocd / the placement ledger per take, the band per plan.
+# 1000 = the fleet's runaway stop (t_b20850d2, FWA-H: a surviving count is 1000),
+# so it never binds in the working range and the plan budget is never a slot sum.
+UNCOUNTED_TICK_FREE = 1000
 
 
 def count_free(h: "PoolHost", running: int) -> int:
@@ -299,7 +299,8 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
             slots = spec["slots"]
             if isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64:
                 raise PoolError(f"fleet-roles.json: host {hid}: role {role} slots must be 1..64")
-            parsed[role] = slots
+            # t_b20850d2 (FWA-H): a legacy kanban-worker count is validated, never read as capacity
+            parsed[role] = None if role == ROLE else slots
         if row["state"] not in _STATES:
             raise PoolError(f"fleet-roles.json: host {hid}: state must be one of {_STATES}")
         out[hid] = (parsed, row["state"])
@@ -1558,10 +1559,6 @@ class TargetSignal:
     # A fixed ledger read for _warm_pick (diagnostics --placement keeps one
     # snapshot per report). None = read fresh per pick (RC7, the dispatcher).
     reservations: Optional[List[Any]] = None
-    # Saturation 4.2 (t_31350981): kanban.placement.admit_on_memory. False =
-    # the memory/band cap is computed and reported only (D1: Ace's yes flips it).
-    admit_on_memory: bool = False
-    reservation_gb: float = _admission.DEFAULT_RESERVATION_GB
     # The ONE placement scorer (t_d6ce856e): <root>/config/fleet-hosts.json and
     # the headroom reservation ledger. None = no table: the band pick below.
     placement_table: Any = None
@@ -1692,9 +1689,6 @@ class SpilloverPlan:
     default_remote: bool = False
     signal: Optional[TargetSignal] = None  # None = KWLB v0.1 (read_signal false)
     taken: Dict[str, int] = field(default_factory=dict)  # this tick's takes, per host
-    # host -> why the memory/band cap is below its free slots (t_31350981);
-    # filled with the flag off too, so the dry readback has its numbers.
-    admission: Dict[str, str] = field(default_factory=dict)
     last_pick: Optional[str] = None      # hysteresis for placement.choose()
     last_decision: Any = None            # the placement.Decision behind the last take()
     last_reservation: Optional[str] = None  # the headroom reservation the last take() wrote
@@ -2198,12 +2192,9 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "band_cap": "",
-               "boards": None}
+               "band": None, "why": "", "probed": free > 0, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
-            row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
-            row["band_cap"] = _admission.band_cap(sample.pressure_text)
             if signal.placement_table is not None:
                 from hermes_cli import kanban_headroom as _kh
                 row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
@@ -2241,7 +2232,6 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
 
     slots: Dict[str, int] = {}
     detail: Dict[str, dict] = {}
-    admission: Dict[str, str] = {}
     for h in ordered:
         r = probed[h.name]
         band, why, free = r["band"], r["why"], r["free"]
@@ -2252,21 +2242,6 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         elif hot:
             free = 0
             why = f"band hot (streak {policy.kanban_band(h.name).hot_streak}, {band} now)"
-        else:
-            limit, cap_why = r["cap"]
-            if limit is not None and limit < free:
-                admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
-                # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the memory axis is admit_class's (measured estimate,
-                # not 6 GB per worker); the cap is still computed and reported, never enforced
-                if signal.admit_on_memory and not _kanban_unified_admit(signal):
-                    free = limit
-                    if free == 0:
-                        why = f"admission: {cap_why}"
-                elif signal.admit_on_memory and r["band_cap"]:
-                    # ...but only the memory axis: a PUBLISHED hot band.kanban still closes the host on every
-                    # path, pinned and unpinned (Prism ce581503f8d8, t_c466b7ee)
-                    free = 0
-                    why = f"admission: {r['band_cap']}"
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],
@@ -2274,11 +2249,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             "reachable": (band not in (None, BAND_UNKNOWN)) if r["probed"] else None,
             "band": band, "hot": hot,
             **({"pressure": why} if why else {}),
-            **({"admission": admission[h.name]} if h.name in admission else {}),
             **({"boards": sorted(r["boards"])} if r["boards"] is not None else {}),
             **(r.get("placement") or ({"sample_status": "absent"} if signal.placement_table is not None
                                       and r["probed"] else {})),
         }
-    plan = _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
-    plan.admission = admission
-    return plan
+    return _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)

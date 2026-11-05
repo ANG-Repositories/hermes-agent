@@ -5,7 +5,6 @@
     "hermes_cli/fleet_placement/*.py",
     "hermes_cli/placement_ledger.py",
     "hermes_cli/placement_policy.py",
-    "hermes_cli/kanban_admission.py",
     "hermes_cli/kanban_headroom.py",
     "hermes_cli/kanban_load_gate.py",
     "hermes_cli/kanban_placement_*.py",
@@ -18,13 +17,12 @@
     }
   ],
   "baseline": {
-    "hermes_cli/kanban_admission.py": 2,
     "hermes_cli/kanban_headroom.py": 12,
-    "hermes_cli/kanban_load_gate.py": 9,
+    "hermes_cli/kanban_load_gate.py": 8,
     "hermes_cli/kanban_placement_diag.py": 7,
     "hermes_cli/kanban_placement_reasons.py": 1,
     "hermes_cli/kanban_placement_view.py": 10,
-    "hermes_cli/kanban_worker_pool.py": 64,
+    "hermes_cli/kanban_worker_pool.py": 63,
     "hermes_cli/placement_ledger.py": 3,
     "hermes_cli/placement_policy.py": 9
   },

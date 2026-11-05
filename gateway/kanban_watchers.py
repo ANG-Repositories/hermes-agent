@@ -421,7 +421,7 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
 
 # LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
 # `hermes kanban daemon` loop); re-exported here for existing importers.
-from hermes_cli.kanban_load_gate import LoadGate, _denom  # noqa: E402,F401
+from hermes_cli.kanban_load_gate import ADMISSION as _GATE_ADMISSION, LoadGate, _denom  # noqa: E402,F401
 
 
 def _format_spawn_routes(routes, sources=None) -> str:
@@ -4013,9 +4013,8 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
-        # kanban.dispatch_load_gate — pause SPAWNS (never reclaims) while the
-        # host's 1-minute load is over its core count; resume with hysteresis.
-        # See LoadGate for the 2026-09-24 incident this encodes.
+        # kanban.dispatch_load_gate: the spawn gate, admission.admit_class("kanban") over this
+        # host's own sample (t_b20850d2: no load1 / CPU keys); never reclaims.
         try:
             _ncpu = os.cpu_count() or 1
         except Exception:
@@ -4023,12 +4022,10 @@ class GatewayKanbanWatchersMixin:
         load_gate = LoadGate(kanban_cfg.get("dispatch_load_gate"), _ncpu)
         if load_gate.enabled:
             logger.info(
-                "kanban dispatcher: load gate armed pause_above=%.1f resume_below=%.1f "
-                "ncpu=%d worker_load_cost=%.1f ramp_seconds=%.0f max_spawn_per_tick=%d "
-                "load5_floor=%s",
-                load_gate.pause_above, load_gate.resume_below, load_gate.ncpu,
-                load_gate.worker_load_cost, load_gate.ramp_seconds,
-                load_gate.max_spawn_per_tick, load_gate.load5_floor,
+                "kanban dispatcher: load gate armed admission=%s ncpu=%d ramp_seconds=%.0f "
+                "max_spawn_per_tick=%d",
+                _GATE_ADMISSION, load_gate.ncpu, load_gate.ramp_seconds,
+                load_gate.max_spawn_per_tick,
             )
         # KWLB v0.1: ONE GateTick per tick (band, LOCAL allowance, ONE shared
         # pool plan). The gate's slope sees LOCAL workers only (PRD 5.2.4).

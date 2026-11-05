@@ -136,7 +136,7 @@ def test_ac12_running_per_host_equals_running_by_host_in_ladder_order(home, boar
     assert list(rep["hosts"]) == LADDER  # the pool's priority, not a hard-coded list
     running = {n: h["running"] for n, h in rep["hosts"].items() if h["running"]}
     assert running == _running_by_host_all_boards() == {"zeta-box": 3, "mid-box": 1, "alpha-box": 1}
-    assert [h["slots"] for h in rep["hosts"].values()] == [6, 2, 4]
+    assert [h["slots"] for h in rep["hosts"].values()] == [None, None, None]   # t_b20850d2: no kanban count
     zeta = rep["hosts"]["zeta-box"]
     assert {(c["task_id"], c["board"], c["rule"]) for c in zeta["cards"]} == {
         (boards["z1"], "default", "pin"), (boards["z2"], "default", "band_spilling"),
@@ -182,7 +182,7 @@ def test_ac12_json_is_the_dict_the_text_prints(home, boards):
     assert json.loads(json.dumps(rep)) == rep
     text = "\n".join(kpv.format_fleet(rep))
     for name, h in rep["hosts"].items():
-        assert f"  {name}: running={h['running']} slots={h['slots']}" in text
+        assert f"  {name}: running={h['running']} slots=uncounted" in text
 
 
 def test_ac12_task_block(home, boards):
@@ -287,7 +287,7 @@ def test_cli_placement_fleet_and_diagnostics_alias(home, boards, tmp_path, capsy
     assert rep["hosts"]["zeta-box"]["band"] == "warm" and rep["hosts"]["zeta-box"]["running"] == 3
     _write(home / "load_gate.json", _gate(band_zeta="hot"))
     assert kcli._cmd_diagnostics(_parse("diagnostics", "--placement", "--fleet")) == 0
-    assert any(ln.startswith("  zeta-box: running=3 slots=6") and "band=hot" in ln
+    assert any(ln.startswith("  zeta-box: running=3 slots=uncounted") and "band=hot" in ln
                for ln in capsys.readouterr().out.splitlines())
     assert kcli._cmd_placement(_parse("placement", boards["h_pin"])) == 0
     assert "held: pin_host_full host=zeta-box" in capsys.readouterr().out

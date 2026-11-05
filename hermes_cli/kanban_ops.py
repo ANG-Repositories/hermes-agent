@@ -87,18 +87,13 @@ def _one_shot_pool_plan(gate, config, builders=None):
 
 
 def _one_shot_load_gate(conn, args, config, additive, defer=False):
-    """Apply ``kanban.dispatch_load_gate`` to one ``kanban dispatch`` call.
+    """Apply the host admission gate to one ``kanban dispatch`` call.
 
-    Same gate object, allowance math and pause text as the gateway loop and
-    ``run_daemon``: allowance = ceil((pause_above - load1 - pending_ramp) /
-    worker_load_cost) capped at ``max_spawn_per_tick``, load5 floor on
-    resume. A one-shot process has no in-memory ramp, so this board's run
-    starts inside ``ramp_seconds`` are booked as the pending ramp; otherwise
-    back-to-back calls would each see an empty ramp and admit a full burst.
-
-    ``additive`` (``--max``) intersects the allowance; it never raises it.
-    ``--ignore-load-gate`` skips the gate but prints the load and returns an
-    ``override`` payload the caller writes as an event on every spawn.
+    The SAME predicate as the gateway tick and ``run_daemon``:
+    ``admission.admit_class("kanban")`` over this host's sample (t_b20850d2:
+    load1 is printed, never read). ``additive`` (``--max``) intersects the
+    allowance; it never raises it. ``--ignore-load-gate`` skips the gate but
+    returns an ``override`` payload the caller writes as an event on every spawn.
 
     Returns ``{spawn_paused, spawn_limit, limit_source, override, info}``.
     ``defer`` (route_first, t_7133e03d) collects the gate line in
@@ -126,82 +121,11 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
     except Exception:
         return out
     out["gate"] = gate
-    load1, load5 = _klg.sample_loadavg()
-    if gate.enabled and gate.admission == "utilization":
-        # t_da6f84f7: the SAME predicate as the gateway tick (admission.admit over cpu_busy / memory / procs,
-        # measured-estimate leases, the host's kanban ceiling); load1 is printed, never read
-        return _cli_utilization_gate(conn, args, gate, out, emit, load1)
-    if not gate.enabled or load1 is None:
-        out["info"] = {"state": "disabled" if not gate.enabled else "unavailable"}
+    if not gate.enabled:
+        out["info"] = {"state": "disabled"}
         return out
-    try:
-        now_wall, now_mono = time.time(), time.monotonic()
-        rows = conn.execute(
-            "SELECT started_at FROM task_runs WHERE started_at >= ?",
-            (int(now_wall - gate.ramp_seconds),),
-        ).fetchall()
-        for row in rows:
-            gate.record_spawns(1, now=now_mono - max(0.0, now_wall - float(row[0])))
-    except Exception:
-        pass
-    # CPU corroboration of a load1 pause (t_bf26e8f1): a one-shot process
-    # has no previous sample, so take a 0.25 s one.
-    cpu_busy, _ = _klg.sample_cpu_busy(None, block=0.25)
-    procs, proc_limit = _klg.sample_user_procs()
-    ecore = None
-    if gate.enabled and gate.ecore_gate != "off":   # the same E-core leg as admit_now (Prism 3b7cbf596c2e)
-        ecore, _ = _klg.sample_ecore_busy(_klg.ecore_cpu_indices(), None, block=0.25)
-    allowance, reason = gate.admit(
-        load1, load5=load5, cpu_busy=cpu_busy,
-        running=_klg.count_running_workers(),
-        procs=procs, proc_limit=proc_limit, ecore_busy=ecore,
-    )
-    info = gate.snapshot()
-    info.pop("boards", None)
-    out["info"] = info
-    if getattr(args, "ignore_load_gate", False):
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            profile = get_active_profile_name()
-        except Exception:
-            profile = "unknown"
-        emit(
-            f"Load gate: load1={load1:.1f} pause_above={gate.pause_above:.1f} "
-            f"OVERRIDE by {profile} (--ignore-load-gate; gate state={gate.state}, "
-            f"would have allowed {allowance}; load {load1:.1f} tasks / {_klg._denom(gate.ncpu)})"
-        )
-        out["override"] = {
-            "source": "cli dispatch --ignore-load-gate",
-            "profile": profile,
-            "load1": round(load1, 2),
-            "load5": None if load5 is None else round(load5, 2),
-            "pause_above": gate.pause_above,
-            "gate_state": gate.state,
-            "gate_allowance": allowance,
-        }
-        info["override_by"] = profile
-        return out
-    if reason:
-        label = {"paused": "PAUSED", "proc_paused": "PROC-PAUSED"}.get(
-            gate.state, "SATURATED")
-        emit(
-            f"Load gate: {label} load1={load1:.1f} (pause_above={gate.pause_above:.1f}) - "
-            + (f"local allowance 0: {reason}" if defer else f"spawning 0 this call: {reason}")
-            + f" [load {load1:.1f} tasks / {_klg._denom(gate.ncpu)}]"
-        )
-        out["spawn_paused"] = reason
-        out["spawn_limit"] = 0
-        out["limit_source"] = "load gate"
-        return out
-    emit(
-        f"Load gate: admitting load1={load1:.1f} pending_ramp={gate.pending_ramp:.1f} "
-        f"allowance={allowance} (pause_above={gate.pause_above:.1f}, "
-        f"max_spawn_per_tick={gate.max_spawn_per_tick}; load {load1:.1f} tasks / {_klg._denom(gate.ncpu)})"
-    )
-    if allowance is not None and (additive is None or allowance < additive):
-        out["spawn_limit"] = allowance
-        out["limit_source"] = "load gate allowance"
-    return out
+    load1, _load5 = _klg.sample_loadavg()
+    return _cli_utilization_gate(conn, args, gate, out, emit, load1)
 
 
 def _recent_local_starts(since: float) -> list:
@@ -232,8 +156,7 @@ def _recent_local_starts(since: float) -> list:
 
 
 def _cli_utilization_gate(conn, args, gate, out, emit, load1):
-    """``kanban.admission: utilization`` for the one-shot CLI: the gateway's
-    utilization admit() with a 0.25 s cpu_busy sample, every board's LOCAL run
+    """The one-shot CLI gate: the gateway's admit_class("kanban") with a 0.25 s cpu_busy sample, every board's LOCAL run
     starts inside admission.DEFAULT_SETTLE_S booked as leases, and the LOCAL
     running count from the gateway's all-board snapshot (count_running_by_placement
     + running_split: every board's remote placements out of every board's total)
@@ -262,9 +185,17 @@ def _cli_utilization_gate(conn, args, gate, out, emit, load1):
     l1 = "?" if load1 is None else f"{load1:.1f}"
     busy = "?" if cpu_busy is None else f"{cpu_busy:.2f}"
     if getattr(args, "ignore_load_gate", False):
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+        except Exception:
+            profile = "unknown"
         out["override"] = {"source": "cli dispatch --ignore-load-gate", "admission": "utilization",
-                           "cpu_busy": cpu_busy, "gate_state": gate.state, "gate_allowance": allowance}
-        emit(f"Load gate: utilization OVERRIDE (--ignore-load-gate; would have allowed {allowance}; cpu_busy={busy})")
+                           "profile": profile, "cpu_busy": cpu_busy, "gate_state": gate.state,
+                           "gate_allowance": allowance}
+        info["override_by"] = profile
+        emit(f"Load gate: utilization OVERRIDE by {profile} (--ignore-load-gate; would have allowed {allowance}; "
+             f"cpu_busy={busy})")
         return out
     if reason:
         emit(f"Load gate: utilization SATURATED cpu_busy={busy} (load {l1} not read) - spawning 0 this call: {reason}")
