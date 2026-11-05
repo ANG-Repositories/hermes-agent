@@ -4500,7 +4500,7 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
             ),
         )
     except DoorHeld as exc:
-        defer(conn, claimed)
+        defer(conn, claimed, exc)
         raise SpawnNowError(f"{task_id}: {exc}") from exc
     except Exception as exc:
         # Failed after the process started (pid/placement write, or the spawner raising after
@@ -4675,7 +4675,7 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except DoorHeld as exc:
-        defer(conn, claimed)
+        defer(conn, claimed, exc)
         result.placement_waits[claimed.id] = str(exc)
         return False
     except Exception as exc:
@@ -6445,7 +6445,8 @@ def _dispatch_once_locked(
     # budget gate below records a ``total:<gate>`` hold on each ready row
     # before it returns, and a paused tick with no plan still routes.
     from hermes_cli import kanban_placement_reasons as _pr
-    route_first = _route_first_enabled()
+    from hermes_cli import kanban_priority_door as _priority_door
+    route_first = _route_first_enabled() or _priority_door.enabled()
     if not dry_run:
         try:
             from hermes_cli import kanban_budget as _kbudget
@@ -6610,7 +6611,7 @@ def _dispatch_once_locked(
             hosts={h.name for h in spillover.config.pool_hosts})
     ready_rows = conn.execute(
         "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker, priority, "
-        "origin_host, workspace_of, branch_name "
+        "origin_host, workspace_of, branch_name, asap "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL AND (? IS NULL OR id = ?) "
         "ORDER BY priority DESC, created_at ASC", (only_task, only_task),
     ).fetchall()
@@ -6740,6 +6741,18 @@ def _dispatch_once_locked(
                    pool=spillover.config if spillover is not None else None, caps=_caps)
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
     _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
+    # Publish before pressure-gated spawn budgets can hide hot-host demand.
+    from hermes_cli import kanban_priority as _priority
+    from hermes_cli import kanban_priority_door as _door
+    if not dry_run and not _admit and _door.enabled():
+        try:
+            _waiting = _priority.waiting_by_host(
+                ready_rows, spillover, routes=row_route, local_host="local", board=board,
+                default_assignee=default_assignee, conn=conn, caps=_caps,
+                cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports)
+            _priority.publish_waiting(conn, _waiting, verdicts=_priority.verdicts_for_plan(spillover))
+        except Exception as exc:
+            _kb._log.warning("kanban door publication failed (starts remain fail-closed): %s", exc)
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.
@@ -7951,7 +7964,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except DoorHeld as exc:
-            defer(conn, claimed)
+            defer(conn, claimed, exc)
             if placed_host is not None:
                 spillover.release(placed_host, _rid)
             if _joined is not None:
@@ -7959,7 +7972,9 @@ def _dispatch_once_locked(
             result.placement_waits[claimed.id] = str(exc)
         except Exception as exc:
             if placed_host is not None and not _launch.launched:
-                spillover.release(placed_host, _rid)  # pre-launch failure: refund
+                from hermes_cli.kanban_priority_door import reservation_owned
+                if not reservation_owned(conn, claimed.id, claimed.current_run_id):
+                    spillover.release(placed_host, _rid)  # door owns any upgraded row
             if _joined is not None and not _launch.launched:
                 _browser_release_joined(conn, claimed, *_joined, "spawn_failed")  # Prism d598b2a71104
             # A host that cannot place the worker (no restart-safe scope,

@@ -14,9 +14,18 @@ class DoorHeld(RuntimeError):
     """No start was made; the dispatcher must return the claim without penalty."""
 
 
+class DoorCancelled(DoorHeld):
+    """An uncertain reservation was cancelled; the next attempt needs a new ID."""
+
+
 def enabled():
     from hermes_cli.fleet_placement import admission_demand
     return getattr(admission_demand.load_priority(), "priority_mode", "spawn-only") in ("fcfs", "classes")
+
+
+def reservation_owned(conn, task_id, run_id):
+    return conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
+                        (task_id, run_id, EVENT)).fetchone() is not None
 
 
 def unit_id(conn, task_id):
@@ -60,7 +69,10 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
     if client is None:
         from hermes_cli import alloc_client as client
     from hermes_cli import kanban_headroom
-    hid = canonical_host(host)
+    try:
+        hid = canonical_host(host)
+    except Exception as exc:
+        raise DoorHeld(f"door host unavailable: {exc}") from exc
     # Before claim the next run count is N; after claim it is N+1.
     uid = unit_id(conn, task.id)
     prefix, count = uid.rsplit("-", 1)
@@ -81,8 +93,13 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
                                      existing_consumer="kanban" if reservation_id else None)
     except (client.Refused, client.Unreachable) as exc:
         raise DoorHeld(f"door unavailable: {exc}") from exc
-    if not ans.get("authorized") or ans.get("reused"):
-        raise DoorHeld(ans.get("reason") or "door already reserved; reconcile original start")
+    if not ans.get("authorized"):
+        raise DoorHeld(ans.get("reason") or "door held")
+    if ans.get("reused"):
+        # No receipt and no spawn on this run: the earlier reply was lost.
+        # Do not spend it again; cancel explicitly and use a fresh attempt.
+        client.release(ans["reservation_id"], consumer=f"kanban@{hid}")
+        raise DoorCancelled("reconciled uncertain authorization; retry with new ID")
     doc = {"reservation_id": ans["reservation_id"], "consumer": f"kanban@{hid}",
            "host": hid, "unit_id": uid, "until": ans["until"]}
     try:
@@ -108,7 +125,7 @@ def spawn(conn, task, workspace, *, host, spawn, spawn_kwargs, state, reservatio
             raise
 
 
-def defer(conn, task):
+def defer(conn, task, reason=None):
     """A held start is not a failure; preserve the waiting ID for the next run."""
     from hermes_cli import kanban_db as kb
     with kb.write_txn(conn):
@@ -116,7 +133,8 @@ def defer(conn, task):
             retry = kb._retry_status_for_run(conn, task.id, task.current_run_id)
             conn.execute("UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,"
                          "worker_pid=NULL WHERE id=?", (retry, task.id))
-            kb._end_run(conn, task.id, outcome="door_held", metadata={"retry_status": retry})
+            kb._end_run(conn, task.id, outcome="door_cancelled" if isinstance(reason, DoorCancelled)
+                        else "door_held", metadata={"retry_status": retry})
             kb._append_event(conn, task.id, "door_held", {}, run_id=task.current_run_id)
 
 

@@ -778,6 +778,9 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
     from hermes_cli.fleet_placement import admission_demand as _dmd
     from hermes_cli.fleet_placement import placement as _pl
 
+    from hermes_cli import kanban_priority_door as door
+    if door.enabled():
+        return  # routed publisher owns host-specific waiting and verdicts
     unit = _ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior")
     try:
         table = _pl.load_hosts(None if root is None else Path(root) / _pl.TABLE_REL)
