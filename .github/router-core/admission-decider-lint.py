@@ -114,33 +114,15 @@ def walk(root: Path, scan_dirs=SCAN):
 
 
 def hits_in(text: str) -> int:
-    # Join continued expressions before matching; count each physical comparison line once,
-    # including a comparison whose operands/operator live on different lines.
-    lines = []
-    pending = ""
-    physical_hits = 0
-    depth = 0
+    # Physical-line ratchet, not a lexer: preserve shell expansions and quoted hashes.
+    n = 0
     for line in text.splitlines():
         s = line.lstrip()
-        if s.startswith("#") or s.startswith("//"):
+        if s.startswith("#") or s.startswith("//") or WAIVER in line:
             continue
-        if WAIVER in line:
-            lines.append(physical_hits)
-            pending = ""
-            physical_hits = 0
-            depth = 0
-            continue
-        code = line.split("#", 1)[0]
-        pending += " " + code.rstrip().removesuffix("\\")
-        physical_hits += bool(RX.search(code))
-        depth += code.count("(") + code.count("[") - code.count(")") - code.count("]")
-        if depth <= 0 and not code.rstrip().endswith("\\"):
-            lines.append(max(physical_hits, bool(RX.search(pending))))
-            pending = ""
-            physical_hits = 0
-            depth = 0
-    lines.append(max(physical_hits, bool(RX.search(pending))))
-    return sum(lines)
+        if RX.search(line):
+            n += 1
+    return n
 
 
 def index_blob(root: Path, rel: str) -> bytes:
