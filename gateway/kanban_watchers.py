@@ -1895,7 +1895,9 @@ class GatewayKanbanWatchersMixin:
             source, identity = self._build_wake_source(
                 plat, adapter, sub, profile=profile or None,
             )
-            await deliver_wake(adapter, text=text, source=source)
+            from gateway.kanban_wake_freshness import obligation_wake
+            text, wake_metadata = obligation_wake(text)
+            await deliver_wake(adapter, text=text, source=source, metadata=wake_metadata)
         except Exception as exc:
             logger.warning(
                 "control wake failed on %s/%s: %s", platform_str, chat_id, exc,

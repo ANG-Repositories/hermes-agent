@@ -100,6 +100,26 @@ def test_unreadable_board_keeps_wake(store, decisions, monkeypatch):
     assert decisions[2] == []
 
 
+def test_merged_human_text_is_never_removed(store, decisions):
+    event = _enqueue(store, _text(["ob_66296ecbf9d0"]))
+    event.text += "\nHuman: also inspect this"
+    with sqlite3.connect(decisions[0]) as conn:
+        conn.execute("UPDATE obligations SET state = 'resolved'")
+    assert asyncio.run(fresh.drop_stale(event)) is False
+    assert "Human: also inspect this" in event.text
+    assert decisions[1:] == ([], [])
+
+
+def test_multiline_summary_and_named_board(store, decisions):
+    text = _text(["ob_66296ecbf9d0"]).replace("| decision", "| decision\nmore context")
+    text = text.replace("--board default", "--board voice")
+    event = _enqueue(store, text)
+    with sqlite3.connect(decisions[0]) as conn:
+        conn.execute("UPDATE obligations SET state = 'resolved'")
+    assert asyncio.run(fresh.drop_stale(event)) is True
+    assert decisions[1] == ["voice"]
+
+
 def test_unrelated_control_wake_is_unchanged(store, decisions):
     event = _enqueue(store, "ordinary wake: ob_66296ecbf9d0")
     assert event.text == "ordinary wake: ob_66296ecbf9d0"
