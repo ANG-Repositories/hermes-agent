@@ -47,19 +47,21 @@ def test_slow_persist_write_is_named_and_fast_tail_is_silent(tmp_path, caplog, m
         _finalize(agent, [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "done"}])
         assert _tail_lines(caplog) == []
 
-        real = db.recompute_effective_last_active
+        # The effective_last_active recompute runs inside the flush's one write txn (t_7bda73a8), so a slow
+        # recompute is charged to the append_batch step that holds that txn.
+        real = db._recompute_last_active_best_effort
 
-        def slow_recompute(session_id):
+        def slow_recompute(conn, session_id):
             time.sleep(turn_step_timing.SLOW_TAIL_S + 0.2)
-            return real(session_id)
+            return real(conn, session_id)
 
-        monkeypatch.setattr(db, "recompute_effective_last_active", slow_recompute)
+        monkeypatch.setattr(db, "_recompute_last_active_best_effort", slow_recompute)
         caplog.clear()
         _finalize(agent, [{"role": "user", "content": "again"}, {"role": "assistant", "content": "done"}])
 
         lines = _tail_lines(caplog)
         assert len(lines) == 1 and "phase=pre_turn_ended" in lines[0]
-        step = next(tok for tok in lines[0].split() if ".recompute_last_active=" in tok)
+        step = next(tok for tok in lines[0].split() if ".append_batch=" in tok)
         assert float(step.split("=")[1].rstrip("s")) >= turn_step_timing.SLOW_TAIL_S
         assert len(db.get_messages(agent.session_id)) == 4  # the timed write still landed
     finally:
