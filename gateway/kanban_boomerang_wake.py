@@ -1080,12 +1080,18 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
         done = set()
     left = [p for p in row.get("parts") or [] if p not in done]
     sent = 0
-    for part in list(left):
+    delivery_parts = list(left)
+    for part in delivery_parts:
         if part == PART_TURN:
             ok = await resurface(runner, entry, row.get("turn"))
         else:
             ok = await post_line(runner, entry, str(row.get("line") or ""))
         if not ok:
+            if part == PART_TURN and row.get("warn_on_failure") and PART_LINE not in done and PART_LINE not in left:
+                left.append(PART_LINE)
+                # Persist the newly owed warning before attempting its send.
+                await asyncio.to_thread(state.update_handback, delegation_id, parts=left)
+                delivery_parts.append(PART_LINE)
             continue
         left.remove(part)
         sent += 1
@@ -1205,11 +1211,12 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
 
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
                 text: Optional[str] = None) -> None:
-    """INV-6: one warning line + the original wake re-delivered, then terminal."""
-    await post_line(runner, entry, f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}")
-    ok = await resurface(runner, entry, text)
+    """INV-6: persist the warning and wake with the terminal claim before either send."""
+    did, row = handback_row(entry, {}, turn_text=text if text is not None else str(entry.get("wake_text") or ""))
+    row["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="failed",
-                            reason=reason, resurfaced=True, resurface_delivered=ok)
+                            reason=reason, resurfaced=True, resurface_delivered=False, handback=(did, row))
+    await deliver_handbacks(runner, state, delegation_id=did)
 
 
 # --- parent source (pass-1 R2) + the child ------------------------------------------------
@@ -1578,14 +1585,15 @@ def _alive(key: str) -> bool:
 
 
 async def _lost(runner: Any, entry: dict, reason: str, state: BoomerangWakeState) -> None:
-    ok = await resurface(runner, entry)
-    # The reconciler's observable (README §5, smoke step 4 / AC-11): it was the only boomerang-wake
-    # outcome with no log line, so a correct re-surface read as FAIL live (2026-10-19 23:07).
-    logger.info("kanban boomerang-wake: %s lost reason=%s resurfaced delivered=%s delegation=%s",
-                entry["task_id"], reason, ok, entry.get("delegation_id"))
-    await post_line(runner, entry, f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason})")
+    did, row = handback_row(entry, {}, turn_text=str(entry.get("wake_text") or ""))
+    row["line"] = f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason})"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="lost",
-                            reason=reason, resurfaced=True, resurface_delivered=ok)
+                            reason=reason, resurfaced=True, resurface_delivered=False, handback=(did, row))
+    await deliver_handbacks(runner, state, delegation_id=did)
+    claim = await asyncio.to_thread(state.get_claim, entry["key"])
+    # Preserve the reconciler's observable (README §5, smoke step 4 / AC-11).
+    logger.info("kanban boomerang-wake: %s lost reason=%s resurfaced delivered=%s delegation=%s",
+                entry["task_id"], reason, bool(claim and claim.get("resurface_delivered")), entry.get("delegation_id"))
 
 
 async def _cancel_then_resurface(runner: Any, entry: dict, state: BoomerangWakeState, wait_s: float) -> None:
@@ -1696,15 +1704,19 @@ async def _superseded_by_terminal(runner: Any, entry: dict, reason: str, state: 
         return False
     status, how, summary = found
     if how == "surfaced":
-        # verdict known, delivery unconfirmed: deliver the child's finding once (never redispatch)
-        ok = await resurface(runner, entry, finding_text(entry, {"summary": summary}, "child surfaced"))
-        logger.info("kanban boomerang-wake: %s lost reason=%s surfaced finding re-delivered=%s status=%s "
-                    "delegation=%s (no lost line)", entry["task_id"], reason, ok, status, entry.get("delegation_id"))
-        if not ok:   # fail visible, as _lost does (Prism af30fe379f6c): the finding must not vanish
-            await post_line(runner, entry, f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason}); "
-                                           f"child surfaced: {str(summary)[:300]}")
+        # Keep successful recovery quiet; a refused turn owes the existing warning as well.
+        did, row = handback_row(entry, {}, turn_text=finding_text(entry, {"summary": summary}, "child surfaced"))
+        row.update(parts=[PART_TURN], warn_on_failure=True,
+                   line=f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason}); "
+                        f"child surfaced: {str(summary)[:300]}")
         await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="surfaced",
-                                reason=reason, resurfaced=True, resurface_delivered=ok, finished_at=_time.time())
+                                reason=reason, resurfaced=True, resurface_delivered=False,
+                                finished_at=_time.time(), handback=(did, row))
+        await deliver_handbacks(runner, state, delegation_id=did)
+        claim = await asyncio.to_thread(state.get_claim, entry["key"])
+        logger.info("kanban boomerang-wake: %s lost reason=%s surfaced finding re-delivered=%s status=%s "
+                    "delegation=%s (no lost line)", entry["task_id"], reason,
+                    bool(claim and claim.get("resurface_delivered")), status, entry.get("delegation_id"))
         return True
     logger.info("kanban boomerang-wake: %s lost reason=%s superseded-by-terminal status=%s kind=%s "
                 "delegation=%s (receipt on board; no line, no re-surface)", entry["task_id"], reason, status,

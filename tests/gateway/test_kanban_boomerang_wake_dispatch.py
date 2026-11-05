@@ -39,6 +39,7 @@ class Adapter:
         self.sent: list = []
         self.handled: list = []
         self.fail_sends = 0   # next N sends report success=False (no receipt)
+        self.fail_turns = 0   # next N turns receive no admission receipt
 
     async def send(self, chat_id, text, metadata=None):
         from gateway.platforms.base import SendResult
@@ -49,6 +50,9 @@ class Adapter:
         return SendResult(success=True, message_id=str(len(self.sent)))
 
     async def handle_message(self, event):
+        if self.fail_turns:
+            self.fail_turns -= 1
+            return
         event._gateway_accepted = True
         self.handled.append(event)
 
@@ -345,14 +349,33 @@ def test_child_handoff_renders_one_boomerang_wake_line(env):
     assert env["adapter"].handled == []
 
 
-def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
+@pytest.mark.parametrize("status,final", [("failed", "rate_limit"), ("completed", "no verdict"),
+                                         ("completed", "refused")])
+@pytest.mark.parametrize("failed_part", ["turn", "line"])
+def test_child_crash_posts_warning_and_resurfaces_the_wake(env, status, final, failed_part):
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid)
-    _run(env, entry, "failed", "rate_limit")
-    assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: child failed") for s in env["adapter"].sent)
-    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
-    assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    setattr(env["adapter"], f"fail_{'turns' if failed_part == 'turn' else 'sends'}", 1)
+    if final == "refused":
+        final = _verdict(entry, "retry", summary="child refusal finding", evidence=["refusal evidence"])
+    _run(env, entry, status, final)
+    state = ah.BoomerangWakeState()
+    assert state.handbacks()[entry["delegation_id"]]["parts"] == [failed_part]
+    assert state.get_claim(entry["key"])["resurface_delivered"] is (failed_part != "turn")
+    assert asyncio.run(ah.reconcile(env["runner"], state=ah.BoomerangWakeState())) == 0
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert len(env["adapter"].sent) == 1
+    assert env["adapter"].sent[0].startswith(f"⚠️ boomerang-wake failed {tid}:")
+    if "child refusal finding" in final:
+        [turn] = env["adapter"].handled
+        assert "child verdict refused" in turn.text and "child refusal finding" in turn.text
+        assert "refusal evidence" in turn.text and turn.text.endswith(f"Task {tid} wake")
+    else:
+        assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    assert state.handbacks() == {}
+    assert state.get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    assert state.get_claim(entry["key"])["resurface_delivered"] is True
 
 
 def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
@@ -576,19 +599,27 @@ def test_ac15e_replayed_handoff_on_terminal_entry_writes_nothing(env):
 # --- AC-14: reconciler -----------------------------------------------------------------------
 
 
-def test_reconciler_dead_child_resurfaced_once(env, caplog):
+@pytest.mark.parametrize("failed_part", ["turn", "line"])
+def test_reconciler_dead_child_resurfaced_once(env, caplog, failed_part):
     """The fallback: the card's D-13 retry is already spent, so a restart-killed child is lost."""
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
     ah.BoomerangWakeState().bump_retry(tid)
     _kill(env, entry)
+    setattr(env["adapter"], f"fail_{'turns' if failed_part == 'turn' else 'sends'}", 1)
     with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
         assert asyncio.run(ah.reconcile(env["runner"])) == 1
+        state = ah.BoomerangWakeState()
+        assert state.handbacks()[entry["delegation_id"]]["parts"] == [failed_part]
+        assert state.get_claim(entry["key"])["resurface_delivered"] is (failed_part != "turn")
+        assert asyncio.run(ah.reconcile(env["runner"], state=ah.BoomerangWakeState())) == 0
         assert asyncio.run(ah.reconcile(env["runner"])) == 0
     assert [r.getMessage() for r in caplog.records if " lost reason=" in r.getMessage()] == [
-        f"kanban boomerang-wake: {tid} lost reason=gateway restart, retry spent resurfaced delivered=True "
+        f"kanban boomerang-wake: {tid} lost reason=gateway restart, retry spent resurfaced delivered={failed_part != 'turn'} "
         f"delegation={entry['delegation_id']}"]
+    assert state.get_claim(entry["key"])["resurface_delivered"] is True
+    assert state.handbacks() == {}
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
     assert [s for s in env["adapter"].sent if "boomerang-wake lost" in s] == [
         f"⚠️ boomerang-wake lost {tid} (reason: gateway restart, retry spent)"]
@@ -745,27 +776,33 @@ def test_restart_between_surfaced_comment_and_resurface_delivers_finding_once(en
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "surfaced" and claim["resurfaced"]
 
 
-def test_restart_surfaced_finding_failed_redelivery_posts_one_lost_line(env, monkeypatch):
-    """Prism af30fe379f6c: when the restart's re-delivery of the surfaced finding fails, the claim still
-    goes terminal, so the finding would vanish. Fail visible: exactly one lost line carrying the summary."""
+@pytest.mark.parametrize("failed_part", ["turn", "line"])
+def test_restart_surfaced_finding_failed_redelivery_posts_one_lost_line(env, failed_part):
+    """Prism af30fe379f6c: a failed finding stays pending across restart; its warning is also durable."""
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
     _verdict_on_board(entry, "surfaced")
     _kill(env, entry)
 
-    async def _undelivered(*_a, **_k):
-        return False
-
-    monkeypatch.setattr(ah, "resurface", _undelivered)
+    env["adapter"].fail_turns = 1
+    env["adapter"].fail_sends = int(failed_part == "line")
     assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    state = ah.BoomerangWakeState()
+    expected = [ah.PART_TURN] + ([ah.PART_LINE] if failed_part == "line" else [])
+    assert state.handbacks()[entry["delegation_id"]]["parts"] == expected
+    assert state.get_claim(entry["key"])["resurface_delivered"] is False
+    assert asyncio.run(ah.reconcile(env["runner"], state=ah.BoomerangWakeState())) == 0
     assert asyncio.run(ah.reconcile(env["runner"])) == 0
     lines = env["adapter"].sent
     assert lines == [f"⚠️ boomerang-wake lost {tid} (reason: gateway restart); child surfaced: child surfaced it"], lines
     assert len(env["dispatched"]) == 1
-    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    [turn] = env["adapter"].handled
+    assert "child surfaced it" in turn.text
+    claim = state.get_claim(entry["key"])
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "surfaced"
-    assert claim["resurfaced"] is True and claim["resurface_delivered"] is False
+    assert claim["resurfaced"] is True and claim["resurface_delivered"] is True
+    assert state.handbacks() == {}
 
 
 def test_restart_completed_wake_without_verdict_redispatches_verification(env):
@@ -836,9 +873,9 @@ def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
 
     real_resurface = ah.resurface
 
-    async def resurface(runner, e):
+    async def resurface(runner, e, text=None):
         order.append("resurface")
-        return await real_resurface(runner, e)
+        return await real_resurface(runner, e, text)
 
     mp = env["monkeypatch"]
     mp.setattr(ah, "_alive", _REAL_ALIVE)
