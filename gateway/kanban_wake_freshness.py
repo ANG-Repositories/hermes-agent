@@ -63,6 +63,8 @@ def filter_obligations(event: Any, *, now: Optional[float] = None) -> bool:
     meta = (getattr(event, "metadata", None) or {}).get(OBLIGATION_META_KEY)
     if not meta or event.text != meta["text"]:
         return False
+    if not meta["rows"]:
+        return True
     live, removed = [], []
     for row in meta["rows"]:
         try:

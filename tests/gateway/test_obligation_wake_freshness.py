@@ -60,6 +60,8 @@ def test_queued_obligation_resolved_before_delivery_is_suppressed(store, decisio
     assert boards == ["default"]
     assert len(logs) == 1
     assert all(s in logs[0] for s in ("t_a486319d", "ob_66296ecbf9d0", "sent-at=", "delivered-at="))
+    assert asyncio.run(fresh.drop_stale(event)) is True
+    assert len(logs) == 1
 
 
 @pytest.mark.parametrize("state", obligations.OPEN_STATES)
