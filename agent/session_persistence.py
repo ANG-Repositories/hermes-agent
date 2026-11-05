@@ -620,7 +620,8 @@ def _db_flush_record_row_ids(agent, batch_rows: List[Dict[str, Any]], batch_msgs
 
 
 def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Dict], messages: List[Dict]) -> None:
-    """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
+    """One transaction for the turn's new rows and the effective_last_active recompute (one lock wait on a
+    contended store): on failure nothing lands and no markers are stamped."""
     if not batch_rows:
         return
     batch_row_ids: List[int] = []
@@ -631,6 +632,7 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
             row_ids_out=batch_row_ids,
             turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
             turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+            recompute_last_active=bool(getattr(agent, "session_id", None)),
         )
     sync_flushed_message_markers(batch_msgs, batch_rows)
     for written in batch_msgs:
@@ -641,13 +643,6 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
         # the rows are durable exactly as the dicts now read.
         drop_shadowed_checkpoints(messages)
-    session_id = getattr(agent, "session_id", None)
-    if session_id:
-        try:
-            with timed(agent, "recompute_last_active"):
-                agent._session_db.recompute_effective_last_active(session_id)
-        except Exception as e:
-            logger.warning("Session DB effective_last_active recompute failed: %s", e)
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
