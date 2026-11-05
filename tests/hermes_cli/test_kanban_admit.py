@@ -106,7 +106,8 @@ def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64, cpu_busy=0.99)
 
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (load1, load1))
     monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (cpu_busy, None))
-    monkeypatch.setattr(klg, "sample_psi", lambda: {})
+    monkeypatch.setattr(klg, "sample_psi", lambda: {
+        "psi_cpu_some10": 0.0, "psi_mem_some10": 0.0, "psi_io_some10": 0.0})
     monkeypatch.setattr(klg, "utilization_context", lambda: {
         "host": "mac-studio", "ceiling": None, "ceiling_reason": "",
         "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), "limits": ad.Limits(),
