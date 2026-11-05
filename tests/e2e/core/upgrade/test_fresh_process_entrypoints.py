@@ -38,6 +38,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 import uuid
 from dataclasses import dataclass
@@ -240,6 +241,7 @@ spec = json.load(open(sys.argv[1]))
 tree = os.path.realpath(spec["tree"])
 sys.path.insert(0, spec["tree"])
 first_party = set(spec["first_party"])
+t_boot = time.monotonic()
 for name in spec["preload"]:
     try:
         importlib.import_module(name)
@@ -302,7 +304,25 @@ def child(entry, wfd):
 queue = list(spec["modules"])
 running = {}
 results = []
+t0 = time.monotonic()
+preload_s = t0 - t_boot
+# Stop on our own budget (below the test's slow_test wall) so an overrun reports what was slow
+# instead of being killed with nothing to read (t_a1bd70f8).
+budget = spec.get("budget")
 while queue or running:
+    if budget is not None and time.monotonic() - t0 > budget:
+        now = time.monotonic()
+        for r, (pid, entry, start, _chunks) in list(running.items()):
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            os.close(r)
+            running.pop(r)
+            results.append({"id": entry["id"], "ok": False, "type": "Unfinished", "elapsed": now - start,
+                            "msg": "still importing when the runner's %ss budget ran out" % budget})
+        results.extend({"id": e["id"], "ok": False, "type": "NotStarted", "elapsed": 0.0,
+                        "msg": "never started: the runner's %ss budget ran out" % budget} for e in queue)
+        queue = []
+        break
     while queue and len(running) < spec["workers"]:
         entry = queue.pop(0)
         r, w = os.pipe()
@@ -318,12 +338,14 @@ while queue or running:
         if chunk:
             running[r][3].append(chunk)
             continue
-        pid, entry, _start, chunks = running.pop(r)
+        pid, entry, start, chunks = running.pop(r)
         os.close(r)
         _, status = os.waitpid(pid, 0)
         raw = b"".join(chunks)
-        results.append(json.loads(raw) if raw else {
-            "id": entry["id"], "ok": False, "type": "ChildDied", "msg": "wait status %d, no result" % status})
+        res = json.loads(raw) if raw else {
+            "id": entry["id"], "ok": False, "type": "ChildDied", "msg": "wait status %d, no result" % status}
+        res["elapsed"] = time.monotonic() - start
+        results.append(res)
     now = time.monotonic()
     for r, (pid, entry, start, _chunks) in list(running.items()):
         if now - start > spec["timeout"]:
@@ -331,10 +353,14 @@ while queue or running:
             os.waitpid(pid, 0)
             os.close(r)
             running.pop(r)
-            results.append({"id": entry["id"], "ok": False, "type": "Timeout",
+            results.append({"id": entry["id"], "ok": False, "type": "Timeout", "elapsed": now - start,
                             "msg": "import did not finish within %ss" % spec["timeout"]})
 with open(spec["out"], "w") as fh:
     json.dump(results, fh)
+with open(spec["out"] + ".meta", "w") as fh:
+    json.dump({"preload_s": preload_s, "imports_wall_s": time.monotonic() - t0,
+               "workers": spec["workers"], "cpu_count": os.cpu_count(),
+               "affinity": len(os.sched_getaffinity(0))}, fh)
 '''
 
 _STALE_RUNNER = _STRIP_EDITABLE + r'''
@@ -484,6 +510,61 @@ def test_optional_import_table_only_names_optional_or_platform_deps():
     assert all(reason.strip() for reason in _PLATFORM_ALLOWLIST.values()), "every allowlist entry needs a reason"
 
 
+# The import runner stops itself at this budget, under the 180 s slow_test wall, so an overrun
+# fails with the slowest imports named instead of a bare wall-clock kill (t_a1bd70f8).
+_IMPORT_BUDGET_S = 140
+
+
+def _budget_overrun_report(results: list[dict], meta: dict) -> str:
+    """Empty when the runner finished every import; else what ran out of time and why."""
+    starved = [r for r in results if r.get("type") in ("Unfinished", "NotStarted")]
+    if not starved:
+        return ""
+    done = [r for r in results if r.get("type") not in ("Unfinished", "NotStarted")]
+    slowest = sorted(results, key=lambda r: r.get("elapsed", 0.0), reverse=True)[:20]
+    unfinished = [r["id"] for r in starved if r["type"] == "Unfinished"]
+    return (
+        f"import smoke ran out of its {_IMPORT_BUDGET_S}s budget: {len(done)}/{len(results)} imports done, "
+        f"{len(starved) - len(unfinished)} never started, unfinished: {unfinished}\n"
+        f"runner: {meta}; child time of finished imports: {sum(r.get('elapsed', 0.0) for r in done):.1f}s\n"
+        "slowest:\n" + "\n".join(f"  {r.get('elapsed', 0.0):7.2f}s {r['type'] if not r.get('ok') else 'ok'} "
+                                 f"{r['id']}" for r in slowest)
+    )
+
+
+def test_import_runner_reports_its_own_budget_overrun(tmp_path):
+    """A slow import makes the runner stop and name it, not hang until the test wall kills it."""
+    tree = tmp_path / "tree"
+    pkg = tree / "slowpkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "fast.py").write_text("X = 1\n", encoding="utf-8")
+    (pkg / "slow.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    entries = [{"id": f"slowpkg.{n}", "kind": "name", "name": f"slowpkg.{n}"} for n in ("fast", "slow", "fast2")]
+    (pkg / "fast2.py").write_text("Y = 2\n", encoding="utf-8")
+    runner = _write_script(tmp_path / "runner", "import_runner.py", _IMPORT_RUNNER)
+    out = tmp_path / "results.json"
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps({
+        "tree": str(tree), "first_party": ["slowpkg"], "modules": entries, "workers": 1,
+        "timeout": 120, "out": str(out), "preload": [], "budget": 2,
+    }), encoding="utf-8")
+    started = time.monotonic()
+    cp = subprocess.run([sys.executable, str(runner), str(spec_path)], capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=60)
+    assert cp.returncode == 0, cp.stderr
+    assert time.monotonic() - started < 30, "runner did not stop at its budget"
+    results = {r["id"]: r for r in json.loads(out.read_text(encoding="utf-8"))}
+    assert results["slowpkg.fast"]["ok"] and results["slowpkg.fast"]["elapsed"] < 2
+    assert results["slowpkg.slow"]["type"] == "Unfinished" and results["slowpkg.slow"]["elapsed"] >= 2
+    assert results["slowpkg.fast2"]["type"] == "NotStarted"
+    meta = json.loads(Path(str(out) + ".meta").read_text(encoding="utf-8"))
+    assert meta["workers"] == 1 and meta["imports_wall_s"] >= 2
+    report = _budget_overrun_report(list(results.values()), meta)
+    assert "slowpkg.slow" in report and "1/3 imports done" in report
+    assert _budget_overrun_report([results["slowpkg.fast"]], meta) == ""
+
+
 @pytest.mark.slow_test(180, reason="2,229 fresh-process imports, ~126 s of child time; the CI guest runs ~3x ACE-AI")
 def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
     _sandbox_or_skip()
@@ -503,15 +584,18 @@ def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
         # Each child is one fork + import, mostly CPU: use every CPU (an 8-vCPU CI guest ran 4 wide
         # and crossed the 60 s wall; 8 wide measured 17 s vs 29 s on 8 ACE-AI cores, t_0271e437).
         "workers": max(2, min(8, os.cpu_count() or 4)), "timeout": 180,
-        "out": str(out), "preload": list(_PRELOAD),
+        "out": str(out), "preload": list(_PRELOAD), "budget": _IMPORT_BUDGET_S,
     }
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
     env = isolated_env(tmp_path / "sbx")
     cp = run([PY, str(runner), str(spec_path)], env=env, cwd=tmp_path, writable=[tmp_path], timeout=900)
     assert cp.returncode == 0 and out.exists(), describe(cp)
-    results = {r["id"]: r for r in json.loads(out.read_text(encoding="utf-8"))}
+    raw_results = json.loads(out.read_text(encoding="utf-8"))
+    results = {r["id"]: r for r in raw_results}
     assert set(results) == set(ids), f"runner lost modules: {sorted(set(ids) - set(results))[:10]}"
+    overrun = _budget_overrun_report(raw_results, json.loads(Path(str(out) + ".meta").read_text(encoding="utf-8")))
+    assert not overrun, overrun
 
     failures, tolerated = {}, {}
     for mid, res in sorted(results.items()):
