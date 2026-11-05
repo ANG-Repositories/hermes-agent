@@ -78,7 +78,7 @@ def tracked(root: Path, scan_dirs=SCAN):
     top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, env=env)
     same = top.returncode == 0 and Path(top.stdout.decode().strip()).resolve() == root.resolve()
     if same:
-        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *scan_dirs], capture_output=True, env=env)
+        out = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z", "--", *scan_dirs], capture_output=True, env=env)
         if out.returncode == 0:
             return [p for p in out.stdout.decode().split("\0") if p]
     return walk(root, scan_dirs)
@@ -140,7 +140,15 @@ def scan(root: Path, scan_dirs=SCAN, library=LIBRARY) -> dict:
 
 def config(doc: dict):
     """(scan dirs, library paths) a baseline declares; hermes-home's defaults when absent."""
-    return tuple(doc.get("scan") or SCAN), frozenset(doc.get("library") or LIBRARY)
+    dirs = doc.get("scan", SCAN)
+    if not isinstance(dirs, (list, tuple)) or not dirs:
+        raise ScanError("scan must be a nonempty list of literal relative directories")
+    for d in dirs:
+        if (not isinstance(d, str) or not d or d.startswith("/") or
+                any(c in d for c in ":*?[]\\\n\r\0") or ".." in d.split("/") or
+                (d != "." and any(part in ("", ".") for part in d.split("/")))):
+            raise ScanError(f"scan path must be a literal relative directory: {d!r}")
+    return tuple(dirs), frozenset(doc.get("library", LIBRARY))
 
 
 def _show(root: Path, ref: str, rel: str):
@@ -196,8 +204,8 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"admission-decider-lint: FAIL baseline {bp} unreadable ({exc})")
         return 2
-    scan_dirs, library = config(doc)
     try:
+        scan_dirs, library = config(doc)
         if a.base_ref and set(a.base_ref) == {"0"}:
             raise ScanError(f"--base-ref {a.base_ref}: null sha")
         now = scan(a.root, scan_dirs, library)
