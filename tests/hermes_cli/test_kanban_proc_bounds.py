@@ -475,7 +475,31 @@ def _chrome_procs(profile: str, exclude: int | None = None) -> list[int]:
     return out
 
 
-@pytest.mark.skipif(not POSIX, reason="POSIX sessions only")
+def _chrome_tree(browser: int) -> dict[int, tuple[float, bool]]:
+    """Browser + every descendant: pid -> (birth, is a ``--type=`` helper).
+
+    macOS helpers do not repeat ``--user-data-dir`` in argv, so the profile
+    path names only the browser there; the process tree names them all.
+    """
+    try:
+        procs = [kb.psutil.Process(browser)]
+        procs += procs[0].children(recursive=True)
+    except kb.psutil.Error:
+        return {}
+    tree = {}
+    for p in procs:
+        born = kb._member_birth(p.pid)
+        if born is not None:
+            helper = any(a.startswith("--type=") for a in kb._safe_cmdline(p))
+            tree[p.pid] = (born, helper)
+    return tree
+
+
+def _tree_survivors(tree: dict[int, tuple[float, bool]]) -> list[int]:
+    return [pid for pid, (born, _) in tree.items() if kb._member_birth(pid) == born]
+
+
+@pytest.mark.platforms("posix")
 def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     _skip_if_host_saturated()
     chrome = _headless_chrome()
@@ -504,12 +528,15 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     browser = int(worker.stdout.readline())
     _track(browser)
     deadline = time.monotonic() + 15
-    # The worker's own argv carries the profile path: count only Chrome's processes.
-    while time.monotonic() < deadline and len(_chrome_procs(profile, worker.pid)) < 2:
+    # A real helper (renderer/gpu/utility) in the browser's tree, not argv
+    # matches on the profile path (t_5dc9a37a).
+    tree = _chrome_tree(browser)
+    while time.monotonic() < deadline and not any(h for _, h in tree.values()):
         time.sleep(0.2)
-    leaked = _chrome_procs(profile, worker.pid)
-    assert len(leaked) >= 2, "Chrome did not start its helpers; drill proves nothing"
-    _track(*leaked)
+        tree = _chrome_tree(browser)
+    assert any(h for _, h in tree.values()), \
+        f"Chrome did not start its helpers; drill proves nothing ({tree})"
+    _track(*tree)
     # The live per-run census sees the browser too (Linux Chrome erases its
     # environ window; the profile path under the card workspace names it).
     key = (tid, str(task.current_run_id))
@@ -530,12 +557,15 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
         time.sleep(0.05)
     assert worker.pid in exited
     assert kb._pid_alive(browser), "Chrome died with its worker; drill proves nothing"
+    tree.update(_chrome_tree(browser))  # helpers that came up since (pid still ours)
+    _track(*tree)
 
     assert kb.reap_exited_worker_leftovers(conn, exited, grace=5.0) == [tid]
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _chrome_procs(profile):
+    while time.monotonic() < deadline and (_chrome_procs(profile) or _tree_survivors(tree)):
         time.sleep(0.2)
     assert _chrome_procs(profile) == [], "Chrome outlived its card"
+    assert _tree_survivors(tree) == [], "Chrome helpers outlived their card"
 
 
 # ---------------------------------------------------------------------------
