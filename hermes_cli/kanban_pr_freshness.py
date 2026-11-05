@@ -407,7 +407,7 @@ def _operator_hold(record, pr: dict) -> str:
             f"so someone else holds it; not flipped, not armed")
 
 
-def ace_gate_ready(repo: str, number: int) -> Optional[int]:
+def ace_gate_ready(repo: str, number: int, *, task_id: str = "") -> Optional[int]:
     """``scripts/ace_gate.py ready <repo> <n>`` (the only sanctioned un-draft). rc, or None if not run."""
     from hermes_constants import get_default_hermes_root
     script = get_default_hermes_root() / "scripts" / "ace_gate.py"
@@ -418,6 +418,7 @@ def ace_gate_ready(repo: str, number: int) -> Optional[int]:
             [sys.executable or "python3", str(script), "ready", repo, str(number)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             timeout=90, check=False,
+            env=dict(os.environ, KANBAN_ROUND_DRAFT_CARD=task_id),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _log.warning("handoff freshness: ace_gate ready %s#%s failed: %s", repo, number, exc)
@@ -527,6 +528,17 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if pr.get("draft") is True:
             held = _operator_hold(flip_records.get(key.lower()), pr)
+            if held and os.environ.get("KANBAN_ROUND_DRAFT", "1").strip() != "0":
+                from hermes_constants import get_default_hermes_root
+                path = (get_default_hermes_root() / "state" / "worker-round-draft" /
+                        (ref.repo.replace("/", "__").casefold() + f"__{ref.number}.json"))
+                try:
+                    receipt = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    receipt = {}
+                head = str((pr.get("head") or {}).get("sha") or "")
+                if receipt.get("card") == task_id and receipt.get("drafted_head") == head:
+                    held = ""  # the round boundary, not an operator hold, drafted this exact head
             if held:
                 # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
                 entry["draft_held"] = held
@@ -560,7 +572,10 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         flipped_now: dict = {}
         for ref, key, pr, entry in own_drafts.values():
             at = int(time.time())  # BEFORE the flip: every post-ready run starts after it
-            rc = ready(ref.repo, ref.number) if ready is not None else None
+            if ready is ace_gate_ready:
+                rc = ace_gate_ready(ref.repo, ref.number, task_id=task_id)
+            else:
+                rc = ready(ref.repo, ref.number) if ready is not None else None
             entry["draft_flip"] = f"ready via ace_gate.py (rc={rc})"
             if rc != 0:
                 failed.append(key)
