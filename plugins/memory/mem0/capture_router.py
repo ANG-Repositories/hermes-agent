@@ -244,6 +244,12 @@ def primary_claim_headers(profile: Optional[str] = None) -> Dict[str, str]:
     return {"X-Fleet-Caller": f"harness=hermes;agent={agent};kind=aux;task=mem0-capture"}
 
 
+# Process-wide secret cache for the default 1Password reader (see BridgeExtractor.__init__).
+_PROCESS_SECRET_CACHE: Dict[str, Tuple[str, float]] = {}
+_PROCESS_SECRET_LOCKS: Dict[str, threading.Lock] = {}
+_PROCESS_SECRET_LOCKS_GUARD = threading.Lock()
+
+
 class BridgeExtractor:
     """Runs one extraction pass against codex-bridge (PRIMARY); on ANY error/timeout falls back to
     gemini-bridge. Both are OpenAI-compatible /v1/chat/completions endpoints behind a bearer secret.
@@ -284,13 +290,21 @@ class BridgeExtractor:
         # ref -> (secret, fetched_at). TTL'd so a rotated 1Password token recovers without a
         # process restart (Greptile #250 P2); per-ref locks so concurrent first-turn passes
         # don't spawn duplicate `op read` subprocesses (Greptile #250 P2).
-        self._secret_cache: Dict[str, Tuple[str, float]] = {}
+        # The default (1Password) reader shares ONE cache per process (t_f32095d5): every mem0
+        # provider builds its own extractor, and a per-instance cache re-read both refs on each
+        # new provider / drain-owner handover across the gateway's agents.
+        if auth_fn is None:
+            self._secret_cache = _PROCESS_SECRET_CACHE
+            self._secret_locks = _PROCESS_SECRET_LOCKS
+            self._secret_locks_guard = _PROCESS_SECRET_LOCKS_GUARD
+        else:
+            self._secret_cache: Dict[str, Tuple[str, float]] = {}
+            self._secret_locks: Dict[str, threading.Lock] = {}
+            self._secret_locks_guard = threading.Lock()
         self._secret_ttl_s = 3600.0
         # A failed read ("") is retried after this; an auth failure re-reads at most this often
         # (t_8ca13fd0: a bridge 401ing every call forked `op read` once per capture).
         self._secret_retry_s = 60.0
-        self._secret_locks: Dict[str, threading.Lock] = {}
-        self._secret_locks_guard = threading.Lock()
 
     # -- provider plumbing --------------------------------------------------
     @staticmethod
@@ -314,11 +328,29 @@ class BridgeExtractor:
         return "op"
 
     @staticmethod
+    def _op_cached_read() -> Optional[str]:
+        """The fleet's cached 1Password reader (``<fleet root>/scripts/op-cached-read``), or None.
+
+        It shares one disk cache + refresh lease across every process, serves the last-known-good
+        value on a 429, and maps a vault name to its ID. A raw ``op read`` per process re-spent
+        the account bucket on every read and failed outright once the bucket was empty
+        (t_f32095d5: ~8.7 reads/min from the gateways against a 3.5/min budget)."""
+        try:
+            from hermes_constants import get_default_hermes_root
+            path = get_default_hermes_root() / "scripts" / "op-cached-read"
+        except Exception:
+            return None
+        return str(path) if path.is_file() else None
+
+    @staticmethod
     def _op_read(ref: str) -> str:
         import subprocess
+        import sys
+        cached = BridgeExtractor._op_cached_read()
+        cmd = [sys.executable, cached, ref] if cached else [BridgeExtractor._op_binary(), "read", ref]
         try:
             out = subprocess.run(
-                [BridgeExtractor._op_binary(), "read", ref],
+                cmd,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=20,
