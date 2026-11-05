@@ -183,7 +183,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            receipt.update(ok=True, classification="local-only",
+                           detail="no repository-required checks: local-only",
+                           recovery="")
             return receipt
         stage = "read check runs and statuses"
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",

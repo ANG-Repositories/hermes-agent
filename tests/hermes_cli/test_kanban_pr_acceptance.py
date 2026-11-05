@@ -111,6 +111,20 @@ def github(tmp_path, monkeypatch):
         thread.join()
 
 
+@pytest.mark.platforms("posix")
+def test_no_required_checks_resolves_to_recorded_local_only(github):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["protection"] = {"required_status_checks": {}}
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "local-only"
+    assert receipt["detail"] == "no repository-required checks: local-only"
+    assert receipt["required"] == []
+    assert receipt["head_sha"] == "a" * 40
+    assert not any("/check-runs" in p for p in github["requests"])
+
+
 @pytest.mark.platforms("linux")
 def test_pr_completion_requires_current_required_evidence(github):
     with connect() as conn:
