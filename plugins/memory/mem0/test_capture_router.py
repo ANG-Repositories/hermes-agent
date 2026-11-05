@@ -716,7 +716,7 @@ def op_env(tmp_path, monkeypatch):
     root = tmp_path / "root"
     (root / "scripts").mkdir(parents=True)
     log = tmp_path / "op-calls.log"
-    log.write_text("")
+    log.write_text("", encoding="utf-8")
     _counting_exe(tmp_path / "op", log, "tok")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setenv("OP_BIN", str(tmp_path / "op"))
@@ -737,7 +737,7 @@ def test_twenty_captures_on_fresh_routers_read_each_secret_once(op_env):
         ex._http = lambda url, body, headers, timeout: _resp([])
         assert ex.extract("sys", "u", "a")["provider"] == "codex-bridge"
         ex._call(ex._fallback_url, ex._fallback_ref, "m", "sys", "u", "a")
-    calls = log.read_text().splitlines()
+    calls = log.read_text(encoding="utf-8-sig").splitlines()
     assert calls.count("read op://V/p/secret") == 1, calls
     assert calls.count("read op://V/f/secret") == 1, calls
 
@@ -750,7 +750,7 @@ def test_default_reader_goes_through_op_cached_read_when_present(op_env, tmp_pat
     (root / "scripts" / "op-cached-read").write_text(
         "import sys\n"
         f"open({str(cached_log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
-        "print('cached-tok')\n")
+        "print('cached-tok')\n", encoding="utf-8")
     assert BridgeExtractor._op_read("op://V/p/secret") == "cached-tok"
-    assert cached_log.read_text().split()[-1] == "op://V/p/secret"
-    assert op_log.read_text() == ""
+    assert cached_log.read_text(encoding="utf-8-sig").split()[-1] == "op://V/p/secret"
+    assert op_log.read_text(encoding="utf-8-sig") == ""
