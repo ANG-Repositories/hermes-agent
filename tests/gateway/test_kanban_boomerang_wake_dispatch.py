@@ -171,7 +171,7 @@ def _writes(tid) -> tuple:
 
 # --- t_47580e49: stale handback timeline -------------------------------------------------------
 
-@pytest.mark.parametrize("phase", ["verdict", "delivery"])
+@pytest.mark.parametrize("phase", ["verdict", "delivery", "legacy_delivery"])
 @pytest.mark.parametrize("arm", ["newer_comment", "release", "hold", "merged", "open", "disabled"])
 def test_stale_surface_timeline(env, arm, phase):
     tid = _card(env)
@@ -179,11 +179,19 @@ def test_stale_surface_timeline(env, arm, phase):
     with kb.connect_closing() as conn, kb.write_txn(conn):
         conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
         conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
-    entry = _claimed_entry(env, tid, row="review_deadman", kind="review_requested")
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "review_deadman", "{}", 1793845000))
+    entry = _claimed_entry(env, tid, row="review_deadman", kind="review_deadman")
     state = ah.BoomerangWakeState()
-    if phase == "delivery":
+    if phase != "verdict":
         # Persist while fresh, then change the board/PR before draining (restart race).
         ah.enqueue_handback(entry, {"summary": "ready"}, state=state, turn_text="old handback")
+        if phase == "legacy_delivery":
+            did, pending = next(iter(state.handbacks().items()))
+            for field in ("event_id", "assignee", "pr"):
+                pending.pop(field)
+            state.drop_handback(did)
+            state.put_handback(did, pending)
     env["health"][(REPO, 71)] = {"state": "merged" if arm == "merged" else "open"}
     if arm in {"newer_comment", "release", "hold", "disabled"}:
         body = {"release": "close-on: released", "hold": "deadman-hold: waiting"}.get(arm, "owner acted")
@@ -193,7 +201,7 @@ def test_stale_surface_timeline(env, arm, phase):
     if arm == "disabled":
         env["monkeypatch"].setenv("BOOMERANG_STALE_GUARD", "0")
     blocked = arm not in {"open", "disabled"}
-    if phase == "delivery":
+    if phase != "verdict":
         sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
         assert sent == (0 if blocked else 2)
         assert bool(env["adapter"].handled) != blocked

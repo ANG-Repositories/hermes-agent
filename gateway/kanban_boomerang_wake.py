@@ -1449,6 +1449,8 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
         await _fail(runner, live, f"child {status}: {_first_line(final, 200)}", state)
         return
     if await asyncio.to_thread(deadman_owner_acted, live):
+        logger.info("kanban boomerang-wake: stale surface refused task=%s stage=run_entry "
+                    "reason=operator already acted delegation=%s", live["task_id"], live.get("delegation_id"))
         await asyncio.to_thread(enqueue_handback, live, {"summary": "operator already acted; stale wake ignored"},
                                 state=state, stale=True)
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale")
