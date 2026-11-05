@@ -496,7 +496,8 @@ def _chrome_tree(browser: int) -> dict[int, tuple[float, bool]]:
 
 
 def _tree_survivors(tree: dict[int, tuple[float, bool]]) -> list[int]:
-    return [pid for pid, (born, _) in tree.items() if kb._member_birth(pid) == born]
+    return [pid for pid, (born, _) in tree.items()
+            if kb._member_birth(pid) == born and kb._pid_alive(pid)]
 
 
 @pytest.mark.platforms("posix")
