@@ -3946,16 +3946,34 @@ except Exception as e:
 '''
 
 
-def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False, remote_host=None):
+def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False, remote_host=None,
+                         reclaimed=None):
     """The only Kanban directory deleter: inspect the exact target, then remove.
 
     Board hard-delete may remove only empty workspace/attachment storage. Archive
     a board with retained work instead: deleting its recovery artifacts would
     defeat survivorship. Linked worktrees retain Git's no-force dirty check.
+
+    ``reclaimed`` (t_83c38f7b) is a capture :mod:`hermes_cli.kanban_reclaim` stored and verified as
+    attachments on a done card. It stands in for the survivor proof: the tree is re-planned and must
+    still match the capture's fingerprint, the survivor row records ``reclaimed:<attachment id>``,
+    and one ``workspace_reclaimed`` event names the attachments and the bytes freed.
     """
     _STATUS_CACHE.clear()   # fresh status for this deletion decision (see _status_records)
     _STAT_CACHE.clear()
     try:
+        if reclaimed is not None:
+            from hermes_cli import kanban_reclaim
+            if conn is None or remote_host is not None or worktree_root is not None or board:
+                raise SurvivorUnavailable("survivor_unavailable: reclaim held (needs a local scratch tree "
+                                          "and a task connection)")
+            workspace = Path(path).expanduser().resolve(strict=True)
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+                raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
+            kanban_reclaim.verify_unchanged(workspace, reclaimed)
+            shutil.rmtree(workspace)
+            kanban_reclaim.record(conn, task_id, reclaimed)
+            return True
         if remote_host is not None:
             import shlex
             from hermes_cli.kanban_worker_pool import _ssh_argv

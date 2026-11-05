@@ -941,6 +941,12 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reclaim_workspaces(args: argparse.Namespace) -> int:
+    """Capture, verify and delete done cards' held workspaces (t_83c38f7b); dry run unless --apply."""
+    from hermes_cli.kanban_reclaim import run
+    return run(args)
+
+
 def _cmd_repair(args: argparse.Namespace) -> int:
     """Integrity check + narrow index-REINDEX auto-repair. Dispatched BEFORE
     the auto ``kb.init_db()`` (init refuses corrupt DBs). Exit 0 = healthy /

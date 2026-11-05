@@ -37,6 +37,7 @@ from hermes_cli.kanban_admit import cmd_admit as _cmd_admit
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
+    _cmd_reclaim_workspaces,
 )
 from hermes_cli import kanban_verb_input as kvi
 from hermes_cli import kanban_access_bound_pin
@@ -590,7 +591,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "archive", "dispatch", "admit", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review", "sendback",
-    "gc",
+    "gc", "reclaim-workspaces",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -5162,6 +5163,7 @@ _HANDLERS = {
     "notify-repair": _cmd_notify_repair,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
     "gc": _cmd_gc, "home-lint": _cmd_home_lint, "obligation": _cmd_obligation,
+    "reclaim-workspaces": _cmd_reclaim_workspaces,
 }
 
 
