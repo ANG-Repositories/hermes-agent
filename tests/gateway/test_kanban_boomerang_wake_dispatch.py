@@ -171,9 +171,10 @@ def _writes(tid) -> tuple:
 
 # --- t_47580e49: stale handback timeline -------------------------------------------------------
 
+@pytest.mark.parametrize("author", ["apollo", "human:apollo"])
 @pytest.mark.parametrize("phase", ["verdict", "delivery", "legacy_delivery"])
 @pytest.mark.parametrize("arm", ["newer_comment", "release", "hold", "merged", "open", "disabled"])
-def test_stale_surface_timeline(env, arm, phase):
+def test_stale_surface_timeline(env, arm, phase, author):
     tid = _card(env)
     _handback(tid, 71)
     with kb.connect_closing() as conn, kb.write_txn(conn):
@@ -197,7 +198,7 @@ def test_stale_surface_timeline(env, arm, phase):
         body = {"release": "close-on: released", "hold": "deadman-hold: waiting"}.get(arm, "owner acted")
         with kb.connect_closing() as conn, kb.write_txn(conn):
             conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-                         (tid, "human:apollo", body, 1793844766 if arm in {"newer_comment", "disabled"} else 1793839413))
+                         (tid, author, body, 1793844766 if arm in {"newer_comment", "disabled"} else 1793839413))
     if arm == "disabled":
         env["monkeypatch"].setenv("BOOMERANG_STALE_GUARD", "0")
     blocked = arm not in {"open", "disabled"}
@@ -210,6 +211,42 @@ def test_stale_surface_timeline(env, arm, phase):
         result = ah.execute_verdict(entry, _verdict(entry, "surface"))
         assert bool(result.get("stale")) == blocked
         assert bool(result.get("surface")) != blocked
+
+
+@pytest.mark.parametrize("author", ["boomerang-wake", "kanban-dispatcher", "unverified:default", "human:other"])
+@pytest.mark.parametrize("body", ["owner acted", "release: deployed", "deadman-hold: waiting"])
+def test_stale_surface_ignores_non_owner_comments(env, author, body):
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, author, body, 1793844766))
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested")
+    env["health"][(REPO, 71)] = {"state": "open"}
+    assert ah.stale_surface_reason(entry) is None
+    if author != "human:other":
+        # Bot provenance is excluded even if persisted ownership accidentally matches it.
+        entry["assignee"] = author
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (author, tid))
+        assert ah.stale_surface_reason(entry) is None
+
+
+@pytest.mark.parametrize("assignee", ["apollo", "human:apollo"])
+def test_stale_surface_bot_comment_does_not_hide_owner_release(env, assignee):
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, tid))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "apollo", "release: deployed", 1793844766))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "boomerang-wake", "child finished", 1793845000))
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested")
+    assert ah.stale_surface_reason(entry) == "owner release/hold line"
 
 
 # --- wake-path dispatch -----------------------------------------------------------------------

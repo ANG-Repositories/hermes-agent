@@ -922,10 +922,13 @@ def stale_surface_reason(entry: dict) -> Optional[str]:
             "AND kind IN ('review_requested', 'completed') AND (? IS NULL OR id <= ?) "
             "ORDER BY id DESC LIMIT 1", (entry["task_id"], event_id, event_id)).fetchone()
         owner = str(entry.get("assignee") or _field(task, "assignee") or "")
-        owners = {owner, str(_field(task, "assignee") or "")}
+        owners = {name.removeprefix("human:") for name in
+                  (owner, str(_field(task, "assignee") or "")) if name}
+        owners |= {f"human:{name}" for name in owners}
         comments = [c for c in kb.list_comments(conn, entry["task_id"])
-                    if str(c.author).startswith("human:") and
-                    (c.author in owners or "human" in owners)]
+                    if str(c.author) not in {"boomerang-wake", "kanban-dispatcher"}
+                    and not str(c.author).startswith("unverified:")
+                    and c.author in owners]
         if comments:
             newest = max(comments, key=lambda c: (c.created_at, c.id))
             if re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M):
