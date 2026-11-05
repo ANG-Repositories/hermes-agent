@@ -374,7 +374,9 @@ def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) ->
 
 
 _TELEGRAM_ONBOARDING_DEFAULT_URL = "https://setup.hermes-agent.nousresearch.com"
-_TELEGRAM_ONBOARDING_USER_AGENT = f"HermesDashboard/{get_version_info().base_version}"
+def _telegram_onboarding_user_agent() -> str:
+    """Resolved on use, not at import: get_version_info() runs git in a checkout (t_a1bd70f8)."""
+    return f"HermesDashboard/{get_version_info().base_version}"
 
 
 @dataclass
@@ -414,7 +416,7 @@ def _telegram_onboarding_request_sync(
     method: str, path: str, *, body: dict[str, Any] | None = None, bearer_token: str | None = None
 ) -> dict[str, Any]:
     import httpx
-    headers = {"Accept": "application/json", "User-Agent": _TELEGRAM_ONBOARDING_USER_AGENT}
+    headers = {"Accept": "application/json", "User-Agent": _telegram_onboarding_user_agent()}
     request_kwargs: dict[str, Any] = {}
     if body is not None:
         headers["Content-Type"] = "application/json"

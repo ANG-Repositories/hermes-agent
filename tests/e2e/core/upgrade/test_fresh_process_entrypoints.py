@@ -284,6 +284,19 @@ def child(entry, wfd):
     for fd in (0, 1, 2):
         os.dup2(devnull, fd)
     res = {"id": entry["id"], "ok": True}
+    import subprocess
+    spawned = []
+    real_init = subprocess.Popen.__init__
+
+    def _spy(self, args, *a, **k):
+        if not spawned:
+            fr = [f for f in traceback.extract_stack()[:-1]
+                  if f.filename.startswith(tree) and "version_info" not in f.filename]
+            res["first_caller"] = (fr[-1].filename[len(tree) + 1:] + ":%d" % fr[-1].lineno) if fr else "?"
+        spawned.append(" ".join(map(str, args[:3])) if isinstance(args, (list, tuple)) else str(args)[:60])
+        return real_init(self, args, *a, **k)
+
+    subprocess.Popen.__init__ = _spy
     try:
         _import(entry)
         outside = sorted(
@@ -297,6 +310,7 @@ def child(entry, wfd):
         res = {"id": entry["id"], "ok": False, "type": type(exc).__name__, "msg": str(exc)[:600],
                "missing": exc.name if isinstance(exc, ModuleNotFoundError) else None,
                "tb": "".join(traceback.format_exception(exc))[-2500:]}
+    res["spawned"] = spawned
     os.write(wfd, json.dumps(res).encode())
     os._exit(0)
 
@@ -624,6 +638,12 @@ def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
     assert set(results) == set(ids), f"runner lost modules: {sorted(set(ids) - set(results))[:10]}"
     overrun = _budget_overrun_report(raw_results, json.loads(Path(str(out) + ".meta").read_text(encoding="utf-8")))
     assert not overrun, overrun
+    import collections as _c  # TEMP-MEASURE t_a1bd70f8
+    _sp = [r for r in raw_results if r.get("spawned")]
+    print("SPAWNMEASURE modules", len(raw_results), "spawning", len(_sp), "total", sum(len(r["spawned"]) for r in _sp))
+    print("SPAWNMEASURE argv", _c.Counter(c for r in _sp for c in r["spawned"]).most_common(15))
+    print("SPAWNMEASURE nongit", sorted({(r["id"], c) for r in _sp for c in r["spawned"] if not c.startswith("git")})[:25])
+    print("SPAWNMEASURE nonspawning", len(raw_results) - len(_sp), [r["id"] for r in raw_results if not r.get("spawned")][:15])
 
     failures, tolerated = {}, {}
     for mid, res in sorted(results.items()):

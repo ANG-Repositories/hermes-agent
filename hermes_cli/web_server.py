@@ -408,7 +408,17 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
     return _app_state_default(app, "pty_active_session_files", dict)
 
 
-app = FastAPI(title="Hermes Agent", version=get_version_info().base_version, lifespan=_lifespan)
+class _HermesApp(FastAPI):
+    """The schema version is resolved when /openapi.json is first built, not at import:
+    get_version_info() runs git in a checkout (t_a1bd70f8)."""
+
+    def openapi(self):
+        if not self.openapi_schema:
+            self.version = get_version_info().base_version
+        return super().openapi()
+
+
+app = _HermesApp(title="Hermes Agent", lifespan=_lifespan)
 
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.

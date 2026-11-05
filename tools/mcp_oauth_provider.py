@@ -33,7 +33,6 @@ def _default_auth_request_user_agent() -> str:
     return f"Hermes-Agent/{get_version_info().base_version}"
 
 
-DEFAULT_AUTH_REQUEST_USER_AGENT = _default_auth_request_user_agent()
 
 
 def stamp_default_user_agent(request):
@@ -47,7 +46,7 @@ def stamp_default_user_agent(request):
     user sees ``Registration failed: 404`` (#113771). Only an absent header is filled, so a
     configured ``oauth.user_agent`` (token requests) still wins."""
     if "user-agent" not in request.headers:
-        request.headers["User-Agent"] = DEFAULT_AUTH_REQUEST_USER_AGENT
+        request.headers["User-Agent"] = _default_auth_request_user_agent()
     return request
 
 
@@ -633,3 +632,10 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
         "token_user_agent": mo.token_request_user_agent(cfg),
         "oauth_flow": cfg.get("flow", "browser"),
         **mo.cimd_provider_kwargs(cfg)}
+
+
+def __getattr__(name: str):
+    # Back-compat for importers of the old module constant; resolved on use (t_a1bd70f8).
+    if name == "DEFAULT_AUTH_REQUEST_USER_AGENT":
+        return _default_auth_request_user_agent()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

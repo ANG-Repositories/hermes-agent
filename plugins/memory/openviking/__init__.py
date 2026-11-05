@@ -53,7 +53,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _OPENVIKING_SERVICE_ENDPOINT = "https://api.vikingdb.cn-beijing.volces.com/openviking"
 _DEFAULT_AGENT = ""
-_OPENVIKING_USER_AGENT = f"openviking-memory-hermes/{get_version_info().base_version}"
 _OVCLI_CONFIG_ENV = "OPENVIKING_CLI_CONFIG_FILE"
 _OVCLI_DEFAULT_RELATIVE_PATH = ".openviking/ovcli.conf"
 _OVCLI_SAVED_PREFIX = "ovcli.conf."
@@ -251,7 +250,7 @@ class _VikingClient:
     def _headers(self, *, include_tenant: bool | None = None) -> dict:
         if include_tenant is None:
             include_tenant = not bool(self._api_key)
-        h = {"Content-Type": "application/json", "User-Agent": _OPENVIKING_USER_AGENT}
+        h = {"Content-Type": "application/json", "User-Agent": f"openviking-memory-hermes/{get_version_info().base_version}"}
         if self._agent:
             h["X-OpenViking-Actor-Peer"] = self._agent
         if include_tenant:

@@ -254,7 +254,10 @@ _PROVIDER_LABELS = _LazyProviderLabels(__name__, "_PROVIDER_LABELS", dict(_PROVI
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
-_HERMES_USER_AGENT = f"hermes-cli/{get_version_info().base_version}"
+def _hermes_user_agent() -> str:
+    """Resolved on use, not at import: get_version_info() runs git in a checkout (t_a1bd70f8).
+    ``_HERMES_USER_AGENT`` stays importable through the module ``__getattr__``."""
+    return f"hermes-cli/{get_version_info().base_version}"
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
@@ -3157,7 +3160,7 @@ def probe_api_models(
                 None, normalized.rstrip("/") + "/models", normalized,
                 alternate_base if alternate_base != normalized else None, failure="timeout",
                 tried_urls=[c.rstrip("/") + "/models" for c, _fb in candidates])
-    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
+    headers: dict[str, str] = {"User-Agent": _hermes_user_agent()}
     if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
         headers["X-Goog-Api-Client"] = f"hermes-agent/{get_version_info().base_version}"
     if api_key and api_mode == "anthropic_messages":
@@ -3285,7 +3288,7 @@ def _fetch_deepinfra_catalog(
         if last_fail is not None and (time.monotonic() - last_fail) < _DEEPINFRA_CATALOG_NEG_TTL:
             return None
 
-    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
+    headers: dict[str, str] = {"User-Agent": _hermes_user_agent()}
     api_key = _deepinfra_env("DEEPINFRA_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -3360,7 +3363,7 @@ def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
         from hermes_constants import AI_GATEWAY_BASE_URL
         base_url = AI_GATEWAY_BASE_URL
 
-    headers = {"Authorization": f"Bearer {api_key}", "User-Agent": _HERMES_USER_AGENT}
+    headers = {"Authorization": f"Bearer {api_key}", "User-Agent": _hermes_user_agent()}
     try:
         url = base_url.rstrip("/") + "/models"
         data = _get_json(url, timeout=timeout, headers=headers)
@@ -3501,3 +3504,10 @@ def cached_fetch_api_models(
     if _cache_entry_valid(entry, fp):
         return _catalog(entry)
     return _chat_catalog_rows(live)
+
+
+def __getattr__(name: str):
+    # Back-compat for importers of the old module constant; resolved on use (t_a1bd70f8).
+    if name == "_HERMES_USER_AGENT":
+        return _hermes_user_agent()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -37,7 +37,9 @@ DEFAULT_TTL_HOURS = DEFAULT_TTL_MINUTES / 60.0
 DEFAULT_FETCH_TIMEOUT = 8.0
 SUPPORTED_SCHEMA_VERSION = 1
 
-_HERMES_USER_AGENT = f"hermes-cli/{get_version_info().base_version}"
+def _hermes_user_agent() -> str:
+    """Resolved on use, not at import: get_version_info() runs git in a checkout (t_a1bd70f8)."""
+    return f"hermes-cli/{get_version_info().base_version}"
 
 # In-process cache, invalidated against the disk file's path + mtime and TTL. The path matters:
 # under a multiplexed gateway each profile has its own ``<home>/cache/model_catalog.json``, and
@@ -97,7 +99,7 @@ def _fetch_manifest(url: str, timeout: float) -> dict[str, Any] | None:
         # test_models.py when the manifest dropped a fixture id).
         return None
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": _HERMES_USER_AGENT})
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": _hermes_user_agent()})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
