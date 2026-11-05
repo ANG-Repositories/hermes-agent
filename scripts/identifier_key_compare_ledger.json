@@ -57,6 +57,11 @@
   }
  ],
  "sites": {
+  "hermes_cli/kanban_pr_freshness.py::_unread_refuses::fold::repo::if ref.repo.casefold() not in worker_draft_repos():": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive; worker_draft_repos() returns casefolded names. The unreadable-PR refusal must match that canonical set regardless of input casing, just like _owns_draft.",
+   "where": "hermes_cli/kanban_pr_freshness.py:457 _unread_refuses"
+  },
   "hermes_cli/kanban.py::_cmd_set_model::fold::model::clearing = args.model is None or str(args.model).lower() in {\"none\", \"-\", \"null\", \"\"}": {
    "verdict": "kept",
    "why": "sentinel-word detection on CLI input (`none`/`null`/`-` clears the pin); the model id itself is stored unfolded.",

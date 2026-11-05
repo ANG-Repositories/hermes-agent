@@ -3968,7 +3968,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
                 raise SurvivorUnavailable("survivor_unavailable: reclaim held (needs a local scratch tree "
                                           "and a task connection)")
             workspace = Path(path).expanduser().resolve(strict=True)
-            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):  # noqa: root-equality -- equality refuses deletion too
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             kanban_reclaim.verify_unchanged(workspace, reclaimed)
             shutil.rmtree(workspace)
@@ -4007,7 +4007,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             ):
                 raise SurvivorUnavailable("survivor_unavailable: no task connection or durable ref")
         else:
-            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):  # noqa: root-equality -- equality refuses deletion too
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             preserve(conn, task_id, cleanup=True, workspace=workspace)
             push_unpushed_survivor(conn, task_id, workspace)

@@ -4159,9 +4159,11 @@ def _apply_a_lane_default_fallback(job: Dict[str, Any]) -> None:
     carries a ``fallback`` or the opt-in is left alone. A rung whose lane list refuses the model
     is dropped (never a route the job cannot fire on); an unreadable list is admitted, as
     ``_require_known_job_route`` does."""
+    from cron.lanes import job_lane
+
     provider = str(job.get("provider") or "").strip().lower()
     model = job.get("model")
-    if (job.get("no_agent") or not model or not _A_LANE_RE.fullmatch(provider)
+    if (job_lane(job) == "script" or not model or not _A_LANE_RE.fullmatch(provider)
             or job.get("fallback") or "allow_cross_provider_fallback" in job):
         return
     from hermes_cli.model_registry import resolve
