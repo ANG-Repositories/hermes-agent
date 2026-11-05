@@ -284,16 +284,18 @@ def child(entry, wfd):
     for fd in (0, 1, 2):
         os.dup2(devnull, fd)
     res = {"id": entry["id"], "ok": True}
+    # get_version_info() runs ~8 git subprocesses in a checkout; called at import it made every
+    # child pay ~1.8 s on the CI guest (t_a1bd70f8). Name the in-tree caller if it happens.
     import subprocess
-    spawned = []
+    version_git = []
     real_init = subprocess.Popen.__init__
 
     def _spy(self, args, *a, **k):
-        if not spawned:
-            fr = [f for f in traceback.extract_stack()[:-1]
-                  if f.filename.startswith(tree) and "version_info" not in f.filename]
-            res["first_caller"] = (fr[-1].filename[len(tree) + 1:] + ":%d" % fr[-1].lineno) if fr else "?"
-        spawned.append(" ".join(map(str, args[:3])) if isinstance(args, (list, tuple)) else str(args)[:60])
+        if not version_git:
+            stack = [os.path.realpath(f.filename) + ":%d" % f.lineno for f in traceback.extract_stack()[:-1]]
+            if any(s.rsplit(":", 1)[0].endswith(os.sep + "version_info.py") for s in stack):
+                mine = [s for s in stack if s.startswith(tree + os.sep) and "version_info.py:" not in s]
+                version_git.append(mine[-1][len(tree) + 1:] if mine else "?")
         return real_init(self, args, *a, **k)
 
     subprocess.Popen.__init__ = _spy
@@ -310,7 +312,8 @@ def child(entry, wfd):
         res = {"id": entry["id"], "ok": False, "type": type(exc).__name__, "msg": str(exc)[:600],
                "missing": exc.name if isinstance(exc, ModuleNotFoundError) else None,
                "tb": "".join(traceback.format_exception(exc))[-2500:]}
-    res["spawned"] = spawned
+    if version_git:
+        res["version_git"] = version_git[0]
     os.write(wfd, json.dumps(res).encode())
     os._exit(0)
 
@@ -638,12 +641,12 @@ def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
     assert set(results) == set(ids), f"runner lost modules: {sorted(set(ids) - set(results))[:10]}"
     overrun = _budget_overrun_report(raw_results, json.loads(Path(str(out) + ".meta").read_text(encoding="utf-8")))
     assert not overrun, overrun
-    import collections as _c  # TEMP-MEASURE t_a1bd70f8
-    _sp = [r for r in raw_results if r.get("spawned")]
-    print("SPAWNMEASURE modules", len(raw_results), "spawning", len(_sp), "total", sum(len(r["spawned"]) for r in _sp))
-    print("SPAWNMEASURE argv", _c.Counter(c for r in _sp for c in r["spawned"]).most_common(15))
-    print("SPAWNMEASURE nongit", sorted({(r["id"], c) for r in _sp for c in r["spawned"] if not c.startswith("git")})[:25])
-    print("SPAWNMEASURE nonspawning", len(raw_results) - len(_sp), [r["id"] for r in raw_results if not r.get("spawned")][:15])
+    # Vacuous in a tree with no .git (the git calls never run); the source scan in
+    # tests/hermes_cli/test_version_info_import_cost.py holds there.
+    version_git = sorted({r["version_git"] for r in raw_results if r.get("version_git")})
+    assert not version_git, (
+        f"get_version_info() ran git at import, so every fresh process pays it (t_a1bd70f8); "
+        f"resolve on use. First in-tree callers: {version_git}")
 
     failures, tolerated = {}, {}
     for mid, res in sorted(results.items()):
