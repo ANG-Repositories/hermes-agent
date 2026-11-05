@@ -556,6 +556,12 @@ def _is_repo_toplevel(workspace_path: str) -> bool:
     workspace still resolves normally.
     """
     sig = _repo_probe_signature(workspace_path)
+    if sig is not None and sig[1] is None:
+        # No ``.git`` entry: discovery can only find an ENCLOSING repository,
+        # whose toplevel is never this path. Answer without forking, so a TTL
+        # expiry does not re-probe every scratch workspace (44 of 48 forks per
+        # TTL on the live boards, 2026-11-04, t_38e057fb).
+        return False
     hit = _repo_probe_get(("toplevel", workspace_path), sig)
     if hit is not None:
         return hit
@@ -567,9 +573,8 @@ def _is_repo_toplevel(workspace_path: str) -> bool:
         except OSError:
             answer = False
     # A failed probe on a path that HAS a ``.git`` may be transient (timeout, held
-    # lock, stale mount): do not pin it. With no ``.git`` entry the answer is
-    # structural (the walk-up case) and stays valid until ``.git`` appears.
-    if out is not None or (sig is not None and sig[1] is None):
+    # lock, stale mount): do not pin it.
+    if out is not None:
         _repo_probe_put(("toplevel", workspace_path), sig, answer)
     return answer
 

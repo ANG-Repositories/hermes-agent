@@ -97,7 +97,8 @@ def test_walk_up_still_answers_not_toplevel_and_stays_cached(tmp_path, git_spawn
     for _ in range(5):
         assert prg._is_repo_toplevel(str(scratch)) is False
         assert prg._remotes_for(str(scratch)) == set()
-    assert len([c for c in git_spawns if "--show-toplevel" in c]) == 1
+    # No ``.git`` entry: answered structurally, never forked (t_38e057fb).
+    assert [c for c in git_spawns if "--show-toplevel" in c] == []
     # ...and becoming a checkout of its own is seen at once.
     subprocess.run(["git", "init", "-q"], cwd=scratch, check=True)
     subprocess.run(["git", "remote", "add", "origin", "git@github.com:o/own.git"],
@@ -176,6 +177,40 @@ def test_branch_conditional_include_is_seen_on_checkout(tmp_path, git_spawns, pr
     subprocess.run(["git", "checkout", "-q", "new"], cwd=repo, check=True)
     # Same clock reading: no TTL expiry, only a HEAD-aware signature sees this.
     assert prg._remotes_for(str(repo)) == {"acme/new"}
+
+
+def test_gate_forks_scale_with_repos_not_cards_across_ttl_expiry(
+    tmp_path, git_spawns, probe_clock,
+):
+    """t_38e057fb: N scratch cards under one checkout + 1 worktree card.
+
+    Live boards (2026-11-04): 44 of 48 forked paths were ``.git``-less scratch
+    workspaces, re-probed on every TTL expiry. Over several TTL periods the
+    forks must stay O(repos), independent of how many scratch cards exist.
+    """
+    outer = tmp_path / "home"
+    _git_init(outer, "git@github.com:ANG-Ventures/hermes-home.git")
+    wt = tmp_path / "wt"
+    _git_init(wt, "git@github.com:o/r.git")
+    n_cards = 25
+    scratch = [outer / "workspaces" / f"t_{i:04x}" for i in range(n_cards)]
+    for path in scratch:
+        path.mkdir(parents=True)
+    ttl = getattr(prg, "_REPO_PROBE_TTL_SECONDS", 120)
+    periods = 3
+    # The counter wrapped subprocess.run before the two _git_init calls above
+    # (init + remote add each); count only the probe forks from here on.
+    del git_spawns[:]
+    for _ in range(periods):
+        for path in scratch:
+            assert prg.repo_context(workspace_path=str(path), body="see #12") is None
+        assert prg.repo_context(workspace_path=str(wt), body="see #12") == "o/r"
+        probe_clock.t += ttl + 1
+    # One real repo: at most toplevel + remotes per TTL period, zero for scratch.
+    assert len(git_spawns) <= 2 * periods, (
+        f"{len(git_spawns)} git forks for {n_cards} scratch cards + 1 repo "
+        f"over {periods} TTL periods"
+    )
 
 
 def test_repeat_within_ttl_still_hits_the_cache(tmp_path, git_spawns, probe_clock):

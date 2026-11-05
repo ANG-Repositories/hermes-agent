@@ -458,9 +458,12 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0, row_ids_out: Optional[List[int]] = None) -> int:
+        turn_lease_ttl_seconds: float = 300.0, row_ids_out: Optional[List[int]] = None,
+        recompute_last_active: bool = False) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
         count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row).
+        ``recompute_last_active``: also run the session's effective_last_active recompute in this txn (the
+        turn flush), so a contended store is waited on once, not twice; its failure never loses the rows.
         ``row_ids_out``: optional list that receives one entry per element of *messages*, in order — the
         committed row id of an inserted message, the stamped ``_row_id`` of a message repaired in place —
         populated only after a successful commit (run_agent's flush indexes it by message position)."""
@@ -472,7 +475,8 @@ class SessionMessagesMixin:
                 self._stamp_tool_call_uids(msg, _parse_tool_calls(msg.get("tool_calls")), tool_uid_index)
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds, row_ids_out=row_ids_out)
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds, row_ids_out=row_ids_out,
+                    recompute_last_active=recompute_last_active)
                 for start in range(0, len(messages), chunk_rows))
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
@@ -507,8 +511,20 @@ class SessionMessagesMixin:
                     else:
                         _rid = _msg.get("_row_id") if isinstance(_msg, dict) else None
                         row_ids_out.append(_rid if isinstance(_rid, int) else None)
+            if recompute_last_active:
+                self._recompute_last_active_best_effort(conn, session_id)
             return inserted
         return self._execute_transcript_write(_do, messages, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def _recompute_last_active_best_effort(self, conn, session_id: str) -> None:
+        """Denorm recompute inside the caller's txn; a failure rolls back only itself (savepoint)."""
+        conn.execute("SAVEPOINT recompute_last_active")
+        try:
+            self._recompute_effective_last_active_for_session(conn, session_id)
+        except Exception as e:
+            conn.execute("ROLLBACK TO recompute_last_active")
+            logger.warning("Session DB effective_last_active recompute failed: %s", e)
+        conn.execute("RELEASE recompute_last_active")
 
     _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
 
