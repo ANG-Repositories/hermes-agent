@@ -103,7 +103,7 @@ def main():
     for job in jobs:
         reads.append([job, '2000-01-01T00:00:00+00:00',
                       o.rewound_watermark({'id': job}, '2000-01-01T00:00:00+00:00')])
-    (args.out / 'occurrence-reads.json').write_text(json.dumps(reads, sort_keys=True, indent=2)+'\n')
+    (args.out / 'occurrence-reads.json').write_text(json.dumps(reads, sort_keys=True, indent=2)+'\n', encoding='utf-8')
     with e._transaction() as conn:
         columns = [r[1] for r in conn.execute('PRAGMA table_info(executions)') if r[1] != 'rewind_proof']
         rows = [dict(zip(columns, row)) for row in conn.execute(
@@ -112,14 +112,14 @@ def main():
     for row in rows:
         if row['process_id'] == 'replay':
             row['pid'] = 0
-    (args.out / 'retained-rows.json').write_text(json.dumps(rows, sort_keys=True, indent=2)+'\n')
+    (args.out / 'retained-rows.json').write_text(json.dumps(rows, sort_keys=True, indent=2)+'\n', encoding='utf-8')
     holds.sort()
     result = dict(pid=os.getpid(), snapshot_rows=sum(counts.values()), snapshot_status=counts,
                   claims=150, finishes=len(holds), synchronous=sync, wall_s=wall,
                   claims_wall_s=claim_wall, hold_p50_ms=holds[len(holds)//2]*1000,
                   hold_p90_ms=holds[int(len(holds)*.9)]*1000, hold_ms=[v*1000 for v in holds],
                   reader_queries=len(reads))
-    (args.out / 'measurements.json').write_text(json.dumps(result, indent=2)+'\n')
+    (args.out / 'measurements.json').write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')
     print(json.dumps({k:v for k,v in result.items() if k != 'hold_ms'}, sort_keys=True))
     e.close_shared_connections()
 
