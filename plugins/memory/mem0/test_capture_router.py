@@ -696,3 +696,61 @@ def test_default_write_same_target_reentrant_writers_do_not_collide(tmp_path, mo
     with open(target, encoding="utf-8-sig") as fh:
         assert fh.read() == "A-content"                 # last publish wins, whole (never truncated)
     assert sorted(os.listdir(os.path.dirname(target))) == ["turn.md"]   # no temp left behind
+
+
+# ---------------------------------------------------------------------------
+# 1Password read budget (t_f32095d5)
+# ---------------------------------------------------------------------------
+
+def _counting_exe(path, log, stdout):
+    """A fake executable that appends its argv to `log` and prints `stdout`."""
+    path.write_text("#!/bin/sh\n"
+                    f"echo \"$@\" >> {log}\n"
+                    f"echo {stdout}\n")
+    path.chmod(0o755)
+
+
+@pytest.fixture
+def op_env(tmp_path, monkeypatch):
+    """Isolated fleet root + a fake `op` that counts calls; the process secret cache starts empty."""
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    log = tmp_path / "op-calls.log"
+    log.write_text("", encoding="utf-8")
+    _counting_exe(tmp_path / "op", log, "tok")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("OP_BIN", str(tmp_path / "op"))
+    monkeypatch.setattr(cr, "_PROCESS_SECRET_CACHE", {}, raising=False)
+    monkeypatch.setattr(cr, "_PROCESS_SECRET_LOCKS", {}, raising=False)
+    return root, log
+
+
+def test_twenty_captures_on_fresh_routers_read_each_secret_once(op_env):
+    """Every mem0 provider builds its own router, so 20 captures can run on 20 extractors.
+    They must cost at most one 1Password read per ref per TTL, not one per extractor."""
+    _root, log = op_env
+    cfg = {"mem0_capture_router": {"enabled": True,
+                                   "primary_secret_ref": "op://V/p/secret",
+                                   "fallback_secret_ref": "op://V/f/secret"}}
+    for _ in range(20):
+        ex = build_router_from_config(cfg)._extractor
+        ex._http = lambda url, body, headers, timeout: _resp([])
+        assert ex.extract("sys", "u", "a")["provider"] == "codex-bridge"
+        ex._call(ex._fallback_url, ex._fallback_ref, "m", "sys", "u", "a")
+    calls = log.read_text(encoding="utf-8-sig").splitlines()
+    assert calls.count("read op://V/p/secret") == 1, calls
+    assert calls.count("read op://V/f/secret") == 1, calls
+
+
+def test_default_reader_goes_through_op_cached_read_when_present(op_env, tmp_path):
+    """With the fleet's op-cached-read installed, the router never execs raw `op`."""
+    root, op_log = op_env
+    cached_log = tmp_path / "cached-calls.log"
+    # run with the gateway's own interpreter, so the fake is Python, not sh
+    (root / "scripts" / "op-cached-read").write_text(
+        "import sys\n"
+        f"open({str(cached_log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "print('cached-tok')\n", encoding="utf-8")
+    assert BridgeExtractor._op_read("op://V/p/secret") == "cached-tok"
+    assert cached_log.read_text(encoding="utf-8-sig").split()[-1] == "op://V/p/secret"
+    assert op_log.read_text(encoding="utf-8-sig") == ""
