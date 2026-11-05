@@ -380,10 +380,10 @@ def map_from_bytes(map_bytes: Optional[bytes], index_bytes: Optional[bytes], *,
     return CapabilityMap(capabilities=names, sniff=sniff, hosts=hosts, index=index,
                          error=error, index_error=index_error, soft=soft,
                          identity_only=identity_only,
-                         browser_remote={h.lower(): row["browser_remote"]
+                         browser_remote={h.lower(): (row["browser_remote"]
+                                                     if isinstance(row["browser_remote"], dict) else {})
                                          for h, row in (doc["hosts"].items() if error is None else ())
-                                         if isinstance(row, dict)
-                                         and isinstance(row.get("browser_remote"), dict)},
+                                         if "browser_remote" in row},
                          index_unverified=unverified if index_error is None else None)
 
 

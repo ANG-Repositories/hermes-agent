@@ -5315,6 +5315,10 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         if verdict.body_ignored and caps_out is not None:
             # Advisory body pin no host may serve (t_640a4ea0): placed without it, recorded.
             caps_out.setdefault("body_ignored", {})[row["id"]] = verdict.body_ignored[0]
+        if (verdict.wait or "").startswith("BROWSER_REMOTE_UNREACHABLE:"):
+            if caps_out is not None:
+                caps_out.setdefault("reasons", {})[row["id"]] = [verdict.wait]
+            return "wait", verdict.wait
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked, workspace_bind=bind,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])

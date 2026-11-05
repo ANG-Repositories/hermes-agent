@@ -41,6 +41,23 @@ class BrowserRemotePlacementTest(unittest.TestCase):
                                             self.context(record)).hard_rule,
                                  "requires:browser-session")
 
+    def test_mixed_pool_excludes_failed_host(self):
+        from dataclasses import replace
+        ctx = self.context({"front_door": True, "ssh": True})
+        cmap = replace(ctx.cmap, browser_remote={
+            "ace-ai": {"front_door": True, "ssh": True},
+            "ci-box": {"front_door": True, "ssh": False}})
+        ctx = replace(ctx, cmap=cmap, pool_hosts=("ace-ai", "ci-box"))
+        self.assertEqual(hc.evaluate("requires: browser-session", (), ctx).only, ("ace-ai",))
+
+    def test_failed_record_vetoes_static_browser_advertisement(self):
+        from dataclasses import replace
+        ctx = self.context({"front_door": False, "ssh": True})
+        ctx = replace(ctx, cmap=replace(ctx.cmap, hosts={"ace-ai": frozenset({"browser-session"})}))
+        self.assertEqual(hc.evaluate("requires: browser-session", (), ctx,
+                                    pin_host="ace-ai").wait,
+                         "BROWSER_REMOTE_UNREACHABLE:front_door")
+
     def test_remote_browser_does_not_supply_screen(self):
         ctx = self.context({"front_door": True, "ssh": True})
         self.assertEqual(hc.evaluate("requires: screen", (), ctx).hard_rule, "requires:screen")
