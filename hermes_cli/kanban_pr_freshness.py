@@ -407,6 +407,32 @@ def _operator_hold(record, pr: dict) -> str:
             f"so someone else holds it; not flipped, not armed")
 
 
+ROUND_DRAFT_MARK = "round-draft: re-drafted by findings-route at "
+
+
+def round_draft_enabled() -> bool:
+    return os.environ.get("KANBAN_ROUND_DRAFT", "1").strip() != "0"
+
+
+def _round_redrafted(gh: GhFn, ref, pr: dict, record) -> bool:
+    """True when the Studio findings-route (hermes-home worker_round_draft.py) re-drafted THIS head at a Prism
+    send-back: its PR comment carries the line ``round-draft: re-drafted by findings-route at <head>``, posted after
+    this card's last flip. The re-draft runs only there; this side only reads the mark and un-drafts at handback.
+    Unreadable comments, no flip record, or the kill switch ``KANBAN_ROUND_DRAFT=0`` -> False (the hold sticks)."""
+    head = str(((pr.get("head") or {}).get("sha")) or "")
+    if not round_draft_enabled() or not head or not isinstance(record, dict):
+        return False
+    try:
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(record.get("at") or 0)))
+    except (TypeError, ValueError):
+        return False
+    line = ROUND_DRAFT_MARK + head
+    # gh_api returns objects only: --jq folds the comment list into {"marked": bool}. ``line`` is hex + ASCII.
+    jq = r'{marked: any(.[]; (.body // "") | split("\n") | map(rtrimstr("\r")) | index([%s]) != null)}' % json.dumps(line)
+    out = gh(f"repos/{ref.repo}/issues/{ref.number}/comments?per_page=100&since={since}", "--jq", jq)
+    return isinstance(out, dict) and out.get("marked") is True
+
+
 def ace_gate_ready(repo: str, number: int, *, task_id: str = "") -> Optional[int]:
     """``scripts/ace_gate.py ready <repo> <n>`` (the only sanctioned un-draft). rc, or None if not run."""
     from hermes_constants import get_default_hermes_root
@@ -528,17 +554,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if pr.get("draft") is True:
             held = _operator_hold(flip_records.get(key.lower()), pr)
-            if held and os.environ.get("KANBAN_ROUND_DRAFT", "1").strip() != "0":
-                from hermes_constants import get_default_hermes_root
-                path = (get_default_hermes_root() / "state" / "worker-round-draft" /
-                        (ref.repo.replace("/", "__").casefold() + f"__{ref.number}.json"))
-                try:
-                    receipt = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    receipt = {}
-                head = str((pr.get("head") or {}).get("sha") or "")
-                if receipt.get("card") == task_id and receipt.get("drafted_head") == head:
-                    held = ""  # the round boundary, not an operator hold, drafted this exact head
+            if held and _round_redrafted(gh, ref, pr, flip_records.get(key.lower())):
+                held = ""  # the findings-route send-back drafted this exact head, not an operator hold
             if held:
                 # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
                 entry["draft_held"] = held
