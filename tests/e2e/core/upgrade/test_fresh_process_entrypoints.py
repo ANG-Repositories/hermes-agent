@@ -357,10 +357,38 @@ while queue or running:
                             "msg": "import did not finish within %ss" % spec["timeout"]})
 with open(spec["out"], "w") as fh:
     json.dump(results, fh)
+meta = {"preload_s": preload_s, "imports_wall_s": time.monotonic() - t0,
+        "workers": spec["workers"], "cpu_count": os.cpu_count(),
+        "affinity": len(os.sched_getaffinity(0)), "dont_write_bytecode": sys.dont_write_bytecode}
+if any(r["type"] in ("Unfinished", "NotStarted") for r in results if not r.get("ok")):
+    # Overran: say whether the time is bytecode compilation (cold >> warm) or the venue itself.
+    import subprocess, sysconfig
+    def _pyc_ratio(root):
+        py = pyc = 0
+        for _d, _s, files in os.walk(root):
+            py += sum(f.endswith(".py") for f in files)
+            pyc += sum(f.endswith(".pyc") for f in files)
+        return "%d pyc / %d py" % (pyc, py)
+    meta["pyc_site"] = _pyc_ratio(sysconfig.get_paths()["purelib"])
+    meta["pyc_tree"] = _pyc_ratio(os.path.join(tree, "gateway"))
+    slow = max((r for r in results if r.get("ok")), key=lambda r: r.get("elapsed", 0.0), default=None)
+    if slow is not None and not slow["id"].endswith(".py") and "/" not in slow["id"]:
+        code = "import sys; sys.path.insert(0, %r); import %s" % (tree, slow["id"])
+        for label in ("cold", "warm"):
+            t = time.monotonic()
+            cp = subprocess.run([sys.executable, "-X", "importtime", "-c", code], capture_output=True,
+                                text=True, stdin=subprocess.DEVNULL, timeout=120)
+            rows = []
+            for line in cp.stderr.splitlines():
+                parts = line.split("|")
+                if line.startswith("import time:") and len(parts) == 3 and parts[0].split()[-1].isdigit():
+                    rows.append((int(parts[0].split()[-1]), parts[2].strip()))
+            rows.sort(reverse=True)
+            meta["importtime_%s" % label] = {"module": slow["id"], "wall_s": round(time.monotonic() - t, 2),
+                                            "modules": len(rows), "self_total_s": round(sum(r[0] for r in rows) / 1e6, 2),
+                                            "top_self_ms": [(round(us / 1e3), n) for us, n in rows[:12]]}
 with open(spec["out"] + ".meta", "w") as fh:
-    json.dump({"preload_s": preload_s, "imports_wall_s": time.monotonic() - t0,
-               "workers": spec["workers"], "cpu_count": os.cpu_count(),
-               "affinity": len(os.sched_getaffinity(0))}, fh)
+    json.dump(meta, fh)
 '''
 
 _STALE_RUNNER = _STRIP_EDITABLE + r'''
