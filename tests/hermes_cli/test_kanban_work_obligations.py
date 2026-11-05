@@ -200,6 +200,17 @@ def test_resolve_needs_a_real_resolution(conn):
             ob.resolve(conn, a.id, bad, now=T0 + 1)
 
 
+def test_receipt_refuses_resolved_row_without_changing_wake_columns(conn):
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:resolved-receipt", now=T0)
+    ob.receipt(conn, a.id, "answered", now=T0 + 1)
+    a = ob.resolve(conn, a.id, "card-closed", now=T0 + 2)
+    before = a.to_dict(T0 + 3)
+    with pytest.raises(ob.ObligationError, match="resolved"):
+        ob.receipt(conn, a.id, "reconciler: delivered", now=T0 + 3)
+    assert ob.get(conn, a.id).to_dict(T0 + 3) == before
+
+
 def test_receipt_never_moves_state_or_gen(conn):
     tid = _card(conn)
     a, _ = ob.open_obligation(conn, tid, "detached:r6", now=T0)
