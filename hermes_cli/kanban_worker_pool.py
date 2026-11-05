@@ -2156,7 +2156,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     policy = signal.policy
     now = signal.clock()
     ordered = sorted(hosts, key=lambda x: x.priority)
-    # Pass 1: probe every host with a free slot.
+    # Pass 1: probe every host eligible for work.
     probed: Dict[str, dict] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
