@@ -24,6 +24,7 @@ from agent.message_sanitization import _INTERRUPT_CLOSE_FINISH_REASON
 
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
+from agent.turn_step_timing import timed
 from agent.message_metadata import (
     DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, PENDING_USER_CONTENT_REWRITE, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID,
     copy_identity_fields, tool_call_uid_from_history)
@@ -619,17 +620,20 @@ def _db_flush_record_row_ids(agent, batch_rows: List[Dict[str, Any]], batch_msgs
 
 
 def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Dict], messages: List[Dict]) -> None:
-    """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
+    """One transaction for the turn's new rows and the effective_last_active recompute (one lock wait on a
+    contended store): on failure nothing lands and no markers are stamped."""
     if not batch_rows:
         return
     batch_row_ids: List[int] = []
-    agent._session_db.append_messages_batch(
-        session_id=agent.session_id, messages=batch_rows,
-        compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
-        row_ids_out=batch_row_ids,
-        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
-        turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
-    )
+    with timed(agent, "append_batch"):
+        agent._session_db.append_messages_batch(
+            session_id=agent.session_id, messages=batch_rows,
+            compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+            row_ids_out=batch_row_ids,
+            turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+            turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+            recompute_last_active=bool(getattr(agent, "session_id", None)),
+        )
     sync_flushed_message_markers(batch_msgs, batch_rows)
     for written in batch_msgs:
         written.pop(PENDING_USER_CONTENT_REWRITE, None)  # an appended rewrite fallback has now landed
@@ -639,12 +643,6 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
         # the rows are durable exactly as the dicts now read.
         drop_shadowed_checkpoints(messages)
-    session_id = getattr(agent, "session_id", None)
-    if session_id:
-        try:
-            agent._session_db.recompute_effective_last_active(session_id)
-        except Exception as e:
-            logger.warning("Session DB effective_last_active recompute failed: %s", e)
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
@@ -789,10 +787,12 @@ class SessionPersistenceMixin:
             # the reason to record.
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
+            with timed(self, "flush_messages"):
+                self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
-                self._session_db.flush_token_counts()
+                with timed(self, "flush_token_counts"):
+                    self._session_db.flush_token_counts()
             note_turn_persisted(self)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
@@ -843,8 +843,10 @@ class SessionPersistenceMixin:
                 self._ensure_db_session()
             # getattr: object.__new__ test agents flush without running AIAgent init.
             replay = getattr(self, "_session_row_replay_pending", None) == self.session_id
-            batch_rows, batch_msgs = _db_flush_collect(self, messages, conversation_history, replay)
-            _db_flush_write(self, batch_rows, batch_msgs, messages)
+            with timed(self, "collect"):
+                batch_rows, batch_msgs = _db_flush_collect(self, messages, conversation_history, replay)
+            with timed(self, "write"):
+                _db_flush_write(self, batch_rows, batch_msgs, messages)
             self._session_row_replay_pending = None
             # Markers are now the sole truth; reset the one-shot seed so no id() outlives this flush.
             self._flushed_db_message_ids = set()

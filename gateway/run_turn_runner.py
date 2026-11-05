@@ -2411,11 +2411,16 @@ class TurnRunner:
         # announces fire where the transitions happen: failover mid-turn, restore inline in
         # restore_primary_runtime, re-init at the pre-run site above). Without this call
         # ``last_served_identity`` is never written.
-        runner._announce_and_persist_served_route(
-            agent=agent, session_key=ctx.session_key, served_provider=resolved_provider,
-            served_model=resolved_model, was_reinit=not reused_cached_agent,
-        )
-        compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
+        from agent.turn_step_timing import StepTimer
+        _post_run = StepTimer()
+        with _post_run.step("persist_served_route"):
+            runner._announce_and_persist_served_route(
+                agent=agent, session_key=ctx.session_key, served_provider=resolved_provider,
+                served_model=resolved_model, was_reinit=not reused_cached_agent,
+            )
+        with _post_run.step("sync_session_after_run"):
+            compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
+        _post_run.log_if_slow(logger, "gateway_post_run", ctx.session_key)
         # failure_reason must survive the empty-response path too (TUI billing, transient-failure
         # persistence). compression_deferred (soft lock-contention defer) is distinct from
         # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
