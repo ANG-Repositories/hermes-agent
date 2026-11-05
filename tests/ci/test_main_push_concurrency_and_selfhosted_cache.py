@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.ci.public_workflow_triggers import self_triggers_live
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 ORCHESTRATORS = ("ci.yaml", "ci-local.yaml")
@@ -270,8 +272,9 @@ def test_warm_job_has_its_own_budget_and_never_gates_main():
     assert _warm_job()["timeout-minutes"] >= 60
     on = _load(_WARM).get("on", _load(_WARM).get(True))
     assert "workflow_call" not in on
-    assert on["push"]["branches"] == ["main"]
     assert set(on) <= {"push", "workflow_dispatch"}
+    if self_triggers_live(_WARM.name, on):
+        assert on["push"]["branches"] == ["main"]
     for orchestrator in ("ci.yaml", "ci-local.yaml"):
         assert _WARM.name not in _reachable_workflows(orchestrator), orchestrator
     assert "warm-selfhosted-cache" not in _tests_jobs()

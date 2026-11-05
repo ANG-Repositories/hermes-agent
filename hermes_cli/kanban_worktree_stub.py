@@ -52,7 +52,8 @@ def _registered_admin_dirs(repo_root: Path, stub: Path) -> list[Path]:
     out = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "--path-format=absolute",
          "--git-common-dir"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30,
     )
     if out.returncode != 0:
         raise OSError(f"cannot resolve the common git dir of {repo_root}")

@@ -327,7 +327,7 @@ def _loop_accumulate(agent, names):
     # ... plus the absorbing-flag loop that qualifies them.
     block += _lift(
         lambda n: isinstance(n, ast.For)
-        and ast.unparse(n.iter) == "usage_flags.items()"
+        and ast.unparse(n.iter) == "billed_flags.items()"
         and "setattr" in ast.unparse(n),
         1,
     )
@@ -337,8 +337,9 @@ def _loop_accumulate(agent, names):
         usage = normalize_usage(
             WIRES[name] if name in WIRES else MEASURED, api_mode="chat_completions"
         )
-        exec(code, {"agent": agent, "canonical_usage": usage,
-                    "usage_flags": _flags(usage), "setattr": setattr})
+        # #2538 (t_9f190074) commits the relay-billed reading: the seam reads billed_usage/billed_flags.
+        exec(code, {"agent": agent, "billed_usage": usage,
+                    "billed_flags": _flags(usage), "setattr": setattr})
         agent.session_prompt_tokens += usage.prompt_tokens
         agent.session_total_tokens += usage.total_tokens
         agent.session_api_calls += 1
