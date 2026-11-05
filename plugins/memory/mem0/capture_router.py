@@ -244,6 +244,12 @@ def primary_claim_headers(profile: Optional[str] = None) -> Dict[str, str]:
     return {"X-Fleet-Caller": f"harness=hermes;agent={agent};kind=aux;task=mem0-capture"}
 
 
+# Process-wide secret cache for the default 1Password reader (see BridgeExtractor.__init__).
+_PROCESS_SECRET_CACHE: Dict[str, Tuple[str, float]] = {}
+_PROCESS_SECRET_LOCKS: Dict[str, threading.Lock] = {}
+_PROCESS_SECRET_LOCKS_GUARD = threading.Lock()
+
+
 class BridgeExtractor:
     """Runs one extraction pass against codex-bridge (PRIMARY); on ANY error/timeout falls back to
     gemini-bridge. Both are OpenAI-compatible /v1/chat/completions endpoints behind a bearer secret.
@@ -260,8 +266,8 @@ class BridgeExtractor:
         fallback_url: str = "http://192.168.1.216:18813/v1/chat/completions",
         model: str = "gpt-6-astra",
         fallback_model: Optional[str] = None,
-        primary_secret_ref: str = "op://Engineering/codex-bridge/secret",
-        fallback_secret_ref: str = "op://Engineering/gemini-bridge/secret",
+        primary_secret_ref: str = "op://p5fyqekdzsdp7rmdk3n4kjecse/codex-bridge/secret",
+        fallback_secret_ref: str = "op://p5fyqekdzsdp7rmdk3n4kjecse/gemini-bridge/secret",
         timeout_s: float = 180.0,
         http_fn: Optional[Callable[[str, bytes, Dict[str, str], float], str]] = None,
         auth_fn: Optional[Callable[[str], str]] = None,
@@ -284,10 +290,21 @@ class BridgeExtractor:
         # ref -> (secret, fetched_at). TTL'd so a rotated 1Password token recovers without a
         # process restart (Greptile #250 P2); per-ref locks so concurrent first-turn passes
         # don't spawn duplicate `op read` subprocesses (Greptile #250 P2).
-        self._secret_cache: Dict[str, Tuple[str, float]] = {}
+        # The default (1Password) reader shares ONE cache per process (t_f32095d5): every mem0
+        # provider builds its own extractor, and a per-instance cache re-read both refs on each
+        # new provider / drain-owner handover across the gateway's agents.
+        if auth_fn is None:
+            self._secret_cache = _PROCESS_SECRET_CACHE
+            self._secret_locks = _PROCESS_SECRET_LOCKS
+            self._secret_locks_guard = _PROCESS_SECRET_LOCKS_GUARD
+        else:
+            self._secret_cache: Dict[str, Tuple[str, float]] = {}
+            self._secret_locks: Dict[str, threading.Lock] = {}
+            self._secret_locks_guard = threading.Lock()
         self._secret_ttl_s = 3600.0
-        self._secret_locks: Dict[str, threading.Lock] = {}
-        self._secret_locks_guard = threading.Lock()
+        # A failed read ("") is retried after this; an auth failure re-reads at most this often
+        # (t_8ca13fd0: a bridge 401ing every call forked `op read` once per capture).
+        self._secret_retry_s = 60.0
 
     # -- provider plumbing --------------------------------------------------
     @staticmethod
@@ -311,11 +328,29 @@ class BridgeExtractor:
         return "op"
 
     @staticmethod
+    def _op_cached_read() -> Optional[str]:
+        """The fleet's cached 1Password reader (``<fleet root>/scripts/op-cached-read``), or None.
+
+        It shares one disk cache + refresh lease across every process, serves the last-known-good
+        value on a 429, and maps a vault name to its ID. A raw ``op read`` per process re-spent
+        the account bucket on every read and failed outright once the bucket was empty
+        (t_f32095d5: ~8.7 reads/min from the gateways against a 3.5/min budget)."""
+        try:
+            from hermes_constants import get_default_hermes_root
+            path = get_default_hermes_root() / "scripts" / "op-cached-read"
+        except Exception:
+            return None
+        return str(path) if path.is_file() else None
+
+    @staticmethod
     def _op_read(ref: str) -> str:
         import subprocess
+        import sys
+        cached = BridgeExtractor._op_cached_read()
+        cmd = [sys.executable, cached, ref] if cached else [BridgeExtractor._op_binary(), "read", ref]
         try:
             out = subprocess.run(
-                [BridgeExtractor._op_binary(), "read", ref],
+                cmd,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=20,
@@ -323,35 +358,46 @@ class BridgeExtractor:
             )
             if out.returncode == 0:
                 return out.stdout.strip()
-            logger.warning("capture-router: op read %s failed rc=%s", ref, out.returncode)
+            # op's stderr names the cause (unknown vault, no account, rate limit); t_f913395e
+            # spent a probe recovering it because this line used to drop it.
+            logger.warning("capture-router: op read %s failed rc=%s: %s", ref, out.returncode,
+                           ((out.stderr or "").strip().splitlines() or [""])[-1][:300])
         except Exception as e:
             logger.warning("capture-router: op read %s error: %s", ref, e)
         return ""
 
-    def _secret(self, ref: str) -> str:
-        now = time.time()
+    def _cached_secret(self, ref: str) -> Optional[str]:
         hit = self._secret_cache.get(ref)
-        if hit is not None and (now - hit[1]) < self._secret_ttl_s:
-            return hit[0]
+        if hit is None:
+            return None
+        # failed fetch ("") is cached briefly so a down `op` doesn't stampede
+        ttl = self._secret_ttl_s if hit[0] else self._secret_retry_s
+        return hit[0] if (time.time() - hit[1]) < ttl else None
+
+    def _secret(self, ref: str) -> str:
+        hit = self._cached_secret(ref)
+        if hit is not None:
+            return hit
         with self._secret_locks_guard:
             lock = self._secret_locks.setdefault(ref, threading.Lock())
         with lock:
             # double-check under the lock — the other pass may have minted while we waited
-            hit = self._secret_cache.get(ref)
-            if hit is not None and (time.time() - hit[1]) < self._secret_ttl_s:
-                return hit[0]
+            hit = self._cached_secret(ref)
+            if hit is not None:
+                return hit
             secret = self._auth(ref) or ""
-            if secret:
-                self._secret_cache[ref] = (secret, time.time())
-            else:
-                # failed fetch: cache briefly (60s) so a down `op` doesn't stampede,
-                # but recover quickly once it's back
-                self._secret_cache[ref] = ("", time.time() - self._secret_ttl_s + 60.0)
+            self._secret_cache[ref] = (secret, time.time())
             return secret
 
-    def invalidate_secret(self, ref: str) -> None:
-        """Drop a cached secret (called on auth-shaped errors so rotation heals mid-process)."""
+    def invalidate_secret(self, ref: str) -> bool:
+        """Drop a cached secret (called on auth-shaped errors so rotation heals mid-process).
+        Refused (False) when the value was read less than `_secret_retry_s` ago: a fresh re-read
+        would return the same value, so the caller must fail instead of forking `op` again."""
+        hit = self._secret_cache.get(ref)
+        if hit is not None and (time.time() - hit[1]) < self._secret_retry_s:
+            return False
         self._secret_cache.pop(ref, None)
+        return True
 
     @staticmethod
     def _default_http(url: str, body: bytes, headers: Dict[str, str], timeout: float) -> str:
@@ -395,10 +441,9 @@ class BridgeExtractor:
         try:
             return self._call(url, secret_ref, model, system_prompt, user, assistant, extra_headers)
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
+            if e.code in (401, 403) and self.invalidate_secret(secret_ref):
                 logger.warning("capture-router: auth-shaped %s from %s — refreshing secret and retrying",
                                e.code, url)
-                self.invalidate_secret(secret_ref)
                 return self._call(url, secret_ref, model, system_prompt, user, assistant,
                                   extra_headers)
             raise
@@ -681,9 +726,9 @@ def build_router_from_config(cfg: Dict[str, Any]) -> Optional[CaptureRouter]:
             fallback_url=str(router_cfg.get(
                 "fallback_url", "http://192.168.1.216:18813/v1/chat/completions")),
             primary_secret_ref=str(router_cfg.get(
-                "primary_secret_ref", "op://Engineering/codex-bridge/secret")),
+                "primary_secret_ref", "op://p5fyqekdzsdp7rmdk3n4kjecse/codex-bridge/secret")),
             fallback_secret_ref=str(router_cfg.get(
-                "fallback_secret_ref", "op://Engineering/gemini-bridge/secret")),
+                "fallback_secret_ref", "op://p5fyqekdzsdp7rmdk3n4kjecse/gemini-bridge/secret")),
             model=str(router_cfg.get("model", "gpt-6-astra")),
             fallback_model=router_cfg.get("fallback_model") or None,
             timeout_s=float(router_cfg.get("timeout_s", 180.0)),

@@ -1,9 +1,8 @@
-"""kanban.admission: utilization on the Studio LoadGate + `kanban dispatch` (t_da6f84f7; ruling t_0b33557c).
+"""The Studio LoadGate's one predicate, utilization (t_da6f84f7; ruling t_0b33557c; legacy removed t_b20850d2).
 
-The readback "the Studio admitting on utilization with the interim 80/90 keys inert": a load1 far over
-pause_above with the CPU 45 % busy and memory free admits under utilization and pauses under legacy; the
-host table's kanban ceiling (2, `_ceiling_reason`) still caps running workers; a spawn inside the settle window
-is a lease the next admit sees; the procs pause still wins.
+A load1 far over the old pause_above with the CPU 45 % busy and memory free admits; the host table's kanban
+ceiling (2, `_ceiling_reason`) still caps running workers; a spawn inside the settle window is a lease the next
+admit sees; the procs pause still wins.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ import json
 
 import pytest
 
-from hermes_cli import admission as ad
+from hermes_cli.fleet_placement import admission as ad
 from hermes_cli import kanban_load_gate as klg
 
 INTERIM = {"pause_above": 64, "resume_below": 48, "cpu_busy_pause": 0.80, "cpu_spill": 0.90, "cpu_pause": 0.90,
@@ -30,16 +29,11 @@ def ctx(monkeypatch):
     return c
 
 
-def _gate(mode):
-    g = klg.LoadGate(dict(INTERIM), 32)
-    g.admission = mode
-    return g
+def _gate(_mode="utilization"):
+    return klg.LoadGate(dict(INTERIM), 32)      # INTERIM = the retired keys a live config.yaml may still carry
 
 
-def test_utilization_admits_where_legacy_pauses(ctx):
-    legacy = _gate("legacy")
-    a, why = legacy.admit(190.0, load5=185.0, now=1000.0, running=0, cpu_busy=0.95)
-    assert a == 0 and legacy.state == "paused"
+def test_utilization_admits_far_over_the_old_load1_bar(ctx):
     util = _gate("utilization")
     a, why = util.admit(190.0, load5=185.0, now=1000.0, running=0, cpu_busy=0.45)
     assert (a, why) == (2, None), why                      # the ceiling of 2, not pause_above 64
@@ -76,6 +70,18 @@ def test_proc_pause_still_wins(ctx):
     g = _gate("utilization")
     a, why = g.admit(1.0, now=1000.0, running=0, cpu_busy=0.05, procs=9000, proc_limit=10000)
     assert a == 0 and g.state == "proc_paused" and not g.remote_allowed
+    assert g.snapshot()["pool"] == {"planned": False, "reason": "proc_paused"}
+    a, _ = g.admit(1.0, now=1060.0, running=0, cpu_busy=0.05, procs=1000, proc_limit=10000)
+    assert a == 2 and g.band == "admitting" and g.remote_allowed     # a real check below resume clears it
+
+
+def test_a_planned_pool_block_is_never_republished(ctx):
+    """RC-8: admit() resets the pool block every tick, so the watch never reads a previous tick's plan."""
+    g = _gate("utilization")
+    g.admit(1.0, now=1000.0, running=0, cpu_busy=0.05)
+    g.pool = {"planned": True, "hosts": {}}
+    g.admit(1.0, now=1060.0, running=0, cpu_busy=0.05)
+    assert g.snapshot()["pool"] == {"planned": False, "reason": "not_needed"}
 
 
 def test_unmeasured_cpu_refuses(ctx):
@@ -123,10 +129,11 @@ def test_slice_memory_is_a_second_memory_axis(ctx, monkeypatch):
     assert a == 0 and "slice_mem_gb" in why
 
 
-def test_gate_from_config_reads_the_kill_switch():
-    assert klg.gate_from_config({"kanban": {"admission": "utilization"}}).admission == "utilization"
-    assert klg.gate_from_config({"kanban": {"admission": "bogus"}}).admission == "legacy"
-    assert klg.gate_from_config({"kanban": {}}).admission == "legacy"
+def test_gate_from_config_keeps_pacing_and_proc_keys():
+    g = klg.gate_from_config({"kanban": {"admission": "legacy", "dispatch_load_gate": {
+        "max_spawn_per_tick": 16, "ramp_seconds": 300, "proc_pause_fraction": 0.7, "pause_above": 64}}})
+    assert (g.max_spawn_per_tick, g.ramp_seconds, g.proc_pause_fraction) == (16, 300.0, 0.7)
+    assert not hasattr(g, "pause_above") and g.snapshot()["admission"] == "utilization"
 
 
 def test_vendored_admission_is_the_canonical_bytes():

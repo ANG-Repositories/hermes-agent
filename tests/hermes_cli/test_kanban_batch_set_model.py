@@ -10,7 +10,8 @@ from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+# proven_operator: flagship overrides need operator authority (t_9e7ba884).
+def kanban_home(tmp_path, monkeypatch, proven_operator):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -28,7 +29,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 def _create(title: str, assignee: str, *, initial_status: str | None = None) -> str:
     suffix = f" --initial-status {initial_status}" if initial_status else ""
-    out = kc.run_slash(f"create '{title}' --assignee {assignee}{suffix}")
+    out = kc.run_slash(f"--board default create '{title}' --assignee {assignee}{suffix}")
     match = re.search(r"t_[a-f0-9]+", out)
     assert match, out
     return match.group(0)
@@ -59,7 +60,7 @@ def test_set_model_where_selects_status_and_assignee(kanban_home):
             conn.execute("UPDATE tasks SET status='running' WHERE id=?", (running,))
 
     out = kc.run_slash(
-        "set-model model-a --provider batch-provider "
+        "--board default set-model model-a --provider batch-provider "
         "--where status=running,ready assignee=worker"
     )
 
@@ -84,7 +85,7 @@ def test_set_model_all_active_excludes_terminal_tasks(kanban_home):
         kb.archive_task(conn, archived)
 
     out = kc.run_slash(
-        "set-model model-a --provider batch-provider --all-active"
+        "--board default set-model model-a --provider batch-provider --all-active"
     )
 
     assert ready in out
@@ -109,7 +110,7 @@ def test_set_model_reclaim_only_reclaims_selected_running_cards(
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, **_kw: signaled.append(pid) or {})
 
     out = kc.run_slash(
-        "set-model model-a --provider batch-provider --reclaim "
+        "--board default set-model model-a --provider batch-provider --reclaim "
         "--where status=running assignee=worker"
     )
 
@@ -148,7 +149,7 @@ def test_set_model_reclaim_leaves_non_running_selected_cards_alone(
     )
 
     out = kc.run_slash(
-        "set-model model-a --provider batch-provider --reclaim --all-active"
+        "--board default set-model model-a --provider batch-provider --reclaim --all-active"
     )
 
     # Every selected card is re-routed ...
@@ -198,9 +199,9 @@ def test_set_model_refuses_unvalidated_provider_when_registry_unavailable(
             conn.execute("UPDATE tasks SET status='running' WHERE id=?", (first,))
     commands = {
         "ids": f"set-model {first} {second} model-a",
-        "where": "set-model model-a --where status=running,ready assignee=worker",
-        "all-active": "set-model model-a --all-active",
-        "reclaim": "set-model model-a --all-active --reclaim",
+        "where": "--board default set-model model-a --where status=running,ready assignee=worker",
+        "all-active": "--board default set-model model-a --all-active",
+        "reclaim": "--board default set-model model-a --all-active --reclaim",
     }
     out = kc.run_slash(f"{commands[selector]} --provider typo-provider-zz")
     assert "provider" in out.lower() and ("unknown" in out.lower() or "discover" in out.lower()), out
@@ -226,6 +227,6 @@ def test_set_model_batch_firepower_gate_is_atomic(kanban_home):
 
 def test_set_model_selector_requires_a_match(kanban_home):
     out = kc.run_slash(
-        "set-model model-a --provider batch-provider --where assignee=nobody"
+        "--board default set-model model-a --provider batch-provider --where assignee=nobody"
     )
     assert "matched no tasks" in out.lower()

@@ -11,14 +11,8 @@ name: Sandbox desktop image
 # Deliberately NOT on every main push: two 4 GB multi-arch builds per commit
 # for an image that changes a few times a year.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request, release); dispatch-only until re-enabled on a card.
 on:
-  pull_request:
-    paths:
-      - docker/sandbox-desktop.Dockerfile
-      - docker/sandbox-desktop-smoke.sh
-      - .github/workflows/sandbox-image.yml
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       publish:
@@ -39,7 +33,7 @@ env:
 jobs:
   # PR code: secret-free build + smoke per arch.
   build:
-    if: github.repository == 'NousResearch/hermes-agent'
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (github.repository == 'NousResearch/hermes-agent') }}
     strategy:
       fail-fast: false
       matrix:
@@ -129,7 +123,7 @@ jobs:
 
   # Registry-side stitch of the two digests into one tagged manifest list.
   merge:
-    if: ${{ !cancelled() && github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (!cancelled() && github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish))) }}
     needs: [publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10

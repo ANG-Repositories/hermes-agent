@@ -335,6 +335,8 @@ def _gate_stubs(monkeypatch, content):
     monkeypatch.setattr(op, "sha_on_default", lambda repo, sha: True)
     monkeypatch.setattr(op, "_default_close_record", lambda: None)
     monkeypatch.setattr(sc, "default_content_check", lambda: content)
+    from hermes_cli import kanban_superseded_open as so
+    monkeypatch.setattr(so, "pr_thread", lambda repo, n: None)   # t_ec8ceae2: no close-record read here
 
 
 def test_e2e_content_on_main_closes_without_a_survivor_ref(board, monkeypatch):
@@ -497,3 +499,107 @@ def test_archive_with_a_content_carrying_sha_still_archives(board, monkeypatch):
         conn.execute("UPDATE task_runs SET summary=? WHERE id=?", (f"SUPERSEDED-BY {SHA}", run))
         conn.commit()
         assert kb.archive_task(conn, tid) is True
+
+
+# --- residual Prism P1s from #2058 (t_194cdb7e) ------------------------------
+
+
+def test_insertion_in_another_scope_is_not_carried():
+    """Prism 86fbd795f101: `run()` the PR added to `a()` is not carried by a `run()` in `b()`. The
+    inserted block must sit right after its unchanged predecessor on the candidate."""
+    mb = ["def a():", "    pass", "def b():", "    pass"]
+    head = ["def a():", "    run()", "    pass", "def b():", "    pass"]
+    wrong = ["def a():", "    pass", "def b():", "    run()", "    pass"]
+    assert not sc.lines_carry(mb, head, wrong)
+    assert sc.lines_carry(mb, head, head)
+    # a newer edit elsewhere, or a line added later after the block, still carries it
+    assert sc.lines_carry(mb, head, ["# newer", "def a():", "    run()", "    log()", "    pass",
+                                     "def b():", "    pass"])
+
+
+def test_frontmatter_deleted_key_replaced_by_a_mapping_is_not_carried():
+    """Prism d3b02265e3bf: a scalar key the PR deleted is still present when the candidate holds a
+    mapping under it; flattening to leaf paths hid it."""
+    assert not sc.frontmatter_carries({"x": 1, "keep": 0}, {"keep": 0}, {"x": {"nested": 2}, "keep": 0})
+    assert sc.frontmatter_carries({"x": 1, "keep": 0}, {"keep": 0}, {"keep": 0})
+    # a deleted nested key the candidate still holds as a container is likewise not gone
+    assert not sc.frontmatter_carries({"m": {"x": 1, "k": 0}}, {"m": {"k": 0}}, {"m": {"x": {"y": 1}, "k": 0}})
+    assert not sc.frontmatter_carries({"m": {"x": 1, "k": 0}}, {"m": {"k": 0}}, {"m": {"x": [1], "k": 0}})
+    # a scalar the PR turned into a mapping is carried by that mapping
+    assert sc.frontmatter_carries({"x": 1}, {"x": {"n": 2}}, {"x": {"n": 2}})
+
+
+# --- t_ec8ceae2 / t_87e32ff7: an equivalent fix worded differently --------------------------
+# hermes-home#7135 closed `CLOSED: SUPERSEDED-BY 6a6fd050d93 -- main fixed the same three anchors` by a fleet bot;
+# 6a6fd050d93 touched scripts/tests/mutate_prism_completed_required.sh with different comment lines, so the line match
+# refused. The PR's own trusted close record naming the sha + that commit touching every differing file is the survivor.
+F87 = "scripts/tests/mutate_prism_completed_required.sh"
+
+
+def _sha_close(monkeypatch, *, login="ang-fleet-interactive[bot]", files=(F87,), named=SHA[:11], pr_files=(F87,)):
+    from hermes_cli import kanban_superseded_open as so
+    body = f"CLOSED: SUPERSEDED-BY {named} -- main fixed the same anchors independently [card t_87e32ff7]"
+    monkeypatch.setattr(so, "pr_thread", lambda repo, n: {"body": "", "comments": [
+        {"body": body, "login": login, "assoc": "NONE"}]})
+    monkeypatch.setattr(so, "commit_files", lambda repo, sha: (SHA, set(files)) if SHA.startswith(sha) else None)
+    monkeypatch.setattr(so, "pr_files", lambda repo, n: set(pr_files))
+
+
+def test_e2e_close_record_sha_touching_every_differing_file_closes(board, monkeypatch):
+    _gate_stubs(monkeypatch, _check(**{SHA: {"sha": SHA, "default": "main", "differs": [F87]}}))
+    _sha_close(monkeypatch)
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=SHA, summary="fixed on main") is True
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "done"
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "routed_pr_superseded"]
+        assert ev and ev[0].payload["close_record_sha"] == {f"{REPO}#4736": SHA}
+        assert kb.list_runs(conn, tid)[-1].metadata["superseded_content"][0]["corroborated_by"] == \
+            "close-record+file-coverage"
+
+
+@pytest.mark.parametrize("variant", [
+    {"files": ("some/other/file.py",)},              # the 4729 shape: the commit did not touch the differing file
+    {"login": "random-user"},                        # an untrusted author's CLOSED: line
+    {"named": "0123456789a"},                        # the record names a different sha
+    {"pr_files": (F87, "a.py")},                     # Prism 1da76026aee9: the PR's other file is not in that commit
+])
+def test_e2e_close_record_mutants_still_refused(board, monkeypatch, variant):
+    _gate_stubs(monkeypatch, _check(**{SHA: {"sha": SHA, "default": "main", "differs": [F87]}}))
+    _sha_close(monkeypatch, **variant)
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        with pytest.raises(sc.SupersededContentError):
+            kb.complete_task(conn, tid, expected_run_id=run, superseded_by=SHA, summary="x")
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+
+
+# --- Prism a431ad52d1d8 (#2465 @ c4243716, t_8d8c3327): the EXACT fallback sha must be on the default branch -------
+# verify() tracks unreadability per PR, not per candidate: with `--superseded-by "<A> <B>"`, A's content check can be
+# unreadable (None) while B's reads `differs`, so the PR lands in `differs` with A's ancestry never checked. The
+# close-record fallback then returned A on close record + touched files alone.
+SHA_B = "ab" * 20
+
+
+@pytest.mark.parametrize("on_default", [False, None])
+def test_e2e_close_record_sha_off_the_default_branch_is_refused(board, monkeypatch, on_default):
+    _gate_stubs(monkeypatch, _check(**{SHA_B: {"sha": SHA_B, "default": "main", "differs": [F87]}}))  # SHA: None
+    monkeypatch.setattr(op, "sha_on_default", lambda repo, sha: on_default if sha.startswith(SHA[:11]) else True)
+    _sha_close(monkeypatch)
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        with pytest.raises(sc.SupersededContentError):
+            kb.complete_task(conn, tid, expected_run_id=run, superseded_by=f"{SHA} {SHA_B}", summary="x")
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+        assert "routed_pr_superseded" not in [e.kind for e in kb.list_events(conn, tid)]
+
+
+def test_e2e_close_record_sha_on_the_default_branch_still_closes(board, monkeypatch):
+    # control for the test above: the same unreadable-candidate shape with the named sha ON main is accepted
+    _gate_stubs(monkeypatch, _check(**{SHA_B: {"sha": SHA_B, "default": "main", "differs": [F87]}}))
+    _sha_close(monkeypatch)
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=f"{SHA} {SHA_B}", summary="x") is True
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "routed_pr_superseded"]
+        assert ev and ev[0].payload["close_record_sha"] == {f"{REPO}#4736": SHA}

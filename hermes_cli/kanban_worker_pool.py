@@ -28,11 +28,14 @@ board loop). A change that ticks boards concurrently must add a lock here.
 Placement Phase 1b (PRD ``plans/2026-10-04_fleet-resource-aware-placement-PRD.md``
 v0.4, I-3, I-8, F-5, F-6; card t_1e4b9684): with a ``TargetSignal`` (config
 ``kanban.placement.read_signal``, default true) the same ssh probe also reads
-the host's ``host-pressure.json`` and the remote clock. ``plan()`` advances a
-per-host hot/clear streak once per new remote ``at`` and persists it;
-``take()`` only reads it. Stale/unreadable pressure is UNKNOWN (refused,
-``reachable: false``, streak reset), never hot. Without a signal the planner
-is KWLB v0.1, byte for byte.
+the host's ``host-pressure.json`` and the remote clock. Stale/unreadable
+pressure is UNKNOWN (refused, ``reachable: false``), never hot. The published
+``band.kanban`` is admission.admit_class's own verdict (hermes-home
+host-pressure.py, t_5d7e7171), so the plan keeps no hot/clear streak of its
+own: under the ONE rule (KANBAN_UNIFIED_ADMIT) every take asks may_start and
+the plan never closes a host on the band; with that rule's kill switch a hot
+band closes the host for the tick. Without a signal the planner is KWLB v0.1,
+byte for byte.
 """
 
 from __future__ import annotations
@@ -47,7 +50,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from hermes_cli import kanban_admission as _admission
 from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
@@ -56,6 +58,26 @@ ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
+# Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
+# until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
+# kanban-worker joined (t_c834e0d8, bug class A: admission is measured use, never
+# a count): ``{}`` parses to ``PoolHost.slots = None``; a legacy count stays a ceiling.  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
+COUNT_FREE_ROLES = frozenset({"ci-runner", ROLE})
+# A count-free kanban host's free slots for ONE plan (t_c834e0d8). A per-tick  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
+# stand-in so ``plan.slots`` / ``budget`` / load_gate.json stay finite ints; it is  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
+# not a concurrency count (running workers are not subtracted). Measured
+# admission decides: allocd / the placement ledger per take, the band per plan.
+# 1000 = the fleet's runaway stop (t_b20850d2, FWA-H: a surviving count is 1000),
+# so it never binds in the working range and the plan budget is never a slot sum.
+UNCOUNTED_TICK_FREE = 1000
+
+
+def count_free(h: "PoolHost", running: int) -> int:
+    """Free pool slots on ``h`` from its count alone: ``slots - running`` for a  # slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458)
+    legacy count, :data:`UNCOUNTED_TICK_FREE` for a count-free host."""
+    if h.slots is None:  # slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458)
+        return UNCOUNTED_TICK_FREE
+    return max(0, h.slots - running)  # slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458)
 # Per-worker-host SSH reach matrix (card t_1e9ea7e9): written daily by the
 # hermes-home no_agent cron ``kanban-reach-matrix`` (``ssh -o BatchMode=yes
 # <alias> true`` from EVERY worker host, rc recorded), read here fail-closed.
@@ -189,7 +211,7 @@ class PoolHost:
     name: str
     ssh_host: str
     ssh_user: str
-    slots: int
+    slots: Optional[int]   # None = count-free (fleet-roles ``kanban-worker: {}``)  # slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458)
     capacity_pct: float
     absence: str
     profiles: Tuple[str, ...]
@@ -246,8 +268,9 @@ def _pct(value) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and 0 < value <= 1
 
 
-def parse_roles(doc) -> Dict[str, Tuple[Dict[str, int], str]]:
-    """``fleet-roles.json`` with the router's validators; raises PoolError."""
+def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
+    """``fleet-roles.json`` with the router's validators; raises PoolError.
+    A ``COUNT_FREE_ROLES`` role may be ``{}`` (parsed as None) or a legacy count."""
     if not isinstance(doc, dict) or set(doc) - _ROLES_TOP:
         raise PoolError("fleet-roles.json: bad top level")
     if isinstance(doc.get("schema"), bool) or doc.get("schema") != 1:
@@ -264,16 +287,23 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, int], str]]:
         roles = row["roles"]
         if not isinstance(roles, dict) or not roles:
             raise PoolError(f"fleet-roles.json: host {hid}: roles must be a non-empty object")
-        parsed: Dict[str, int] = {}
+        parsed: Dict[str, Optional[int]] = {}
         for role, spec in roles.items():
             if not isinstance(role, str) or not _ROLE_RE.fullmatch(role):
                 raise PoolError(f"fleet-roles.json: host {hid}: bad role {role!r}")
+            if role in COUNT_FREE_ROLES and spec == {}:
+                # Membership only (t_940fc400): the per-box allocator owns CI capacity;
+                # for kanban-worker, measured admission does (t_c834e0d8).
+                parsed[role] = None
+                continue
             if not isinstance(spec, dict) or set(spec) != {"slots"}:
-                raise PoolError(f"fleet-roles.json: host {hid}: role {role} must be {{\"slots\": N}}")
+                shape = "{} or {\"slots\": N}" if role in COUNT_FREE_ROLES else "{\"slots\": N}"  # slots-vocab: allow legacy fleet-roles.json schema key
+                raise PoolError(f"fleet-roles.json: host {hid}: role {role} must be {shape}")
             slots = spec["slots"]
             if isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64:
                 raise PoolError(f"fleet-roles.json: host {hid}: role {role} slots must be 1..64")
-            parsed[role] = slots
+            # t_b20850d2 (FWA-H): a legacy kanban-worker count is validated, never read as capacity
+            parsed[role] = None if role == ROLE else slots
         if row["state"] not in _STATES:
             raise PoolError(f"fleet-roles.json: host {hid}: state must be one of {_STATES}")
         out[hid] = (parsed, row["state"])
@@ -691,7 +721,7 @@ def _ssh_config_files(path: Path, depth: int = 0,
     if depth > 4:
         return files
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return files
     for line in text.splitlines():
@@ -724,7 +754,7 @@ def ssh_config_hosts(path: Optional[Path] = None) -> Optional[frozenset]:
     names: List[str] = []
     try:
         for f in files:
-            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in f.read_text(encoding="utf-8-sig", errors="replace").splitlines():
                 key, val = _ssh_config_kv(line)
                 if key == "host":
                     names += [n.lower() for n in val.split()
@@ -1507,7 +1537,16 @@ def board_fault(host: str, board: str, *, now: Optional[float] = None) -> Option
 # -- target pressure + hysteresis (Placement PRD Phase 1b) -------------------
 
 BAND_OK, BAND_WARM, BAND_HOT, BAND_UNKNOWN = "ok", "warm", "hot", "unknown"
-TARGET_STATE_FILE = "kanban-target-state.json"
+
+
+def _kanban_unified_admit(signal: Any = None) -> bool:
+    """True only where the ONE rule actually replaces the 6 GB/worker cap (D9, t_3694ab3c; Prism f4d9c1273272):
+    KANBAN_UNIFIED_ADMIT on, a placement table on the signal, and ``kanban.admission: utilization``, i.e. exactly
+    when kanban_headroom.unified_filter runs for every take (pinned ones included). Anywhere else the cap binds."""
+    from hermes_cli import kanban_load_gate as _klg
+    from hermes_cli.fleet_placement import placement as _pl
+    return (_klg.unified_admit() and signal is not None and getattr(signal, "placement_table", None) is not None
+            and _pl.admission_mode() == "utilization")
 
 
 @dataclass
@@ -1515,17 +1554,12 @@ class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
 
     policy: Any                       # placement_policy.PlacementPolicy
-    state_path: Path                  # <root>/var/kanban-target-state.json
     ledger_dir: Path                  # <root>/var/placement
     cpu_est: Optional[float] = None   # kanban's measured slope; None = policy prior
     clock: Callable[[], float] = time.time
     # A fixed ledger read for _warm_pick (diagnostics --placement keeps one
     # snapshot per report). None = read fresh per pick (RC7, the dispatcher).
     reservations: Optional[List[Any]] = None
-    # Saturation 4.2 (t_31350981): kanban.placement.admit_on_memory. False =
-    # the memory/band cap is computed and reported only (D1: Ace's yes flips it).
-    admit_on_memory: bool = False
-    reservation_gb: float = _admission.DEFAULT_RESERVATION_GB
     # The ONE placement scorer (t_d6ce856e): <root>/config/fleet-hosts.json and
     # the headroom reservation ledger. None = no table: the band pick below.
     placement_table: Any = None
@@ -1579,44 +1613,15 @@ def read_pressure(remote_now: Optional[float], text: str, *,
     return (float(at), band), ""
 
 
-def _load_state(path: Path) -> dict:
+def _band_reason(text: str) -> str:
+    """The sampler's ``band_reason.kanban`` (the admitter's reason for its verdict), or ""."""
     try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return {}
-    hosts = doc.get("hosts") if isinstance(doc, dict) else None
-    return hosts if isinstance(hosts, dict) else {}
-
-
-def advance_streak(prev: Optional[Mapping], at: Optional[float], band: str, *,
-                   hot_streak: int, clear_streak: int, now: float,
-                   discard_after_s: float) -> dict:
-    """One sample's step of the per-host hysteresis (F-5). A repeated ``at``
-    is a no-op; state older than ``discard_after_s`` is discarded first.
-
-    UNKNOWN neither builds nor erases a streak (I-3, F-5 addendum t_36840c8a):
-    the state is kept as-is, ``updated`` included, so an earned hot verdict
-    still needs ``clear_streak`` fresh non-hot samples and a host that stays
-    UNKNOWN past ``discard_after_s`` starts over. ``plan()`` refuses the
-    UNKNOWN tick itself."""
-    st = dict(prev) if isinstance(prev, Mapping) else {}
-    updated = st.get("updated")
-    if not isinstance(updated, (int, float)) or now - float(updated) > discard_after_s:
-        st = {}
-    if band == BAND_UNKNOWN or at is None:
-        return {"at": st.get("at"), "hot": bool(st.get("hot")), "hot_run": int(st.get("hot_run") or 0),
-                "clear_run": int(st.get("clear_run") or 0), "updated": st.get("updated")}
-    if st.get("at") == at:
-        return st
-    hot, hot_run, clear_run = bool(st.get("hot")), int(st.get("hot_run") or 0), int(st.get("clear_run") or 0)
-    if band == BAND_HOT:
-        hot_run, clear_run = hot_run + 1, 0
-        hot = hot or hot_run >= hot_streak
-    else:
-        hot_run, clear_run = 0, clear_run + 1
-        if hot and clear_run >= clear_streak:
-            hot = False
-    return {"at": at, "hot": hot, "hot_run": hot_run, "clear_run": clear_run, "updated": now}
+        doc = json.loads(text) if text else None
+    except ValueError:
+        return ""
+    why = doc.get("band_reason") if isinstance(doc, dict) else None
+    why = why.get("kanban") if isinstance(why, dict) else None
+    return why[:300] if isinstance(why, str) else ""
 
 
 def running_by_host(conn) -> Dict[str, int]:
@@ -1656,9 +1661,6 @@ class SpilloverPlan:
     default_remote: bool = False
     signal: Optional[TargetSignal] = None  # None = KWLB v0.1 (read_signal false)
     taken: Dict[str, int] = field(default_factory=dict)  # this tick's takes, per host
-    # host -> why the memory/band cap is below its free slots (t_31350981);
-    # filled with the flag off too, so the dry readback has its numbers.
-    admission: Dict[str, str] = field(default_factory=dict)
     last_pick: Optional[str] = None      # hysteresis for placement.choose()
     last_decision: Any = None            # the placement.Decision behind the last take()
     last_reservation: Optional[str] = None  # the headroom reservation the last take() wrote
@@ -1668,6 +1670,9 @@ class SpilloverPlan:
     _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
     # Dry-run takes per host: never in the ledger, so choose() adds them.
     _simulated: Dict[str, int] = field(default_factory=dict)
+    # Dry-run takes per host under the ONE rule: each take's OWN lease (its estimate and class), newest last, so a
+    # later verdict replays what was granted, never the current job's footprint times k (Prism fd6bd8070eee).
+    _sim_leases: Dict[str, List[Any]] = field(default_factory=dict)
     # Reservations alloc_client booked (kanban.placement.allocd on): rid -> whether
     # that take debited ``slots`` (a band-closed host has none to debit).
     _alloc: Dict[str, bool] = field(default_factory=dict)
@@ -1722,7 +1727,7 @@ class SpilloverPlan:
             return {}
         if sig.placement_live is not None:
             return sig.placement_live
-        from hermes_cli import placement as _placement
+        from hermes_cli.fleet_placement import placement as _placement
         # A corrupt ledger raises LedgerError: take() refuses (never reads it as empty).
         return _placement.live_reservations(sig.placement_reservations, now=sig.clock(),
                                             table=sig.placement_table)
@@ -1733,7 +1738,7 @@ class SpilloverPlan:
             return None
         return {"load1": d.get("load1"), "ncpu": d.get("ncpu")}
 
-    def pin_host_refusal(self, pin: str) -> Optional[str]:
+    def pin_host_refusal(self, pin: str, skip_admission: bool = False) -> Optional[str]:
         """Why the HOST behind ``pin`` cannot give a slot now, or None.
 
         Host state only: no profile check and no reservation, so the no-slot
@@ -1749,6 +1754,10 @@ class SpilloverPlan:
                     else "pin_host_dropped"
                     if low in {h.lower() for h in (self.config.hosts or ())}
                     else "pin_unknown_host")
+        if skip_admission:
+            # kanban admit (t_32e8796a): no slot / band / pressure verdict; the
+            # host's fleet-roles state still binds.
+            return None if host.state == "active" else f"pin_host_{host.state}"
         if self.slots.get(pin, 0) > 0:
             return None
         if host.state != "active":
@@ -1776,7 +1785,7 @@ class SpilloverPlan:
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
              only: Optional[Collection[str]] = None,
              board: Optional[str] = None, job: Any = None,
-             job_id: Optional[str] = None) -> Optional[PoolHost]:
+             job_id: Optional[str] = None, skip_admission: bool = False) -> Optional[PoolHost]:
         """Reserve one slot: on ``pin`` only, else (signal + placement table)
         ``placement.choose()`` over the hosts that serve ``assignee`` with
         ``job`` overrides (t_d6ce856e); without a table the band pick. ``only``
@@ -1797,30 +1806,47 @@ class SpilloverPlan:
             if host is not None and assignee not in host.profiles:
                 self.refusal = "pin_profile"  # the pinned host does not serve this assignee
                 return None
-            self.refusal = self.pin_host_refusal(pin)
+            self.refusal = self.pin_host_refusal(pin, skip_admission=skip_admission)
             if self.refusal is not None:
                 return None
             why = self.board_refusal(pin, board)
             if why is not None:
                 self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
                 return None
+            # a pin keeps its precedence, not an exemption from the ONE rule (Prism f4d9c1273272: with the
+            # memory cap folded into admit_class, a pinned take must pass may_start too)
+            unified = not skip_admission and _kanban_unified_admit(self.signal)
+            if unified and self.dry_run:          # a dry run books nothing: the read-only verdict is its answer
+                from hermes_cli import kanban_headroom as _kh
+                _keep, held = _kh.unified_filter(self, [pin], job)
+                if pin in held:
+                    self.refusal = f"pin_host_unified_admission ({pin}: {held[pin]})"
+                    return None
             if self.signal is not None and self.signal.placement_table is not None:
                 # A pin keeps its precedence but its footprint is booked like any
                 # take, so later admissions see it (Prism 4609a040ad20 / b8c13f6c2e7a).
                 rid = None
                 if self.dry_run:
                     self._simulated[pin] = self._simulated.get(pin, 0) + 1
+                    if unified:
+                        from hermes_cli import kanban_headroom as _kh
+                        self._sim_leases.setdefault(pin, []).append(_kh.sim_lease(self, pin, job))
                 else:
                     from hermes_cli import kanban_headroom as _kh
-                    from hermes_cli import placement as _placement
+                    from hermes_cli.fleet_placement import placement as _placement
                     try:
-                        rid = _kh.book_pin(self, pin, job_id, job)
+                        # unified: may_start under the ledger lock, booking what it admitted on
+                        # (Prism c8d0343d7fb6 / 8e0e895ec5d4)
+                        rid = _kh.book_pin(self, pin, job_id, job, check=unified)
+                    except _kh.ClassRefusal as exc:
+                        self.refusal = f"pin_host_unified_admission ({pin}: {exc})"
+                        return None
                     except _placement.PlacementError as exc:  # corrupt ledger: fail closed
                         self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
                         return None
                     self.last_reservation = rid
                 self._rids.setdefault(pin, []).append(rid)
-            self.slots[pin] -= 1
+            self.slots[pin] = self.slots.get(pin, 0) - 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host
         if only is not None:
@@ -1843,6 +1869,11 @@ class SpilloverPlan:
             names = [n for n, h in self.hosts.items() if n in allowed and assignee in h.profiles]
             if not names:
                 self.refusal = "pool_full"
+                return None
+            names, held = _kh.unified_filter(self, names, job)
+            if not names:
+                self.refusal = f"{_reasons.UNIFIED_ADMISSION} (" + "; ".join(
+                    f"{n}: {w}" for n, w in sorted(held.items())) + ")"
                 return None
             mode = _kh.plan_allocd_mode(self)
             if mode == _kh.ALLOCD_ON:
@@ -1878,7 +1909,7 @@ class SpilloverPlan:
         """The in-process scorer take (kanban.placement.allocd off / shadow): one
         locked ``placement.admit`` (``choose`` on a dry run) over ``names``."""
         from hermes_cli import kanban_headroom as _kh
-        from hermes_cli import placement as _placement
+        from hermes_cli.fleet_placement import placement as _placement
         rid = None
         try:
             if self.dry_run:
@@ -1895,10 +1926,14 @@ class SpilloverPlan:
             self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
                 f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
             return None
+        if self._class_refused(key, job, rid, release=lambda: _kh.release_id(self.signal, rid)):
+            return None
         self.last_reservation = rid
         self._rids.setdefault(key, []).append(rid)
         if self.dry_run:
             self._simulated[key] = self._simulated.get(key, 0) + 1
+            if _kh.unified_active(self):
+                self._sim_leases.setdefault(key, []).append(_kh.sim_lease(self, key, job))
         self.slots[key] -= 1
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
@@ -1927,6 +1962,9 @@ class SpilloverPlan:
             _kh.release_alloc(r.reservation_id)
             self.refusal = f"pool_unavailable (allocd picked {r.host}, not a candidate)"
             return None
+        if self._class_refused(key, job, r.reservation_id, release=lambda: _kh.release_alloc(r.reservation_id),
+                               via_alloc=True, decision=r):
+            return None
         debit = self.slots.get(key, 0) > 0
         if debit:
             self.slots[key] -= 1
@@ -1936,6 +1974,22 @@ class SpilloverPlan:
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
         return self.hosts[key]
+
+    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release, via_alloc: bool = False,
+                       decision: Any = None) -> bool:
+        """The ONE rule's verdict for a take the old locked rule just booked, UNDER the ledger lock (Prism
+        c8d0343d7fb6): refused = the row is already dropped, ``release`` clears the booker's own state, refusal
+        set. An unreadable ledger fails closed the same way. False = admitted (or the rule is off)."""
+        from hermes_cli import kanban_headroom as _kh
+        try:
+            why = _kh.confirm_class(self, key, job, rid, via_alloc=via_alloc, decision=decision)
+        except Exception as exc:  # LedgerError / lock fault: fail closed
+            why = f"closed:{type(exc).__name__}: {exc}"
+        if why is None:
+            return False
+        release()
+        self.refusal = f"{_reasons.UNIFIED_ADMISSION} ({key}: {why})"
+        return True
 
     def reservation_via(self, rid: Optional[str]) -> Optional[str]:
         """``alloc_client`` when ``rid`` was booked by :meth:`_take_allocd`, else None."""
@@ -1967,6 +2021,8 @@ class SpilloverPlan:
                 self.taken[host.name] -= 1
             if self._simulated.get(host.name):
                 self._simulated[host.name] -= 1
+                if self._sim_leases.get(host.name):
+                    self._sim_leases[host.name].pop()
         if not rids:
             return
         if reservation is not None:
@@ -2006,9 +2062,10 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
     enabled, under its slots and probed under ``capacity_pct x ncpu`` (I-3).
     A host with no free slot or not active is not probed.
 
-    With ``signal`` the load bar is the host's pressure band instead: the
-    per-host streak advances here, once per new remote ``at`` (F-5), and a
-    host is refused when its streak says hot or its pressure is UNKNOWN.
+    With ``signal`` the load bar is the host's published pressure band
+    instead (admit_class's verdict, t_5d7e7171): a host is refused when its
+    pressure is UNKNOWN, and when its band is hot only while the ONE rule's
+    kill switch is set; under the ONE rule each take asks may_start itself.
 
     ``workspace_paths`` (host -> paths, t_8bfdcc07) rides the same probe: a
     host holding continuation state is probed even with no free slot, and
@@ -2051,7 +2108,7 @@ def _plan_v01(hosts, running_by_host, *, probe, disabled, planned_at, config,
     detail: Dict[str, dict] = {}
     for h in sorted(hosts, key=lambda x: x.priority):
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
+        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         probed = free > 0
         sample = _probe_states(probe, h, probed, workspace_paths.get(h.name, ()), states)
         load1: Optional[float] = None
@@ -2098,76 +2155,46 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     states = {} if states is None else states
     policy = signal.policy
     now = signal.clock()
-    discard_after = policy.stale_after_s * 3
     ordered = sorted(hosts, key=lambda x: x.priority)
-    # Pass 1: probe. samples[name] = (at, band) for every host probed this tick.
+    # Pass 1: probe every host eligible for work.
     probed: Dict[str, dict] = {}
-    samples: Dict[str, Tuple[Optional[float], str]] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
+        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "boards": None}
+               "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
-            row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
             if signal.placement_table is not None:
                 from hermes_cli import kanban_headroom as _kh
                 row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
                                                      stale_after_s=policy.stale_after_s, local_now=now)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
                                             stale_after_s=policy.stale_after_s)
-            at, row["band"] = (None, BAND_UNKNOWN) if got is None else got
-            samples[h.name] = (at, row["band"])
+            row["band"] = BAND_UNKNOWN if got is None else got[1]
+            row["band_reason"] = _band_reason(sample.pressure_text) if got is not None else ""
         elif sample is not None:  # a v0.1-shape probe: no pressure read
             row["load1"], row["ncpu"] = sample
             row["band"], row["why"] = BAND_UNKNOWN, "pressure not probed"
-            samples[h.name] = (None, BAND_UNKNOWN)
         elif free > 0:
             row["band"], row["why"] = BAND_UNKNOWN, "host unreachable"
-            samples[h.name] = (None, BAND_UNKNOWN)
         probed[h.name] = row
 
-    # Pass 2: advance every streak against the COMMITTED state, under the
-    # state file's lock, so two planners on one root never lose a sample.
-    def advance(old: Mapping) -> Mapping:
-        hs = old.get("hosts") if isinstance(old.get("hosts"), dict) else {}
-        out = dict(hs)
-        for name, (at, band) in samples.items():
-            kb = policy.kanban_band(name)
-            out[name] = advance_streak(hs.get(name), at, band, hot_streak=kb.hot_streak,
-                                       clear_streak=kb.clear_streak, now=now,
-                                       discard_after_s=discard_after)
-        return {"hosts": out, "updated": now}
-
-    try:
-        committed = _ledger.update_json(signal.state_path, advance).get("hosts") or {}
-    except Exception as exc:  # unsaved state: decide on this tick's step from what is on disk
-        _log.warning("kanban pool: target state not saved: %s", exc)
-        committed = advance({"hosts": _load_state(signal.state_path)})["hosts"]
-
+    # t_5d7e7171 (FWA-G): no second verdict. Under the ONE rule a host is never closed here on its band (each take
+    # runs may_start, which IS the band's formula); otherwise a hot band closes it this tick, with no streak.
+    band_closes = not _kanban_unified_admit(signal)
     slots: Dict[str, int] = {}
     detail: Dict[str, dict] = {}
-    admission: Dict[str, str] = {}
     for h in ordered:
         r = probed[h.name]
         band, why, free = r["band"], r["why"], r["free"]
-        st = committed.get(h.name)
-        hot = bool(isinstance(st, Mapping) and st.get("hot")) and band not in (None, BAND_UNKNOWN)
+        hot = band == BAND_HOT and band_closes
         if band == BAND_UNKNOWN:
             free = 0
         elif hot:
             free = 0
-            why = f"band hot (streak {policy.kanban_band(h.name).hot_streak}, {band} now)"
-        else:
-            limit, cap_why = r["cap"]
-            if limit is not None and limit < free:
-                admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
-                if signal.admit_on_memory:
-                    free = limit
-                    if free == 0:
-                        why = f"admission: {cap_why}"
+            why = f"band hot (admit_class: {r['band_reason'] or 'no reason published'})"
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],
@@ -2175,11 +2202,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             "reachable": (band not in (None, BAND_UNKNOWN)) if r["probed"] else None,
             "band": band, "hot": hot,
             **({"pressure": why} if why else {}),
-            **({"admission": admission[h.name]} if h.name in admission else {}),
             **({"boards": sorted(r["boards"])} if r["boards"] is not None else {}),
             **(r.get("placement") or ({"sample_status": "absent"} if signal.placement_table is not None
                                       and r["probed"] else {})),
         }
-    plan = _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
-    plan.admission = admission
-    return plan
+    return _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)

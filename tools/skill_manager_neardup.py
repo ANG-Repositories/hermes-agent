@@ -1,0 +1,211 @@
+"""Near-duplicate gate for skill_manage create (fork t_f78aa714).
+
+A create whose SKILL.md scores at or above ``skills.neardup_gate.threshold`` against an existing skill
+is refused with the top matches, unless the call carries ``justification``; a justified create records
+``metadata.hermes.distinct_from`` in the new skill's frontmatter. Refusals and justified creates each
+append one row to ``<root>/state/skill-neardup-ledger.jsonl``.
+
+The scorer is the Hermes root's ``scripts/lib/skill_similarity.py`` (ONE scorer, shared with the
+root's promotion sweep), loaded by path like ``_load_tier_module``. A root without it (a vanilla
+install) has no gate: creation behaves as before.
+"""
+
+import importlib.util
+import inspect
+import logging
+import re
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import hermes_yaml as yaml
+
+from utils import is_truthy_value
+
+logger = logging.getLogger(__name__)
+
+_SCORER_REL = ("scripts", "lib", "skill_similarity.py")
+_SCORER_MODULE = "_hermes_skill_similarity"
+_COMPARE_LOCK = ("state", "skill-neardup-create.lock")
+_scorer_cache: Dict[Tuple[str, int], Any] = {}
+# Same closing fence as skill_manager_tool._validate_frontmatter: a whole ``---`` line, not a ``---key``.
+_FRONTMATTER_END_RE = re.compile(r"\n---\s*\n")
+
+
+class DistinctFromError(ValueError):
+    """The existing ``metadata.hermes.distinct_from`` is not a list, so it cannot be extended."""
+
+
+def _load_scorer(root: Path):
+    """The root's scorer module, or None when the file is absent. Reloaded when the file changes."""
+    path = root.joinpath(*_SCORER_REL)
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    mod = _scorer_cache.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(_SCORER_MODULE, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        mod = importlib.util.module_from_spec(spec)
+        # Registered BEFORE exec (a51c70d89c38): dataclasses/typing/pickle inside the scorer resolve their own
+        # module through sys.modules; a failed exec must not leave a half-initialised module behind.
+        prior = sys.modules.get(_SCORER_MODULE)
+        sys.modules[_SCORER_MODULE] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            if prior is not None:
+                sys.modules[_SCORER_MODULE] = prior
+            else:
+                sys.modules.pop(_SCORER_MODULE, None)
+            raise
+        _scorer_cache.clear()
+        _scorer_cache[key] = mod
+    return mod
+
+
+def _gate_settings(default_threshold: float) -> Tuple[bool, float]:
+    """``skills.neardup_gate.{enabled,threshold}``, read at call time from the served profile's config."""
+    from hermes_cli.config import cfg_get, load_config
+    cfg = load_config()
+    enabled = is_truthy_value(cfg_get(cfg, "skills", "neardup_gate", "enabled"), default=True)
+    try:
+        threshold = float(cfg_get(cfg, "skills", "neardup_gate", "threshold", default=default_threshold))
+    except (TypeError, ValueError):
+        threshold = default_threshold
+    return enabled, threshold
+
+
+def _skill_roots(shared_root: Path, overlay_roots: Sequence[Path] = ()) -> List[Path]:
+    """Every loaded skill root, the trusted project dirs (``.agents/skills``, ``.hermes/skills``: they outrank
+    the others at load time, 9393a1595eda) and the whole shared tree (unsubscribed groups, ``*-aux``).
+    ``overlay_roots`` go first: the scorer keeps the first SKILL.md per name, so a batch preview's staged
+    content shadows the on-disk copy of a skill an earlier op created or rewrote (e485146dd10e)."""
+    from agent.skill_utils import get_all_skills_dirs, get_project_skills_dirs
+    roots = [Path(p) for p in get_project_skills_dirs()] + [Path(p) for p in get_all_skills_dirs()]
+    return [Path(p) for p in overlay_roots] + roots + [shared_root]
+
+
+def add_distinct_from(content: str, entries: List[Dict[str, Any]]) -> str:
+    """Return ``content`` with ``entries`` appended to ``metadata.hermes.distinct_from``."""
+    content = content.lstrip("\ufeff")
+    end = _FRONTMATTER_END_RE.search(content[3:])
+    body_start = 3 + end.start()  # validation already required the fence
+    fm = yaml.safe_load(content[3:body_start]) or {}
+    # A non-mapping container is the author's data: refuse rather than replace it with {} (346629c28142).
+    meta = fm.get("metadata")
+    if meta is not None and not isinstance(meta, dict):
+        raise DistinctFromError(
+            f"metadata must be a mapping, got {type(meta).__name__}; fix it in the content and retry.")
+    meta = fm["metadata"] = dict(meta or {})  # copy: a YAML alias must not receive distinct_from too (b8f3589b6894)
+    hermes = meta.get("hermes")
+    if hermes is not None and not isinstance(hermes, dict):
+        raise DistinctFromError(
+            f"metadata.hermes must be a mapping, got {type(hermes).__name__}; fix it in the content and retry.")
+    hermes = meta["hermes"] = dict(hermes or {})
+    prior = hermes.get("distinct_from")
+    if prior is not None and not isinstance(prior, list):
+        raise DistinctFromError(
+            f"metadata.hermes.distinct_from must be a list, got {type(prior).__name__}; "
+            "fix it in the content and retry.")
+    hermes["distinct_from"] = list(prior or []) + entries
+    dumped = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True, width=1_000_000)
+    return "---\n" + dumped + content[body_start + 1:]
+
+
+@contextmanager
+def create_lock(shared_root: Path):
+    """Cross-process lock held from the compare through the write of a create (adbf7b9e2588): two concurrent
+    creates of near-identical skills must not both score against a tree that holds neither. One lock per fleet
+    root, next to the ledger; creates are rare, so the serialisation costs nothing."""
+    from tools.skill_usage import skill_file_lock
+    with skill_file_lock(shared_root.parent.joinpath(*_COMPARE_LOCK)):
+        yield
+
+
+def _accepts_corpus(fn) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "corpus" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def check_create(name: str, content: str, justification: Optional[str], *, shared_root: Path,
+                 profile: str, overlay_roots: Sequence[Path] = (), exclude_names: Sequence[str] = ()
+                 ) -> Tuple[Optional[str], Optional[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
+    """-> (refusal message or None, refusal payload, content to write, ledger row to append on success).
+
+    ``exclude_names``: skills an earlier op of the same batch deletes. Their on-disk copies are dropped from the
+    corpus, so a preview scores what approve will (8377c7154a79, aaa4ebf59b72).
+
+    Fails open (no gate) when the scorer is absent or raises: a create is reversible, a crashed
+    create path is not a safety property."""
+    root = shared_root.parent
+    try:
+        scorer = _load_scorer(root)
+        if scorer is None:
+            return None, None, content, None
+        enabled, threshold = _gate_settings(scorer.THRESHOLD)
+        if not enabled:
+            return None, None, content, None
+        roots = _skill_roots(shared_root, overlay_roots)
+        kwargs = {"roots": roots, "threshold": threshold}
+        # 370d9676504e: the scorer is the ROOT's file, which may predate check(corpus=). Pass corpus only when a
+        # batch deletes skills AND check() accepts it; an older scorer then scores the on-disk tree (stricter: the
+        # deleted copy still counts) instead of raising TypeError and failing the whole gate open.
+        if exclude_names and _accepts_corpus(scorer.check) and hasattr(scorer, "Corpus"):
+            gone = set(exclude_names)
+            kwargs["corpus"] = scorer.Corpus([d for d in scorer.Corpus.load(roots).docs if d["name"] not in gone])
+        verdict = scorer.check(name, content, **kwargs)
+    except Exception:  # noqa: BLE001
+        logger.warning("near-duplicate gate unavailable for create of %s; allowing", name, exc_info=True)
+        return None, None, content, None
+    if not verdict["near_duplicate"]:
+        return None, None, content, None
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "path": "skill_manage", "name": name,
+           "profile": profile, "threshold": verdict["threshold"], "matches": verdict["matches"]}
+    if justification is not None and not isinstance(justification, str):
+        # An ordinary operation failure (never an exception): a batch must roll back its earlier ops.
+        return (f"justification must be a string, got {type(justification).__name__}.",
+                {"near_duplicates": verdict["matches"]}, content, None)
+    why = (justification or "").strip()
+    try:  # scorer code: same fail-open boundary as check() (aada50d66930)
+        message = None if why else scorer.refusal_message(name, verdict)
+        entries = scorer.distinct_from_entries(verdict, why) if why else None
+    except Exception:  # noqa: BLE001
+        logger.warning("near-duplicate gate unavailable for create of %s; allowing", name, exc_info=True)
+        return None, None, content, None
+    if not why:
+        _append_ledger(scorer, root, {**row, "event": "refuse"})
+        return message, {"near_duplicates": verdict["matches"]}, content, None
+    try:
+        content = add_distinct_from(content, entries)
+    except DistinctFromError as e:
+        return str(e), {}, content, None
+    return None, None, content, {**row, "event": "justified_create", "why": why}
+
+
+def record_justified(row: Optional[Dict[str, Any]], shared_root: Path) -> None:
+    if row is None:
+        return
+    root = shared_root.parent
+    try:  # audit only: the skill is already on disk, so nothing here may fail the create
+        scorer = _load_scorer(root)
+    except Exception:  # noqa: BLE001
+        logger.warning("near-duplicate ledger skipped for %s: scorer reload failed", row.get("name"),
+                       exc_info=True)
+        return
+    if scorer is not None:
+        _append_ledger(scorer, root, row)
+
+
+def _append_ledger(scorer, root: Path, row: Dict[str, Any]) -> None:
+    try:
+        scorer.append_ledger(row, scorer.ledger_path(root))
+    except Exception:  # noqa: BLE001  the ledger is audit, never a reason to fail the create
+        logger.warning("near-duplicate ledger write failed for %s", row.get("name"), exc_info=True)

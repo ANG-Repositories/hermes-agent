@@ -7,10 +7,10 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -39,16 +39,77 @@ _PROCESS_ID = uuid.uuid4().hex
 
 # --- executions ledger --------------------------------------------------------------------------
 
-def _connect() -> sqlite3.Connection:
+def _ledger_path() -> Path:
+    return EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+
+
+def _connect(*, path: Optional[Path] = None, shared: bool = False) -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
     # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
     # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
     from cron.jobs import _ensure_cron_dir
     from hermes_cli.sqlite_util import open_db
 
-    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path = path or _ledger_path()
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    return open_db(path, db_label="cron/executions.db", synchronous_full=True,
+                   check_same_thread=not shared, initialize=_initialize_schema)
+
+
+# One long-lived connection per ledger file per process (t_e92870f8). Opening per call cost a
+# connect + WAL probe + config deepcopy, and closing the last connection to a WAL database runs a
+# checkpoint: ~50 ms of a ~80-100 ms claim, 4 ledger transactions per claim, all under ``_lock``.
+# The connection is only used under ``_lock`` (so one thread at a time), keyed by path because one
+# process ticks many profile homes, and re-opened when the file was replaced (a restore must not
+# write into an unlinked inode), after a fork, or after any SQLite error.
+# Bounded so homes that left the ticked set (and test tmp dirs) do not pin fds forever.
+# path -> (connection, owning pid, (st_dev, st_ino) at open)
+MAX_SHARED_CONNECTIONS = 16
+_shared: Dict[str, tuple] = {}
+_depth = threading.local()
+
+
+def _file_identity(path: Path) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _drop_shared(key: str) -> None:
+    entry = _shared.pop(key, None)
+    if entry is not None and entry[1] == os.getpid():
+        try:
+            entry[0].close()
+        except sqlite3.Error:
+            pass
+
+
+def _shared_connection(path: Path) -> sqlite3.Connection:
+    """The process's connection to *path* (caller holds ``_lock``)."""
+    key = str(path)
+    entry = _shared.get(key)
+    if entry is not None:
+        conn, pid, ident = entry
+        if pid == os.getpid() and ident is not None and _file_identity(path) == ident:
+            return conn
+        if pid != os.getpid():
+            _shared.pop(key, None)  # a forked child must never close or use its parent's handle
+        else:
+            _drop_shared(key)
+    conn = _connect(path=path, shared=True)
+    while len(_shared) >= MAX_SHARED_CONNECTIONS:  # oldest first: dicts keep insertion order
+        _drop_shared(next(iter(_shared)))
+    _shared[key] = (conn, os.getpid(), _file_identity(path))
+    return conn
+
+
+def close_shared_connections() -> None:
+    """Close this process's cached ledger connections (tests, shutdown)."""
+    with _lock:
+        for key in list(_shared):
+            _drop_shared(key)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -94,18 +155,125 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
 
+    # Older processes may still finish attempts during a rolling upgrade. Queue their writes
+    # in SQLite too; the next pruning transaction consumes only these newly completed ids.
+    conn.execute("CREATE TABLE IF NOT EXISTS execution_proof_pending (id TEXT PRIMARY KEY)")
+    for event in ("INSERT", "UPDATE OF status"):
+        name = "insert" if event == "INSERT" else "update"
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS execution_proof_{name} AFTER {event} ON executions "
+            "WHEN NEW.status='completed' BEGIN "
+            "INSERT OR IGNORE INTO execution_proof_pending(id) VALUES (NEW.id); END"
+        )
+    # Publish the exemption column and its backfill atomically across process openers.
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        if add_column_if_missing(conn, "executions", "rewind_proof",
+                                 "rewind_proof INTEGER NOT NULL DEFAULT 0"):
+            conn.executemany("UPDATE executions SET rewind_proof=1 WHERE id=?",
+                             [(i,) for i in _rewind_proof_ids(conn)])
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_rewind_proof "
+        "ON executions(job_id) WHERE rewind_proof=1"
+    )
+    for name, predicate in (
+        ("terminal", "status IN ('completed','failed','unknown')"),
+        ("prunable", "status IN ('completed','failed','unknown') AND rewind_proof=0"),
+    ):
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_executions_{name}_finish ON executions "
+            "(julianday(finished_at) DESC, finished_at DESC, julianday(claimed_at) DESC, "
+            f"claimed_at DESC, id DESC) WHERE {predicate}"
+        )
+
+
+# What each thread's ledger transaction is doing right now, and who holds ``_lock``: the script
+# runner's watchdog reads both when a tick trips (t_302ab1e8). Four trips in 36 h all stopped in
+# this function with nothing saying whether the tick waited on ``_lock`` or on SQLite.
+# thread ident -> [caller label, stage, tx start (monotonic), stage start (monotonic)].
+_inflight: Dict[int, List[Any]] = {}
+# (thread name, caller label, held since (monotonic)) of the ``_lock`` owner, or None.
+_lock_holder: Optional[tuple] = None
+LEDGER_LOCK_WAIT_NOTE_S = 0.1
+
+
+def ledger_activity() -> Dict[str, Any]:
+    """Snapshot of ``_inflight`` and ``_lock_holder`` with ages in seconds. Never raises."""
+    now = time.monotonic()
+    names = {t.ident: t.name for t in threading.enumerate()}
+    holder = _lock_holder
+    return {
+        "inflight": {
+            names.get(ident, f"thread-{ident}"): {
+                "label": s[0], "stage": s[1], "tx_s": round(now - s[2], 3),
+                "stage_s": round(now - s[3], 3)}
+            for ident, s in _inflight.copy().items()},  # dict.copy is atomic under the GIL
+        "lock_holder": None if holder is None else {
+            "thread": holder[0], "label": holder[1], "held_s": round(now - holder[2], 3)},
+    }
+
+
+def _stage(state: List[Any], stage: str) -> None:
+    state[1], state[3] = stage, time.monotonic()
+
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
+    global _lock_holder
+    from cron.lanes import caller_section_label, record_lock_wait
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
-        yield conn
+    label = caller_section_label(sys._getframe(1))
+    ident = threading.get_ident()
+    started = time.monotonic()
+    state = _inflight[ident] = [label, "lock_wait", started, started]
+    try:
+        with _lock:
+            waited = time.monotonic() - started
+            if waited >= LEDGER_LOCK_WAIT_NOTE_S:
+                record_lock_wait(f"ledger_lock:{label}", waited)
+            prev, _lock_holder = _lock_holder, (threading.current_thread().name, label,
+                                                time.monotonic())
+            depth = getattr(_depth, "n", 0)
+            _depth.n = depth + 1
+            try:
+                _stage(state, "connect")
+                if depth:
+                    # Re-entered from inside a ledger transaction on this thread: the shared
+                    # connection's transaction belongs to the outer caller, so use a private one.
+                    with transaction(_connect()) as conn:
+                        _stage(state, "body")
+                        yield conn
+                        _stage(state, "commit")
+                else:
+                    path = _ledger_path()
+                    conn = _shared_connection(path)
+                    try:
+                        with conn:  # commit on success, roll back on error; stays open
+                            _stage(state, "body")
+                            yield conn
+                            _stage(state, "commit")
+                    except sqlite3.Error:
+                        _drop_shared(str(path))
+                        raise
+            finally:
+                _depth.n = depth
+                _lock_holder = prev
+    finally:
+        if _inflight.get(ident) is state:
+            _inflight.pop(ident, None)
 
 
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:
     row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
-    return dict(row) if row is not None else None
+    return _public_record(row) if row is not None else None
+
+
+def _public_record(row: sqlite3.Row) -> Dict[str, Any]:
+    record = dict(row)
+    record.pop("rewind_proof", None)  # retention bookkeeping is not part of the audit API
+    return record
 
 
 def _emit_execution_state(
@@ -144,6 +312,17 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     # bounded by the stale-claim sweep below.
     from gateway.status import start_time_fingerprints_match
     return start_time_fingerprints_match(started_at, current)
+
+
+def _lane_peer(pid: int, started_at: Optional[int]) -> bool:
+    """``cron.lanes.lane_peer`` for the home that owns this ledger; any failure is False."""
+    try:
+        from cron.lanes import lane_peer
+
+        path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+        return lane_peer(pid, started_at, Path(path).parent.parent)
+    except Exception:
+        return False
 
 
 def _live_owner_stale_after_seconds() -> Optional[float]:
@@ -196,23 +375,51 @@ def _rewind_proof_ids(conn: sqlite3.Connection) -> List[str]:
     return list(keep.values())
 
 
+def _advance_rewind_proof(conn: sqlite3.Connection, execution_id: str) -> None:
+    from cron.occurrences import proves_slot, scheduled_instant
+
+    row = _fetch(conn, execution_id)
+    if row is None:  # an older process may already have pruned this pending completion
+        return
+    slot = scheduled_instant(row["scheduled_instant"])
+    if slot is None or not proves_slot(row["finished_at"] or row["claimed_at"], slot):
+        return
+    incumbent = conn.execute(
+        "SELECT id FROM executions WHERE job_id=? AND rewind_proof=1", (row["job_id"],)
+    ).fetchone()
+    if incumbent is not None:
+        winner = conn.execute(
+            "SELECT id FROM executions WHERE id IN (?,?) "
+            "ORDER BY julianday(scheduled_instant) DESC, id DESC LIMIT 1",
+            (execution_id, incumbent["id"]),
+        ).fetchone()
+        if winner["id"] != execution_id:
+            return
+        conn.execute("UPDATE executions SET rewind_proof=0 WHERE id=?", (incumbent["id"],))
+    conn.execute("UPDATE executions SET rewind_proof=1 WHERE id=?", (execution_id,))
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     # Each job's newest VALID completed occurrence survives the cap: it is the proof
     # completed_occurrence()/rewound_watermark() read when jobs.json is rewound to an older
     # snapshot. The cap is fleet-wide (~1.5 h of history on a busy host), so without this a daily
     # job's morning run was gone by evening and a rewound store re-fired it (2026-10-05 22:44,
     # 402 catch-ups).
+    pending = conn.execute("SELECT id FROM execution_proof_pending ORDER BY id").fetchall()
+    for row in pending:
+        _advance_rewind_proof(conn, row["id"])
+    conn.execute("DELETE FROM execution_proof_pending")
+    cap = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    # Indexed scans visit at most cap retained rows plus non-proof rows actually deleted,
+    # even when thousands of old per-job proofs survive outside the history cap.
     conn.execute(
-        """DELETE FROM executions WHERE id IN (
-             SELECT id FROM (
-               SELECT id FROM executions
-               WHERE status IN ('completed','failed','unknown')
-               ORDER BY julianday(finished_at) DESC, finished_at DESC,
-                        julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
-             )
-             WHERE id NOT IN (SELECT value FROM json_each(?))
-           )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)), json.dumps(_rewind_proof_ids(conn))),
+        "DELETE FROM executions WHERE id IN ("
+        "SELECT id FROM executions INDEXED BY idx_executions_prunable_finish "
+        "WHERE status IN ('completed','failed','unknown') AND rewind_proof=0 "
+        "AND id NOT IN (SELECT id FROM executions "
+        "WHERE status IN ('completed','failed','unknown') "
+        "ORDER BY julianday(finished_at) DESC, finished_at DESC, "
+        "julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT ?))", (cap,),
     )
 
 
@@ -336,6 +543,11 @@ def finish_execution(
             return None
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
+    # The attempt is durably recorded: a no_agent script's outcome record is no longer the only
+    # evidence of how it ended (cron/script_outcome_records.py, t_854cd586).
+    from cron.script_outcome_records import discard_execution
+
+    discard_execution(execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
@@ -352,6 +564,48 @@ _OWNER_WEDGED_REASON = (
 )
 
 
+def _orphan_session_window(conn: sqlite3.Connection, record: Dict[str, Any]) -> tuple:
+    """Epoch window from this claim to the next claim or this locked recovery snapshot.
+
+    Parse claim instants in Python: SQLite julianday() rounds away sub-millisecond
+    distinctions. The snapshot caps cleanup after the transaction releases its lock.
+    """
+    snapshot = _hermes_now()
+    start = datetime.fromisoformat(record["claimed_at"])
+    claims = conn.execute(
+        "SELECT claimed_at FROM executions WHERE job_id=? AND id<>?",
+        (record["job_id"], record["id"]),
+    ).fetchall()
+    later = (datetime.fromisoformat(row["claimed_at"]) for row in claims)
+    end = min((instant for instant in later if instant > start), default=snapshot)
+    return str(record["job_id"]), start.timestamp(), min(end, snapshot).timestamp()
+
+
+def _end_orphaned_cron_sessions(windows: List[tuple]) -> int:
+    """Close the state.db cron session rows of attempts just recovered as ``unknown``.
+
+    ``_finalize_cron_session`` never runs for an attempt whose owner died (kill, restart), so its
+    ``cron_<job>_*`` row kept ``ended_at IS NULL`` forever and read as live (t_fd68626f).
+    Best-effort: session bookkeeping must never fail ledger recovery."""
+    if not windows:
+        return 0
+    ended = 0
+    try:
+        from hermes_state_registry import acquire, release_or_close
+
+        db = acquire()
+        try:
+            for job_id, start, end in windows:
+                ended += len(db.end_orphaned_cron_sessions(
+                    job_id, started_since=start, started_before=end))
+        finally:
+            release_or_close(db)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).debug("Ending orphaned cron sessions failed: %s", exc)
+    return ended
+
+
 def recover_interrupted_executions() -> int:
     """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
     dead, plus rows whose live owner holds a claim older than the derived stale bound (the
@@ -359,6 +613,7 @@ def recover_interrupted_executions() -> int:
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
+    orphan_windows: List[tuple] = []
     # Derived on the first live-owned row only: the bound reads config, and the idle gateway
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
     stale_after: Optional[float] = None
@@ -375,6 +630,11 @@ def recover_interrupted_executions() -> int:
                 continue
             reason = _OWNER_GONE_REASON
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                # A progressing script runner of this home owns the row: its run may legitimately
+                # reach the script timeout and then deliver (cron/lanes.py ``lane_peer``, spec
+                # §5.2a). Gateway-owned rows keep the bound below.
+                if _lane_peer(int(row["pid"]), row["process_started_at"]):
+                    continue
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
                 # this check, so a claim older than the derived bound is treated as wedged
@@ -412,10 +672,14 @@ def recover_interrupted_executions() -> int:
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
+                    # Only a provably dead owner: a wedged live owner may still finalize its own row.
+                    if reason == _OWNER_GONE_REASON:
+                        orphan_windows.append(_orphan_session_window(conn, record))
         if changed:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
+    _end_orphaned_cron_sessions(orphan_windows)
     return changed
 
 
@@ -469,8 +733,10 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
         if cur.rowcount != 1:
             return False
         record = _fetch(conn, execution_id)
+        window = _orphan_session_window(conn, record) if record is not None else None
         _prune_unlocked(conn)
     _emit_execution_state(record)
+    _end_orphaned_cron_sessions([window] if window else [])
     return True
 
 
@@ -497,7 +763,7 @@ def list_executions(
             + " ORDER BY julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT ?",
             params,
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [_public_record(row) for row in rows]
 
 
 def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
@@ -507,7 +773,7 @@ def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
             "SELECT * FROM executions WHERE id=?",
             (str(execution_id),),
         ).fetchone()
-    return dict(row) if row is not None else None
+    return _public_record(row) if row is not None else None
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
@@ -535,4 +801,4 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                   WHERE rn=1)""",
             clean,
         ).fetchall()
-    return {row["job_id"]: dict(row) for row in rows}
+    return {row["job_id"]: _public_record(row) for row in rows}

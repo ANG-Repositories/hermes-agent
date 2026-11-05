@@ -926,6 +926,10 @@ class _LateCompletion:
 # (floor _CHILD_TIMEOUT_FLOOR_S). Only delivery is bounded by it: persistence teardown waits
 # for the turn to exit (docs/dev/delegate-child-lifecycle.md, I2).
 _LATE_STOP_DRAIN_SECONDS = 5.0
+
+#: How long delegate_task waits for a kanban unit's card to spawn (or fall back) before it reports
+#: the runtime as pending. A refusal is immediate; a failed spawn's fence wait is up to ~12 s.
+_KANBAN_LAUNCH_WAIT_SECONDS = 15.0
 # Children whose persistence teardown is waiting on a still-live turn.
 _deferred_teardowns = 0
 _deferred_teardowns_lock = threading.Lock()
@@ -2061,6 +2065,8 @@ def _build_child_agent(
     # Default path (inherit_context False) is byte-identical: keep the historical
     # boot-attr forward (INV-5).
     child_prefill_messages: Any = getattr(parent_agent, "prefill_messages", None)
+    # Which inheritance construction ACTUALLY delivered (None = none): a sign grant needs it (Prism 8283ee6dbefe).
+    context_inherited: Optional[str] = None
     if materialized_prefill_messages is not None:
         child_prefill_messages = copy.deepcopy(materialized_prefill_messages)
     elif mode == "summary":
@@ -2088,6 +2094,7 @@ def _build_child_agent(
             _folded = _fold_conversation_history_to_context(_parent_history, _max_tokens)
             if _folded is not None:
                 child_prefill_messages = [_folded]
+                context_inherited = "summary"
         except Exception as _inh_exc:
             logger.warning("boomerang inherit_context fold failed (continuing without): %s", _inh_exc)
     # Fork: the parent's ephemeral prompt / prefill / request_overrides, not the slim child build (INV-2).
@@ -2123,6 +2130,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._context_inherited = context_inherited
     if mode == "fork":
         # _apply_child_cache_ttl and _regate_inherited_child_tier are SKIPPED: both rewrite request bytes.
         _fork.apply_fork_overlay(child, parent_agent)
@@ -2138,6 +2146,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
         _arm_first_request_pin(child, parent_agent, "fork")
+        child._context_inherited = "fork"
         child._boomerang_fork_log_pending = True   # one `boomerang.fork served_by=…` line
     else:
         _apply_child_cache_ttl(child)
@@ -3545,6 +3554,7 @@ def _build_durable_background_spec(
     task_images: Optional[List[Optional[List[str]]]] = None,
     task_schemas: Optional[List[Optional[Dict[str, Any]]]] = None,
     skills: Optional[List[str]] = None,
+    routing_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Build the non-secret restart intent for a routable gateway session. Call-level inputs that
     delegate_task applies outside ``task_list`` (top-level ``images`` / ``output_schema`` / ``skills``)
@@ -3567,6 +3577,7 @@ def _build_durable_background_spec(
         return None, None
 
     from gateway.status import get_current_boot_id
+    from tools.async_delegation_store import persistable_fallback_chain, persistable_fallback_policy
 
     boot_id = get_current_boot_id()
     if not boot_id or str(boot_id).endswith(":"):
@@ -3625,6 +3636,9 @@ def _build_durable_background_spec(
             # The children inherited the parent's route (no delegation.provider/base_url pin): on
             # reconstruction they must inherit it again, routing filters included, not become a pin.
             "inherited_route": not creds.get("provider") and not cfg.get("base_url"),
+            # A model-only pin (``delegation.model``, provider inherited) is still a pin: recovery restores
+            # the model so the child resolves its fallback chain as pinned, as at dispatch (Prism e087e98e6bb8).
+            "model_pinned": bool(creds.get("model")),
         }
     session_parts = str(session_key or "").split(":")
     chat_type = session_parts[3] if len(session_parts) > 4 else None
@@ -3644,7 +3658,12 @@ def _build_durable_background_spec(
             creds.get("args") or getattr(effective_agent, "acp_args", None) or []
         ),
         "reasoning_config": copy.deepcopy(getattr(effective_agent, "reasoning_config", None)),
-        "fallback_chain": copy.deepcopy(getattr(effective_agent, "fallback_model", None)),
+        # The DISPATCHING parent's chain: reconstruction gives it to the rebuilt parent and the
+        # children derive theirs from it, as in-process (AIAgent has no ``fallback_model`` attribute).
+        "fallback_chain": persistable_fallback_chain(getattr(parent_agent, "_fallback_chain", None)),
+        # The fallback policy of the block that owned the route (``credentials_cfg`` or delegation):
+        # recovery restores it so a pinned child resolves the same chain as at dispatch.
+        "fallback_policy": persistable_fallback_policy(cfg if routing_cfg is None else routing_cfg),
         "service_tier": getattr(effective_agent, "service_tier", None),
         "providers_allowed": copy.deepcopy(getattr(effective_agent, "providers_allowed", None)),
         "providers_ignored": copy.deepcopy(getattr(effective_agent, "providers_ignored", None)),
@@ -3872,6 +3891,7 @@ def delegate_task(
     parent_agent=None,
     _recovery_spec: Optional[Dict[str, Any]] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    sign_grant: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3996,6 +4016,7 @@ def delegate_task(
         # The model is inherited with it: the parent was rebuilt on the persisted resolved model, and
         # a model without its provider re-runs alias resolution (gpt-5.5 -> openai-codex).
         _inherited_route = bool(_credential_ref.get("inherited_route"))
+        _model_pinned = bool(_credential_ref.get("model_pinned"))
         cfg = dict(cfg)
         cfg.update({
             "model": "" if _inherited_route else (_execution.get("model") or ""),
@@ -4007,6 +4028,12 @@ def delegate_task(
                 _execution.get("max_iterations") or DEFAULT_MAX_ITERATIONS
             ),
         })
+        # The dispatch-time route owner's fallback policy (a per-call ``credentials_cfg`` is not
+        # replayed): without it a pinned child would take the global block's policy. Older records
+        # carry none and keep the global policy.
+        _fallback_policy = _execution.get("fallback_policy")
+        if isinstance(_fallback_policy, dict):
+            cfg["fallback_providers"] = copy.deepcopy(_fallback_policy.get("fallback_providers"))
     if model:
         cfg = dict(cfg)
         cfg["model"] = model
@@ -4047,6 +4074,13 @@ def delegate_task(
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+    if _recovery_spec and not model and _inherited_route and _model_pinned:
+        # A model-only pin (provider inherited) is restored AFTER resolution, as the resolved model the
+        # dispatch recorded: alias resolution is not idempotent (gpt-5.5 -> openai-codex), so it must not
+        # run twice. The child then resolves as pinned on the inherited route, as at dispatch (Prism
+        # e087e98e6bb8, 0418dcff8ba7).
+        creds = dict(creds)
+        creds["model"] = _execution.get("model") or None
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -4092,6 +4126,10 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+    if sign_grant:
+        # Top-level grant: every task without its own gets one (each bound to its own child).
+        task_list = [dict(t, sign_grant=t.get("sign_grant") or sign_grant) if isinstance(t, dict) else t
+                     for t in task_list]
 
     # Validate each task has a goal
     for i, task in enumerate(task_list):
@@ -4283,6 +4321,24 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    # Scoped board-signing grants (t_19c567a8): minted only now, bound to each built
+    # child's session and model, and revoked when the children's run ends.
+    sign_grants: List[Dict[str, Any]] = []
+    if any(isinstance(t, dict) and t.get("sign_grant") for _i, t, _c in children):
+        from tools.delegate_tool_sign_grant import SignGrantError, mint_for_children, register_turn_grants
+
+        if background:
+            return tool_error("sign_grant needs background=false: a grant ends with this turn")
+        try:
+            # All or nothing: any exception revokes what was already minted.
+            sign_grants = mint_for_children(children, parent_agent, inherit_context=inherit_context,
+                                            inherit_mode=inherit_mode)
+        except SignGrantError as exc:
+            return tool_error(f"sign_grant refused: {exc}")
+        # Live until the PARENT's turn ends (the turn facade's finally revokes them) or expiry, whichever is first:
+        # the parent may still run the merge gate over the child's stamp in this turn.
+        register_turn_grants(parent_agent, sign_grants)
 
     # Record an accepted override only after task validation and child construction.
     # A rejected or unbuildable request must not leave a success-shaped audit.
@@ -4519,7 +4575,11 @@ def delegate_task(
     # not blocked in the meantime. This is the contract: dispatch N subagents,
     # keep chatting, get the combined summaries back together at the end.
     if background:
-        from tools.async_delegation import dispatch_async_delegation_batch
+        from tools.async_delegation import (
+            KANBAN_SPAWNED_RUNTIME,
+            dispatch_async_delegation_batch,
+            kanban_launch_runtime,
+        )
         from tools.approval import get_current_session_key
 
         # Finite sessions cannot route a detached subagent result back to the
@@ -4702,6 +4762,7 @@ def delegate_task(
                 task_images=task_images,
                 task_schemas=task_schemas,
                 skills=skills,
+                routing_cfg=routing_cfg,
             )
         except Exception as exc:
             logger.error(
@@ -4716,6 +4777,30 @@ def delegate_task(
                     "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
+        # Kanban runtime (docs/dev/delegate-background-on-kanban-runtime.md §5.1-5.2): an eligible durable
+        # unit runs as one card on the internal ``delegations`` board, in its own process. The allowlist
+        # fails closed: any condition not positively true keeps today's in-process unit (I6).
+        _kanban = None
+        if _durable_spec is not None:
+            from tools import async_delegation_kanban as _akb
+
+            _unit_cwd = (_durable_spec.get("execution") or {}).get("workspace_hint")
+            _why_not = _akb.ineligible_reason(durable_spec=_durable_spec, children=_child_agents, cwd=_unit_cwd)
+            if _why_not is None:
+                _durable_spec["execution"]["runtime"] = "kanban"
+                _durable_spec["execution"]["route"] = _akb.parent_route(parent_agent, cfg)
+
+                def _on_kanban_spawned():
+                    # The gateway-built children never run: close them through the one teardown door.
+                    for _c in _child_agents:
+                        with _quiet("kanban: gateway child close failed", exc_info=True):
+                            _teardown(_c, "kanban_spawned")
+
+                _kanban = {"profile": _durable_spec.get("profile") or "default", "cwd": _unit_cwd,
+                           "session_id": _parent_session_id, "on_spawned": _on_kanban_spawned,
+                           "flagship_reason": audit_reason}
+            else:
+                _akb.log_ineligible(_why_not, live_deleg_id)
         # Detached mode (docs/dev/delegate-detached-background.md): a durable unit runs its children in
         # its own process so a gateway restart neither kills nor re-runs it. Only on a restart-safe spawn.
         _detached = None
@@ -4725,7 +4810,7 @@ def delegate_task(
         # So does a session-isolated sandbox (docker + container_persistent: false): children alias the
         # parent's per-session container by its live task id, and that container is never reused across
         # processes, so a detached worker would land in a fresh "default" sandbox without the session's files.
-        if _durable_spec is not None and _get_detached_background() and not _has_fork_child \
+        if _kanban is None and _durable_spec is not None and _get_detached_background() and not _has_fork_child \
                 and not _terminal_session_isolated():
             from tools.delegate_detached import spawn_mode
 
@@ -4757,6 +4842,7 @@ def delegate_task(
             durable_spec=_durable_spec,
             current_boot_id=_gateway_boot_id,
             detached=_detached,
+            kanban=_kanban,
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
@@ -4807,7 +4893,17 @@ def delegate_task(
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]
-            if _detached is not None:
+            _runtime = None
+            if _kanban is not None:
+                # Report where the unit actually runs, not the intent: a failed card spawn falls
+                # back in-process (t_7e0f9dab).
+                _runtime = kanban_launch_runtime(dispatch["delegation_id"], _KANBAN_LAUNCH_WAIT_SECONDS)
+                payload["runtime"] = _runtime or "kanban (spawn pending)"
+            if _kanban is not None and _runtime in (None, KANBAN_SPAWNED_RUNTIME):
+                payload["control_hint"] = (
+                    "This background unit runs in its own process and survives a gateway restart. "
+                    "steer/list are not available for it; /stop still cancels it.")
+            elif _detached is not None:
                 payload["detached"] = True
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
@@ -5059,6 +5155,13 @@ DELEGATE_TASK_SCHEMA = {
                         "role": _p(
                             "string", "Per-task role; overrides the top-level 'role'.", enum=["leaf", "orchestrator"],
                         ),
+                        "sign_grant": _p(
+                            "object",
+                            "Optional scoped board-signing grant (needs kanban.sign_grants: on, inherit_context, "
+                            "background=false, and an operator session): {cards: [t_...], verbs: [verdict, approve, "
+                            "request_changes, release], expires_in_min: <=120 (default 45), by: 'reviewer'}. The child "
+                            "may sign comments as `by` on those cards only; the grant is revoked when its run ends.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -5088,6 +5191,9 @@ DELEGATE_TASK_SCHEMA = {
                 items={"type": "string"},
             ),
             "role": _p("string", _ROLE_PARAM_DESCRIPTION, enum=["leaf", "orchestrator"]),
+            "sign_grant": _p(
+                "object", "Scoped board-signing grant for every task without its own; see tasks[].sign_grant.",
+            ),
             "model": _p("string", "Optional per-call model override. Flagship models require allow_flagship_reason."),
             "provider": _p("string", "Provider for per-call model override; requires model."),
             "allow_flagship_reason": _p(
@@ -5130,7 +5236,9 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
     within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
     the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    from tools.delegate_tool_sign_grant import carries_sign_grant
+
+    return not getattr(parent_agent, "_delegate_depth", 0) > 0 and not carries_sign_grant(args)
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
@@ -5161,7 +5269,7 @@ registry.register(
         inherit_mode=args.get("inherit_mode"),
         model=args.get("model"), provider=args.get("provider"), allow_flagship_reason=args.get("allow_flagship_reason"),
         force_model=args.get("force_model"), images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+        parent_agent=kw.get("parent_agent"), sign_grant=args.get("sign_grant"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

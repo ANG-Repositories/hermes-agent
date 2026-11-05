@@ -197,7 +197,7 @@ def test_lane_pin_requires_flag_and_admission(kanban_home):
 
 
 def test_cli_set_model_pin_accepted_with_flag_refused_without(kanban_home, capsys):
-    tid = _created_id(_cli("create 'scratch' --assignee daedalus-opus", capsys))
+    tid = _created_id(_cli("--board default create 'scratch' --assignee daedalus-opus", capsys))
     refused = _cli(f"set-model {tid} --provider claude-bpx-24 --model {OPUS}", capsys)
     assert "pins one Claude subscription" in refused
     with kb.connect() as conn:
@@ -211,13 +211,13 @@ def test_cli_set_model_pin_accepted_with_flag_refused_without(kanban_home, capsy
             task.pin_sub_reason) == ("claude-bpx-24", OPUS, "high", "test"), out
 
     assert "[PIN claude-bpx-24: test]" in _cli(f"show {tid}", capsys)
-    assert "[PIN claude-bpx-24: test]" in _cli("list --all", capsys)
-    pins = _cli("pins", capsys)
+    assert "[PIN claude-bpx-24: test]" in _cli("--board default list --all", capsys)
+    pins = _cli("--board default pins", capsys)
     assert tid in pins and "[PIN claude-bpx-24: test]" in pins
 
 
 def test_cli_sub_zero_pinnable_only_with_flag(kanban_home, capsys):
-    tid = _created_id(_cli("create 'scratch' --assignee daedalus-opus", capsys))
+    tid = _created_id(_cli("--board default create 'scratch' --assignee daedalus-opus", capsys))
     out = _cli(f"set-model {tid} --provider claude-bpx-0 --model {OPUS}", capsys)
     assert "pins one Claude subscription" in out
     _cli(f"set-model {tid} --provider claude-bpx-0 --model {OPUS} --pin-sub 'last resort'",
@@ -228,7 +228,7 @@ def test_cli_sub_zero_pinnable_only_with_flag(kanban_home, capsys):
 
 
 def test_cli_alias_refused_with_flag(kanban_home, capsys):
-    tid = _created_id(_cli("create 'scratch' --assignee daedalus-opus", capsys))
+    tid = _created_id(_cli("--board default create 'scratch' --assignee daedalus-opus", capsys))
     out = _cli(f"set-model {tid} --provider claude-api-proxy --model {OPUS} --pin-sub 'x'",
                capsys)
     assert "pre-rename alias" in out
@@ -334,6 +334,12 @@ def test_capped_pin_waits_by_default(kanban_home, monkeypatch):
 
 def test_capped_pin_with_fallback_rides_family_pool(kanban_home, monkeypatch):
     _cap_pinned_sub(monkeypatch)
+    # The family pool is admissible: a relay with free slots. Without this the
+    # test probes the host's real relay /health, and an unreachable relay reads
+    # as 0 free slots (relay_free_slots), which holds the pin on a CI runner
+    # (t_f1a3e390).
+    monkeypatch.setattr(ph, "_fetch", lambda url, cache, provider: {
+        "eligible_count": 4, "max_inflight": 8, "active_turns": 0})
     with kb.connect_closing() as conn:
         tid = _pinned_card(conn, fallback=True)
         seen = []

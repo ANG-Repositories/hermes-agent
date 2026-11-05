@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Dict, List, Optional, Tuple
@@ -24,6 +25,7 @@ from agent import model_metadata_http
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL, openrouter_variant_base
+from tools.async_delegation_store import redact_url  # base_url userinfo never reaches agent.log
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, without_persistence_fields
 
 logger = logging.getLogger(__name__)
@@ -423,20 +425,38 @@ _LOCAL_CTX_PROBE_CACHE: Dict[tuple, tuple] = {}
 # session, offline box), so it must expire rather than stick.
 _BEDROCK_PROBE_FAILURE_TTL_SECONDS = 300.0
 _BEDROCK_PROBE_FAILURE_CACHE: Dict[tuple, float] = {}
+# Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
+# and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
+# Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
+# longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
+# An IMMUTABLE ((id, window), ...) tuple, not dict rows: it is the FALLBACK hermes-home's
+# scripts/anthropic-limits-render.py --check certifies against config/anthropic-limits.json, and a tuple
+# cannot be changed after this line (hermes-home#7860, Prism f-ce7cb29c7df69f55 / f-bbf4d7c761341baa).
+ANTHROPIC_CONTEXT_FALLBACK: Tuple[Tuple[str, int], ...] = (
+    ("claude-fable-5-1", 1000000),
+    ("claude-fable-5", 1000000),
+    ("claude-fable", 1000000),
+    ("claude-mythos-5", 1000000),
+    ("claude-opus-5-5", 1000000),
+    ("claude-opus-5", 1000000),
+    ("claude-sonnet-5-5", 1000000),
+    ("claude-sonnet-5", 1000000),
+    ("claude-haiku-5-5", 1000000),  # 1M; haiku-4-5 stays on the 200K "claude" catch-all
+    ("claude-opus-4-8", 1000000),
+    ("claude-opus-4.8", 1000000),
+    ("claude-opus-4-7", 1000000),
+    ("claude-opus-4.7", 1000000),
+    ("claude-opus-4-6", 1000000),
+    ("claude-sonnet-4-6", 1000000),
+    ("claude-opus-4.6", 1000000),
+    ("claude-sonnet-4.6", 1000000),
+    ("claude", 200000),  # catch-all for older Claude models
+)
 # Family-pattern fallbacks, used only when provider-aware sources all miss.
 # Lookups are longest-key-first substring matches, so dict order is cosmetic
 # and a specific key must be STRICTLY longer than its catch-all.
 DEFAULT_CONTEXT_LENGTHS = {
-    # Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
-    # and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
-    # Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
-    # longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
-    "claude-fable-5-1": 1000000, "claude-fable-5": 1000000, "claude-fable": 1000000, "claude-mythos-5": 1000000,
-    "claude-opus-5-5": 1000000, "claude-opus-5": 1000000, "claude-sonnet-5-5": 1000000, "claude-sonnet-5": 1000000,
-    "claude-haiku-5-5": 1000000,  # 1M; haiku-4-5 stays on the 200K "claude" catch-all
-    "claude-opus-4-8": 1000000, "claude-opus-4.8": 1000000, "claude-opus-4-7": 1000000, "claude-opus-4.7": 1000000,
-    "claude-opus-4-6": 1000000, "claude-sonnet-4-6": 1000000, "claude-opus-4.6": 1000000, "claude-sonnet-4.6": 1000000,
-    "claude": 200000,  # catch-all for older Claude models
+    **dict(ANTHROPIC_CONTEXT_FALLBACK),
     # OpenAI — direct-API windows (Codex OAuth caps gpt-5.4+/5.5/5.6 at 272K, resolved by
     # its own branch). 5.4-nano/-mini are 400k, not 1.05M; gpt-5.3-codex-spark is
     # Codex-OAuth-only and listed so "gpt-5" (400k) doesn't win.
@@ -774,9 +794,43 @@ def _catalog_key_matches(key: str, model_lower: str) -> bool:
     return key in model_lower or _normalize_model_version(key) in _normalize_model_version(model_lower)
 
 
+# Anthropic rows of DEFAULT_CONTEXT_LENGTHS (seeded from ANTHROPIC_CONTEXT_FALLBACK) follow the fleet catalog <fleet root>/config/anthropic-limits.json
+# (models[*].context_window + aliases; agent/anthropic_limits.py). The literal rows are the FALLBACK when the
+# catalog is unreadable; hermes-home's `anthropic-limits-render.py --check` keeps the tuple equal to it. The overlay
+# is applied in place on the first lookup and again whenever the catalog's mtime changes.
+_ANTHROPIC_LITERAL_ROWS: Dict[str, int] = dict(ANTHROPIC_CONTEXT_FALLBACK)
+_anthropic_rows_lock = threading.Lock()
+_anthropic_rows_applied: Dict[str, Any] = {"catalog": None}
+
+
+def _sync_anthropic_context_rows() -> None:
+    """Overlay the catalog's Anthropic windows onto DEFAULT_CONTEXT_LENGTHS; restore the literals without one."""
+    try:
+        from agent import anthropic_limits
+        cat = anthropic_limits.load_catalog()
+    except Exception:
+        return
+    if cat is _anthropic_rows_applied["catalog"]:
+        return
+    with _anthropic_rows_lock:
+        if cat is _anthropic_rows_applied["catalog"]:
+            return
+        try:
+            rows = (anthropic_limits.context_rows(cat) if cat is not None else None) or {}
+        except Exception:
+            rows = {}
+        for k in [k for k in DEFAULT_CONTEXT_LENGTHS
+                  if k.startswith("claude") and k not in _ANTHROPIC_LITERAL_ROWS and k not in rows]:
+            del DEFAULT_CONTEXT_LENGTHS[k]
+        DEFAULT_CONTEXT_LENGTHS.update({**_ANTHROPIC_LITERAL_ROWS, **rows})
+        _anthropic_rows_applied["catalog"] = cat
+
+
 def _longest_key_match(table: Dict[str, int], model_lower: str) -> Optional[Tuple[str, int]]:
     """First ``(key, value)`` whose key is a substring of ``model_lower``, longest key first so
     specific entries (``gpt-5.4-mini``) beat their family catch-all (``gpt-5``); ties keep table order."""
+    if table is DEFAULT_CONTEXT_LENGTHS:
+        _sync_anthropic_context_rows()
     for key, value in sorted(table.items(), key=lambda x: len(x[0]), reverse=True):
         if _catalog_key_matches(key, model_lower):
             return key, value
@@ -883,9 +937,9 @@ def _reconcile_local_cached_context_length(model: str, base_url: str, cached: in
     if not (live_ctx and live_ctx > 0 and live_ctx != cached):
         return cached
     if live_ctx < MINIMUM_CONTEXT_LENGTH:
-        logger.info("Live local probe for %s@%s reports %s (< minimum %s); invalidating stale cache — agent init should reject", model, base_url, f"{live_ctx:,}", f"{MINIMUM_CONTEXT_LENGTH:,}")
+        logger.info("Live local probe for %s@%s reports %s (< minimum %s); invalidating stale cache — agent init should reject", model, redact_url(base_url), f"{live_ctx:,}", f"{MINIMUM_CONTEXT_LENGTH:,}")
     else:
-        logger.info("Reconciling stale local cache entry %s@%s: %s -> %s (live probe)", model, base_url, f"{cached:,}", f"{live_ctx:,}")
+        logger.info("Reconciling stale local cache entry %s@%s: %s -> %s (live probe)", model, redact_url(base_url), f"{cached:,}", f"{live_ctx:,}")
     _invalidate_cached_context_length(model, base_url)
     if live_ctx >= MINIMUM_CONTEXT_LENGTH:
         _maybe_cache_local_context_length(model, base_url, live_ctx)
@@ -1828,6 +1882,7 @@ def _stale_pre_catalog_cache_entry(model: str, cached: int) -> bool:
     """True when a persisted window is a pre-catalog leftover: the model resolves (longest-key-first) to a
     _PRE_CATALOG_STALE_KEYS key and the cached value is <= the largest shorter matching catch-all (or 256K)."""
     model_lower = model.lower()
+    _sync_anthropic_context_rows()
     matches = [(key, value) for key, value in DEFAULT_CONTEXT_LENGTHS.items() if _catalog_key_matches(key, model_lower)]
     if not matches:
         return False
@@ -2543,7 +2598,7 @@ def _resolve_custom_codex_route_context_length(model: str, base_url: str, api_ke
     does not know take the ordinary endpoint probes."""
     ctx, _source = _resolve_codex_oauth_context_length_with_source(model)
     if ctx:
-        logger.info("Using Codex OAuth context length %s for model %r (codex_responses route at %s)", f"{ctx:,}", model, base_url)
+        logger.info("Using Codex OAuth context length %s for model %r (codex_responses route at %s)", f"{ctx:,}", model, redact_url(base_url))
         return ctx
     return _resolve_custom_endpoint_context_length(model, base_url, api_key, provider)
 

@@ -10,7 +10,7 @@ existing skills (bundled, hub, user) are modified in place. Layout:
 import contextvars as _ctxvars
 import hashlib
 import json
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, nullcontext, suppress
 import logging
 import re
 import shutil
@@ -30,7 +30,8 @@ from agent.skill_utils import (
     SKILL_PROMPT_DESC_LIMIT)
 from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
-    _containing_skills_root, _curator_consolidation_delete_guard, _is_path_redirect, _maybe_auto_propose_org_edit,
+    _containing_skills_root, _curator_consolidation_delete_guard, _curator_remove_file_carry_guard,
+    _is_path_redirect, _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
@@ -104,6 +105,14 @@ def _skill_mutation_locks(names):
     for lock_path in sorted({_skill_lock_path(n) for n in names}):
         stack.enter_context(skill_file_lock(lock_path))
     return stack
+
+
+def _remove_file_carry_fence():
+    """Skills-root-wide lock for background curator remove_file (no-op in the foreground)."""
+    if not _is_background_review():
+        return nullcontext()
+    from tools.skill_usage import skill_file_lock
+    return skill_file_lock(_skills_dir() / ".locks" / "remove-file-carry.lock")
 
 
 MAX_NAME_LENGTH = 64
@@ -655,17 +664,35 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 
 # --- Core actions -------------------------------------------------------------
 
-def _create_skill(name: str, content: str, category: str = None, *, local: bool = False) -> Dict[str, Any]:
+def _create_skill(name: str, content: str, category: str = None, *, local: bool = False,
+                  justification: Optional[str] = None) -> Dict[str, Any]:
     """Create a new user skill. By default (when a git-backed skills-shared/ tree exists) authors
     into skills-shared/<group>/ so the skill is backed up and fleet-shareable; ``local=True`` for a
     genuine single-agent skill in the gitignored local tree. Validation runs BEFORE mkdir, so a
-    frontmatter/size failure can never leave an orphan directory behind on either tree."""
+    frontmatter/size failure can never leave an orphan directory behind on either tree.
+    A near-duplicate of an existing skill is refused unless ``justification`` says why it is distinct
+    (tools/skill_manager_neardup.py)."""
     if err := (_validate_name(name) or _validate_category(category)
                or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)
     # Name collisions across all directories AND every shared group (subscribed or not).
     if existing := _find_existing_skill_anywhere(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
+    from tools import skill_manager_neardup as _neardup
+    with _neardup.create_lock(_shared_skills_root()):   # compare + write under one lock (adbf7b9e2588)
+        return _create_skill_locked(name, content, category, local=local, justification=justification,
+                                    _neardup=_neardup)
+
+
+def _create_skill_locked(name: str, content: str, category: str = None, *, local: bool, justification,
+                         _neardup) -> Dict[str, Any]:
+    refusal, payload, content, neardup_row = _neardup.check_create(
+        name, content, justification, shared_root=_shared_skills_root(), profile=_active_profile_name())
+    if refusal:
+        return _err(refusal, **payload)
+    # The justification rewrote the frontmatter: the written bytes must pass the same checks.
+    if neardup_row and (err := _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
+        return _err(err)
     # A bad/missing group in shared mode fails loud here, BEFORE any directory is created.
     try:
         skill_dir = _resolve_skill_dir(name, category, local=local)
@@ -697,6 +724,7 @@ def _create_skill(name: str, content: str, category: str = None, *, local: bool 
     root = _shared_skills_root() if authored_shared else _skills_dir()
     display = skill_dir.relative_to(root) if skill_dir.is_relative_to(root) else skill_dir
     _record_create_metric(name, category, shared=authored_shared)
+    _neardup.record_justified(neardup_row, _shared_skills_root())
     result = {
         "success": True, "message": f"Skill '{name}' created.", "path": str(display),
         "skill_md": str(skill_md), "_change": {"description": _description_preview(content)},
@@ -872,7 +900,12 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return _err(f"File '{file_path}' not found in skill '{name}'.", available_files=available or None)
     if read_guard := _background_review_read_before_write_guard(name, target, "remove_file", file_path):
         return read_guard
-    target.unlink()
+    # One fence across ALL skills for background removes, held from the carry check through the
+    # unlink: two reviews removing identical copies must not each count the other's as the carrier.
+    with _remove_file_carry_fence():
+        if carry_guard := _curator_remove_file_carry_guard(name, skill_dir, target, file_path):
+            return carry_guard
+        target.unlink()
     _rmdir_if_empty(target.parent, skill_dir)
     return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
 
@@ -917,7 +950,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
 
 _FLAT_OP_KEYS = ("content", "category", "file_path", "file_content", "old_string", "new_string",
-                 "absorbed_into", "local", "operations")
+                 "absorbed_into", "local", "justification", "operations")
 
 
 def _skill_manage_from(payload: Dict[str, Any], **extra) -> str:
@@ -985,7 +1018,8 @@ def _act_patch(a):
 # action -> handler(args dict) returning a result dict, or a tool_error JSON string for
 # argument-shape errors. "edit" is a legacy alias for a full rewrite (not in the schema).
 _ACTION_HANDLERS = {
-    "create": lambda a: _create_skill(a["name"], a["content"], a["category"], local=bool(a.get("local"))),
+    "create": lambda a: _create_skill(a["name"], a["content"], a["category"], local=bool(a.get("local")),
+                                      justification=a.get("justification")),
     "edit": lambda a: _edit_skill(a["name"], a["content"]),
     "patch": _act_patch,
     "delete": lambda a: _delete_skill(a["name"], absorbed_into=a["absorbed_into"]),
@@ -1037,7 +1071,7 @@ def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
     replace_all: bool = False, absorbed_into: str = None, local: bool = False, task_id: str = None,
-    session_id: str = None, operations=None) -> str:
+    session_id: str = None, operations=None, justification: str = None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
     if operations is not None:
@@ -1049,7 +1083,8 @@ def skill_manage(
     # of origin; bypassed when replaying an approved staged write.
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
                 old_string=old_string, new_string=new_string, replace_all=replace_all,
-                absorbed_into=absorbed_into, local=True if local else None)
+                absorbed_into=absorbed_into, local=True if local else None,
+                justification=justification)
     if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
         return gate_result
     if (shape_err := _op_shape_error(action, args)) is not None:
@@ -1165,6 +1200,11 @@ SKILL_MANAGE_SCHEMA = {
                                       "authored into skills-shared/<category>/ (git-backed, shared across "
                                       "agents). Set true ONLY for a genuine single-agent skill in the local "
                                       "(gitignored, not-backed-up) tree.")},
+                        "justification": {"type": "string",
+                                          "description": (
+                                              "Only after a create was refused as a near-duplicate: why this "
+                                              "skill is distinct from the listed matches. Recorded in its "
+                                              "frontmatter under distinct_from.")},
                     }, ("content",)),
                     _op_schema("patch", {
                         "old_string": _OLD_STRING, "new_string": _NEW_STRING,

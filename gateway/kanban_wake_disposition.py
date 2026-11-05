@@ -1,7 +1,8 @@
-"""Judgment gate for auto-handled kanban wakes (Boomerang v2 P3a, spec §5.4, D-13, D-15).
+"""Judgment gate for boomerang-wake kanban wakes (Boomerang v2 P3a, spec §5.4, D-13).
 
 Pure logic, no I/O. ``wake_disposition(kind, payload, task, *, retries)`` answers what a
-card event's wake should become once ``resolve_auto_handle`` says the card opted in:
+card event's wake should become once ``resolve_boomerang_wake`` says the card is at the
+``boomerang wake`` level:
 
 - ``"surface"`` — today's path (passive line + wake turn). Every judgment event, every
   event on a spend/egress card, and every kind this table does not name (INV-5).
@@ -23,6 +24,9 @@ its ``trigger``. The payload is the event payload, plus two keys the caller reso
   Missing/false → the upstream row (surface).
 - ``pr_state``: ``"green"`` | ``"pending"`` | ``"red"`` | ``"dirty"``. Missing or anything
   else on an own repo → surface (fail-safe: never guess a PR is green).
+- ``prism_all_answered``: True only when the handback text answers every Prism key open at
+  the handback head (``gateway/kanban_prism_answers.py``) and the row's config knob is on.
+  Anything else (False / None / missing) leaves today's rows deciding (t_6e9f48cc).
 
 Card tags are read from ``task.tags`` (an iterable) when the caller has one, else from the
 card title/body: a ``tags: a, b`` line or a ``[tag]`` marker (the ``[milestone]`` /
@@ -113,6 +117,13 @@ _TABLE: tuple = (
          lambda c: c.kind == "blocked" and str(c.payload.get("kind") or "") == "needs_input", SURFACE),
     _Row(2, "blocked", lambda c: c.kind == "blocked", SURFACE),
     _Row(2, "block_loop_detected", lambda c: c.kind == "block_loop_detected", SURFACE),
+    # Tier 3 — a mechanical own-repo handback: every open Prism key is answered in the
+    # handback text, so posting those lines, the coverage and the enqueue is not a verdict
+    # (t_6e9f48cc). Above the green and red rows: the queue owns CI (a red row's existing
+    # fm_args such as --allow-red-ci ride along unchanged; a dirty PR refuses at step 3 and
+    # the child surfaces). An unanswered key falls through to today's rows.
+    _Row(3, "own_repo_review_all_keys_answered",
+         lambda c: _own_review(c) and c.payload.get("prism_all_answered") is True, AUTO, MODE_FORK),
     # Tier 3 — the merge pass owns a green/pending own-repo handback.
     _Row(3, "own_repo_review_green_or_pending",
          lambda c: _own_review(c) and _pr_state(c) in ("green", "pending"), NONE),
@@ -123,6 +134,10 @@ _TABLE: tuple = (
     _Row(4, "changes_requested", lambda c: c.kind == "changes_requested", AUTO, MODE_FORK),
     _Row(4, "crash_first_occurrence",
          lambda c: c.kind in CRASH_KINDS and c.retries < MAX_AUTO_RETRIES, AUTO, MODE_FORK),
+    # t_1e0ffee4: the review deadman's tier-1 page, emitted as a ``review_deadman`` card event
+    # (hermes-home scripts/kanban-review-deadman.py) instead of a direct wake. The child does the
+    # attended read: a bounded why-waits comment, or surface.
+    _Row(4, "review_deadman", lambda c: c.kind == "review_deadman", AUTO, MODE_FORK),
     # Tier 5 — default: upstream handbacks, repeat crashes, reclaimed, skipped_nonspawnable,
     # status/heartbeat plumbing and any kind nobody listed.
     _Row(5, "default", lambda c: True, SURFACE),
@@ -148,32 +163,13 @@ def wake_disposition(kind: str, payload: Optional[dict], task: Any, *, retries: 
     return classify(kind, payload, task, retries=retries).verdict
 
 
-def _tri(value: Any) -> Optional[bool]:
-    """Tri-state read: True / False / None (unset). Accepts bools, on/off strings, 0/1."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in ("1", "true", "on", "yes"):
-        return True
-    if text in ("0", "false", "off", "no"):
-        return False
-    return None
+def resolve_boomerang_wake(card: Any) -> bool:
+    """D-A: the card's own level is the only setting (no session toggle, no board default).
 
-
-def resolve_auto_handle(card: Any, session_setting: Any, board_default: Any) -> bool:
-    """D-15: card flag → home session ``/autohandle`` → board default → False.
-
-    ``card`` is either the card's ``auto_handle`` value or the card itself (a Task / dict
-    carrying ``auto_handle``). Resolved to a bool BEFORE any truthiness check (pass-1 R6):
-    an explicit ``False`` on the card beats a session that is on.
+    ``card`` is the card's ``boomerang_wake`` value or the card itself (a Task / dict carrying
+    ``boomerang_wake``). Only an explicit on (True / 1 / "true") opts in.
     """
-    card_value = card if card is None or isinstance(card, (bool, int, str)) else _field(card, "auto_handle")
-    for value in (card_value, session_setting, board_default):
-        resolved = _tri(value)
-        if resolved is not None:
-            return resolved
-    return False
+    value = card if card is None or isinstance(card, (bool, int, str)) else _field(card, "boomerang_wake")
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "on", "yes")
+    return bool(value) if isinstance(value, (bool, int)) else False

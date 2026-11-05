@@ -1080,7 +1080,6 @@ def test_sandboxed_worker_env_cannot_reach_live_board(tmp_path, monkeypatch):
     scratch.mkdir()
     # Stock dispatched-worker env.
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live_board))
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ban-forensics")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path / "live" / "workspaces"))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_live")
     # The "documented" hermeticity move, plus the new flag.
@@ -3956,6 +3955,27 @@ def test_requeue_ready_card_overrides_active_pr(kanban_home, monkeypatch):
         assert kb.requeue_task(conn, task_id, actor="operator", reason="retry PR") == (True, None)
         assert kb.list_events(conn, task_id)[-1].kind == "requeued"
         assert kbd.check_respawn_guard(conn, task_id) is None
+
+
+@pytest.mark.parametrize("origin", [None, "ace-media"])
+def test_requeue_drop_origin_promotes_a_blocked_card_only_when_an_origin_dropped(kanban_home, origin):
+    """Prism 954a3633bcc2 (t_8a8aad55): no origin to drop = the block stands and the verb errors."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="blocked on input", assignee="worker")
+        conn.execute("UPDATE tasks SET status='blocked', origin_host=?, workspace_path=NULL WHERE id=?",
+                     (origin, tid))
+        conn.commit()
+        ok, err = kb.requeue_task(conn, tid, actor="operator", reason="start fresh", drop_origin=True)
+        row = conn.execute("SELECT status, origin_host FROM tasks WHERE id=?", (tid,)).fetchone()
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        if origin is None:
+            assert ok is False and "stays blocked" in err and "no origin" in err
+            assert row["status"] == "blocked"
+            assert "requeued" not in kinds
+        else:
+            assert (ok, err) == (True, None)
+            assert row["status"] == "ready" and row["origin_host"] is None
+            assert "origin_dropped" in kinds and kinds[-1] == "requeued"
 
 
 @pytest.mark.parametrize("later_pr_second", [False, True])

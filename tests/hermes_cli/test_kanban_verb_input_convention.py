@@ -49,7 +49,7 @@ def _required(verb):
 # (verb, argv after the verb) -- empty and partial inputs. {tid} is the card.
 EMPTY_AND_PARTIAL = [
     ("create", []),
-    ("create", ['""']),
+    ("create", ['""', "--board", "default"]),
     ("comment", []),
     ("comment", ["{tid}"]),
     ("comment", ["{tid}", "--body", '""']),
@@ -218,3 +218,97 @@ def test_flat_form_head_reads_legacy_routed_pr(board, monkeypatch):
         conn.commit()
         assert kvi._routed_pr_head(conn, board) == (HEAD, "ANG-Ventures/hermes-agent#41")
     assert seen == [("ANG-Ventures/hermes-agent", 41)]
+
+
+@pytest.mark.parametrize("routed", [True, False])
+@pytest.mark.parametrize("lensed", [True, False])
+@pytest.mark.parametrize("verdict", ["APPROVE", "CHANGES_REQUESTED"])
+def test_coverage_stamps_only_the_routed_pr(board, monkeypatch, routed, lensed, verdict):
+    from hermes_cli import kanban_handback_head as hh
+
+    pr = "ANG-Ventures/hermes-agent#41"
+    monkeypatch.setattr(hh, "_default_reader", lambda: lambda repo, number: {"head": HEAD})
+    overrides = {"verdict": verdict}
+    if lensed:
+        overrides["lenses"] = {lens: "done" for lens in REQUIRED_REVIEW_LENSES}
+    with kb.connect() as conn:
+        if routed:
+            run = kb.latest_run(conn, board)
+            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                         (json.dumps({"pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/41"}), run.id))
+            conn.commit()
+        text, error = kvi.build_coverage(
+            conn, board, findings=["one finding"],
+            lens_specs=[] if lensed else ["all=done"], overrides=overrides)
+    assert error is None, error
+    record = json.loads(text)
+    if routed:
+        assert record["pr"] == pr
+        assert record["head_sha"] == HEAD
+    else:
+        assert "pr" not in record
+        assert record["head_sha"] == "n/a: card routes no PR"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"head_sha": "explicit-head"},
+    {"pr": "ANG-Ventures/hermes-agent#99"},
+    {"head_sha": "explicit-head", "pr": "ANG-Ventures/hermes-agent#99"},
+])
+def test_coverage_pr_and_head_overrides_are_independent(board, monkeypatch, overrides):
+    from hermes_cli import kanban_handback_head as hh
+
+    monkeypatch.setattr(hh, "_default_reader", lambda: lambda repo, number: {"head": HEAD})
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, board)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                     (json.dumps({"pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/41"}), run.id))
+        conn.commit()
+        text, error = kvi.build_coverage(
+            conn, board, findings=["one finding"], lens_specs=["all=done"], overrides=overrides)
+    assert error is None, error
+    record = json.loads(text)
+    assert record["pr"] == overrides.get("pr", "ANG-Ventures/hermes-agent#41")
+    assert record["head_sha"] == overrides.get("head_sha", HEAD)
+
+
+# --- --priority accepts p0..p3; the argparse refusal ends on the cause (2026-10-24) -------------
+
+@pytest.mark.parametrize("text,expected", [("p0", 300), ("P1", 200), ("p2", 100), ("p3", 0), ("7", 7), ("-2", -2)])
+def test_priority_value_accepts_tiers_and_ints(text, expected):
+    from hermes_cli.kanban_parser import priority_value
+    assert priority_value(text) == expected
+
+
+def test_p0_sorts_above_every_live_priority_shape():
+    """A p0 card must be dispatched first; the fleet's measured scale tops out at 300 (2026-10-24)."""
+    from hermes_cli.kanban_parser import _P_TIERS, priority_value
+    assert priority_value("p0") >= 300 and priority_value("p0") > priority_value("80")
+    assert list(_P_TIERS.values()) == sorted(_P_TIERS.values(), reverse=True)
+
+
+def test_priority_value_refuses_garbage_with_both_shapes_named():
+    import argparse
+    from hermes_cli.kanban_parser import priority_value
+    with pytest.raises(argparse.ArgumentTypeError) as exc:
+        priority_value("high")
+    assert "p0..p3" in str(exc.value) and "int" in str(exc.value)
+
+
+def test_create_with_tier_priority_is_accepted(board, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
+    out = cli.run_slash('create "tier prio card" --board default --priority p2 --body x')
+    assert "usage error" not in out, out
+    with kb.connect_closing() as conn:
+        row = conn.execute("SELECT priority FROM tasks WHERE title = ?", ("tier prio card",)).fetchone()
+    assert row is not None and row[0] == 100
+
+
+def test_argparse_refusal_puts_the_cause_on_the_last_line(board, monkeypatch):
+    """The schema is context; the refusal is the answer. A reader (or a `tail`) that sees only
+    the last line must see WHY the call was refused, not the example invocation."""
+    monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
+    out = cli.run_slash('create --board default "x" --priority high')
+    last = out.rstrip().splitlines()[-1]
+    assert "error:" in last and "--priority" in last, out
+    assert "example:" in out.lower(), out

@@ -610,7 +610,7 @@ async def get_system_stats():
         info["psutil"] = False
         # stdlib-only fallbacks for load average where the kernel exposes it.
         try:
-            info["load_avg"] = list(os.getloadavg())
+            info["load_avg"] = list(os.getloadavg())  # admission-lint: not-a-decider status page read
         except (OSError, AttributeError):
             pass
 

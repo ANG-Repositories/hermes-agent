@@ -87,20 +87,23 @@ PLACEMENT_WAIT_EPISODE_END_KINDS = frozenset({
     "deferred", "archived", "assigned",
 })
 
-# kanban.placement.lineage_pins (read per tick). ``kinds`` (default): only a
-# link kind that can share a workspace holds a card local; ``legacy``: any
-# link does, with the bare ``linked`` reason (the pre-t_ae87edff behaviour);
-# ``none``: links never hold a card (spec Phase 2b-i), only the workspace
-# binds do. An UNKNOWN value reads as ``legacy`` (the safe side of a kill
+# kanban.placement.lineage_pins (read per tick). ``none`` (default): links
+# never hold a card (spec Phase 2b-i), only the workspace binds do
+# (``workspace_of`` / ``workspace_shared``); ``kinds`` (opt-in co-location):
+# a live link kind that can share a workspace holds a card local; ``legacy``:
+# any link does, with the bare ``linked`` reason (the pre-t_ae87edff
+# behaviour). An UNKNOWN value reads as ``legacy`` (the safe side of a kill
 # switch: pin local), with one WARN per value per 5 min. Placement only:
 # retention has its own switch (kanban.workspace.retention_key).
 LINEAGE_PINS_KINDS = "kinds"
 LINEAGE_PINS_LEGACY = "legacy"
 LINEAGE_PINS_NONE = "none"
 LINEAGE_PINS_MODES = (LINEAGE_PINS_KINDS, LINEAGE_PINS_LEGACY, LINEAGE_PINS_NONE)
-# ``none`` becomes the default only after P0-7 (spec §7 Phase 0) posts a
-# pool-profile blocks rate at or under 1%.
-LINEAGE_PINS_DEFAULT = LINEAGE_PINS_KINDS
+# ``none`` since t_6ff07b3d: under ``kinds`` a parent whose blocks child had not
+# started could run only on the Studio, whatever headroom the pool had (Ace's
+# standing rule 10-19: placement weighs every pool box, a blocks edge does not
+# pin). Kill switch: ``kanban.placement.lineage_pins: kinds``.
+LINEAGE_PINS_DEFAULT = LINEAGE_PINS_NONE
 LINEAGE_PINS_UNKNOWN = LINEAGE_PINS_LEGACY
 UNKNOWN_SWITCH_WARN_SECONDS = 300
 _unknown_switch_warned: Dict[tuple, float] = {}
@@ -110,13 +113,32 @@ _unknown_switch_warned: Dict[tuple, float] = {}
 # child never waits on, or builds on, the parent's output. ``blocks`` and a
 # NULL kind (read as ``blocks``) stay pinning; an unknown kind fails closed.
 PROVENANCE_LINK_KINDS = frozenset({"derived-from"})
+# Link kinds that hold only the CHILD (t_250a7fc5): ``after-merge`` gates the
+# child on the parent's PR merging; the parent owes the child nothing, so its
+# own outgoing edge never constrains where it runs. t_041ad167 sat 20 h in
+# ``not_portable:linked(after-merge->t_84e763a3)`` behind its own child.
+CHILD_ONLY_LINK_KINDS = frozenset({"after-merge"})
 
 
 # Phase 2a (t_7133e03d): hold codes written by the dispatcher itself.
 LOCAL_FULL = "local_full"
+# What bound a ``local_full`` hold (t_f73c65a8), so "local_full while a host has
+# headroom" is checkable from the event alone: ``gate`` = the host load gate
+# paused or allowed no new local worker this tick; ``quota`` = the gate had
+# room but this board's share of it was spent (by other boards, by this
+# board's own spawns this tick, or held back for a review row).
+LOCAL_BINDING_GATE = "gate"
+LOCAL_BINDING_QUOTA = "quota"
+# The board-split pause the gateway writes when other boards spent the shared
+# allowance; classified as ``quota``, every other pause as ``gate``.
+QUOTA_SPENT_PREFIX = "load gate: this tick's allowance of "
 POOL_UNAVAILABLE = "pool_unavailable"
 POOL_FULL = "pool_full"
 BOARD_UNHOSTABLE = "board_unhostable"
+# The ONE admission rule (placement.may_start / admit_class) refused every candidate, or refused the take under the
+# ledger lock (t_3694ab3c). Capacity: the hosts exist and serve the row, the class rule has no room now (Prism
+# 43117075a644, t_c466b7ee).
+UNIFIED_ADMISSION = "unified_admission"
 
 # The ONE vocabulary of ``SpilloverPlan.take()`` refusals for an UNPINNED row
 # (Control-Plane Protection spec v0.3, Momus pass 3 R4). The placement record's
@@ -126,7 +148,7 @@ BOARD_UNHOSTABLE = "board_unhostable"
 # no free slot that serves the row; structural = no pool host may take this row
 # at all (reach, board root). "Profile served on no free host" is reported as
 # capacity (``pool_full`` / ``pool_unavailable``): take() has no code for it.
-TAKE_CAPACITY = frozenset({POOL_FULL, POOL_UNAVAILABLE})
+TAKE_CAPACITY = frozenset({POOL_FULL, POOL_UNAVAILABLE, UNIFIED_ADMISSION})
 TAKE_STRUCTURAL = frozenset({HOST_REACH, BOARD_UNHOSTABLE})
 TAKE_REFUSALS = TAKE_CAPACITY | TAKE_STRUCTURAL
 # ``placement.reason`` of a portable row the Studio spawned after take()
@@ -144,7 +166,7 @@ TOTAL_MAX_SPAWN = "max_spawn"
 TOTAL_MAX_IN_PROGRESS = "max_in_progress"
 TOTAL_MEMORY_CRITICAL = "memory_critical"
 TOTAL_MAX_NEW = "max_new"
-TOTAL_READY_BUDGET = "ready_budget"
+TOTAL_MEMORY_ELEVATED = "memory_elevated"
 
 # The record of every spawn, both routes (spec §4.1); its ``route`` values
 # live in kanban_db_dispatch (``_ROUTE_*``): routes are not hold reasons.
@@ -211,6 +233,23 @@ def route_first(kanban_cfg: Any) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() not in ("false", "off", "no", "0")
+
+
+def local_full_binding(spawn_paused, local_budget, local_spawned) -> "dict | None":
+    """``{binding, binding_detail}`` for this tick's ``local_full`` holds, or
+    None when no local budget bound them (gate disabled: local is never full).
+    Read at the end of the tick: ``local_spawned`` only grows, and a row is
+    held local_full only once it reached ``local_budget``."""
+    if spawn_paused:
+        text = str(spawn_paused)
+        cause = LOCAL_BINDING_QUOTA if text.startswith(QUOTA_SPENT_PREFIX) else LOCAL_BINDING_GATE
+        return {"binding": cause, "binding_detail": text}
+    if local_budget is None:
+        return None
+    if local_budget <= 0:
+        return {"binding": LOCAL_BINDING_GATE, "binding_detail": "gate allowance 0 this tick"}
+    return {"binding": LOCAL_BINDING_QUOTA,
+            "binding_detail": f"{local_spawned}/{local_budget} local spawns this tick"}
 
 
 def take_refusal_code(refusal) -> "str | None":

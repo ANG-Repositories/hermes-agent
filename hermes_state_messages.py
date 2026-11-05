@@ -458,9 +458,12 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0, row_ids_out: Optional[List[int]] = None) -> int:
+        turn_lease_ttl_seconds: float = 300.0, row_ids_out: Optional[List[int]] = None,
+        recompute_last_active: bool = False) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
         count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row).
+        ``recompute_last_active``: also run the session's effective_last_active recompute in this txn (the
+        turn flush), so a contended store is waited on once, not twice; its failure never loses the rows.
         ``row_ids_out``: optional list that receives one entry per element of *messages*, in order — the
         committed row id of an inserted message, the stamped ``_row_id`` of a message repaired in place —
         populated only after a successful commit (run_agent's flush indexes it by message position)."""
@@ -472,7 +475,8 @@ class SessionMessagesMixin:
                 self._stamp_tool_call_uids(msg, _parse_tool_calls(msg.get("tool_calls")), tool_uid_index)
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds, row_ids_out=row_ids_out)
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds, row_ids_out=row_ids_out,
+                    recompute_last_active=recompute_last_active)
                 for start in range(0, len(messages), chunk_rows))
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
@@ -507,8 +511,20 @@ class SessionMessagesMixin:
                     else:
                         _rid = _msg.get("_row_id") if isinstance(_msg, dict) else None
                         row_ids_out.append(_rid if isinstance(_rid, int) else None)
+            if recompute_last_active:
+                self._recompute_last_active_best_effort(conn, session_id)
             return inserted
         return self._execute_transcript_write(_do, messages, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def _recompute_last_active_best_effort(self, conn, session_id: str) -> None:
+        """Denorm recompute inside the caller's txn; a failure rolls back only itself (savepoint)."""
+        conn.execute("SAVEPOINT recompute_last_active")
+        try:
+            self._recompute_effective_last_active_for_session(conn, session_id)
+        except Exception as e:
+            conn.execute("ROLLBACK TO recompute_last_active")
+            logger.warning("Session DB effective_last_active recompute failed: %s", e)
+        conn.execute("RELEASE recompute_last_active")
 
     _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
 
@@ -1255,8 +1271,25 @@ class SessionMessagesMixin:
             ") AND content IS ?",
             (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
 
+    def _update_row_with_metadata(self, sql: str, params: tuple, row_id: int,
+                                  display_metadata_patch: Optional[Dict[str, Any]]) -> int:
+        """One UPDATE plus, when it matched and ``display_metadata_patch`` is given, the patch merged into
+        that row's ``display_metadata``: one transaction, so the two can never land apart."""
+        def _do(conn):
+            rowcount = conn.execute(sql, params).rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            if rowcount > 0 and display_metadata_patch:
+                row = conn.execute("SELECT display_metadata FROM messages WHERE id = ?", (row_id,)).fetchone()
+                meta = dict(self._decode_display_metadata(row[0]) or {}) if row is not None else {}
+                meta.update(display_metadata_patch)
+                conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta), row_id))
+            return rowcount
+        return self._execute_write(_do)
+
     def set_message_api_content(
-        self, session_id: str, row_id: int, content: Any, api_content: str
+        self, session_id: str, row_id: int, content: Any, api_content: str,
+        display_metadata_patch: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Backfill the ``api_content`` sidecar onto ONE known durable row.
 
@@ -1277,21 +1310,23 @@ class SessionMessagesMixin:
         """
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
-        return self._write_rowcount(
+        return self._update_row_with_metadata(
             "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
             "AND role = 'user' AND active = 1 AND content IS ?",
-            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)),
+            row_id, display_metadata_patch)
 
-    def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
+    def set_user_message_content(self, session_id: str, row_id: int, content: Any,
+                                 display_metadata_patch: Optional[Dict[str, Any]] = None) -> int:
         """Rewrite the content of ONE known active user row. Used when a user turn was written at submit
         time (before the agent ran) and the turn prologue then rewrote the prompt it persists (@-file
         expansion, native image parts): the early row must show what the transcript will replay, not the
         raw keystrokes, and the turn must not append a second row for the same input."""
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
-        return self._write_rowcount(
+        return self._update_row_with_metadata(
             "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
-            (self._encode_content(content), row_id, session_id))
+            (self._encode_content(content), row_id, session_id), row_id, display_metadata_patch)
 
     def deactivate_message(self, session_id: str, row_id: int) -> int:
         """Deactivate ONE known row (id-addressed, idempotent; returns the affected row count). Used by
@@ -1524,6 +1559,28 @@ class SessionMessagesMixin:
                ORDER BY page.display_order ASC""",
             (session_id, -1 if limit is None else limit, offset, session_id),
         ).fetchall()
+
+    def user_message_contains(self, session_ids: List[str], needle: str, *, since: float = 0.0,
+                              session_key: str = "") -> bool:
+        """True when any user row (any active state) at or after ``since`` contains ``needle``, in
+        ``session_ids`` or in any session of ``session_key`` still open or ended since (a wake retargeted
+        from an idle-ended parent runs in the key's current session): the consumption receipt for an
+        admitted gateway wake (t_97a879af). ``needle`` must be followed by a newline, a CR, a space or
+        the end of the content, so ``Event: X:g1`` never matches ``Event: X:g10`` (t_506536db) while a batch
+        wake's ``Event: X   Total duration: Ns`` line still matches."""
+        ids = [sid for sid in session_ids if sid]
+        if session_key:
+            ids += [row[0] for row in self._read_all(
+                "SELECT id FROM sessions WHERE session_key = ? AND (ended_at IS NULL OR ended_at >= ?)",
+                (session_key, since))]
+        if not ids or not needle:
+            return False
+        row = self._read_one(
+            f"SELECT 1 FROM messages WHERE session_id IN ({_placeholders(ids)}) AND role = 'user'"
+            " AND timestamp >= ? AND (instr(content || char(10), ?) > 0 OR instr(content, ?) > 0"
+            " OR instr(content, ?) > 0) LIMIT 1",
+            (*ids, since, needle + "\n", needle + " ", needle + "\r"))
+        return row is not None
 
     def display_message_count(self, session_id: str) -> int:
         """Rows a display read of this segment paints: one per ``display_order`` group of

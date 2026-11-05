@@ -362,8 +362,21 @@ def test_dispatch_non_pool_worker_unaffected_by_empty_pool(home, pool):
         assert pool.hits == 0
 
 
-def test_dispatch_fails_open_when_pool_unreachable(home):
+def test_dispatch_falls_back_when_relay_unreachable(home):
+    """t_bde7653d: an unreadable relay /health adds no relay ceiling (slot count
+    decides); t_6b917840's 0-free fail-closed blocked dispatch forever."""
     _config(home, pool_health_urls=_urls(_dead_url()))
+    _profile(home, "a", "claude-apr")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="pool bound", assignee="a")
+        observed = []
+        res = kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
+        assert observed == [tid]
+        assert (tid, "relay_capacity") not in res.respawn_guarded
+
+
+def test_dispatch_fails_open_when_pool_unreachable_and_relay_capacity_off(home):
+    _config(home, pool_health_urls=_urls(_dead_url()), pool_relay_capacity=False)
     _profile(home, "a", "claude-apr")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="pool bound", assignee="a")
@@ -818,7 +831,10 @@ def test_pinned_lanes_share_sub_budget_and_zero_disables_it(home, apr):
 
 
 def test_unreachable_probe_fails_open_even_with_pool_budget(home):
-    _config(home, pool_health_urls=_urls(_dead_url()), pool_spawns_per_eligible=2)
+    # The eligible budget alone fails open; the relay-capacity gate (fail
+    # closed, t_6b917840) is off here and covered in test_kanban_relay_capacity.
+    _config(home, pool_health_urls=_urls(_dead_url()), pool_spawns_per_eligible=2,
+            pool_relay_capacity=False)
     _profile(home, "a", "claude-apr")
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"unreachable-{i}", assignee="a") for i in range(5)]

@@ -155,7 +155,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
-- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_DB` pinned to their board's database, so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Pre-dispatch file collision warning** — immediately before spawning a ready card, the dispatcher compares explicit file paths in its body with structured `changed_files` reported by running/review cards and cards blocked within the last seven days. An overlap is logged and written to both cards, naming both task IDs and the shared paths, but **never blocks or cancels dispatch**. If the new card has no explicit paths, or an active card has not reported `changed_files`, the CLI/log/event output says the check was unknown or partial rather than silently implying full coverage. Put paths in the card body and keep `changed_files` in worker handoffs to make this cheap warning useful.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
@@ -212,8 +212,9 @@ Per-board isolation is absolute:
 - Separate SQLite DB per board (`~/.hermes/kanban/boards/<slug>/kanban.db`).
 - Separate `workspaces/` and `logs/` directories.
 - Workers spawned for a task see **only** their board's tasks — the
-  dispatcher sets `HERMES_KANBAN_BOARD` in the child env and every
-  `kanban_*` tool the worker has access to reads it.
+  dispatcher pins `HERMES_KANBAN_DB` (the board's database path) in the
+  child env, and every `kanban_*` tool and `hermes kanban` call the worker
+  makes opens that database.
 - Linking tasks across boards is not allowed (keeps the schema simple; if
   you really need cross-project refs, use free-text mentions and look
   them up by id manually).
@@ -229,8 +230,10 @@ like a board DB is not one:
 ~/.hermes/kanban/boards/<slug>/board.json    # that board's metadata
 ~/.hermes/kanban/boards/<slug>/workspaces/   # scratch workspaces
 ~/.hermes/kanban/boards/<slug>/logs/         # per-task worker logs
-~/.hermes/kanban/current                     # one line: the active slug
 ```
+
+There is no "current board" file. Every command names its board (see
+[Board resolution](#board-resolution) below).
 
 Note the asymmetry that trips people up: the `default` board's DB is
 **not** under `boards/` — it sits at `~/.hermes/kanban.db`, one level
@@ -277,16 +280,15 @@ hermes kanban boards list
 hermes kanban boards create atm10-server \
     --name "ATM10 Server" \
     --description "Minecraft modded server ops" \
-    --icon 🎮 \
-    --switch                   # optional: make it the active board
+    --icon 🎮
 
-# Operate on a specific board without switching.
+# Every verb that is not about one card names its board.
 hermes kanban --board atm10-server list
 hermes kanban --board atm10-server create "Restart ATM server" --assignee ops
 
-# Change which board is "current" for subsequent calls.
-hermes kanban boards switch atm10-server
-hermes kanban boards show             # who's active right now?
+# A verb on a card finds the card's board itself.
+hermes kanban show t_abc123
+hermes kanban locate t_abc123         # prints <slug><TAB><db path>
 
 # Rename the display name (the slug is immutable — it's the directory name).
 hermes kanban boards rename atm10-server "ATM10 (Prod)"
@@ -299,14 +301,27 @@ hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
 
-Board resolution order (highest precedence first):
+#### Board resolution
 
-1. Explicit `--board <slug>` on the CLI call.
-2. `HERMES_KANBAN_BOARD` env var (set by the dispatcher when spawning a
-   worker, so workers can't see other boards).
-3. `~/.hermes/kanban/current` — the slug persisted by `hermes kanban
-   boards switch`.
-4. `default`.
+There is no current board: nothing on disk and nothing in the environment
+says which board a bare command means. A command's board comes from, in
+order (first match wins):
+
+1. An explicit `--board <slug>` (before or after the verb). Under a
+   `HERMES_KANBAN_DB` pin it must name the pinned board, or the command is
+   refused.
+2. A `HERMES_KANBAN_DB` pin (set by the dispatcher for every worker): the
+   board that database belongs to.
+3. The verb's card id (`show`, `comment`, `complete`, ...): the board that
+   holds that card. A card found on two boards, or a board that cannot be
+   read, refuses the command instead of guessing.
+4. `create --parent/--continues/--workspace-of <card>`: that card's board.
+5. Otherwise the command is refused with the next step:
+   `kanban: <verb> needs a board: pass --board <slug> ...`.
+
+The kill switch `kanban.bare_verb: default` in `~/.hermes/config.yaml`
+turns step 5 into the `default` board. It does not bring back a current
+board.
 
 Slugs are validated: lowercase alphanumerics + hyphens + underscores, 1-64
 chars, must start with alphanumeric. Uppercase input is auto-downcased.
@@ -320,10 +335,10 @@ as more than one board exists (or any board has tasks). Single-board users
 see only a small `+ New board` button; the switcher is hidden until it
 matters.
 
-- **Board dropdown** — pick the active board. Your selection is saved to
-  the browser's `localStorage` so it persists across reloads without
-  shifting the CLI's `current` pointer out from under a terminal you left
-  open.
+- **Board dropdown** — pick the board this tab shows. Your selection is
+  saved to the browser's `localStorage` so it persists across reloads, and
+  every request the tab makes names that board (`?board=<slug>`); nothing
+  server-side remembers a current board.
 - **+ New board** — opens a modal asking for slug, display name,
   description, icon, project directory, and (when any Project exists) a
   **Project** selector. Option to auto-switch to the new board.
@@ -437,6 +452,10 @@ kanban:
                                    # for human-only review boards.
   # Optional replacement for the built-in [fable, astra] worker-model ban.
   banned_worker_model_substrings: [fable, astra]
+  # Standing per-profile grants (root config only): the named profile's
+  # resolved model.default may be a flagship with no --allow-flagship.
+  # Pins and lanes are not covered.
+  # flagship_profile_allowances: {tiresias: "Ace D1: Tiresias on Fable"}
   # dispatch_profiles: [sage]       # unset (key omitted): this home may claim
                                    # cards for any existing profile. Set to a
                                    # list (or comma-separated string) of profile
@@ -452,6 +471,52 @@ model unless `--allow-flagship "<reason>"` is supplied; the reason is recorded
 as a `flagship override:` task comment. The dispatcher independently refuses
 direct database bypasses and records a `flagship dispatch refused:` comment,
 leaving the card queued until an explicit override comment is present.
+
+The assignee is a route choice too. On a card with no `--model` pin and no
+lane override, the route is the assignee profile's `model.default`, and the
+same ban applies to it: `create --assignee <profile>` and
+`assign`/`reassign <id> <profile>` refuse a profile whose default matches the
+banned list (`assignee profile default of '<profile>' is a flagship route: ...`) unless
+`--allow-flagship "<reason>"` is given. The reason is written as the same
+`flagship override:` comment. The dispatcher applies the check to the profile
+route when there is no pin or lane, so a card that reached `ready` by another
+path gets a `flagship dispatch refused:` comment naming the profile. A
+non-flagship `--model` pin replaces the profile route and needs no reason.
+Clearing a pin (`set-model <id>` with no model) lands the card on the profile
+route, so it is judged the same way, before anything is written or
+`--reclaim`ed. A default that still holds an unexpanded `${VAR}` after the
+profile's own `.env` is bound counts as unresolved and needs a reason too.
+A profile with an empty `model.default` and a `model.provider` runs that
+provider's `default_model` (`providers.<p>.default_model`, or the legacy
+`custom_providers[].model`), so that model is the route that is judged; a
+provider with no default it can find counts as unresolved.
+Flagship authority has one definition, used identically on every write and
+read path: the actor is an operator label (`default`/`apollo`/`aegis`,
+`ace`/`user`, `human:<name>`) and the process is not a dispatched worker: it
+carries no `HERMES_KANBAN_TASK`, and no dispatched worker sits in its process
+ancestry (the board's `task_runs.worker_pid`, the same evidence comment
+authorship uses), so unsetting the env marker inside a worker changes
+nothing. The actor is the caller's own verified identity (an
+operator name the caller cannot prove persists as `unverified:<name>` and
+holds no authority); it is never taken from `--created-by` or a comment body.
+Every path that takes a reason judges it before writing anything: `create`,
+`assign`/`reassign`, `set-model` (a flagship pin, or a clear onto a flagship
+profile route), `lane-model set --firepower`, `kanban swarm`, the
+`kanban_create` tool and a direct `kanban_db` call all refuse with
+`allow_flagship is operator/orchestrator-only; ask Apollo to assign`. What an
+authorized actor writes is a `flagship override:` comment under its own
+operator label, and that is the only comment the read side honours: the
+dispatcher (pin, lane and profile routes alike), reassign and pin clear admit
+a card only on an override whose author is an operator label and which was
+not written from a worker run. The same authority gates the WRITE: every
+comment writer (`kanban comment`, the `kanban_comment` tool, a direct
+`add_comment`) refuses a body that starts with `flagship override:` unless
+the author holds flagship authority, so a worker cannot plant one on another
+card (where its comment would otherwise carry no run id). A worker's own
+`kanban_comment` body, an `unverified:*` author and the literal `operator`
+admit nothing.
+`kanban swarm` takes `--allow-flagship "<reason>"` for its child cards; the
+swarm's root card is `no_worker` (never dispatched) and is not gated.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway

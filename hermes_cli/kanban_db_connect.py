@@ -57,12 +57,23 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
+    before = _kb._path_identity(path)
     conn = connect_tracked(
         path,
         connect_fn=sqlite3.connect,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
+    try:
+        # The (dev, ino) of the file this connection has OPEN, for board_for_conn: the path can be
+        # re-pointed later while the fd stays on the old file (Prism 1cb3ded18c44). sqlite opens the
+        # main file inside connect(), so an identity unchanged across it is the opened file's. A swap
+        # during the open records nothing and board_for_conn falls back to the path.
+        after = _kb._path_identity(path)
+        if after is not None and before in (None, after):
+            conn._hermes_open_identity = after
+    except AttributeError:
+        pass
     try:
         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
         # survives wrapper changes; PRAGMA assignments can't bind parameters.
@@ -747,8 +758,8 @@ def connect(
     * ``db_path`` explicit → used as-is (legacy callers, tests).
     * ``board`` explicit → resolves to that board's DB.
     * Neither → :func:`kanban_db_path` resolves via
-      ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+      ``HERMES_KANBAN_DB`` env → the context board → ``default`` (S7: no
+      current-board file, no board env var).
     """
     if db_path is not None:
         path = db_path
@@ -1059,6 +1070,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "task_events", "actor_session_id", "actor_session_id TEXT"
         )
+    # CLOCK_BOOTTIME + boot id of liveness evidence (claimed/spawned/heartbeat),
+    # so the session reap compares births without a wall conversion
+    # (kanban_db._boot_window). NULL for historical rows and non-Linux writers.
+    if ev_cols and "boottime" not in ev_cols:
+        _add_column_if_missing(conn, "task_events", "boottime", "boottime REAL")
+    if ev_cols and "boot_id" not in ev_cols:
+        _add_column_if_missing(conn, "task_events", "boot_id", "boot_id TEXT")
 
     # task_comments gained per-run / per-session provenance. Two concurrent
     # sessions on the SAME profile used to be indistinguishable on the board
@@ -1077,6 +1095,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "session_ref" not in cm_cols:
             _add_column_if_missing(
                 conn, "task_comments", "session_ref", "session_ref TEXT"
+            )
+        if "grant_id" not in cm_cols:
+            # Scoped signing grant the comment was written under (t_19c567a8).
+            _add_column_if_missing(
+                conn, "task_comments", "grant_id", "grant_id TEXT"
             )
 
     # task_links gained a ``kind`` column (blocks | derived-from). Every
@@ -1158,10 +1181,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if _add_column_if_missing(conn, "tasks", "workspace_of", "workspace_of TEXT"):
             _kb._log.info("kanban migration: workspace_of backfill set %d decompose child(ren)",
                           backfill_workspace_of(conn))
-    if "auto_handle" not in cols:
-        # After workspace_of (fresh column order). Nullable tri-state, no backfill:
-        # NULL = inherit (Boomerang v2 D-15), which is what every existing card means.
-        _add_column_if_missing(conn, "tasks", "auto_handle", "auto_handle INTEGER")
+    if "boomerang_wake" not in cols:
+        # After workspace_of (fresh column order). Ace 2026-10-22 (t_7be18632).
+        _add_column_if_missing(conn, "tasks", "boomerang_wake", "boomerang_wake INTEGER")
+    # Every init while the pre-rename ``auto_handle`` column exists: pre-update code may
+    # still write it after an earlier copy (Prism 4158abbc3b1b).
+    _migrate_legacy_boomerang_column(conn, cols)
     # Retention reads ``workspace_of = ?`` per GC decision (Momus pass 3 answer 4).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_workspace_of ON tasks(workspace_of) "
                  "WHERE workspace_of IS NOT NULL")
@@ -1169,6 +1194,37 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     _rebuild_drifted_tables(conn)
     # After the rebuild: a rebuilt kanban_notify_subs drops extra indexes.
     _kb._ensure_single_waker_index(conn)
+
+
+# The pre-rename card column (Boomerang v2 D-15). Read only by the copy below; written
+# beside ``boomerang_wake`` by ``write_card_boomerang_wake`` so the two never diverge.
+_LEGACY_BOOMERANG_COLUMN = "auto_handle"
+
+
+def _migrate_legacy_boomerang_column(conn: sqlite3.Connection, cols) -> None:
+    """Copy the legacy column into ``boomerang_wake`` where they differ (1/0 as stored; a
+    NULL legacy value is never copied). Idempotent; runs on every init while the legacy
+    column exists, so a late write by pre-update code is picked up. Logs only when a row
+    changed. Subscription rows are NOT rewritten: the old gateway wakes only on
+    ``notify+wake``/``wake`` (Apollo F-1). The level lives on the card."""
+    if _LEGACY_BOOMERANG_COLUMN not in cols:
+        return
+    copied = conn.execute(
+        f"UPDATE tasks SET boomerang_wake = {_LEGACY_BOOMERANG_COLUMN}"
+        f" WHERE {_LEGACY_BOOMERANG_COLUMN} IS NOT NULL"
+        f" AND (boomerang_wake IS NULL OR boomerang_wake != {_LEGACY_BOOMERANG_COLUMN})").rowcount
+    if copied:
+        _kb._log.info("kanban migration: boomerang_wake copied from %s on %d card(s)",
+                      _LEGACY_BOOMERANG_COLUMN, copied)
+
+
+def write_card_boomerang_wake(conn: sqlite3.Connection, task_id: str, stored: int) -> None:
+    """Write a card's level; mirror it into the legacy column while that exists, so the
+    per-init copy above cannot revert it and pre-restart code reads the same value."""
+    conn.execute("UPDATE tasks SET boomerang_wake = ? WHERE id = ?", (stored, task_id))
+    if _LEGACY_BOOMERANG_COLUMN in _column_names(conn, "tasks"):
+        conn.execute(f"UPDATE tasks SET {_LEGACY_BOOMERANG_COLUMN} = ? WHERE id = ?",
+                     (stored, task_id))
 
 
 def backfill_workspace_of(conn: sqlite3.Connection) -> int:
@@ -1282,7 +1338,7 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
         " run_id INTEGER, session_ref TEXT,"
-        " created_at INTEGER NOT NULL)",
+        " created_at INTEGER NOT NULL, grant_id TEXT)",
         ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
     ),
     "task_runs": (

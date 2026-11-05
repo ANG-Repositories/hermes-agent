@@ -6,7 +6,7 @@
 #
 # Placeholders:
 #   __FLOOR_SHA__   40-char commit SHA of the central repo
-#   __RUNNER__      private ANG-Ventures repo: ${{ vars.CI_RUNNER || 'hermes-ci' }} (x64 only).
+#   __RUNNER__      private ANG-Ventures repo: ${{ vars.CI_RUNNER || 'universal-ci' }} (x64 only).
 #                   Public or Kyzcreig repo: ubuntu-latest.
 name: regression-test-lint
 
@@ -14,9 +14,9 @@ name: regression-test-lint
 # satisfies a code change anywhere), and GitHub drops a filtered workflow on a >3,000-file diff whose
 # matches sort late. It reads only the REST file list (no checkout) and finishes in seconds. Not a
 # required check (making it one is Apollo's call).
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request); dispatch-only until re-enabled on a card.
 on:
-  pull_request:  # no-paths-ok: reads the PR title/body/file list, not the tree; see path-filter-exempt above
-    types: [opened, edited, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,6 +24,7 @@ permissions:
 
 jobs:
   regression_test_lint:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1' }}
     uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/regression-test-lint.yml@38d6a1cb2f634d0b24fa81369eb28780c0e16776
     with:
       runner: ubuntu-latest

@@ -11,12 +11,10 @@ _DESC_TASK_ID_DEFAULT = (
 )
 
 _DESC_BOARD = (
-    "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: the board database path and board slug "
-    "from the process env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "Kanban board slug to target. When omitted: a dispatched worker uses "
+    "its own board; a call naming a card id uses that card's board; "
+    "kanban_create with parents uses the parent's board. Otherwise the "
+    "call is refused: there is no current board, so pass board explicitly."
 )
 
 
@@ -503,12 +501,14 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "open-ended cards where one shot rarely finishes the "
                 "work. Defaults to false (classic single-shot worker)."
         )),
-        "auto_handle": _prop("boolean", (
-            "Let mechanical wakes on this card (completed, changes requested, a red "
-            "own-repo handback, a first crash) be handled by a background boomerang "
-            "child instead of a turn in the home session. Judgment events and cards "
-            "tagged irreversible/spend/outbound always surface. Omit to inherit the "
-            "home session's /autohandle setting (default off)."
+        "boomerang_wake": _prop("boolean", (
+            "Subscription level 'boomerang wake': mechanical wakes on this card "
+            "(completed, changes requested, a red own-repo handback, a first crash) are "
+            "handled by a background boomerang child instead of a turn in the home "
+            "session; the calling chat subscribes as the card's waker. Judgment events and "
+            "cards tagged irreversible/spend/outbound always surface. Operator auto-subscriptions "
+            "default to kanban.auto_subscribe_boomerang (true); false opts out. Worker creates "
+            "do not inherit this default."
         )),
         "unhomed": _prop("boolean", (
             "Mint the card with no home session on purpose. Without "
@@ -542,6 +542,12 @@ KANBAN_CREATE_SCHEMA = _schema(
         "force_model": _prop("string", (
                 "Reason to pin a 'model' id the provider's live model list does not "
                 "know. Without it an unknown id is refused with the valid list."
+        )),
+        "allow_flagship": _prop("string", (
+                "Reason for a flagship route (a flagship 'model', or an assignee "
+                "whose profile default is flagship). Without it such a card is "
+                "refused. Recorded as a 'flagship override:' comment. "
+                "Operator-only: honoured from an operator label outside a dispatched worker."
         )),
     },
     ["title", "assignee"],

@@ -31,7 +31,8 @@ from agent.prompt_caching import (
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
-    identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
+    identity_line_value, note_inert_pinned_tools, rewrite_identity_line, runtime_host_value,
+    stage_surface_switch_note,
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
@@ -783,6 +784,15 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     stale_field = _stored_prompt_runtime_mismatch(agent, stored_prompt) if stored_prompt else None
+    if stored_prompt and stale_field is not None:
+        rewritten = _provider_identity_rewrite(agent, stored_prompt, stale_field)
+        if rewritten is not None:
+            logger.info(
+                "Stored system prompt for session %s names provider %r; runtime is %r. Rewrote the "
+                "Provider line in place (no rebuild, rest of the prompt byte-identical).",
+                agent.session_id, stale_field[1], stale_field[2],
+            )
+            stored_prompt, stale_field = rewritten, None
     if stored_prompt and stale_field is None:
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):
@@ -944,6 +954,24 @@ def _stored_prompt_runtime_mismatch(agent, prompt: str):
     # stored bytes, it only makes their interface section out of date, and that is corrected by
     # agent.surface_switch.stage_surface_switch_note without touching the cached prefix (#104414).
     return None
+
+
+def _provider_identity_rewrite(agent, prompt: str, stale_field):
+    """The stored prompt with its ``Provider:`` trailer set to the runtime's, when that line is
+    the ONLY stale identity; else ``None`` (rebuild).
+
+    A turn can start on another relay face for the same model (claude-alr <-> claude-dtlr when
+    the first-choice pool sheds).  A full rebuild then re-renders every dynamic section, the
+    system bytes drift by hundreds of bytes and the whole transcript re-prefills; flipping back
+    rebuilds again (t_d1f61f76).  The builder renders the provider only in that line (alibaba
+    adds an identity paragraph, so it still rebuilds), and the mid-turn fallback already rewrites
+    just these lines (``rewrite_prompt_model_identity``), so a fallback hop lands on the same
+    bytes the previous turn sent there."""
+    field, stored, current = stale_field
+    if field != "Provider" or not current or "alibaba" in (stored, current):
+        return None
+    rewritten = rewrite_identity_line(prompt, "Provider", current)
+    return rewritten if _stored_prompt_runtime_mismatch(agent, rewritten) is None else None
 
 
 # Named so _is_synthetic_compression_user_turn can recognize a crash-persisted nudge by
@@ -1590,6 +1618,13 @@ def _current_turn_tail_tool_index(
     synthetic mid-turn user nudges (length continuation, Codex incomplete,
     verify/kanban stop guards) that follow this turn's tool results.
     Without a valid index the scan stops at the first ``role:"user"``.
+
+    A completed ``assistant`` response (it carries ``finish_reason``: a stop-gate
+    candidate or a truncation partial) newer than every tool row means that round
+    was already answered and sent: inserting after its tool result rewrites
+    history the provider has seen (t_3f6a01ee: a steer landed before the final
+    reply after a kanban stop nudge, and the bridge reseeded on the diverged
+    replay). A redirect placeholder has no ``finish_reason`` and is passed over.
     """
     bound_known = (
         isinstance(turn_start_idx, int)
@@ -1606,7 +1641,7 @@ def _current_turn_tail_tool_index(
         role = msg.get("role")
         if role == "tool":
             return i
-        if role == "user" and not bound_known:
+        if (role == "assistant" and msg.get("finish_reason")) or (role == "user" and not bound_known):
             return None
     return None
 
@@ -2180,12 +2215,16 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+    from agent import route_identity as _route
     while s.retry_count < s.max_retries:
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
         if _ng.action == "break":
             return None
+        # Route note: computed per rung against the route about to be tried; it rides this
+        # request only and is committed (transcript, then Known) only when the rung succeeds.
+        _route_call = _route.prepare_call(agent, s)
         try:
             _bq = _run_phase(build_api_request, agent, s)
             if _bq.action == "return":
@@ -2193,6 +2232,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             if _run_phase(perform_api_call, agent, s).action == "break":
                 return None
             _rc = _run_phase(check_api_response, agent, s)
+            if _route_call is not None and _route.call_succeeded(s, _rc.action):
+                _route_call = _route.commit_call_safely(agent, s, _route_call)
             if _rc.action == "return":
                 return _rc.result
             if _rc.action == "break":
@@ -2206,6 +2247,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
                 return _ae.result
             if _ae.action == "break":
                 return None
+        finally:
+            _route.abandon_call(s, _route_call)
     return None
 
 
@@ -2435,22 +2478,28 @@ def run_conversation(
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
-        result = _run_conversation_turn(
-            agent,
-            user_message,
-            system_message=system_message,
-            conversation_history=conversation_history,
-            task_id=task_id,
-            stream_callback=stream_callback,
-            persist_user_message=persist_user_message,
-            persist_user_timestamp=persist_user_timestamp,
-            persist_user_display_kind=persist_user_display_kind,
-            persist_user_display_metadata=persist_user_display_metadata,
-            persist_user_platform_id=persist_user_platform_id,
-            moa_config=moa_config,
-            turn_author=turn_author,
-            title_user_message=title_user_message,
-        )
+        try:
+            result = _run_conversation_turn(
+                agent,
+                user_message,
+                system_message=system_message,
+                conversation_history=conversation_history,
+                task_id=task_id,
+                stream_callback=stream_callback,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_id=persist_user_platform_id,
+                moa_config=moa_config,
+                turn_author=turn_author,
+                title_user_message=title_user_message,
+            )
+        finally:
+            # t_634b4ddf: a fallback line held for same-cause collapse posts by
+            # turn end at the latest (chain exhausted, terminal error, interrupt).
+            from agent.fallback_cause import flush_banner
+            flush_banner(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
     return result

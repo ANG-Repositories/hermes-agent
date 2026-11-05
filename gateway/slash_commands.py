@@ -27,7 +27,6 @@ from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
-from gateway.slash_commands_autohandle import GatewayAutoHandleCommandsMixin
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 from gateway.slash_commands_model import GatewayModelCommandsMixin, _model_switch_skew_guard
 from gateway.slash_commands_branch_thread import merge_delta_rows
@@ -398,8 +397,7 @@ class GatewaySlashCommandsMixin(
     GatewayModelCommandsMixin,
     GatewaySessionCommandsMixin,
     GatewayStatusCommandsMixin,
-    GatewayGoalCommandsMixin,
-    GatewayAutoHandleCommandsMixin):
+    GatewayGoalCommandsMixin):
     """In-session slash-command handlers for GatewayRunner (plus the helpers the sibling mixins share)."""
 
     async_session_store: AsyncSessionStore
@@ -709,7 +707,15 @@ class GatewaySlashCommandsMixin(
         def _sub():
             from hermes_cli import kanban_db_connect as _kbc
             from hermes_cli import kanban_db_notify as _kbn
-            conn = _kbc.connect(board=requested_board)
+            if requested_board:
+                conn = _kbc.connect(board=requested_board)
+            else:
+                # The CLI may have derived the board (--parent/--continues/--workspace-of, or a
+                # --board after the verb); the card itself says where it landed (Prism 35e770f2b096).
+                from pathlib import Path
+                from hermes_cli import kanban_db_board_registry as _kbr
+                # locate() returns a pin raw; expand ~ as kanban_db_path() does (Prism ab54f29e6449).
+                conn = _kbc.connect(db_path=Path(_kbr.locate(task_id)[1]).expanduser())
             try:
                 _kbn.add_notify_sub(
                     conn, task_id=task_id, platform=platform_str, chat_id=chat_id, chat_type=chat_type,
@@ -784,7 +790,14 @@ class GatewaySlashCommandsMixin(
 
         # Idle /stop also blocks future automatic arrivals, without double-cancelling children.
         from gateway import queue_mgmt
-        self._session_state(session_key).persistent.run_generation += 1
+        # Idle /stop is an explicit invalidation (it can land in the turn-lease flush window, slot
+        # released, lease held): record the watermark before the bump so the lease registry reads
+        # the still-flushing holder as stopped, not superseded (t_d659b247 review).
+        _persistent = self._session_state(session_key).persistent
+        _persistent.invalidated_run_generation = max(
+            int(_persistent.invalidated_run_generation), int(_persistent.run_generation),
+        )
+        _persistent.run_generation += 1
         self._session_state(session_key).conversation.automatic_turns_paused = True
         queue_mgmt.hold_user_items(self, session_key, self._delivery_adapter_for(source))
         # Same contract as the busy path (run_agent_cache): a marker write failure must not abort
@@ -3415,7 +3428,6 @@ class GatewaySlashCommandsMixin(
                     "Model session override was not cleared because the session "
                     "store could not persist the reset. No route change was made."
                 )
-            getattr(self, "_pending_model_notes", {}).pop(session_key, None)
             getattr(self, "_last_resolved_model", {}).pop(session_key, None)
             _fb_cleared = await asyncio.to_thread(
                 self._clear_fallback_for_user_route,
@@ -3660,26 +3672,9 @@ class GatewaySlashCommandsMixin(
                                     "Failed to persist model switch to DB: %s", exc
                                 )
 
-                        # Store model note + session override.  Use display
-                        # form (strips opaque Palantir prefix) for the user-
-                        # visible note; session-override map still gets the
-                        # full opaque ID, which is what the wire needs.
+                        # Store the session override (changes ``intended`` only). The model
+                        # learns of the switch from the per-call route note (agent/route_identity.py).
                         from hermes_cli.model_switch import format_model_for_display
-                        _display_cur = format_model_for_display(_cur_model)
-                        _display_new = format_model_for_display(result.new_model)
-                        if not hasattr(_self, "_pending_model_notes"):
-                            _self._pending_model_notes = {}
-                        # Route (provider) is named explicitly: a sub-to-sub move
-                        # keeps the model slug, so "fable-5-1 to fable-5-1" alone
-                        # reads as a no-op when the provider actually changed.
-                        # `_cur_provider` is the LIVE agent's provider (read at the
-                        # top of the handler), not the config/override value.
-                        _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_display_cur} to {_display_new} "
-                            f"via {result.provider_label or result.target_provider} "
-                            f"(route {_cur_provider} -> {result.target_provider}). "
-                            f"Adjust your self-identification accordingly.]"
-                        )
                         # Off the loop: the persistability check re-resolves
                         # credentials (config load + provider resolution, which
                         # can refresh an OAuth token over the network).
@@ -4025,24 +4020,9 @@ class GatewaySlashCommandsMixin(
                         "Failed to persist model switch to DB: %s", exc
                     )
 
-            # Store a note to prepend to the next user message so the model
-            # knows about the switch (avoids system messages mid-history).
-            # Display form strips opaque Palantir RID prefixes; the override
-            # map below keeps the full ID for the wire.
+            # No model-facing note here: the switch changes ``intended`` only, and the
+            # per-call route note (agent/route_identity.py) tells the model what serves.
             from hermes_cli.model_switch import format_model_for_display
-            if not hasattr(self, "_pending_model_notes"):
-                self._pending_model_notes = {}
-            # `current_model`/`current_provider` are the LIVE agent's route (read
-            # near the top of the handler), so the note names what the session
-            # was actually running, and the provider is spelled out because a
-            # sub-to-sub move keeps the model slug.
-            self._pending_model_notes[session_key] = (
-                f"[Note: model was just switched from {format_model_for_display(current_model)} to {format_model_for_display(result.new_model)} "
-                f"via {result.provider_label or result.target_provider} "
-                f"(route {current_provider} -> {result.target_provider}). "
-                f"{'This override applies to the next turn only. ' if one_turn else ''}"
-                f"Adjust your self-identification accordingly.]"
-            )
 
             # Store session override so next agent creation uses the new model
             # (single door — also persists the config-backed identity, RC-2/P3b).

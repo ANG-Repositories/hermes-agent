@@ -474,7 +474,7 @@ class GatewayAgentCacheMixin:
             if _carry_held:
                 state.conversation.held_queue.extend(_carry_held)
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
-        # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
+        # SessionState), e.g. _pending_skills_reload_notes. SessionState-backed names resolve to MutableMapping
         # views (not dict), so the isinstance(dict) guard skips them — already handled above.
         for attr in _CONVERSATION_SCOPED_STATE:
             store = getattr(self, attr, None)
@@ -522,6 +522,13 @@ class GatewayAgentCacheMixin:
         Settles a pending one-shot model override first: the displaced turn's finalizer is
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
         self._restore_pending_one_turn_model_override(session_key)
+        persistent = self._session_state(session_key).persistent
+        # Every generation up to the one in flight is now "stopped and draining"; record it BEFORE
+        # the bump so the turn-lease stale test (``_is_session_run_invalidated``) can tell this
+        # apart from a generation merely superseded by a later inbound (t_d659b247).
+        persistent.invalidated_run_generation = max(
+            int(persistent.invalidated_run_generation), int(persistent.run_generation),
+        )
         generation = self._begin_session_run_generation(session_key)
         if reason:
             logger.info("Invalidated run generation for %s → %d (%s)", session_key, generation, reason)
@@ -537,6 +544,38 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return True
         return self._current_session_run_generation(session_key) == int(generation)
+
+    def _is_session_run_invalidated(self, session_key: str, generation: int) -> bool:
+        """True when ``generation`` was explicitly invalidated (/stop, /new, reset, eviction) for
+        ``session_key`` — NOT merely superseded by a later inbound's ``_begin_session_run_generation``.
+        The turn-lease registry's stale-holder test (t_d659b247): a superseded holder is a live
+        turn still flushing; only an invalidated one is a zombie worth the short wait."""
+        if not session_key:
+            return False
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return False
+        return int(generation) <= int(state.persistent.invalidated_run_generation)
+
+    def _holds_unreleased_turn_lease(self, session_key: str) -> bool:
+        """True while ``session_key`` still holds a turn-lease token the registry recognises as the
+        current holder — the window between ``_run_agent``'s slot release and ``_handle_message``'s
+        lease release (persist + deliver). An inbound in that window must take the busy path, never
+        a fresh dispatch (t_d659b247). getattr-guarded: bare ``object.__new__`` runners."""
+        if not session_key:
+            return False
+        registry = getattr(self, "_turn_leases", None)
+        state = self._peek_session_state(session_key)
+        if registry is None or state is None:
+            return False
+        try:
+            return any(
+                not getattr(token, "released", False) and registry.is_holder(token)
+                for token in list(state.turn.lease_tokens.values())
+            )
+        except Exception:
+            logger.debug("turn lease hold check failed for %s", session_key, exc_info=True)
+            return False
 
     def _bind_adapter_run_generation(self, adapter: Any, session_key: str, generation: int | None) -> None:
         """Bind a gateway run generation to the adapter's active-session event."""
@@ -802,13 +841,18 @@ class GatewayAgentCacheMixin:
         return f"[Voice channel now: {vc_now or 'not connected to a voice channel'}]"
 
     async def _rehydrate_prompt_pins(self, session_key: str, expected_session_id: Optional[str]) -> None:
-        """Adopt the durable pin snapshot for an internal turn when this process holds no pins for
-        *session_key* (a restart). Eviction clears only ``ephemeral_pin`` and keeps ``channel_pin``,
-        so an evicted agent still re-renders instead of reviving the snapshot."""
+        """Adopt the durable pin snapshot for an internal turn, per pin this process lacks for
+        *session_key*: both after a restart, ``ephemeral_pin`` alone after an agent eviction.
+
+        Eviction (fallback activation, model drift, hygiene) clears ``ephemeral_pin``. An internal
+        source has no chat_name/user_name/guild/message_id, so re-rendering from it rewrote the
+        session-context block ("#chan" -> chat id) and the next human turn rewrote it back: two
+        cold prefix writes per wake on long fallback sessions (t_d38720a8). The durable snapshot
+        is the last human turn's render; a real metadata change re-renders on the next human turn."""
         state = self._peek_session_state(session_key)
-        if state is not None and (
-            state.conversation.ephemeral_pin is not None or state.conversation.channel_pin is not None
-        ):
+        need_eph = state is None or state.conversation.ephemeral_pin is None
+        need_chan = state is None or state.conversation.channel_pin is None
+        if not (need_eph or need_chan):
             return
         try:
             pin = sanitize_prompt_pin(await self.async_session_store.get_prompt_pin(
@@ -820,8 +864,10 @@ class GatewayAgentCacheMixin:
         if pin is None:
             return
         conversation = self._session_state(session_key).conversation
-        conversation.ephemeral_pin = (pin["context_key"], pin["context_prompt"], pin["redact_pii"])
-        conversation.channel_pin = (pin["channel_prompt"], pin["parent_chat_id"])
+        if need_eph:
+            conversation.ephemeral_pin = (pin["context_key"], pin["context_prompt"], pin["redact_pii"])
+        if need_chan:
+            conversation.channel_pin = (pin["channel_prompt"], pin["parent_chat_id"])
 
     async def _persist_prompt_pins(self, session_key: Optional[str], expected_session_id: Optional[str]) -> None:
         """Persist this conversation's pins before the agent runs; the store no-ops an unchanged
@@ -1140,6 +1186,11 @@ class GatewayAgentCacheMixin:
         # this eviction frees. Pressure-evictable agents have flushed by definition, so it's populated.
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = None
+
+    def _cached_agent_count(self) -> int:
+        """Live entries in the agent cache. Read lock-free by the runtime-status writer thread's
+        lcm_db_fds gauge (``len`` of an OrderedDict is atomic under the GIL)."""
+        return len(getattr(self, "_agent_cache", None) or ())
 
     def _agent_cache_bounds(self):
         """Operator-configured agent-cache bounds, resolved once per process (lazily, not in

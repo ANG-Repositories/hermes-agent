@@ -678,20 +678,23 @@ def finalize_turn(
     finish_turn(agent, _turn_exit_reason, final_response, interrupted=interrupted, failed=failed)
 
     _cleanup_errors: List[str] = []
+    from agent import turn_step_timing as _tail_timing
+    _tail = _tail_timing.resume_or_start(agent, turn_id)
+
+    def _guarded(label, fn):
+        with _tail.step(label):
+            _guarded_cleanup(label, fn, _cleanup_errors, logger)
+
     # The model has answered (or the loop gave up): a title upgrade held back because it shares a
     # self-hosted endpoint with the main request (#117296) may go out now.
     from agent.turn_context import start_deferred_title_upgrade
-    _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
+    _guarded("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent))
     # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
-    _guarded_cleanup(
+    _guarded(
         "save_trajectory",
         lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
-        _cleanup_errors, logger,
     )
-    _guarded_cleanup(
-        "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
-        _cleanup_errors, logger,
-    )
+    _guarded("cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id))
     # Persist only after the transcript tail is shaped and scaffolding removed. Each
     # sub-step runs in the same order as the original inline block, and the
     # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
@@ -699,7 +702,8 @@ def finalize_turn(
     # raise in any of them can't drop text the user already saw (#95514, #8049).
     def _persist_step():
         nonlocal final_response
-        _drop_transcript_scaffolding(agent, messages)
+        with _tail.step("drop_scaffolding"):
+            _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
         )
@@ -708,13 +712,17 @@ def finalize_turn(
         # gets the recorded outcome back. Either way the tail close below writes the text the
         # user will see, never the raw model text (#44239).
         if final_response and not interrupted:
-            final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
-        _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
+            with _tail.step("output_transform"):
+                final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
+        with _tail.step("close_tail"):
+            _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
-            _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
-        agent._persist_session(messages, conversation_history)
+            with _tail.step("micro_compact"):
+                _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
+        with _tail.step("persist"):
+            agent._persist_session(messages, conversation_history)
 
-    _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
+    _guarded("persist_session", _persist_step)
 
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
@@ -723,6 +731,8 @@ def finalize_turn(
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger,
                    effective_task_id=effective_task_id)
+    _tail.log_if_slow(logger, "pre_turn_ended", agent.session_id)
+    _tail = _tail_timing.start(agent, turn_id)
 
     # Response transforms apply only to real, uninterrupted responses.
     if final_response and not interrupted:
@@ -736,21 +746,23 @@ def finalize_turn(
     _response_transformed = False
     _pre_transform_response = None
     if final_response and not interrupted:
-        final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
-            agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
-            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
-        )
+        with _tail.step("output_hooks"):
+            final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
+                agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
+                turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+            )
 
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
     # ``None`` on turns that never reached a provider response — by contract.
     try:
         from agent.conversation_loop import _notify_context_engine_turn_complete
-        _notify_context_engine_turn_complete(
-            agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
-            turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
-            interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
-        )
+        with _tail.step("context_engine_turn_complete"):
+            _notify_context_engine_turn_complete(
+                agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
+                turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
+                interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
+            )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 
@@ -847,10 +859,11 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
-    )
+    with _tail.step("external_memory_sync"):
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message, final_response=final_response,
+            interrupted=interrupted, messages=messages,
+        )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
@@ -862,7 +875,7 @@ def finalize_turn(
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
-        with suppress(Exception):
+        with suppress(Exception), _tail.step("spawn_background_review"):
             agent._spawn_background_review(
                 messages_snapshot=list(messages), review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
@@ -873,18 +886,21 @@ def finalize_turn(
     # Fork: every turn (detached review forks included) emits through emit_session_end so each
     # Blackbox call-ledger row gets its turns row (#1056); the fork's turn carries
     # ``_blackbox_is_subagent``/parent ids instead of being suppressed.
-    emit_session_end(
-        agent,
-        turn_id=turn_id,
-        effective_task_id=effective_task_id,
-        completed=completed,
-        failed=failed,
-        interrupted=interrupted,
-        turn_exit_reason=_turn_exit_reason,
-        original_user_message=original_user_message,
-        final_response=final_response,
-        turn_calls=_turn_calls,
-    )
+    with _tail.step("emit_session_end"):
+        emit_session_end(
+            agent,
+            turn_id=turn_id,
+            effective_task_id=effective_task_id,
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            turn_exit_reason=_turn_exit_reason,
+            original_user_message=original_user_message,
+            final_response=final_response,
+            turn_calls=_turn_calls,
+        )
+    _tail.log_if_slow(logger, "post_turn_ended", agent.session_id)
+    _tail_timing.stop(agent)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
@@ -944,10 +960,16 @@ def emit_session_end(
                 # context WINDOW (occupancy) rather than the turn's SPEND. The
                 # /context "Context window" line renders this split so the
                 # window numbers are visibly different from the billed sums.
+                # The row's cache_*/input buckets are the BILL (a multi-request relay row sums
+                # every request, t_9f190074); the window split is the row's context_* fields.
                 _last_call = _turn_calls[-1]
-                _last_cache_read = int(_last_call.get("cache_read_tokens", 0) or 0)
-                _last_cache_write = int(_last_call.get("cache_write_tokens", 0) or 0)
-                _last_uncached = int(_last_call.get("input_tokens", 0) or 0)
+
+                def _last_split(key: str) -> int:
+                    return int(_last_call.get(f"context_{key}", _last_call.get(key, 0)) or 0)
+
+                _last_cache_read = _last_split("cache_read_tokens")
+                _last_cache_write = _last_split("cache_write_tokens")
+                _last_uncached = _last_split("input_tokens")
                 # Discriminator for the four FINAL-call figures (the split above
                 # plus context_used). The turn-level flags in _rollup_turn_usage
                 # are absorbing across every call, so they answer "did ANY call

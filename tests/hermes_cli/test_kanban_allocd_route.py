@@ -36,7 +36,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_worker_pool as kwp
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 from hermes_cli import placement_policy as pp
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "kanban_placement" / "allocd_replay.json"
@@ -110,15 +110,45 @@ class FakeAllocd:
                 hid = table.resolve(k) or k
                 resv[hid] = resv[hid].plus(v) if hid in resv else v
             d = placement.choose(table, req["consumer"], samples, reservations=resv, now=now, candidates=cands,
-                                 slots_used=placement.live_slots(req["consumer"], now=now, table=table),
+                                 admitted=placement.live_admissions(req["consumer"], now=now, table=table),
                                  footprint=req.get("footprint"), job=job, previous=req.get("previous"))
             return 200, {"shadow": True, "host": d.host, "reason": d.reason, "rule": d.rule}
         d, rid = placement.admit(table, req["consumer"], samples, ttl_s=req.get("ttl_s", 1800.0), job_id=req["job_id"],
                                  footprint=req.get("footprint"), job=job, previous=req.get("previous"),
                                  reuse_job=True, extra_reserved=extra, candidates=cands, now=now)
+        if d.host and req.get("unified") is True:
+            ok, why = self.confirm_class(table, req["consumer"], job, rid, samples, now=now,
+                                         stale_after_s=float(req.get("stale_after_s") or placement.DEFAULT_STALE_AFTER_S))
+            if not ok:
+                return 409, {"refused": True, "reason": f"unified_admission: {why}"}
         if d.host:
-            return 200, {"host": d.host, "reservation_id": rid, "rule": d.rule, "band": None}
+            out = {"host": d.host, "reservation_id": rid, "rule": d.rule, "band": None}
+            if req.get("unified") is True:
+                out["unified"] = True
+            return 200, out
         return 409, {"refused": True, "reason": d.reason}
+
+    @staticmethod
+    def confirm_class(table, consumer, job, rid, samples, *, now, stale_after_s):
+        """``scripts/allocd.py`` _confirm_class (hermes-home, t_c466b7ee): placement.may_start on THIS ledger under
+        its lock with the booked row left out by id; refused = the row is dropped in the same lock section."""
+        rpath = placement.reservations_path()
+        with placement._locked(rpath):
+            doc = placement._read_ledger(rpath)
+            own = next((r for r in doc["rows"] if r.get("id") == rid), None)
+            if own is None or not placement._row_live(own, now):
+                return False, f"closed:reservation {rid} not live at the class check"
+            hid = table.resolve(own["host"]) or own["host"]
+            live = [r for r in doc["rows"] if placement._row_live(r, now)]
+            leases = placement.ledger_leases(rpath, now=now, table=table)
+            del leases[next(i for i, r in enumerate(live) if r.get("id") == rid)]
+            admitted = placement.live_admissions(consumer, rpath, now=now, table=table).get(hid, 0) - 1
+            ok, why = placement.may_start(hid, consumer, job=job, table=table, now=now, samples=samples,
+                                          leases=leases, admitted=admitted, stale_after_s=stale_after_s)
+            if not ok:
+                placement._write_ledger(rpath, {"schema": doc.get("schema", placement.SCHEMA),
+                                                "rows": [r for r in doc["rows"] if r.get("id") != rid]})
+            return ok, why
 
 
 @pytest.fixture
@@ -157,7 +187,7 @@ def _replay_plan(home, dec, table_doc, mode):
                               ttl_s=86400, job_id=f"seed-{h}", path=rpath, now=at - 1)
     hosts, slots, detail, measured = [], {}, {}, {}
     for i, (h, v) in enumerate(sorted(dec["hosts"].items())):
-        n = table.hosts[table.resolve(h)].slots_for("kanban") or 1
+        n = table.hosts[table.resolve(h)].ceiling_for("kanban") or 1
         hosts.append(kwp.PoolHost(name=h, ssh_host=h, ssh_user="kanbanw", slots=n, capacity_pct=100.0,
                                   absence="optional", profiles=(dec["assignee"],), state="active",
                                   enabled=True, priority=i))
@@ -173,8 +203,7 @@ def _replay_plan(home, dec, table_doc, mode):
             detail[h] = {"slots": n, "running": 0, "load1": None,
                          "pressure": (v["reason"] or "closed").split(":", 1)[-1]}
     _pressure(home, measured, at=at)
-    sig = kwp.TargetSignal(policy=pp.PlacementPolicy(), state_path=home / "var" / kwp.TARGET_STATE_FILE,
-                           ledger_dir=home / "var" / "placement", clock=lambda: at, placement_table=table,
+    sig = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=home / "var" / "placement", clock=lambda: at, placement_table=table,
                            placement_reservations=rpath, allocd=mode)
     return kwp._finish_plan(hosts, slots, detail, (), at, None, sig)
 
@@ -639,7 +668,7 @@ def test_vendored_alloc_client_matches_canonical():
             skip = 1
             continue
         if skip and x.startswith("import placement"):
-            theirs_n.append("from hermes_cli import placement  # VENDORED: the fork's placement copy "
+            theirs_n.append("from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy "
                             "(hermes-home: sys.path + import placement)")
             skip = 0
             continue

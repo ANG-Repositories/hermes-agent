@@ -335,6 +335,14 @@ jobs:
           restore-keys: |
             test-durations-
 
+      - name: Snapshot restored durations (this slice's merge base)
+        # Concurrent main runs can restore different entries, so save-durations
+        # cannot use its own restore as every slice's baseline. Each slice ships
+        # the exact cache it started from; the merge diffs a slice against THAT
+        # (Prism ee9809c35fca, t_153af496).
+        run: |
+          if [ -f test_durations.json ]; then cp test_durations.json test_durations.base.json; fi
+
       - name: Run tests (${{ matrix.slice.name }})
         id: tests
         # The slice verdict below decides pass/fail (spec I4): a failure made
@@ -351,6 +359,14 @@ jobs:
         # matrix job via --files. Previously each job re-discovered files and
         # re-ran LPT independently — redundant N times.
         run: |
+          # Cross-repo vendoring contract (t_4ee9c117): the fleet runners mount the private
+          # hermes-home mirror read-only at /opt/git-mirror/2; hand its main placement.py to
+          # test_vendored_placement_matches_canonical. Hosted runners have no mirror: it skips.
+          if git -c safe.directory='*' --git-dir=/opt/git-mirror/2 show main:scripts/lib/placement.py \
+               > "$RUNNER_TEMP/placement_canonical.py" 2>/dev/null; then
+            export PLACEMENT_CANONICAL="$RUNNER_TEMP/placement_canonical.py"
+            echo "PLACEMENT_CANONICAL from hermes-home mirror main $(git -c safe.directory='*' --git-dir=/opt/git-mirror/2 rev-parse --short main)"
+          fi
           # Verbose pytest output lets timeout verdicts name the last test reached.
           scripts/run_tests.sh --files '${{ matrix.slice.files }}' \
             --junit-dir ci-junit --result-file ci-junit/slice-result.json -- -v
@@ -363,9 +379,10 @@ jobs:
           # Subprocess-per-file is import/IO-bound, not CPU-bound: workers spend
           # most of their wall time in interpreter boot + module import, not
           # computing. This is a CEILING, not an absolute — run_tests_parallel.py
-          # clamps it to max(2, effective_cpus*2) where effective_cpus comes from
-          # the cgroup CPU quota, not nproc. So a 4-vCPU hosted runner still gets
-          # 8, while a --cpus=2 self-hosted container gets 4 instead of 12.
+          # clamps it to max(2, effective_cpus) where effective_cpus comes from
+          # the cgroup CPU quota, not nproc. So a 4-vCPU runner gets 4 and a
+          # --cpus=2 self-hosted container gets 2 instead of 12 (2x the quota
+          # blew per-test walls on the 4-CPU mirror pool, t_58979a5e).
           # (12 on 2 CPUs was 6x oversubscription: CFS throttling blew wall-clock
           # windows and sqlite busy-timeouts, ejecting merge-queue entries.)
           # HERMES_TEST_WORKERS_FORCE=1 bypasses the clamp.
@@ -382,7 +399,10 @@ jobs:
           name: ci-slice-result-${{ matrix.slice.index }}-a${{ github.run_attempt }}
           path: ci-junit/
           if-no-files-found: warn
-          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+          # 14 days on evidence events: flake_quarantine.py / flake_ledger.py read these
+          # junits back EVIDENCE_WINDOW_DAYS=14 for push/merge_group/schedule runs only.
+          # PR runs are never evidence, so they keep the t_82cb42f5 3-day cut.
+          retention-days: ${{ contains(fromJSON('["push", "merge_group", "schedule"]'), github.event_name) && 14 || 3 }}
 
       - name: Slice verdict (flake quarantine, base-ref list)
         # Green iff the suite passed, or every failure is a test that is
@@ -416,11 +436,19 @@ jobs:
       - name: Upload per-slice durations
         # Advisory artifact (feeds slice balancing) — a transient artifact-
         # service blip must not fail an otherwise-green test slice.
+        # !cancelled(): a red slice still writes its PASSING files' durations
+        # (_clean_pass_durations drops failed/flaky ones). Under the implicit
+        # success() a red verdict skipped this upload, and main runs 7-9/16
+        # slices red, so the cache was never written (t_153af496).
+        if: ${{ !cancelled() }}
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-durations-slice-${{ matrix.slice.index }}
-          path: test_durations.json
+          path: |
+            test_durations.json
+            test_durations.base.json
+          if-no-files-found: ignore
           retention-days: 1
 
   # Merge per-slice duration data into a single cache, so future runs
@@ -430,11 +458,36 @@ jobs:
     # !cancelled() replaces the implicit success(), which also failed on the
     # always-skipped `placement` ancestor of `test` and skipped this job on
     # every push:main run since #938 (last cache written 2026-09-24T15:30Z).
-    if: "!cancelled() && needs.test.result == 'success' && github.ref == 'refs/heads/main'"
+    # needs.test.result != 'skipped' (not == 'success'): main runs 7-9/16
+    # slices red, so the success gate skipped this job on every push:main run
+    # and the repo held 0 test-durations-* entries (205/205 restores missed,
+    # t_153af496). Red slices still upload their passing files' durations.
+    # Main only: PRs restore main's entry via restore-keys (default-branch
+    # caches are readable from every PR); a PR-scoped entry is not.
+    if: "!cancelled() && needs.test.result != 'skipped' && github.ref == 'refs/heads/main'"
+    # Advisory plumbing: now that it runs on red runs too, its own failure
+    # (no readable slice files) must not add a red job to the run.
+    continue-on-error: true
     # Artifact/cache plumbing needs no LAN or self-hosted test slot.
     runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
+      - name: Restore previous merged durations (merge base)
+        # Each slice file is its own restored cache plus its fresh values
+        # (_save_durations merges into it). A plain dict.update over slices
+        # lets a stale copy overwrite a fresh value, so the merge takes only
+        # entries a slice changed vs ITS OWN snapshot (test_durations.base.json
+        # in its artifact), then applies them over this newest entry. A
+        # concurrent main run may have saved between a slice's restore and
+        # this one, so this restore is the output base, never the diff base.
+        # Same path as the save so the cache version matches.
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-restore-${{ github.run_id }}
+          restore-keys: |
+            test-durations-
+
       - name: Download all slice durations
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -452,13 +505,28 @@ jobs:
         run: |
           python3 -c "
           import json, glob, os, sys
-          merged = {}
+          base = {}
+          if os.path.isfile('test_durations.json'):
+            try:
+              with open('test_durations.json') as fh:
+                base = json.load(fh)
+            except (json.JSONDecodeError, OSError) as e:
+              print(f'WARNING: unreadable base cache, merging without it: {e}', file=sys.stderr)
+          merged = dict(base)
           files = sorted(glob.glob('durations/**/test_durations.json', recursive=True))
           bad = 0
           for f in files:
             try:
               with open(f) as fh:
-                merged.update(json.load(fh))
+                data = json.load(fh)
+              # Fresh = changed vs the cache THIS slice restored (absent
+              # snapshot = restore missed, every entry is fresh).
+              snap = os.path.join(os.path.dirname(f), 'test_durations.base.json')
+              sbase = {}
+              if os.path.isfile(snap):
+                with open(snap) as fh:
+                  sbase = json.load(fh)
+              merged.update({k: v for k, v in data.items() if sbase.get(k) != v})
             except (json.JSONDecodeError, OSError) as e:
               # One unreadable slice must not sink the aggregate cache —
               # but zero readable slices should fail loudly.

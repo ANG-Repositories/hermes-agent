@@ -401,6 +401,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(
         hermes_constants, "_get_platform_default_hermes_home", isolated_platform_default
     )
+    # The CI runners are Docker containers (/.dockerenv), so the canonical container signal
+    # made every owner-only chmod a no-op there and the 0600/0700 tests red on ci-box/ace-ai only.
+    # Like HERMES_CONTAINER (blanked in step 2), the runner's own container-ness is not a test
+    # input; tests of the container policy set it explicitly (t_b56f9e1e).
+    monkeypatch.setattr(hermes_constants, "_detect_container", lambda: False)
     fake_hermes_home = tmp_path / "hermes_test"
     fake_hermes_home.mkdir()
     (fake_hermes_home / "sessions").mkdir()
@@ -452,6 +457,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # create cards without a session predate that. The refusal's own tests
     # (test_kanban_operator_home.py) unset this.
     monkeypatch.setenv("HERMES_KANBAN_ALLOW_UNHOMED_CREATE", "1")
+    # t_f2eb71b3: add_comment refuses an operator APPROVE review_coverage stamp
+    # unless the one writer (hermes-home operator_approve.py) set this; fixtures
+    # that seed operator APPROVE records predate that. The refusal's own tests
+    # (test_kanban_close_on_guard.py) unset it.
+    monkeypatch.setenv("OPERATOR_APPROVE_WRITER", "1")
     # And never let a developer-shell (or leaked child) bypass disarm the
     # guard for in-process code under test.
     monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)
@@ -665,6 +675,37 @@ def _isolate_fallback_sticky_store():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_relay_health_cache():
+    """Fresh process-global relay /health TTL cache per test (t_bde7653d): a body
+    cached in one test must not answer a reused loopback port in the next."""
+    try:
+        from hermes_cli import kanban_provider_health as _kph
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    caches = [getattr(_kph, n, {}) for n in ("_RELAY_HEALTH_CACHE", "_RELAY_UNREADABLE_LOGGED")]
+    for c in caches:
+        c.clear()
+    yield
+    for c in caches:
+        c.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_wall_budget_registry():
+    """Fresh process-global cross-session wait registry per test (t_78b5a5bb): a wait
+    armed in one test must not read as a sibling session in the next."""
+    try:
+        from agent import fallback_wall_budget as _wb
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _wb.clear_registry()
+    yield
+    _wb.clear_registry()
+
+
+@pytest.fixture(autouse=True)
 def _refuse_real_detached_delegation_child(request, monkeypatch):
     """A background delegate_task in a gateway-bound session spawns a REAL ``python -m
     tools.delegate_detached`` process by default (``delegation.detached_background``). It never runs
@@ -770,6 +811,94 @@ def _reset_foreground_exit_fence():
 
 
 @pytest.fixture(autouse=True)
+def _kanban_bare_verb_policy_cache_reset():
+    """``kanban.bare_verb`` is cached per config path; tests write that file under temp homes."""
+    try:
+        from hermes_cli import kanban_board_select as _kbsel
+    except Exception:
+        return
+    _kbsel._POLICY_CACHE.clear()
+
+
+def _kanban_test_call_site() -> str:
+    """The innermost frame in a test file (not a conftest/helper module) on the current stack."""
+    tests_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
+    frame = sys._getframe(2)
+    while frame is not None:
+        path = frame.f_code.co_filename
+        if path.startswith(tests_dir) and os.path.basename(path).startswith("test_"):
+            return f"{os.path.relpath(path, os.path.dirname(tests_dir.rstrip(os.sep)))}:{frame.f_lineno}"
+        frame = frame.f_back
+    return "<no test frame on the stack>"
+
+
+@pytest.fixture(autouse=True)
+def _kanban_unnamed_board_guard(request, monkeypatch):
+    """S7 §6: fail AT THE CALL SITE when a test reaches board resolution with no board and no pin.
+
+    Under the shipped ``kanban.bare_verb: refuse`` such a call is refused, and the surface turns
+    the refusal into an rc 2, a tool error or an HTTP 400 that some assertion trips over several
+    frames later. This guard fails the test with the test line that made the call instead. Tests
+    that exercise the refusal itself opt out with ``@pytest.mark.kanban_board_refusal``.
+    ``pytest.fail`` raises a BaseException, so the surfaces' ``except Exception`` cannot eat it.
+    """
+    if request.node.get_closest_marker("kanban_board_refusal"):
+        yield
+        return
+    try:
+        from hermes_cli import kanban_board_select as _kbsel
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        yield
+        return
+
+    def _fail(verb: str) -> None:
+        pytest.fail(
+            f"kanban {verb} reached board resolution with no board and no pin at "
+            f"{_kanban_test_call_site()}: pass board=\"default\" (tool dict), --board default (CLI) "
+            f"or ?board=default (dashboard), or mark the test kanban_board_refusal if the refusal "
+            f"is what it tests.",
+            pytrace=False,
+        )
+
+    real_resolve_slug = _kbsel.resolve_slug
+
+    def _guarded_resolve_slug(board, *, verb, card_ids=()):
+        try:
+            return real_resolve_slug(board, verb=verb, card_ids=card_ids)
+        except _kbsel.BoardRequired:
+            if not _kb.raw_db_pin():
+                _fail(verb)
+            raise
+
+    real_policy = _kbsel.bare_verb_policy
+    dashboard_hits: list[str] = []
+
+    def _guarded_policy():
+        policy = real_policy()
+        # The dashboard's _resolve_board reads the policy directly for an omitted ?board=. It runs
+        # on the TestClient's portal thread, so record the request and fail at teardown instead of
+        # raising through the ASGI stack.
+        caller = sys._getframe(1)
+        if policy != _kbsel.BARE_VERB_DEFAULT and caller.f_code.co_name == "_resolve_board":
+            endpoint = caller.f_back.f_code.co_name if caller.f_back else "?"
+            dashboard_hits.append(endpoint)
+        return policy
+
+    monkeypatch.setattr(_kbsel, "resolve_slug", _guarded_resolve_slug)
+    monkeypatch.setattr(_kbsel, "bare_verb_policy", _guarded_policy)
+    yield
+    if dashboard_hits:
+        pytest.fail(
+            f"kanban dashboard request(s) named no board ({len(dashboard_hits)}x, endpoints: "
+            f"{sorted(set(dashboard_hits))}) in {request.node.nodeid}: request with ?board=default "
+            f"(tests/plugins/_kanban_board_client.naming_board), or mark the test "
+            f"kanban_board_refusal if the 400 is what it tests.",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
 
@@ -806,6 +935,24 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_owning_install_retarget(request, monkeypatch):
+    """Keep ``cmd_update`` from re-running itself in the checkout whose venv runs the suite.
+
+    Update tests point ``PROJECT_ROOT`` at a fake tree; under a checkout's in-tree ``.venv``
+    ``retarget_to_owning_install`` correctly reads that as a redirected install and re-execs
+    the real updater with pytest's argv (SystemExit 2). Tests of the repair itself opt in with
+    ``@pytest.mark.real_owning_install``.
+    """
+    if request.node.get_closest_marker("real_owning_install"):
+        return
+    try:
+        from hermes_cli import update_owning_install
+    except Exception:
+        return
+    monkeypatch.setattr(update_owning_install, "retarget_to_owning_install", lambda *_: None)
 
 
 @pytest.fixture(autouse=True)
@@ -1164,6 +1311,53 @@ def _state_db_write_guard(request, monkeypatch):
     monkeypatch.setattr(
         _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
     )
+    yield
+
+
+# ── state.db holder scan: only this test's own processes are suspects ───────
+# ``hermes_state_holders.foreign_state_db_holders`` walks the WHOLE host's
+# /proc and, by design, counts a process it cannot inspect (fd readlink/listdir
+# EACCES) as a holder of ANY state.db when its argv looks like Hermes. On a
+# shared CI/worker host other jobs' ``python -m hermes_cli`` children (runner
+# containers, other users) are exactly that, so a test's private tmp state.db
+# read as "held" whenever one happened to be alive: 0/3/6/6/8 failures across
+# identical runs on ace-media (t_9b59804a). A process the test did not spawn
+# cannot hold a fresh tmp_path DB, so its argv is withheld from the scan
+# (``None`` = "not identifiable", the scan's own answer for an unreadable
+# cmdline). Descendants of this pytest process — the real holders the tests
+# spawn — keep the production fail-closed path. Readable-fd inode matches are
+# untouched. A test that patches ``_read_proc_argv`` itself overrides this.
+
+
+def _pid_descends_from(pid: int, ancestor: int) -> bool:
+    for _ in range(64):
+        if pid == ancestor:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                pid = int(handle.read().rsplit(b")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _holder_scan_ignores_unrelated_host_processes(monkeypatch):
+    holders = sys.modules.get("hermes_state_holders")
+    if holders is None or not sys.platform.startswith("linux"):
+        yield
+        return
+    real_read_proc_argv = holders._read_proc_argv
+    test_pid = os.getpid()
+
+    def _read_proc_argv(pid):
+        if not _pid_descends_from(pid, test_pid):
+            return None
+        return real_read_proc_argv(pid)
+
+    monkeypatch.setattr(holders, "_read_proc_argv", _read_proc_argv)
     yield
 
 
@@ -1574,6 +1768,11 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
 
     config.addinivalue_line(
         "markers",
+        "kanban_board_refusal: test exercises the S7 board refusal itself (opts out of the "
+        "unnamed-board call-site guard)",
+    )
+    config.addinivalue_line(
+        "markers",
         "allow_sys_modules_purge: test intentionally leaves sys.modules purged "
         "(opts out of the sys.modules leak gate — say why in a comment)",
     )
@@ -1588,6 +1787,9 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers", "real_release_channels: keep the real R2 channel reader (no local source-branch stub)."
+    )
+    config.addinivalue_line(
+        "markers", "real_owning_install: keep the real cmd_update owning-install retarget (no autouse stub)."
     )
     config.addinivalue_line(
         "markers",

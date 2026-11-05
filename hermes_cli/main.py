@@ -226,6 +226,9 @@ def _set_process_title() -> None:
     kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if kanban_task:
         title = f"hermes kanban-worker {kanban_task}"
+    elif sys.argv[1:] == ["cron", "runner"]:
+        # cron_runner_plist.uninstall() finds a surviving runner by this title (t_5a9e1629).
+        title = "hermes cron runner"
     try:
         import setproctitle  # type: ignore[import-untyped]
 
@@ -942,7 +945,6 @@ from hermes_cli.main_web_build import (  # frozen updater surface: update_cmd*.p
 )
 from hermes_cli.main_tui_launch import (
     _launch_tui,
-    _pin_kanban_board_env,
     _resolve_use_tui,
     _sync_bundled_skills_quietly,
 )
@@ -1908,7 +1910,6 @@ def cmd_chat(args):
         # runs must keep it (see run_agent._session_source_for_agent).
         os.environ["HERMES_SESSION_SOURCE_EXPLICIT"] = "1"
 
-    _pin_kanban_board_env()
     from hermes_cli.observability.shared_metrics_consent import offer_consent_before_chat
 
     offer_consent_before_chat(args)
@@ -2942,6 +2943,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
+        "delegation-unit",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
@@ -3010,7 +3012,7 @@ def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
         )
 
 
-_AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+_AGENT_COMMANDS = {None, "chat", "acp", "rl", "delegation-unit"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
     "gateway": ("gateway_command", {"run"}),
@@ -3617,6 +3619,10 @@ def _build_cli_parser():
     build_gui_parser(subparsers, cmd_gui=cmd_gui)
     build_logs_parser(subparsers, cmd_logs=cmd_logs)
     build_prompt_size_parser(subparsers, cmd_prompt_size=cmd_prompt_size)
+
+    # Hidden: the kanban-runtime background delegation runner (spawned by the dispatcher only).
+    from hermes_cli.subcommands.delegation_unit import build_delegation_unit_parser
+    build_delegation_unit_parser(subparsers)
     return parser, subparsers
 
 

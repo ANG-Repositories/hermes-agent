@@ -69,6 +69,9 @@ _IDLE_WAKE_HORIZON_S = 6 * 3600
 # No-progress stop: this many judged-``continue`` turns in a row with no tool call (the agent is only
 # answering the judge) pauses the goal. 0 disables.
 DEFAULT_NO_PROGRESS_TURNS = 4
+# Turn effects (hermes_cli.goal_turn_effects) after which no continuation is queued unless the user
+# spoke: a wake/page/NO_REPLY answered with reads only changed nothing the next turn could act on.
+_NO_NUDGE_TURN_EFFECTS = frozenset({"read", "none"})
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -498,6 +501,14 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    # Bumped by every GoalManager save; GoalManager._save compares the stored row before writing.
+    revision: int = 0
+    # Stamped by resume(): with goal + created_at it is the active goal's identity (same_active_goal), so a
+    # pause+resume (which enqueues its own continuation) is not mistaken for a nonterminal edit.
+    resumed_at: float = 0.0
+    # Bumped by every save an evaluate_after_turn makes: a row another evaluation advanced is not the row
+    # this one judged, so same_active_goal is false and the older evaluation never retries onto it.
+    evaluation_writes: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -506,8 +517,8 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns")}
-        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
+        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at", "resumed_at")}
         return cls(
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
@@ -545,6 +556,13 @@ class GoalState:
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
+
+# GoalState fields an idle wake mutates (accounting + the wait barrier it consumes).
+_IDLE_WAKE_FIELDS = (
+    "idle_wakes", "last_idle_wake_at", "waiting_on_pid", "waiting_on_session", "waiting_until",
+    "waiting_on_delegations", "waiting_reason", "waiting_since",
+)
+
 
 def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
@@ -683,23 +701,31 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
 
 def load_goal(session_id: str) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
+    return _load_goal_raw(session_id)[0]
+
+
+def _load_goal_raw(session_id: str, *, strict: bool = False) -> Tuple[Optional[GoalState], Optional[str]]:
+    """``(state, stored row text)``; the text is the revision GoalManager._save compares against.
+    ``strict``: a failed read raises instead of reading as "no goal" (a locked DB is not a cleared goal)."""
     if not session_id:
-        return None
+        return None, None
     db = _get_session_db()
     if db is None:
-        return None
+        return None, None
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        raw = db.get_meta_committed(_meta_key(session_id))
     except Exception as exc:
+        if strict:
+            raise
         logger.debug("GoalManager: get_meta failed: %s", exc)
-        return None
+        return None, None
     if not raw:
-        return None
+        return None, None
     try:
-        return GoalState.from_json(raw)
+        return GoalState.from_json(raw), raw
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
-        return None
+        return None, raw
 
 
 def list_active_goal_session_ids() -> List[str]:
@@ -734,6 +760,41 @@ def save_goal(session_id: str, state: GoalState) -> None:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
+
+
+def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    """Give back a recorded idle wake that was never dispatched (the session turned busy or was
+    /stop-ped meanwhile), so it does not consume a check-in. Read, compare and write run in ONE
+    write transaction, so a pause/clear from any surface either lands first (and the goal is left
+    alone) or after (and sees the restored fields). The give-back applies only while the stored row
+    is byte-identical to the row the wake saved (``after["_row"]``): any save since then, including
+    a replacement goal whose fields happen to equal the post-wake values, wins and is left alone.
+    Returns True when anything changed."""
+    db = _get_session_db() if session_id and before else None
+    execute_write = getattr(db, "_execute_write", None)
+    if execute_write is None:
+        return False
+    key = _meta_key(session_id)
+
+    def _txn(conn) -> bool:
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if not row or not after.get("_row") or row[0] != after["_row"]:
+            return False  # the row is no longer the one this wake wrote (another save or another goal)
+        state = GoalState.from_json(row[0]) if row and row[0] else None
+        if state is None or state.status != "active":
+            return False
+        changed = [f for f in _IDLE_WAKE_FIELDS if f in before and getattr(state, f) == after.get(f) != before[f]]
+        for field in changed:
+            setattr(state, field, before[field])
+        if changed:
+            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
+        return bool(changed)
+
+    try:
+        return bool(execute_write(_txn))
+    except Exception as exc:
+        logger.debug("GoalManager: idle-wake undo failed for %s: %s", session_id, exc)
+        return False
 
 
 def clear_goal(session_id: str) -> None:
@@ -1265,6 +1326,33 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+_UNPINNED = object()  # evaluate_after_turn(baseline=...) not given
+_STALE_RETRIES = 2  # re-evaluations after a nonterminal edit to the same goal lost the CAS mid-judge
+
+
+def _row_state(raw: Optional[str]) -> Optional[GoalState]:
+    try:
+        return GoalState.from_json(raw) if raw else None
+    except Exception:
+        return None
+
+
+def same_active_goal(a: Optional[GoalState], b: Optional[GoalState]) -> bool:
+    """Both rows are the SAME activation of the same goal and both active: set() stamps created_at (a
+    replacement restarts it), resume() stamps resumed_at, every evaluation save bumps evaluation_writes.
+    A nonterminal edit (/subgoal, gate, contract, check-in interval) keeps this true; pause, clear, done,
+    resume, a replacement or another evaluation's write makes it false."""
+    return (
+        a is not None and b is not None and a.status == "active" and b.status == "active"
+        and a.goal == b.goal and a.created_at == b.created_at and a.resumed_at == b.resumed_at
+        and a.evaluation_writes == b.evaluation_writes
+    )
+
+
+class _StaleGoalWrite(Exception):
+    """A save inside evaluate_after_turn lost the compare-and-set (internal control flow)."""
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1276,7 +1364,16 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._state, self._stored = _load_goal_raw(session_id)
+        self._evaluating = False
+
+    def reload(self, *, strict: bool = False) -> Optional[GoalState]:
+        """Re-read the persisted goal, dropping this manager's snapshot (another writer may have saved).
+        State and stored row are refreshed together: ``_stored`` is the CAS token ``_save`` and
+        ``idle_wake_snapshot`` compare against, so it must be the row this state was read from.
+        ``strict``: a failed read raises (snapshot kept) instead of reading as "no goal"."""
+        self._state, self._stored = _load_goal_raw(self.session_id, strict=strict)
+        return self._state
 
     # --- introspection ------------------------------------------------
 
@@ -1322,8 +1419,33 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
-        return self._state
+        """Inside ``evaluate_after_turn`` the write is compare-and-set against the row this manager
+        loaded: a judge holding a stale copy (the user ran /goal pause or clear meanwhile) drops its
+        write and aborts. Every other caller is a user verb or a fresh read-modify-write; it writes."""
+        db = _get_session_db() if self.session_id and self._state is not None else None
+        if db is None:  # not persisted (warned); _stored still mirrors the row as last seen
+            save_goal(self.session_id, self._state)
+            return self._state
+        self._state.revision += 1
+        if self._evaluating:
+            self._state.evaluation_writes += 1
+        raw = self._state.to_json()
+        try:
+            if self._evaluating:
+                written = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+            else:
+                db.set_meta(_meta_key(self.session_id), raw)
+                written = True
+        except Exception as exc:
+            logger.debug("GoalManager: goal write failed: %s", exc)
+            return self._state
+        if written:
+            self._stored = raw
+            return self._state
+        logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
+        lost_to = self._stored
+        self._state, self._stored = _load_goal_raw(self.session_id)
+        raise _StaleGoalWrite(lost_to)  # abort: nothing more of this evaluation may touch the new row
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1375,6 +1497,7 @@ class GoalManager:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        self._state.resumed_at = time.time()
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
@@ -1660,11 +1783,46 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
-    def evaluate_after_turn(
+    def evaluate_after_turn(self, last_response: str, *, baseline: Any = _UNPINNED, **kwargs: Any) -> Dict[str, Any]:
+        """See ``_evaluate_after_turn``. A save that lost to a newer stored state (the user paused,
+        cleared or replaced the goal while the judge ran) never continues on the stale copy.
+        ``baseline``: the stored row when the turn ended; a different row now is a goal the turn never saw."""
+        if _get_session_db() is not None:  # CAS baseline = the row as of evaluation start, not construction
+            try:
+                now = _load_goal_raw(self.session_id, strict=True)
+            except Exception as exc:  # keep the loaded state; the CAS still guards the write
+                logger.warning("GoalManager: goal refresh for %s failed, keeping loaded state: %s", self.session_id, exc)
+                now = (self._state, self._stored)
+            if now[1] != self._stored:  # another manager wrote the row since our last load/save
+                self._state, self._stored = now
+        # A nonterminal edit to the same active goal (/subgoal during the send) is judged on the edited
+        # row; only a pause, clear, done or replacement skips (nothing else re-arms the loop then).
+        if baseline is not _UNPINNED and baseline != self._stored and not same_active_goal(_row_state(baseline), self._state):
+            logger.info("GoalManager: goal for %s changed since the turn ended; skipped the evaluation", self.session_id)
+            status = self._state.status if self._state else None
+            return {**_decision(status, False, None, "stale", "goal changed since the turn ended", ""), "held": "stale"}
+        for _attempt in range(_STALE_RETRIES + 1):
+            self._evaluating = True
+            try:
+                return self._evaluate_after_turn(last_response, **kwargs)
+            except _StaleGoalWrite as lost:
+                evaluated = _row_state(lost.args[0])  # the row the failed CAS expected; _save reloaded the newer one
+            finally:
+                self._evaluating = False
+            # Retry only a nonterminal edit; a row another evaluation advanced keeps the old abort.
+            if not same_active_goal(evaluated, self._state):
+                break
+            logger.info("GoalManager: goal for %s was edited while the judge ran; re-evaluating", self.session_id)
+        status = self._state.status if self._state else None
+        return {**_decision(status, False, None, "stale", "goal changed while the judge ran", ""), "held": "stale"}
+
+    def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0, real_event: bool = False, made_tool_calls: Optional[bool] = None,
-        no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS,
+        no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS, turn_effect: Optional[str] = None,
+        user_spoke: bool = False, nudge_on_read_only_turns: bool = False,
+        checkin_minutes: float = DEFAULT_CHECKIN_MINUTES, max_checkins: int = DEFAULT_MAX_IDLE_CHECKINS,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -1673,7 +1831,16 @@ class GoalManager:
         ``real_event``: the turn was NOT started by the goal loop (user message, worker/process result);
         it re-arms the idle check-ins. ``made_tool_calls``: whether the turn called any tool (None =
         unknown, not counted); ``no_progress_turns`` judged-continue turns in a row without one pause
-        the goal (0 disables)."""
+        the goal (0 disables).
+
+        ``turn_effect`` (``hermes_cli.goal_turn_effects``: write | read | none; None = unknown): a
+        read/none turn the user did not author (``user_spoke``) still gets the judge's done/blocked/
+        wait/budget verdicts but queues no continuation, and leaves ``turns_used``/``last_turn_at``/
+        ``toolless_turns`` unchanged, so the idle check-in is the next nudge.
+        ``nudge_on_read_only_turns`` (config ``goals.nudge_on_read_only_turns``) disables the gate.
+        A held turn is never the last word: when no idle check-in can follow it (``checkin_minutes``
+        is the gateway's config value; 0 means the idle poller is off; see ``_idle_checkin_can_follow``)
+        the continuation is queued anyway and the decision carries ``hold_overridden``."""
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
@@ -1685,6 +1852,7 @@ class GoalManager:
         if self.is_waiting():
             return self._waiting_decision(state)
 
+        prior_turns_used, prior_last_turn_at = state.turns_used, state.last_turn_at
         state.turns_used += 1
         state.last_turn_at = time.time()
 
@@ -1749,6 +1917,14 @@ class GoalManager:
         if state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
 
+        hold_overridden = None
+        if not nudge_on_read_only_turns and not user_spoke and turn_effect in _NO_NUDGE_TURN_EFFECTS:
+            if self._idle_checkin_can_follow(prior_last_turn_at, checkin_minutes, max_checkins):
+                state.turns_used, state.last_turn_at = prior_turns_used, prior_last_turn_at
+                self._save()
+                return {**_decision("active", False, None, "continue", reason, ""), "held": turn_effect}
+            hold_overridden = f"held: {turn_effect}-only turn, no check-in configured"
+
         if made_tool_calls is not None:
             state.toolless_turns = 0 if made_tool_calls else state.toolless_turns + 1
             if no_progress_turns and state.toolless_turns >= no_progress_turns:
@@ -1761,10 +1937,27 @@ class GoalManager:
                 )
 
         self._save()
-        return _decision(
+        decision = _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
         )
+        if hold_overridden:
+            decision["hold_overridden"] = hold_overridden
+        return decision
+
+    def _idle_checkin_can_follow(self, last_turn_at: float, checkin_minutes: float, max_checkins: int) -> bool:
+        """Whether ``idle_wake_prompt`` will ever wake this goal after a held turn. Mirrors its gates:
+        the gateway poller runs only with a positive config interval, the goal's own interval wins,
+        the check-in budget, and the stale horizon."""
+        s = self._state
+        if s is None or not checkin_minutes or checkin_minutes <= 0:
+            return False
+        minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
+        if not minutes or minutes <= 0 or s.idle_wakes >= max(0, int(max_checkins)):
+            return False
+        interval = minutes * 60 * min(2 ** s.idle_wakes, _CHECKIN_BACKOFF_CAP)
+        base = max(last_turn_at, s.last_idle_wake_at, s.created_at)
+        return interval <= _IDLE_WAKE_HORIZON_S and time.time() - base <= _IDLE_WAKE_HORIZON_S
 
     def idle_wake_prompt(
         self, now: Optional[float] = None, *, checkin_minutes: float = DEFAULT_CHECKIN_MINUTES,
@@ -1826,6 +2019,14 @@ class GoalManager:
         s.last_idle_wake_at = now
         self._save()
         return prompt
+
+    def idle_wake_snapshot(self) -> Dict[str, Any]:
+        """The fields ``idle_wake_prompt`` may change, plus the exact stored row (``_row``), for
+        ``undo_idle_wake``. Take the post-wake snapshot right after the wake's save."""
+        s = self._state
+        if s is None:
+            return {}
+        return {**{f: getattr(s, f) for f in _IDLE_WAKE_FIELDS}, "_row": self._stored}
 
     def set_checkin_minutes(self, minutes: int) -> GoalState:
         """Per-goal check-in interval (minutes; 0 = off for this goal; -1 = config default)."""

@@ -136,7 +136,7 @@ def test_ac12_running_per_host_equals_running_by_host_in_ladder_order(home, boar
     assert list(rep["hosts"]) == LADDER  # the pool's priority, not a hard-coded list
     running = {n: h["running"] for n, h in rep["hosts"].items() if h["running"]}
     assert running == _running_by_host_all_boards() == {"zeta-box": 3, "mid-box": 1, "alpha-box": 1}
-    assert [h["slots"] for h in rep["hosts"].values()] == [6, 2, 4]
+    assert [h["slots"] for h in rep["hosts"].values()] == [None, None, None]   # t_b20850d2: no kanban count
     zeta = rep["hosts"]["zeta-box"]
     assert {(c["task_id"], c["board"], c["rule"]) for c in zeta["cards"]} == {
         (boards["z1"], "default", "pin"), (boards["z2"], "default", "band_spilling"),
@@ -182,7 +182,7 @@ def test_ac12_json_is_the_dict_the_text_prints(home, boards):
     assert json.loads(json.dumps(rep)) == rep
     text = "\n".join(kpv.format_fleet(rep))
     for name, h in rep["hosts"].items():
-        assert f"  {name}: running={h['running']} slots={h['slots']}" in text
+        assert f"  {name}: running={h['running']} slots=uncounted" in text
 
 
 def test_ac12_task_block(home, boards):
@@ -248,8 +248,18 @@ def test_ac12_no_reason_literal_outside_the_reasons_module():
     values = {v for k, v in vars(pr).items() if k.isupper() and isinstance(v, str)}
     values |= {"pin_host_full", "pin_host_hot", "pool_full", "local_full"}  # take()/route codes
     src = Path(kpv.__file__)
-    found = sorted({(n.value, n.lineno) for n in ast.walk(ast.parse(src.read_text()))
-                    if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in values})
+    tree = ast.parse(src.read_text())
+    # The report's own schema key "gate" shares its spelling with
+    # LOCAL_BINDING_GATE (#2256). It is exempt only in KEY position (dict-literal
+    # key or ``.get("gate")``); as a value it is still a reason literal.
+    report_keys = {"gate"}
+    key_nodes = {id(k) for n in ast.walk(tree) if isinstance(n, ast.Dict) for k in n.keys if k is not None}
+    key_nodes |= {id(n.args[0]) for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr == "get" and n.args}
+    found = sorted({(n.value, n.lineno) for n in ast.walk(tree)
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in values
+                    and not (n.value in report_keys and id(n) in key_nodes)})
     assert found == [], found
     wp = ast.parse(Path(kwp.__file__).read_text())
     assert not [n for n in ast.walk(wp) if isinstance(n, ast.Constant) and n.value == pr.WORKER_PLACED_EVENT]
@@ -277,7 +287,7 @@ def test_cli_placement_fleet_and_diagnostics_alias(home, boards, tmp_path, capsy
     assert rep["hosts"]["zeta-box"]["band"] == "warm" and rep["hosts"]["zeta-box"]["running"] == 3
     _write(home / "load_gate.json", _gate(band_zeta="hot"))
     assert kcli._cmd_diagnostics(_parse("diagnostics", "--placement", "--fleet")) == 0
-    assert any(ln.startswith("  zeta-box: running=3 slots=6") and "band=hot" in ln
+    assert any(ln.startswith("  zeta-box: running=3 slots=uncounted") and "band=hot" in ln
                for ln in capsys.readouterr().out.splitlines())
     assert kcli._cmd_placement(_parse("placement", boards["h_pin"])) == 0
     assert "held: pin_host_full host=zeta-box" in capsys.readouterr().out

@@ -3,9 +3,9 @@
 # the PR-head status; the job below is only the merge-group check-run.
 name: Fleet attribution merge-group relay
 
+# t_868e850a: public mirror load guard -- self-triggers removed (merge_group); dispatch-only until re-enabled on a card.
 on:
-  merge_group:
-    types: [checks_requested]
+  workflow_dispatch:
 
 permissions:
   contents: read

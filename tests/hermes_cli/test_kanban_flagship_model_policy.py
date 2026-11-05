@@ -14,7 +14,8 @@ from hermes_cli.model_policy import FLAGSHIP_MODEL_SUBSTRINGS
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+# proven_operator: flagship overrides need operator authority (t_9e7ba884).
+def kanban_home(tmp_path, monkeypatch, proven_operator):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -62,7 +63,7 @@ def test_create_refuses_flagship_model_without_override(
     kanban_home, capsys, model,
 ):
     rc = kc.kanban_command(
-        _parse("create", "guarded", "--assignee", "worker", "--model", model)
+        _parse("create", "--board", "default", "guarded", "--assignee", "worker", "--model", model)
     )
 
     captured = capsys.readouterr()
@@ -80,7 +81,7 @@ def test_create_refuses_flagship_model_without_override(
 def test_create_override_records_comment(kanban_home, capsys):
     rc = kc.kanban_command(
         _parse(
-            "create",
+            "create", "--board", "default",
             "incident",
             "--assignee",
             "worker",
@@ -106,7 +107,7 @@ def test_create_validates_resolved_alias_and_records_override(
     kanban_home, flagship_alias, capsys,
 ):
     rc = kc.kanban_command(
-        _parse("create", "blocked alias", "--assignee", "worker", "--model", "fast")
+        _parse("create", "--board", "default", "blocked alias", "--assignee", "worker", "--model", "fast")
     )
     captured = capsys.readouterr()
     assert rc == 2
@@ -116,7 +117,7 @@ def test_create_validates_resolved_alias_and_records_override(
 
     rc = kc.kanban_command(
         _parse(
-            "create",
+            "create", "--board", "default",
             "allowed alias",
             "--assignee",
             "worker",
@@ -240,7 +241,7 @@ def test_configured_ban_is_used_by_create(kanban_home, capsys):
 
     rc = kc.kanban_command(
         _parse(
-            "create",
+            "create", "--board", "default",
             "custom policy",
             "--assignee",
             "worker",
@@ -301,7 +302,7 @@ def test_dispatch_allows_direct_db_model_with_override_comment(
         kb.add_comment(
             conn,
             task_id,
-            "operator",
+            "apollo",  # an operator label: the literal "operator" admits nothing
             "flagship override: incident commander approved",
         )
 

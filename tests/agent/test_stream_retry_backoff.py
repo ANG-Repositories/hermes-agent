@@ -14,6 +14,7 @@ def _bare_call(agent):
     call = object.__new__(cch._StreamingCall)
     call.agent = agent
     call.api_kwargs = {}
+    call._dispatch = None
     call.result = {}
     call.clients = SimpleNamespace(diag={}, close_once=MagicMock())
     call._request_cancelled = {"value": False}

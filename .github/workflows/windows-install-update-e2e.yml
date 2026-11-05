@@ -12,10 +12,10 @@ name: Windows install + update E2E
 # wine2e-install/** run it alone, for sabotage proofs and iteration without the
 # rest of CI.
 
+# t_868e850a: public mirror load guard -- self-triggers removed (push); dispatch-only until re-enabled on a card.
 on:
+  workflow_dispatch:
   workflow_call:
-  push:
-    branches: ['wine2e-install/**']
 
 permissions:
   contents: read

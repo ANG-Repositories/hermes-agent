@@ -1,11 +1,10 @@
 """``hermes kanban diagnostics --placement`` (Placement PRD v0.4 §6 Phase 1 "Verify with").
 
 READ-ONLY view of what the pool planner sees, built from files the gateway
-already wrote. It never probes a host over ssh and never advances a streak:
+already wrote. It never probes a host over ssh:
 
 * ``<root>/load_gate.json`` ``pool`` block: band / hot / pressure / load1 /
   free per host, from the last gateway tick;
-* ``<root>/var/kanban-target-state.json``: the per-host hot/clear streak;
 * ``placement_ledger.read_all()`` + ``projected(host, load1)`` per host, with
   each reservation's unrealised share;
 * the rung ``SpilloverPlan.take()`` would pick now, and why. The real
@@ -50,7 +49,6 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
     block = _map(gate_state.get("pool"))
     tick_hosts = _map(block.get("hosts"))
     signal_on = _read_signal(kanban_cfg)
-    streaks = kwp._load_state(root / "var" / kwp.TARGET_STATE_FILE)
     reservations = pledger.read_all(pledger.ledger_dir(root), policy, now=now)
     cost = _num(gate_state.get("cost"))
 
@@ -70,8 +68,6 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
                              "ramp_s": r.ramp_s, "unrealised": [round(s, 4) for s in shares],
                              "pending": round(r.cpu_est * sum(shares), 4)})
         pending = pledger.pending(name, reservations, now=now)
-        kb = policy.kanban_band(name)
-        st = _map(streaks.get(name))
         hosts[name] = {
             # Eligible only when the CURRENT pool places on it: a host the
             # last tick saw but the pool files have since dropped is not.
@@ -84,9 +80,6 @@ def compute(root: Path, *, kanban_cfg: Optional[Mapping] = None, gate_state: Opt
             "pending": round(pending, 4),
             "projected": None if load1 is None else round(pledger.projected(name, load1, reservations, now=now), 4),
             "reservations": res_rows,
-            "streak": dict(st) if st else None,
-            "streak_policy": {"hot_streak": kb.hot_streak, "clear_streak": kb.clear_streak,
-                              "warm": kb.warm, "hot": kb.hot},
         }
 
     if assignee is None:
@@ -130,7 +123,7 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
         if h.state != "active":
             return 0
         running = int(_num(row.get("running")) or 0)
-        return max(0, min(int(_num(row.get("free")) or 0), h.slots - running))
+        return max(0, min(int(_num(row.get("free")) or 0), kwp.count_free(h, running)))
 
     slots = {h.name: _free_now(h) for h in hosts}
     detail = {h.name: {k: v for k, v in _map(tick_hosts.get(h.name)).items() if k != "free"}
@@ -138,7 +131,7 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
     signal = None
     if signal_on:
         from hermes_cli import kanban_headroom as kh
-        from hermes_cli import placement
+        from hermes_cli.fleet_placement import placement
 
         table = kh.load_table(root)
         rpath = root / placement.RESERVATIONS_REL
@@ -148,8 +141,7 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
                 live = placement.live_reservations(rpath, now=now, table=table)
             except placement.PlacementError:
                 live = None  # take() re-reads, refuses and names the error
-        signal = kwp.TargetSignal(policy=policy, state_path=root / "var" / kwp.TARGET_STATE_FILE,
-                                  ledger_dir=pledger.ledger_dir(root), cpu_est=cost, clock=lambda: now,
+        signal = kwp.TargetSignal(policy=policy, ledger_dir=pledger.ledger_dir(root), cpu_est=cost, clock=lambda: now,
                                   reservations=list(reservations), placement_table=table,
                                   placement_reservations=rpath, placement_live=live)
     plan = kwp._finish_plan(hosts, slots, detail, pool.disabled, block.get("planned_at"), pool, signal)
@@ -197,18 +189,12 @@ def format_lines(rep: Mapping) -> List[str]:
     out.append(f"  last tick: planned={tick.get('planned')} reason={tick.get('reason') or '-'} "
                f"gate band={tick.get('band')} (updated {age})")
     for name, h in (rep.get("hosts") or {}).items():
-        st = h.get("streak")
-        sp = h["streak_policy"]
-        streak = ("none" if not st else
-                  f"hot={st.get('hot')} hot_run={st.get('hot_run')}/{sp['hot_streak']} "
-                  f"clear_run={st.get('clear_run')}/{sp['clear_streak']}")
         proj = "? (no load1 this tick)" if h.get("projected") is None else f"{h['projected']:.2f}"
         out.append(f"  {name}: band={h['band']}{' HOT' if h.get('hot') else ''}"
                    f"{'' if h.get('enabled') else ' (disabled)'} free={h.get('free')} "
                    f"load1={h.get('load1')} pending=+{h['pending']:.2f} projected={proj}")
         if h.get("pressure"):
             out.append(f"    pressure: {h['pressure']}")
-        out.append(f"    streak: {streak}")
         for r in h.get("reservations") or ():
             out.append(f"    reservation {r['consumer']}: units={r['busy_units']} cpu_est={r['cpu_est']} "
                        f"ramp={r['ramp_s']:g}s unrealised={r['unrealised']} -> +{r['pending']:.2f}")

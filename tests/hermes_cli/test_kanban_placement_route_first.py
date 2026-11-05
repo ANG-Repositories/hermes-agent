@@ -175,7 +175,7 @@ def test_ac6_memory_elevated_allows_one_total(kanban_home, monkeypatch):
         _make(conn, 3, body="host: ace-ai")
         res, spawned = _tick(conn, spillover=_plan(free=3), spawn_limit=4)
         assert len(spawned) == 1
-        assert sorted(set(res.placement_waits.values())) == ["total:ready_budget"]
+        assert sorted(set(res.placement_waits.values())) == ["total:memory_elevated"]
 
 
 def test_route_first_false_restores_the_silent_returns(kanban_home, monkeypatch):
@@ -494,14 +494,14 @@ def test_ac19_every_row_past_the_slot_wall_is_recorded(kanban_home):
         assert len(held) == 4 and all(len(_events(conn, t, "placement_wait")) == 1 for t in held)
 
 
-def test_ac19_ready_budget_one_records_five(kanban_home):
+def test_ac19_max_new_one_records_five(kanban_home):
     with kb.connect_closing() as conn:
         ids = _make(conn, 6, body="host: any")
         res, spawned = _tick(conn, spillover=_plan(free=6), spawn_limit=0, spawn_paused="test",
                              max_new=1)
         assert len(spawned) == 1
         codes = [e["code"] for t in ids for e in _events(conn, t, "placement_wait")]
-        assert codes == ["total:ready_budget"] * 5
+        assert codes == ["total:max_new"] * 5
 
 
 def test_paused_tick_with_no_plan_still_records_holds(kanban_home):
@@ -511,6 +511,68 @@ def test_paused_tick_with_no_plan_still_records_holds(kanban_home):
         res, spawned = _tick(conn, spillover=None, spawn_limit=0, spawn_paused="test")
         assert spawned == []
         assert res.placement_waits == {t: "local_full" for t in ids}
+
+
+# -- local_full binding cause (t_f73c65a8) -------------------------------------
+
+def _local_full_events(conn, ids):
+    return [e for t in ids for e in _events(conn, t, "placement_wait") if e.get("code") == "local_full"]
+
+
+def test_local_full_bound_by_the_paused_gate_says_gate(kanban_home):
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 2)
+        _tick(conn, spillover=None, spawn_limit=0, spawn_paused="paused: load1 90 > 64")
+        evs = _local_full_events(conn, ids)
+        assert len(evs) == 2
+        assert {(e["binding"], e["binding_detail"]) for e in evs} == {("gate", "paused: load1 90 > 64")}
+
+
+def test_local_full_with_gate_allowance_zero_says_gate(kanban_home):
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 1)
+        _tick(conn, spillover=None, spawn_limit=0)
+        (ev,) = _local_full_events(conn, ids)
+        assert ev["binding"] == "gate"
+
+
+def test_local_full_after_the_board_spent_its_allowance_says_quota(kanban_home):
+    """The gate had room (allowance 1); this board's own spawn used it: the row behind waits on quota."""
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 2)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=1)
+        assert len(spawned) == 1
+        (ev,) = _local_full_events(conn, ids)
+        assert ev["binding"] == "quota" and ev["binding_detail"] == "1/1 local spawns this tick"
+
+
+def test_local_full_when_other_boards_spent_the_split_says_quota(kanban_home):
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 1)
+        _tick(conn, spillover=None, spawn_limit=0,
+              spawn_paused=f"{pr.QUOTA_SPENT_PREFIX}3 spawn(s) is used by other boards")
+        (ev,) = _local_full_events(conn, ids)
+        assert ev["binding"] == "quota"
+
+
+def test_binding_is_not_part_of_the_dedup_key(kanban_home):
+    """gate -> quota on an unchanged local_full hold inside the refresh window writes no new row."""
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 1)
+        _tick(conn, spillover=None, spawn_limit=0, spawn_paused="paused")
+        _tick(conn, spillover=None, spawn_limit=0,
+              spawn_paused=f"{pr.QUOTA_SPENT_PREFIX}3 spawn(s) is used by other boards")
+        assert len(_local_full_events(conn, ids)) == 1
+
+
+def test_only_local_full_rows_carry_a_binding(kanban_home):
+    plan = _plan(free=2, band="admitting")
+    plan.pins_only = True
+    with kb.connect_closing() as conn:
+        (pin,) = _make(conn, 1, body="host: ace-media", priority=1)
+        _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="paused")
+        evs = _events(conn, pin, "placement_wait")
+        assert evs and all("binding" not in e for e in evs if e.get("code") != "local_full")
 
 
 # -- wait-episode boundaries (Prism P2 residue of #1907, t_74441abc) ----------

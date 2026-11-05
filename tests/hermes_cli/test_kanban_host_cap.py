@@ -198,28 +198,40 @@ def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
     return tid
 
 
-def test_review_lane_gets_reserved_slot_under_ready_backlog(
+def test_review_lane_shares_the_budget_by_priority_not_a_reserved_slot(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
+    """FWA-I (t_cd43f4ff, audit K8): one allocation layer. The review lane
+    holds no slot back from the ready lane; the shared budget goes by priority
+    across both lanes. A review card that outranks a ready card spawns ahead
+    of it in the same tick; one that ranks below every ready card waits, and
+    no ready card waits on ``total:ready_budget`` for it."""
     import hermes_cli.config as cfgmod
     monkeypatch.setattr(
         cfgmod, "load_config",
         lambda *a, **k: {"kanban": {"review_dispatch": True}},
     )
 
-    spawns: list = []
     with kbc.connect() as conn:
-        for title in ("ready-1", "ready-2", "ready-3"):
-            kb.create_task(conn, title=title, assignee="alice")
-        review_id = _park_in_review(conn, "review-me", "reviewer")
+        hi = [kb.create_task(conn, title=f"ready-hi-{i}", assignee="alice", priority=10)
+              for i in range(2)]
+        low_review = _park_in_review(conn, "review-low", "reviewer")
         res = kbd.dispatch_once(
-            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+            conn, spawn_fn=_fake_spawn_factory([]), max_in_progress=2,
         )
+    assert sorted(s[0] for s in res.spawned) == sorted(hi)
+    assert "total:ready_budget" not in res.placement_waits.values()
 
-    spawned_ids = [s[0] for s in res.spawned]
-    # Budget 2: one ready + the reserved review slot — never 2×ready.
-    assert len(spawned_ids) == 2
-    assert review_id in spawned_ids
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id IN (?, ?)", hi)
+        conn.execute("UPDATE tasks SET priority=5 WHERE id=?", (low_review,))
+        top = kb.create_task(conn, title="ready-top", assignee="alice", priority=10)
+        low = kb.create_task(conn, title="ready-low", assignee="alice", priority=1)
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory([]), max_in_progress=2,
+        )
+    assert sorted(s[0] for s in res.spawned) == sorted([top, low_review])
+    assert res.placement_waits.get(low) == "total:max_in_progress"
 
 
 def _guard_review_row(conn: sqlite3.Connection, review_id: str) -> dict:

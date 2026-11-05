@@ -89,8 +89,7 @@ def _git(*args: str, cwd: Path, check: bool = True) -> str:
 
 
 def _real_uv() -> str | None:
-    cand = shutil.which("uv") or str(H.REAL_HOME / ".hermes" / "bin" / "uv")
-    return cand if cand and Path(cand).exists() else None
+    return H.host_uv()
 
 
 OFFICIAL_URL = "https://github.com/NousResearch/hermes-agent.git"
@@ -637,6 +636,7 @@ def clean_leg(tmp_path_factory, template_home):
     return lg, _update(lg)
 
 
+@pytest.mark.slow_test(80, reason="health probes against the updated install: 62.5 s call on ci-priv (workers=6), mirror run 41587306281")
 def test_clean_update(clean_leg, provider):
     leg, final = clean_leg
     assert_healthy_at_head(leg, provider, final)
@@ -653,6 +653,7 @@ def test_clean_update_keeps_long_scalar_lines_verbatim(clean_leg):
                 assert line in after_lines, f"{name}: long user value re-folded: {line!r}"
 
 
+@pytest.mark.slow_test(400, reason="a full N-1 -> HEAD update with dependency sync in the call: 106-118 s on 8 ACE-AI cores")
 def test_update_with_local_edits_and_orphan_autostash(leg, provider):
     # A file that does not change N-1 -> HEAD, so restoring the user's edit is conflict-free.
     unchanged = next(p for p in ("README.md", "LICENSE", "AGENTS.md")
@@ -682,6 +683,7 @@ def test_update_with_local_edits_and_orphan_autostash(leg, provider):
     assert untracked_ok, "untracked user file lost by the update"
 
 
+@pytest.mark.slow_test(400, reason="a killed update plus a full retry update in the call: 103-133 s on 8 ACE-AI cores")
 @pytest.mark.parametrize("torn", [
     pytest.param(False, id="lock-only"),
     pytest.param(True, id="torn-tree"),
@@ -709,6 +711,7 @@ def test_kill_mid_pull_then_retry_heals(leg, provider, torn):
         assert_healthy_at_head(leg, provider, final)
 
 
+@pytest.mark.slow_test(400, reason="a killed update plus a full retry update in the call: 128-134 s on 8 ACE-AI cores")
 def test_kill_before_deps_then_retry_heals(leg, provider):
     (leg.root / "arm-deps").touch()
     _publish_head(leg)

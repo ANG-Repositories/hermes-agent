@@ -93,6 +93,19 @@ def conn(tmp_path, monkeypatch):
 _STARTED: list[int] = []
 
 
+@pytest.fixture
+def own_processes_only(monkeypatch):
+    """The sweep scans every process on the host; scope it to the ones this test started.
+
+    A real init-parented process of the same uid (ACE-AI: one with its cwd under
+    ``~/.hermes/var``) otherwise reaches ``realpath`` of a real-home path, and its
+    outcome depends on the host instead of the test.
+    """
+    real = kb.psutil.process_iter
+    monkeypatch.setattr(kb.psutil, "process_iter",
+                        lambda *a, **k: (p for p in real(*a, **k) if p.pid in _STARTED))
+
+
 def _gone(pid: int, timeout: float = 15.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -165,7 +178,7 @@ def _spawn_orphan(cwd: Path) -> int:
     return pid
 
 
-def test_orphan_sweep_reaps_terminal_card_only(conn, tmp_path):
+def test_orphan_sweep_reaps_terminal_card_only(conn, tmp_path, own_processes_only):
     root = tmp_path / "ws"
     done_id = kb.create_task(conn, title="done card", assignee="worker")
     run_id = kb.create_task(conn, title="running card", assignee="worker")
@@ -197,7 +210,7 @@ def test_orphan_sweep_reaps_terminal_card_only(conn, tmp_path):
         conn, root=root, min_terminal_age=0, notify=False) == {}
 
 
-def test_orphan_sweep_sends_one_logs_line_only_when_it_reaped(conn, tmp_path, monkeypatch):
+def test_orphan_sweep_sends_one_logs_line_only_when_it_reaped(conn, tmp_path, monkeypatch, own_processes_only):
     sent: list[str] = []
     monkeypatch.setattr(kb, "_notify_orphan_sweep", lambda board, reaped: sent.append(reaped))
     root = tmp_path / "ws"
@@ -230,3 +243,48 @@ def test_dispatch_tick_runs_both_reaps(conn, monkeypatch):
     calls.clear()
     kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
     assert calls == {}, "a dry run must not signal anything"
+
+
+def test_dispatch_tick_finishes_when_an_orphan_cwd_probe_hangs(conn, tmp_path, monkeypatch,
+                                                               own_processes_only):
+    """A cwd on a dead NFS mount blocks psutil's cwd() with the GIL held (Studio
+    2026-11-03, t_68bd4f4a): the tick skips that pid and still reaps the rest."""
+    import functools
+
+    import hermes_proc_cwd
+
+    ws = kb.workspaces_root("default", stale_pin_ok=True)
+    done_id = kb.create_task(conn, title="done card", assignee="worker")
+    assert kb.claim_task(conn, done_id) is not None
+    assert kb.complete_task(conn, done_id, summary="done")
+    (ws / done_id).mkdir(parents=True)
+    (tmp_path / "nfs").mkdir()
+    hung = _spawn_orphan(tmp_path / "nfs")
+    done_orphan = _spawn_orphan(ws / done_id)
+    # Stand-in for the dead mount: the probe child's cwd() of one pid never returns.
+    monkeypatch.setenv("T68_HUNG_PID", str(hung))
+    monkeypatch.setattr(hermes_proc_cwd, "_PROBE_CHILD", (
+        "import os, time, psutil\n"
+        "_real = psutil.Process.cwd\n"
+        "def _cwd(self):\n"
+        "    if self.pid == int(os.environ['T68_HUNG_PID']):\n"
+        "        time.sleep(600)\n"
+        "    return _real(self)\n"
+        "psutil.Process.cwd = _cwd\n"
+    ) + hermes_proc_cwd._PROBE_CHILD)
+    real_cwd = kb.psutil.Process.cwd
+    # The dispatcher itself must never read that cwd: here it would block for 60 s.
+    monkeypatch.setattr(kb.psutil.Process, "cwd",
+                        lambda self: time.sleep(60) if self.pid == hung else real_cwd(self))
+    monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans", functools.partial(
+        kb.sweep_terminal_workspace_orphans, min_terminal_age=0, grace=2.0, notify=False))
+    kbd._ORPHAN_SWEEP_LAST.clear()
+
+    started = time.monotonic()
+    res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30, f"dispatcher tick held {elapsed:.1f}s behind one hung cwd probe"
+    assert [i["pid"] for i in res.orphans_reaped.get(done_id, [])] == [done_orphan]
+    assert _gone(done_orphan)
+    assert kb._pid_alive(hung), "the orphan with the unreadable cwd must be skipped, not killed"

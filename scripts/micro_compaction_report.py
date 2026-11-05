@@ -102,7 +102,7 @@ def report(micro: list[dict], batch: list[dict], per_session: bool) -> int:
     durations = [e.get("duration_ms") or 0 for e in micro]
 
     if per_session:
-        print(f"{'session':<26} {'passes':>6} {'occupancy%':>18} {'batch':>6} {'saved':>10}")
+        print(f"{'session':<26} {'passes':>6} {'occupancy%':>18} {'batch':>6} {'saved':>10}")  # admission-lint: not-a-decider report column header, not host load
         print("-" * 72)
         batch_by_session: dict[str, int] = defaultdict(int)
         for b in batch:

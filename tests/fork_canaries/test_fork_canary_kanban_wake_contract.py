@@ -308,9 +308,9 @@ def test_w9_wake_only_sub_is_never_suppressed(env):
 # --- W10-W14: S5 actionable-only wakes (t_4f6afb67) -----------------------------
 
 
-def _red(env, pr, checks, *, head="a" * 40, inherited=None, state="open"):
+def _red(env, pr, checks, *, head="a" * 40, state="open"):
     env["health"][(REPO, pr)] = {"state": state, "mergeable_state": "clean", "failing": list(checks),
-                                 "head": head, "inherited_from_main": inherited}
+                                 "head": head}
 
 
 def _rehandback(tid, pr: int):
@@ -322,18 +322,6 @@ def _rehandback(tid, pr: int):
 
 def _reasons(tid) -> list:
     return [(r.payload["reason"], r.payload["path"]) for r in _receipts(tid)]
-
-
-def test_w10_inherited_only_red_handback_is_zero_turns_and_a_receipt(env):
-    """S5 (t_a716c180 05:05, 10-12): main's red inherited into the PR is not the owner's to fix.
-
-    RED-PROVABLE: drop the inherited-only rule from red_handback_noise -> 1 owner-wake turn."""
-    _red(env, 2110, ["lints-fast"], inherited="5cb9ca920abc")
-    tid = _card(env)
-    _handback(tid, 2110)
-    turns = _tick(env)
-    assert turns == [], _msg("W10", "an inherited-only red woke its owner", turns)
-    assert ("inherited-red", "owner-wake") in _reasons(tid), _reasons(tid)
 
 
 def test_w11_same_red_same_head_wakes_once(env):
@@ -384,7 +372,7 @@ def test_w13_home_session_send_back_is_no_wake_but_the_line_posts(env):
 
 def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
     """S5 keeps the actionable set: a worker's needs_input block wakes once; with
-    actionable_only off, W10's inherited red wakes again."""
+    actionable_only off, W11's duplicate red wakes again."""
     tid = _card(env)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn), \
@@ -395,9 +383,12 @@ def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
     from hermes_constants import get_hermes_home
     (get_hermes_home() / "config.yaml").write_text(
         "kanban:\n  notify_suppress:\n    actionable_only: false\n")
-    _red(env, 2114, ["lints-fast"], inherited="5cb9ca920abc")
+    _red(env, 2114, ["lints-fast"])
     t2 = _card(env)
     _handback(t2, 2114)
+    turns = list(_tick(env))
+    env["runner"]._kanban_owner_wake_state.last_wake.clear()   # past the coalescing window
+    _rehandback(t2, 2114)
     more = _tick(env)[len(turns):]
     assert _paths(more) == ["owner-wake"], _msg("W14", "actionable_only:false must restore the wake", more)
 
@@ -495,14 +486,19 @@ def test_w17_gave_up_on_approved_card_with_no_land_still_wakes(tp_env):
 
 
 def _auto_on(env, on=True):
-    from hermes_constants import get_hermes_home
-    (get_hermes_home() / "config.yaml").write_text(
-        f"delegation:\n  boomerang:\n    auto_handle_enabled: {'true' if on else 'false'}\n")
+    """The emergency stop file is the only switch (no config knob)."""
+    from gateway import kanban_boomerang_wake as ah
+    stop = ah.stop_file_path()
+    if on:
+        stop.unlink(missing_ok=True)
+    else:
+        stop.parent.mkdir(parents=True, exist_ok=True)
+        stop.write_text("")
 
 
 @pytest.fixture
 def auto_env(env):
-    from gateway import kanban_auto_handle as ah
+    from gateway import kanban_boomerang_wake as ah
 
     seen: list = []
 
@@ -513,16 +509,18 @@ def auto_env(env):
     env["monkeypatch"].setattr(ah, "run_entry", record)
     env["monkeypatch"].setattr(ah, "_INFLIGHT", {})
     env["monkeypatch"].setattr(ah, "_alive", lambda key: key in keys())
+    env["monkeypatch"].setattr(ah, "_LAST_ENABLED", {})
+    env["monkeypatch"].setattr(ah, "post_logs", lambda text: None)
     env["dispatched"] = seen
     _auto_on(env)
     return env
 
 
 def _auto_card(env, **kw) -> str:
-    return _card(env, auto_handle=True, **kw)
+    return _card(env, boomerang_wake=True, **kw)
 
 
-def test_w18_auto_handled_red_handback_is_one_dispatch_zero_turns(auto_env):
+def test_w18_boomerang_wake_red_handback_is_one_dispatch_zero_turns(auto_env):
     """One event through both paths (notifier sub + owner-wake reason e) = ONE child, no turn.
 
     RED-PROVABLE: drop the claim check in owner_wake_filter -> two dispatches."""
@@ -532,11 +530,11 @@ def test_w18_auto_handled_red_handback_is_one_dispatch_zero_turns(auto_env):
     _sub(tid)
     _handback(tid, 2118)
     turns = _tick(env)
-    assert turns == [], _msg("W18", "an auto-handled red handback still woke the owner", turns)
+    assert turns == [], _msg("W18", "a boomerang-wake red handback still woke the owner", turns)
     assert len(env["dispatched"]) == 1, f"FORK CANARY {FEATURE} W18: dispatches={env['dispatched']}"
 
 
-def test_w19_auto_handle_needs_input_still_one_notifier_turn(auto_env):
+def test_w19_boomerang_wake_needs_input_still_one_notifier_turn(auto_env):
     """INV-5: a judgment event on an opted-in card is today's one turn, never a child."""
     env = auto_env
     tid = _auto_card(env)
@@ -544,11 +542,11 @@ def test_w19_auto_handle_needs_input_still_one_notifier_turn(auto_env):
     with kb.connect_closing() as conn, kb.write_txn(conn):
         kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
     turns = _tick(env)
-    assert _paths(turns) == ["notifier"] and env["dispatched"] == [], _msg("W19", "needs_input auto-handled", turns)
+    assert _paths(turns) == ["notifier"] and env["dispatched"] == [], _msg("W19", "needs_input boomerang-woken", turns)
 
 
 def test_w20_kill_switch_off_auto_card_wakes_as_today(auto_env):
-    """INV-7: auto_handle_enabled=false -> an opted-in card is today's one turn, no claim."""
+    """INV-7: stop file present -> a boomerang-wake card is today's one turn, no claim."""
     env = auto_env
     _auto_on(env, False)
     tid = _auto_card(env)
@@ -556,3 +554,153 @@ def test_w20_kill_switch_off_auto_card_wakes_as_today(auto_env):
     _close(tid, sid=WORKER_SID, profile="worker", summary="worker finished")
     turns = _tick(env)
     assert _paths(turns) == ["notifier"] and env["dispatched"] == [], _msg("W20", "switch off still dispatched", turns)
+
+
+# --- W21-W22: a mechanical own-repo handback (every open Prism key answered) -> a fork child (t_6e9f48cc) ---
+
+
+def _answered_handback(env, pr, lines, open_keys):
+    """A green own-repo PR whose handback SUMMARY carries ``lines``; ``round`` reads ``open_keys``."""
+    from gateway import kanban_prism_answers as pa
+    from hermes_constants import get_default_hermes_root
+
+    scripts = get_default_hermes_root() / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "prism_soft_gate.py").write_text(
+        "import re\n"
+        "VERDICT_LINE = re.compile(r'prism-verdict:\\s*([A-Za-z0-9_.\\-]+)\\s+(not-a-bug|false|by-design)\\b', re.I)\n"
+        "FIXED_LINE = re.compile(r'prism-verdict:\\s*([A-Za-z0-9_.\\-]+)\\s+fixed\\s+(?:in\\s+)?([0-9a-f]{7,40})\\b', re.I)\n")
+    env["monkeypatch"].setattr(pa, "_GRAMMAR", {})
+    env["monkeypatch"].setattr(pa, "open_keys_fn", lambda repo, n, head, card: list(open_keys))
+    env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": [], "head": "e" * 40}
+    tid = _auto_card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb.request_review(conn, tid, force=True, summary=f"PR {REPO}#{pr} ready\n" + "\n".join(lines))
+    return tid
+
+
+def test_w21_all_keys_answered_handback_is_one_fork_dispatch_zero_turns(auto_env):
+    """RED-PROVABLE: drop the own_repo_review_all_keys_answered row from kanban_wake_disposition._TABLE
+    (or stop setting prism_all_answered in kanban_boomerang_wake.review_payload) -> 0 dispatches."""
+    env = auto_env
+    _answered_handback(env, 2131, ["prism-verdict: 5ef38967cc14 fixed " + "e" * 40,
+                                   "prism-verdict: f1a50a36ff7f not-a-bug unreachable"],
+                       ["5ef38967cc14", "f1a50a36ff7f"])
+    turns = _tick(env)
+    rows = [(e["row"], e["mode"]) for e in env["dispatched"]]
+    assert rows == [("own_repo_review_all_keys_answered", "fork")] and turns == [], \
+        _msg("W21", f"an all-answered handback did not fork exactly once: {rows}", turns)
+
+
+def test_w22_one_unanswered_key_keeps_todays_merge_pass_row(auto_env):
+    """RED-PROVABLE: make kanban_prism_answers.all_answered ignore keys -> a dispatch appears."""
+    env = auto_env
+    _answered_handback(env, 2132, ["prism-verdict: 5ef38967cc14 fixed " + "e" * 40],
+                       ["5ef38967cc14", "f1a50a36ff7f"])
+    turns = _tick(env)
+    assert env["dispatched"] == [], _msg("W22", "an unanswered key was auto-handled", turns)
+    assert _paths(turns) == ["notifier"], _msg("W22", "the green handback must wake as today", turns)
+
+
+# --- W23: a wake ACCEPTED behind a busy session survives the drain's depth cap (t_f36d21e8) ---
+
+
+@pytest.mark.asyncio
+async def test_w23_two_wakes_queued_behind_a_depth_capped_turn_both_survive(monkeypatch, tmp_path):
+    """2026-10-22 05:43-07:12 (session 20261018_220948_05ec4d95): the notifier logged ``woke agent
+    for t_69c88a73`` at 05:43:23, the adapter accepted it behind a busy turn, and no turn for it ever
+    ran (next G-LINT turn 07:12, from a later handback). At ``_MAX_INTERRUPT_DEPTH`` the drain
+    re-seated the dequeued follow-up with ``merge_pending_message_event`` into the head slot that
+    ``_promote_queued_event`` had just refilled from the overflow, so the overflow head was
+    REPLACED (two internal TEXT events never merge). One accepted wake per handback must reach a turn.
+
+    RED-PROVABLE: restore the plain ``merge_pending_message_event`` re-seat in
+    ``GatewayRunner._run_agent_queued_followup`` -> wake B is gone."""
+    import importlib
+    import sys
+    import types
+
+    from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+    from gateway.config import PlatformConfig
+
+    key = "agent:main:telegram:group:-1001:17585"
+    src = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", thread_id="17585")
+
+    class _Ad(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+
+        async def connect(self, *, is_reconnect: bool = False) -> bool:
+            return True
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+            return SendResult(success=True, message_id="m1")
+
+        async def edit_message(self, chat_id, message_id, content) -> SendResult:
+            return SendResult(success=True, message_id=message_id)
+
+        async def send_typing(self, chat_id, metadata=None) -> None:
+            return None
+
+        async def stop_typing(self, chat_id) -> None:
+            return None
+
+        async def get_chat_info(self, chat_id: str):
+            return {"id": chat_id}
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    gateway_run = importlib.import_module("gateway.run")
+    adapter = _Ad()
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {adapter.platform: adapter}
+    for name, value in (("_voice_mode", {}), ("_prefill_messages", []), ("_ephemeral_system_prompt", ""),
+                        ("_reasoning_config", None), ("_provider_routing", {}), ("_fallback_model", None),
+                        ("_session_db", None), ("_running_agents", {}), ("_session_run_generation", {})):
+        setattr(runner, name, value)
+    runner.hooks = types.SimpleNamespace(loaded_hooks=False)
+    runner.config = types.SimpleNamespace(thread_sessions_per_user=False, group_sessions_per_user=False,
+                                          stt_enabled=False)
+    runner._MAX_INTERRUPT_DEPTH = 0  # this drain IS the capped one
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+
+    def wake(tid):
+        return MessageEvent(text=f"[kanban] Task {tid} handed off for review", message_type=MessageType.TEXT,
+                            source=src, internal=True, allow_gateway_control=False,
+                            metadata={"kanban_owner_wake": True})
+
+    class StubAgent:
+        def __init__(self, **kwargs):
+            self.tools = []
+            self._interrupt_requested = False
+
+        @property
+        def is_interrupted(self):
+            return self._interrupt_requested
+
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+            # Both notifier wakes arrive while this turn runs; the runner FIFO accepts both.
+            runner._enqueue_fifo(key, wake("t_A"), adapter)
+            runner._enqueue_fifo(key, wake("t_B"), adapter)
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = StubAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    await runner._run_agent(message="busy turn", context_prompt="", history=[], source=src,
+                            session_id="sess-w23", session_key=key)
+
+    head = adapter._pending_messages.get(key)
+    overflow = list(runner._session_state(key).conversation.queued_events)
+    texts = ([head.text] if head else []) + [e.text for e in overflow]
+    assert texts == ["[kanban] Task t_A handed off for review", "[kanban] Task t_B handed off for review"], (
+        f"FORK CANARY {FEATURE} W23: an accepted wake was dropped at the interrupt-depth cap; queue={texts}")

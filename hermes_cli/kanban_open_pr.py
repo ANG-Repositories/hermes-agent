@@ -86,19 +86,22 @@ QUERY_TIMEOUT_SECONDS = 10
 NOT_FOUND = "NOT_FOUND"
 
 
-def query_pr_state(repo: str, number: int) -> Optional[dict]:
+def query_pr_state(repo: str, number: int, env: Optional[dict] = None) -> Optional[dict]:
     """REST PR state: ``{"state": OPEN|CLOSED|MERGED|NOT_FOUND}`` or None.
 
     Unlike :func:`kanban_pr_gate.query_pr` this separates a definite 404
     (``NOT_FOUND``: the ref names no PR, e.g. an upstream number qualified with
     the fork's slug) from "cannot tell" (None: timeout, rate/READ cap, auth).
     Completion routing fails closed on None and must not on a 404.
+    ``env`` = the child env for ``gh`` (the card's profile identity); None inherits.
     """
     try:
         proc = subprocess.run(
-            ["gh", "api", f"repos/{repo}/pulls/{number}"],
+            # every extracted ref is a github.com ref; a profile env may carry GH_HOST (Enterprise), which would
+            # resolve an unrelated owner/repo/number there and let a MERGED answer close the card (Prism 7cf1422cf1d2)
+            ["gh", "api", "--hostname", "github.com", f"repos/{repo}/pulls/{number}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=QUERY_TIMEOUT_SECONDS, check=False,
+            timeout=QUERY_TIMEOUT_SECONDS, check=False, env=env,
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
         return None
@@ -376,7 +379,8 @@ class ClosedUnmergedPrError(ValueError):
                 f"was deleted looks exactly like this). Reopen/retarget and land it, or name what superseded "
                 f"it with the close-reason token: 'SUPERSEDED-BY owner/repo#N' / 'RE-CARRIED-AS #N' (a MERGED "
                 f"PR) or 'SUPERSEDED-BY <sha>' (a commit on the default branch), in --result/--summary or "
-                f"--superseded-by <ref>."
+                f"--superseded-by <ref>. A PR abandoned on purpose: close-record it on GitHub with "
+                f"'CLOSED: ABANDONED|REJECTED|THROWAWAY -- <why>' and pass --abandon-routed-pr '<reason>' to done (archive needs no flag)."
             )
             if len(self.closed) > 1:
                 parts.append("Each closed PR needs its own token: name it before the token, e.g. "
@@ -402,7 +406,8 @@ def sha_on_default(repo: str, sha: str) -> Optional[bool]:
     """True iff ``sha`` is reachable from ``repo``'s default branch; None when GitHub cannot tell."""
     def _get(path):
         try:
-            proc = subprocess.run(["gh", "api", path], capture_output=True, text=True, encoding="utf-8",
+            # Same host as the PR reads (Prism fe268dfe02ca): a GH_HOST env must not move the ancestry proof.
+            proc = subprocess.run(["gh", "api", "--hostname", "github.com", path], capture_output=True, text=True, encoding="utf-8",
                                   errors="replace", timeout=QUERY_TIMEOUT_SECONDS, check=False)
         except (OSError, subprocess.SubprocessError, TimeoutError):
             return None, False
@@ -612,6 +617,19 @@ def recorded_pr_refs(metadata) -> list:
     return out
 
 
+def authored_pr_refs(metadata) -> list:
+    """The PRs a run declared as its OWN work: ``pr_url`` and ``own_prs`` only. Never survivor evidence
+    (``survivor.refs[].pr`` / ``claims[].pr``): a card closed ``--superseded-by`` records the superseding PR
+    there, so supersession would chain transitively (Prism 7004158a070b). Never ``auto_routed_open_prs``:
+    it lists PRs the handoff prose merely mentions (Prism 4cacc8c8c4b5)."""
+    if not isinstance(metadata, dict):
+        return []
+    out: list = []
+    for key in ("pr_url", "own_prs"):
+        out.extend(_iter_strings(metadata.get(key)))
+    return out
+
+
 # --------------------------------------------------------------------------- close-record + merged survivor
 # t_9aff2951 (2026-10-01): a closed-unmerged own PR whose OWN GitHub thread carries the sanctioned close record
 # (``CLOSED: <TOKEN> -- ...``, coding-guardrails/references/pr-close-reasons.md) is not lost work when the
@@ -628,11 +646,27 @@ def has_close_record(body) -> bool:
     return isinstance(body, str) and bool(_CLOSE_RECORD_RE.search(body))
 
 
-def pr_close_record(repo: str, number: int) -> Optional[bool]:
-    """True iff a comment on ``repo#number`` carries ``CLOSED: <TOKEN>``; None when GitHub cannot be read."""
+# t_2ce83b37 (2026-10-29): a PR closed on purpose with ``CLOSED: ABANDONED|REJECTED|THROWAWAY -- ...`` on its
+# own thread has no merged survivor by design (hermes-home#7741, re-carded as a new card). That record is a
+# terminal reason: ``archive`` accepts it, ``done`` accepts it with the audited ``--abandon-routed-pr <reason>``.
+# A stacked PR auto-closed by base deletion carries no such comment, so it is still refused.
+TERMINAL_CLOSE_TOKENS = ("ABANDONED", "REJECTED", "THROWAWAY")
+_TERMINAL_RECORD_RE = re.compile(r"^\s*CLOSED: (?:" + "|".join(TERMINAL_CLOSE_TOKENS) + r")\b", re.MULTILINE)
+
+
+def has_terminal_close_record(body) -> bool:
+    """Does one PR comment body carry a terminal (no-survivor) close-reason line?"""
+    return isinstance(body, str) and bool(_TERMINAL_RECORD_RE.search(body))
+
+
+def pr_close_record(repo: str, number: int, *, match=None) -> Optional[bool]:
+    """True iff a comment on ``repo#number`` carries ``CLOSED: <TOKEN>`` (``match`` narrows the tokens);
+    None when GitHub cannot be read."""
+    match = match or has_close_record
     try:
         proc = subprocess.run(
-            ["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments?per_page=100",
+            ["gh", "api", "--hostname", "github.com", "--paginate",
+             f"repos/{repo}/issues/{number}/comments?per_page=100",
              "--jq", ".[].body | @json"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=QUERY_TIMEOUT_SECONDS, check=False,
@@ -643,7 +677,7 @@ def pr_close_record(repo: str, number: int) -> Optional[bool]:
         return None
     for line in (proc.stdout or "").splitlines():
         try:
-            if has_close_record(json.loads(line)):
+            if match(json.loads(line)):
                 return True
         except ValueError:
             continue
@@ -655,6 +689,32 @@ def _default_close_record() -> Optional[CloseRecordFn]:
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return None
     return pr_close_record
+
+
+def pr_terminal_close_record(repo: str, number: int) -> Optional[bool]:
+    """True iff a comment on ``repo#number`` carries ``CLOSED: ABANDONED|REJECTED|THROWAWAY``."""
+    return pr_close_record(repo, number, match=has_terminal_close_record)
+
+
+def _default_terminal_record() -> Optional[CloseRecordFn]:
+    """The real ``gh``-backed terminal close-record reader, or None inside pytest (no live GitHub)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return pr_terminal_close_record
+
+
+def _terminally_closed(refs, record_fn: Optional[CloseRecordFn]) -> list:
+    """The subset of ``refs`` whose own GitHub thread carries a terminal close record. Unreadable -> not."""
+    out = []
+    for ref in refs:
+        try:
+            ok = record_fn(ref.repo, ref.number) if record_fn is not None else None
+        except Exception as exc:
+            _log.warning("kanban closed-pr check: terminal close record %s lookup failed: %s", ref, exc)
+            ok = None
+        if ok:
+            out.append(ref)
+    return out
 
 
 def _default_sha_check() -> Optional[ShaCheckFn]:
@@ -688,11 +748,19 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
                                 query_fn: Optional[QueryFn] = None,
                                 sha_check: Optional[ShaCheckFn] = None,
                                 verb: str = "done", decision_texts=(), recorded=(),
-                                close_record_fn: Optional[CloseRecordFn] = None) -> list:
+                                close_record_fn: Optional[CloseRecordFn] = None,
+                                abandon_reason: Optional[str] = None,
+                                terminal_record_fn: Optional[CloseRecordFn] = None,
+                                abandoned_out: Optional[list] = None,
+                                card_cover: Optional[Callable[[list], list]] = None,
+                                card_covered_out: Optional[list] = None) -> list:
     """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged (or unreadable) and
     the handoff (``texts`` + ``superseded_by``) carries no SUPERSEDED-BY/RE-CARRIED-AS token naming merged
     work for it. ``decision_texts`` (archive only: card comments) may instead record an explicit
-    ``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF`` decision. Returns the closed refs accepted."""
+    ``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF`` decision. A closed PR whose OWN GitHub thread
+    carries ``CLOSED: ABANDONED|REJECTED|THROWAWAY`` is terminal for ``archive``, and for ``done`` when a
+    non-empty ``abandon_reason`` (``--abandon-routed-pr``) is given; those refs (and only those) are appended
+    to ``abandoned_out``. Returns the closed refs accepted."""
     # Fleet-owned refs only: a foreign (upstream / third-party) PR is a mention the fleet cannot land.
     # ``recorded``: PR strings earlier runs persisted for this card (see :func:`recorded_pr_refs`), so a
     # reviewer approving without repeating the PR is still gated on it (FleetReview #1339).
@@ -712,6 +780,25 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
     uncovered = [c for c in uncovered if not any(_decision_covers(c, t, sole=sole) for t in decision_texts)]
     if not uncovered:
         return closed
+    if card_cover is not None:
+        # ``--superseded-by <card>`` (t_6a853d1c): covered only when ALL of :func:`card_supersession`'s
+        # rules hold for EVERY uncovered closed PR; anything less falls through to the refusal below.
+        covers = card_cover(uncovered)
+        if covers:
+            if card_covered_out is not None:
+                card_covered_out.extend(covers)
+            return closed
+    if verb == "archive" or (isinstance(abandon_reason, str) and abandon_reason.strip()):
+        if terminal_record_fn is None:
+            terminal_record_fn = _default_terminal_record()
+        abandoned = _terminally_closed(uncovered, terminal_record_fn)
+        uncovered = [c for c in uncovered if c not in abandoned]
+        # Recorded as soon as they are exempted (Prism e100e3d33ea7): another closed PR may still pass
+        # below via the merged-survivor path. A refusal discards the list along with the completion.
+        if abandoned_out is not None:
+            abandoned_out.extend(abandoned)
+        if not uncovered:
+            return closed
     # A merged survivor + the PR's own close record (t_9aff2951). ``done`` takes the survivor from
     # ``--survivor-pr``; ``archive`` has no flag, so any of the card's own PRs that merged qualifies.
     candidates = primary if verb == "archive" else split_fleet(extract_pr_refs(survivor_pr=survivor_pr))[0]
@@ -734,6 +821,167 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
             return closed
     raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], verb=verb,
                                 untokened=untokened, survivors=[f"{r.repo}#{r.number}" for r in survivors])
+
+
+# --------------------------------------------------------------------------- superseded by ANOTHER card
+# t_6a853d1c (2026-10-31): t_eb5bf009's fos#350 was closed ``CLOSED: SUPERSEDED-BY #351``; #351 is card
+# t_be729571's PR, merged, and edits the same spawn() block a different way. No commit carries #350's
+# content and #351 does not name t_eb5bf009, so every close form refused and the card could only be
+# archived. ``--superseded-by <card>`` now covers the card's closed own PR when ALL of these hold:
+#   1. that card is done;
+#   2. one of its own PRs merged, merge commit on the default branch. "Own" = a PR its runs declared
+#      (:func:`authored_pr_refs`: pr_url / own_prs) whose head branch names THAT card;
+#   3. the closed PR's own GitHub thread carries ``CLOSED: SUPERSEDED-BY <that PR>``;
+#   4. both PRs are in the same repo and their changed files (verbatim paths) intersect.
+# Anything unreadable refuses (the ordinary closed-unmerged refusal stands).
+CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+_SUPERSEDED_LINE_RE = re.compile(r"^\s*CLOSED: SUPERSEDED-BY\s+(" + _TARGET + r")\b", re.MULTILINE)
+FilesFn = Callable[[str, int], Optional[set]]
+SupersedeTargetsFn = Callable[[str, int], Optional[list]]
+
+
+def superseding_card(superseded_by: Optional[str]) -> Optional[str]:
+    """The ONE card id a ``--superseded-by`` pointer names, else None (none, or ambiguous)."""
+    ids = set(CARD_ID_RE.findall(superseded_by)) if isinstance(superseded_by, str) else set()
+    return ids.pop() if len(ids) == 1 else None
+
+
+def pr_files(repo: str, number: int) -> Optional[set]:
+    """Paths a PR changes (new and previous names), each kept VERBATIM; None when GitHub cannot be read.
+    One JSON array per page (Prism 340172f6f023): a line split would strip ``a.py `` into ``a.py`` and
+    split a path holding a newline in two."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "--hostname", "github.com", "--paginate",
+             f"repos/{repo}/pulls/{number}/files?per_page=100",
+             "--jq", "[.[] | .filename, (.previous_filename // empty)]"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=QUERY_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out: set = set()
+    text, pos, dec = proc.stdout or "", 0, json.JSONDecoder()
+    while True:
+        while pos < len(text) and text[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(text):
+            return out
+        try:
+            page, pos = dec.raw_decode(text, pos)
+        except ValueError:
+            return None
+        if not isinstance(page, list) or not all(isinstance(p, str) and p for p in page):
+            return None
+        out.update(page)
+
+
+def pr_superseded_targets(repo: str, number: int) -> Optional[list]:
+    """Targets of every ``CLOSED: SUPERSEDED-BY <ref>`` line on the PR's own thread; None if unreadable."""
+    out: list = []
+
+    def _collect(body):
+        if isinstance(body, str):
+            out.extend(_SUPERSEDED_LINE_RE.findall(body))
+        return False
+    if pr_close_record(repo, number, match=_collect) is None:
+        return None
+    return out
+
+
+def _default_files() -> Optional[FilesFn]:
+    return None if os.environ.get("PYTEST_CURRENT_TEST") else pr_files
+
+
+def _default_superseded_targets() -> Optional[SupersedeTargetsFn]:
+    return None if os.environ.get("PYTEST_CURRENT_TEST") else pr_superseded_targets
+
+
+def _target_key(closed_ref, target: str) -> Optional[tuple]:
+    m = _BARE_PR_RE.match(target)
+    if m:
+        return closed_ref.repo.lower(), int(m.group(1))
+    refs = extract_pr_refs(target) if ("#" in target or "/pull/" in target) else []
+    return (refs[0].repo.lower(), refs[0].number) if refs else None
+
+
+class SharedWorkspaceSupersessionError(ClosedUnmergedPrError):
+    """--superseded-by CARD on a shared workspace (Prism fad0ffab0ac9). The retention hold a
+    supersession close records protects only this card's id; a workspace-of reader, or an owner
+    with a live reader, can still lose the shared directory through the other card, so it is refused."""
+
+    def __init__(self, task_id: str, prs: list, card: str):
+        super().__init__(task_id, prs)
+        self.args = (f"done refused: superseded-by {card} is not supported on a shared workspace; "
+                     f"close the owner/readers first or use --survivor-unbound",)
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
+def card_supersession(closed, *, card: str, card_status: Optional[str], card_prs, query_fn: Optional[QueryFn],
+                      sha_check: Optional[ShaCheckFn] = None, targets_fn: Optional[SupersedeTargetsFn] = None,
+                      files_fn: Optional[FilesFn] = None) -> list:
+    """Cover entries for every closed ref in ``closed`` that ``card``'s merged work superseded (rules 1-4
+    above); ``[]`` unless EVERY closed ref is covered. Each entry is the survivor-ref shape
+    :func:`kanban_survivor.preserve` records, plus ``supersedes`` (the closed PR) and ``card``."""
+    if card_status != "done" or not closed or query_fn is None:
+        return []
+    sha_check = sha_check or _default_sha_check()
+    targets_fn = targets_fn or _default_superseded_targets()
+    files_fn = files_fn or _default_files()
+    if sha_check is None or targets_fn is None or files_fn is None:
+        return []
+    merged = {}
+    for r in merged_survivors(split_fleet(extract_pr_refs(*card_prs))[0], query_fn=query_fn, sha_check=sha_check):
+        try:
+            payload = query_fn(r.repo, r.number)
+        except Exception as exc:
+            _log.warning("kanban card supersession: %s#%s lookup failed: %s", r.repo, r.number, exc)
+            continue
+        head_ref = payload.get("head_ref") if isinstance(payload, dict) else None
+        # Positive ownership, as the open-PR route: the head branch must name ``card``. An operator
+        # or no-card branch is nobody's own PR (Prism fe296d065135 / 4cacc8c8c4b5).
+        if branch_names_card(head_ref, card) and not branch_is_operators(head_ref):
+            merged[(r.repo.lower(), r.number)] = r
+    if not merged:
+        return []
+    covers: list = []
+    for c in closed:
+        try:
+            targets = targets_fn(c.repo, c.number)
+            hits = [merged[k] for k in dict.fromkeys(_target_key(c, t) for t in (targets or [])) if k in merged]
+            mine = files_fn(c.repo, c.number) if hits else None
+        except Exception as exc:
+            _log.warning("kanban card supersession: %s#%s lookup failed: %s", c.repo, c.number, exc)
+            return []
+        sup = None
+        for s in hits:
+            # Rule 4 compares paths, which only mean the same file inside ONE repo: a cross-repo
+            # superseder never covers (README.md in repo A is not README.md in repo B).
+            if s.repo.lower() != c.repo.lower():
+                continue
+            try:
+                theirs = files_fn(s.repo, s.number)
+            except Exception as exc:
+                _log.warning("kanban card supersession: %s#%s files failed: %s", s.repo, s.number, exc)
+                theirs = None
+            if mine and theirs and mine & theirs:
+                sup = s
+                break
+        if sup is None:
+            return []
+        payload = query_fn(sup.repo, sup.number) or {}
+        covers.append({"remote": f"https://github.com/{sup.repo}.git", "branch": f"refs/pull/{sup.number}/head",
+                       "sha": str(payload.get("merge_commit_sha") or ""), "pr": f"{sup.repo}#{sup.number}",
+                       "state": "MERGED", "external": True, "corroborated_by": "superseded-card",
+                       "card": card, "supersedes": f"{c.repo}#{c.number}",
+                       # Proves another card's PR REPLACED this one, not that it holds this card's
+                       # bytes: completion only, never workspace-deletion authority (Prism c5429c8af4f5).
+                       "unbound": True})
+    return covers
 
 
 # --------------------------------------------------------------------------- routed-PR survivor gate

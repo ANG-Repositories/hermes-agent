@@ -1,8 +1,9 @@
 """Run several Python shell hooks from ONE interpreter start (driver: agent/shell_hooks_batch.py, t_f010356f).
 
-Hermes starts ``<python> shell_hook_dispatcher.py`` once per tool call instead of one
-``<python> <hook>.py`` per configured hook. stdin is one JSON object
-``{"hooks": [{"script", "args", "timeout"}, ...], "stdin": "<hook payload>"}``.
+Hermes keeps ``<python> shell_hook_dispatcher.py --serve`` warm and sends it one request per tool
+call, instead of one ``<python> <hook>.py`` per configured hook. A request is one JSON object
+``{"hooks": [{"script", "args", "timeout"}, ...], "stdin": "<hook payload>"}``: one per stdin line
+with ``--serve`` (each answered by its rows then ``{"end": true}``), or all of stdin without it.
 
 Each hook runs in a forked child that looks to the hook like a fresh ``<python> <script> <args...>``:
 its own process group, the payload on a pipe at fd 0, its own stdout / stderr pipes, ``sys.argv``,
@@ -102,7 +103,7 @@ def _run_child(script, args, in_fd, out_fd, err_fd):
         os.dup2(err_fd, 2)
         _close_inherited_fds()
         signal.signal(signal.SIGINT, signal.default_int_handler)
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # windows-footgun: ok — POSIX fork child; on Windows os.fork fails first and shell_hooks_batch runs hooks one by one
         orig_in, orig_out, orig_err = sys.__stdin__, sys.__stdout__, sys.__stderr__
         sys.stdin = open(0, "r", encoding=orig_in.encoding, errors=orig_in.errors, closefd=False)
         sys.stdout = open(1, "w", encoding=orig_out.encoding, errors=orig_out.errors, closefd=False)
@@ -184,7 +185,7 @@ def _start(i, hook, payload):
     err_r, err_w = os.pipe()
     sys.stdout.flush()
     sys.stderr.flush()
-    pid = os.fork()
+    pid = os.fork()  # windows-footgun: ok — POSIX fork model; on Windows this raises and shell_hooks_batch runs hooks one by one
     if pid == 0:
         _run_child(script, args, in_r, out_w, err_w)
     for fd in (in_r, out_w, err_w):
@@ -222,9 +223,28 @@ def _finish(sel, h, timed_out):
 
 
 def main():
-    request = json.loads(sys.stdin.read())
+    """One request on stdin (read to EOF), or with ``--serve`` one request per stdin line until EOF,
+    each answered by its rows and then ``{"end": true}`` (the warm dispatcher, t_e920d269)."""
+    if "--serve" in sys.argv[1:]:
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return
+            _run_request(json.loads(line))
+            _emit({"end": True})
+    _run_request(json.loads(sys.stdin.read()))
+
+
+def _run_request(request):
     payload = request["stdin"].encode("utf-8")
     sel = selectors.DefaultSelector()
+    try:
+        _run_hooks(request, payload, sel)
+    finally:
+        sel.close()
+
+
+def _run_hooks(request, payload, sel):
     live = []
     for i, hook in enumerate(request["hooks"]):
         h = _start(i, hook, payload)
@@ -281,7 +301,7 @@ def main():
                 live.remove(h)
             elif now >= h.deadline:
                 try:
-                    os.killpg(h.pid, signal.SIGKILL)
+                    os.killpg(h.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX fork model; never reached on Windows (os.fork fails first)
                 except OSError:
                     pass
                 if h.status is None:

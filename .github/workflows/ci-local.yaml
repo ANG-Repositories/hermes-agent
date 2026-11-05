@@ -78,6 +78,7 @@ name: CI (local fallback)
 #     merge_group forces them on and push:main runs everything, so a PR run is
 #     never the only gate (t_e8c5045e).
 
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request, push, merge_group); dispatch-only until re-enabled on a card.
 on:   # ARMED 2026-10-09 20:06 PT by Apollo on Ace's word ("let's arm it"); Support #4838502 still open on ci.yaml
   workflow_dispatch:
     inputs:
@@ -93,22 +94,6 @@ on:   # ARMED 2026-10-09 20:06 PT by Apollo on Ace's word ("let's arm it"); Supp
         required: false
         type: boolean
         default: false
-  pull_request:
-  push:
-    branches: [main]
-  # merge_group: the merge queue creates a temporary batched branch and fires
-  # this event; the required checks must run on it or the queue wedges forever.
-  # The detect-changes classifier resolves a REAL diff here, three-dot from the
-  # TARGET BRANCH (github.event.merge_group.base_ref) to the candidate head —
-  # deliberately NOT merge_group.base_sha, which is the previous chained queue
-  # candidate and yields only the topmost entry's delta. The three-dot diff is
-  # the union of the batch's member PRs, so lane selection over it cannot
-  # under-test any member (the full argument, with the measurement, lives in
-  # .github/actions/detect-changes/action.yml).
-  # A malformed/absent payload still fails open to the full matrix, and every
-  # other non-PR event (push to main, release, dispatch) is untouched: no base
-  # resolved, empty diff, every lane true.
-  merge_group:
 
 permissions:
   contents: read
@@ -127,9 +112,14 @@ permissions:
 # github.run_id, so even a parent rerun cannot kill this child mid-flight.
 # Release (workflow_call with inputs.release) never cancels and never gets
 # cancelled: its group is github.run_id. PRs collapse per-PR; pushes use the
-# ref as before.
+# ref as before, except push:main under vars.CI_MAIN_GROUP_PER_SHA == 'true':
+# one group per sha (hermes-home#5880/#5942 shape). One shared `main` group
+# keeps ONE pending run, so a third push replaced the second (mirror run
+# 40124835454 @83bf634c, cancelled with 0 jobs) and main shas went ungraded.
+# The nested workflows key push:main by run_id, so concurrent main runs do not
+# cancel each other's children. Rollback: delete the repo variable.
 concurrency:
-  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
+  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CI_MAIN_GROUP_PER_SHA == 'true' && github.sha || github.ref)) }}
   # Cancel superseded runs on BOTH pull_request and merge_group.
   #
   # merge_group was previously excluded, which stranded a full 44-job run every
@@ -162,6 +152,7 @@ jobs:
   # tag is not a meaningful applicability signal.
   # ─────────────────────────────────────────────────────────────────────
   detect:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1' }}
     name: Detect affected areas
     # Unblock all lanes without waiting for a self-hosted test slot.
     runs-on: ubuntu-latest
@@ -186,6 +177,7 @@ jobs:
       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
       e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
       desktop: ${{ steps.gate-lanes.outputs.desktop }}
+      hosted_os: ${{ steps.gate-lanes.outputs.hosted_os }}
       # Not lane booleans: raw classifier values, never release-forced.
       test_scope: ${{ steps.classify.outputs.test_scope }}
       changed_files: ${{ steps.classify.outputs.changed_files }}
@@ -229,6 +221,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS }}
           PR_OS_TESTS: ${{ vars.CI_PR_OS_TESTS }}
+          PR_E2E_UPGRADE: ${{ vars.CI_PR_E2E_UPGRADE }}
+          HOSTED_OS_JOBS: ${{ vars.CI_HOSTED_OS_JOBS }}
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
         run: |
           python3 - <<'PY'
@@ -237,6 +231,11 @@ jobs:
           release = os.environ['RELEASE'] == 'true'
           if os.environ['EVENT_NAME'] == 'merge_group':
               values.update(e2e_upgrade='true', bootstrap='true')
+          # CI_PR_E2E_UPGRADE=off skips the install/update e2e lane on pull_request only: on the
+          # private mirror those shards need the 2-runner ci-priv class and queued every PR
+          # behind it (Ace 2026-11-01, t_38da7416). push:main and merge_group still run them.
+          if os.environ['EVENT_NAME'] == 'pull_request' and os.environ.get('PR_E2E_UPGRADE') == 'off':
+              values['e2e_upgrade'] = 'false'
           if not release and os.environ['DESKTOP_JOBS'] != 'on':
               values['desktop'] = 'false'
           # macOS + Windows unit lanes: path-gated on pull_request only
@@ -244,6 +243,12 @@ jobs:
           # vars.CI_PR_OS_TESTS=on runs them on every PR again.
           if os.environ['EVENT_NAME'] != 'pull_request' or os.environ['PR_OS_TESTS'] == 'on':
               values['os_tests'] = 'true'
+          # Hosted macOS/Windows jobs (tests-os, install.ps1 protocol surface).
+          # CI_HOSTED_OS_JOBS=off on the private mirror, which has no hosted
+          # billing and no self-hosted macOS/Windows class: those jobs otherwise
+          # fail with runner=none and 0 steps (t_70d527c7). A release run forces
+          # it back on below, so a strict release gate still sees them.
+          values['hosted_os'] = 'false' if os.environ.get('HOSTED_OS_JOBS') == 'off' else 'true'
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for lane, value in values.items():
                   if release and value in ('true', 'false'):
@@ -311,7 +316,8 @@ jobs:
   tests-os:
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    # Every job in tests-os.yml is hosted macOS/Windows; hosted_os gates it (CI_HOSTED_OS_JOBS).
+    if: needs.detect.outputs.python == 'true' && needs.detect.outputs.hosted_os == 'true'
     uses: ./.github/workflows/tests-os.yml
     with:
       # The Windows lane spawns the real desktop-update hand-off script
@@ -359,6 +365,8 @@ jobs:
     # are platforms("windows") pytest files and run in tests-os.
     if: needs.detect.outputs.bootstrap == 'true'
     uses: ./.github/workflows/bootstrap-installer.yml
+    with:
+      hosted_os: ${{ needs.detect.outputs.hosted_os == 'true' }}
 
   e2e-desktop:
     name: Desktop E2E
@@ -495,7 +503,7 @@ jobs:
   review-labels:
     name: Review label gate
     needs: [detect, supply-chain]
-    if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')) }}
     uses: ./.github/workflows/review-labels.yml
     with:
       ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
@@ -553,7 +561,7 @@ jobs:
       # its own check. It was never required here, because it is too slow
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
-    if: always()
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always()) }}
     # A completed matrix must not wait for the pool to report its verdict.
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -593,7 +601,7 @@ jobs:
   ci-timings:
     name: CI timing report
     needs: [all-checks-pass]
-    if: always()
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always()) }}
     # GitHub API/cache/artifacts only; reserve pool slots for tests.
     runs-on: ubuntu-latest
     timeout-minutes: 10

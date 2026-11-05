@@ -234,7 +234,7 @@ def test_cli_create_prints_scope_warning(tmp_path):
                                 "HERMES_CRON", "HERMES_DELEGATED", "_HERMES_GATEWAY"))}
     env.update(HERMES_HOME=str(home), HOME=str(tmp_path), PYTHONPATH=str(REPO))
     proc = subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", "create", "prose card",
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", "create", "prose card",
          "--assignee", "worker1", "--home", "operator", "--body", PROSE_BODY],
         env=env, capture_output=True, text=True, timeout=180, cwd=str(REPO))
     assert proc.returncode == 0, proc.stderr
@@ -245,11 +245,11 @@ def test_tool_create_returns_scope_warning(board, monkeypatch):
     for k in list(os.environ):
         if k.startswith(("HERMES_KANBAN", "HERMES_SESSION_", "HERMES_DELEGATED")):
             monkeypatch.delenv(k, raising=False)
-    d = json.loads(kt._handle_create({"title": "prose card", "assignee": "peer",
+    d = json.loads(kt._handle_create({"board": "default", "title": "prose card", "assignee": "peer",
                                       "body": PROSE_BODY, "unhomed": True}))
     assert d["ok"] is True, d
     assert "capabilities/device_timing.yaml" in d["scope_warning"]
-    d2 = json.loads(kt._handle_create({"title": "declared card", "assignee": "peer",
+    d2 = json.loads(kt._handle_create({"board": "default", "title": "declared card", "assignee": "peer",
                                        "body": HEADING_BODY, "unhomed": True}))
     assert d2["ok"] is True, d2
     assert "scope_warning" not in d2

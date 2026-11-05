@@ -160,6 +160,35 @@ def test_oneshot_jobs_are_not_requeued(env):
     assert cj.request_restart_requeue(job["id"], "test") is False
 
 
+def test_final_repetition_is_not_requeued(env):
+    """Prism cd1ea5071578: a killed run that reached its repeat limit retired the job, so a marker
+    could never fire. The shared predicate refuses it, in flight and after the count."""
+    from cron import jobs as cj
+    job = _make_job()
+    cj.update_job(job["id"], {"repeat": {"times": 1, "completed": 0}})
+    job = cj.get_job(job["id"])
+    assert cj.restart_refire_refusal(job, run_counted=False) == "final repetition"
+    assert cj.restart_refire_refusal(job, run_counted=True) is None
+    cj.update_job(job["id"], {"repeat": {"times": 1, "completed": 1}})
+    assert cj.request_restart_requeue(job["id"], "test") is False
+    assert not cj.get_job(job["id"]).get(cj.RESTART_REQUEUE_KEY)
+    cj.update_job(job["id"], {"repeat": {"times": 3, "completed": 1}})
+    assert cj.request_restart_requeue(job["id"], "test") is True
+
+
+def test_disabled_job_is_not_requeued(env):
+    """Prism 9b45f30f3479: a disabled (paused) job's re-fire never runs, so the predicate refuses it
+    and the bounded skew drain waits for the run instead of killing it."""
+    from cron import jobs as cj
+    job = _make_job()
+    cj.update_job(job["id"], {"enabled": False})
+    job = cj.get_job(job["id"])
+    assert cj.restart_refire_refusal(job, run_counted=False) == "disabled"
+    assert cj.request_restart_requeue(job["id"], "test") is False
+    cj.update_job(job["id"], {"enabled": True})
+    assert cj.restart_refire_refusal(cj.get_job(job["id"]), run_counted=False) is None
+
+
 def test_dying_process_tick_leaves_requeue_marker_for_next_boot(env):
     """Reviewer race on #1301: the dying gateway's ticker keeps running from
     drain timeout until runner.stop() returns. A tick in that window must not
@@ -267,10 +296,10 @@ def test_sigterm_outside_shutdown_still_pages(env, monkeypatch):
     assert "-15" in content or "exited with code" in content
 
 
-def _make_named_job(name):
+def _make_named_job(name, schedule="0 3 * * *"):
     from cron.jobs import create_job, get_job
     job = create_job(
-        prompt=None, schedule="0 3 * * *", name=name,
+        prompt=None, schedule=schedule, name=name,
         script="long.sh", no_agent=True, deliver="local",
     )
     return get_job(job["id"])
@@ -320,3 +349,34 @@ def test_requeues_in_one_scan_are_staggered(env, monkeypatch):
     at_slot = later + timedelta(seconds=1)
     monkeypatch.setattr(cj, "_hermes_now", lambda: at_slot)
     assert pending in {j["id"] for j in cj.get_due_jobs()}, "staggered re-fire lost"
+
+
+def test_stagger_never_defers_past_the_jobs_own_cadence(env, monkeypatch):
+    """t_f1302096: slot 26 parked an every-1m job (prism-container-status) 7800 s, holding a
+    resolved page open for 2h. A re-fire is due no later than the job's next natural occurrence;
+    long-cadence jobs keep the full slot * STAGGER spread."""
+    from datetime import datetime
+    from cron import jobs as cj
+
+    # Daily at 12 h from now: a fixed 03:00 put the natural run inside the 29-slot spread
+    # (8,400 s) whenever the suite ran 00:40-03:00 in the cron TZ, and the cadence cap then
+    # (correctly) clamped several slots to the same instant (3/12 mirror main runs, t_0fcbd3fa).
+    daily_at = f"0 {(cj._hermes_now().hour + 12) % 24} * * *"
+    daily = [_make_named_job(f"heavy-{i}", daily_at) for i in range(29)]
+    fast = cj.create_job(prompt=None, schedule="every 1m", name="prism-container-status",
+                         script="long.sh", no_agent=True, deliver="local")
+    killed = daily + [cj.get_job(fast["id"])]
+    for job in killed:
+        assert cj.request_restart_requeue(job["id"], "restart") is True
+
+    t0 = cj._hermes_now()
+    monkeypatch.setattr(cj, "_hermes_now", lambda: t0)
+    cj.get_due_jobs()
+    fire = {j["id"]: datetime.fromisoformat(cj.get_job(j["id"])["next_run_at"]) for j in killed}
+    row = cj.get_job(fast["id"])
+    assert row["next_run_at"] == row["manual_run_at"], "run-now shape kept"
+    assert (fire[fast["id"]] - t0).total_seconds() <= 60, "every-1m job parked past its cadence"
+    # The daily jobs keep the anti-stampede spread: distinct slots, STAGGER apart.
+    delays = sorted((fire[j["id"]] - t0).total_seconds() for j in daily)
+    assert len(set(delays)) == len(daily)
+    assert all(b - a >= cj.RESTART_REQUEUE_STAGGER_S for a, b in zip(delays, delays[1:]))

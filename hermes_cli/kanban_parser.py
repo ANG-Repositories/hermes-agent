@@ -9,6 +9,8 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
@@ -106,6 +108,16 @@ def _base_check_setup(p: argparse.ArgumentParser) -> None:
     add_arguments(p)
 
 
+def _reclaim_setup(p: argparse.ArgumentParser) -> None:
+    from hermes_cli.kanban_reclaim import add_arguments
+    add_arguments(p)
+
+
+def _obligation_setup(p: argparse.ArgumentParser) -> None:
+    from hermes_cli.kanban_work_obligations import setup_parser
+    setup_parser(p)
+
+
 _TASK_ID = _arg("task_id")
 # Operator-Surface S2 (t_cd1bcea4): ONE convention on every lifecycle verb that takes prose /
 # structured input / can refuse. Mapping to each verb's historic field is in the handler.
@@ -121,7 +133,58 @@ _WHY = _arg("--why", action="store_true",
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+# Tiers sit on the fleet's live scale (store ORDER BY priority DESC): 0 is the default/normal
+# pile, ~80 is the ready pile, 100-300 is operator-urgent (measured 2026-10-24 on kanban.db).
+# A p0 must sort ABOVE every existing card, so it is 300, not a small ordinal (Prism P1 f02195f23922).
+_P_TIERS = {"p0": 300, "p1": 200, "p2": 100, "p3": 0}
+
+
+def priority_value(text: str) -> int:
+    """``--priority`` accepts the signed int the store keeps (higher = first) OR a
+    ``p0``..``p3`` tier (p0=300, p1=200, p2=100, p3=0: the fleet's live scale, p0 = highest). An operator who
+    types ``--priority p2`` against an int-only flag gets a refusal whose last line is
+    the create schema, which never mentions ``--priority`` -- the real cause scrolls off
+    (2026-10-24, three refused creates in a row on the vegas-theft board)."""
+    t = text.strip().lower()
+    if t in _P_TIERS:
+        return _P_TIERS[t]
+    try:
+        return int(t)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: want an int (higher = first) or a tier p0..p3 (p0 = highest)")
+
+
+_PRIORITY = _arg("--priority", type=priority_value, default=0,
+                 help="Priority tiebreaker: int (higher = first) or p0..p3 (p0 = highest)")
+# Bands (hermes-home config/kanban-priority-bands.json, spec 2026-11-02, Ace Q1 A): a human's bare
+# `kanban create` lands at human_default (100 = p2), above every machine minter (those cap at 59 and pass
+# --created-by <minter> --priority band(...)). KANBAN_PRIORITY_BANDS=off restores the old default 0.
+HUMAN_DEFAULT_PRIORITY = 100
+HUMAN_CREATED_BY = "user"
+
+
+# A cron script, a dispatched worker or a TTY-less script that omits --created-by still records "user";
+# the minter-origin class (kb.classify_create_origin) keeps those at 0 so no machine minter lands above 59.
+_MINTER_ORIGINS = frozenset({kb.CREATE_ORIGIN_CRON, kb.CREATE_ORIGIN_WORKER, kb.CREATE_ORIGIN_SCRIPT})
+
+
+def create_default_priority(created_by: str | None, origin: str | None = None) -> int:
+    """The priority of a ``create`` with no ``--priority``: 100 for a human (no ``--created-by`` minter id, and
+    not a cron/worker/script process), else 0. Kill switch ``KANBAN_PRIORITY_BANDS=off`` -> 0 (read per call)."""
+    if (os.environ.get("KANBAN_PRIORITY_BANDS") or "").strip().lower() == "off":
+        return 0
+    if (created_by or HUMAN_CREATED_BY) != HUMAN_CREATED_BY:
+        return 0
+    return 0 if (origin or kb.classify_create_origin()) in _MINTER_ORIGINS else HUMAN_DEFAULT_PRIORITY
+
+
+_CREATE_PRIORITY = _arg(
+    "--priority", type=priority_value, default=None,
+    help="Dispatch priority, higher = first: int or tier p0=300 p1=200 p2=100 p3=0. Bands: ace_direct 300, "
+         "operator_fix 200, human_default 100, prism_sendback 60, pager_unowned 40, ci_red 30, "
+         "ci_housekeeping 0; a minter (--created-by <id>) stays <= 59. Default: 100 for a human, 0 for a "
+         "minter (KANBAN_PRIORITY_BANDS=off: 0).")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -156,6 +219,12 @@ _ALLOW_FLAGSHIP = _arg(
     help="Allow an orchestrator-only flagship model for this task. Requires a non-empty "
          "reason, recorded as a task comment. --firepower is an alias.",
 )
+_ASSIGN_FLAGSHIP = _arg(
+    "--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
+    help="Required when the new profile's model.default is an orchestrator-only "
+         "flagship and the card has no --model pin. Recorded as a "
+         "'flagship override:' comment.",
+)
 _HANDBACK_FLAGS = (
     _arg("--request-changes", dest="request_changes", metavar="REASON",
          help="Required to hand a card in review with an open PR back: records "
@@ -176,7 +245,6 @@ _BOARD_SPECS = [
         _arg("--description", help="Optional description"),
         _arg("--icon", help="Optional emoji or single-character icon for the dashboard"),
         _arg("--color", help="Optional hex color (e.g. '#8b5cf6') for the dashboard"),
-        _arg("--switch", action="store_true", help="Switch to the new board after creating it"),
         _arg("--default-workdir", help="Default workspace path for tasks created on this board"),
     ], aliases=["new"], help="Create a new board"),
     _cmd("rm", [
@@ -185,8 +253,8 @@ _BOARD_SPECS = [
              help="Hard-delete the board directory instead of archiving it. "
                   "Default is to move it to boards/_archived/ so it's recoverable."),
     ], aliases=["remove", "delete"], help="Archive (default) or delete a board"),
-    _cmd("switch", [_SLUG], aliases=["use"], help="Set the active board for subsequent CLI calls"),
-    _cmd("show", aliases=["current"], help="Print the currently-active board slug"),
+    _cmd("show", aliases=["current"],
+         help="Print the board this call is scoped to (--board or the HERMES_KANBAN_DB pin)"),
     _cmd("rename", [_SLUG, _arg("name", help="New display name")],
          help="Change a board's human-readable display name (slug is immutable)"),
     _cmd("set-default-workdir", [
@@ -194,7 +262,7 @@ _BOARD_SPECS = [
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
     _cmd("export", [
-        _arg("slug", nargs="?", help="Board to export (default: the current board)"),
+        _arg("slug", help="Board to export"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
         _arg("--no-attachments", action="store_true", help="Skip attachment files, keeping the archive small"),
         _arg("--include-logs", action="store_true", help="Include per-task worker logs"),
@@ -208,7 +276,6 @@ _BOARD_SPECS = [
     _cmd("import", [
         _arg("archive", help="Path to the .tar.gz archive"),
         _arg("--as", dest="as_slug", help="Slug for the imported board (default: from the archive)"),
-        _arg("--switch", action="store_true", help="Switch to the imported board afterwards"),
         _json_flag(),
     ], help="Import a board archive as a new board", description=(
         "Import a .tar.gz produced by `hermes kanban boards export`. The board always lands as a "
@@ -297,7 +364,7 @@ _SPECS = [
                   "worktree under the project's primary repo with a "
                   "deterministic branch. See `hermes project list`."),
         _TENANT,
-        _PRIORITY,
+        _CREATE_PRIORITY,
         _arg("--triage", action="store_true",
              help="Park in triage — a specifier will flesh out the spec and promote to todo"),
         _arg("--idempotency-key",
@@ -361,10 +428,13 @@ _SPECS = [
                   "review). Best for open-ended cards one shot rarely finishes."),
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
-        _arg("--auto-handle", choices=("true", "false"), dest="auto_handle", default=None,
-             help="Boomerang v2: let mechanical wakes on this card be auto-handled by a "
-                  "background child (true) or always surface (false). Omit to inherit the "
-                  "home session's /autohandle, then the board default (off)."),
+        _arg("--no-boomerang-wake", action="store_false", default=None, dest="boomerang_wake",
+             help="Opt out of the default boomerang subscription."),
+        _arg("--boomerang-wake", action="store_true", default=None, dest="boomerang_wake",
+             help="Subscription level 'boomerang wake': mechanical wakes on this card are "
+                  "handled by a background boomerang child (the calling chat subscribes "
+                  "--boomerang-wake). Defaults to kanban.auto_subscribe_boomerang "
+                   "for operator creates with a gateway origin."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -398,6 +468,9 @@ _SPECS = [
         _PRIORITY,
         _arg("--created-by", help="Creator/anchor profile"),
         _arg("--idempotency-key", help="Dedup key for the root card"),
+        _arg("--allow-flagship", dest="allow_flagship", metavar="REASON",
+             help="Authorize child cards whose assignee profile default is a "
+                  "flagship model (logged as a 'flagship override:' comment)"),
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),
     _cmd("list", [
@@ -433,6 +506,7 @@ _SPECS = [
         _TASK_ID,
         _arg("profile", help="Profile name (or 'none' to unassign)"),
         *_HANDBACK_FLAGS,
+        _ASSIGN_FLAGSHIP,
     ], help="Assign or reassign a task"),
     _cmd("set-model", [
         _arg("task_ids", nargs="*", metavar="task_id",
@@ -507,6 +581,7 @@ _SPECS = [
              help="Release any active claim before reassigning (required if task is running)"),
         _RECLAIM_REASON,
         *_HANDBACK_FLAGS,
+        _ASSIGN_FLAGSHIP,
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
         _arg("--severity", choices=["warning", "error", "critical"],
@@ -518,7 +593,7 @@ _SPECS = [
         _arg("--fleet", action="store_true",
              help="With --placement: the fleet view (alias of `kanban placement --fleet`)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
-    ], aliases=["diag"], help="List active diagnostics on the current board"),
+    ], aliases=["diag"], help="List active diagnostics on the board named by --board or the DB pin"),
     _cmd("placement", [
         _arg("task_id", nargs="?", help="One card: its Placement block only"),
         _arg("--fleet", action="store_true",
@@ -561,7 +636,13 @@ _SPECS = [
              help="Read the comment body from PATH ('-' = stdin). Use this for "
                   "text with backticks or $(...): the shell never sees it."),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
+        _arg("--grant", metavar="GRANT_ID",
+             help="Sign as --author under a scoped signing grant this delegate child was given "
+                  "(kanban.sign_grants: on); refused outside its cards, verbs, expiry or session"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _arg("--if-latest-release", type=int, metavar="COMMENT_ID",
+             help="Append only while COMMENT_ID is still the card's newest release-bearing "
+                  "(close-on:) comment, checked in the insert's transaction; else exit 3, nothing written"),
         _WHY,
     ], help="Append a comment"),
     _cmd("attach", [
@@ -611,7 +692,9 @@ _SPECS = [
              help="Audited override: the card was routed to review on its own PR, that PR is still "
                   "OPEN, and the --survivor-pr/--survivor-ref claim names something else. Without "
                   "this flag such a completion is refused (t_829fce95); with it a "
-                  "routed_pr_abandoned event records the PRs and REASON. An empty REASON is refused."),
+                  "routed_pr_abandoned event records the PRs and REASON. An empty REASON is refused. "
+                  "Also closes a card whose own PR is CLOSED unmerged with a 'CLOSED: "
+                  "ABANDONED|REJECTED|THROWAWAY' comment on GitHub (t_2ce83b37)."),
         _arg("--survivor-ref", action="append", metavar="[REPO=]URL#SHA",
              help="Name an external survivor when the implementation lives on a remote, not in "
                   "the workspace. Verified with git ls-remote AND required to name this task: "
@@ -673,10 +756,14 @@ _SPECS = [
             _arg("--worker-ok", action="store_const", const=False, dest="no_worker",
                  help="Clear the no-worker flag"),
         ),
-        _arg("--auto-handle", choices=("true", "false", "inherit"), dest="auto_handle",
-             default=None,
-             help="Boomerang v2 auto-handle flag: true / false, or inherit to clear it "
-                  "(home session /autohandle, then board default, then off)."),
+        _group(
+            _arg("--boomerang-wake", action="store_const", const=True, dest="boomerang_wake",
+                 default=None,
+                 help="Set the card's level to 'boomerang wake' (the card column; "
+                      "subscription rows are unchanged)"),
+            _arg("--no-boomerang-wake", action="store_const", const=False, dest="boomerang_wake",
+                 help="Drop the card back to plain wake"),
+        ),
         # fork #1614: per-card skill list; fork #1612: needs-input pager opt-out.
         _arg("--skill", action="append", default=[], dest="skills", metavar="NAME",
              help="Append a skill to force-load into the worker (repeatable; "
@@ -790,6 +877,11 @@ _SPECS = [
         # ``--operator "<who: why>"`` comes from the home-guard loop in build_parser;
         # on request-changes it is also the operator send-back (coverage waived).
     ], help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("sendback", [
+        _TASK_ID,
+        _arg("--payload", required=True,
+             help="The Forge L0 section 2.4 sendback row as a JSON object (source, reason, summary, evidence, ...)"),
+    ], help="Producer verb: return a PR defect (CI red, Prism, lander, conflict, revert) to the card's implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
@@ -829,13 +921,22 @@ _SPECS = [
              help="Running-count ceiling for this board: spawn nothing once N are running "
                   "(default: kanban.max_spawn)"),
         _arg("--ignore-load-gate", action="store_true",
-             help="Bypass kanban.dispatch_load_gate for this call. Prints load1/pause_above "
+             help="Bypass kanban.dispatch_load_gate for this call. Prints the admission verdict "
                   "and records a load_gate_override event on every card it spawns"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
         _json_flag(),
     ], help="One dispatcher pass: reclaim stale, promote ready, spawn workers"),
+    _cmd("admit", [
+        _TASK_ID,
+        _arg("--host", required=True,
+             help="The ONE host to spawn this card on (must be in the card's eligible set)"),
+        _arg("--reason", required=True,
+             help="Why (required; quote the ruling). Recorded on the admission_override event"),
+    ], help="Operator-only: spawn ONE ready card on ONE host now, skipping the load gate "
+            "and the host admission band (never the measured-danger floor or eligibility). "
+            "Needs KANBAN_OPERATOR_TOKEN; kill switch kanban.admin_admit.enabled"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),
@@ -887,17 +988,21 @@ _SPECS = [
         _arg("--notifier-profile",
              help="Profile gateway that owns/delivers this subscription (default: active profile)"),
         # choices: single source of truth shared with the DB/watcher enum.
-        _arg("--delivery-mode", choices=kbn._NOTIFY_DELIVERY_MODES,
+        _arg("--delivery-mode", choices=(*kbn._NOTIFY_DELIVERY_MODES, *kbn.BOOMERANG_REQUEST_MODES),
              help="How the kanban-notifier reacts to terminal events for this "
                   "subscription: 'notify' (passive message only; default), "
                   "'notify+wake' (message AND wake the destination gateway agent so "
-                  "it reads the full board context and replies in its own voice), or "
-                  "'wake' (wake the agent only, no passive message). Omit to leave an "
-                  "existing subscription's mode unchanged (new subs default to 'notify')."),
+                  "it reads the full board context and replies in its own voice), "
+                  "'wake' (wake the agent only, no passive message), or the boomerang "
+                  "wake level 'notify+boomerang' / 'boomerang' (stored as notify+wake / wake "
+                  "and sets the card's boomerang_wake once this chat holds the wake). Omit to leave an existing subscription's "
+                  "mode unchanged (new subs default to 'notify')."),
         _arg("--wake", action="store_true",
              help="Shorthand for --delivery-mode notify+wake. One waker per card: "
                   "when another chat holds the wake this sub is stored notify "
                   "(use --takeover to move it)."),
+        _arg("--boomerang-wake", action="store_true", dest="boomerang_wake",
+             help="Shorthand for --delivery-mode notify+boomerang (boomerang wake level)."),
         _arg("--takeover", action="store_true",
              help="Move the card's wake to this chat; the old waker drops to notify."),
         _arg("--also", action="store_true",
@@ -987,6 +1092,8 @@ _SPECS = [
         _arg("--dry-run", action="store_true",
              help="List the workspaces gc would try to remove; delete nothing"),
     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
+    _cmd("reclaim-workspaces", setup=_reclaim_setup,
+         help="Capture, verify and delete the held workspaces of done cards (dry run unless --apply)"),
     _cmd("clone", setup=_clone_setup,
          help="git clone that borrows objects from a shared fleet mirror",
          description=(
@@ -1006,6 +1113,9 @@ _SPECS = [
              "declared scope, or is more than --max-behind commits behind. Prints the re-port "
              "remediation."
          )),
+    _cmd("obligation", setup=_obligation_setup,
+         help="Durable work obligations: open/claim/progress/resolve decision rows on a card",
+         description="See docs/kanban-obligations.md for verbs, JSON shapes and exit codes."),
     _cmd("home-lint", [
         _arg("--backfill", action="store_true", help="Stamp each homeless open card 'unhomed' + comment"),
         _arg("--dry-run", action="store_true", help="With --backfill: list what would be stamped"),
@@ -1126,10 +1236,9 @@ def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
     parser.__class__ = _Intermixed
 
 
-_BOARD_HELP = ("Board slug to operate on. Defaults to the current board (set "
-               "via `hermes kanban boards switch <slug>` or the "
-               "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
-               "list` to see all boards.")
+_BOARD_HELP = ("Board slug to operate on. When omitted, a dispatched worker's HERMES_KANBAN_DB "
+               "pin names it, or the verb's card id does; otherwise the verb is refused. "
+               "There is no current board. Use `hermes kanban boards list` to see all boards.")
 
 # Verbs that take no verb-position ``--board``: ``clone`` is a git operation with no board state,
 # ``budget`` owns ``--board`` as a report filter. ``boards …`` accepts it for parity and its
@@ -1172,8 +1281,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                     "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban.",
     )
     # --board scopes every subcommand to one board's DB; when omitted the
-    # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
-    # file, then "default" (kanban_db.get_current_board()).
+    # DB pin or the verb's card id names it (kanban_board_select.resolve, S7 D2).
     kanban_parser.add_argument("--board", default=None, metavar="<slug>", help=_BOARD_HELP)
     sub = kanban_parser.add_subparsers(dest="kanban_action")
     _add_commands(sub, _SPECS)
@@ -1199,6 +1307,34 @@ def _schema_on_usage_error(sub: argparse._SubParsersAction) -> None:
             _verb = name
 
             def error(self, message):
-                super().error(f"{message}\n{schema_text(self._verb)}")
+                # Schema FIRST, the actual refusal LAST: a tool/terminal that tails the
+                # output shows the cause, not the example line (2026-10-24: three
+                # `--priority p2` refusals read as "the wrapper wants a different shape").
+                self.print_usage(sys.stderr)
+                self.exit(2, f"{schema_text(self._verb)}\n{self.prog}: error: {message}\n")
 
         p.__class__ = _SchemaOnError
+    _removed_boards_verbs_hint(sub)
+
+
+# S7 (Q4): verbs deleted with the current-board pointer, and the one line that replaces each.
+REMOVED_BOARDS_VERBS = {
+    "switch": "boards switch was removed (S7): pass --board <slug> on each verb.",
+    "use": "boards use was removed (S7): pass --board <slug> on each verb.",
+}
+
+
+def _removed_boards_verbs_hint(sub: argparse._SubParsersAction) -> None:
+    """``boards switch``/``use`` exit 2 with the one line naming what replaced them."""
+    boards = sub.choices.get("boards")
+    if boards is None:
+        return
+    base = type(boards)
+
+    class _RemovedVerbHint(base):  # type: ignore[misc, valid-type]
+        def _check_value(self, action, value):
+            if isinstance(action, argparse._SubParsersAction) and value in REMOVED_BOARDS_VERBS:
+                self.exit(2, f"{self.prog}: {REMOVED_BOARDS_VERBS[value]}\n")
+            super()._check_value(action, value)
+
+    boards.__class__ = _RemovedVerbHint

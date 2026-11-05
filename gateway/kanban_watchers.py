@@ -16,6 +16,7 @@ refusal paging) as the loop bodies ``GatewayRunner`` runs.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import os
 import sqlite3
@@ -35,6 +36,7 @@ from gateway.kanban_watchers_common import (
     _wake_downgrade_reason,
     logger,
 )
+from gateway.kanban_watchers_dispatcher import _default_profile_secret_scope
 from gateway.kanban_watchers_notifier import (
     _adapter_for_subscription,
     _safe_review_reason,
@@ -232,22 +234,117 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
+class _SessionOriginReader:
+    """One reused SessionDB per state.db path for the notifier's origin lookups (t_69e10010).
+
+    Constructing a SessionDB runs the full writable open path (fd-table scans under the startup
+    lock); the notifier used to do that once per actor per subscription per tick. The handle comes
+    from ``hermes_state_registry.acquire``, the process-wide registry the gateway's session store
+    also opens through, so in a gateway it is the runner's own writer and nothing new is opened.
+    The path is resolved per call (``_default_db_path`` follows the context-local HERMES_HOME),
+    the handle is dropped when the file at the path was replaced or a read fails, and ``close()``
+    returns every reference when the watcher stops.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._dbs: dict[str, Any] = {}
+        # Prism c1643c48add2: set by close(). A ``_collect`` worker that is still running when the
+        # watcher's ``finally`` closes the reader must not park a fresh registry reference here
+        # where nothing would release it; after close, get_session() takes and returns one per call.
+        self._closed = False
+
+    def _handle(self, key: str):
+        """``(db, owned)``: the cached handle (``owned`` False), or, after ``close()``, a fresh
+        reference the caller must release (``owned`` True)."""
+        from hermes_state_common import stat_db_file_identity
+
+        with self._lock:
+            db = self._dbs.get(key)
+        if db is not None and getattr(db, "_db_file_identity", None) == stat_db_file_identity(Path(key)):
+            return db, False
+        if db is not None:
+            self._drop(key, db)
+        from hermes_state_registry import acquire
+
+        db = acquire(Path(key))
+        with self._lock:
+            other = None if self._closed else self._dbs.setdefault(key, db)
+        if other is None:  # closed: the caller owns this reference and releases it itself
+            return db, True
+        if other is not db:
+            self._release(db)
+        return other, False
+
+    def _drop(self, key: str, db) -> None:
+        with self._lock:
+            if self._dbs.get(key) is db:
+                del self._dbs[key]
+            else:
+                return
+        self._release(db)
+
+    @staticmethod
+    def _release(db) -> None:
+        try:
+            from hermes_state_registry import release_or_close
+
+            release_or_close(db)
+        except Exception:
+            logger.debug("kanban notifier: origin reader release failed", exc_info=True)
+
+    def get_session(self, session_id: str):
+        from hermes_state import _default_db_path
+
+        key = str(_default_db_path())
+        db, owned = self._handle(key)
+        try:
+            return db.get_session(session_id)
+        except Exception:
+            if not owned:
+                self._drop(key, db)
+            raise
+        finally:
+            if owned:  # taken after close(): nothing else will return it
+                self._release(db)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            dbs, self._dbs = list(self._dbs.values()), {}
+        for db in dbs:
+            self._release(db)
+
+
+# Set by the notifier watcher for its lifetime; ``asyncio.to_thread`` copies it into ``_collect``.
+_ORIGIN_READER: "contextvars.ContextVar[Optional[_SessionOriginReader]]" = contextvars.ContextVar(
+    "kanban_notifier_origin_reader", default=None,
+)
+
+
 def _session_origin(session_id: str) -> Optional[dict]:
     """The ``origin_json`` dict a session was opened from, or None.
 
-    Blocking state.db lookup; call from a worker thread only.
+    Blocking state.db lookup; call from a worker thread only. Inside the notifier watcher the
+    lookup reuses its ``_SessionOriginReader``; elsewhere it opens (and closes) one SessionDB.
     """
     row = None
     try:
-        from hermes_state import SessionDB
+        reader = _ORIGIN_READER.get()
+        if reader is not None:
+            row = reader.get_session(session_id)
+        else:
+            from hermes_state import SessionDB
 
-        db = SessionDB()
-        try:
-            row = db.get_session(session_id)
-        finally:
-            close = getattr(db, "close", None)
-            if callable(close):
-                close()
+            db = SessionDB()
+            try:
+                row = db.get_session(session_id)
+            finally:
+                close = getattr(db, "close", None)
+                if callable(close):
+                    close()
     except Exception:
         return None
     raw = (row or {}).get("origin_json")
@@ -324,7 +421,7 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
 
 # LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
 # `hermes kanban daemon` loop); re-exported here for existing importers.
-from hermes_cli.kanban_load_gate import LoadGate, _denom  # noqa: E402,F401
+from hermes_cli.kanban_load_gate import ADMISSION as _GATE_ADMISSION, LoadGate, _denom  # noqa: E402,F401
 
 
 def _format_spawn_routes(routes, sources=None) -> str:
@@ -341,6 +438,13 @@ def _format_spawn_routes(routes, sources=None) -> str:
         f"kind={route_kind(route)}"
         for task_id, route in entries.items()
     )
+
+
+def _held_by_requires(res) -> int:
+    """Ready cards a ``requires:`` pin holds at host=none this tick (t_640a4ea0)."""
+    waits = getattr(res, "placement_waits", None) or {}
+    return sum(1 for tid, a in (getattr(res, "placement_affinity", None) or {}).items()
+               if a.get("host") == "none" and str(waits.get(tid, "")).startswith("requires_unsatisfied"))
 
 
 def _format_lane_expiry(lane, route, successor="profile default") -> str:
@@ -1225,10 +1329,23 @@ class _NeedsInputPager(_GuardStuckNotifier):
         digest = hashlib.sha1(str(item.get("reason") or "").encode("utf-8")).hexdigest()[:12]
         return "|".join((str(board), str(item["task_id"]), digest))
 
+    # The p>=200 #alerts mirror has its own ledger entry, set only when the
+    # mirror send itself returned True (t_d36da044 r1, Prism 560c78346c1a): a
+    # mirror lost to a transient failure is retried on the next page, and a
+    # delivered one is never repeated.
+    _MIRROR_SUFFIX = "|alerts-mirror"
+    # Same pattern for a card homed in #alerts (t_d36da044 r2, Prism
+    # 7dfa6f11a80d): set only when a page to #alerts itself returned True. A
+    # card whose earlier pages went to #logs (below the floor) and is later
+    # raised over it still gets its first #alerts page.
+    _ALERTS_FIRST_SUFFIX = "|alerts-first"
+
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
+        current |= {key + suffix for key in current
+                    for suffix in (self._MIRROR_SUFFIX, self._ALERTS_FIRST_SUFFIX)}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         before = dict(self._sent)
@@ -1256,9 +1373,17 @@ class _NeedsInputPager(_GuardStuckNotifier):
                 continue
             if time.monotonic() >= deadline:
                 break
-            if send(board, item, last is not None):
+            mirror_key = key + self._MIRROR_SUFFIX
+            first_key = key + self._ALERTS_FIRST_SUFFIX
+            page = dict(item, alerts_mirror_due=mirror_key not in self._sent,
+                        alerts_first_due=first_key not in self._sent)
+            if send(board, page, last is not None):
                 self._sent[key] = now
                 delivered += 1
+            if page.get("alerts_mirror_delivered"):
+                self._sent[mirror_key] = now
+            if page.get("alerts_first_delivered"):
+                self._sent[first_key] = now
         if self._sent != before:
             self._save()
         return delivered
@@ -1296,7 +1421,13 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     #alerts gets ONE page per (card, reason) from a card homed there or with no
     home (t_081bb603): its "still waiting" re-page goes to #logs instead (a
     standing wait is a report, not a page), and a card whose origin IS #alerts
-    is not mirrored there a second time."""
+    is not mirrored there a second time.
+
+    t_d36da044 (13 #alerts lines/day vs a budget of 3): the p>=200 mirror
+    fires on the first page only, never on a "still waiting" re-page; and a
+    card homed in #alerts below the pager's own floor
+    (``NEEDS_INPUT_PAGE_MIN_PRIORITY``) posts to #logs, because it pages only
+    for having #alerts as its home, not for its priority."""
     script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; needs-input page not delivered")
@@ -1314,13 +1445,35 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     if channel is not None and not str(channel).isdigit():
         channel = None  # numeric channel ids only
     alerts_ch, logs_ch = _needs_input_channels()
-    if channel and still_waiting and str(channel) == alerts_ch:
-        return _notify_send(script, message, ["--target", logs_ch])
+    from hermes_cli.kanban_db import NEEDS_INPUT_PAGE_MIN_PRIORITY
+
+    try:
+        below_floor = int(item.get("priority") or 0) < NEEDS_INPUT_PAGE_MIN_PRIORITY
+    except (TypeError, ValueError):
+        below_floor = True
+    if channel and str(channel) == alerts_ch:
+        # #alerts gets the card's first page once it is at or above the floor,
+        # whatever still_waiting says: the pager sets ``alerts_first_due`` from
+        # its own ledger entry and reads back ``alerts_first_delivered``. A
+        # direct caller without the flag keeps the first-page-only rule.
+        first_due = item.get("alerts_first_due", not still_waiting)
+        if below_floor or not first_due:
+            return _notify_send(script, message, ["--target", logs_ch])
+        ok = _notify_send(script, message, ["--target", alerts_ch])
+        if ok:
+            item["alerts_first_delivered"] = True
+        return ok
     if channel:
         ok = _notify_send(script, message, ["--target", str(channel)])
-        if (item.get("alerts") and str(channel) != alerts_ch
-                and not _notify_send(script, message, ["--sev", "error"])):
-            logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
+        # The pager sets ``alerts_mirror_due`` from its own mirror ledger entry
+        # and reads back ``alerts_mirror_delivered``; a direct caller without
+        # the flag mirrors on the first page only.
+        mirror_due = item.get("alerts_mirror_due", not still_waiting)
+        if item.get("alerts") and mirror_due and str(channel) != alerts_ch:
+            if _notify_send(script, message, ["--sev", "error"]):
+                item["alerts_mirror_delivered"] = True
+            else:
+                logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
         return ok
     if still_waiting:
         return _notify_send(script, message, ["--target", logs_ch])
@@ -1769,6 +1922,12 @@ class GatewayKanbanWatchersMixin:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        try:
+            from tools.async_delegation_kanban import clear_dispatcher_heartbeat, set_dispatcher_active
+            set_dispatcher_active(False)
+            clear_dispatcher_heartbeat()
+        except Exception:
+            pass
         _release_singleton_lock(handle)
     async def _sleep_between_ticks(self, interval: float) -> None:
         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
@@ -1779,6 +1938,19 @@ class GatewayKanbanWatchersMixin:
             slept += 1.0
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Run the notifier loop with ONE reused state.db reader for origin lookups (t_69e10010):
+        ``_session_origin`` used to construct a SessionDB per actor per tick; the reader is set
+        for this task's context (``asyncio.to_thread`` carries it into ``_collect``) and every
+        reference it took is returned when the watcher stops."""
+        reader = _SessionOriginReader()
+        token = _ORIGIN_READER.set(reader)
+        try:
+            await self._kanban_notifier_watcher_loop(interval)
+        finally:
+            _ORIGIN_READER.reset(token)
+            reader.close()
+
+    async def _kanban_notifier_watcher_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -1947,7 +2119,7 @@ class GatewayKanbanWatchersMixin:
                     from hermes_cli import kanban_open_pr as _open_pr
 
                     _cg_query = getattr(self, "_kanban_close_gate_query", None) or _open_pr.memo_query()
-                    from gateway import kanban_auto_handle as _ah
+                    from gateway import kanban_boomerang_wake as _ah
                     from gateway import kanban_owner_wake as _ow
 
                     _auto_on = _ah.enabled()
@@ -2236,7 +2408,7 @@ class GatewayKanbanWatchersMixin:
                                             red_state[_ev.id] = _verdict["state"]
                                             red_keys[_ev.id] = _verdict["keys"]
                                             _why_red = _ns.red_handback_noise(
-                                                _verdict["keys"], _verdict["inherited_only"], _red_seen,
+                                                _verdict["keys"], _red_seen,
                                             ) if _s5 else None
                                             if _why_red:
                                                 wake_noise[_ev.id] = _why_red
@@ -2256,20 +2428,19 @@ class GatewayKanbanWatchersMixin:
                                                 _kids = []
                                             if _kids:
                                                 ready_state[_ev.id] = _kids
-                                    # Boomerang v2 P3b (spec §5.5): events whose wake an
-                                    # auto-handle child takes instead. AFTER the suppressor;
-                                    # only when the kill switch is on (read every tick).
+                                    # Boomerang v2 P3b (spec §5.5): events whose wake a
+                                    # boomerang-wake child takes instead. AFTER the suppressor;
+                                    # only while the stop file is absent (read every tick).
                                     auto: dict = {}
                                     if _auto_on and _wake_mode:
                                         try:
                                             auto = _ah.collect_candidates(
-                                                _kb, conn, slug, task, events, _home_sid,
-                                                getattr(self, "session_store", None),
+                                                _kb, conn, slug, task, events,
                                                 skip=set(suppressed) | set(wake_noise),
                                                 pr_health=_red_health, memo=_red_memo,
                                             )
                                         except Exception as _ah_exc:
-                                            logger.warning("kanban notifier: auto-handle gate for %s failed "
+                                            logger.warning("kanban notifier: boomerang-wake gate for %s failed "
                                                            "(%s); surfacing", sub["task_id"], _ah_exc)
                                             auto = {}
                                     logger.debug(
@@ -2426,13 +2597,13 @@ class GatewayKanbanWatchersMixin:
                             )
                             mode = "notify"
                     wake_agent = mode in ("notify+wake", "wake")
-                    # Host load1 alone never stops an auto-handle child: the child REPLACES the
+                    # Host load1 alone never stops a boomerang-wake child: the child REPLACES the
                     # session's wake turn, so downgrading it saves nothing, and on a box idling
-                    # above the band auto-handle never ran (smoke 2026-10-19: load 55-75 for
+                    # above the band boomerang wake never ran (smoke 2026-10-19: load 55-75 for
                     # hours). Same rule as a human-owned wake (t_b7b31563): dispatcher
                     # proc_paused and a capped lane still downgrade. Only AUTO events use it.
                     # Host contention alone (load1 band OR measured cpu busy, t_0e52c7ab #2114 made cpu
-                    # the default axis) never stops an auto-handle child; lane / proc_paused still do.
+                    # the default axis) never stops a boomerang-wake child; lane / proc_paused still do.
                     _ah_load_exempt = bool(
                         d.get("auto") and wake_downgrade
                         and str(wake_downgrade).startswith(("host load", "host cpu"))
@@ -3148,7 +3319,7 @@ class GatewayKanbanWatchersMixin:
                             # Boomerang v2 P3b: a claimed auto event is the child's, not the
                             # session's: its wake is withheld. A failed dispatch stays here
                             # and wakes as today (INV-6).
-                            from gateway import kanban_auto_handle as _ah
+                            from gateway import kanban_boomerang_wake as _ah
 
                             _wake_kinds = await _ah.notifier_dispatch(
                                 self, d, sub, board_slug, task, _wake_kinds, _synth,
@@ -3396,15 +3567,15 @@ class GatewayKanbanWatchersMixin:
                 await _owner_wake.tick(self)
             except Exception as exc:
                 logger.warning("kanban owner-wake tick failed: %s", exc)
-            # Boomerang v2 P3b (spec §5.7): open auto-handle claims whose child died (a
+            # Boomerang v2 P3b (spec §5.7): open boomerang-wake claims whose child died (a
             # restart empties the in-process registry, so the first tick after startup
             # re-surfaces them) or outlived max_minutes. A no-op with no claim file.
             try:
-                from gateway import kanban_auto_handle as _ah_rec
+                from gateway import kanban_boomerang_wake as _ah_rec
 
                 await _ah_rec.reconcile(self)
             except Exception as exc:
-                logger.warning("kanban auto-handle reconcile failed: %s", exc)
+                logger.warning("kanban boomerang-wake reconcile failed: %s", exc)
             # t_b7b31563: fire deferred human-owner wakes once the gate clears
             # or their ceiling passes.
             try:
@@ -3683,6 +3854,13 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        write_dispatcher_heartbeat = lambda _interval: None  # noqa: E731 - bound if the import fails
+        try:
+            from tools.async_delegation_kanban import set_dispatcher_active, write_dispatcher_heartbeat
+            set_dispatcher_active(True)  # §5.1.5: a dispatcher now reaps this host's unit workers
+            write_dispatcher_heartbeat(interval)
+        except Exception:
+            logger.debug("kanban dispatcher: could not flag the delegations runtime", exc_info=True)
         if waiting_logged or unavailable_logged:
             logger.warning("kanban dispatcher: assumed leadership after standby (%s)", _lock_path)
         else:
@@ -3835,9 +4013,8 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
-        # kanban.dispatch_load_gate — pause SPAWNS (never reclaims) while the
-        # host's 1-minute load is over its core count; resume with hysteresis.
-        # See LoadGate for the 2026-09-24 incident this encodes.
+        # kanban.dispatch_load_gate: the spawn gate, admission.admit_class("kanban") over this
+        # host's own sample (t_b20850d2: no load1 / CPU keys); never reclaims.
         try:
             _ncpu = os.cpu_count() or 1
         except Exception:
@@ -3845,12 +4022,10 @@ class GatewayKanbanWatchersMixin:
         load_gate = LoadGate(kanban_cfg.get("dispatch_load_gate"), _ncpu)
         if load_gate.enabled:
             logger.info(
-                "kanban dispatcher: load gate armed pause_above=%.1f resume_below=%.1f "
-                "ncpu=%d worker_load_cost=%.1f ramp_seconds=%.0f max_spawn_per_tick=%d "
-                "load5_floor=%s",
-                load_gate.pause_above, load_gate.resume_below, load_gate.ncpu,
-                load_gate.worker_load_cost, load_gate.ramp_seconds,
-                load_gate.max_spawn_per_tick, load_gate.load5_floor,
+                "kanban dispatcher: load gate armed admission=%s ncpu=%d ramp_seconds=%.0f "
+                "max_spawn_per_tick=%d",
+                _GATE_ADMISSION, load_gate.ncpu, load_gate.ramp_seconds,
+                load_gate.max_spawn_per_tick,
             )
         # KWLB v0.1: ONE GateTick per tick (band, LOCAL allowance, ONE shared
         # pool plan). The gate's slope sees LOCAL workers only (PRD 5.2.4).
@@ -3873,6 +4048,7 @@ class GatewayKanbanWatchersMixin:
             kanban_cfg=_kanban_cfg_now,
             ledger=lambda boards: _kb.count_running_by_placement(boards),
             connect=lambda board=None: _kb.connect(board=board),
+            skip_board=lambda slug: _board_quarantined(slug),
         )
 
         _proc_paged = {"episode": False}
@@ -3889,6 +4065,7 @@ class GatewayKanbanWatchersMixin:
         # wall-clock start of each board's current zero-spawn streak while
         # the gate had allowance (published to `hermes kanban diagnostics`).
         from hermes_cli import kanban_load_gate as _klg
+        from hermes_cli import kanban_placement_reasons as _kpr
         _board_rr = {"tick": 0}
         _board_starved_since: dict[str, float] = {}
 
@@ -3935,6 +4112,12 @@ class GatewayKanbanWatchersMixin:
             except OSError:
                 return (resolved, None, None)
             return (resolved, stat.st_mtime_ns, stat.st_size)
+
+        def _board_quarantined(slug: str) -> bool:
+            # Same rule as the dispatch tick: same fingerprint, inside the retry window.
+            q = disabled_corrupt_boards.get(slug)
+            return (q is not None and q[0] == _board_db_fingerprint(slug)
+                    and time.monotonic() - q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             # The guard class lives in ``kanban_db_connect`` since upstream's
@@ -4149,7 +4332,7 @@ class GatewayKanbanWatchersMixin:
                 _paused = _spawn_paused
                 if _paused is None and _limit is not None and _limit <= 0:
                     _paused = (
-                        f"load gate: this tick's allowance of {_allowance} "
+                        f"{_kpr.QUOTA_SPENT_PREFIX}{_allowance} "
                         f"spawn(s) is used by other boards"
                     )
                 # spawn_limit is an int whenever the gate is enabled (0 when
@@ -4181,9 +4364,10 @@ class GatewayKanbanWatchersMixin:
                 elif _ready > 0:
                     logger.info(
                         "kanban dispatcher [%s]: ready=%d quota=%d spawned=%d "
-                        "starved=%d allowance=%s",
+                        "starved=%d allowance=%s held_by_requires=%d",
                         slug, _ready, _quota, _n,
                         _ready if _n == 0 else 0, _allowance,
+                        _held_by_requires(res),
                     )
                     _prev = _board_starved_since.get(slug)
                     if _n > 0:
@@ -4301,7 +4485,14 @@ class GatewayKanbanWatchersMixin:
             """Run the auto-decomposer for up to N triage tasks across all
             boards. Returns the number of triage tasks that were
             successfully decomposed or specified this tick.
+
+            The tick runs in a fresh context (``_to_thread_process_service``), so it
+            installs the launch profile's secret scope itself (#107955 / #57837).
             """
+            with _default_profile_secret_scope():
+                return _auto_decompose_boards(auto_decompose_per_tick)
+
+        def _auto_decompose_boards(auto_decompose_per_tick: int) -> int:
             try:
                 from hermes_cli import kanban_decompose as _decomp
             except Exception as exc:  # pragma: no cover
@@ -4316,22 +4507,15 @@ class GatewayKanbanWatchersMixin:
             attempted = 0
             successes = 0
             # Enumeration: sweeps every board on disk looking for triage cards.
-            # The body pins HERMES_KANBAN_BOARD and lets the decomposer connect
-            # with no board kwarg, so the resolves happen deep inside the call —
-            # only a body-spanning extent reaches them.
+            # S7 D4: the board is named explicitly and scoped with a ContextVar for
+            # this thread only; never an os.environ flip (process-global, M6).
             for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin this board for the duration of the call — same
-                # pattern as the dashboard specify endpoint. The
-                # decomposer module connects with no board kwarg and
-                # relies on the env var.
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                with _kb.scoped_current_board(slug):
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        triage_ids = _decomp.list_triage_ids(board=slug)
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
@@ -4344,7 +4528,7 @@ class GatewayKanbanWatchersMixin:
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
+                                tid, author="auto-decomposer", board=slug,
                             )
                         except Exception:
                             logger.exception(
@@ -4371,11 +4555,6 @@ class GatewayKanbanWatchersMixin:
                                 "kanban auto-decompose [%s]: %s skipped: %s",
                                 slug, tid, outcome.reason,
                             )
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
         logger.info(
@@ -4549,6 +4728,8 @@ class GatewayKanbanWatchersMixin:
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
+            # §5.1.5: other gateways on this host send background units here while this beats.
+            write_dispatcher_heartbeat(interval)
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.

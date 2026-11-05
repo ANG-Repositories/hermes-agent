@@ -2,18 +2,8 @@ name: Windows bundle SDK
 # The desktop signing adapter downloads and executes the pinned Windows SDK
 # tools. The vitest halves under js-tests run on Linux and skip every
 # runIf(win32) leg, so this is the only lane that runs the real downloader.
+# t_868e850a: public mirror load guard -- self-triggers removed (pull_request); dispatch-only until re-enabled on a card.
 on:
-  pull_request:
-    paths:
-      - 'apps/desktop/scripts/windows-bundle-tools.mjs'
-      - 'apps/desktop/scripts/windows-bundle-tools.test.mjs'
-      - 'scripts/msix-shared.mjs'
-      - 'apps/desktop/scripts/msix-shared.test.mjs'
-      - 'apps/desktop/scripts/sign-msix.mjs'
-      - 'apps/desktop/scripts/sign-msix.test.mjs'
-      - 'apps/desktop/scripts/batch-sign-binaries.mjs'
-      - 'apps/desktop/scripts/batch-sign-binaries.test.mjs'
-      - '.github/workflows/windows-bundle-sdk.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -22,6 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   windows-bundle-tools:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1' }}
     name: Cold Windows SDK (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Cold ARM64 npm extraction alone can exceed 15 minutes on the hosted runner.

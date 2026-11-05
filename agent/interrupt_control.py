@@ -9,6 +9,7 @@ import threading
 from typing import Optional
 
 from agent.interrupt_compat import request_hard_interrupt
+from agent.route_note_ingest import relabel_route_note_text
 from tools.interrupt import request_yield as _request_yield
 from tools.interrupt import set_interrupt as _set_interrupt
 
@@ -243,8 +244,17 @@ class InterruptControlMixin:
             # Hard stop only (see docstring). The comment that used to run unconditionally here
             # claimed a hard interrupt supersedes the steer — but nothing gated this wipe on
             # hard_cancel, so a soft clear dropped a live user message with no trace.
-            with _ic_lock(self, "_pending_steer_lock"):
-                self._pending_steer = None
+            def _wipe() -> None:
+                with _ic_lock(self, "_pending_steer_lock"):
+                    self._pending_steer = None
+
+            # A steer provenance ledger (gateway ``_steer_wipe_sink``) wipes under its own lock and
+            # drops the entries that described the wiped text (Prism 7c35492cc023 / 43b1ce3c30ef).
+            sink = getattr(self, "_steer_wipe_sink", None)
+            if callable(sink):
+                sink(_wipe)
+            else:
+                _wipe()
         return True
 
     def steer(self, text: str) -> bool:
@@ -265,7 +275,8 @@ class InterruptControlMixin:
         to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
         if not text or not text.strip():
             return False
-        cleaned = text.strip()
+        # E11: one relabel for both redirect sinks (codex native turn/steer and the correction row).
+        cleaned = relabel_route_note_text(text.strip())
 
         _native_steer = _ic_codex_method(self, "request_steer")
         if _native_steer is not None:

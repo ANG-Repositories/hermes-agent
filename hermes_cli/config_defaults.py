@@ -1651,6 +1651,11 @@ DEFAULT_CONFIG = {
         # Durable background units run in their own process and survive a gateway restart
         # (docs/dev/delegate-detached-background.md). false = in-gateway threads (kill switch).
         "detached_background": False,  # default OFF (Ace ruling option B, t_7ccdc21b); the replacement is t_414b4d92
+        # Where a restart-durable gateway background unit runs: "in_process" (gateway threads) or
+        # "kanban" (one card on the internal `delegations` board, its own process; survives a gateway
+        # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
+        # Default "kanban" since option C P3 (t_3646c28e: drills + daedalus canary).
+        "background_runtime": "kanban",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -1663,6 +1668,10 @@ DEFAULT_CONFIG = {
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
+        # Gateway: a turn whose tool calls were all reads (or none: a NO_REPLY, a page answered in
+        # chat) and that the user did not author queues no continuation; the idle check-in is the
+        # next nudge. True restores a continuation after every judged-continue turn.
+        "nudge_on_read_only_turns": False,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
@@ -2170,6 +2179,11 @@ DEFAULT_CONFIG = {
         # due by at most this much; beyond it the job is removed and a loud
         # MISSED notice is delivered. 0 = the old 120s grace only. Default 6h.
         "oneshot_catchup_s": 21600,
+        # Cron script runner (`hermes cron runner`, cron/script_runner.py): when true in the
+        # process home's config, the gateway hands each home's plain-script (no_agent) lane to the
+        # runner while the runner progresses, and ticks it itself otherwise. Only a YAML boolean
+        # true enables it. Off = the gateway ticks every lane, as before.
+        "script_runner": {"enabled": False},
         "script_timeout_seconds": 3600,
         # Timeout (seconds) for SessionDB() init inside cron jobs: state.db open/migrate has no
         # timeout of its own against a wedged sqlite3.connect, and an unbounded hang wedges the
@@ -2247,6 +2261,11 @@ DEFAULT_CONFIG = {
         # without a logged flagship override. None uses model_policy's shared
         # FLAGSHIP_MODEL_SUBSTRINGS; a non-empty list replaces that default.
         "banned_worker_model_substrings": None,
+        # Standing per-profile flagship grants: {profile: "<reason>"}. Admits
+        # ONLY that profile's resolved model.default route (no pin, no lane)
+        # without --allow-flagship, so a no_agent cron can dispatch it. Set by
+        # the operator in the root config, e.g. tiresias: Ace D1 (Fable).
+        "flagship_profile_allowances": {},
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
         # Implicit pre-spawn probe per claude relay FAMILY (used when
@@ -2349,18 +2368,10 @@ DEFAULT_CONFIG = {
         # Per-tick spawn cap for the dispatcher (gateway tick and
         # `kanban dispatch`; the CLI --max flag wins over it). None = no cap.
         "max_spawn": None,
-        # Pause dispatcher SPAWNS (reclaims still run) while the host's
-        # 1-minute load average is over `pause_above` (default: CPU count);
-        # resume once it drops below `resume_below` (default: 0.75 × CPU
-        # count). Hysteresis so a load that hovers at the bar doesn't flap
-        # spawns every tick. Set enabled: false to disable.
-        # Projected-load admission (a worker's load lands over 5-10 min):
-        # each worker spawned in the last `ramp_seconds` counts as the
-        # per-worker load cost x the share of the ramp not yet elapsed; a
-        # tick admits at most floor((pause_above - load1 - pending) / cost)
-        # and never
-        # more than `max_spawn_per_tick`. `load5_floor`: resuming from a
-        # pause also needs load5 < pause_above. See kanban_load_gate.py.
+        # dispatch_load_gate (below): the spawn gate. Every tick admits by
+        # admission.admit_class("kanban") over this host's measured sample
+        # (cpu_busy, memory, procs, PSI); load1 is never read (t_b20850d2).
+        # See kanban_load_gate.py.
         # Worker pool (KWLB v0.1): while the Studio gate is spilling/paused
         # (or a ready card pins host:<id>), portable cards spawn with their
         # terminal + file tools on a fleet host over ssh. Hosts come from
@@ -2390,10 +2401,9 @@ DEFAULT_CONFIG = {
         # (committed mode off), logged once per process as browser_registry_fallback.
         "browser_hosts_file": None,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
-        # also reads each host's host-pressure.json (same ssh round-trip), a
-        # host turns hot after 2 hot samples and clears after 3 (state in
-        # <root>/var/kanban-target-state.json), warm hosts are picked last by
-        # projected load, and kanban's placements are written to
+        # also reads each host's host-pressure.json (same ssh round-trip); its
+        # band.kanban is admit_class's verdict (t_5d7e7171, no streak), warm
+        # hosts are picked last by projected load, and kanban's placements are written to
         # <root>/var/placement/host-reservations.kanban.json. false = KWLB v0.1.
         # kanban.placement.capabilities (t_8c474c2e, Fleet Work Placement
         # Phase 1): off | warn | enforce, read per tick from the ROOT
@@ -2403,22 +2413,21 @@ DEFAULT_CONFIG = {
         # of `fleet-host capabilities --sync` (generated_by + source_hash);
         # a hand-written index runs warn. Absent host-capabilities.json = off.
         # See hermes_cli/kanban_host_capabilities.py.
+        # kanban.placement.body_requires_mode (t_640a4ea0, read per tick from
+        # the ROOT config): advisory (absent) = a body-sniffed capability no
+        # host may serve never holds the card (event requires_body_ignored);
+        # enforce = it holds at host=none as before. A `requires:` line always
+        # enforces; a host=none hold past one tick gets ONE card comment.
         # route_first (t_7133e03d, read per tick): every ready row is routed
         # and every held row gets a placement_wait, including rows a total
         # gate or an exhausted budget holds; false restores the silent early
         # returns and the old one-shot gate line.
-        # admit_on_memory (t_31350981, Saturation spec 4.2; D1: off until
-        # Ace's yes): a pool host takes at most floor(mem_available_gb /
-        # worker_reservation_gb) new workers per tick and none while its
-        # sampler publishes band.kanban hot. false = computed and logged per
-        # tick ("kanban admission (dry ...): would-refuse N"), never applied.
         # default (Control-Plane Protection spec v0.3 §3.1, t_667f1f6a; read
         # per tick, no restart): remote = every portable card is offered to
         # the worker pool first and spawns on this host only as the last
         # resort after the pool refused it (no cap: the load gate is the only
         # local limit); local = today's local-first order. Kill switch: local.
         "placement": {"read_signal": True, "route_first": True, "default": "local",
-                      "admit_on_memory": False, "worker_reservation_gb": 6,
                       # allocd (Router Core Card B1, t_4187c8f1; read per tick): off | shadow | on.
                       # off = the in-process scorer, allocd never consulted. shadow = allocd also
                       # scores each unpinned pool take (nothing booked), the in-process pick acts,
@@ -2426,36 +2435,16 @@ DEFAULT_CONFIG = {
                       # (promotion gate: n >= 50 answered, 0 disagreements). on = alloc_client.admit
                       # picks and books; release/renew go through alloc_client.
                       "allocd": "off"},
-        # Admission predicate (t_da6f84f7, read per tick by the gateway gate, `kanban dispatch` and the shared
-        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/admission.py admit() over the
-        # host's measured cpu_busy / memory / PSI / procs with one measured-estimate lease per recent spawn. In
-        # utilization the dispatch_load_gate load/CPU keys are inert (procs pause and max_spawn_per_tick still apply).
+        # Admission predicate of the shared placement scorer and unified_filter (t_da6f84f7): legacy = the
+        # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
+        # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).
         "admission": "legacy",
         "dispatch_load_gate": {
             "enabled": True,
-            "pause_above": None,
-            "resume_below": None,
-            "worker_load_cost": 2.0,
+            # A spawn younger than ramp_seconds is a lease candidate (admission settles it after
+            # DEFAULT_SETTLE_S); max_spawn_per_tick paces one tick, it is not capacity.
             "ramp_seconds": 600,
             "max_spawn_per_tick": 4,
-            "load5_floor": True,
-            # t_bf26e8f1: load-per-worker is measured (least squares of load1
-            # on running workers over slope_window_seconds), clamped to
-            # [worker_load_cost_min, worker_load_cost_max]; worker_load_cost
-            # is the prior. A load1 pause needs the CPU at least
-            # cpu_busy_pause busy (cpu_corroborate); below that the gate
-            # admits on CPU headroom at worker_cpu_cost cores per worker.
-            "worker_load_cost_min": 0.5,
-            "worker_load_cost_max": 4.0,
-            "slope_window_seconds": 600,
-            "cpu_corroborate": True,
-            "cpu_busy_pause": 0.70,
-            "worker_cpu_cost": 1.0,
-            # t_a7978f86: E-core band saturation (Apple silicon) at or above
-            # ecore_busy_pause is no local CPU headroom. off | report (log
-            # "would-refuse" only; D1: flips to on on Ace's yes) | on.
-            "ecore_gate": "report",
-            "ecore_busy_pause": 0.95,
             # t_b660edb6: pause spawns (state proc_paused, #alerts page) at
             # proc_pause_fraction of this uid's process limit (RLIMIT_NPROC,
             # or proc_limit when set); resume below proc_resume_fraction.
@@ -2477,6 +2466,14 @@ DEFAULT_CONFIG = {
         "needs_input_pager": True,
         # Also page a card parked as `dependency` on a parent that is blocked.
         "needs_input_pager_dependency": False,
+        # Per-row kill switches for boomerang wake disposition rows, on top of the
+        # state/boomerang-wake.disabled stop file (t_6e9f48cc, t_7be18632).
+        # review_all_answered: an own-repo review handback whose text answers every
+        # open Prism key forks a child to post the lines, coverage and enqueue.
+        # review_deadman: a review-deadman tier-1 event on a boomerang-wake card
+        # forks a child for the attended read (why-waits comment or surface);
+        # false = the owner-wake delivers it as a plain turn (t_1e0ffee4).
+        "boomerang_wake_rows": {"review_all_answered": True, "review_deadman": True},
         # "platform:chat_id" (e.g. "discord:1480525090331561984"). When set,
         # the notifier posts done / ready-for-review / blocked lines there
         # instead of the subscriber's chat; the wake still goes to the
@@ -2518,8 +2515,7 @@ DEFAULT_CONFIG = {
             "closers": ["review-card closer", "land-autopilot", "merge-pass",
                         "review-merge-pass", "kanban-review-merge-pass"],
             # t_4f6afb67 (S5): withhold the WAKE (the line still posts) for a
-            # red handback whose every red is inherited from main, a red already
-            # woken at the same (card, PR, head, red-set), a handback whose card
+            # red already woken at the same (card, PR, head, red-set), a handback whose card
             # left review, the home session's own send-back/handback/block echo,
             # and a closer's stamped auto-route send-back. Receipts show in
             # `kanban show` under "Withheld notifications".
@@ -2546,6 +2542,11 @@ DEFAULT_CONFIG = {
         # A present-but-unknown/empty value fails to "none" (never "all")
         # and logs review_policy_invalid.
         "review_policy": "all",
+        # Scoped board-signing grants for same-model delegate children
+        # (hermes_cli/kanban_sign_grants.py): "on" lets an operator session
+        # pass delegate_task(sign_grant=...) and the child sign comments under
+        # it; anything else refuses every mint and every granted write.
+        "sign_grants": "off",
         # Default reviewer profile for request_review. None/blank = no
         # default: a review request with no reviewer is refused rather than
         # leaving the implementer as its own reviewer.
@@ -2578,6 +2579,10 @@ DEFAULT_CONFIG = {
         # Per-tick pool admission budget: eligible relay subs * this value.
         # Pinned apx/bpx lanes each spend one sub's budget. 0 = unlimited.
         "pool_spawns_per_eligible": 2,
+        # Relay-family pools (claude-apr/bpr): admit at most the relay's own
+        # free turn slots (max_inflight - active_turns); an unreadable
+        # /health admits none (fail closed). false = off.
+        "pool_relay_capacity": True,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create
@@ -2627,9 +2632,11 @@ DEFAULT_CONFIG = {
         # session: notify+wake (Ace 2026-10-03, t_74bf5296). One waker per
         # card is enforced in the store; false = notify-only.
         "auto_subscribe_wake": True,
+        "auto_subscribe_boomerang": True,  # operator auto-subscriptions use a child by default
         # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
-        # Unset thresholds inherit dispatch_load_gate. lane_headroom: also
-        # downgrade while the waker profile's model lane is capped.
+        # host_axis cpu (default): downgrade at cpu_pause (0.90) busy. host_axis
+        # load1 (kill switch): the pause_above / resume_below band set HERE.
+        # lane_headroom: also downgrade while the waker profile's model lane is capped.
         "wake_load_gate": {
             "enabled": True,
             "pause_above": None,
@@ -2929,6 +2936,11 @@ DEFAULT_CONFIG = {
         # host 127.0.0.1:7890"). Per-platform vars (DISCORD_PROXY, TELEGRAM_PROXY, ...) are still
         # honored.
         "trust_env": True,
+        # After a messaging user (matrix/discord/telegram/whatsapp/signal/imessage) gets the "Sorry, I
+        # encountered an error" notice, page the operator via <root>/scripts/lib/episode_pager.py:
+        # one page per room per episode, cleared after 30 min with no new error. Read per error
+        # (no restart to flip). No-op when the pager script is absent.
+        "page_on_turn_error": True,
         # Media delivery. False: any emitted file path is delivered natively unless under the
         # credential/system denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env, auth.json). True:
         # files must be under the Hermes cache, media_delivery_allow_dirs, or fresher than

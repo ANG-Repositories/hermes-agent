@@ -428,6 +428,11 @@ def _fmt_review_requested(ev, n) -> tuple:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
         wake_handoff = _first_line(summary, 200)
+    cmds = _payload(ev, "draft_cmds")   # t_5c6c67c5: negative-result PR left as-is; flip commands on accept
+    if isinstance(cmds, list) and cmds:
+        from hermes_cli.kanban_negative_result import draft_note_line
+        # Whole commands or a count, never a slice (Prism 11a86869f533).
+        handoff += f"\n{draft_note_line([str(c) for c in cmds])}"
     return t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 
@@ -690,7 +695,8 @@ class _KanbanNotification:
         async def send_ping():
             nonlocal _send_res
             _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
-        if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
+        if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev),
+                                          chat_id=sub.get("chat_id"), thread_id=metadata.get("thread_id")):
             return False
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the

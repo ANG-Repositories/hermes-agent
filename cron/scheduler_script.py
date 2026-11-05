@@ -19,8 +19,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
+from cron import script_outcome_records as _outcome_records
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -277,6 +279,231 @@ def _terminate_cron_script_tree(proc: subprocess.Popen) -> None:
     fallback("Cron script tree-kill reported no signal for pid %s", pid)
 
 
+def _script_tree_snapshot(proc: subprocess.Popen) -> Optional[list]:
+    """psutil handles for the script leader and every descendant, taken BEFORE any signal: a setsid
+    grandchild is reparented once its parent dies and is then unreachable from the leader (#85125).
+    None when psutil is unavailable or the leader is already gone."""
+    try:
+        import psutil
+        root = psutil.Process(proc.pid)
+    except Exception:
+        return None
+    try:
+        from agent.delegation_context import spare_dispatched_workers
+        return [root] + spare_dispatched_workers(root.children(recursive=True))
+    except Exception:
+        # A zombie leader has no live children of its own to list; anything else falls back.
+        with contextlib.suppress(Exception):
+            if root.status() == psutil.STATUS_ZOMBIE:
+                return [root]
+        return None
+
+
+# Per-run token in every script child's env, inherited by everything it spawns (Prism
+# 85c0395583d8): a TERM handler can fork a child that calls setsid() and exit, so the child is in no
+# snapshot, descends from no surviving member and sits outside the script's process group. Ancestry
+# cannot find it; the token in its environment can. Set on the Popen as ``_SCRIPT_RUN_TOKEN_ATTR``.
+SCRIPT_RUN_TOKEN_ENV = "_HERMES_CRON_SCRIPT_RUN"
+_SCRIPT_RUN_TOKEN_ATTR = "_hermes_script_run_token"
+_SCRIPT_RUN_STARTED_ATTR = "_hermes_script_run_started"  # time.time() just before the Popen
+
+
+class _UnprovenMember:
+    """Stand-in for "the token scan could not run": counts as alive, so the re-fire is withheld
+    rather than run beside an escaped copy that could not be ruled out."""
+
+    pid = -1
+
+    def is_running(self) -> bool:
+        return True
+
+    def status(self) -> str:
+        return "unproven"
+
+    def children(self, recursive: bool = False) -> list:
+        return []
+
+    def send_signal(self, _sig) -> None:
+        return None
+
+
+class _UnreadableMember:
+    """A same-user process started after the script whose environment cannot be read (Prism
+    952be3262777: a token-inheriting escapee can make itself non-dumpable). It may be ours, so it
+    counts as alive while it runs and the re-fire is withheld; it may not be, so it is never
+    signalled."""
+
+    def __init__(self, process) -> None:
+        self._process = process
+        self.pid = process.pid
+
+    def is_running(self) -> bool:
+        return self._process.is_running()
+
+    def status(self) -> str:
+        return self._process.status()
+
+    def children(self, recursive: bool = False) -> list:
+        return []
+
+    def send_signal(self, _sig) -> None:
+        return None
+
+
+# Re-derived by every token scan, never carried from an earlier snapshot (Prism 06a05538f9a0).
+_SCAN_MARKERS = (_UnprovenMember, _UnreadableMember)
+
+
+def _is_orphaned(cand, started: float) -> bool:
+    """Whether ``cand`` may be an adopted escapee: its parent is init, this runner, or its ancestor.
+    An orphan of the script is adopted by the nearest living child subreaper among its ancestors,
+    which are the runner's ancestors, else init; so the test is ancestry, never the parent's name
+    (Prism f21e0ce565ea: a custom-named subreaper). A parent that cannot be read, or that is gone,
+    leaves the candidate unsure, which counts it. Only a live readable parent outside the runner's
+    ancestry (an unrelated sudo, ssh) proves it unrelated."""
+    ppid = cand.ppid()
+    if ppid <= 1:
+        return True
+    import psutil
+    try:
+        parent = psutil.Process(ppid)
+        parent.create_time()  # unreadable or gone: unsure
+        if ppid == os.getpid():  # the runner as a child subreaper (Prism 5c769fe73b89)
+            return True
+        return any(a.pid == ppid for a in psutil.Process(os.getpid()).parents())
+    except psutil.Error:
+        return True
+
+
+def _script_run_token_members(proc: subprocess.Popen) -> list:
+    """Live processes whose environment carries ``proc``'s run token, wherever they were reparented
+    or whichever session they moved to. [] when ``proc`` has no token; ``[_UnprovenMember()]`` when
+    the scan itself fails. A process that is gone, or another user's, is skipped. An orphaned
+    same-user process started since the script whose environ is unreadable is returned as an
+    ``_UnreadableMember`` (Prism 952be3262777): counted alive, never signalled. Orphaned (parent is
+    init or a subreaper, where an escapee of an exited parent lands) keeps an unrelated
+    non-dumpable process with a live parent (sudo, ssh) from withholding the re-fire."""
+    token = getattr(proc, _SCRIPT_RUN_TOKEN_ATTR, None)
+    if not token:
+        return []
+    started = getattr(proc, _SCRIPT_RUN_STARTED_ATTR, None)
+    try:
+        import psutil
+    except ImportError:
+        return []  # no psutil: no scan is possible, and no snapshot was taken either
+    try:
+        found = []
+        uid = os.getuid()  # windows-footgun: ok — POSIX-only caller (cron script runner)
+        for cand in psutil.process_iter():
+            if cand.pid == os.getpid():
+                continue
+            try:
+                if cand.environ().get(SCRIPT_RUN_TOKEN_ENV) == token:
+                    found.append(cand)
+            except psutil.AccessDenied:
+                with contextlib.suppress(psutil.Error):
+                    if (started is not None and cand.uids().real == uid
+                            and cand.create_time() >= started - 1.0
+                            and cand.status() != psutil.STATUS_ZOMBIE
+                            and _is_orphaned(cand, started)):
+                        found.append(_UnreadableMember(cand))
+            except psutil.Error:
+                continue
+        # A Kanban worker a dispatch in the script spawned inherits the token; it is not the script's.
+        from agent.delegation_context import spare_dispatched_workers
+        return spare_dispatched_workers(found)
+    except Exception:
+        logger.warning("cron script run-token scan failed for pid %s; treating the tree as alive",
+                       getattr(proc, "pid", None), exc_info=True)
+        return [_UnprovenMember()]
+
+
+def _script_tree_refresh(proc: subprocess.Popen, snapshot: Optional[list]) -> Optional[list]:
+    """``snapshot`` plus every descendant spawned since (Prism 361a15209668): the leader's live tree
+    if it still runs, and the children of every snapshot member still running, so a process forked
+    during the TERM grace is signalled and counted even after the leader is reaped. Also every
+    process carrying the run's env token (Prism 85c0395583d8: a setsid escapee of an exited
+    parent)."""
+    tokened = None
+    if snapshot is None:
+        # No snapshot (psutil missing, or the leader already gone) still runs the token scan
+        # (Prism 57280310926d): a setsid escapee outlives a reaped leader.
+        snapshot = _script_tree_snapshot(proc)
+        tokened = _script_run_token_members(proc)
+        if not tokened:
+            return snapshot
+        # Leader gone: the process-group scan below still finds its group.
+        snapshot = snapshot or []
+    # A marker from an earlier scan says nothing about now: drop it, the scan below re-adds it only
+    # if it still applies (Prism 06a05538f9a0).
+    snapshot = [m for m in snapshot if not isinstance(m, _SCAN_MARKERS)]
+    merged = list(snapshot)
+    fresh = _script_tree_snapshot(proc) if proc.poll() is None else None
+    # Members of the script's own process group (its pgid is the leader pid): a same-group child
+    # whose parent already exited is reparented away from every snapshot member.
+    group: list = []
+    with contextlib.suppress(Exception):
+        import psutil
+        for cand in psutil.process_iter():
+            with contextlib.suppress(Exception):
+                if os.getpgid(cand.pid) == proc.pid:
+                    group.append(cand)
+    if tokened is None:
+        tokened = _script_run_token_members(proc)
+    for member in list(snapshot) + (fresh or []) + group + tokened:
+        found = [member] if member not in merged else []
+        with contextlib.suppress(Exception):
+            if member.is_running():
+                found += member.children(recursive=True)
+        merged += [m for m in found if m not in merged]
+    from agent.delegation_context import spare_dispatched_workers
+    return spare_dispatched_workers(merged)
+
+
+def _script_tree_alive(proc: subprocess.Popen, snapshot: Optional[list]) -> bool:
+    """Whether any member of ``snapshot`` still runs: same pid AND create_time (psutil's
+    is_running, pid-reuse safe) and not a zombie, so a zombie-only tree counts as gone. Without a
+    snapshot, falls back to probing the script's process group (its pgid is the leader pid)."""
+    if snapshot is None:
+        try:
+            os.killpg(proc.pid, 0)  # windows-footgun: ok — POSIX-only caller (cron script runner)
+        except ProcessLookupError:
+            return False
+        except Exception:
+            return True
+        return True
+    import psutil
+    for member in snapshot:
+        try:
+            if member.is_running() and member.status() != psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            continue
+        except Exception:
+            return True  # cannot tell: count it alive, so no re-fire runs beside it
+    return False
+
+
+def _signal_script_tree(proc: subprocess.Popen, snapshot: Optional[list], sig: int) -> None:
+    """Signal the whole script tree: the leader's live tree through the same unified tree-kill the
+    timeout and cancel paths use (SIGKILL: ``_terminate_cron_script_tree``), then every snapshot
+    member still running, which reaches descendants orphaned from the leader. No snapshot: the
+    process group only."""
+    if snapshot is None:
+        with contextlib.suppress(Exception):
+            os.killpg(proc.pid, sig)  # windows-footgun: ok — POSIX-only caller (cron script runner)
+        return
+    if sig == getattr(signal, "SIGKILL", None):
+        _terminate_cron_script_tree(proc)
+    else:
+        with contextlib.suppress(Exception):
+            from agent.deadline import kill_process_tree
+            kill_process_tree(proc.pid, sig=sig)
+    for member in snapshot:
+        with contextlib.suppress(Exception):
+            member.send_signal(sig)  # psutil checks pid + create_time before signalling
+
+
 def _drain_script_pipes(proc: subprocess.Popen) -> None:
     """Reap a terminated script without blocking forever: a surviving descendant can hold the pipe
     write ends open, so bound the drain and abandon the pipes (output is not needed)."""
@@ -453,7 +680,7 @@ def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
     *, timeout_seconds: Optional[int] = None, job_name: Optional[str] = None,
-    job_id: Optional[str] = None,
+    job_id: Optional[str] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -466,7 +693,9 @@ def _run_job_script(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714). timeout_seconds: per-job ceiling (``_job_script_kwargs``) that may
     only LOWER the global ``cron.script_timeout_seconds`` cap. job_name / job_id: for the timeout
-    log line and the shutdown-kill re-fire flag.
+    log line and the shutdown-kill re-fire flag. execution_id: a no_agent job's attempt; when set
+    the script's exit status is also written to a durable record so a run that outlives this
+    process is graded by its real outcome after restart (cron/script_outcome_records.py).
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
@@ -491,10 +720,16 @@ def _run_job_script(
             _job_timeout = 0
         if _job_timeout > 0:
             script_timeout = min(script_timeout, _job_timeout)
+    outcome_record = None
+    proc = None
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
             return False, err
+        if execution_id and job_id:
+            outcome_record = _outcome_records.begin(job_id, execution_id)
+            if outcome_record is not None:
+                argv = _outcome_records.wrap_argv(outcome_record, argv)
         from tools.environments.local import build_subprocess_env
         # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
         # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
@@ -541,7 +776,13 @@ def _run_job_script(
         # record which job minted a card (the orphan watch maps it to the
         # job's deliver chat).
         env["HERMES_CRON_JOB_ID"] = str(job_id or job_name or path.name)
+        # Runner role only: the _HERMES_GATEWAY marker a gateway-started script inherits (§5.6).
+        from hermes_cli.process_bootstrap import apply_child_env
+        apply_child_env(env)
         env.update(env_overlay)
+        run_token = uuid.uuid4().hex
+        env[SCRIPT_RUN_TOKEN_ENV] = run_token  # finds setsid escapees (Prism 85c0395583d8)
+        run_started = time.time()
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -549,6 +790,10 @@ def _run_job_script(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        setattr(proc, _SCRIPT_RUN_TOKEN_ATTR, run_token)
+        setattr(proc, _SCRIPT_RUN_STARTED_ATTR, run_started)
+        if outcome_record is not None:
+            _outcome_records.note_pid(outcome_record, proc.pid)
         # Registered so the shutdown drain can TERMINATE this script (see
         # cron.scheduler.terminate_running_scripts); deregistered on EVERY exit so a later drain
         # never signals a dead or recycled pid. start_new_session (POSIX) / the win32
@@ -556,6 +801,8 @@ def _run_job_script(
         _proc_key = id(proc)
         with _sched._script_procs_lock:
             _sched._active_script_procs[_proc_key] = proc
+            if job_id:
+                _sched._script_proc_job_ids[_proc_key] = _sched._inflight_key(str(job_id))
         try:
             _started = time.monotonic()
             deadline = _started + script_timeout
@@ -568,6 +815,9 @@ def _run_job_script(
                     return False, "Script cancelled because cron fire ownership was lost"
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    # Elapsed at the deadline, not after the kill: tree-kill (worker-spare board
+                    # reads, TERM->KILL escalation) can take seconds on a loaded host.
+                    timed_out_after = int(time.monotonic() - _started)
                     _terminate_cron_script_tree(proc)
                     _drain_script_pipes(proc)
                     # Phase 4a (#85125): a script timeout must leave ZERO living descendants. killpg only
@@ -578,7 +828,7 @@ def _run_job_script(
                     # tree-kill (#85147, d6a5cb9725).
                     logger.warning(
                         "PHASE=cron_script_timeout job=%s elapsed=%d timeout=%d script=%s",
-                        job_name or path.name, int(time.monotonic() - _started),
+                        job_name or path.name, timed_out_after,
                         script_timeout, path.name,
                     )
                     return False, f"Script timed out after {script_timeout}s: {path}"
@@ -590,6 +840,12 @@ def _run_job_script(
         finally:
             with _sched._script_procs_lock:
                 _sched._active_script_procs.pop(_proc_key, None)
+                _skew_key = _sched._script_proc_job_ids.pop(_proc_key, None)
+                _skew_cut = _skew_key is not None and _skew_key in _sched._skew_interrupted_job_ids
+                if _skew_cut:
+                    _sched._skew_interrupted_job_ids.discard(_skew_key)
+                    if _skew_key not in _sched._refire_withheld_job_ids:
+                        _sched._restart_killed_job_ids.add(_skew_key)
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
@@ -603,6 +859,14 @@ def _run_job_script(
             logger.warning("Failed to redact sensitive text from output: %s", e)
             stdout = stderr = "[REDACTED - redaction failed]"
 
+        if _skew_cut:
+            # Cut off by the script runner's bounded code-skew drain: never a success, whatever the
+            # script's own exit status (Prism b86087faa72f); its re-fire flag is set above.
+            parts = [f"Script interrupted by the cron script runner's code-skew drain "
+                     f"(exit {proc.returncode}); eligible for one re-fire after restart."]
+            if stderr:
+                parts.append(f"stderr:\n{stderr}")
+            return False, "\n".join(parts)
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]
             if (
@@ -612,8 +876,10 @@ def _run_job_script(
             ):
                 # Killed by the gateway shutdown drain (or its backstop), not a script failure:
                 # flag it so run_one_job re-queues one fire (fork #462/#1429).
+                _killed_key = _sched._inflight_key(str(job_id))
                 with _sched._script_procs_lock:
-                    _sched._restart_killed_job_ids.add(str(job_id))
+                    if _killed_key not in _sched._refire_withheld_job_ids:
+                        _sched._restart_killed_job_ids.add(_killed_key)
                 parts.append(
                     "Killed by gateway shutdown mid-run; eligible for one "
                     "re-fire after restart.")
@@ -625,6 +891,12 @@ def _run_job_script(
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        # A script that never started leaves no evidence worth keeping. Once it ran, the record
+        # stays until the caller durably records the run (finish_execution discards it), so a
+        # crash between here and mark_job_run still leaves settle() the real exit status.
+        if outcome_record is not None and proc is None:
+            _outcome_records.discard(outcome_record)
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
@@ -650,6 +922,11 @@ def _run_job_script_with_claim_heartbeat(
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     script_kwargs = _sched._job_script_kwargs(job)
+
+    # no_agent only: the script IS the job. A pre-run script feeds an agent that dies with the
+    # process, so its exit status is not the job's outcome.
+    if job.get("no_agent") and job.get("execution_id"):
+        script_kwargs = {**script_kwargs, "execution_id": str(job["execution_id"])}
 
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,

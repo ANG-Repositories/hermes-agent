@@ -78,6 +78,10 @@ class TurnFacadeMixin:
         task_started = task_finished = False
         relay_outcome = "failed"
 
+        # This turn owns the context engine until its finally: an eviction release_clients() on another
+        # thread defers the engine shutdown to exit_turn instead of closing stores under it (t_055f9d8d).
+        from agent.context_engine_owners import enter_turn, exit_turn
+        enter_turn(self)
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
             _review_queue.note_turn_started()
@@ -150,6 +154,8 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
+                    # The dispatch stamp is this turn's: a sign grant never binds a previous turn's model.
+                    self._dispatched_model = None
                     result = run_conversation(
                         self, user_message, system_message, conversation_history, effective_task_id,
                         stream_callback, persist_user_message,
@@ -204,19 +210,25 @@ class TurnFacadeMixin:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            from agent.turn_step_timing import StepTimer
+            _release = StepTimer()  # the gap between "Turn ended" and the gateway's "response ready"
             try:
                 if relay_turn is not None:
-                    relay_runtime.SESSION_COORDINATOR.end_turn(relay_turn, outcome=relay_outcome)
+                    with _release.step("relay_end_turn"):
+                        relay_runtime.SESSION_COORDINATOR.end_turn(relay_turn, outcome=relay_outcome)
             finally:
                 try:
                     if relay_lease is not None:
-                        relay_runtime.SESSION_COORDINATOR.release_conversation(relay_lease)
+                        with _release.step("relay_release_conversation"):
+                            relay_runtime.SESSION_COORDINATOR.release_conversation(relay_lease)
                 finally:
                     if lease is not None:
                         lease.stop_refresher()
-                        lease.join_threads()
+                        with _release.step("lease_join_threads"):
+                            lease.join_threads()
                         lease.clear_interrupt()  # refresher interrupt between stop and join; AFTER join
-                        lease.release()
+                        with _release.step("lease_release"):
+                            lease.release()
                     # Always clear mid-turn labels on exit — including interrupted early returns
                     # that skip finalize_turn. Keep ts.
                     with suppress(Exception):
@@ -234,6 +246,16 @@ class TurnFacadeMixin:
                     # Balance note_turn_started so the idle queue's live-turn count cannot leak.
                     with suppress(Exception):
                         _review_queue.note_turn_finished()
+                    # Signing grants minted for delegate children end with this turn, on EVERY exit
+                    # (finalize_turn, early returns such as a content_filter refusal, exceptions):
+                    # this finally is the one place they all pass (t_19c567a8, Prism d8077e51e319).
+                    if "_sign_grants" in self.__dict__:
+                        from tools.delegate_tool_sign_grant import revoke_turn_grants
+
+                        revoke_turn_grants(self)
+                    with suppress(Exception), _release.step("exit_turn"):
+                        exit_turn(self, self._shutdown_context_engine_now)
+                    _release.log_if_slow(logger, "release", getattr(self, "session_id", None))
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """Final response string of one turn; ``stream_callback`` receives each text delta."""

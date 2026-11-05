@@ -341,6 +341,29 @@ def _thread_metadata_for_event(event) -> dict | None:
     return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
 
+_POST_HANDLER_FLOOR_S = 1.0
+
+
+def _log_post_handler_stages(event, session_key: str, handler_returned: float, extracted_at: float) -> None:
+    """One INFO line for the span PHASE=delivery_stages does not cover: the stage clock's end ->
+    the final send. ``post_turn``/``goal_pin`` are the pre-send part of the post-turn hooks
+    (/loop completion, the goal row pin); ``unwind`` is the rest of the handler's return path
+    (profile scope exit, finally); ``extract`` is media/path extraction here."""
+    stages_end = getattr(event, "_delivery_stages_end", None)
+    if stages_end is None:
+        return
+    now = time.monotonic()
+    if now - stages_end <= _POST_HANDLER_FLOOR_S:
+        return
+    post_turn, goal_pin = getattr(event, "_pre_send_post_turn_s", (0.0, 0.0))
+    logger.info(
+        "PHASE=post_handler_stages session=%s stages_end_to_send_s=%.2f post_turn=%.2f goal_pin=%.2f "
+        "unwind=%.2f extract=%.2f pre_send=%.2f",
+        session_key, now - stages_end, post_turn, goal_pin,
+        handler_returned - stages_end - post_turn - goal_pin, extracted_at - handler_returned, now - extracted_at,
+    )
+
+
 def _mark_notify_metadata(metadata: dict | None) -> dict:
     """Clone metadata and mark a user-visible reply as notify-worthy."""
     notify_metadata = dict(metadata) if metadata else {}
@@ -3868,7 +3891,9 @@ class BasePlatformAdapter(ABC):
     def warning_notifications_enabled(self, logical_platform=None, *, chat_id=None, metadata=None) -> bool:
         """Presentation policy under the caller's owning profile; old plugins inherit it."""
         from gateway.warning_notifications import warning_notifications_enabled
-        return warning_notifications_enabled(logical_platform or self.platform)
+        return warning_notifications_enabled(
+            logical_platform or self.platform, chat_id=chat_id,
+            thread_id=(metadata or {}).get("thread_id") if isinstance(metadata, dict) else None)
 
     def prepare_tts_text(self, text: str) -> str:
         """Chat Markdown -> transcript-like spoken script (reasoning blocks removed,
@@ -4341,9 +4366,16 @@ class BasePlatformAdapter(ABC):
                 try:
                     _result = _cb()
                     if inspect.isawaitable(_result):
-                        await _result
+                        # Each link keeps ITS bound (Prism fc4a550234d2): an unbounded /goal hook in the
+                        # chain must not unbound a stalled neighbour and hold the session forever.
+                        _b = getattr(_cb, "post_delivery_timeout", _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+                        await (_result if _b is None else asyncio.wait_for(_result, timeout=_b))
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
+        # The chain keeps the longest bound a link asked for.
+        # None = unbounded (the /goal hooks: parity with the old inline await).
+        _bounds = [getattr(_cb, "post_delivery_timeout", _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS) for _cb in callbacks]
+        _chained.post_delivery_timeout = None if None in _bounds else max(_bounds)
         return _chained
 
     @staticmethod
@@ -5035,6 +5067,16 @@ class BasePlatformAdapter(ABC):
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
+        # Atomic admission (Prism eb13daf988ed): a producer whose eligibility can go stale across an
+        # adapter's own awaits (Discord resolves the channel first) re-checks here; nothing awaits
+        # between this check and the claim or queue below. False = refused: not accepted, not queued.
+        # One-shot (Prism 199961bfd516): consumed here, so a queued event replayed through this path
+        # later is never refused after its producer has stopped watching (it could not roll back).
+        admit = getattr(event, "_admission_check", None)
+        if admit is not None:
+            event._admission_check = None
+            if not admit(session_key):
+                return
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
             return
@@ -5394,7 +5436,19 @@ class BasePlatformAdapter(ABC):
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
+        self._page_turn_error(event, e)
         return _thread_metadata
+
+    def _page_turn_error(self, event: MessageEvent, e: BaseException) -> None:
+        """Page #alerts once per room episode after the user's error notice (gateway.page_on_turn_error)."""
+        try:
+            from gateway import turn_error_pager
+            with self._media_delivery_scope(event.source):
+                enabled = bool(_config_section("gateway").get("page_on_turn_error", True))
+            if enabled and turn_error_pager.episode_key(event) is not None:
+                turn_error_pager.maybe_page(event, e, self._event_session_key(event))
+        except Exception:
+            logger.error("[%s] turn-error page not dispatched", self.name, exc_info=True)
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
@@ -5494,7 +5548,8 @@ class BasePlatformAdapter(ABC):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
                 if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+                    _bound = getattr(_post_cb, "post_delivery_timeout", _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+                    await (_post_result if _bound is None else asyncio.wait_for(_post_result, timeout=_bound))
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -5541,6 +5596,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            _handler_returned = time.monotonic()
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -5560,6 +5616,7 @@ class BasePlatformAdapter(ABC):
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
+                _extracted_at = time.monotonic()
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
@@ -5592,6 +5649,7 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
+                    _log_post_handler_stages(event, session_key, _handler_returned, _extracted_at)
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery,
@@ -5606,6 +5664,12 @@ class BasePlatformAdapter(ABC):
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
                 event=event) or "")
+            # Right after the send, before the completion hook and the queued-message check: a message
+            # arriving mid-callback (the /goal judge) stays in _pending_messages, so a /stop cancel keeps it.
+            # Typing stops first: a stuck callback must not keep it alive.
+            if session_key in self._post_delivery_callbacks:
+                await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+            await self._fire_post_delivery_callback(session_key, interrupt_event)
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)

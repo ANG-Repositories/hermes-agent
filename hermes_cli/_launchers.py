@@ -383,7 +383,7 @@ def _shell_launcher_python(target: Path) -> Path | None:
     try:
         if target.is_symlink():
             return None
-        lines = target.read_text(encoding="utf-8").split("\n", 1)
+        lines = target.read_text(encoding="utf-8-sig").split("\n", 1)
         if lines[0] != "#!/bin/sh" or len(lines) < 2:
             return None
         tokens = shlex.split(lines[1])
@@ -394,21 +394,31 @@ def _shell_launcher_python(target: Path) -> Path | None:
     return None
 
 
+def _launcher_works(target: Path) -> bool:
+    """An executable store launcher whose interpreter is an executable file on disk.
+
+    A missing file, a dangling symlink, a non-executable file, an unrecognized script or a
+    wrapper whose Python was pruned does not work, and is always repaired.
+    """
+    if not (target.is_file() and os.access(target, os.X_OK)):
+        return False
+    python = _shell_launcher_python(target)
+    return python is not None and python.is_file() and os.access(python, os.X_OK)
+
+
 def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> Path | None:
     """The live interpreter ``target`` already execs when ``store_python`` is in another store.
 
-    The store follows HERMES_HOME, so a process with a test or scratch home
-    (pytest's tmp_path) resolves a different store than the install's. Its
-    launcher self-heal must not rebind the install's shared launcher there:
-    the tmp store is deleted and every command exits 127 (t_968b018f). A
-    repin inside the same store, or a launcher whose interpreter is gone,
-    still republishes. Only a launcher bound to a real PM store (its
-    ``<store>/<entry>/bin/python3`` has the store's facts.json) is kept;
-    legacy venv and developer interpreters migrate as before.
+    Never rebind a launcher that works to a different store; always repair one that is
+    missing or broken, wherever the store lives (Ace ruling 2026-11-02, Prism 7138eebbd730).
+    The store follows HERMES_HOME, so a process with a test or scratch home resolves
+    another store than the install's: it leaves a working shared launcher alone
+    (t_968b018f). A repin inside the same store still republishes; legacy venv and
+    developer interpreters (no store facts.json) migrate as before.
     """
-    current = _shell_launcher_python(target)
-    if current is None or not current.is_file():
+    if not _launcher_works(target):
         return None
+    current = _shell_launcher_python(target)
     try:
         old_store = current.parents[2]
         if not (old_store / "facts.json").is_file():
