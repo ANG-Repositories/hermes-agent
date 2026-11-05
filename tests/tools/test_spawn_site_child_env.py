@@ -54,13 +54,19 @@ def _openviking_server_seen(child_env, monkeypatch, names):
     real_popen, children = subprocess.Popen, []
 
     def _record(*args, **kwargs):
-        children.append(real_popen(*args, **kwargs))
-        return children[-1]
+        child = real_popen(*args, **kwargs)
+        # The environment builder may spawn its own probes (for example psutil's
+        # safe process snapshot). Wait for the server, not the first subprocess.
+        if args[0][0] == str(probe):
+            children.append(child)
+        return child
 
     monkeypatch.setattr(ov.subprocess, "Popen", _record)
     state, _ = ov._start_local_openviking_server("http://127.0.0.1:1933")
     assert state == ov._LOCAL_SERVER_STARTED
-    children[0].wait(timeout=30)
+    assert len(children) == 1
+    returncode = children[0].wait(timeout=30)
+    assert returncode == 0, (ov.get_hermes_home() / ov._OPENVIKING_SERVER_LOG_RELATIVE_PATH).read_text(encoding="utf-8")
     return json.loads(out.read_text(encoding="utf-8-sig"))
 
 
@@ -73,11 +79,31 @@ def test_compute_host_is_hermes_and_keeps_its_full_environment(child_env, monkey
 
 
 @pytest.mark.platforms("posix")
-def test_openviking_server_keeps_provider_keys_but_never_tier1_secrets(child_env, monkeypatch):
+@pytest.mark.parametrize("auxiliary_child", [False, True])
+def test_openviking_server_keeps_provider_keys_but_never_tier1_secrets(child_env, monkeypatch, auxiliary_child):
     # Its embedding/VLM models call providers, so provider keys pass. Bot and relay tokens never do.
     # It finds ov.conf through OPENVIKING_CONFIG_FILE or HOME; Hermes' PYTHONPATH would shadow its
     # own site-packages (#78153).
     _plant(monkeypatch)
+    if auxiliary_child:
+        import subprocess
+        from tools.environments import local
+
+        build_env = local.served_profile_child_env
+
+        def build_with_probe(*args, **kwargs):
+            # Force an unrelated child before the server, even when the process
+            # snapshot cache is warm. Reap it here; the helper must not wait on it.
+            child = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+            child.wait(timeout=30)
+
+            def wrong_child(*args, **kwargs):
+                pytest.fail("waited on the environment probe instead of the server")
+
+            monkeypatch.setattr(child, "wait", wrong_child)
+            return build_env(*args, **kwargs)
+
+        monkeypatch.setattr(local, "served_profile_child_env", build_with_probe)
     monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")  # HOME stays the user's even so
     monkeypatch.setenv("OPENVIKING_CONFIG_FILE", str(child_env / "ov.conf"))
     monkeypatch.setenv("PYTHONPATH", str(child_env / "hermes-venv"))
