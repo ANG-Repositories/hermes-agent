@@ -169,6 +169,41 @@ def _writes(tid) -> tuple:
     return ev, cm
 
 
+# --- t_47580e49: stale handback timeline -------------------------------------------------------
+
+@pytest.mark.parametrize("phase", ["verdict", "delivery"])
+@pytest.mark.parametrize("arm", ["newer_comment", "release", "hold", "merged", "open", "disabled"])
+def test_stale_surface_timeline(env, arm, phase):
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+    entry = _claimed_entry(env, tid, row="review_deadman", kind="review_requested")
+    state = ah.BoomerangWakeState()
+    if phase == "delivery":
+        # Persist while fresh, then change the board/PR before draining (restart race).
+        ah.enqueue_handback(entry, {"summary": "ready"}, state=state, turn_text="old handback")
+    env["health"][(REPO, 71)] = {"state": "merged" if arm == "merged" else "open"}
+    if arm in {"newer_comment", "release", "hold", "disabled"}:
+        body = {"release": "close-on: released", "hold": "deadman-hold: waiting"}.get(arm, "owner acted")
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                         (tid, "human:apollo", body, 1793844766 if arm in {"newer_comment", "disabled"} else 1793839413))
+    if arm == "disabled":
+        env["monkeypatch"].setenv("BOOMERANG_STALE_GUARD", "0")
+    blocked = arm not in {"open", "disabled"}
+    if phase == "delivery":
+        sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
+        assert sent == (0 if blocked else 2)
+        assert bool(env["adapter"].handled) != blocked
+        assert state.handbacks() == {}
+    else:
+        result = ah.execute_verdict(entry, _verdict(entry, "surface"))
+        assert bool(result.get("stale")) == blocked
+        assert bool(result.get("surface")) != blocked
+
+
 # --- wake-path dispatch -----------------------------------------------------------------------
 
 
