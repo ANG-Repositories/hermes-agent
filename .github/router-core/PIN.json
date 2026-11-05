@@ -23,9 +23,9 @@
    "sha256": "10bc6c0faae3eaa7977626775e0c3efd218bf2f0030e672b956fffa1aa427505"
   },
   "admission-decider-lint.py": {
-   "source_sha": "17b7a1fbd69cb07433ea2a41b100d3b561e2d8b8",
+   "source_sha": "0b353013fe8d0294adf26649f283e584dc973fc3",
    "source_path": "scripts/admission-decider-lint.py",
-   "sha256": "a4275ac37bcd134804a13abddf2632464baa0923eb79a34e275f3232c32ad0f4"
+   "sha256": "98e4438c2699915c474a96cb65932a23186b4b907e57b00bbe8dcecdef5cfe38"
   }
  }
 }
