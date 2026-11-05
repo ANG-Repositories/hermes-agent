@@ -2401,10 +2401,9 @@ DEFAULT_CONFIG = {
         # (committed mode off), logged once per process as browser_registry_fallback.
         "browser_hosts_file": None,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
-        # also reads each host's host-pressure.json (same ssh round-trip), a
-        # host turns hot after 2 hot samples and clears after 3 (state in
-        # <root>/var/kanban-target-state.json), warm hosts are picked last by
-        # projected load, and kanban's placements are written to
+        # also reads each host's host-pressure.json (same ssh round-trip); its
+        # band.kanban is admit_class's verdict (t_5d7e7171, no streak), warm
+        # hosts are picked last by projected load, and kanban's placements are written to
         # <root>/var/placement/host-reservations.kanban.json. false = KWLB v0.1.
         # kanban.placement.capabilities (t_8c474c2e, Fleet Work Placement
         # Phase 1): off | warn | enforce, read per tick from the ROOT

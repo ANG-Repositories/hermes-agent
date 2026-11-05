@@ -290,7 +290,7 @@ def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
                             pressure_text=json.dumps({"at": 1000.0, "mem_available_gb": 100.0}))
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
-                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+                             placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
     assert m.mem_available_gb is None and "unmeasured" in ka.floor_refusal(m)
 
@@ -320,7 +320,7 @@ def test_an_invalid_remote_placement_table_refuses_instead_of_a_zero_reserve(boa
                             pressure_text=json.dumps({"at": 2000.0, "mem_available_gb": 100.0}))
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
-                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+                             placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
     assert m.mem_available_gb == 100.0
     refusal = ka.floor_refusal(m)
@@ -516,7 +516,7 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
     from types import SimpleNamespace
 
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=600.0),
-                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+                             placement_table=None)
     real_plan = ka._dispatcher_plan
 
     def plan_with_signal(cfg):

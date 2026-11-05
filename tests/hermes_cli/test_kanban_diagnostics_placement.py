@@ -40,9 +40,6 @@ def root(tmp_path: Path) -> Path:
         "consumer": "kanban", "at": NOW - 10, "ttl_s": 180,
         "hosts": {"ace-ai": {"busy_units": 2, "cpu_est": 2.0, "ramp_s": 600,
                              "placed_at": [NOW - 150, NOW - 150]}}})
-    _write(r / "var" / kwp.TARGET_STATE_FILE, {"hosts": {
-        "ace-ai": {"at": NOW - 5, "hot": False, "hot_run": 0, "clear_run": 4, "updated": NOW - 5},
-        "ace-media": {"at": NOW - 5, "hot": False, "hot_run": 1, "clear_run": 0, "updated": NOW - 5}}})
     return r
 
 
@@ -76,12 +73,12 @@ def test_golden_warm_rung_is_least_projected_and_read_only(root, monkeypatch):
                                    "unrealised": [0.75, 0.75], "pending": 3.0}]
     assert (ai["pending"], ai["projected"]) == (3.0, 13.0)
     assert (media["pending"], media["projected"]) == (0.0, 12.0)
-    assert ai["streak"]["clear_run"] == 4 and media["streak"]["hot_run"] == 1
+    assert "streak" not in ai and "streak" not in media   # t_5d7e7171: no plan-side streak
     assert rep["rung"] == {"host": "ace-media", "assignee": "alpha",
                            "why": "warm: least projected() wins (ace-ai=13.00, ace-media=12.00)"}
     text = "\n".join(kpd.format_lines(rep))
     assert "rung for @alpha: ace-media" in text and "projected=13.00" in text
-    assert _snapshot(root) == before  # nothing written: no streak advance, no ledger write
+    assert _snapshot(root) == before  # nothing written: no ledger write
 
 
 def test_ok_band_wins_in_priority_order_and_unplanned_tick_names_reason(root):

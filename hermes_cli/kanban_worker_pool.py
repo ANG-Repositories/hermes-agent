@@ -28,11 +28,14 @@ board loop). A change that ticks boards concurrently must add a lock here.
 Placement Phase 1b (PRD ``plans/2026-10-04_fleet-resource-aware-placement-PRD.md``
 v0.4, I-3, I-8, F-5, F-6; card t_1e4b9684): with a ``TargetSignal`` (config
 ``kanban.placement.read_signal``, default true) the same ssh probe also reads
-the host's ``host-pressure.json`` and the remote clock. ``plan()`` advances a
-per-host hot/clear streak once per new remote ``at`` and persists it;
-``take()`` only reads it. Stale/unreadable pressure is UNKNOWN (refused,
-``reachable: false``, streak reset), never hot. Without a signal the planner
-is KWLB v0.1, byte for byte.
+the host's ``host-pressure.json`` and the remote clock. Stale/unreadable
+pressure is UNKNOWN (refused, ``reachable: false``), never hot. The published
+``band.kanban`` is admission.admit_class's own verdict (hermes-home
+host-pressure.py, t_5d7e7171), so the plan keeps no hot/clear streak of its
+own: under the ONE rule (KANBAN_UNIFIED_ADMIT) every take asks may_start and
+the plan never closes a host on the band; with that rule's kill switch a hot
+band closes the host for the tick. Without a signal the planner is KWLB v0.1,
+byte for byte.
 """
 
 from __future__ import annotations
@@ -1534,7 +1537,6 @@ def board_fault(host: str, board: str, *, now: Optional[float] = None) -> Option
 # -- target pressure + hysteresis (Placement PRD Phase 1b) -------------------
 
 BAND_OK, BAND_WARM, BAND_HOT, BAND_UNKNOWN = "ok", "warm", "hot", "unknown"
-TARGET_STATE_FILE = "kanban-target-state.json"
 
 
 def _kanban_unified_admit(signal: Any = None) -> bool:
@@ -1552,7 +1554,6 @@ class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
 
     policy: Any                       # placement_policy.PlacementPolicy
-    state_path: Path                  # <root>/var/kanban-target-state.json
     ledger_dir: Path                  # <root>/var/placement
     cpu_est: Optional[float] = None   # kanban's measured slope; None = policy prior
     clock: Callable[[], float] = time.time
@@ -1612,44 +1613,15 @@ def read_pressure(remote_now: Optional[float], text: str, *,
     return (float(at), band), ""
 
 
-def _load_state(path: Path) -> dict:
+def _band_reason(text: str) -> str:
+    """The sampler's ``band_reason.kanban`` (the admitter's reason for its verdict), or ""."""
     try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return {}
-    hosts = doc.get("hosts") if isinstance(doc, dict) else None
-    return hosts if isinstance(hosts, dict) else {}
-
-
-def advance_streak(prev: Optional[Mapping], at: Optional[float], band: str, *,
-                   hot_streak: int, clear_streak: int, now: float,
-                   discard_after_s: float) -> dict:
-    """One sample's step of the per-host hysteresis (F-5). A repeated ``at``
-    is a no-op; state older than ``discard_after_s`` is discarded first.
-
-    UNKNOWN neither builds nor erases a streak (I-3, F-5 addendum t_36840c8a):
-    the state is kept as-is, ``updated`` included, so an earned hot verdict
-    still needs ``clear_streak`` fresh non-hot samples and a host that stays
-    UNKNOWN past ``discard_after_s`` starts over. ``plan()`` refuses the
-    UNKNOWN tick itself."""
-    st = dict(prev) if isinstance(prev, Mapping) else {}
-    updated = st.get("updated")
-    if not isinstance(updated, (int, float)) or now - float(updated) > discard_after_s:
-        st = {}
-    if band == BAND_UNKNOWN or at is None:
-        return {"at": st.get("at"), "hot": bool(st.get("hot")), "hot_run": int(st.get("hot_run") or 0),
-                "clear_run": int(st.get("clear_run") or 0), "updated": st.get("updated")}
-    if st.get("at") == at:
-        return st
-    hot, hot_run, clear_run = bool(st.get("hot")), int(st.get("hot_run") or 0), int(st.get("clear_run") or 0)
-    if band == BAND_HOT:
-        hot_run, clear_run = hot_run + 1, 0
-        hot = hot or hot_run >= hot_streak
-    else:
-        hot_run, clear_run = 0, clear_run + 1
-        if hot and clear_run >= clear_streak:
-            hot = False
-    return {"at": at, "hot": hot, "hot_run": hot_run, "clear_run": clear_run, "updated": now}
+        doc = json.loads(text) if text else None
+    except ValueError:
+        return ""
+    why = doc.get("band_reason") if isinstance(doc, dict) else None
+    why = why.get("kanban") if isinstance(why, dict) else None
+    return why[:300] if isinstance(why, str) else ""
 
 
 def running_by_host(conn) -> Dict[str, int]:
@@ -2090,9 +2062,10 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
     enabled, under its slots and probed under ``capacity_pct x ncpu`` (I-3).
     A host with no free slot or not active is not probed.
 
-    With ``signal`` the load bar is the host's pressure band instead: the
-    per-host streak advances here, once per new remote ``at`` (F-5), and a
-    host is refused when its streak says hot or its pressure is UNKNOWN.
+    With ``signal`` the load bar is the host's published pressure band
+    instead (admit_class's verdict, t_5d7e7171): a host is refused when its
+    pressure is UNKNOWN, and when its band is hot only while the ONE rule's
+    kill switch is set; under the ONE rule each take asks may_start itself.
 
     ``workspace_paths`` (host -> paths, t_8bfdcc07) rides the same probe: a
     host holding continuation state is probed even with no free slot, and
@@ -2182,17 +2155,15 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     states = {} if states is None else states
     policy = signal.policy
     now = signal.clock()
-    discard_after = policy.stale_after_s * 3
     ordered = sorted(hosts, key=lambda x: x.priority)
-    # Pass 1: probe. samples[name] = (at, band) for every host probed this tick.
+    # Pass 1: probe every host with a free slot.
     probed: Dict[str, dict] = {}
-    samples: Dict[str, Tuple[Optional[float], str]] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
         free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0, "boards": None}
+               "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             if signal.placement_table is not None:
@@ -2201,47 +2172,29 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
                                                      stale_after_s=policy.stale_after_s, local_now=now)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
                                             stale_after_s=policy.stale_after_s)
-            at, row["band"] = (None, BAND_UNKNOWN) if got is None else got
-            samples[h.name] = (at, row["band"])
+            row["band"] = BAND_UNKNOWN if got is None else got[1]
+            row["band_reason"] = _band_reason(sample.pressure_text) if got is not None else ""
         elif sample is not None:  # a v0.1-shape probe: no pressure read
             row["load1"], row["ncpu"] = sample
             row["band"], row["why"] = BAND_UNKNOWN, "pressure not probed"
-            samples[h.name] = (None, BAND_UNKNOWN)
         elif free > 0:
             row["band"], row["why"] = BAND_UNKNOWN, "host unreachable"
-            samples[h.name] = (None, BAND_UNKNOWN)
         probed[h.name] = row
 
-    # Pass 2: advance every streak against the COMMITTED state, under the
-    # state file's lock, so two planners on one root never lose a sample.
-    def advance(old: Mapping) -> Mapping:
-        hs = old.get("hosts") if isinstance(old.get("hosts"), dict) else {}
-        out = dict(hs)
-        for name, (at, band) in samples.items():
-            kb = policy.kanban_band(name)
-            out[name] = advance_streak(hs.get(name), at, band, hot_streak=kb.hot_streak,
-                                       clear_streak=kb.clear_streak, now=now,
-                                       discard_after_s=discard_after)
-        return {"hosts": out, "updated": now}
-
-    try:
-        committed = _ledger.update_json(signal.state_path, advance).get("hosts") or {}
-    except Exception as exc:  # unsaved state: decide on this tick's step from what is on disk
-        _log.warning("kanban pool: target state not saved: %s", exc)
-        committed = advance({"hosts": _load_state(signal.state_path)})["hosts"]
-
+    # t_5d7e7171 (FWA-G): no second verdict. Under the ONE rule a host is never closed here on its band (each take
+    # runs may_start, which IS the band's formula); otherwise a hot band closes it this tick, with no streak.
+    band_closes = not _kanban_unified_admit(signal)
     slots: Dict[str, int] = {}
     detail: Dict[str, dict] = {}
     for h in ordered:
         r = probed[h.name]
         band, why, free = r["band"], r["why"], r["free"]
-        st = committed.get(h.name)
-        hot = bool(isinstance(st, Mapping) and st.get("hot")) and band not in (None, BAND_UNKNOWN)
+        hot = band == BAND_HOT and band_closes
         if band == BAND_UNKNOWN:
             free = 0
         elif hot:
             free = 0
-            why = f"band hot (streak {policy.kanban_band(h.name).hot_streak}, {band} now)"
+            why = f"band hot (admit_class: {r['band_reason'] or 'no reason published'})"
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],
