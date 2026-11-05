@@ -152,13 +152,27 @@ def config(doc: dict):
 
 
 def _show(root: Path, ref: str, rel: str):
-    """File text at ref, None when the path is absent there; ScanError when the commit itself is unreadable."""
+    """File text at ref; only a confirmed absent tree entry returns None. Unreadable objects abort."""
     env = _git_env()
     ok = subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"], capture_output=True, env=env)
     if ok.returncode != 0:
         raise ScanError(f"--base-ref {ref}: commit not readable (fetch it first)")
-    p = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{rel}"], capture_output=True, env=env)
-    return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else None
+    tree = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-tree", "-z", ref, "--", rel],
+                          capture_output=True, env=env)
+    if tree.returncode != 0:
+        raise ScanError(f"--base-ref {ref}: {rel}: tree not readable (fetch it first)")
+    if not tree.stdout:
+        return None
+    entries = tree.stdout.rstrip(b"\0").split(b"\0")
+    header, _, name = entries[0].partition(b"\t")
+    fields = header.split()
+    if len(entries) != 1 or len(fields) != 3 or fields[1] != b"blob" or name != rel.encode("utf-8"):
+        raise ScanError(f"--base-ref {ref}: {rel}: expected one blob entry")
+    p = subprocess.run(["git", "-C", str(root), "cat-file", "blob", fields[2].decode("ascii")],
+                       capture_output=True, env=env)
+    if p.returncode != 0:
+        raise ScanError(f"--base-ref {ref}: {rel}: blob not readable (fetch it first)")
+    return p.stdout.decode("utf-8", errors="replace")
 
 
 def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
