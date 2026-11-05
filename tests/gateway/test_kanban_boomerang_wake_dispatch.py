@@ -872,8 +872,7 @@ def _gate(env, tmp_path, *, load: float, lane=None, axis="load1", cpu=None):
 
     kw = {"cpu_sampler": (lambda prev: (cpu, object()))} if cpu is not None else {}
     env["runner"]._kanban_wake_gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                    "wake_load_gate": {"host_axis": axis}}},
+        {"kanban": {"wake_load_gate": {"pause_above": 64, "resume_below": 48, "host_axis": axis}}},
         ncpu=32, loadavg=lambda: (load, load, load), lane_probe=lambda p: lane,
         state_file=tmp_path / "wake_gate.json", **kw)
 

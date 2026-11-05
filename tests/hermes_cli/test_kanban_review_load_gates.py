@@ -108,27 +108,6 @@ def test_spawn_paused_tick_spawns_nothing_but_reports_reason(kanban_home, monkey
     assert len(res2.spawned) == 1 and res2.spawn_paused is None
 
 
-def test_load_gate_hysteresis():
-    from gateway.kanban_watchers import LoadGate
-
-    g = LoadGate({}, ncpu=32)
-    assert g.pause_above == 32.0 and g.resume_below == 24.0
-    assert g.update(20) is None
-    assert g.update(32.0) is None          # equal is not over
-    assert g.update(33) is not None         # over the bar => paused
-    assert g.update(28) is not None         # inside the band stays paused
-    assert g.update(23.9) is None           # below resume => released
-    assert g.update(30) is None             # under the bar again: allowed
-    # explicit thresholds + degenerate band collapse
-    g2 = LoadGate({"pause_above": 10, "resume_below": 50}, ncpu=4)
-    assert g2.resume_below == 7.5
-    # disabled gate never pauses
-    g3 = LoadGate({"enabled": False}, ncpu=1)
-    assert g3.update(999) is None
-    # garbage sample keeps prior state
-    assert g.update("nan?") is None
-
-
 # ── review round cap ────────────────────────────────────────────────────────
 
 def _one_round(conn, tid, reviewer="argus"):

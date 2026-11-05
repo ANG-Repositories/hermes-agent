@@ -21,7 +21,7 @@ from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 
 TOKEN = "op-token-test"
-GATE = {"enabled": True, "pause_above": 64, "resume_below": 48, "max_spawn_per_tick": 16, "ecore_gate": "off"}
+GATE = {"enabled": True, "max_spawn_per_tick": 16}
 LOCAL_NAME = "admit-test-box"     # this machine's hostname in every test, whatever venue runs it
 POOL_HOST = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
                          absence="required", profiles=("alpha",), state="active", enabled=True, priority=0)
@@ -100,11 +100,18 @@ def _events(tid, kind=ka.EVENT):
             "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kind)).fetchall()]
 
 
-def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64):
-    """The Studio's LoadGate PAUSED (load1 66 > pause_above 64), memory and threads as given."""
+def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64, cpu_busy=0.99):
+    """The Studio's LoadGate SATURATED (cpu_busy 0.99: admit_class refuses), memory and threads as given."""
+    from hermes_cli.fleet_placement import admission as ad
+
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (load1, load1))
-    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.99, None))
-    monkeypatch.setattr(klg, "utilization_context", lambda: {"mem_available_gb": mem})
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (cpu_busy, None))
+    monkeypatch.setattr(klg, "sample_psi", lambda: {})
+    monkeypatch.setattr(klg, "utilization_context", lambda: {
+        "host": "mac-studio", "ceiling": None, "ceiling_reason": "",
+        "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), "limits": ad.Limits(),
+        "mem_available_gb": mem, "mem_total_gb": 512.0})
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
     monkeypatch.setattr(ka.os, "cpu_count", lambda: threads)
 
 
@@ -123,7 +130,8 @@ def test_admit_spawns_on_a_host_whose_band_is_hot_and_writes_the_event(board, mo
     assert SPAWNS == [(tid, None)] and _status(tid) == "running"
     [ev] = _events(tid)
     assert ev["actor"] == "apollo" and ev["host"] == "studio" and ev["reason"] == "Ace 21:3x: do both"
-    assert ev["band"] == "paused" and ev["gate_allowance"] == 0      # what it overrode
+    assert ev["band"] == "spilling" and ev["gate_allowance"] == 0    # what it overrode
+    assert ev["admission"] == "utilization"
     assert ev["load1"] == 66.0 and ev["load_limit"] == 96.0 and ev["mem_reserve_gb"] == 0.0
 
 
@@ -234,7 +242,7 @@ def test_a_local_admit_lowers_the_next_gateway_tick_allowance_by_one(board, monk
     budget on the very next tick, before its CPU shows in load1."""
     from gateway import kanban_gate_tick as kgt
 
-    _hot_local(monkeypatch, load1=40.0)        # (64 - 40) / cost 2 = 12 admitted, under the cap
+    _hot_local(monkeypatch, load1=40.0, mem=36.0, cpu_busy=0.05)   # 36 GB / 3 GB per worker = 12, under the cap
     monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
     cfg = {"dispatch_load_gate": dict(GATE)}
 
@@ -282,7 +290,7 @@ def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
                             pressure_text=json.dumps({"at": 1000.0, "mem_available_gb": 100.0}))
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
-                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+                             placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
     assert m.mem_available_gb is None and "unmeasured" in ka.floor_refusal(m)
 
@@ -312,7 +320,7 @@ def test_an_invalid_remote_placement_table_refuses_instead_of_a_zero_reserve(boa
                             pressure_text=json.dumps({"at": 2000.0, "mem_available_gb": 100.0}))
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
-                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+                             placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
     assert m.mem_available_gb == 100.0
     refusal = ka.floor_refusal(m)
@@ -508,7 +516,7 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
     from types import SimpleNamespace
 
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=600.0),
-                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+                             placement_table=None)
     real_plan = ka._dispatcher_plan
 
     def plan_with_signal(cfg):
@@ -661,6 +669,8 @@ NOT_A_CARD_REFUSAL = {
     "continue: dry_run": "the --dry-run preview; admit never dry-runs",
     "return: _cap == 0": "`dispatch --max 0`, an operator argument; admit has no --max (spec item 5)",
     "continue: record_only is not None": "the tail behind an EARLIER row's wall; admit routes one row",
+    "break: spawn_budget is not None and spawned >= spawn_budget": "budget spent by EARLIER ready rows; admit routes one row",
+    "continue: route_first": "budget spent by EARLIER ready rows; admit routes one row",
     "rows: sorted": "orders the rows; admit has one",
     "rows: bool": "the placement-record gate snapshot",
     "rows: _capabilities_unplanned": "dry-run preview only",
@@ -706,12 +716,13 @@ def _site_triggers():
         ctx["kanban_cfg"] = {"max_spawn": 1}
         return "studio", "twin", "spawn_capped: max_spawn=1"
 
-    def review_reservation(m, ctx):
+    def review_ahead(m, ctx):
+        # A review card that outranks the card owns the one slot max_spawn leaves.
         with kb.connect_closing() as conn:
-            rid = kb.create_task(conn, title="review", assignee="alpha")
+            rid = kb.create_task(conn, title="review", assignee="alpha", priority=5)
             conn.execute("UPDATE tasks SET status='review' WHERE id=?", (rid,))
         ctx["kanban_cfg"] = {"max_spawn": 1}
-        return "studio", "twin", "total:ready_budget"
+        return "studio", "twin", "total:max_spawn"
 
     def no_worker(m, ctx):
         upd("UPDATE tasks SET no_worker=1 WHERE id=?", ctx)
@@ -990,8 +1001,7 @@ def _site_triggers():
         "return: _kbudget.evaluate_board_budget(board, _kb.kanban_db_path(board=board), "
         "_kb.board_state_dir(board), cache=budget_cache)": budget,
         "return: running_count >= max_spawn": max_spawn,
-        "break: ready_budget is not None and spawned >= ready_budget": review_reservation,
-        "continue: route_first": review_reservation,
+        "continue: _ahead and spawn_budget is not None and (spawned + _ahead >= spawn_budget)": review_ahead,
         "rows: _kb._drop_no_worker_rows": no_worker,
         "rows: _drop_human_lane_rows": human_lane,
         "rows: _kph.held_routes": pause_pre,

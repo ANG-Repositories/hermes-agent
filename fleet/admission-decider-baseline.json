@@ -1,0 +1,19 @@
+{
+ "_doc": "Grandfathered host-load comparisons per file for .github/router-core/admission-decider-lint.py, a byte copy of ANG-Ventures/hermes-home scripts/admission-decider-lint.py (t_22955b73; first baseline here seeded from main). A ratchet: counts only go DOWN, and a PR that removes a hit lowers its row in the same PR (--update). `scan` = the whole tree, `library` = this repo's vendored copy of the ONE admission library. Pagers, forensics and status reads carry `# admission-lint: not-a-decider <why>` on the line instead of a row. Fleet total: hermes-home scripts/admission-decider-census.py.",
+ "schema": 1,
+ "scan": [
+  "."
+ ],
+ "library": [
+  "hermes_cli/fleet_placement/admission.py",
+  "hermes_cli/fleet_placement/admission_demand.py",
+  "hermes_cli/fleet_placement/placement.py"
+ ],
+ "files": {
+  "hermes_cli/kanban_admit.py": 3,
+  "hermes_cli/kanban_load_gate.py": 12,
+  "hermes_cli/kanban_wake_gate.py": 3,
+  "hermes_cli/kanban_worker_pool.py": 1,
+  "hermes_cli/placement_ledger.py": 1
+ }
+}

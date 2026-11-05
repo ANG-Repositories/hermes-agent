@@ -203,8 +203,7 @@ def _replay_plan(home, dec, table_doc, mode):
             detail[h] = {"slots": n, "running": 0, "load1": None,
                          "pressure": (v["reason"] or "closed").split(":", 1)[-1]}
     _pressure(home, measured, at=at)
-    sig = kwp.TargetSignal(policy=pp.PlacementPolicy(), state_path=home / "var" / kwp.TARGET_STATE_FILE,
-                           ledger_dir=home / "var" / "placement", clock=lambda: at, placement_table=table,
+    sig = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=home / "var" / "placement", clock=lambda: at, placement_table=table,
                            placement_reservations=rpath, allocd=mode)
     return kwp._finish_plan(hosts, slots, detail, (), at, None, sig)
 

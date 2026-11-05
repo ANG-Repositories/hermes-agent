@@ -108,6 +108,11 @@ def _base_check_setup(p: argparse.ArgumentParser) -> None:
     add_arguments(p)
 
 
+def _reclaim_setup(p: argparse.ArgumentParser) -> None:
+    from hermes_cli.kanban_reclaim import add_arguments
+    add_arguments(p)
+
+
 def _obligation_setup(p: argparse.ArgumentParser) -> None:
     from hermes_cli.kanban_work_obligations import setup_parser
     setup_parser(p)
@@ -916,7 +921,7 @@ _SPECS = [
              help="Running-count ceiling for this board: spawn nothing once N are running "
                   "(default: kanban.max_spawn)"),
         _arg("--ignore-load-gate", action="store_true",
-             help="Bypass kanban.dispatch_load_gate for this call. Prints load1/pause_above "
+             help="Bypass kanban.dispatch_load_gate for this call. Prints the admission verdict "
                   "and records a load_gate_override event on every card it spawns"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -1087,6 +1092,8 @@ _SPECS = [
         _arg("--dry-run", action="store_true",
              help="List the workspaces gc would try to remove; delete nothing"),
     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
+    _cmd("reclaim-workspaces", setup=_reclaim_setup,
+         help="Capture, verify and delete the held workspaces of done cards (dry run unless --apply)"),
     _cmd("clone", setup=_clone_setup,
          help="git clone that borrows objects from a shared fleet mirror",
          description=(

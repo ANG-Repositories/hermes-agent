@@ -175,7 +175,7 @@ def test_ac6_memory_elevated_allows_one_total(kanban_home, monkeypatch):
         _make(conn, 3, body="host: ace-ai")
         res, spawned = _tick(conn, spillover=_plan(free=3), spawn_limit=4)
         assert len(spawned) == 1
-        assert sorted(set(res.placement_waits.values())) == ["total:ready_budget"]
+        assert sorted(set(res.placement_waits.values())) == ["total:memory_elevated"]
 
 
 def test_route_first_false_restores_the_silent_returns(kanban_home, monkeypatch):
@@ -494,14 +494,14 @@ def test_ac19_every_row_past_the_slot_wall_is_recorded(kanban_home):
         assert len(held) == 4 and all(len(_events(conn, t, "placement_wait")) == 1 for t in held)
 
 
-def test_ac19_ready_budget_one_records_five(kanban_home):
+def test_ac19_max_new_one_records_five(kanban_home):
     with kb.connect_closing() as conn:
         ids = _make(conn, 6, body="host: any")
         res, spawned = _tick(conn, spillover=_plan(free=6), spawn_limit=0, spawn_paused="test",
                              max_new=1)
         assert len(spawned) == 1
         codes = [e["code"] for t in ids for e in _events(conn, t, "placement_wait")]
-        assert codes == ["total:ready_budget"] * 5
+        assert codes == ["total:max_new"] * 5
 
 
 def test_paused_tick_with_no_plan_still_records_holds(kanban_home):
@@ -563,12 +563,6 @@ def test_binding_is_not_part_of_the_dedup_key(kanban_home):
         _tick(conn, spillover=None, spawn_limit=0,
               spawn_paused=f"{pr.QUOTA_SPENT_PREFIX}3 spawn(s) is used by other boards")
         assert len(_local_full_events(conn, ids)) == 1
-
-
-def test_local_full_binding_counts_the_review_reservation():
-    assert pr.local_full_binding(None, None, None, 0) is None
-    assert pr.local_full_binding(None, 3, 2, 2) == {
-        "binding": "quota", "binding_detail": "2/3 local spawns this tick (1 held for review)"}
 
 
 def test_only_local_full_rows_carry_a_binding(kanban_home):

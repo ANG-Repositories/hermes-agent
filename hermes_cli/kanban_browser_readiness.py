@@ -8,7 +8,8 @@ def probe(home, host):
     script = home / 'scripts' / 'browsers' / 'dispatch_relay.py'
     try:
         out = subprocess.run([sys.executable, str(script), 'readiness', '--host', host],
-                             capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL)
+                             capture_output=True, text=True, encoding='utf-8', errors='replace',
+                             timeout=25, stdin=subprocess.DEVNULL)
         resp = json.loads(((out.stdout or '').strip().splitlines() or ['{}'])[-1])
         if not isinstance(resp, dict):
             raise ValueError('invalid reply')
