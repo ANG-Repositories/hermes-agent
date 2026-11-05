@@ -5,6 +5,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 ``kanban_db.<name>`` keeps working.
 """
 from __future__ import annotations
+import bisect
 import contextlib
 import json
 import os
@@ -6062,8 +6063,8 @@ def _any_spawnable_review(
     Unavailable profile metadata retains the historic fail-open behavior. A
     review row that :func:`_dispatch_lane_task` would refuse this tick — its
     assignee already at the per-profile cap, or respawn-guarded — cannot
-    consume the reservation, so it must not withhold capacity from an
-    otherwise ready task (one such row would pin ``ready_budget`` to 0).
+    take budget ahead of a ready row, so it must not withhold capacity from an
+    otherwise ready task (one such row would hold budget it can never use).
     """
     if not review_rows:
         return False
@@ -6483,6 +6484,9 @@ def _dispatch_once_locked(
 
     running_count = 0
     spawn_budget: Optional[int] = None
+    # The gate whose cap set ``spawn_budget``: rows behind a spent budget wait
+    # on ``total:<that gate>``.
+    budget_gate: Optional[str] = None
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
 
@@ -6498,6 +6502,7 @@ def _dispatch_once_locked(
                 _record_total_hold(conn, result, _pr.TOTAL_MAX_SPAWN, dry_run, only_task)
             return result
         spawn_budget = max_spawn - running_count
+        budget_gate = _pr.TOTAL_MAX_SPAWN
 
     # Honour kanban.max_in_progress across both ready and review queues: if
     # the board already has enough running tasks, skip this tick entirely.
@@ -6522,6 +6527,7 @@ def _dispatch_once_locked(
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+            budget_gate = _pr.TOTAL_MAX_IN_PROGRESS
 
     # Load-gate allowance (kanban.dispatch_load_gate, see kanban_load_gate):
     # the per-tick number of NEW LOCAL workers this host can absorb. It caps
@@ -6556,6 +6562,7 @@ def _dispatch_once_locked(
                 "limiting to at most 1 new worker this tick"
             )
             spawn_budget = 1
+            budget_gate = _pr.TOTAL_MEMORY_ELEVATED
 
     # ``max_new`` (CLI ``--max N``, additive) caps NEW workers this call
     # across local AND remote spawns: it is a TOTAL-budget cap, never only
@@ -6564,6 +6571,7 @@ def _dispatch_once_locked(
         _cap = max(0, int(max_new))
         if spawn_budget is None or spawn_budget > _cap:
             spawn_budget = _cap
+            budget_gate = _pr.TOTAL_MAX_NEW
         if _cap == 0:
             result.spawn_capped = "--max=0: no new workers this call"
             if route_first:
@@ -6716,12 +6724,13 @@ def _dispatch_once_locked(
     # review lane is never offered to the pool: its rows are always local.
     review_rows = []
     _review_pause_pins: dict = {}  # review id -> resume-origin host (Prism 01f1e61334ff)
-    # kanban admit enumerates them too, read-only, so the review-lane slot
-    # reservation below binds it exactly as it binds the tick; it never spawns one.
+    # kanban admit enumerates them too, read-only, so a review row that
+    # outranks the card binds it exactly as it binds the tick; it never spawns one.
     _review_dry = dry_run or _admit
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee, no_worker, body, skills, workspace_path, workspace_kind, origin_host FROM tasks "
+            "SELECT id, assignee, no_worker, body, skills, workspace_path, workspace_kind, origin_host, "
+            "priority FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -6733,17 +6742,10 @@ def _dispatch_once_locked(
                                      lane="review", planned=spillover is not None, entry=entry,
                                      pins_out=_review_pause_pins,
                                      pool=spillover.config if spillover is not None else None, caps=_caps)
-    # Review-lane reservation (OOF-30 review finding): the ready loop runs
+    # Review-lane fairness (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
-    # ready backlog permanently starved autonomous reviews — completed work
-    # sat in 'review' forever while new work kept spawning. When spawnable
-    # review work exists and the tick has any budget, hold one slot back
-    # from the ready loop so the review lane always gets a spawn
-    # opportunity. The reservation is per-tick and self-releasing: with no
-    # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
+    # ready backlog permanently starved autonomous reviews. Priority settles
+    # it (``_review_ahead`` below), not a held-back slot.
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -6775,39 +6777,23 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
-    # Resolved BEFORE the review reservation so the reservation can see which
-    # review rows the lane loop would refuse this tick (respawn guard,
-    # per-profile cap): such a row cannot use the reserved slot and must not
-    # starve the ready lane (``_any_spawnable_review``).
-    def _any_spawnable_review_this_tick() -> bool:
-        if not review_rows:
-            return False
-        if _per_profile_cap is None:
-            return _any_spawnable_review(conn, review_rows)
-        return any(
-            _any_spawnable_review(
-                conn, [row],
-                per_profile_cap=_cap_for(row["assignee"]),
-                per_profile_running=_per_profile_running,
-            )
-            for row in review_rows
+    # One budget, one order (FWA-I, t_cd43f4ff, audit K8): no slot is held
+    # back for the review lane. A spawnable review row at the same or a higher
+    # priority than a ready row keeps its place ahead of it (a review finishes
+    # work, so it wins the tie): the ready row leaves that much budget to the
+    # review loop below. A review row ranked below a ready row waits like any
+    # other lower-priority card. ``_review_ahead`` = negated priorities of the
+    # review rows the review loop would spawn this tick (respawn guard,
+    # per-profile cap: ``_any_spawnable_review``).
+    _review_ahead = sorted(
+        -(r["priority"] or 0) for r in review_rows
+        if _any_spawnable_review(
+            conn, [r],
+            per_profile_cap=_cap_for(r["assignee"]) if _per_profile_cap is not None else None,
+            per_profile_running=_per_profile_running,
         )
-
-    ready_budget = spawn_budget
-    # Review rows spawn locally, so the reservation holds back one LOCAL slot
-    # too (``ready_local``); the review loop checks the full ``local_budget``.
-    ready_local = local_budget
+    )
     local_spawned = 0
-    if (
-        (spawn_budget is None or spawn_budget > 0)
-        and (local_budget is None or local_budget > 0)
-        and (spawn_budget is not None or local_budget is not None)
-        and _any_spawnable_review_this_tick()
-    ):
-        if spawn_budget is not None:
-            ready_budget = max(spawn_budget - 1, 0)
-        if local_budget is not None:
-            ready_local = local_budget - 1
     # Lazily populated only when a ready card reaches the point where it would
     # actually spawn. A queue containing only unassigned, capped, guarded, or
     # control-plane cards pays zero collision-scan queries on every idle tick.
@@ -7386,14 +7372,23 @@ def _dispatch_once_locked(
                 record_only if record_only != "wall"
                 else _wall_reason(route, route_arg, spillover))
             continue
-        if ready_budget is not None and spawned >= ready_budget:
+        if spawn_budget is not None and spawned >= spawn_budget:
             ready_scan_complete = False
             if route_first:
-                record_only = _pr.total(_pr.TOTAL_READY_BUDGET)
+                record_only = _pr.total(budget_gate or _pr.TOTAL_MAX_SPAWN)
                 result.placement_waits[row["id"]] = record_only
                 continue
             break
-        local_free = ready_local is None or local_spawned < ready_local
+        # Review rows that outrank this row spawn first: they own that much of
+        # the total and the local budget (reviews only run locally).
+        _ahead = bisect.bisect_right(_review_ahead, -(row["priority"] or 0))
+        if _ahead and spawn_budget is not None and spawned + _ahead >= spawn_budget:
+            # Not record_only: rows are route-sorted, so a later row may
+            # outrank this one and still fit.
+            ready_scan_complete = False
+            result.placement_waits[row["id"]] = _pr.total(budget_gate or _pr.TOTAL_MAX_SPAWN)
+            continue
+        local_free = local_budget is None or local_spawned + _ahead < local_budget
         if route == "portable" and local_free and not _caps_out.get("only", {}).get(row["id"]):
             _portable_room.add(row["id"])
         pool_free = spillover is not None and spillover.budget > 0
@@ -7981,7 +7976,7 @@ def _dispatch_once_locked(
     _park_access_contradictions(conn, result, dry_run, default_assignee)
     _record_placement_waits(
         conn, result, row_route, dry_run, _wait_reached,
-        local_binding=_pr.local_full_binding(spawn_paused, local_budget, ready_local, local_spawned))
+        local_binding=_pr.local_full_binding(spawn_paused, local_budget, local_spawned))
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
@@ -8025,12 +8020,12 @@ def _dispatch_once_locked(
     # changes without block-loop accounting, or escalate a genuine blocker.
     # Human-only boards can disable it with ``kanban.review_dispatch``.
     #
-    # ``review_rows`` was enumerated before the ready loop; when it is
-    # non-empty the ready loop ran against ``ready_budget`` (one slot held
-    # back) so this lane cannot be permanently starved by a sustained
-    # ready backlog. The review loop itself still checks the FULL shared
-    # ``spawn_budget`` — the reservation caps the ready lane, it does not
-    # grant the review lane extra capacity. Same for the per-pool hold:
+    # ``review_rows`` was enumerated before the ready loop, which left budget
+    # for every spawnable review row that outranks a ready row
+    # (``_review_ahead``), so a higher-priority review is not starved by a
+    # lower-priority ready backlog. The review loop checks the FULL shared
+    # ``spawn_budget`` — priority orders the lanes, it does not grant the
+    # review lane extra capacity. Same for the per-pool hold:
     # release it so reviewers are judged on the pool's real budget.
     review_pool_reserve.clear()
     for row in review_rows:

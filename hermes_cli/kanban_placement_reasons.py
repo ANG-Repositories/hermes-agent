@@ -166,7 +166,7 @@ TOTAL_MAX_SPAWN = "max_spawn"
 TOTAL_MAX_IN_PROGRESS = "max_in_progress"
 TOTAL_MEMORY_CRITICAL = "memory_critical"
 TOTAL_MAX_NEW = "max_new"
-TOTAL_READY_BUDGET = "ready_budget"
+TOTAL_MEMORY_ELEVATED = "memory_elevated"
 
 # The record of every spawn, both routes (spec §4.1); its ``route`` values
 # live in kanban_db_dispatch (``_ROUTE_*``): routes are not hold reasons.
@@ -235,11 +235,11 @@ def route_first(kanban_cfg: Any) -> bool:
     return str(val).strip().lower() not in ("false", "off", "no", "0")
 
 
-def local_full_binding(spawn_paused, local_budget, ready_local, local_spawned) -> "dict | None":
+def local_full_binding(spawn_paused, local_budget, local_spawned) -> "dict | None":
     """``{binding, binding_detail}`` for this tick's ``local_full`` holds, or
     None when no local budget bound them (gate disabled: local is never full).
     Read at the end of the tick: ``local_spawned`` only grows, and a row is
-    held local_full only once it reached ``ready_local``."""
+    held local_full only once it reached ``local_budget``."""
     if spawn_paused:
         text = str(spawn_paused)
         cause = LOCAL_BINDING_QUOTA if text.startswith(QUOTA_SPENT_PREFIX) else LOCAL_BINDING_GATE
@@ -248,11 +248,8 @@ def local_full_binding(spawn_paused, local_budget, ready_local, local_spawned) -
         return None
     if local_budget <= 0:
         return {"binding": LOCAL_BINDING_GATE, "binding_detail": "gate allowance 0 this tick"}
-    held = local_budget - (ready_local if ready_local is not None else local_budget)
-    detail = f"{local_spawned}/{local_budget} local spawns this tick"
-    if held > 0:
-        detail += f" ({held} held for review)"
-    return {"binding": LOCAL_BINDING_QUOTA, "binding_detail": detail}
+    return {"binding": LOCAL_BINDING_QUOTA,
+            "binding_detail": f"{local_spawned}/{local_budget} local spawns this tick"}
 
 
 def take_refusal_code(refusal) -> "str | None":
