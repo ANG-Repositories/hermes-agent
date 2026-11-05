@@ -6744,15 +6744,6 @@ def _dispatch_once_locked(
     # Publish before pressure-gated spawn budgets can hide hot-host demand.
     from hermes_cli import kanban_priority as _priority
     from hermes_cli import kanban_priority_door as _door
-    if not dry_run and not _admit and _door.enabled():
-        try:
-            _waiting = _priority.waiting_by_host(
-                ready_rows, spillover, routes=row_route, local_host="local", board=board,
-                default_assignee=default_assignee, conn=conn, caps=_caps,
-                cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports)
-            _priority.publish_waiting(conn, _waiting, verdicts=_priority.verdicts_for_plan(spillover))
-        except Exception as exc:
-            _kb._log.warning("kanban door publication failed (starts remain fail-closed): %s", exc)
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.
@@ -6764,7 +6755,7 @@ def _dispatch_once_locked(
     if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee, no_worker, body, skills, workspace_path, workspace_kind, origin_host, "
-            "priority FROM tasks "
+            "priority, asap FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -6776,6 +6767,15 @@ def _dispatch_once_locked(
                                      lane="review", planned=spillover is not None, entry=entry,
                                      pins_out=_review_pause_pins,
                                      pool=spillover.config if spillover is not None else None, caps=_caps)
+    if not dry_run and not _admit and _door.enabled():
+        try:
+            _waiting = _priority.waiting_by_host(
+                [*ready_rows, *review_rows], spillover, routes=row_route, local_host="local", board=board,
+                default_assignee=default_assignee, conn=conn, caps=_caps,
+                cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports)
+            _priority.publish_waiting(conn, _waiting, verdicts=_priority.verdicts_for_plan(spillover))
+        except Exception as exc:
+            _kb._log.warning("kanban door publication failed (starts remain fail-closed): %s", exc)
     # Review-lane fairness (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews. Priority settles

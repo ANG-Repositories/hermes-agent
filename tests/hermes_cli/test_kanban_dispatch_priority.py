@@ -68,3 +68,17 @@ def test_binding_verdict_has_no_fictional_cpu_deficit():
     }
     assert door_verdict(False, "cpu", {"cpu": -.125}, 32)["deficit_cpu"] == 4
     assert door_verdict(False, "unknown", {}, 32)["deficit_cpu"] == 0
+    # Adapter carries CPU/PSI/memory bindings without converting PSI into cores.
+    from types import SimpleNamespace
+    from hermes_cli.kanban_priority import verdicts_for_plan
+    from unittest.mock import patch
+    plan = SimpleNamespace(hosts={"ai": object()}, signal=SimpleNamespace(placement_table=object()),
+                           detail={"ai": {"ncpu": 32}})
+    for reason, binding, deficit in (("saturated:cpu -0.12", "cpu", 3.84),
+                                      ("saturated:psi_cpu_some60 -0.2", "psi_cpu_some60", 0),
+                                      ("saturated:mem -0.1", "mem", 0),
+                                      ("closed:stale", "unknown", 0)):
+        with patch("hermes_cli.kanban_headroom._class_verdict", return_value=(False, reason)):
+            verdict = verdicts_for_plan(plan)["ai"]
+        assert verdict["binding"] == binding
+        assert verdict["deficit_cpu"] == deficit

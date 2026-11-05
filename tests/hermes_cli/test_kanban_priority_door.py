@@ -130,3 +130,8 @@ def test_failed_spawn_releases_and_held_attempt_keeps_arrival_id(board, monkeypa
         with door.start(board, task, "ace-ai", client=client):
             raise RuntimeError("spawn failed")
     assert client.calls[-1] == ("release", "same-row", {"consumer": "kanban@ace-ai"})
+    monkeypatch.setattr(door, "enabled", lambda: False)
+    client.calls.clear()
+    with door.start(board, task, "ace-ai", client=client):
+        pass
+    assert client.calls == []
