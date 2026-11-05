@@ -136,7 +136,7 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
     ctx["under_systemd"] = bool(os.environ.get("INVOCATION_ID")) or ppid == 1
     # High load points at "something crushing the box" rather than an external killer.
     with contextlib.suppress(OSError, AttributeError):
-        ctx["loadavg_1m"] = os.getloadavg()[0]
+        ctx["loadavg_1m"] = os.getloadavg()[0]  # admission-lint: not-a-decider shutdown forensics record
     # Nonzero TracerPid means a debugger/strace is attached.
     with contextlib.suppress(TypeError, ValueError):
         if (tracer := _read_proc_field(pid, "TracerPid")) is not None and tracer != "0":
@@ -169,7 +169,7 @@ def _async_diagnostic_script(signal_name: str, self_pid: int) -> str:
         # line is echoed first so ``sort`` does not bury it among the 0.0-cpu rows.
         "ps -eo pid,ppid,user,pcpu,pmem,stat,comm 2>/dev/null | { IFS= read -r h; echo \"$h\"; sort -nrk4; } | head -60; "
         f"echo '--- pstree of self ---'; pstree -pl {self_pid} 2>/dev/null | head -40 || true; "
-        "echo '--- loadavg ---'; cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null || true; "
+        "echo '--- loadavg ---'; cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null || true; "  # admission-lint: not-a-decider shutdown forensics dump
         "echo '--- recent dmesg (oom/killed) ---'; "
         "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
         "echo '=== end ==='"

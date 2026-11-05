@@ -180,7 +180,7 @@ def _host_load_suffix() -> str:
     than raising and costing us the diagnostic dump.
     """
     try:
-        load1 = f"{os.getloadavg()[0]:.2f}"
+        load1 = f"{os.getloadavg()[0]:.2f}"  # admission-lint: not-a-decider diagnostic text for the dump
     except (OSError, AttributeError, IndexError):
         load1 = "unknown"
     try:
@@ -200,7 +200,7 @@ def _sample_host_load() -> tuple[Optional[float], Optional[int]]:
     starvation must not create a hold.
     """
     try:
-        load1: Optional[float] = float(os.getloadavg()[0])
+        load1: Optional[float] = float(os.getloadavg()[0])  # admission-lint: not-a-decider liveness-miss classifier, gates no work
     except (OSError, AttributeError, IndexError, TypeError, ValueError):
         load1 = None
     try:
@@ -256,7 +256,7 @@ def evaluate_liveness_miss(
     if load1 is not None and load1 == load1:  # not NaN
         cores = ncpu if isinstance(ncpu, int) and ncpu > 0 else 1
         threshold = max(factor * cores, LIVENESS_STARVATION_LOAD_FLOOR)
-        starved = load1 > threshold
+        starved = load1 > threshold  # admission-lint: not-a-decider liveness-miss classifier (hold vs exit), gates no work
 
     if not starved:
         return _LivenessMissDecision(
