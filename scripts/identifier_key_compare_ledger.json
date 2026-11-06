@@ -597,6 +597,11 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and worker_draft_repos() folds its set the same way, so the folded repo IS the canonical key; byte-exact would miss a worker-draft repo written in another case.",
    "where": "hermes_cli/kanban_pr_freshness.py:309 _owns_draft"
   },
+  "hermes_cli/kanban_pr_freshness.py::_unread_refuses::fold::repo::if ref.repo.casefold() not in worker_draft_repos():": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and worker_draft_repos() folds its set the same way (same comparand as _owns_draft), so the folded repo IS the canonical key; byte-exact would treat a worker-draft repo written in another case as foreign.",
+   "where": "hermes_cli/kanban_pr_freshness.py:458 _unread_refuses"
+  },
   "hermes_cli/kanban_round_draft.py::draft_at_round_start::fold::repo::if ref.repo.casefold() not in repos:": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and repos is worker_draft_repos(), folded the same way (same comparand as _owns_draft), so the folded repo IS the canonical key; byte-exact would skip a worker-draft repo written in another case.",
