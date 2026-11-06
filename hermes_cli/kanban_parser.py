@@ -370,6 +370,10 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--signature",
+             help="Automated minters: the failure's identity minus its per-occurrence sha/epoch. An open card "
+                  "for it, or one closed in the last 24 h, is returned instead of minting; after 3 no-code "
+                  "closes in a row the mint is refused (mint breaker). Humans are never affected."),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
