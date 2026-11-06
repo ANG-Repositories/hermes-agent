@@ -11996,11 +11996,17 @@ def complete_task(
                     with write_txn(conn):
                         _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
 
+            # The card's Intent block into its own PR bodies before the ready flip (t_deee5435);
+            # None when KANBAN_PR_INTENT/KANBAN_HANDOFF_PR_INTENT=0. Never raises.
+            from hermes_cli import kanban_pr_intent as _intent
+            intent_fn = _intent.applier_for_task(conn, task_id, summary, metadata)
+
             def _freshness_gate(refs, allow_arm):
                 try:
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
+                        intent=intent_fn,
                     )
                 except _fresh.DraftPrError as draft_err:
                     _record_flips(draft_err.flipped)
