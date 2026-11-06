@@ -188,14 +188,14 @@ _LIVE_BAND_OPERATORS = frozenset({"apollo", "daedalus", "daedalus-opus"})
 
 
 def live_priority_band(conn, *, now: int | None = None) -> int:
-    """Median ``tasks.priority`` of the distinct cards with a ``spawned`` event in the last 24 h, floor 100."""
+    """Median ``tasks.priority`` over the ``spawned`` events of the last 24 h (one value per spawn, so the band
+    follows where the dispatcher's capacity actually went), floor 100."""
     import statistics
     import time
     since = int(time.time() if now is None else now) - LIVE_BAND_WINDOW_S
     rows = conn.execute(
-        "SELECT t.priority FROM tasks t WHERE t.id IN "
-        "(SELECT DISTINCT task_id FROM task_events WHERE kind = 'spawned' AND created_at >= ?)",
-        (since,)).fetchall()
+        "SELECT t.priority FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = 'spawned' AND e.created_at >= ?", (since,)).fetchall()
     prios = [int(r[0] or 0) for r in rows]
     return max(HUMAN_DEFAULT_PRIORITY, int(statistics.median(prios))) if prios else HUMAN_DEFAULT_PRIORITY
 
