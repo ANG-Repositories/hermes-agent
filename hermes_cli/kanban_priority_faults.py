@@ -208,10 +208,12 @@ def note_transport(err: str, verb: str = "authorize") -> None:
     now = _now()
     with _state() as doc:
         verbs = _transport(doc)
-        t = verbs.get(verb)
-        interval = tick_interval() if not t else min(TRANSPORT_MAX_BACKOFF_S, float(t["interval"]) * 2)
-        t = {"since": now if not t else t["since"], "interval": interval, "next_at": now + interval,
-             "error": str(err)[:300]}
+        prev = verbs.get(verb)
+        interval = tick_interval() if not prev else min(TRANSPORT_MAX_BACKOFF_S, float(prev["interval"]) * 2)
+        # `paged` is read from the EXISTING record before it is replaced (round 4): overwriting first dropped it, so
+        # a single-verb outage re-paged on every retry past 10 min.
+        t = {"since": now if not prev else prev["since"], "interval": interval, "next_at": now + interval,
+             "error": str(err)[:300], "paged": bool(prev and prev.get("paged"))}
         verbs[verb] = t
         paged = any(v.get("paged") for v in verbs.values())
         if not paged and now - t["since"] > TRANSPORT_PAGE_AFTER_S:

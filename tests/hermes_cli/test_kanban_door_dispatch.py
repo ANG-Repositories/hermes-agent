@@ -290,6 +290,36 @@ def test_partial_outage_publish_and_lookup_succeed_authorize_503_backs_off_and_p
     assert len(fleet.pages) == 2 and "again" in fleet.pages[1]
 
 
+def test_publish_only_outage_pages_once_at_first_failed_retry_past_600s(fleet, monkeypatch):
+    """Round-4 reader repro (kanban_priority_faults.py:213-216): with only publish 503 across 9 attempts the failing
+    verb's record was rebuilt before its `paged` flag was read, so every retry past 10 min re-paged (5 pages). A verb
+    pages only on its unpaged -> paged transition. The page fires on the first FAILED retry after 600 s (here ~720 s:
+    the check runs only when a retry fails), never on a timer."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    t0 = time.time()
+    clock = [t0]
+    monkeypatch.setattr(faults, "_now", lambda: clock[0])
+    allocd = Allocd()
+    ok = ok_door()
+    allocd.answer = lambda path, body: (503, {"error": "publish down"}) if path == "/demand/publish" else ok(path, body)
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    tid, spawned = _card(), []
+    page_at = None
+    for _ in range(9):
+        _tick(spawned)
+        t = json.loads((fleet.root / faults.STATE_REL).read_text())["transport"]
+        assert set(t) == {"publish"}, t
+        if fleet.pages and page_at is None:
+            page_at = clock[0] - t0
+        clock[0] = t["publish"]["next_at"] + 1
+    assert spawned == [] and _status(tid).status == "ready"
+    assert len(fleet.pages) == 1, fleet.pages
+    assert "publish unreachable" in fleet.pages[0]
+    assert faults.TRANSPORT_PAGE_AFTER_S < page_at <= faults.TRANSPORT_PAGE_AFTER_S + faults.TRANSPORT_MAX_BACKOFF_S
+
+
 _KILLED_TICK = """
 import os, signal
 from hermes_cli import kanban_db_connect as kbc, kanban_db_dispatch as kbd
