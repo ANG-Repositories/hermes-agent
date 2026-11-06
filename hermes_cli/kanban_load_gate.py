@@ -770,10 +770,12 @@ def unified_inputs(host: str) -> "tuple[list, Any]":
 
 
 def publish_ready_demand(queued: int, root=None) -> Optional[str]:
-    """Kanban's queue for the ONE rule (t_3694ab3c), published through allocd's pair door as kanban@<this host>
-    (hermes-home #9223 deleted the local writer: one owner model). Unit = the table's kanban footprint (the prior
-    work_estimate seeds from). Demand is advisory, so a failed publish never stops the tick: it returns the error
-    text (None = published) for the caller to log, and the next tick publishes again (Prism 8397e82995e1)."""
+    """Kanban's queue for the ONE rule (t_3694ab3c), published through allocd's pair door as kanban@<host> for
+    EVERY table host (hermes-home #9223 deleted the local writer): a portable card may run on any of them, which the
+    old ``hosts: null`` file said and the door's per-pair ``hosts`` union now says. Unit = the table's kanban
+    footprint (the prior work_estimate seeds from). Demand is advisory, so a failed publish never stops the tick: it
+    returns the error text (None = published) for the caller to log, and the next tick publishes again (Prism
+    8397e82995e1)."""
     from hermes_cli import alloc_client as _ac
     from hermes_cli.fleet_placement import admission as _ad
     from hermes_cli.fleet_placement import placement as _pl
@@ -785,15 +787,17 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
     try:
         table = _pl.load_hosts(None if root is None else Path(root) / _pl.TABLE_REL)
         unit = _pl.need_of(table.footprint(UNIFIED_WORKLOAD))
-        hid = table.resolve(UTIL_HOST_ALIAS)
-        if not hid:
-            return "this host is not in the fleet table"
-        _ac.publish_queue(UNIFIED_WORKLOAD, hid, int(queued),
-                          {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib},
-                          unified=unified_admit())
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
-    return None
+    errors = []
+    for hid in sorted(table.hosts):
+        try:
+            _ac.publish_queue(UNIFIED_WORKLOAD, hid, int(queued),
+                              {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib},
+                              unified=unified_admit())
+        except Exception as exc:
+            errors.append(f"{hid}: {type(exc).__name__}: {exc}")
+    return "; ".join(errors) or None
 
 
 def utilization_context() -> dict:

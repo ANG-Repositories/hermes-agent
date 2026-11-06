@@ -385,7 +385,21 @@ def test_pinned_take_books_the_learned_estimate_it_was_admitted_on(home, monkeyp
 
 # ---------------------------------------------------------------------------------- demand publication
 
-def test_tick_publishes_ready_demand(home):
+@pytest.fixture
+def door(monkeypatch):
+    """allocd's pair door faked at the client (hermes-home #9223: publish_queue is the only queue writer)."""
+    from hermes_cli import alloc_client
+    sent = []
+
+    def publish_queue(workload, host, queued, unit, *, unified, timeout=None):
+        sent.append({"workload": workload, "host": host, "queued": queued, "unit": dict(unit), "unified": unified})
+        return {"ok": True}
+
+    monkeypatch.setattr(alloc_client, "publish_queue", publish_queue)
+    return sent
+
+
+def test_tick_publishes_ready_demand(home, door):
     with kb.connect_closing() as conn:
         for i in range(3):
             kb.create_task(conn, title=f"c{i}", assignee="alpha")
@@ -393,12 +407,13 @@ def test_tick_publishes_ready_demand(home):
     b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet", kanban_cfg=lambda: {},
                             ledger=lambda boards: {}, connect=lambda board=None: kb.connect())
     assert b.publish_demand([{"slug": "default"}]) == 3
-    doc = json.loads((home / "var" / "placement" / "demand" / "kanban.json").read_text(encoding="utf-8"))
-    assert doc["workload"] == "kanban" and doc["queued"] == 3 and doc["hosts"] is None
-    assert doc["unit"] == {"cpus": 2.0, "ram_gb": 3.0, "gpu_mib": 0.0}
+    # a portable card may run on any table host: the old ``hosts: null`` is one pair publish per host
+    assert sorted(d["host"] for d in door) == sorted(TABLE["hosts"])
+    assert all(d["workload"] == "kanban" and d["queued"] == 3 and d["unified"] is True for d in door)
+    assert all(d["unit"] == {"cpus": 2.0, "ram_gb": 3.0, "gpu_mib": 0.0} for d in door)
 
 
-def test_tick_demand_skips_operator_only_cards(home):
+def test_tick_demand_skips_operator_only_cards(home, door):
     """Prism 8d48747ae751: no_worker=1 cards are dropped before spawn; publishing them reserved kanban capacity on
     every host for work that never runs."""
     with kb.connect_closing() as conn:
@@ -412,7 +427,7 @@ def test_tick_demand_skips_operator_only_cards(home):
     assert b.publish_demand([{"slug": "default"}]) == 1
 
 
-def test_tick_demand_skips_human_and_unassigned_cards(home):
+def test_tick_demand_skips_human_and_unassigned_cards(home, door):
     """t_365e5753 (2026-10-30): 135 ready cards assigned human:apollo (review/operator lanes the dispatcher never
     spawns) were published as kanban demand 163 and held back ~110 CI runners on ci-box under the ONE rule while 146
     workflow runs queued. Only cards a worker would actually spawn for are demand: the same predicate the
@@ -429,8 +444,7 @@ def test_tick_demand_skips_human_and_unassigned_cards(home):
     b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet", kanban_cfg=lambda: {},
                             ledger=lambda boards: {}, connect=lambda board=None: kb.connect())
     assert b.publish_demand([{"slug": "default"}]) == 2
-    doc = json.loads((home / "var" / "placement" / "demand" / "kanban.json").read_text(encoding="utf-8"))
-    assert doc["queued"] == 2
+    assert door and all(d["queued"] == 2 for d in door)
 
 
 def test_tick_publishes_nothing_under_the_kill_switch(home, monkeypatch):

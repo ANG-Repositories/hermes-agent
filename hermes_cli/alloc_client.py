@@ -1,7 +1,7 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
 # VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 01524a8d64 (hermes-home#9223 merge, P1 door t_810c9012;
-# sha256 f2043b4ad8ff2c645df20c061f929723cc23a45f62c765aa17ab1051f63bea52) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. Local changes:
-# package imports of placement/admission_demand, utf-8-sig reads, admit(unified=); tests/hermes_cli/test_kanban_allocd_route.py checks
+# sha256 f2043b4ad8ff2c645df20c061f929723cc23a45f62c765aa17ab1051f63bea52) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code.
+# local changes: package imports of placement/admission_demand, utf-8-sig reads, admit(unified=); see tests/hermes_cli/test_kanban_allocd_route.py, which checks
 # the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
 
