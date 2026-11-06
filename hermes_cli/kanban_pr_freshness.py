@@ -407,32 +407,6 @@ def _operator_hold(record, pr: dict) -> str:
             f"so someone else holds it; not flipped, not armed")
 
 
-ROUND_DRAFT_MARK = "round-draft: re-drafted by findings-route at "
-
-
-def round_draft_enabled() -> bool:
-    return os.environ.get("KANBAN_ROUND_DRAFT", "1").strip() != "0"
-
-
-def _round_redrafted(gh: GhFn, ref, pr: dict, record) -> bool:
-    """True when the Studio findings-route (hermes-home worker_round_draft.py) re-drafted THIS head at a Prism
-    send-back: its PR comment carries the line ``round-draft: re-drafted by findings-route at <head>``, posted after
-    this card's last flip. The re-draft runs only there; this side only reads the mark and un-drafts at handback.
-    Unreadable comments, no flip record, or the kill switch ``KANBAN_ROUND_DRAFT=0`` -> False (the hold sticks)."""
-    head = str(((pr.get("head") or {}).get("sha")) or "")
-    if not round_draft_enabled() or not head or not isinstance(record, dict):
-        return False
-    try:
-        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(record.get("at") or 0)))
-    except (TypeError, ValueError):
-        return False
-    line = ROUND_DRAFT_MARK + head
-    # gh_api returns objects only: --jq folds the comment list into {"marked": bool}. ``line`` is hex + ASCII.
-    jq = r'{marked: any(.[]; (.body // "") | split("\n") | map(rtrimstr("\r")) | index([%s]) != null)}' % json.dumps(line)
-    out = gh(f"repos/{ref.repo}/issues/{ref.number}/comments?per_page=100&since={since}", "--jq", jq)
-    return isinstance(out, dict) and out.get("marked") is True
-
-
 def ace_gate_ready(repo: str, number: int, *, task_id: str = "") -> Optional[int]:
     """``scripts/ace_gate.py ready <repo> <n>`` (the only sanctioned un-draft). rc, or None if not run."""
     from hermes_constants import get_default_hermes_root
@@ -490,7 +464,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
           flipped: Optional[dict] = None, evaluate: Optional[ArmFn] = None,
-          event_land: Optional[bool] = None) -> dict:
+          event_land: Optional[bool] = None, round_runs=None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -512,7 +486,11 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     ``waiting:fast-tier`` (CI not green / not started) or ``waiting:prism`` (CI green; the evaluator
     reads tier, Prism and review) and calls ``evaluate`` (default :func:`spawn_evaluate`, E6).
     Off: (c) is unchanged, ``spawn_arm`` and all.
+
+    ``round_runs``: this card's run ids. A same-head draft marked by one of them
+    (:func:`kanban_round_draft.round_marked`, t_c418eebc) is the worker's own round draft, flipped like any own draft.
     """
+    from hermes_cli import kanban_round_draft as _rd
     report: dict = {"prs": {}, "checked_at": int(time.time())}
     # Never update-branch or arm a third-party PR (t_06dccfe3): the caller
     # already passes fleet refs only; this keeps the actuator safe on its own.
@@ -554,8 +532,9 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if pr.get("draft") is True:
             held = _operator_hold(flip_records.get(key.lower()), pr)
-            if held and _round_redrafted(gh, ref, pr, flip_records.get(key.lower())):
-                held = ""  # the findings-route send-back drafted this exact head, not an operator hold
+            if held and _rd.round_marked(gh, ref, str(((pr.get("head") or {}).get("sha")) or ""),
+                                         flip_records.get(key.lower()), round_runs):
+                held = ""  # t_c418eebc: one of this card's runs drafted this head for its round, not an operator hold
             if held:
                 # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
                 entry["draft_held"] = held

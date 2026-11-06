@@ -1,24 +1,28 @@
-"""Round draft (t_c418eebc): a Prism send-back re-draft is un-drafted once at the next handback.
+"""Round draft (t_c418eebc): the worker owns its PR's draft bit for a fix round.
 
-The re-draft runs only on the Studio, in hermes-home's findings-route cron, which posts the PR comment line
-``round-draft: re-drafted by findings-route at <head>``. This side reads that mark; it never re-drafts.
+Round start drafts the card's own ready PR and posts ``round-draft: drafted by worker run <id> at <head>``;
+the handback un-drafts once. The Prism findings-route never drafts.
 """
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli import kanban_open_pr as op
 from hermes_cli import kanban_pr_freshness as fr
+from hermes_cli import kanban_round_draft as rd
 
 CARD, SHA = "t_1234abcd", "a" * 40
 
 
 def _jq_eval(jq: str, comments: list) -> dict:
-    """Evaluate the mark the way GitHub's --jq would, for the one shape the helper sends."""
-    line = json.loads(jq[jq.index("index([") + 7:jq.index("]) != null")])
-    marked = any(line in [ln.rstrip("\r") for ln in (c.get("body") or "").split("\n")] for c in comments)
-    return {"marked": marked}
+    """Evaluate the mark query the way GitHub's --jq would, for the one shape round_marked sends."""
+    prefix, suffix = (json.loads(s) for s in re.findall(r'startswith\(("[^"]*")\) and endswith\(("[^"]*")\)', jq)[0])
+    runs = [ln.rstrip("\r")[len(prefix):-len(suffix)]
+            for c in comments for ln in (c.get("body") or "").split("\n")
+            if ln.rstrip("\r").startswith(prefix) and ln.rstrip("\r").endswith(suffix)]
+    return {"runs": runs}
 
 
 @pytest.fixture
@@ -26,7 +30,7 @@ def rig(monkeypatch):
     monkeypatch.setattr(op, "FLEET_OWNERS", {"o"})
     monkeypatch.setattr(fr, "worker_draft_repos", lambda: {"o/r"})
     monkeypatch.delenv("KANBAN_ROUND_DRAFT", raising=False)
-    state = {"pr": {"draft": True, "head": {"sha": SHA, "ref": "worker/" + CARD}}, "comments": []}
+    state = {"pr": {"state": "open", "draft": False, "head": {"sha": SHA, "ref": "worker/" + CARD}}, "comments": []}
 
     def gh(*args):
         if args[0] == "repos/o/r/pulls/1":
@@ -34,47 +38,99 @@ def rig(monkeypatch):
         if args[0].startswith("repos/o/r/issues/1/comments"):
             return _jq_eval(args[2], state["comments"])
         return None
-    calls = []
+    log = []
+
+    def draft(repo, n):
+        log.append(("draft", repo, n))
+        if state.get("draft_fails"):
+            return False
+        state["pr"]["draft"] = True
+        return True
+
+    def comment(repo, n, body):
+        log.append(("comment", repo, n, body))
+        state["comments"].append({"body": body})
+        return True
 
     def ready(*a):
-        calls.append(a)
+        log.append(("ready",) + a)
         state["pr"]["draft"] = False
         return 0
-    opts = dict(task_id=CARD, allow_arm=False, gh=gh, flipped={"o/r#1": {"head": SHA, "at": 1}}, ready=ready)
-    return SimpleNamespace(state=state, calls=calls, opts=opts, refs=op.extract_pr_refs("o/r#1"))
+    records = {"o/r#1": {"head": SHA, "at": 1}}
+    return SimpleNamespace(
+        state=state, log=log,
+        start=lambda run: rd.draft_at_round_start(CARD, run, records, gh=gh, draft=draft, comment=comment),
+        handback=lambda **kw: fr.check(op.extract_pr_refs("o/r#1"), task_id=CARD, allow_arm=False, gh=gh,
+                                       flipped=records, ready=ready, round_runs={"101", "102"}, **kw))
 
 
-def test_route_mark_on_this_head_unholds_and_flips_once(rig):
-    rig.state["comments"] = [{"body": "Prism round 1\r\nround-draft: re-drafted by findings-route at " + SHA}]
-    report = fr.check(rig.refs, **rig.opts)
-    assert rig.calls == [("o/r", 1)]
-    assert report["draft_flipped"] == ["o/r#1"]
-    fr.check(rig.refs, **rig.opts)  # PR is ready now: a second handback does not flip again
-    assert rig.calls == [("o/r", 1)]
+def test_round_start_drafts_own_ready_pr_and_marks_it(rig):
+    assert rig.start(101) == {"o/r#1": "drafted + marked"}
+    assert rig.log == [("draft", "o/r", 1), ("comment", "o/r", 1, rd.mark_line(101, SHA))]
+    assert rig.state["pr"]["draft"] is True
 
 
-def test_no_mark_or_older_head_mark_is_still_an_operator_hold(rig):
-    rig.state["comments"] = [{"body": "round-draft: re-drafted by findings-route at " + "b" * 40}]
-    report = fr.check(rig.refs, **rig.opts)
-    assert report["draft_held"] and rig.calls == []
+def test_draft_failure_logs_and_continues_without_retry(rig):
+    rig.state["draft_fails"] = True
+    assert rig.start(101) == {"o/r#1": "draft failed (logged; round runs CI per push)"}
+    assert rig.log == [("draft", "o/r", 1)]   # one attempt, no mark, no retry
 
 
-def test_kill_switch_and_draft_ok_never_flip(rig, monkeypatch):
-    rig.state["comments"] = [{"body": "round-draft: re-drafted by findings-route at " + SHA}]
-    assert fr.check(rig.refs, draft_ok=True, **rig.opts)["draft_override"] == ["o/r#1"]
+def test_second_run_adopts_marked_draft_and_handback_undrafts_once(rig):
+    rig.start(101)                       # run 101 drafts, then dies mid-round
+    rig.log.clear()
+    assert rig.start(102) == {"o/r#1": "skip: already draft"}
+    assert rig.log == []                 # no second draft, no second mark
+    report = rig.handback()
+    assert report["draft_flipped"] == ["o/r#1"] and rig.log == [("ready", "o/r", 1)]
+    rig.handback()                       # ready now: a second handback does not flip again
+    assert rig.log == [("ready", "o/r", 1)]
+
+
+def test_same_head_draft_without_own_mark_stays_an_operator_hold(rig):
+    rig.state["pr"]["draft"] = True
+    rig.state["comments"] = [{"body": rd.mark_line(999, SHA)}, {"body": rd.mark_line(101, "b" * 40)}]
+    report = rig.handback()
+    assert report["draft_held"] and rig.log == []
+
+
+def test_kill_switch_foreign_branch_and_closed_pr_untouched(rig, monkeypatch):
     monkeypatch.setenv("KANBAN_ROUND_DRAFT", "0")
-    assert fr.check(rig.refs, **rig.opts)["draft_held"]
-    assert rig.calls == []
-
-
-def test_pr_naming_no_card_is_untouched(rig):
+    assert rig.start(101) == {} and rig.log == []
+    rig.state["pr"]["draft"] = True
+    rig.state["comments"] = [{"body": rd.mark_line(101, SHA)}]
+    assert rig.handback()["draft_held"] and rig.log == []   # kill switch: same-head draft is a hold, as before
+    monkeypatch.delenv("KANBAN_ROUND_DRAFT")
+    rig.state["pr"]["draft"] = False
     rig.state["pr"]["head"]["ref"] = "feature/no-card"
-    rig.state["comments"] = [{"body": "round-draft: re-drafted by findings-route at " + SHA}]
-    try:
-        fr.check(rig.refs, **rig.opts)
-    except fr.DraftPrError:
-        pass  # a foreign draft refuses the handback; either way nothing is flipped
-    assert rig.calls == [] and rig.state["pr"]["draft"] is True
+    assert rig.start(101) == {"o/r#1": "skip: branch does not name this card"}
+    rig.state["pr"]["head"]["ref"] = "worker/" + CARD
+    rig.state["pr"]["state"] = "closed"
+    assert rig.start(101) == {"o/r#1": "skip: not open"} and rig.log == []
+
+
+def test_worker_boot_reads_the_cards_flip_receipt_from_the_board(tmp_path, monkeypatch):
+    """run_from_env against a real temp board: the receipt (handoff_draft_flipped) and run id drive the draft."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="slice", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_draft_flipped", {"flipped": {"o/r#1": {"head": SHA, "at": 1}}})
+        assert rd.card_run_ids(conn, tid) == {str(run)}
+    seen = []
+    monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run))
+    monkeypatch.setattr(rd, "draft_at_round_start", lambda *a, **kw: seen.append(a) or {})
+    rd.run_from_env()
+    assert seen == [(tid, str(run), {"o/r#1": {"head": SHA, "at": 1}})]
 
 
 def test_ready_carries_owner_card_to_ace_gate(tmp_path, monkeypatch):
