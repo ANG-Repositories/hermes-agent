@@ -1,0 +1,229 @@
+"""Fleet-priority FAULT TAXONOMY for the kanban door (Apollo ruling 2026-11-05 19:30, card t_0c5ef02e).
+
+1. REGISTRY absent or unreadable (fleet/admission-priority.json): spawn-only, i.e. today's behaviour, but loud: a
+   warning every tick and ONE page while door config exists on the box, cleared when the file is back.
+2. CONFIG fault in fcfs/classes (pair token missing/empty, host table missing or without the host, typed
+   auth/invalid): refuse every start, the card that hit it is blocked kind=capability, and the door is LATCHED (no
+   further door calls) until the token, table or registry changes. ONE page.
+3. TRANSPORT fault in fcfs/classes (allocd unreachable, timeout, 5xx, malformed reply): refuse new starts, the unit
+   keeps its id, no latch. Retry on a capped backoff (doubling from the tick interval to at most 5 min); ONE page
+   past 10 min, cleared on the first success.
+4. ORDER refusals (queued_behind, capacity, not_enqueued): normal; no state here.
+
+State is one small JSON file under the fleet root (var/kanban/door-faults.json), so a gateway restart neither
+re-pages nor forgets a latch. Existing runs are never touched by anything here.
+"""
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+_log = logging.getLogger(__name__)
+
+STATE_REL = Path("var") / "kanban" / "door-faults.json"
+TOKENS_REL = Path("var") / "alloc" / "tokens"
+TRANSPORT_MAX_BACKOFF_S = 300.0
+TRANSPORT_PAGE_AFTER_S = 600.0
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _root() -> Path:
+    from hermes_cli.fleet_placement import placement
+    return Path(placement.fleet_root())
+
+
+def _registry_path() -> Path:
+    from hermes_cli.fleet_placement import admission_demand
+    return Path(admission_demand._root()) / admission_demand.PRIORITY_REL
+
+
+def _table_path() -> Path:
+    from hermes_cli.fleet_placement import placement
+    return _root() / placement.TABLE_REL
+
+
+def registry_state() -> str:
+    """``ok`` | ``missing`` | ``unreadable``: our own existence/parse check, never the shared loader's defaults."""
+    try:
+        doc = json.loads(_registry_path().read_bytes())
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, ValueError):
+        return "unreadable"
+    return "ok" if isinstance(doc, dict) else "unreadable"
+
+
+def _kanban_tokens():
+    d = _root() / TOKENS_REL
+    try:
+        return sorted(p for p in d.iterdir() if p.name.startswith("kanban@"))
+    except OSError:
+        return []
+
+
+def door_config_present() -> bool:
+    """Any door config on this box: the host table or a kanban pair token."""
+    return _table_path().exists() or bool(_kanban_tokens())
+
+
+def fingerprint() -> str:
+    """Changes when the token(s), host table or registry change (path, mtime, size)."""
+    h = hashlib.sha256()
+    for p in (_registry_path(), _table_path(), *_kanban_tokens()):
+        try:
+            st = p.stat()
+            h.update(f"{p}:{st.st_mtime_ns}:{st.st_size};".encode())
+        except OSError:
+            h.update(f"{p}:-;".encode())
+    return h.hexdigest()
+
+
+@contextlib.contextmanager
+def _state():
+    """Read-modify-write of the state file under a flock; atomic replace on write."""
+    path = _root() / STATE_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                doc = {}
+        except (OSError, ValueError):
+            doc = {}
+        before = json.dumps(doc, sort_keys=True)
+        yield doc
+        if json.dumps(doc, sort_keys=True) != before:
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".door-faults.")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, sort_keys=True)
+            os.replace(tmp, path)
+
+
+def _page(text: str) -> bool:
+    """Out-of-agent page through the fleet notifier (no-op where none is installed, e.g. a test home)."""
+    from hermes_cli import kanban_budget
+    script = kanban_budget._notify_script_path()
+    if script is None:
+        _log.warning("kanban door page (no notifier): %s", text)
+        return False
+    return kanban_budget._run_notify([sys.executable, script, "--sev", "warn", "--send", text])
+
+
+def tick_interval() -> float:
+    try:
+        from hermes_cli import kanban_db_dispatch as kbd
+        value = float((kbd._root_kanban_cfg() or {}).get("dispatch_interval_seconds", 60) or 60)
+    except Exception:
+        value = 60.0
+    return value if value > 0 else 60.0
+
+
+# -- class 1 -------------------------------------------------------------------------------------------------------
+
+def check_registry() -> str:
+    """Once per tick. Returns the registry state; logs every tick and pages once while it is absent/unreadable."""
+    state = registry_state()
+    if state == "ok" and not (_root() / STATE_REL).exists():
+        return state                      # steady state: no lock, no write
+    with _state() as doc:
+        if state != "ok":
+            _log.warning("kanban door: priority registry %s (%s); running spawn-only", state, _registry_path())
+            if not doc.get("registry_paged") and door_config_present():
+                _page(f"kanban door: priority registry {state} ({_registry_path()}); running spawn-only")
+                doc["registry_paged"] = _now()
+        elif doc.pop("registry_paged", None) is not None:
+            _log.warning("kanban door: priority registry is back; page cleared")
+            _page("kanban door: priority registry is back; the spawn-only fallback page is cleared")
+    return state
+
+
+# -- class 2 -------------------------------------------------------------------------------------------------------
+
+def latch(reason: str) -> None:
+    """Latch the door after a config fault; page once per latch."""
+    with _state() as doc:
+        if doc.get("config"):
+            return
+        doc["config"] = {"reason": str(reason)[:300], "fingerprint": fingerprint(), "at": _now()}
+        _log.error("kanban door: config fault, door LATCHED (no door calls) until token/table/registry change: %s",
+                   reason)
+        _page(f"kanban door config fault: {str(reason)[:200]}; every kanban start refused until the pair token, "
+              "host table or priority registry changes")
+
+
+def claim_block(task_id: str) -> bool:
+    """True for the FIRST card that meets this latch: it is the one blocked kind=capability (the publish pass can
+    latch before any start). Later cards are held without a block; the dispatcher stops claiming next tick."""
+    with _state() as doc:
+        cfg = doc.get("config")
+        if not cfg or cfg.get("blocked"):
+            return False
+        cfg["blocked"] = str(task_id)
+        return True
+
+
+def latched():
+    """The latch reason, or None. A changed token/table/registry clears the latch (the next start retries)."""
+    with _state() as doc:
+        cfg = doc.get("config")
+        if not cfg:
+            return None
+        if cfg.get("fingerprint") != fingerprint():
+            doc.pop("config", None)
+            _log.warning("kanban door: config changed; latch cleared (%s)", cfg.get("reason"))
+            return None
+        return cfg.get("reason") or "config fault"
+
+
+# -- class 3 -------------------------------------------------------------------------------------------------------
+
+def note_transport(err: str) -> None:
+    now = _now()
+    with _state() as doc:
+        t = doc.get("transport")
+        interval = tick_interval() if not t else min(TRANSPORT_MAX_BACKOFF_S, float(t["interval"]) * 2)
+        t = {"since": now if not t else t["since"], "interval": interval, "next_at": now + interval,
+             "paged": bool(t and t.get("paged")), "error": str(err)[:300]}
+        if not t["paged"] and now - t["since"] > TRANSPORT_PAGE_AFTER_S:
+            _page(f"kanban door: allocd unreachable for {int(now - t['since'])} s; kanban starts held: {err}")
+            t["paged"] = True
+        doc["transport"] = t
+
+
+def note_success() -> None:
+    with _state() as doc:
+        t = doc.pop("transport", None)
+        if t and t.get("paged"):
+            _page("kanban door: allocd reachable again; kanban starts resumed")
+
+
+def backoff_remaining():
+    with _state() as doc:
+        t = doc.get("transport")
+    if not t:
+        return None
+    left = float(t["next_at"]) - _now()
+    return left if left > 0 else None
+
+
+def hold_reason():
+    """Why a door-mode tick must not start anything, or None."""
+    reason = latched()
+    if reason:
+        return f"door latched: {reason}"
+    left = backoff_remaining()
+    if left:
+        return f"door transport backoff {int(left)} s"
+    return None

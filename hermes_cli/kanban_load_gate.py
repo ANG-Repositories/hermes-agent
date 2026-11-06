@@ -775,7 +775,24 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
     old ``hosts: null`` file said and the door's per-pair ``hosts`` union now says. Unit = the table's kanban
     footprint (the prior work_estimate seeds from). Demand is advisory, so a failed publish never stops the tick: it
     returns the error text (None = published) for the caller to log, and the next tick publishes again (Prism
-    8397e82995e1)."""
+    8397e82995e1).
+
+    Fire-and-forget (fault-taxonomy ruling 2026-11-05): the whole call spends at most PUBLISH_BUDGET_S across every
+    host (a host left when the budget is gone is skipped, not waited for), never raises, and is counted in
+    PUBLISH_STATS (ok / failed / skipped hosts)."""
+    try:
+        return _publish_ready_demand(queued, root)
+    except Exception as exc:  # advisory: nothing here may fail the tick
+        PUBLISH_STATS["failed"] += 1
+        return f"{type(exc).__name__}: {exc}"
+
+
+PUBLISH_BUDGET_S = 1.0
+PUBLISH_STATS = {"ok": 0, "failed": 0, "skipped": 0}
+
+
+def _publish_ready_demand(queued, root):
+    import time as _time
     from hermes_cli import alloc_client as _ac
     from hermes_cli.fleet_placement import admission as _ad
     from hermes_cli.fleet_placement import placement as _pl
@@ -788,14 +805,23 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
         table = _pl.load_hosts(None if root is None else Path(root) / _pl.TABLE_REL)
         unit = _pl.need_of(table.footprint(UNIFIED_WORKLOAD))
     except Exception as exc:
+        PUBLISH_STATS["failed"] += 1
         return f"{type(exc).__name__}: {exc}"
     errors = []
+    deadline = _time.monotonic() + PUBLISH_BUDGET_S
     for hid in sorted(table.hosts):
+        left = deadline - _time.monotonic()
+        if left <= 0.01:
+            PUBLISH_STATS["skipped"] += 1
+            errors.append(f"{hid}: skipped (publish budget {PUBLISH_BUDGET_S} s spent)")
+            continue
         try:
             _ac.publish_queue(UNIFIED_WORKLOAD, hid, int(queued),
                               {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib},
-                              unified=unified_admit())
+                              unified=unified_admit(), timeout=left)
+            PUBLISH_STATS["ok"] += 1
         except Exception as exc:
+            PUBLISH_STATS["failed"] += 1
             errors.append(f"{hid}: {type(exc).__name__}: {exc}")
     return "; ".join(errors) or None
 

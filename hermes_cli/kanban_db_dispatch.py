@@ -6446,7 +6446,21 @@ def _dispatch_once_locked(
     # before it returns, and a paused tick with no plan still routes.
     from hermes_cli import kanban_placement_reasons as _pr
     from hermes_cli import kanban_priority_door as _priority_door
+    from hermes_cli import kanban_priority_faults as _door_faults
+    if not dry_run:
+        try:
+            _door_faults.check_registry()   # taxonomy class 1: absent registry = spawn-only, loud
+        except Exception as exc:
+            _kb._log.warning("kanban door: registry check failed (%s: %s)", type(exc).__name__, exc)
     route_first = _route_first_enabled() or _priority_door.enabled()
+    if not dry_run and _priority_door.enabled():
+        # Taxonomy class 2 latch / class 3 backoff: claim nothing, call no door verb; runs already going are
+        # untouched (the lifecycle sweep still renews/releases them).
+        _door_hold = _door_faults.hold_reason()
+        if _door_hold:
+            _record_total_hold(conn, result, "door_hold", dry_run, only_task)
+            _kb._log.warning("kanban door: no starts this tick (%s)", _door_hold)
+            return result
     if not dry_run:
         try:
             from hermes_cli import kanban_budget as _kbudget

@@ -184,6 +184,9 @@ def test_typed_refusals_follow_the_p1_recovery_rule(board, monkeypatch):
             pytest.fail("auth fault must not spawn")
     door.defer(board, task, held.value)
     assert kb.get_task(board, tid).status == "blocked"                   # a human fixes config; no blind retry
+    from hermes_cli import kanban_priority_faults as faults
+    assert faults.latched()                                              # class 2 latches the door
+    (faults._root() / faults.STATE_REL).unlink()                         # the operator fixed the config
 
     tid, uid, task = _claimed(board, monkeypatch, "requeue")
     client.raise_on_authorize = None

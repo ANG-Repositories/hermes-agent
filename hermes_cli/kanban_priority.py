@@ -106,15 +106,43 @@ def publish_waiting(conn, waiting, *, verdicts=None, client=None):
     """Enqueue/withdraw only this board's own units through the pair door; never replace a host queue.
 
     Withdrawals run first, so a card that moved host is gone from the old host before the new
-    host's enqueue (the door refuses a live id on two hosts). One unit's refusal (a typed auth for
-    an id another pair owns, a transport error) is logged and skips that unit only; the rest of the
-    board still publishes. Returns {(host, unit_id): error} for the refused units.
+    host's enqueue (the door refuses a live id on two hosts). Fault taxonomy (2026-11-05): a Refused
+    (missing token, typed auth/invalid) latches the door (class 2); an Unreachable starts the transport
+    backoff (class 3); either stops this publish. Returns {(host, unit_id): error} for what failed.
     """
     from hermes_cli import kanban_priority_door as door
-    if not door.enabled():
-        return {}
+    from hermes_cli import kanban_priority_faults as faults
+    if not door.enabled() or faults.hold_reason():
+        return {}                                    # latched (class 2) or backing off (class 3): no door call
     if client is None:
-        from hermes_cli import alloc_client as client
+        client = door._client()
+    try:
+        errors = _publish_waiting(conn, waiting, verdicts, client, door)
+    except _Stop as stop:
+        errors = stop.errors
+    for (hid, uid), why in errors.items():
+        _log.warning("kanban door publish %s %s refused: %s", hid, uid, why)
+    return errors
+
+
+class _Stop(Exception):
+    def __init__(self, errors):
+        super().__init__("door publish stopped")
+        self.errors = errors
+
+
+def _classify(client, faults, exc, errors):
+    """Class 2 (missing token, typed auth/invalid) latches and stops; class 3 (transport) backs off and stops."""
+    if isinstance(exc, client.Unreachable):
+        faults.note_transport(str(exc))
+        raise _Stop(errors)
+    if isinstance(exc, client.Refused):
+        faults.latch(f"door publish refused: {exc}")
+        raise _Stop(errors)
+
+
+def _publish_waiting(conn, waiting, verdicts, client, door):
+    from hermes_cli import kanban_priority_faults as faults
     from hermes_cli.fleet_placement import placement
     table = placement.load_hosts()
     cpus, ram_gb = door.need()
@@ -132,7 +160,8 @@ def publish_waiting(conn, waiting, *, verdicts=None, client=None):
             client.withdraw("kanban", hid, uid)
             current.discard((hid, uid))
         except (client.Refused, client.Unreachable) as exc:
-            errors[(hid, uid)] = str(exc)            # retried next tick; still ours
+            errors[(hid, uid)] = str(exc)            # still ours; retried after the fault clears
+            _classify(client, faults, exc, errors)
     for host, hid, rows in plan:
         # The capacity fact only (last writer wins); units are managed per id below.
         try:
@@ -140,16 +169,16 @@ def publish_waiting(conn, waiting, *, verdicts=None, client=None):
                 "admittable": False, "binding": "unknown", "deficit_cpu": 0.0}))
         except (client.Refused, client.Unreachable) as exc:
             errors[(hid, None)] = str(exc)
+            _classify(client, faults, exc, errors)
         for card, uid in rows:
             try:
                 client.enqueue("kanban", hid, uid, cpus, ram_gb)
             except (client.Refused, client.Unreachable) as exc:
                 errors[(hid, uid)] = str(exc)
-                continue
+                _classify(client, faults, exc, errors)
             current.add((hid, uid))
             door.mark_asap_if_set(client, conn, hid, uid, card["id"])
-    for (hid, uid), why in errors.items():
-        _log.warning("kanban door publish %s %s refused: %s", hid, uid, why)
+    faults.note_success()
     return errors
 
 

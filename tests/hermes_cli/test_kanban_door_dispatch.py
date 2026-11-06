@@ -1,0 +1,331 @@
+"""Door fault taxonomy through the REAL dispatch tick (dispatch_once), not the adapters (P4 round 2, t_0c5ef02e).
+
+Apollo ruling 2026-11-05 19:30: class 1 registry absent -> spawn-only and loud (one page); class 2 config fault ->
+card blocked (capability), door latched, no door call until token/table/registry change; class 3 transport ->
+held on a capped backoff, one page past 10 min; spawn-only is today's dispatcher. Real alloc_client, real host
+table and real priority registry in a temp fleet root; allocd itself is a recording fake or a closed port.
+"""
+from __future__ import annotations
+
+import json
+import socket
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import alloc_client
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_priority_door as door
+from hermes_cli import kanban_priority_faults as faults
+
+TABLE = {
+    "schema": 1, "default_first": "mac-studio", "saturate_to": 1.0,
+    "footprints": {"kanban": {"ram_gb": 3, "threads": 1}},
+    "hosts": {"mac-studio": {"cores": 32, "threads": 32, "mem_total_gb": 512, "mem_reserve_gb": 64,
+                             "cores_reserve": 4, "consumers": {"kanban": {"slots": 8}}, "clock_mhz": 4000,
+                             "aliases": ["studio", "local"]}},
+}
+
+
+class Allocd:
+    """A loopback HTTP allocd stand-in: ``answer(path, body) -> (code, doc)``; every request is recorded."""
+
+    def __init__(self):
+        self.calls = []
+        self.answer = lambda path, body: (500, {})
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                outer.calls.append((self.path, body))
+                code, doc = outer.answer(self.path, body)
+                raw = json.dumps(doc).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def paths(self):
+        return [p for p, _ in self.calls]
+
+
+def ok_door(clock=time.time):
+    """Answers every door verb the kanban client uses, authorizing each unit once."""
+    n = [0]
+
+    def answer(path, body):
+        base = {"schema": 1, "workload": body.get("workload"), "host": body.get("host")}
+        if path == "/demand/authorize":
+            n[0] += 1
+            return 200, {**base, "id": body["id"], "reservation_id": f"rid-{n[0]}", "until": clock() + 90,
+                         "reused": False}
+        if path in ("/release", "/renew"):
+            return 200, {"ok": True, "released": True, "renewed": True}
+        return 200, {**base, "ok": True, "door": {"at": clock()}}
+    return answer
+
+
+def _closed_port() -> str:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return f"http://127.0.0.1:{port}"
+
+
+@pytest.fixture
+def fleet(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    root = tmp_path / "fleet-root"
+    (root / "fleet").mkdir(parents=True)
+    (root / "config").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PLACEMENT_HOME", str(root))
+    monkeypatch.setenv("ALLOCD_URL", _closed_port())
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    pages = []
+    monkeypatch.setattr(faults, "_page", lambda text: pages.append(text) or True)
+    kb.init_db()
+    ns = type("Fleet", (), {})()
+    ns.root, ns.pages = root, pages
+
+    def registry(mode):
+        (root / "fleet" / "admission-priority.json").write_text(
+            json.dumps({"schema": 1, "priority_mode": mode}), encoding="utf-8")
+
+    def table():
+        (root / "config" / "fleet-hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
+
+    def token():
+        d = root / alloc_client.TOKENS_REL
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "kanban@mac-studio").write_text("pair-token\n", encoding="utf-8")
+
+    ns.registry, ns.table, ns.token = registry, table, token
+    return ns
+
+
+def _tick(spawned, **kw):
+    def spawn(task, workspace, *a, **k):
+        spawned.append(task.id)
+        return 424242
+    with kbc.connect_closing() as conn:
+        return kbd.dispatch_once(conn, spawn_fn=spawn, dry_run=False, default_assignee="default", **kw)
+
+
+def _card(title="c"):
+    with kbc.connect_closing() as conn:
+        return kb.create_task(conn, title=title, assignee="default")
+
+
+def _status(tid):
+    with kbc.connect_closing() as conn:
+        return kb.get_task(conn, tid)
+
+
+def test_spawn_only_is_todays_dispatcher_with_no_token_and_allocd_down(fleet):
+    fleet.registry("spawn-only")
+    fleet.table()
+    tid = _card()
+    spawned = []
+    t0 = time.monotonic()
+    _tick(spawned)
+    assert spawned == [tid]
+    assert _status(tid).status == "running"
+    assert fleet.pages == []
+    assert time.monotonic() - t0 < 30
+
+
+def test_missing_registry_is_spawn_only_and_pages_once_across_two_ticks(fleet):
+    """Class 1 (reader repro: kanban_priority_door.py:35-37): no registry, door config present -> the card still
+    spawns, a warning every tick, exactly ONE page; the page clears when the file is back."""
+    fleet.table()
+    fleet.token()
+    a, spawned = _card("a"), []
+    _tick(spawned)
+    b = _card("b")
+    _tick(spawned)
+    assert spawned == [a, b]
+    assert len(fleet.pages) == 1 and "registry missing" in fleet.pages[0]
+    fleet.registry("spawn-only")
+    _tick(spawned)
+    assert len(fleet.pages) == 2 and "back" in fleet.pages[1]
+
+
+@pytest.mark.parametrize("arm", ["missing_token", "missing_table", "auth"])
+def test_config_fault_blocks_capability_latches_and_is_not_reclaimed(fleet, monkeypatch, arm):
+    """Class 2 (reader arms, door.py:132-151, 185-201): the card is blocked kind=capability (not returned to ready
+    and reclaimed every tick), the door is latched (no door call on the next tick), ONE page; changing the
+    token/table/registry clears the latch."""
+    fleet.registry("fcfs")
+    if arm != "missing_table":
+        fleet.table()
+    if arm != "missing_token":
+        fleet.token()
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    allocd.answer = (lambda path, body: (403, {"error": "pair token mismatch"})) if arm == "auth" else ok_door()
+    tid, spawned = _card(), []
+    _tick(spawned)
+    task = _status(tid)
+    assert spawned == []
+    assert task.status == "blocked" and task.block_kind == "capability"
+    assert len(fleet.pages) == 1 and "config fault" in fleet.pages[0]
+    n = len(allocd.calls)
+    other = _card("other")
+    _tick(spawned)
+    assert spawned == []
+    assert _status(tid).status == "blocked" and _status(other).status == "ready"
+    assert len(allocd.calls) == n, "a latched door makes no door call"
+    assert len(fleet.pages) == 1
+    # the operator fixes the config: the latch clears, the next tick starts the other card
+    allocd.answer = ok_door()
+    fleet.table()
+    fleet.token()
+    _tick(spawned)
+    assert spawned == [other]
+
+
+def test_transport_fault_holds_same_id_on_capped_backoff_and_pages_after_10_min(fleet, monkeypatch):
+    """Class 3: allocd unreachable WITH a token -> held (never blocked), same unit id, door verbs only when the
+    backoff elapses (doubling from the tick interval to 300 s), ONE page past 10 min, cleared by the first success."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    clock = [time.time()]
+    monkeypatch.setattr(faults, "_now", lambda: clock[0])
+    allocd = Allocd()
+    allocd.answer = lambda path, body: (503, {"error": "router off"})
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    tid, spawned = _card(), []
+    with kbc.connect_closing() as conn:
+        uid = door.unit_id(conn, tid)
+    _tick(spawned)
+    assert spawned == [] and _status(tid).status == "ready"
+    first = len(allocd.calls)
+    assert first > 0
+    _tick(spawned)                                        # inside the backoff: no door call
+    assert len(allocd.calls) == first
+    intervals = []
+    for _ in range(8):
+        t = json.loads((fleet.root / faults.STATE_REL).read_text())["transport"]
+        intervals.append(t["interval"])
+        clock[0] = t["next_at"] + 1
+        _tick(spawned)
+        assert _status(tid).status == "ready"
+    assert intervals[:2] == [60.0, 120.0] and max(intervals) == faults.TRANSPORT_MAX_BACKOFF_S
+    assert len(fleet.pages) == 1 and "unreachable" in fleet.pages[0]
+    assert spawned == []
+    with kbc.connect_closing() as conn:
+        assert door.unit_id(conn, tid) == uid, "a transport hold keeps the arrival id"
+    allocd.answer = ok_door()
+    clock[0] += faults.TRANSPORT_MAX_BACKOFF_S + 1
+    _tick(spawned)
+    assert spawned == [tid]
+    assert len(fleet.pages) == 2 and "again" in fleet.pages[1]
+    auth = [b for p, b in allocd.calls if p == "/demand/authorize"]
+    assert [b["id"] for b in auth] == [uid]
+
+
+_KILLED_TICK = """
+import os, signal
+from hermes_cli import kanban_db_connect as kbc, kanban_db_dispatch as kbd
+def die(task, workspace, *a, **k):
+    os.kill(os.getpid(), signal.SIGKILL)   # the gateway dies after the door receipt, before any worker exists
+with kbc.connect_closing() as conn:
+    kbd.dispatch_once(conn, spawn_fn=die, dry_run=False, default_assignee="default")
+"""
+
+
+def test_fcfs_start_consumes_one_authorization_and_survives_restart(fleet, monkeypatch):
+    """An fcfs tick authorizes ONE unit at the start boundary before it spawns. Restart drill: a real dispatcher
+    process is SIGKILLed after the durable door receipt and before the spawn; the restarted dispatcher (this
+    process) never spawns that run, releases its lease, and spawns the card exactly once on a NEW unit id."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    allocd = Allocd()
+    allocd.answer = ok_door()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    tid = _card()
+    proc = subprocess.run([sys.executable, "-c", _KILLED_TICK], env=dict(os.environ), timeout=120,
+                          capture_output=True, text=True)
+    assert proc.returncode == -signal.SIGKILL, proc.stderr[-2000:]
+    auth = [b for p, b in allocd.calls if p == "/demand/authorize"]
+    assert len(auth) == 1
+    first_uid = auth[0]["id"]
+    with kbc.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+                            (tid, door.EVENT)).fetchone()[0] == 1
+        assert kb.get_task(conn, tid).status == "running"
+    spawned = []
+    _tick(spawned)
+    # Inside the dead-claimer launch bound an unstamped orphan may still exist: the restarted dispatcher neither
+    # respawns the run nor drops its lease (the lifecycle sweep renews it).
+    assert spawned == [] and "/release" not in allocd.paths()
+    with kbc.connect_closing() as conn:
+        # Age the dead process's claim and run past the claim TTL and the launch bound (what a real restart waits).
+        old = int(time.time()) - kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS - 60
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (old, tid))
+            conn.execute("UPDATE task_runs SET started_at=?, claim_expires=? WHERE task_id=?", (old, old, tid))
+    for _ in range(3):
+        r = _tick(spawned)
+    with kbc.connect_closing() as conn:
+        dbg = (kb.get_task(conn, tid).status, [(e.kind, e.payload) for e in kb.list_events(conn, tid)][-3:],
+               r.placement_waits, allocd.paths()[-8:])
+    assert spawned == [tid], f"exactly one spawn after the restart {dbg}"
+    auth = [b for p, b in allocd.calls if p == "/demand/authorize"]
+    assert len(auth) == 2 and auth[1]["id"] != first_uid
+    assert "/release" in allocd.paths(), "the never-spawned run's lease is released"
+
+
+def test_spawn_only_aggregate_publish_is_fire_and_forget(fleet, monkeypatch):
+    """Spawn-only advisory publish (kanban_load_gate.py publish_ready_demand): a wedged allocd (accepts, never answers)
+    costs the tick at most the 1 s budget over EVERY host, never raises, and is counted."""
+    from hermes_cli import kanban_load_gate as klg
+    fleet.registry("spawn-only")
+    doc = json.loads(json.dumps(TABLE))
+    for name in ("ci-box", "ace-ai", "ace-media"):
+        doc["hosts"][name] = {**TABLE["hosts"]["mac-studio"], "aliases": []}
+    (fleet.root / "config" / "fleet-hosts.json").write_text(json.dumps(doc), encoding="utf-8")
+    d = fleet.root / alloc_client.TOKENS_REL
+    d.mkdir(parents=True, exist_ok=True)
+    for name in doc["hosts"]:
+        (d / f"kanban@{name}").write_text("pair-token\n", encoding="utf-8")
+    wedged = socket.socket()
+    wedged.bind(("127.0.0.1", 0))
+    wedged.listen(16)                                     # connects succeed; no reply ever comes
+    monkeypatch.setenv("ALLOCD_URL", f"http://127.0.0.1:{wedged.getsockname()[1]}")
+    before = dict(klg.PUBLISH_STATS)
+    try:
+        t0 = time.monotonic()
+        err = klg.publish_ready_demand(3)
+        took = time.monotonic() - t0
+    finally:
+        wedged.close()
+    assert took < klg.PUBLISH_BUDGET_S + 0.5, took
+    assert err                                            # reported to the caller, not raised
+    counted = {k: klg.PUBLISH_STATS[k] - before[k] for k in before}
+    assert counted["ok"] == 0 and counted["failed"] + counted["skipped"] == len(doc["hosts"])
