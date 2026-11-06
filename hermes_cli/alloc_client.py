@@ -1,6 +1,6 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
-# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 01524a8d64 (hermes-home#9223 merge, P1 door t_810c9012;
-# sha256 f2043b4ad8ff2c645df20c061f929723cc23a45f62c765aa17ab1051f63bea52) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code.
+# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 9141c8dd5f (hermes-home#9302 merge, P1 door t_810c9012;
+# sha256 cea6b9456b39992bbd5d8ca3e5097778495f968c5b4ba41107f122908be8966f) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code.
 # local changes: package imports of placement/admission_demand, utf-8-sig reads, admit(unified=); see tests/hermes_cli/test_kanban_allocd_route.py, which checks
 # the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
@@ -466,6 +466,8 @@ def authorize_start(workload: str, host: str, unit_id: str, *, ttl_s: float = 90
             or type(result.get("reused")) is not bool):
         raise Unreachable("invalid authorization receipt")
     _OWNER[result["reservation_id"]] = identity
+    # The door now owns this lease's recovery lifecycle, including an idempotently reused upgrade.
+    _FALLBACK_ISSUED.pop(result["reservation_id"], None)
     return {**result, "authorized": True}
 
 

@@ -439,9 +439,11 @@ def _demand_of(doc, now: float, max_age: float, host: str,
 
 
 def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: Optional[float] = None,
-                resolve: Optional[Callable[[str], Optional[str]]] = None) -> List[admission.Demand]:
+                resolve: Optional[Callable[[str], Optional[str]]] = None,
+                full_queue: bool = False) -> List[admission.Demand]:
     """Every FRESH class queue that may run on ``host``. ``resolve`` (name -> canonical host id or None) folds aliases
-    on both sides of a ``hosts`` restriction; without it the match is case-insensitive string equality."""
+    on both sides of a ``hosts`` restriction; without it the match is case-insensitive string equality.
+    ``full_queue`` retains all fresh units for lookup/authorization; publication uses the bounded default."""
     now = float(time.time() if now is None else now)
     max_age = max_age_s(root=root) if max_age is None else float(max_age)
     out: List[admission.Demand] = []
@@ -480,7 +482,8 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
                 waiting.append(admission.WaitingUnit(min(at, now), admission.Estimate(cpu, mem),
                                                       u.get("asap") is True, str(u.get("id", ""))))
             waiting.sort(key=lambda u: (not u.asap, u.at, u.id))
-            waiting = waiting[:load_priority(root=root).door_window_units]
+            if not full_queue:
+                waiting = waiting[:load_priority(root=root).door_window_units]
             v = state.get("verdict")
             verdict = None
             if (isinstance(v, dict) and isinstance(v.get("admittable"), (bool, int))
