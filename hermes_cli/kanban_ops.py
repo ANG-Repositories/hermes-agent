@@ -354,6 +354,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             except Exception as exc:
                 print(f"warning: could not record load_gate_override events: {exc}", file=sys.stderr)
         limit_notes = _dispatch_limit_notes(res, gate, max_spawn_source)
+        live_band = None
+        try:  # the default priority a person's/operator's bare create gets now (t_febbdb61)
+            from hermes_cli.kanban_parser import live_priority_band
+            live_band = live_priority_band(conn)
+        except Exception:
+            pass
         # Spawned cards nobody is watching will finish silently — surface
         # that on every dispatch run instead of relying on the operator
         # remembering to notify-subscribe. Best-effort: notification
@@ -448,6 +454,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "memory_pressure": res.memory_pressure,
             "placement_waits": dict(res.placement_waits or {}),
             "routes": list(res.routes or []),
+            "live_band": live_band,
         }, ascii=True)
         return 0
     if res.skipped_locked:
@@ -482,6 +489,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"a human: {', '.join(res.gate_closed_unmerged)}"
         )
     print(f"Spawned:      {len(res.spawned)}")
+    if live_band is not None:
+        print(f"Live band:    {live_band} (default priority of a person/operator create; median of 24 h spawns, floor 100)")
     # Say WHY nothing (or less than asked) spawned: a bare "Spawned: 0" with
     # dispatchable cards on the board is indistinguishable from an idle board
     # (t_f78d1938: manual `dispatch --max 3` spawned 0 of 2 with no reason).
