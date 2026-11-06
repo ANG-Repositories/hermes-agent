@@ -5957,11 +5957,14 @@ def _signature_history(conn: sqlite3.Connection, signature: str, limit: int) -> 
 
 
 def resolve_signature(conn: sqlite3.Connection, signature: Optional[str], created_by: Optional[str], *,
-                      now: Optional[int] = None) -> Optional[str]:
+                      now: Optional[int] = None, reuse: bool = True) -> Optional[str]:
     """The card that already owns ``signature`` (open, or closed within the quiet window), else None.
 
     Raises :class:`MintBreakerError` when the last :func:`signature_flap_n` cards for it all closed with no code
     change. Inert for humans (:func:`mint_cap_applies`), a NULL signature, or ``HERMES_KANBAN_SIGNATURE_DEDUP=0``.
+    ``reuse=False`` (``kanban create --no-signature-reuse``): the caller has proven it needs a FRESH card (a possible
+    regression after the signature's card closed), so the open/quiet-window reuse is skipped while the breaker still
+    applies and the new card still stores the signature, keeping it in the breaker's history.
     """
     sig = (signature or "").strip()
     if not sig or not signature_dedup_on() or not mint_cap_applies(created_by):
@@ -5972,10 +5975,10 @@ def resolve_signature(conn: sqlite3.Connection, signature: Optional[str], create
     if not hist:
         return None
     newest = hist[0]
-    if newest["closed_at"] is None:
+    if reuse and newest["closed_at"] is None:
         _append_event(conn, newest["id"], "signature_remint", {"signature": sig, "created_by": created_by, "at": now})
         return newest["id"]
-    if now - newest["closed_at"] < signature_quiet_s():
+    if reuse and newest["closed_at"] is not None and now - newest["closed_at"] < signature_quiet_s():
         _append_event(conn, newest["id"], "signature_remint",
                       {"signature": sig, "created_by": created_by, "at": now, "quiet_window": True})
         return newest["id"]
@@ -6244,6 +6247,7 @@ def create_task(
     boomerang_wake: Optional[bool] = None,
     no_worker: bool = False,
     signature: Optional[str] = None,
+    signature_reuse: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6252,6 +6256,7 @@ def create_task(
     returns the OPEN card for it, or the card that closed within :data:`SIGNATURE_QUIET_S`, instead of
     minting; after :data:`SIGNATURE_FLAP_N` consecutive closes with no code change it raises
     :class:`MintBreakerError` (``force_reason`` overrides, ledgered ``mint_breaker_forced``).
+    ``signature_reuse=False`` skips the reuse but keeps the breaker and stores the signature (a caller-proven fresh card).
 
     ``no_worker=True`` mints the card operator-only (the ``no_worker`` flag,
     see :func:`set_no_worker`): it never reaches a worker, so the assignee
@@ -6547,7 +6552,7 @@ def create_task(
     if signature:
         try:
             with write_txn(conn):
-                owner = resolve_signature(conn, signature, created_by)
+                owner = resolve_signature(conn, signature, created_by, reuse=signature_reuse)
         except MintBreakerError as exc:
             if not force_reason:
                 raise

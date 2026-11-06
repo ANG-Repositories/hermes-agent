@@ -1024,6 +1024,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 triage=bool(getattr(args, "triage", False)),
                 idempotency_key=getattr(args, "idempotency_key", None),
                 signature=getattr(args, "signature", None),
+                signature_reuse=getattr(args, "signature_reuse", True),
                 max_runtime_seconds=max_runtime,
                 skills=getattr(args, "skills", None) or None,
                 max_retries=max_retries,

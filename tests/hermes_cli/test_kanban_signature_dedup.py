@@ -144,3 +144,39 @@ def test_signature_column_is_stored_and_migrates(kanban_home):
         idx = {r[1] for r in conn.execute("PRAGMA index_list(tasks)")}
         assert "idx_tasks_signature_created" in idx
     kb.init_db()   # re-running the migration is a no-op
+
+
+def test_no_reuse_mints_fresh_but_keeps_the_signature_and_the_breaker(kanban_home):
+    """--no-signature-reuse (a caller-proven regression): a fresh card even inside the quiet window, the card still
+    stores the signature, so its no-code close counts toward the breaker (Prism vh#9319 @59f4f7b7 P1 repro:
+    signed A closed, fresh B and C closed inside A's window, D a day later -> refused, not a 4th card)."""
+    with kb.connect() as conn:
+        a = _mint(conn, 1)
+        _close(conn, a, ago_s=27 * 3600)
+        b = _mint(conn, 2, signature_reuse=False)
+        assert b != a
+        _close(conn, b, ago_s=26 * 3600)
+        c = _mint(conn, 3, signature_reuse=False)
+        assert c not in (a, b)
+        _close(conn, c, ago_s=25 * 3600)
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE signature = ?", (SIG,)).fetchone()[0] == 3
+        with pytest.raises(kb.MintBreakerError):
+            _mint(conn, 4)
+        with pytest.raises(kb.MintBreakerError):
+            _mint(conn, 5, signature_reuse=False)
+
+
+def test_no_reuse_with_an_open_card_still_mints_fresh(kanban_home):
+    with kb.connect() as conn:
+        a = _mint(conn, 1)
+        assert _mint(conn, 2, signature_reuse=False) != a
+
+
+def test_cli_no_signature_reuse_flag_parses():
+    import argparse  # noqa: PLC0415
+    from hermes_cli.kanban_parser import build_parser  # noqa: PLC0415
+    p = argparse.ArgumentParser()
+    build_parser(p.add_subparsers(dest="cmd"))
+    ns = p.parse_args(["kanban", "create", "t", "--signature", "s", "--no-signature-reuse"])
+    assert ns.signature_reuse is False
+    assert p.parse_args(["kanban", "create", "t", "--signature", "s"]).signature_reuse is True
