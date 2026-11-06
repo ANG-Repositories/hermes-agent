@@ -1,8 +1,4 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
-# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 9141c8dd5f (hermes-home#9302 merge, P1 door t_810c9012;
-# sha256 cea6b9456b39992bbd5d8ca3e5097778495f968c5b4ba41107f122908be8966f) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code.
-# local changes: package imports of placement/admission_demand, utf-8-sig reads, admit(unified=); see tests/hermes_cli/test_kanban_allocd_route.py, which checks
-# the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
 
     import alloc_client as ac
@@ -70,7 +66,36 @@ import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
-from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy (hermes-home: sys.path + lazy _Placement)
+if not __package__:                      # hermes-home scripts/lib: siblings are top-level modules
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def _sibling(name: str):
+    """A sibling library module: ``<package>.<name>`` when this file is vendored inside a package (hermes-agent
+    hermes_cli/fleet_placement/), else the top-level module on scripts/lib (hermes-home). Lazy, so a remote
+    door-only client never imports the capacity scorer."""
+    if name == "placement":
+        if __package__:
+            from . import placement as module
+        else:
+            import placement as module
+    elif name == "admission_demand":
+        if __package__:
+            from . import admission_demand as module
+        else:
+            import admission_demand as module
+    else:
+        raise ValueError(f"unknown alloc_client sibling: {name}")
+    return module
+
+
+class _Placement:
+    """Capacity/fallback dependencies are optional for remote door-only clients."""
+    def __getattr__(self, name):
+        return getattr(_sibling("placement"), name)
+
+
+placement = _Placement()
 
 
 def _fleet_root() -> Path:
@@ -193,8 +218,13 @@ _DURABLE_MARKERS: set = set()         # marker paths THIS process fsync'd (file 
 
 def mark_protected(consumer: str) -> None:
     """Record that ``consumer`` uses a token, so a later MISSING token file is refused, never "no auth"."""
-    d = _fleet_root() / PROTECTED_REL
-    d.mkdir(parents=True, exist_ok=True)
+    root = _fleet_root()
+    d = root / PROTECTED_REL
+    # a NEWLY created directory is durable only once its entry in the parent is (t_430834ff): fsync every ancestor
+    # up to the fleet root (mkdir may have made any of them, here or in a process that crashed before syncing) AND
+    # up to the deepest pre-existing ancestor when mkdir created the fleet root itself (PLACEMENT_HOME nested under a
+    # fresh path), before the marker is cached durable. One helper with admission_demand (t_3d0928f7).
+    _sibling("admission_demand").make_dirs_durable(d, through=root)
     # durable before any token use succeeds (Prism f5e6f9863e5c): a crash that loses the marker while a later token
     # removal survives would read as "no auth"; fsync the file AND its directory entry (OSError -> caller fails closed)
     fd = os.open(str(d / consumer), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -249,7 +279,7 @@ _PUBLISHED_UNITS = {}
 
 def _unit_request(workload, host, unit_id, op, *, need_cpu=None, need_mem_gb=None,
                   timeout=TIMEOUT_S):
-    from hermes_cli.fleet_placement import admission_demand  # VENDORED: fork package import
+    admission_demand = _sibling("admission_demand")
     body = {"schema": 1, "workload": workload, "host": host, "id": unit_id, "op": op}
     if op == "enqueue":
         body.update(need_cpu=need_cpu, need_mem_gb=need_mem_gb)
@@ -287,7 +317,7 @@ def publish_queue(workload, host, queued, unit, *, unified, timeout=TIMEOUT_S):
     """Publish the class's aggregate queue (``queued`` units of ``unit`` = {cpus, ram_gb, gpu_mib}) for ``host``
     through the pair door; ``unified`` = the publisher's <WORKLOAD>_UNIFIED_ADMIT switch. The server stamps ``at``.
     Replaces the deleted local admission_demand.publish (t_810c9012 round 4: one code path, one owner model)."""
-    from hermes_cli.fleet_placement import admission_demand  # VENDORED: fork package import
+    admission_demand = _sibling("admission_demand")
     body = {"schema": 1, "workload": workload, "host": host, "op": "queue", "queued": int(queued),
             "unified": bool(unified), "unit": {k: float(unit[k]) for k in ("cpus", "ram_gb", "gpu_mib")}}
     admission_demand.validate_door(body, admission_demand.load_priority())
@@ -317,7 +347,7 @@ def mark_asap(workload, host, unit_id, *, timeout=TIMEOUT_S):
     """Mark ONE already-enqueued unit urgent; its arrival is kept. Operator only: sends the pair token AND the
     ``asap-operator`` capability; without it allocd answers 403 -> Refused. 409 (``not_enqueued`` / ``asap_cap``)
     -> Refused. Urgency is never inherited and never carried by enqueue (ruling p4-trusted-asap-unit-merge)."""
-    from hermes_cli.fleet_placement import admission_demand  # VENDORED: fork package import
+    admission_demand = _sibling("admission_demand")
     body = {"schema": 1, "workload": workload, "host": host, "id": unit_id, "op": "mark_asap"}
     admission_demand.validate_door(body, admission_demand.load_priority())
     identity = f"{workload}@{host}"
@@ -361,7 +391,7 @@ def publish_demand(workload: str, host: str, waiting: list, verdict: Mapping, *,
     admittable:bool, binding:str, deficit_cpu:float. Server stamps every clock.
     Refused covers authentication/validation; Unreachable covers transport/bad replies.
     """
-    from hermes_cli.fleet_placement import admission_demand  # VENDORED: fork package import
+    admission_demand = _sibling("admission_demand")
     req = {"schema": 1, "workload": workload, "host": host, "waiting": waiting, "verdict": dict(verdict)}
     admission_demand.validate_door(req, admission_demand.load_priority())
     identity = f"{workload}@{host}"
@@ -562,6 +592,16 @@ def _call(path: str, body: dict, *, timeout: float, token=_UNSET, headers=None, 
         raise Unreachable(f"{type(exc).__name__}: {exc}") from exc
 
 
+def _receipt(code: int, out, field: str) -> bool:
+    """A lifecycle reply: 200 must carry a boolean ``field`` (else Unreachable, so strict/fallback handling runs,
+    never "gone" and never AttributeError: t_430834ff); any other code allocd answered (410 gone, 409) is False."""
+    if code == 200:
+        if not isinstance(out, dict) or type(out.get(field)) is not bool:
+            raise Unreachable(f"invalid {field} receipt")
+        return out[field]
+    return False
+
+
 def _fallback_admit(consumer: str, *, job_id: str, ttl_s: float, klass: Optional[str], footprint, job_kw: Mapping,
                     previous, why: str, t0: float, candidates=None) -> AdmitResult:
     table = placement.load_hosts()
@@ -701,8 +741,8 @@ def release(reservation_id: str, *, consumer: str, timeout: float = TIMEOUT_S, a
             return placement.release(rid, lock_timeout_s=lt, owner=owner)
     try:
         code, out = _call("/release", body, timeout=timeout, token=tok)
-        ok = code == 200 and bool(out.get("released"))
-        refused = out.get("actual_refused")
+        ok = _receipt(code, out, "released")
+        refused = out.get("actual_refused") if isinstance(out, dict) else None
     except Unreachable as exc:
         ok = bool(_local_ledger_op("release", rid, consumer, str(exc), t0, _local))
     _FALLBACK_ISSUED.pop(rid, None)
@@ -758,7 +798,7 @@ def _extend(rid: str, owner: str, ttl_s: float, timeout: float) -> bool:
     try:
         code, out = _call("/renew", {"reservation_id": rid, "ttl_s": ttl_s, "consumer": owner}, timeout=timeout,
                           token=tok)
-        return code == 200 and bool(out.get("renewed"))
+        return _receipt(code, out, "renewed")
     except Unreachable as exc:
         return bool(_local_ledger_op("renew", rid, owner, str(exc), t0,
                                      lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt, owner=owner)))
@@ -781,7 +821,7 @@ def renew(reservation_id: str, *, ttl_s: float, consumer: str, timeout: float = 
     try:
         code, out = _call("/renew", {"reservation_id": rid, "ttl_s": ttl_s, "consumer": owner}, timeout=timeout,
                           token=tok)
-        ok = code == 200 and bool(out.get("renewed"))
+        ok = _receipt(code, out, "renewed")
     except Unreachable as exc:
         res = _local_ledger_op("renew", rid, consumer, str(exc), t0,
                                lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt, owner=owner))

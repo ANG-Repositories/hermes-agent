@@ -345,8 +345,17 @@ def plan(workload: str, host: str, sample: Mapping, my_units: int, door: Iterabl
             held.append(Lease(host, d.workload, u.need, math.inf, holdback=True))
     if earlier:
         return Plan(0, 0, f"door:{earlier[0][0].workload} unit waiting since {earlier[0][1].at}", tuple(stuck))
+    limit = my_units
+    if mode in ("fcfs", "classes"):
+        # A batch never jumps a competitor that arrived between this workload's units (t_430834ff): start only
+        # this workload's door units that precede the next competing unit the door would hold for.
+        rivals = [key(d, u) for d, u in candidates if d.workload != workload
+                  and (d.verdict.admittable >= 1 or d.verdict.binding in CPU_AXES)]
+        own = [key(d, u) for d, u in candidates if d.workload == workload]
+        if rivals and own:
+            limit = min(my_units, max(1, sum(1 for k in own if k < min(rivals))))
     start, reason = 0, ""
-    for i in range(1, my_units + 1):
+    for i in range(1, limit + 1):
         total = Estimate(need.cpus * i, need.ram_gb * i, need.gpu_mib * i)
         v = admit_class(sample, workload, total, leases, demand=door if mode == "spawn-only" else (),
                         priority=registry, limits=limits, host=host, slice_mem=slice_mem, settle_s=settle_s)

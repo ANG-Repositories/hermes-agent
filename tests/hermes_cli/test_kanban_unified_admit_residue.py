@@ -19,7 +19,7 @@ import pytest
 from gateway import kanban_gate_tick as kgt
 from hermes_cli import kanban_db as kb
 from hermes_cli.fleet_placement import admission as ad
-from hermes_cli import alloc_client
+from hermes_cli.fleet_placement import alloc_client
 from hermes_cli.fleet_placement import placement
 from tests.hermes_cli.demand_fixture import write_demand
 

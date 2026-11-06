@@ -793,7 +793,7 @@ PUBLISH_STATS = {"ok": 0, "failed": 0, "skipped": 0}
 
 def _publish_ready_demand(queued, root):
     import time as _time
-    from hermes_cli import alloc_client as _ac
+    from hermes_cli.fleet_placement import alloc_client as _ac
     from hermes_cli.fleet_placement import admission as _ad
     from hermes_cli.fleet_placement import placement as _pl
 

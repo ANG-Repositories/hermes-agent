@@ -307,7 +307,7 @@ def _kanban_rows(home):
 
 def _plan_mode(home, fleet, allocd, monkeypatch):
     if allocd == "on":       # alloc_client's in-process fallback (router-off): the same ledger, allocd's own path
-        from hermes_cli import alloc_client
+        from hermes_cli.fleet_placement import alloc_client
         (home / "var" / "alloc").mkdir(parents=True, exist_ok=True)
         (home / "var" / "alloc" / "router-off").write_text("", encoding="utf-8")
         monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: True)
@@ -388,7 +388,7 @@ def test_pinned_take_books_the_learned_estimate_it_was_admitted_on(home, monkeyp
 @pytest.fixture
 def door(monkeypatch):
     """allocd's pair door faked at the client (hermes-home #9223: publish_queue is the only queue writer)."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     sent = []
 
     def publish_queue(workload, host, queued, unit, *, unified, timeout=None):
@@ -523,7 +523,7 @@ def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypat
     refused and released, since
     unified_filter's local pre-check cannot see allocd's ledger. Router host (one ledger): the local check still runs,
     and a row allocd says it booked but the shared file lacks is refused as before, whatever the reply says."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
 
     t0 = time.time()
     f = Fleet(t0)
@@ -549,7 +549,7 @@ def test_remote_plain_allocd_grants_cannot_overrun_the_class_rule(home, monkeypa
     """Prism 11efd32500fc repro: off the router host, a router that runs only placement.admit() grants every take; the
     local pre-check reads an empty dispatcher ledger and passes both. Under the unified rule neither plain grant may
     stand (the second would project 0.880 + (4+2)/256 > 0.90 with Prism's demand held); both are released."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
 
     t0 = time.time()
     f = Fleet(t0)
@@ -572,7 +572,7 @@ def remote_allocd(home, monkeypatch):
     """A kanban dispatcher OFF the router host, taking through a real HTTP allocd (FakeAllocd mirrors hermes-home
     scripts/allocd.py, including its unified confirm). The local pre-check is a pass-through: off the router it reads
     the dispatcher's own file, which never holds allocd's rows (Prism 11efd32500fc), so only allocd can refuse."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     from tests.hermes_cli.test_kanban_allocd_route import FakeAllocd
 
     def make(fleet, *, legacy=False):

@@ -31,7 +31,7 @@ import pytest
 from tests.hermes_cli.test_kanban_headroom_placement import (  # noqa: F401  (fixture)
     FAKE_PID, TABLE, Fleet, _plan, home,
 )
-from hermes_cli import alloc_client
+from hermes_cli.fleet_placement import alloc_client
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
@@ -647,29 +647,3 @@ def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
     assert kh.RESERVATION_KEY in payload and kh.RESERVATION_VIA_KEY not in payload
     assert loud.requests == []
 
-
-# -- the vendored client stays the canonical one -----------------------------------------------
-
-def test_vendored_alloc_client_matches_canonical():
-    """hermes_cli/alloc_client.py == hermes-home scripts/lib/alloc_client.py except the declared local changes:
-    the vendoring header, package imports of placement/admission_demand, utf-8-sig reads, and admit(unified=,
-    stale_after_s=) (#2462). ALLOC_CLIENT_CANONICAL names the canonical file (CI skips)."""
-    import os
-    import re
-    env = os.environ.get("ALLOC_CLIENT_CANONICAL")
-    if not env:
-        pytest.skip("ALLOC_CLIENT_CANONICAL not set (no hermes-home checkout to cross-read)")
-    ours = Path(alloc_client.__file__).read_text(encoding="utf-8")
-    theirs = Path(env).read_text(encoding="utf-8")
-    ours = "\n".join(x for x in ours.splitlines() if not re.match(r"# (VENDORED|sha256|local changes|the rest against)", x))
-    s, e = theirs.index("sys.path.insert(0, str(Path(__file__).resolve().parent))\n"), theirs.index("def _fleet_root()")
-    theirs = (theirs[:s] + "from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy "
-              "(hermes-home: sys.path + lazy _Placement)\n\n\n" + theirs[e:])
-    theirs = theirs.replace("    import admission_demand\n", "    from hermes_cli.fleet_placement import admission_demand"
-                            "  # VENDORED: fork package import\n")
-    ours = ours.replace('read_text(encoding="utf-8-sig")', 'read_text(encoding="utf-8")')
-    unified = re.compile(r",\n\s+unified: bool = False, stale_after_s: Optional\[float\] = None\)|"
-                         r"\n    ``unified`` = .*\n.*stale_after_s`` = .*|"
-                         r"\n    if unified:\n        body\[\"unified\"\] = True\n.*\n.*float\(stale_after_s\)")
-    ours = unified.sub(lambda m: ")" if m.group(0).startswith(",") else "", ours)
-    assert ours.splitlines() == theirs.splitlines()

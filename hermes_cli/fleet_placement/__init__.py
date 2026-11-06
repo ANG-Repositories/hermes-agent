@@ -1,4 +1,5 @@
-"""Byte copies of hermes-home ``scripts/lib/{placement,admission,work_estimate,admission_demand}.py`` (t_29403e19).
+"""Byte copies of hermes-home ``scripts/lib/{placement,admission,work_estimate,admission_demand,alloc_client}.py``
+(t_29403e19).
 
 The fleet has ONE placement scorer and ONE admission predicate; the fork may not import hermes-home code, so it
 carries copies. ``VENDORED.json`` pins the source ref and each file's sha256, and

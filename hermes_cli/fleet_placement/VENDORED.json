@@ -1,9 +1,9 @@
 {
   "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
   "source_repo": "ANG-Ventures/hermes-home",
-  "source_ref": "9141c8dd5f00782e2b9087566497578927b28738",
-  "source_note": "hermes-home #9302 merge 2026-11-05 (P1 door residue on #9223, t_810c9012): admission_demand per-unit door store (no local publish path), full-queue lookup; admission WaitingUnit/DoorVerdict; placement 1-line change. Re-vendored by P4 t_0c5ef02e.",
-  "vendored_at": "2026-11-05",
+  "source_ref": "7155a6de7ead5daf8978ab4b133d0092e8828ecb",
+  "source_note": "hermes-home main 7155a6de7e (after #9369 merge f03300d924, t_3d0928f7): alloc_client + admission_demand are a PAIR (the client calls admission_demand.make_dirs_durable); admission carries cbef7a82 (t_430834ff fcfs batch order). alloc_client moved here from hermes_cli/ so its canonical _sibling package import resolves unmodified. Re-vendored by P4 t_0c5ef02e round 4.",
+  "vendored_at": "2026-11-06",
   "max_age_days": 21,
   "files": {
     "placement.py": {
@@ -12,7 +12,7 @@
     },
     "admission.py": {
       "source_path": "scripts/lib/admission.py",
-      "sha256": "ca11a6c3adc4e8f99577e19beffcf618f4ccfb4b9f376c5d5648f77c922a7a22"
+      "sha256": "58e008b8b7790727a16c18851529bed927c3a8fd5b4e4970138b9970b6bf4978"
     },
     "work_estimate.py": {
       "source_path": "scripts/lib/work_estimate.py",
@@ -20,7 +20,11 @@
     },
     "admission_demand.py": {
       "source_path": "scripts/lib/admission_demand.py",
-      "sha256": "ab7296571b0e82401df6779692514ca83bcd66cc0b24c5af1c4d3a39db0201de"
+      "sha256": "877e19b00ed31b3992d611e7ea6bbf4bb14f838ef7e2acc9f762ce93bd759762"
+    },
+    "alloc_client.py": {
+      "source_path": "scripts/lib/alloc_client.py",
+      "sha256": "b8a4e37199fe69abea7b882ef7754c9244404cbe76d88a708c4898683f375648"
     }
   }
 }

@@ -39,7 +39,7 @@ class DoorUnreachable(DoorHeld):
 
 
 def _client():
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     return alloc_client
 
 

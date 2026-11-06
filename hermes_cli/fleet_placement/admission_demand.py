@@ -49,6 +49,8 @@ PRIORITY_REL = Path("fleet") / "admission-priority.json"
 DEMAND_REL = Path("var") / "placement" / "demand"
 DEFAULT_MAX_AGE_S = 120.0
 _SAID: set = set()
+_PROVEN_DIRS: dict = {}     # demand dir -> (st_dev, st_ino) whose whole chain from the store root THIS process fsync'd
+_UNPROVEN_TOP: dict = {}    # demand dir -> top of a chain whose sync failed after mkdir (retry walks up to it)
 
 
 def _root(root=None) -> Path:
@@ -168,10 +170,58 @@ def _name(value):
     return isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value) is not None
 
 
+def make_dirs_durable(directory, *, mode=0o777, through=None) -> None:
+    """``mkdir -p`` whose NEW entries survive a power loss (Prism 570db39355af; shared with alloc_client).
+
+    A created directory is durable only once its entry in the parent is, so after the mkdir every created level AND
+    the deepest pre-existing ancestor (whose entry list changed) is fsync'd, and nothing above it. ``through`` names
+    an ancestor that is always synced down from, created or not (alloc_client's fleet root). An existing chain with
+    no ``through`` syncs nothing here; the caller's own leaf fsync covers its file. OSError propagates."""
+    directory = Path(directory)
+    anchor = directory
+    while not anchor.exists() and anchor.parent != anchor:
+        anchor = anchor.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=mode)
+    top = anchor if through is None or anchor in Path(through).parents else Path(through)
+    if top == directory:
+        return   # leaf not fsync'd here: correct only because every caller fsyncs the leaf after its write (_replace)
+    for path in [directory] + [p for p in directory.parents if p == top or top in p.parents]:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 @contextlib.contextmanager
 def _writer(root=None):
-    directory = _root(root) / DEMAND_REL
-    directory.mkdir(parents=True, exist_ok=True, mode=0o755)
+    base = _root(root)
+    directory = base / DEMAND_REL
+    # before the first record (or tombstone) can be acknowledged. Existence is not durability (Prism cdecee16d1ed): a
+    # chain left by a failed sync, here or in a crashed process, is re-synced from the store root down until this
+    # process has PROVEN it; only then do later writes skip the walk and rely on _replace's leaf fsync. When mkdir
+    # creates the store root itself, the pre-mkdir anchor above it is kept until success, so a retry after a failed
+    # ancestor sync walks up to that anchor again rather than stopping at the (now existing) root.
+    # Proof is the dir's (st_dev, st_ino), not its path: a dir deleted and recreated between writes is a new inode
+    # whose parent entry was never synced (reader deleg_29a9bec5). One stat per write, replacing is_dir().
+    key = str(directory)
+    try:
+        st = os.stat(directory)
+        ident = (st.st_dev, st.st_ino)
+    except OSError:
+        ident = None
+    if ident is None or _PROVEN_DIRS.get(key) != ident:
+        _PROVEN_DIRS.pop(key, None)   # a vanished dir's old proof is void until this re-prove succeeds (Prism 324248e82c6f)
+        top = _UNPROVEN_TOP.get(key)
+        if top is None:
+            anchor = directory
+            while not anchor.exists() and anchor.parent != anchor:
+                anchor = anchor.parent
+            top = _UNPROVEN_TOP[key] = anchor if anchor in base.parents else base
+        make_dirs_durable(directory, mode=0o755, through=top)
+        st = os.stat(directory)
+        _UNPROVEN_TOP.pop(key, None)
+        _PROVEN_DIRS[key] = (st.st_dev, st.st_ino)
     with (directory / ".writer.lock").open("a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         yield directory
@@ -204,13 +254,21 @@ def _owned(path, workload, root=None):
     owners maps each kind to its registered filesystem service user (or numeric UID).
     Missing policy retains same-UID compatibility, never trusts a different filesystem owner.
     """
+    uid = _owner_uid(workload, root)
+    try:
+        return uid is not None and path.stat().st_uid == uid and not path.is_symlink()
+    except OSError:
+        return False
+
+
+def _owner_uid(workload, root=None):
+    """The configured filesystem owner of ``workload``'s store (UID), None when the policy names no resolvable one."""
     owners = _read_policy(_root(root) / PRIORITY_REL).get("owners", {})
     owner = owners.get(workload, os.getuid()) if isinstance(owners, dict) else os.getuid()
     try:
-        uid = owner if type(owner) is int else pwd.getpwnam(owner).pw_uid
-        return path.stat().st_uid == uid and not path.is_symlink()
-    except (OSError, KeyError, TypeError):
-        return False
+        return owner if type(owner) is int else pwd.getpwnam(owner).pw_uid
+    except (KeyError, TypeError):
+        return None
 
 
 class DemandStoreUnreadable(OSError):
@@ -219,9 +277,12 @@ class DemandStoreUnreadable(OSError):
 
 
 def _existing(path, workload, root=None):
-    if not path.exists() and not path.is_symlink():
-        return {}
-    if not _owned(path, workload, root):
+    absent = not path.exists() and not path.is_symlink()
+    # allocd is the single writer, and _replace always leaves a file owned by THIS process's UID. If the policy names
+    # another owner, read_demand would hide whatever we write, so EVERY write is refused before any mutation, whether
+    # the store is absent or already exists (never accept-then-hide; t_430834ff). An existing store must also carry
+    # the configured owner.
+    if _owner_uid(workload, root) != os.getuid() or (not absent and not _owned(path, workload, root)):
         # Never erase queues or anti-replay tombstones because ownership policy changed.
         from episode_pager import EpisodePager
         try:
@@ -232,6 +293,8 @@ def _existing(path, workload, root=None):
         if outcome == "failed":
             raise DemandStoreUnreadable(f"ownership refusal page failed for {path}; retry next request")
         raise DoorConflict("auth")
+    if absent:
+        return {}
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -333,10 +396,17 @@ def store_door(req, *, owner: str, root=None, now=None):
         if req.get("op") == "queue":
             # Class-level aggregate (legacy holdback input), last writer wins; ``hosts`` keeps every pair host that
             # published within demand_max_age_s, so two hosts' publishers never hide each other's restriction.
-            prior = doc.get("hosts") if (_num(doc.get("at")) and 0 <= now - doc["at"] <= registry.demand_max_age_s
-                                         and isinstance(doc.get("hosts"), list)) else []
+            # Each host keeps ITS OWN publication time (``host_at``): one live publisher never keeps a stopped
+            # publisher's host alive (t_430834ff). A legacy doc without host_at dates its hosts by the doc ``at``.
+            host_at = doc.get("host_at")
+            if not isinstance(host_at, dict):
+                host_at = ({str(h): doc["at"] for h in doc["hosts"]} if _num(doc.get("at"))
+                           and isinstance(doc.get("hosts"), list) else {})
+            host_at = {str(h): t for h, t in host_at.items()
+                       if _num(t) and 0 <= now - t <= registry.demand_max_age_s}
+            host_at[host] = now
             doc.update(schema=SCHEMA, workload=workload, at=now, queued=req["queued"],
-                       hosts=sorted({*(str(h) for h in prior), host}),
+                       hosts=sorted(host_at), host_at=host_at,
                        unit={k: float(req["unit"][k]) for k in ("cpus", "ram_gb", "gpu_mib")},
                        unified=req["unified"])
             _replace(path, doc)
@@ -429,6 +499,10 @@ def _demand_of(doc, now: float, max_age: float, host: str,
             return None
         # with a resolver (placement's HostTable.resolve), an alias names its canonical host (Prism 364936434c3d)
         want = (resolve(host) if resolve else None) or host
+        host_at = doc.get("host_at")
+        if isinstance(host_at, dict):
+            # per-host freshness: a host whose own publisher stopped expires on its own clock (t_430834ff)
+            hosts = [h for h in hosts if _num(host_at.get(str(h))) and abs(now - host_at[str(h)]) <= max_age]
         names = {((resolve(str(h)) if resolve else None) or str(h)).lower() for h in hosts}
         if want.lower() not in names:
             return None
@@ -476,8 +550,10 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
                 seen_at = u.get("seen_at", state["at"])
                 if not _num(seen_at) or not 0 <= now - seen_at <= max_age:
                     continue
+                # freshness is the heartbeat (seen_at, checked above); arrival is only the ordering key, so a live
+                # unit re-asserted for more than 7 days stays visible and authorizable (t_430834ff)
                 at, cpu, mem = u.get("at"), u.get("need_cpu"), u.get("need_mem_gb")
-                if not (_num(at) and now - at <= 7 * 86400 and _num(cpu) and cpu > 0 and _num(mem) and mem >= 0):
+                if not (_num(at) and _num(cpu) and cpu > 0 and _num(mem) and mem >= 0):
                     continue
                 waiting.append(admission.WaitingUnit(min(at, now), admission.Estimate(cpu, mem),
                                                       u.get("asap") is True, str(u.get("id", ""))))
@@ -524,7 +600,8 @@ def doors_from_document(doc: Mapping, *, now: float) -> List[admission.Demand]:
             if not isinstance(u, dict):
                 continue
             t, cpu, mem = u.get("at"), u.get("need_cpu"), u.get("need_mem_gb")
-            if not (_num(t) and now - t <= 7 * 86400 and _num(cpu) and cpu > 0 and _num(mem) and mem >= 0):
+            # the row's ``at`` (server publication) is the freshness check above; arrival only orders (t_430834ff)
+            if not (_num(t) and _num(cpu) and cpu > 0 and _num(mem) and mem >= 0):
                 continue
             waiting.append(admission.WaitingUnit(min(t, now), admission.Estimate(cpu, mem),
                                                   u.get("asap") is True, str(u.get("id", ""))))

@@ -340,7 +340,7 @@ def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[s
         return None
     table = sig.placement_table
     if via_alloc:
-        from hermes_cli import alloc_client
+        from hermes_cli.fleet_placement import alloc_client
         if not alloc_client.ledger_is_local(table):
             detail = getattr(decision, "detail", None)
             if getattr(decision, "source", None) == "allocd" and isinstance(detail, Mapping) \
@@ -539,7 +539,7 @@ def allocd_request(plan, names, job: Optional[placement.Job]) -> Dict[str, Any]:
 def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str]):
     """``alloc_client.admit`` for an unpinned take (mode on). Returns AdmitResult;
     raises alloc_client.Refused on a terminal answer (never bypassed)."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     unified = unified_active(plan)
     return alloc_client.admit(CONSUMER, job_id=admission_key(job_id), ttl_s=RESERVE_TTL_S,
                               unified=unified, stale_after_s=float(plan.signal.policy.stale_after_s) if unified else None,
@@ -556,7 +556,7 @@ def admission_key(job_id: Optional[str]) -> Optional[str]:
 
 def release_alloc(rid: str) -> bool:
     """Release a reservation alloc_client booked (allocd, or its in-process fallback)."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     try:
         return alloc_client.release(rid, consumer=CONSUMER)
     except Exception as exc:  # Refused / an unreadable ledger: the TTL bounds the row
@@ -566,7 +566,7 @@ def release_alloc(rid: str) -> bool:
 
 def _renew_alloc(rid: str) -> bool:
     """Renew a reservation alloc_client booked; a terminal refusal is a failed renewal."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     try:
         return alloc_client.renew(rid, ttl_s=RESERVE_TTL_S, consumer=CONSUMER)
     except Exception as exc:  # Refused / an unreadable ledger
@@ -575,7 +575,7 @@ def _renew_alloc(rid: str) -> bool:
 
 def _alloc_current(rid: str) -> str:
     """The id alloc_client now tracks for ``rid`` (its process-local re-admit alias)."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     return alloc_client._current(rid)
 
 
@@ -599,7 +599,7 @@ def shadow_ask(plan, names, job: Optional[placement.Job], job_id: Optional[str])
     """What allocd WOULD answer for this take (mode shadow), asked BEFORE the old
     path books: ``/admit`` with ``shadow: true`` (scored, nothing reserved) over the
     candidates mode on would send. Never the in-process fallback, never a write."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     cands = [n for n in names if structural_free(plan, n) > 0]
     req = allocd_request(plan, cands, job)
     out: Dict[str, Any] = {"candidates": req["candidates"], "answered": False, "new_host": None,
