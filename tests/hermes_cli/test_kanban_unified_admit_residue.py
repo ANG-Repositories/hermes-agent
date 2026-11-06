@@ -5,6 +5,7 @@
                 host held back for Prism published ``ok``. band == may_start's verdict for one job (hot) and two (warm).
   8397e82995e1  GateTickBuilder.publish_demand() swallowed a failed demand write at DEBUG and returned the count as if
                 it had been published. A failed write is now logged (warning) and the next tick writes it again.
+                Since hermes-home #9223 the write is alloc_client.publish_queue (allocd's pair door), faked here.
 """
 from __future__ import annotations
 
@@ -18,8 +19,9 @@ import pytest
 from gateway import kanban_gate_tick as kgt
 from hermes_cli import kanban_db as kb
 from hermes_cli.fleet_placement import admission as ad
-from hermes_cli.fleet_placement import admission_demand as dmd
+from hermes_cli import alloc_client
 from hermes_cli.fleet_placement import placement
+from tests.hermes_cli.demand_fixture import write_demand
 
 NOW = 1792989332.0
 PRISM_UNIT = ad.Estimate(cpus=4.0, ram_gb=4.0)
@@ -73,7 +75,7 @@ def _band(table, s, root):
 def test_band_is_may_starts_verdict_for_one_and_two_jobs(root, busy, queued, one, two):
     table = _table()
     if queued:
-        dmd.publish("prism", queued, PRISM_UNIT, hosts=["studio"], root=root, now=NOW)
+        write_demand("prism", queued, PRISM_UNIT, hosts=["studio"], root=root, now=NOW)
     s = _sample(busy)
     m1, m2 = _may(table, s, root, 1), _may(table, s, root, 2)
     assert (m1[0], m2[0]) == (one, two), (m1, m2)
@@ -85,11 +87,11 @@ def test_band_kill_switch_is_admit(root, monkeypatch):
     """The band follows the kanban ADMITTER's rule as it published it (Prism 59574d3a240b), never the reader's env;
     a missing or stale mode is the switch's live default (unset = on since #2462, Prism 8a9579c42a36)."""
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")                         # the reader's env is not the switch
-    dmd.publish("prism", 64, PRISM_UNIT, root=root, now=NOW)
+    write_demand("prism", 64, PRISM_UNIT, root=root, now=NOW)
     assert _band(_table(), _sample(0.60), root)[0] == "hot"                 # no kanban.json: default on
-    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW, env={"KANBAN_UNIFIED_ADMIT": "0"})
+    write_demand("kanban", 0, PRISM_UNIT, root=root, now=NOW, env={"KANBAN_UNIFIED_ADMIT": "0"})
     assert _band(_table(), _sample(0.60), root)[0] == "ok"                  # admitter's published kill switch
-    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW - 3600, env={"KANBAN_UNIFIED_ADMIT": "0"})
+    write_demand("kanban", 0, PRISM_UNIT, root=root, now=NOW - 3600, env={"KANBAN_UNIFIED_ADMIT": "0"})
     assert _band(_table(), _sample(0.60), root)[0] == "hot"                 # aged out: back to the default
 
 
@@ -106,6 +108,13 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     (home / "fleet").mkdir()
+    (home / "config").mkdir()
+    (home / "config" / "fleet-hosts.json").write_text(json.dumps({
+        "schema": 1, "default_first": "mac-studio", "saturate_to": 1.0,
+        "footprints": {"kanban": {"ram_gb": 3, "threads": 2}},
+        "hosts": {"mac-studio": {"cores": 24, "threads": 32, "mem_total_gb": 512, "mem_reserve_gb": 128,
+                                 "cores_reserve": 4, "consumers": {}, "aliases": ["studio", "local"]}}}),
+        encoding="utf-8")
     with kb.connect_closing() as conn:
         for i in range(2):
             kb.create_task(conn, title=f"c{i}", assignee="alpha")
@@ -118,30 +127,42 @@ def _builder(home):
                                ledger=lambda boards: {}, connect=lambda board=None: kb.connect())
 
 
-def test_failed_demand_publish_is_logged_and_retried_next_tick(board, monkeypatch, caplog):
-    real = dmd.publish
+@pytest.fixture
+def door(monkeypatch):
+    """allocd's pair door, faked at the client: records every publish_queue call (workload, host, queued)."""
+    sent = []
+
+    def publish_queue(workload, host, queued, unit, *, unified, timeout=None):
+        sent.append((workload, host, queued))
+        return {"ok": True}
+
+    monkeypatch.setattr(alloc_client, "publish_queue", publish_queue)
+    return sent
+
+
+def test_failed_demand_publish_is_logged_and_retried_next_tick(board, door, monkeypatch, caplog):
+    real = alloc_client.publish_queue
     calls = []
 
     def flaky(*a, **kw):
         calls.append(a)
         if len(calls) == 1:
-            raise OSError(28, "No space left on device")
+            raise alloc_client.Unreachable("allocd down")
         return real(*a, **kw)
 
-    monkeypatch.setattr(dmd, "publish", flaky)
+    monkeypatch.setattr(alloc_client, "publish_queue", flaky)
     b = _builder(board)
-    path = board / "var" / "placement" / "demand" / "kanban.json"
     with caplog.at_level(logging.WARNING, logger="gateway.kanban_watchers"):
         assert b.publish_demand([{"slug": "default"}]) is None        # not reported as published
-    assert not path.exists()
+    assert door == []
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("demand" in m and "failed" in m and "No space left" in m for m in msgs), msgs
-    assert b.publish_demand([{"slug": "default"}]) == 2              # next tick: written
-    assert json.loads(path.read_text(encoding="utf-8"))["queued"] == 2
+    assert any("demand" in m and "failed" in m and "allocd down" in m for m in msgs), msgs
+    assert b.publish_demand([{"slug": "default"}]) == 2              # next tick: published
+    assert door == [("kanban", "mac-studio", 2)]                      # as the canonical pair, never an alias
     assert len(calls) == 2
 
 
-def test_unreadable_board_is_logged_not_silently_dropped(board, caplog):
+def test_unreadable_board_is_logged_not_silently_dropped(board, door, caplog):
     def connect(board=None):
         if board == "broken":
             raise RuntimeError("database disk image is malformed")
@@ -155,7 +176,7 @@ def test_unreadable_board_is_logged_not_silently_dropped(board, caplog):
     assert any("broken" in r.getMessage() for r in caplog.records)
 
 
-def test_quarantined_or_unopenable_board_is_zero_demand_and_not_reopened(board):
+def test_quarantined_or_unopenable_board_is_zero_demand_and_not_reopened(board, door):
     """Corrupt-board guard (operator send-back 17:5x): the demand read never re-opens a board the dispatcher has
     quarantined, or one whose open already raised this tick; with no board readable nothing is published."""
     opened = []
@@ -177,7 +198,6 @@ def test_quarantined_or_unopenable_board_is_zero_demand_and_not_reopened(board):
         b._tick_connect(board="broken")                                # an earlier probe this tick hit it
     assert b.publish_demand([{"slug": "default"}, {"slug": "broken"}]) == 2
     assert opened == ["broken", "default"]                             # not re-opened by the demand read
-    path = board / "var" / "placement" / "demand" / "kanban.json"
-    path.unlink()
+    door.clear()
     assert b.publish_demand([{"slug": "quarantined"}]) is None         # nothing readable: nothing published
-    assert not path.exists()
+    assert door == []
