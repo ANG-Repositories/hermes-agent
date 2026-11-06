@@ -575,7 +575,39 @@ def _cut_suffix(agent: Any, st: dict, waited: float) -> str:
     return f"; cut to next lane at {int(budget)}s"
 
 
-def _relay_stage_phrase(agent: Any) -> Optional[str]:
+def _allowance_phrase(info: dict, *, shared: bool) -> Optional[str]:
+    """Render only producer-stamped counts; unknown eligibility is not zero."""
+    allowance = info.get("allowance")
+    model = info.get("model")
+    if not isinstance(allowance, dict) or not isinstance(model, str) or not model:
+        return None
+    total, exhausted, eligible = (allowance.get(k) for k in
+                                  ("seats_total", "seats_exhausted", "seats_eligible"))
+    if (any(type(n) is not int for n in (total, exhausted, eligible))
+            or not 0 < exhausted <= total or not 0 <= eligible <= total - exhausted):
+        return None
+    text = f"{model} weekly cap{',' if shared else ':'} {eligible} of {total} seats left"
+    if not shared:
+        inflight, seat = allowance.get("seat_inflight"), info.get("seat")
+        if type(inflight) is not int or inflight < 0 or not isinstance(seat, str) or not seat:
+            return None
+        text += f", {inflight} turns on {seat}"
+    reset = allowance.get("earliest_reset")
+    if isinstance(reset, str):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from hermes_time import safe_strftime
+        try:
+            dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                clock = safe_strftime(dt.astimezone(ZoneInfo("America/Los_Angeles")), "%H:%M")
+                text += f"{',' if shared else ' ·'} resets {clock} PT"
+        except (ValueError, OverflowError):
+            pass  # A missing reset must not discard the measured seat counts.
+    return text
+
+
+def _relay_stage_phrase(agent: Any, *, shared: bool = False) -> Optional[str]:
     """Which hop a pool-relay wait is on, in plain words (t_9a635fbd), else None.
 
     2026-10-28 17:00-20:00 PT the relay's upload to the box (our uplink) ran 80-117 s
@@ -596,8 +628,14 @@ def _relay_stage_phrase(agent: Any) -> Optional[str]:
                 if isinstance(since_ms, (int, float)) and not isinstance(since_ms, bool)
                 and math.isfinite(since_ms) else "")
     stage = info.get("stage")
+    allowance = _allowance_phrase(info, shared=shared)
+    # Shared notices keep their existing recorded-cause wording without enrichment.
+    if shared and not allowance:
+        return None
     if stage == "relay_send":
         return f"request still uploading to {seat or 'the pool seat'} (our uplink){in_stage}"
+    if allowance:
+        return allowance
     if stage in ("box_headers", "upstream_ttfb"):
         return f"{seat or 'the pool seat'} connected, provider has not sent a first token{in_stage}"
     if stage == "queued":
@@ -622,7 +660,7 @@ def _shared_notice(agent: Any, st: dict, waited: float, now: float) -> Optional[
     if st.get("shared") == key:
         return ""
     st["shared"] = key
-    stage = _slow_stage(agent)
+    stage = _slow_stage(agent) or _relay_stage_phrase(agent, shared=True)
     return (f"⏳ {len(slow)} sessions waiting on {_lane_label(lane)} "
             f"(oldest {int(max(slow.values()))}s){': ' + stage if stage else ''}; "
             f"this turn {int(waited)}s, cut at {int(st['budget_s'])}s{_ahead_suffix(agent)}")
