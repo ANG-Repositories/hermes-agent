@@ -485,3 +485,43 @@ class TestHomeWorkingDirGuard:
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         result = tracker.check_tool_call("read_file", {"path": str(sub / "f.py")})
         assert result is not None and "Package rules" in result
+
+
+class TestAutomountRootPaths:
+    """t_e16044ad: a remote path literal under an autofs root must never be stat'ed.
+
+    On macOS each lookup of /home/<missing-user> execs od_user_homes via automountd with no
+    negative cache; one `ssh kanbanw@ci-box cat /home/kanbanw/...` tool call made ~34 execs.
+    """
+
+    def test_out_of_tree_automount_path_is_not_touched(self, project, monkeypatch):
+        import agent.subdirectory_hints as sh
+
+        root = project.parent / "fake-autofs-home"
+        monkeypatch.setattr(sh, "_AUTOMOUNT_ROOTS", (str(root),), raising=False)
+        touched = []
+        real_resolve, real_is_dir, real_exists = Path.resolve, Path.is_dir, Path.exists
+
+        def spy(real):
+            def wrapped(self, *a, **k):
+                if str(self).startswith(str(root)):
+                    touched.append((real.__name__, str(self)))
+                return real(self, *a, **k)
+            return wrapped
+
+        monkeypatch.setattr(Path, "resolve", spy(real_resolve))
+        monkeypatch.setattr(Path, "is_dir", spy(real_is_dir))
+        monkeypatch.setattr(Path, "exists", spy(real_exists))
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        cmd = f"ssh kanbanw@ci-box 'cat {root}/kanbanw/scratch/t_x/a.log; ls {root}/kanbanw/.hermes/scripts'"
+        assert tracker.check_tool_call("terminal", {"command": cmd}) is None
+        assert tracker.check_tool_call("read_file", {"path": f"{root}/kanbanw/repo/x.py"}) is None
+        assert touched == []
+
+    def test_working_dir_under_automount_root_still_discovers(self, project, monkeypatch):
+        import agent.subdirectory_hints as sh
+
+        monkeypatch.setattr(sh, "_AUTOMOUNT_ROOTS", (str(project.parent),), raising=False)
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        result = tracker.check_tool_call("read_file", {"path": str(project / "backend" / "src" / "main.py")})
+        assert result is not None and "Backend-specific instructions" in result
