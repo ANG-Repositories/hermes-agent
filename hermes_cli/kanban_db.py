@@ -11985,8 +11985,9 @@ def complete_task(
                 except (TypeError, ValueError, AttributeError):
                     continue
 
-            from hermes_cli.kanban_round_draft import card_run_ids
+            from hermes_cli.kanban_round_draft import card_run_ids, mark_records
             _round_runs = card_run_ids(conn, task_id)  # t_c418eebc: whose round-draft marks count as own
+            _round_marks = mark_records(conn, task_id)  # kernel-persisted marks only (Prism 852b8897186d)
 
             def _record_flips(flipped):
                 if flipped:
@@ -11999,7 +12000,7 @@ def complete_task(
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
-                        round_runs=_round_runs,
+                        round_runs=_round_runs, marked=_round_marks,
                     )
                 except _fresh.DraftPrError as draft_err:
                     _record_flips(draft_err.flipped)

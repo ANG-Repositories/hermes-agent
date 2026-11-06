@@ -4,7 +4,6 @@ Round start drafts the card's own ready PR and posts ``round-draft: drafted by w
 the handback un-drafts once. The Prism findings-route never drafts.
 """
 import json
-import re
 from types import SimpleNamespace
 
 import pytest
@@ -14,15 +13,6 @@ from hermes_cli import kanban_pr_freshness as fr
 from hermes_cli import kanban_round_draft as rd
 
 CARD, SHA = "t_1234abcd", "a" * 40
-
-
-def _jq_eval(jq: str, comments: list) -> dict:
-    """Evaluate the mark query the way GitHub's --jq would, for the one shape round_marked sends."""
-    prefix, suffix = (json.loads(s) for s in re.findall(r'startswith\(("[^"]*")\) and endswith\(("[^"]*")\)', jq)[0])
-    runs = [ln.rstrip("\r")[len(prefix):-len(suffix)]
-            for c in comments for ln in (c.get("body") or "").split("\n")
-            if ln.rstrip("\r").startswith(prefix) and ln.rstrip("\r").endswith(suffix)]
-    return {"runs": runs}
 
 
 @pytest.fixture
@@ -36,7 +26,7 @@ def rig(monkeypatch):
         if args[0] == "repos/o/r/pulls/1":
             return json.loads(json.dumps(state["pr"]))
         if args[0].startswith("repos/o/r/issues/1/comments"):
-            return _jq_eval(args[2], state["comments"])
+            return json.loads(json.dumps(state["comments"]))
         return None
     log = []
 
@@ -57,17 +47,45 @@ def rig(monkeypatch):
         state["pr"]["draft"] = False
         return 0
     records = {"o/r#1": {"head": SHA, "at": 1}}
+    marks: dict = {}
     return SimpleNamespace(
-        state=state, log=log,
-        start=lambda run: rd.draft_at_round_start(CARD, run, records, gh=gh, draft=draft, comment=comment),
+        state=state, log=log, marks=marks,
+        start=lambda run: rd.draft_at_round_start(CARD, run, records, gh=gh, draft=draft, comment=comment,
+                                                  persist=marks.__setitem__),
         handback=lambda **kw: fr.check(op.extract_pr_refs("o/r#1"), task_id=CARD, allow_arm=False, gh=gh,
-                                       flipped=records, ready=ready, round_runs={"101", "102"}, **kw))
+                                       flipped=records, ready=ready, round_runs={"101", "102"},
+                                       marked=marks, **kw))
 
 
 def test_round_start_drafts_own_ready_pr_and_marks_it(rig):
     assert rig.start(101) == {"o/r#1": "drafted + marked"}
     assert rig.log == [("draft", "o/r", 1), ("comment", "o/r", 1, rd.mark_line(101, SHA))]
     assert rig.state["pr"]["draft"] is True
+    assert rig.marks["o/r#1"]["run"] == "101" and rig.marks["o/r#1"]["head"] == SHA
+
+
+def test_forged_mark_comment_does_not_clear_an_operator_hold(rig):
+    """Prism 852b8897186d repro: operator drafted at head H; anyone posts the mark line for an own run id."""
+    rig.state["pr"]["draft"] = True
+    rig.state["comments"] = [{"body": rd.mark_line(101, SHA)}]
+    report = rig.handback()
+    assert report["draft_held"] and rig.log == []
+
+
+def test_persisted_mark_by_own_run_at_head_readies(rig):
+    rig.state["pr"]["draft"] = True
+    rig.marks["o/r#1"] = {"run": "101", "head": SHA, "at": 2}
+    assert rig.handback()["draft_flipped"] == ["o/r#1"] and rig.log == [("ready", "o/r", 1)]
+
+
+def test_persisted_mark_at_stale_head_or_before_flip_stays_held(rig):
+    rig.state["pr"]["draft"] = True
+    rig.marks["o/r#1"] = {"run": "101", "head": "b" * 40, "at": 2}
+    assert rig.handback()["draft_held"] and rig.log == []
+    rig.marks["o/r#1"] = {"run": "101", "head": SHA, "at": 0}     # older than the card's last flip
+    assert rig.handback()["draft_held"] and rig.log == []
+    rig.marks["o/r#1"] = {"run": "999", "head": SHA, "at": 2}     # not one of this card's runs
+    assert rig.handback()["draft_held"] and rig.log == []
 
 
 def test_draft_failure_logs_and_continues_without_retry(rig):
@@ -98,7 +116,7 @@ def test_kill_switch_foreign_branch_and_closed_pr_untouched(rig, monkeypatch):
     monkeypatch.setenv("KANBAN_ROUND_DRAFT", "0")
     assert rig.start(101) == {} and rig.log == []
     rig.state["pr"]["draft"] = True
-    rig.state["comments"] = [{"body": rd.mark_line(101, SHA)}]
+    rig.marks["o/r#1"] = {"run": "101", "head": SHA, "at": 2}
     assert rig.handback()["draft_held"] and rig.log == []   # kill switch: same-head draft is a hold, as before
     monkeypatch.delenv("KANBAN_ROUND_DRAFT")
     rig.state["pr"]["draft"] = False
@@ -128,9 +146,12 @@ def test_worker_boot_reads_the_cards_flip_receipt_from_the_board(tmp_path, monke
     seen = []
     monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run))
-    monkeypatch.setattr(rd, "draft_at_round_start", lambda *a, **kw: seen.append(a) or {})
+    monkeypatch.setattr(rd, "draft_at_round_start",
+                        lambda *a, **kw: seen.append(a) or kw["persist"]("o/r#1", {"run": a[1], "head": SHA, "at": 2}))
     rd.run_from_env()
     assert seen == [(tid, str(run), {"o/r#1": {"head": SHA, "at": 1}})]
+    with kb.connect() as conn:   # the mark is on the card, written by the kernel from the worker's own run id
+        assert rd.mark_records(conn, tid) == {"o/r#1": {"run": str(run), "head": SHA, "at": 2}}
 
 
 def test_ready_carries_owner_card_to_ace_gate(tmp_path, monkeypatch):

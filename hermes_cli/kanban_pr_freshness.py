@@ -464,7 +464,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
           flipped: Optional[dict] = None, evaluate: Optional[ArmFn] = None,
-          event_land: Optional[bool] = None, round_runs=None) -> dict:
+          event_land: Optional[bool] = None, round_runs=None, marked=None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -487,7 +487,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     reads tier, Prism and review) and calls ``evaluate`` (default :func:`spawn_evaluate`, E6).
     Off: (c) is unchanged, ``spawn_arm`` and all.
 
-    ``round_runs``: this card's run ids. A same-head draft marked by one of them
+    ``round_runs``: this card's run ids; ``marked``: this card's persisted round-draft marks
+    (:func:`kanban_round_draft.mark_records`). A same-head draft whose persisted mark is by one of those runs
     (:func:`kanban_round_draft.round_marked`, t_c418eebc) is the worker's own round draft, flipped like any own draft.
     """
     from hermes_cli import kanban_round_draft as _rd
@@ -513,6 +514,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     evaluate = evaluate or spawn_evaluate
     ev_on = event_land_enabled() if event_land is None else event_land
     flip_records = {str(k).lower(): v for k, v in (flipped or {}).items() if isinstance(v, dict)}
+    mark_records = {str(k).lower(): v for k, v in (marked or {}).items() if isinstance(v, dict)}
 
     views = []
     drafts = []
@@ -532,7 +534,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if pr.get("draft") is True:
             held = _operator_hold(flip_records.get(key.lower()), pr)
-            if held and _rd.round_marked(gh, ref, str(((pr.get("head") or {}).get("sha")) or ""),
+            if held and _rd.round_marked(mark_records.get(key.lower()), str(((pr.get("head") or {}).get("sha")) or ""),
                                          flip_records.get(key.lower()), round_runs):
                 held = ""  # t_c418eebc: one of this card's runs drafted this head for its round, not an operator hold
             if held:
