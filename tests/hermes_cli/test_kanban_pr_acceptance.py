@@ -39,9 +39,14 @@ def github(tmp_path, monkeypatch):
                     self.end_headers()
                     self.wfile.write(b'{"message": "Resource not accessible by integration"}')
                     return
-                value = {"name": "main", "protection": state.get("protection") or {"required_status_checks": {
-                    "checks": [{"context": "required", "app_id": state.get("app_id", 1)}],
-                    "contexts": ["required"]}}}
+                value = {"name": "main", "protected": state.get("protected", True),
+                         "protection": state.get("protection") or {"required_status_checks": {
+                             "checks": [{"context": "required", "app_id": state.get("app_id", 1)}],
+                             "contexts": ["required"]}}}
+                if state.get("omit_protection"):
+                    del value["protection"]
+                if state.get("omit_protected"):
+                    del value["protected"]
             elif "/issues/" in self.path and self.path.split("?")[0].endswith("/comments"):
                 value = [state.get("comments", [])]
             elif "/rules/branches/" in self.path:
@@ -116,6 +121,7 @@ def test_no_required_checks_resolves_to_recorded_local_only(github):
     from hermes_cli.kanban_pr_acceptance import collect_acceptance
 
     github["protection"] = {"required_status_checks": {}}
+    github["protected"] = False
     receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
     assert receipt["ok"] is True
     assert receipt["classification"] == "local-only"
@@ -123,6 +129,29 @@ def test_no_required_checks_resolves_to_recorded_local_only(github):
     assert receipt["required"] == []
     assert receipt["head_sha"] == "a" * 40
     assert not any("/check-runs" in p for p in github["requests"])
+
+
+def test_protected_branch_with_unreadable_checks_fails_closed(github):
+    # Prism 3dda6c19e7d5 repro: {"name": "main", "protected": true} with no `protection` body and empty rulesets
+    # must NOT resolve to local-only.
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["omit_protection"] = True
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] != "local-only"
+    assert "read branch protection" in receipt["detail"]
+    assert not any("/check-runs" in p for p in github["requests"])
+
+
+def test_branch_without_protected_flag_or_protection_fails_closed(github):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["omit_protection"] = True
+    github["omit_protected"] = True
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] != "local-only"
 
 
 @pytest.mark.platforms("linux")
