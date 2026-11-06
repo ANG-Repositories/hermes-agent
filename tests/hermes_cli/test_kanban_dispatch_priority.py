@@ -46,8 +46,18 @@ def test_waiting_uses_structural_capacity_not_pressure_band(monkeypatch):
     routes = {"local": ("local", "worktree"), "portable": ("portable", None),
               "urgent": ("pin", "ai")}
     waiting = waiting_by_host(cards, plan, routes=routes, local_host="studio", board="default")
+    # one host per unit: the door refuses a live id on a second host (hermes-home #9223), so local-first
     assert [r["id"] for r in waiting["studio"]] == ["local", "portable"]
-    assert [r["id"] for r in waiting["ai"]] == ["urgent", "portable"]
+    assert [r["id"] for r in waiting["ai"]] == ["urgent"]
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._portable_only", lambda *args: (("ai",), None))
+    w = waiting_by_host(cards, plan, routes=routes, local_host="studio", conn=object())
+    assert [r["id"] for r in w["ai"]] == ["urgent", "portable"] and [r["id"] for r in w["studio"]] == ["local"]
+    plan.detail["ai"]["running"] = 2                                   # one structural slot left: ASAP takes it
+    w = waiting_by_host(cards, plan, routes=routes, local_host="studio", conn=object())
+    assert [r["id"] for r in w["ai"]] == ["urgent"] and all(r["id"] != "portable" for r in w["studio"])
+    plan.detail["ai"]["band"] = "ok"
+    assert waiting_by_host(cards, plan, routes=routes, local_host="studio", conn=object()) == w   # band is not read
+    monkeypatch.undo()
     plan.detail["ai"]["running"] = 3
     assert waiting_by_host(cards, plan, routes=routes, local_host="studio")["ai"] == []
     plan.detail["ai"]["running"] = 0

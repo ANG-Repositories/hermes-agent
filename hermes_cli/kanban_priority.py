@@ -1,8 +1,11 @@
 """Kanban's adapter to the fleet admission door; ordering belongs to admission."""
 from __future__ import annotations
 
+import logging
 import math
 import os
+
+_log = logging.getLogger(__name__)
 
 
 def set_asap(conn, task_id: str, flag: bool, *, operator: str) -> bool:
@@ -37,6 +40,10 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
 
     No age or workload ordering is decided here. The common publisher selects its
     urgency-first visible window; retain explicit urgent cards before the slot cap.
+    A card waits on exactly ONE host: the door keeps unit ids unique per workload
+    (hermes-home #9223), so a second host's enqueue is refused. Local-first: a
+    local/portable card waits here unless its constraints exclude this host, then on
+    the first eligible pool host in plan order; a pin/origin card on its host.
     """
     from hermes_cli.kanban_worker_pool import count_free
 
@@ -47,77 +54,103 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
         hosts = plan.hosts
     out.update({name: [] for name in hosts})
     own_only = cap_only or {}
-    for card in cards:
+    local_names = {local_host.lower()}
+    try:
+        from hermes_cli.fleet_placement import placement
+        resolved = placement.load_hosts().resolve(local_host)
+        if resolved:
+            local_names.add(resolved.lower())
+    except Exception:
+        pass
+    # Structural slot capacity per pool host, never the pressure band: the door decides admission.
+    free = {} if plan is None else {
+        name: max(0, count_free(host, int(plan.detail.get(name, {}).get("running", 0))) - plan.taken.get(name, 0))
+        for name, host in hosts.items()}
+    # Explicit urgent cards claim capacity first; otherwise the dispatcher's own row order.
+    for card in [c for c in cards if c["asap"]] + [c for c in cards if not c["asap"]]:
         route, arg = routes.get(card["id"], ("local", None))
         if route == "wait":
             continue
         assignee = card["assignee"] or default_assignee
         if not assignee:
             continue
-        if route in ("local", "portable") and not own_only.get(card["id"]):
-            out[local_host].append(card)
-        if plan is None or route == "local":
-            continue
         only = None
-        if route == "portable" and conn is not None:
+        if route == "portable" and plan is not None and conn is not None:
             from hermes_cli.kanban_db_dispatch import _portable_only
             only, _ = _portable_only(conn, card, assignee, plan, caps,
                                      own_only.get(card["id"]),
                                      (worktree_ports or {}).get(card["id"]))
-            if only is not None and local_host.lower() not in {n.lower() for n in only}:
-                out[local_host] = [r for r in out[local_host] if r["id"] != card["id"]]
+        allowed = None if only is None else {n.lower() for n in only}
+        if (route == "local" or (route == "portable" and not own_only.get(card["id"])
+                                 and (allowed is None or local_names & allowed))):
+            out[local_host].append(card)
+            continue
+        if plan is None:
+            continue
         for name, host in plan.hosts.items():
             if route in ("pin", "origin") and name != arg:
                 continue
-            if only is not None and name.lower() not in {n.lower() for n in only}:
+            if allowed is not None and name.lower() not in allowed:
                 continue
-            if (not host.enabled or host.state != "active" or name in plan.disabled
+            if (free[name] <= 0 or not host.enabled or host.state != "active" or name in plan.disabled
                     or assignee not in host.profiles or plan.board_refusal(name, board)
                     or plan.detail.get(name, {}).get("reachable") is False):
                 continue
             out[name].append(card)
-    if plan is not None:
-        for name, host in hosts.items():
-            capacity = count_free(host, int(plan.detail.get(name, {}).get("running", 0)))
-            capacity = max(0, capacity - plan.taken.get(name, 0))
-            rows = out[name]
-            out[name] = ([r for r in rows if r["asap"]]
-                         + [r for r in rows if not r["asap"]])[:capacity]
+            free[name] -= 1
+            break
     return out
 
 
 def publish_waiting(conn, waiting, *, verdicts=None, client=None):
-    """Merge only this board's acknowledged units; never replace a host queue."""
+    """Enqueue/withdraw only this board's own units through the pair door; never replace a host queue.
+
+    Withdrawals run first, so a card that moved host is gone from the old host before the new
+    host's enqueue (the door refuses a live id on two hosts). One unit's refusal (a typed auth for
+    an id another pair owns, a transport error) is logged and skips that unit only; the rest of the
+    board still publishes. Returns {(host, unit_id): error} for the refused units.
+    """
     from hermes_cli import kanban_priority_door as door
     if not door.enabled():
-        return
+        return {}
     if client is None:
         from hermes_cli import alloc_client as client
     from hermes_cli.fleet_placement import placement
     table = placement.load_hosts()
-    need = placement.need_of(table.footprint("kanban"))
+    cpus, ram_gb = door.need()
     key = conn.execute("PRAGMA database_list").fetchone()[2]
-    current = set(_published.get(key, set()))
-    wanted = set()
-    _published[key] = current
+    current = _published.setdefault(key, set())
+    plan = []
     for host, cards in waiting.items():
         hid = table.resolve(host)
-        if not hid:
-            continue
-        # Empty convenience publication updates only the capacity fact; units
-        # are managed explicitly above, never ranked or replaced by this client.
-        client.publish_demand("kanban", hid, [], (verdicts or {}).get(host, {
-            "admittable": False, "binding": "unknown", "deficit_cpu": 0.0}))
-        for card in cards:
-            uid = door.unit_id(conn, card["id"])
-            client.enqueue("kanban", hid, uid, need.cpus, need.ram_gb)
+        if hid:
+            plan.append((host, hid, [(card, door.unit_id(conn, card["id"])) for card in cards]))
+    wanted = {(hid, uid) for _, hid, rows in plan for _, uid in rows}
+    errors = {}
+    for hid, uid in sorted(current - wanted):
+        try:
+            client.withdraw("kanban", hid, uid)
+            current.discard((hid, uid))
+        except (client.Refused, client.Unreachable) as exc:
+            errors[(hid, uid)] = str(exc)            # retried next tick; still ours
+    for host, hid, rows in plan:
+        # The capacity fact only (last writer wins); units are managed per id below.
+        try:
+            client.publish_demand("kanban", hid, [], (verdicts or {}).get(host, {
+                "admittable": False, "binding": "unknown", "deficit_cpu": 0.0}))
+        except (client.Refused, client.Unreachable) as exc:
+            errors[(hid, None)] = str(exc)
+        for card, uid in rows:
+            try:
+                client.enqueue("kanban", hid, uid, cpus, ram_gb)
+            except (client.Refused, client.Unreachable) as exc:
+                errors[(hid, uid)] = str(exc)
+                continue
             current.add((hid, uid))
-            wanted.add((hid, uid))
-            if card["asap"]:
-                client.mark_asap("kanban", hid, uid)
-    for hid, uid in list(current - wanted):
-        client.withdraw("kanban", hid, uid)
-        current.discard((hid, uid))
+            door.mark_asap_if_set(client, conn, hid, uid, card["id"])
+    for (hid, uid), why in errors.items():
+        _log.warning("kanban door publish %s %s refused: %s", hid, uid, why)
+    return errors
 
 
 _published = {}

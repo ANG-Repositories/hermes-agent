@@ -1,4 +1,9 @@
-"""Per-unit shared-door lifecycle for kanban. No private ordering or admission."""
+"""Per-unit shared-door lifecycle for kanban. No private ordering or admission.
+
+Contract: hermes-home alloc_client @ 01524a8d (P1 #9223). authorize_start answers a wait as
+{authorized: False, reason: queued_behind | capacity | not_enqueued} and RAISES AuthorizeRefused for
+spent_expired | auth | invalid. A lost reply is reconciled with lookup_unit() before any retry.
+"""
 from __future__ import annotations
 
 import json
@@ -8,6 +13,7 @@ from contextlib import contextmanager
 _log = logging.getLogger(__name__)
 EVENT = "door_authorized"
 RELEASED = "door_released"
+FAULT = "door_fault"
 
 
 class DoorHeld(RuntimeError):
@@ -15,7 +21,15 @@ class DoorHeld(RuntimeError):
 
 
 class DoorCancelled(DoorHeld):
-    """An uncertain reservation was cancelled; the next attempt needs a new ID."""
+    """The unit id is spent (or an uncertain reservation was cancelled); the next attempt needs a new ID."""
+
+
+class DoorFault(DoorHeld):
+    """auth / invalid: a configuration fault. Never retried blind: the card is blocked (capability)."""
+
+    def __init__(self, reason, detail):
+        super().__init__(f"door {reason}: {detail}")
+        self.reason = reason
 
 
 def enabled():
@@ -28,14 +42,15 @@ def reservation_owned(conn, task_id, run_id):
                         (task_id, run_id, EVENT)).fetchone() is not None
 
 
-def unit_id(conn, task_id):
-    # The board path separates identical ids on different boards; no user prompt content.
+def unit_id(conn, task_id, *, offset=0):
+    """Stable per-attempt id. A held run (door_held) keeps its id, so its arrival survives the wait."""
     import hashlib
+    # The board path separates identical ids on different boards; no user prompt content.
     path = conn.execute("PRAGMA database_list").fetchone()[2]
     board = hashlib.sha256(path.encode()).hexdigest()[:16]
     row = conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=? "
                        "AND COALESCE(outcome,'') != 'door_held'", (task_id,)).fetchone()
-    return f"kb-{board}-{task_id}-{int(row[0])}"
+    return f"kb-{board}-{task_id}-{int(row[0]) + offset}"
 
 
 def canonical_host(host=None):
@@ -47,6 +62,26 @@ def canonical_host(host=None):
     return hid
 
 
+def need():
+    from hermes_cli.fleet_placement import placement
+    n = placement.need_of(placement.load_hosts().footprint("kanban"))
+    return n.cpus, n.ram_gb
+
+
+def mark_asap_if_set(client, conn, hid, uid, task_id):
+    """Urgency is the operator capability (alloc_client.ASAP_OPERATOR), never the pair's. Without it the unit keeps
+    its arrival; the refusal is logged, never raised: ASAP may reorder a start, never block one."""
+    row = conn.execute("SELECT asap FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not (row and row[0]):
+        return False
+    try:
+        client.mark_asap("kanban", hid, uid)
+        return True
+    except (client.Refused, client.Unreachable) as exc:
+        _log.warning("kanban door: ASAP for %s not applied (%s); unit keeps its arrival", task_id, exc)
+        return False
+
+
 def _receipt(conn, task, doc):
     from hermes_cli import kanban_db as kb
     with kb.write_txn(conn):
@@ -55,13 +90,38 @@ def _receipt(conn, task, doc):
         kb._append_event(conn, task.id, EVENT, doc, run_id=task.current_run_id)
 
 
+def _authorize(client, hid, uid, reservation_id, ttl_s):
+    try:
+        ans = client.authorize_start("kanban", hid, uid, ttl_s=ttl_s, existing_reservation_id=reservation_id,
+                                     existing_consumer="kanban" if reservation_id else None)
+    except client.Unreachable:
+        # Lost reply: the server may have authorized. Read the unit before anything else.
+        try:
+            seen = client.lookup_unit("kanban", hid, uid)
+        except (client.Refused, client.Unreachable) as exc:
+            raise DoorHeld(f"door unreachable; unit {uid} unresolved, kept for retry: {exc}") from exc
+        state = seen.get("state")
+        if state == "authorized":
+            # No receipt exists for a start this run never made: cancel the lease, a fresh id next run.
+            client.release(seen["reservation_id"], consumer=f"kanban@{hid}")
+            raise DoorCancelled("lost authorization reply; cancelled, retry with new ID") from None
+        if state == "spent_expired":
+            raise DoorCancelled(f"unit {uid} spent_expired after a lost reply; retry with new ID") from None
+        raise DoorHeld(f"door unreachable; unit {uid} {state}") from None
+    if not ans.get("authorized"):
+        if ans.get("reason") == "not_enqueued":
+            client.enqueue("kanban", hid, uid, *need())   # same id again; the next tick retries it
+        raise DoorHeld(ans.get("reason") or "door held")
+    return ans
+
+
 @contextmanager
 def start(conn, task, host=None, *, reservation_id=None, client=None):
     """One authorization per actual start, upgraded in place when capacity was booked.
 
-    Receipt precedes spawn. A repeated authorization never spawns again. An
-    uncertain transport leaves the original ID intact, so its retry cannot spend
-    twice. Pair-owned leases survive restart in task_events, not a process cache.
+    Receipt precedes spawn. A repeated authorization never spawns again. A lost reply is
+    reconciled by lookup_unit before any retry, so a retry cannot spend twice. Pair-owned
+    leases survive restart in task_events, not a process cache.
     """
     if not enabled():
         yield
@@ -73,31 +133,24 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
         hid = canonical_host(host)
     except Exception as exc:
         raise DoorHeld(f"door host unavailable: {exc}") from exc
-    # Before claim the next run count is N; after claim it is N+1.
-    uid = unit_id(conn, task.id)
-    prefix, count = uid.rsplit("-", 1)
-    uid = f"{prefix}-{int(count) - 1}"
-    row = conn.execute("SELECT asap FROM tasks WHERE id=?", (task.id,)).fetchone()
+    # claim_task opened this run: the waiting id is the one the publisher used before the claim.
+    uid = unit_id(conn, task.id, offset=-1)
+    if reservation_owned(conn, task.id, task.current_run_id):
+        raise DoorHeld("run already authorized; reconcile original start")
     try:
-        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
-                        (task.id, task.current_run_id, EVENT)).fetchone():
-            raise DoorHeld("run already authorized; reconcile original start")
-        # A direct spawn_now has not participated in a publisher tick yet.
-        from hermes_cli.fleet_placement import placement
-        need = placement.need_of(placement.load_hosts().footprint("kanban"))
-        client.enqueue("kanban", hid, uid, need.cpus, need.ram_gb)
-        if row and row[0]:
-            client.mark_asap("kanban", hid, uid)
-        ans = client.authorize_start("kanban", hid, uid, ttl_s=kanban_headroom.RESERVE_TTL_S,
-                                     existing_reservation_id=reservation_id,
-                                     existing_consumer="kanban" if reservation_id else None)
+        # A direct spawn_now has not been through a publisher tick; a repeat enqueue keeps the arrival.
+        client.enqueue("kanban", hid, uid, *need())
+        mark_asap_if_set(client, conn, hid, uid, task.id)
+        ans = _authorize(client, hid, uid, reservation_id, kanban_headroom.RESERVE_TTL_S)
+    except client.AuthorizeRefused as exc:
+        if exc.reason == "spent_expired":
+            # kanban's existence check is the run row: this run holds no door_authorized receipt, so no start.
+            raise DoorCancelled(f"unit {uid} spent_expired; retry with new ID") from exc
+        raise DoorFault(exc.reason, exc.detail or str(exc)) from exc
     except (client.Refused, client.Unreachable) as exc:
         raise DoorHeld(f"door unavailable: {exc}") from exc
-    if not ans.get("authorized"):
-        raise DoorHeld(ans.get("reason") or "door held")
     if ans.get("reused"):
-        # No receipt and no spawn on this run: the earlier reply was lost.
-        # Do not spend it again; cancel explicitly and use a fresh attempt.
+        # spent_live with no receipt on this run: the earlier reply was lost. Cancel, never a second spawn.
         client.release(ans["reservation_id"], consumer=f"kanban@{hid}")
         raise DoorCancelled("reconciled uncertain authorization; retry with new ID")
     doc = {"reservation_id": ans["reservation_id"], "consumer": f"kanban@{hid}",
@@ -126,16 +179,26 @@ def spawn(conn, task, workspace, *, host, spawn, spawn_kwargs, state, reservatio
 
 
 def defer(conn, task, reason=None):
-    """A held start is not a failure; preserve the waiting ID for the next run."""
+    """A held start is not a failure: the claim returns without penalty and the waiting id is kept (a cancelled
+    one moves on). A DoorFault (auth / invalid) is a config fault: the card is blocked for a human, never retried."""
     from hermes_cli import kanban_db as kb
+    outcome = ("door_fault" if isinstance(reason, DoorFault) else
+               "door_cancelled" if isinstance(reason, DoorCancelled) else "door_held")
     with kb.write_txn(conn):
-        if kb._claim_still_held(conn, task):
-            retry = kb._retry_status_for_run(conn, task.id, task.current_run_id)
-            conn.execute("UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,"
-                         "worker_pid=NULL WHERE id=?", (retry, task.id))
-            kb._end_run(conn, task.id, outcome="door_cancelled" if isinstance(reason, DoorCancelled)
-                        else "door_held", metadata={"retry_status": retry})
-            kb._append_event(conn, task.id, "door_held", {}, run_id=task.current_run_id)
+        if not kb._claim_still_held(conn, task):
+            return
+        retry = kb._retry_status_for_run(conn, task.id, task.current_run_id)
+        conn.execute("UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,"
+                     "worker_pid=NULL WHERE id=?", (retry, task.id))
+        kb._end_run(conn, task.id, outcome=outcome, metadata={"retry_status": retry})
+        kb._append_event(conn, task.id, FAULT if outcome == "door_fault" else "door_held",
+                         {"reason": str(reason or "")[:300]}, run_id=task.current_run_id)
+    if isinstance(reason, DoorFault):
+        _log.error("kanban door %s for %s: %s (config fault; card blocked, not retried)",
+                   reason.reason, task.id, reason)
+        kb.block_task(conn, task.id, reason=f"kanban door {reason.reason}: {str(reason)[:200]}; operator: "
+                      "check kanban@<host> pair token / door schema", kind="capability",
+                      require_unclaimed_ready=True)
 
 
 def _mark_released(conn, tid, run_id, doc):

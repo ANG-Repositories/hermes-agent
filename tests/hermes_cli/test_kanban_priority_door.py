@@ -21,16 +21,28 @@ def board(tmp_path, monkeypatch):
 
 
 class Client:
+    """The pinned alloc_client surface (hermes-home 01524a8d), recording calls."""
     class Refused(Exception):
         pass
 
     class Unreachable(Exception):
         pass
 
+    class AuthorizeRefused(Refused):
+        def __init__(self, reason, detail=""):
+            super().__init__(f"{reason}: {detail}")
+            self.reason, self.detail = reason, detail
+
     def __init__(self):
         self.calls = []
         self.reused = False
         self.authorized = True
+        self.raise_on_authorize = None
+        self.lookup = {"state": "unknown"}
+
+    def lookup_unit(self, *args):
+        self.calls.append(("lookup", args))
+        return self.lookup
 
     def enqueue(self, *args):
         self.calls.append(("enqueue", args))
@@ -46,7 +58,11 @@ class Client:
 
     def authorize_start(self, *args, **kwargs):
         self.calls.append(("authorize", args, kwargs))
-        return {"authorized": self.authorized, "reused": self.reused,
+        if self.raise_on_authorize is not None:
+            raise self.raise_on_authorize
+        if not self.authorized:
+            return {"authorized": False, "reason": "queued_behind", "detail": ""}
+        return {"authorized": True, "reused": self.reused,
                 "reservation_id": "same-row", "until": 9999999999}
 
     def release(self, rid, **kwargs):
@@ -104,8 +120,10 @@ def test_actual_launch_upgrades_once_and_reconciles_without_second_spawn(board, 
     priority.publish_waiting(board, {"ace-ai": [{"id": child, "asap": False}]}, client=client)
     assert client.calls[-1][0] == "enqueue"
     child_uid = door.unit_id(board, child)
+    client.calls.clear()
     priority.publish_waiting(board, {"ace-ai": []}, client=client)
-    assert client.calls[-1] == ("withdraw", ("kanban", "ace-ai", child_uid))
+    # withdraw precedes any enqueue, so a card that moved host leaves the old host first
+    assert client.calls[0] == ("withdraw", ("kanban", "ace-ai", child_uid))
 
 
 def test_failed_spawn_releases_and_held_attempt_keeps_arrival_id(board, monkeypatch):
@@ -135,3 +153,82 @@ def test_failed_spawn_releases_and_held_attempt_keeps_arrival_id(board, monkeypa
     with door.start(board, task, "ace-ai", client=client):
         pass
     assert client.calls == []
+
+
+def _claimed(board, monkeypatch, title):
+    monkeypatch.setattr(door, "enabled", lambda: True)
+    monkeypatch.setattr(door, "canonical_host", lambda host: "ace-ai")
+    monkeypatch.setattr(door, "need", lambda: (1.0, 3.0))
+    tid = kb.create_task(board, title=title, assignee=None)
+    uid = door.unit_id(board, tid)
+    return tid, uid, kb.claim_task(board, tid)
+
+
+def test_typed_refusals_follow_the_p1_recovery_rule(board, monkeypatch):
+    """hermes-home 9141c8dd AUTHORIZE_REASONS: spent_expired -> new id next run (no spawn, no fault);
+    auth/invalid -> config fault, card blocked, never retried blind; not_enqueued -> SAME id re-enqueued."""
+    client = Client()
+    tid, uid, task = _claimed(board, monkeypatch, "spent")
+    client.raise_on_authorize = Client.AuthorizeRefused("spent_expired", "lease gone")
+    with pytest.raises(door.DoorCancelled):
+        with door.start(board, task, "ace-ai", client=client):
+            pytest.fail("spent unit must not spawn")
+    door.defer(board, task, door.DoorCancelled("x"))
+    assert door.unit_id(board, tid) != uid                               # the next attempt is a NEW id
+    assert kb.get_task(board, tid).status == "ready"
+
+    tid, uid, task = _claimed(board, monkeypatch, "auth")
+    client.raise_on_authorize = Client.AuthorizeRefused("auth", "pair token mismatch")
+    with pytest.raises(door.DoorFault) as held:
+        with door.start(board, task, "ace-ai", client=client):
+            pytest.fail("auth fault must not spawn")
+    door.defer(board, task, held.value)
+    assert kb.get_task(board, tid).status == "blocked"                   # a human fixes config; no blind retry
+
+    tid, uid, task = _claimed(board, monkeypatch, "requeue")
+    client.raise_on_authorize = None
+    client.calls.clear()
+    monkeypatch.setattr(client, "authorize_start", lambda *a, **k: {"authorized": False, "reason": "not_enqueued"})
+    with pytest.raises(door.DoorHeld):
+        with door.start(board, task, "ace-ai", client=client):
+            pytest.fail("not enqueued must not spawn")
+    assert [c for c in client.calls if c[0] == "enqueue"][-1][1][2] == uid  # the SAME id, twice
+
+
+def test_lost_reply_is_reconciled_by_lookup_before_any_retry(board, monkeypatch):
+    client = Client()
+    tid, uid, task = _claimed(board, monkeypatch, "lost")
+    client.raise_on_authorize = Client.Unreachable("reply lost")
+    client.lookup = {"state": "authorized", "reservation_id": "ghost", "until": 1}
+    with pytest.raises(door.DoorCancelled):
+        with door.start(board, task, "ace-ai", client=client):
+            pytest.fail("never spawn on an unreceipted lease")
+    assert ("lookup", ("kanban", "ace-ai", uid)) in client.calls
+    assert client.calls[-1] == ("release", "ghost", {"consumer": "kanban@ace-ai"})
+    client.lookup = {"state": "waiting"}
+    client.calls.clear()
+    with pytest.raises(door.DoorHeld) as held:
+        with door.start(board, task, "ace-ai", client=client):
+            pytest.fail("unresolved unit must not spawn")
+    assert not isinstance(held.value, door.DoorCancelled)                # same id kept for the retry
+    assert not any(c[0] == "release" for c in client.calls)
+
+
+def test_asap_without_operator_capability_never_blocks_a_start(board, monkeypatch):
+    """mark_asap needs the asap-operator token; a pair-only dispatcher gets Refused. The start still proceeds at
+    the unit's own arrival: urgency may reorder, never hold."""
+    from hermes_cli import kanban_priority
+    client = Client()
+    tid, uid, task = _claimed(board, monkeypatch, "urgent")
+    kanban_priority._set_asap(board, tid, True, operator="apollo")
+
+    def refuse(*args):
+        client.calls.append(("mark_asap", args))
+        raise Client.Refused("asap operator capability required")
+
+    monkeypatch.setattr(client, "mark_asap", refuse)
+    spawned = []
+    with door.start(board, task, "ace-ai", client=client):
+        spawned.append(tid)
+    assert spawned == [tid]
+    assert ("mark_asap", ("kanban", "ace-ai", uid)) in client.calls
