@@ -833,7 +833,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = False,
-                              explicit_home: Optional[str] = None) -> bool:
+                              explicit_home: Optional[str] = None,
+                              home_fallback: bool = False) -> bool:
     """Subscribe the originating chat to ``task_id`` when configured.
 
     Gated by ``kanban.cli_auto_subscribe`` (default False). ``hermes kanban
@@ -850,7 +851,9 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
     ``tasks.boomerang_wake``).
 
     ``explicit_home`` (the ``--session`` value, t_ea40ff83): a home that is not the
-    caller's own subscribes the HOME's chat, never the caller's.
+    caller's own subscribes the HOME's chat, never the caller's. ``home_fallback``
+    (operator callers): with no gateway identity in env, a routable explicit home is
+    subscribed directly (Ace 2026-11-06: boomerang wake is the default for homed cards).
 
     Returns True when a subscription row was written. Never raises — a
     notification bookkeeping failure must not fail the create.
@@ -867,6 +870,7 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
             wake=True if boomerang_wake else None,
             explicit_home=(None if explicit_home is None
                            else (explicit_home, _caller_session_id())),
+            home_fallback=home_fallback,
         )
     except Exception:
         return False
@@ -994,15 +998,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
     try:
         with kb.connect_closing() as conn:
             from hermes_cli.config import cfg_get as _cfg_get, load_config as _load_config
-            from tools.kanban_tools import _auto_boomerang, _auto_wake, _resolve_notify_target
+            from tools.kanban_tools import (_auto_boomerang, _auto_wake, _resolve_notify_target,
+                                            routable_home_target)
             # Scripts and cron drive the CLI: the boomerang default only follows a CLI create
-            # that kanban.cli_auto_subscribe (default False) would subscribe (Prism 1aec29b63c57).
+            # that kanban.cli_auto_subscribe (default False) would subscribe (Prism 1aec29b63c57),
+            # OR one that names an explicit --session whose home has a routable chat (Ace
+            # 2026-11-06: the card's home gets boomerang wake by default, env or not).
+            _explicit_sid = (_resolve_session_flag(args.session)
+                             if getattr(args, "session", None) is not None else None)
             boomerang = _auto_boomerang(
                 getattr(args, "boomerang_wake", None),
                 worker=is_dispatcher_owned_worker_context(),
                 subscribed=bool(_cfg_get(_load_config(), "kanban", "cli_auto_subscribe", default=False)
                                 and _auto_wake(None)
-                                and _resolve_notify_target(require_platform_identity=True)))
+                                and _resolve_notify_target(require_platform_identity=True))
+                or bool(_explicit_sid and routable_home_target(_explicit_sid) is not None))
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
@@ -1069,7 +1079,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             auto_subscribed = _maybe_cli_auto_subscribe(
                 conn, task_id, boomerang_wake=bool(boomerang),
                 explicit_home=(task.session_id or "" if getattr(args, "session", None) is not None
-                               else None))
+                               else None),
+                home_fallback=bool(boomerang) and not is_dispatcher_owned_worker_context())
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
