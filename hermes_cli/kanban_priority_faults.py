@@ -189,32 +189,63 @@ def latched():
 
 # -- class 3 -------------------------------------------------------------------------------------------------------
 
-def note_transport(err: str) -> None:
+# Transport health is tracked PER VERB (round 3, t_0c5ef02e): ``authorize`` is the start boundary (enqueue,
+# authorize_start and its lost-reply lookup), ``publish`` the waiting publisher. Only the verb's own answer clears
+# its history: a healthy publish or lookup proves nothing about authorize_start (reader repro: authorize 503 for
+# 732 s while publish/lookup answered gave twelve 60 s retries and no page). Any verb in backoff holds starts;
+# one page per outage across verbs, one clear when the last verb recovers.
+VERBS = ("authorize", "publish")
+
+
+def _transport(doc) -> dict:
+    t = doc.get("transport")
+    return t if isinstance(t, dict) and all(isinstance(v, dict) for v in t.values()) else {}
+
+
+def note_transport(err: str, verb: str = "authorize") -> None:
+    if verb not in VERBS:
+        raise ValueError(f"unknown door verb {verb!r}")
     now = _now()
     with _state() as doc:
-        t = doc.get("transport")
+        verbs = _transport(doc)
+        t = verbs.get(verb)
         interval = tick_interval() if not t else min(TRANSPORT_MAX_BACKOFF_S, float(t["interval"]) * 2)
         t = {"since": now if not t else t["since"], "interval": interval, "next_at": now + interval,
-             "paged": bool(t and t.get("paged")), "error": str(err)[:300]}
-        if not t["paged"] and now - t["since"] > TRANSPORT_PAGE_AFTER_S:
-            _page(f"kanban door: allocd unreachable for {int(now - t['since'])} s; kanban starts held: {err}")
-            t["paged"] = True
-        doc["transport"] = t
+             "error": str(err)[:300]}
+        verbs[verb] = t
+        paged = any(v.get("paged") for v in verbs.values())
+        if not paged and now - t["since"] > TRANSPORT_PAGE_AFTER_S:
+            _page(f"kanban door: allocd {verb} unreachable for {int(now - t['since'])} s; kanban starts held: {err}")
+            paged = True
+        t["paged"] = paged
+        doc["transport"] = verbs
 
 
-def note_success() -> None:
+def note_success(verb: str = "authorize") -> None:
+    if verb not in VERBS:
+        raise ValueError(f"unknown door verb {verb!r}")
     with _state() as doc:
-        t = doc.pop("transport", None)
-        if t and t.get("paged"):
+        verbs = _transport(doc)
+        t = verbs.pop(verb, None)
+        if t is None:
+            return
+        if verbs:
+            if t.get("paged"):
+                for v in verbs.values():
+                    v["paged"] = True             # the outage page is still open on the other verb
+            doc["transport"] = verbs
+            return
+        doc.pop("transport", None)
+        if t.get("paged"):
             _page("kanban door: allocd reachable again; kanban starts resumed")
 
 
 def backoff_remaining():
     with _state() as doc:
-        t = doc.get("transport")
-    if not t:
+        verbs = _transport(doc)
+    if not verbs:
         return None
-    left = float(t["next_at"]) - _now()
+    left = max(float(v["next_at"]) for v in verbs.values()) - _now()
     return left if left > 0 else None
 
 

@@ -120,8 +120,7 @@ def _authorize(client, hid, uid, reservation_id, ttl_s):
             seen = client.lookup_unit("kanban", hid, uid)
         except client.Unreachable as exc:
             raise DoorUnreachable(f"door unreachable; unit {uid} unresolved, kept for retry: {exc}") from exc
-        from hermes_cli import kanban_priority_faults as faults
-        faults.note_success()                     # allocd answered the lookup
+        # A lookup answer is NOT authorize health: the authorize transport history stays (per-verb, round 3).
         state = seen.get("state")
         if state == "authorized":
             # No receipt exists for a start this run never made: cancel the lease, a fresh id next run.
@@ -131,7 +130,7 @@ def _authorize(client, hid, uid, reservation_id, ttl_s):
             raise DoorCancelled(f"unit {uid} spent_expired after a lost reply; retry with new ID") from None
         raise DoorUnreachable(f"door unreachable; unit {uid} {state}") from None
     from hermes_cli import kanban_priority_faults as faults
-    faults.note_success()                         # an answer, a grant or an order refusal (class 4)
+    faults.note_success("authorize")              # authorize_start answered: a grant or an order refusal (class 4)
     if not ans.get("authorized"):
         if ans.get("reason") == "not_enqueued":
             client.enqueue("kanban", hid, uid, *need())   # same id again; the next tick retries it
@@ -189,7 +188,7 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
         faults.claim_block(task.id)
         raise
     except DoorUnreachable as exc:
-        faults.note_transport(str(exc))
+        faults.note_transport(str(exc), "authorize")
         raise
     if ans.get("reused"):
         # spent_live with no receipt on this run: the earlier reply was lost. Cancel, never a second spawn.

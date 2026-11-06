@@ -225,7 +225,7 @@ def test_transport_fault_holds_same_id_on_capped_backoff_and_pages_after_10_min(
     assert len(allocd.calls) == first
     intervals = []
     for _ in range(8):
-        t = json.loads((fleet.root / faults.STATE_REL).read_text())["transport"]
+        t = json.loads((fleet.root / faults.STATE_REL).read_text())["transport"]["publish"]   # full outage: publish fails first
         intervals.append(t["interval"])
         clock[0] = t["next_at"] + 1
         _tick(spawned)
@@ -242,6 +242,52 @@ def test_transport_fault_holds_same_id_on_capped_backoff_and_pages_after_10_min(
     assert len(fleet.pages) == 2 and "again" in fleet.pages[1]
     auth = [b for p, b in allocd.calls if p == "/demand/authorize"]
     assert [b["id"] for b in auth] == [uid]
+
+
+def test_partial_outage_publish_and_lookup_succeed_authorize_503_backs_off_and_pages(fleet, monkeypatch):
+    """Round-3 reader repro (kanban_priority.py:181, kanban_priority_door.py:123-124): publish and lookup answer,
+    authorize_start returns 503 for 732 s. Transport health is per verb: a successful publish or lookup must NOT
+    clear the authorize history, so the backoff doubles to 300 s and exactly one page fires past 600 s; the first
+    successful authorize clears it (one clear page)."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    t0 = time.time()
+    clock = [t0]
+    monkeypatch.setattr(faults, "_now", lambda: clock[0])
+    allocd = Allocd()
+    ok = ok_door()
+    authorize_up = [False]
+
+    def answer(path, body):
+        if path == "/demand/authorize" and not authorize_up[0]:
+            return 503, {"error": "authorize down"}
+        if path == "/demand/lookup":
+            return 200, {"schema": 1, "workload": body["workload"], "host": body["host"], "id": body["id"],
+                         "state": "waiting"}
+        return ok(path, body)
+    allocd.answer = answer
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    tid, spawned = _card(), []
+    intervals = []
+    while clock[0] - t0 <= 732:
+        _tick(spawned)
+        t = json.loads((fleet.root / faults.STATE_REL).read_text()).get("transport", {})
+        assert "publish" not in t, t
+        t = t.get("authorize")
+        assert t, "a successful publish/lookup cleared the authorize transport history"
+        intervals.append(t["interval"])
+        clock[0] = t["next_at"] + 1
+    assert "/demand/lookup" in allocd.paths() and "/demand/publish" in allocd.paths()
+    assert spawned == [] and _status(tid).status == "ready"
+    assert intervals[:3] == [60.0, 120.0, 240.0] and intervals[-1] == faults.TRANSPORT_MAX_BACKOFF_S
+    assert len(fleet.pages) == 1 and "unreachable" in fleet.pages[0]
+    authorize_up[0] = True
+    _tick(spawned)
+    assert spawned == [tid]
+    state = json.loads((fleet.root / faults.STATE_REL).read_text())
+    assert not any(k.startswith("transport") for k in state), state
+    assert len(fleet.pages) == 2 and "again" in fleet.pages[1]
 
 
 _KILLED_TICK = """

@@ -134,7 +134,7 @@ class _Stop(Exception):
 def _classify(client, faults, exc, errors):
     """Class 2 (missing token, typed auth/invalid) latches and stops; class 3 (transport) backs off and stops."""
     if isinstance(exc, client.Unreachable):
-        faults.note_transport(str(exc))
+        faults.note_transport(str(exc), "publish")
         raise _Stop(errors)
     if isinstance(exc, client.Refused):
         faults.latch(f"door publish refused: {exc}")
@@ -178,7 +178,7 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
                 _classify(client, faults, exc, errors)
             current.add((hid, uid))
             door.mark_asap_if_set(client, conn, hid, uid, card["id"])
-    faults.note_success()
+    faults.note_success("publish")                   # publish health only; never clears the authorize history
     return errors
 
 
