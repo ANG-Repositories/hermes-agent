@@ -73,7 +73,6 @@ from typing import Mapping, Optional
 from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy (hermes-home: sys.path + lazy _Placement)
 
 
-
 def _fleet_root() -> Path:
     """Fleet root: preserve legacy placement resolution when available; standalone uses explicit root."""
     env = os.environ.get("PLACEMENT_HOME")
