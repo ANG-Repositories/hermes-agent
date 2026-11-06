@@ -86,7 +86,8 @@ def round_marked(gh, ref, head: str, record, own_runs: Optional[Iterable] = None
 def gh_draft(repo: str, number: int) -> bool:
     try:
         proc = subprocess.run(["gh", "pr", "ready", str(number), "--repo", repo, "--undo"],
-                              capture_output=True, text=True, timeout=60, check=False)
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         _log.warning("round draft: gh pr ready --undo %s#%s failed: %s", repo, number, exc)
         return False
@@ -99,7 +100,8 @@ def gh_draft(repo: str, number: int) -> bool:
 def gh_comment(repo: str, number: int, body: str) -> bool:
     try:
         proc = subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/issues/{number}/comments",
-                               "-f", f"body={body}"], capture_output=True, text=True, timeout=60, check=False)
+                               "-f", f"body={body}"], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         _log.warning("round draft: mark on %s#%s failed: %s", repo, number, exc)
         return False
