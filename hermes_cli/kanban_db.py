@@ -6400,6 +6400,8 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("title", title), ("body", body)])
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -8712,6 +8714,8 @@ def add_comment(
     card, author, verb and session inside the insert's transaction; else
     :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("comment", body)])
     _validate_comment_args(author, body, kernel_approve=_kernel_approve)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
@@ -12938,6 +12942,8 @@ def edit_task(
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("title", title), ("body", body)])
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
