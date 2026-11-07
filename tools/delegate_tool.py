@@ -1962,6 +1962,9 @@ def _build_child_agent(
     # Boomerang v2 (spec §5.1, D-2/D-16): "fork"|"branch"|"summary"|None. None keeps
     # inherit_context's v1 meaning (true -> "summary"), so existing callers are unchanged.
     inherit_mode: Optional[str] = None,
+    # The batch's live delegation id, when known at build time: only attributes the
+    # ``boomerang.fork_ineligible`` line to its batch (fork-fan RC-8).
+    delegation_id: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -2056,7 +2059,7 @@ def _build_child_agent(
         if _ok:
             rt = _fork_rt
         else:
-            _fork.log_ineligible(_reason, parent_agent)
+            _fork.log_ineligible(_reason, parent_agent, delegation_id=delegation_id, task_index=task_index)
             mode = "summary"
     # ── Boomerang context inheritance (spec v0.8 D-4 / P0.3) ────────────
     # When inherit_context is set, fold the PARENT's conversation history into
@@ -2137,7 +2140,8 @@ def _build_child_agent(
         _parent_fp = _fork.request_fingerprint(parent_agent)
         _diff = [k for k, v in _fork.request_fingerprint(child).items() if v != _parent_fp[k]]
         if _diff:
-            _fork.log_ineligible("same_request_params:" + ",".join(_diff), parent_agent)
+            _fork.log_ineligible("same_request_params:" + ",".join(_diff), parent_agent,
+                                delegation_id=delegation_id, task_index=task_index)
             with _quiet("fork downgrade: child close failed", exc_info=True):
                 _teardown(child, "fork downgrade before first run")
             if child_session_db is not None and not getattr(child, "_owns_session_db", False):
@@ -3821,6 +3825,7 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                delegation_id=live_deleg_id,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -4286,6 +4291,7 @@ def delegate_task(
                     else None
                 ),
                 skills=(t.get("skills") if "skills" in t else skills),
+                delegation_id=live_deleg_id,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
