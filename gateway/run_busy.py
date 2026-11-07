@@ -474,7 +474,11 @@ class GatewayBusySessionMixin:
         tasks = getattr(self, "_active_session_release_tasks", None)
         if tasks is None:
             tasks = self._active_session_release_tasks = set()
+        existing = getattr(lease, "_gateway_release_task", None)
+        if isinstance(existing, asyncio.Task):
+            return existing
         task = loop.create_task(asyncio.to_thread(lease.release))
+        lease._gateway_release_task = task
         tasks.add(task)
 
         def finished(done):
@@ -484,6 +488,17 @@ class GatewayBusySessionMixin:
 
         task.add_done_callback(finished)
         return task
+
+    async def _wait_active_session_release(self, task):
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _drain_active_session_releases(self):
         """Do not cancel lease cleanup with ordinary background work at shutdown."""

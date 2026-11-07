@@ -157,3 +157,69 @@ async def test_cross_runner_claim_honors_registry_cap(rig):
     await runner._release_active_session_lease(winners[0])
     assert not active_sessions._read_entries(path)
 
+
+@pytest.mark.asyncio
+async def test_superseded_acquisition_never_clears_successor(rig, monkeypatch):
+    from gateway.session import build_session_key
+    runner, path = rig
+    event = _make_event()
+    key = build_session_key(event.source)
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    loop = asyncio.get_running_loop()
+    acquire = runner._claim_active_session_slot
+
+    def delayed(*args):
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(5)
+        return acquire(*args)
+
+    monkeypatch.setattr(runner, "_claim_active_session_slot", delayed)
+    turn = asyncio.create_task(runner._handle_message(event))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        runner._invalidate_session_run_generation(key, reason="test supersession")
+        successor = object()
+        runner._session_state(key).turn.agent = successor
+    finally:
+        proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    assert runner._session_state(key).turn.agent is successor
+    runner._handle_message_with_agent.assert_not_awaited()
+    assert not active_sessions._read_entries(path)
+
+
+@pytest.mark.asyncio
+async def test_release_barrier_survives_cancellation_and_is_idempotent(rig, monkeypatch):
+    runner, path = rig
+    lease, _ = await runner._claim_active_session_slot_off_loop("a", _make_event().source)
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_release = lease.release
+    calls = []
+
+    def release():
+        calls.append(1)
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(5)
+        real_release()
+
+    monkeypatch.setattr(lease, "release", release)
+    task = runner._release_active_session_lease(lease)
+    assert runner._release_active_session_lease(lease) is task
+    waiter = asyncio.create_task(runner._wait_active_session_release(task))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+    finally:
+        proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await runner._drain_active_session_releases()
+    assert calls == [1]
+    assert not active_sessions._read_entries(path)
+
