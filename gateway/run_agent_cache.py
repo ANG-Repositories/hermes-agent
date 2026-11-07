@@ -323,7 +323,7 @@ class GatewayAgentCacheMixin:
         if state is not None:
             if state.turn.lease is not None:
                 try:
-                    state.turn.lease.release()
+                    self._release_active_session_lease(state.turn.lease)
                 except Exception:
                     logger.debug("Failed to release active session slot", exc_info=True)
             # One structured reset instead of a drifting pop-list. Turn-lease tokens are deliberately NOT

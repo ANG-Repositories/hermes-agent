@@ -2336,6 +2336,14 @@ class GatewayShutdownMixin:
         # CancelledError into this _stop_impl and skip _shutdown_event.set() / _exit_code = 75 (#12875). It
         # self-terminates anyway.
         self._background_tasks.clear()
+        # Acquisitions own their worker until it returns, even when cancelled.
+        # Join them before draining the durable releases they may enqueue.
+        _claims = tuple(getattr(self, "_active_session_claim_tasks", ()))
+        for _claim in _claims:
+            _claim.cancel()
+        if _claims:
+            await asyncio.gather(*_claims, return_exceptions=True)
+        await self._drain_active_session_releases()
         ctx.api_live = self._active_api_run_count()
         # Fork: sweep follow-ups still parked in adapter queues into the restart spool before the
         # adapters (and their queues) die with the process.
@@ -2348,6 +2356,7 @@ class GatewayShutdownMixin:
         self.adapters.clear()
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
+        await self._drain_active_session_releases()
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
         # Off-loop (fork): each payload ends in an unbounded os.replace inside the timed shutdown path.
         # Pass the LIVE view with drain=True rather than a dict() copy: the offload's await is a window in

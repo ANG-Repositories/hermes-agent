@@ -388,11 +388,8 @@ class GatewayBusySessionMixin:
         self, session_key: str, source: SessionSource
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
-        if self._is_session_running(session_key):
-            return None, None
-        limit_message = self._active_session_limit_message(session_key)
-        if limit_message is not None:
-            return None, limit_message
+        # Local admission is checked on the loop before reserving the pending slot.
+        # This method runs wholly in a worker: never inspect mutable runner state here.
         try:
             from hermes_cli.active_sessions import try_acquire_active_session
             platform = source.platform.value if source and source.platform else "gateway"
@@ -416,6 +413,82 @@ class GatewayBusySessionMixin:
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
             return None, None
+
+    async def _claim_active_session_slot_off_loop(self, session_key, source):
+        # Serialize displaced generations too: an older queued worker must never
+        # re-enter the registry after a successor has acquired its lease.
+        locks = getattr(self, "_active_session_claim_locks", None)
+        if locks is None:
+            locks = self._active_session_claim_locks = {}
+        lock = locks.setdefault(session_key, asyncio.Lock())
+        pending = getattr(self, "_active_session_claim_tasks", None)
+        if pending is None:
+            pending = self._active_session_claim_tasks = {}
+        owner = asyncio.current_task()
+        pending[owner] = session_key
+        try:
+            async with lock:
+                return await self._await_active_session_claim(session_key, source)
+        finally:
+            pending.pop(owner, None)
+            # Count users explicitly rather than relying on Lock's private waiters.
+            if session_key not in pending.values():
+                locks.pop(session_key, None)
+
+    async def _await_active_session_claim(self, session_key, source):
+        """Keep ownership until a cancelled worker has returned its exact lease.
+
+        Cancelling an executor await does not stop its thread. Shield and join it,
+        including repeated cancellation, before unwinding the pending generation.
+        """
+        worker = asyncio.create_task(asyncio.to_thread(
+            self._claim_active_session_slot, session_key, source,
+        ))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        lease, message = worker.result()
+        if cancelled:
+            if lease is not None:
+                cleanup = self._release_active_session_lease(lease)
+                if cleanup is not None:
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            pass
+                    cleanup.result()
+            raise asyncio.CancelledError
+        return lease, message
+
+    def _release_active_session_lease(self, lease):
+        """Detach the exact lease from turn state before scheduling durable I/O."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            lease.release()
+            return None
+        tasks = getattr(self, "_active_session_release_tasks", None)
+        if tasks is None:
+            tasks = self._active_session_release_tasks = set()
+        task = loop.create_task(asyncio.to_thread(lease.release))
+        tasks.add(task)
+
+        def finished(done):
+            tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                logger.error("Failed to release active session slot", exc_info=done.exception())
+
+        task.add_done_callback(finished)
+        return task
+
+    async def _drain_active_session_releases(self):
+        """Do not cancel lease cleanup with ordinary background work at shutdown."""
+        while tasks := tuple(getattr(self, "_active_session_release_tasks", ())):
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks))
 
     @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:

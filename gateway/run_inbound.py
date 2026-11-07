@@ -1579,7 +1579,7 @@ class GatewayInboundMixin:
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
+        _limit_message = self._active_session_limit_message(_quick_key)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             if _checkout_ticket is not None:
@@ -1589,8 +1589,6 @@ class GatewayInboundMixin:
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
         _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
@@ -1602,12 +1600,22 @@ class GatewayInboundMixin:
         if not hasattr(self, "_running_agent_tasks"):
             self._running_agent_tasks = {}  # self-heal for object.__new__ partials
         self._running_agent_tasks[_quick_key] = asyncio.current_task()
-        from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
-        start_reply_clock(source, internal=is_internal)
-        self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            _active_session_lease, _limit_message = await self._claim_active_session_slot_off_loop(
+                _quick_key, source,
+            )
+            if _claim_state.persistent.run_generation != _run_generation:
+                if _active_session_lease is not None:
+                    self._release_active_session_lease(_active_session_lease)
+                raise asyncio.CancelledError
+            if _limit_message is not None:
+                return _limit_message
+            _claim_state.turn.lease = _active_session_lease
+            from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
+            start_reply_clock(source, internal=is_internal)
+            self._persist_active_agents()
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
