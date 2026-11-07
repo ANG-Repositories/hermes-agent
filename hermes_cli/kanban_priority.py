@@ -212,15 +212,16 @@ def _table_hosts():
 
 
 def _auth_refusal(client, exc) -> bool:
-    """A stale-record withdraw we can never authenticate: no/unreadable pair token, or a typed ``auth`` refusal."""
+    """Only explicit credential faults are auth; a bare HTTP refusal must still latch."""
     if not isinstance(exc, client.Refused):
         return False
-    return getattr(exc, "reason", "auth") == "auth"
+    return (getattr(exc, "reason", None) == "auth"
+            or isinstance(exc, getattr(client, "TokenUnreadable", ()))
+            or str(exc) == "provisioned demand publisher token required")
 
 
 def _drop_stale(current, hid, uid, why) -> None:
-    """Round 6 (Prism 7e404c636d6f): a recorded unit on a host we cannot reach cannot be live for us; keeping it made
-    every publish withdraw it, get Refused and latch, forever. Drop it from the record with one line; never latch."""
+    """A host removed from the table has no withdrawal destination. Warn once and forget it."""
     current.discard((hid, uid))
     _log.warning("kanban door: dropped published unit %s on %s from the record: %s", uid, hid, why)
 
@@ -238,12 +239,39 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
             raise _Stop({(host, None): str(exc)}) from exc
         plan.append((host, hid, [(card, door.unit_id(conn, card["id"])) for card in cards]))
     current = door.load_published(conn)
+    pending = door.load_pending_withdrawals(conn)
     wanted = {(hid, uid) for _, hid, rows in plan for _, uid in rows}
-    if not plan and not current:
+    if not plan and not current and not pending:
         return {}                # no allocd call made: proves nothing about publish health (Prism 0056dc604414)
     errors = {}
     known = _table_hosts()
+    import time
+    from hermes_cli.fleet_placement import alloc_client
+    # Waiting units expire by demand freshness, NOT authorize_start's reservation TTL.
+    ttl = alloc_client._sibling("admission_demand").max_age_s()
+    now = time.time()
+    answered = False
     try:
+        for entry in list(pending):
+            hid, uid = entry["host"], entry["unit_id"]
+            if known is not None and hid not in known:
+                pending.remove(entry)
+                _log.warning("kanban door: dropped pending withdrawal %s on %s: host left table", uid, hid)
+                continue
+            if now - entry["first_seen"] > ttl:
+                pending.remove(entry)
+                _log.info("kanban door: expired pending withdrawal %s on %s after %s seconds", uid, hid, ttl)
+                continue
+            try:
+                client.withdraw("kanban", hid, uid)  # idempotent, including a unit already absent
+                pending.remove(entry)
+                answered = True
+            except (client.Refused, client.Unreachable) as exc:
+                entry["last_reason"] = str(exc)
+                if _auth_refusal(client, exc):
+                    continue
+                errors[(hid, uid)] = str(exc)
+                _classify(client, faults, exc, errors)
         for hid, uid in sorted(current - wanted):
             if known is not None and hid not in known:
                 _drop_stale(current, hid, uid, "host is no longer in the host table")
@@ -251,14 +279,18 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
             try:
                 client.withdraw("kanban", hid, uid)
                 current.discard((hid, uid))
+                answered = True
             except (client.Refused, client.Unreachable) as exc:
                 if _auth_refusal(client, exc):
-                    _drop_stale(current, hid, uid, f"withdraw refused for auth ({exc})")
+                    current.discard((hid, uid))
+                    if not any(p["host"] == hid and p["unit_id"] == uid for p in pending):
+                        pending.append({"host": hid, "unit_id": uid, "first_seen": now, "last_reason": str(exc)})
+                        _log.warning("kanban door: pending withdrawal of published unit %s on %s: %s", uid, hid, exc)
                     continue
                 errors[(hid, uid)] = str(exc)        # still ours; retried after the fault clears
                 _classify(client, faults, exc, errors)
     finally:
-        door.save_published(conn, current)
+        door.save_published(conn, current, pending_withdrawals=pending)
     for host, hid, rows in plan:
         # The capacity fact only (last writer wins); units are managed per id below.
         try:
@@ -274,7 +306,8 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
             except (client.Refused, client.Unreachable) as exc:
                 errors[(hid, uid)] = str(exc)
                 _classify(client, faults, exc, errors)
-    faults.note_success("publish")                   # publish health only; never clears the authorize history
+    if plan or answered:
+        faults.note_success("publish")               # only a real answer proves publish health
     return errors
 
 
