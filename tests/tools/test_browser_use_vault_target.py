@@ -103,6 +103,19 @@ def test_route_change_between_fence_and_pin_refuses_before_secret_access(target_
     assert calls == []
 
 
+def test_route_change_during_target_probe_refuses_before_secret_access(target_route, monkeypatch):
+    target, route, selected, calls = target_route
+
+    def race(expected):
+        target.record_route("task", {"BU_CDP_WS": "ws://replacement"}, local=True)
+        return tuple(selected)
+
+    monkeypatch.setattr(target, "selected_target", race)
+    with pytest.raises(RuntimeError, match="route changed"):
+        target.begin("task", expected_route=route)
+    assert calls == []
+
+
 @pytest.mark.parametrize("cleanup", ["error", "timeout", "stalled"])
 def test_evaluation_success_is_not_overridden_or_delayed_by_detach(monkeypatch, cleanup):
     import asyncio
