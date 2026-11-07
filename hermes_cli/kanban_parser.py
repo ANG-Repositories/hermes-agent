@@ -612,6 +612,12 @@ _SPECS = [
              help="Read this load_gate.json instead of <root>/load_gate.json"),
         _json_flag(help="Emit the dict the text is printed from"),
     ], help="Where cards run and why they wait (read-only; no probe)"),
+    _cmd("placement-holds", [
+        _arg("--clear", metavar="TASK_ID",
+             help="End this card's open pause_hold label now (a live hold is re-derived next tick)"),
+        _arg("--operator", default=None, help="Who clears it (recorded on the event)"),
+        _json_flag(help="Emit the dict the text is printed from"),
+    ], help="Fleet-pause holds: every host manifest (live or stale) and every card labelled pause_hold"),
     # rehome (t_808bc8e6)
     _cmd("rehome", [
         _arg("task_id"),
