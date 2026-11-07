@@ -126,6 +126,27 @@ def is_own_echo(event: Any, home_session_id: Optional[str], is_home: bool) -> bo
     return bool(is_home and actor and actor == _s(home_session_id) and kind in OWN_ECHO_KINDS)
 
 
+def is_operator_own_echo(event: Any, home_session_id: Optional[str], receiver_profile: Optional[str]) -> bool:
+    """:func:`is_own_echo` for an ``operator:<name>`` home (t_fa08b93d).
+
+    An operator-homed card has no home CHAT (``home_from_row`` -> ``operator-home``),
+    so the chat check never matched and the operator's own block/archive/... woke the
+    chat it was typed in. Here the home is the operator itself: the event is an echo
+    when its stamped ``actor_profile`` is that operator AND the receiving subscription
+    belongs to that same operator. A worker, another profile, or an unstamped actor
+    still wakes (fail open)."""
+    g = (lambda k: event.get(k)) if isinstance(event, dict) else (lambda k: getattr(event, k, None))
+    home = _s(home_session_id)
+    if not home.startswith("operator:"):
+        return False
+    operator = home[len("operator:"):]
+    actor = _s(g("actor_profile"))
+    return bool(
+        operator and actor and _s(g("kind")) in OWN_ECHO_KINDS
+        and same_operator(actor, operator) and same_operator(actor, receiver_profile or "default")
+    )
+
+
 def is_auto_route(event: Any, cfg: "SuppressConfig") -> bool:
     """A ``changes_requested`` a configured closer STAMPED (``actor_profile`` exactly a closer,
     never the prose guess): the merge pass already requeued the card to its implementer

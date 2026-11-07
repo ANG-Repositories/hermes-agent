@@ -370,6 +370,14 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--signature",
+             help="Automated minters: the failure's identity minus its per-occurrence sha/epoch. An open card "
+                  "for it, or one closed in the last 24 h, is returned instead of minting; after 3 no-code "
+                  "closes in a row the mint is refused (mint breaker). Humans are never affected."),
+        _arg("--no-signature-reuse", dest="signature_reuse", action="store_false",
+             help="With --signature: never hand back an existing card for it (the caller proved this occurrence "
+                  "needs a fresh owner, e.g. a regression after the card closed); the breaker still applies and the "
+                  "new card keeps the signature."),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
@@ -434,7 +442,8 @@ _SPECS = [
              help="Subscription level 'boomerang wake': mechanical wakes on this card are "
                   "handled by a background boomerang child (the calling chat subscribes "
                   "--boomerang-wake). Defaults to kanban.auto_subscribe_boomerang "
-                   "for operator creates with a gateway origin."),
+                   "for operator creates with a gateway origin or a --session whose home "
+                   "has a routable chat."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
