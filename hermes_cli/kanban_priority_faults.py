@@ -89,15 +89,28 @@ def door_config_present() -> bool:
 
 
 def fingerprint() -> str:
-    """Changes when any door credential, the host table or the registry changes (path, mtime, size)."""
+    """Changes when any door credential, the host table or the registry changes (path, mtime, size, mode, owner,
+    ctime): a permission-only repair (chmod 000 -> 600) moves mode and ctime only (Prism 917208e77049)."""
     h = hashlib.sha256()
     for p in (_registry_path(), _table_path(), *_door_credentials()):
         try:
             st = p.stat()
-            h.update(f"{p}:{st.st_mtime_ns}:{st.st_size};".encode())
+            h.update(f"{p}:{st.st_mtime_ns}:{st.st_size}:{st.st_mode}:{st.st_uid}:{st.st_ctime_ns};".encode())
         except OSError:
             h.update(f"{p}:-;".encode())
     return h.hexdigest()
+
+
+def _lock(fh, *, lock: bool = True) -> None:
+    """Exclusive whole-file lock/unlock: flock on POSIX, an msvcrt byte lock on native Windows (Prism df51bfc576d9:
+    a POSIX-only lock made every state operation raise there)."""
+    if os.name == "nt":
+        import msvcrt
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
 
 
 @contextlib.contextmanager
@@ -105,22 +118,24 @@ def _state():
     """Read-modify-write of the state file under a flock; atomic replace on write."""
     path = _root() / STATE_REL
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path) + ".lock", "a", encoding="utf-8") as lock:  # windows-footgun: ok (append-mode lock file, never read)
-        import fcntl                      # lazy: importing this module must not break native-Windows dispatch
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with open(str(path) + ".lock", "a+b") as lock:  # windows-footgun: ok (binary lock file, never read)
+        _lock(lock)
         try:
-            doc = json.loads(path.read_text(encoding="utf-8-sig"))
-            if not isinstance(doc, dict):
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8-sig"))
+                if not isinstance(doc, dict):
+                    doc = {}
+            except (OSError, ValueError):
                 doc = {}
-        except (OSError, ValueError):
-            doc = {}
-        before = json.dumps(doc, sort_keys=True)
-        yield doc
-        if json.dumps(doc, sort_keys=True) != before:
-            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".door-faults.")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(doc, fh, sort_keys=True)
-            os.replace(tmp, path)
+            before = json.dumps(doc, sort_keys=True)
+            yield doc
+            if json.dumps(doc, sort_keys=True) != before:
+                fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".door-faults.")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh, sort_keys=True)
+                os.replace(tmp, path)
+        finally:
+            _lock(lock, lock=False)
 
 
 def _page(text: str) -> bool:

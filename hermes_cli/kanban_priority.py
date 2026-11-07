@@ -239,6 +239,8 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
         plan.append((host, hid, [(card, door.unit_id(conn, card["id"])) for card in cards]))
     current = door.load_published(conn)
     wanted = {(hid, uid) for _, hid, rows in plan for _, uid in rows}
+    if not plan and not current:
+        return {}                # no allocd call made: proves nothing about publish health (Prism 0056dc604414)
     errors = {}
     known = _table_hosts()
     try:

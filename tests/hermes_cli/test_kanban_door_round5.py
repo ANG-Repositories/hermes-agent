@@ -380,3 +380,48 @@ def test_a_stale_record_entry_on_an_unreachable_host_is_dropped_never_latched(do
         assert door.load_published(conn) == set()
     dropped = [r for r in caplog.records if "dropped published unit" in r.getMessage()]
     assert len(dropped) == 1 and uid in dropped[0].getMessage()
+
+
+# -- CI-completion round 2 (Prism at 605a9c86) ---------------------------------------------------------------------
+
+@pytest.mark.platforms("windows")
+def test_fault_state_operations_work_on_native_windows(fleet):
+    """Prism df51bfc576d9. RED on 605a9c86 on Windows: the lazy fcntl import only moved the failure, so latched(),
+    hold_reason() and check_registry() with a missing registry raised ModuleNotFoundError inside _state()."""
+    fleet.table()
+    fleet.token()
+    assert faults.check_registry() == "missing"
+    assert len(fleet.pages) == 1
+    faults.latch("probe")
+    assert faults.latched() == "probe"
+    assert faults.hold_reason() == "door latched: probe"
+
+
+@pytest.mark.platforms("posix")
+def test_a_permission_only_token_repair_clears_the_latch(door_fleet):
+    """Prism 917208e77049. chmod leaves mtime and size alone. RED on 605a9c86: the fingerprint hashed only those,
+    so a pair token repaired from mode 000 to 600 stayed latched."""
+    token = door_fleet.root / alloc_client.TOKENS_REL / f"kanban@{POOL}"
+    token.chmod(0o000)
+    try:
+        faults.latch("pair token unreadable")
+        assert faults.latched()
+        token.chmod(0o600)
+        assert faults.latched() is None
+    finally:
+        token.chmod(0o600)
+
+
+def test_an_idle_publish_does_not_clear_a_publish_outage(door_fleet):
+    """Prism 0056dc604414. RED on 605a9c86: with nothing waiting and nothing recorded, publish_waiting made no allocd
+    call yet recorded publish success, so an idle tick after the backoff cleared the outage and paged recovery."""
+    from hermes_cli import kanban_priority as priority
+    faults.note_transport("demand publication unavailable", "publish")
+    with faults._state() as doc:
+        doc["transport"]["publish"]["next_at"] = 0           # backoff expired; the next tick may publish
+        doc["transport"]["publish"]["paged"] = True
+    with kbc.connect_closing() as conn:
+        assert priority.publish_waiting(conn, {}) == {}
+    with faults._state() as doc:
+        assert "publish" in faults._transport(doc)
+    assert not any("reachable again" in p for p in door_fleet.pages)
