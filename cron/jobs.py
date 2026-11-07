@@ -4167,15 +4167,15 @@ def _apply_a_lane_default_fallback(job: Dict[str, Any]) -> None:
     from hermes_cli.model_registry import resolve
 
     chain = []
-    for lane in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
+    for fallback_provider in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
         try:
-            ok = resolve(lane, model, resolve_aliases=False).ok
+            ok = resolve(fallback_provider, model, resolve_aliases=False).ok
         except Exception:
             ok = True
         if ok:
-            chain.append({"provider": lane, "model": model})
+            chain.append({"provider": fallback_provider, "model": model})
         else:
-            logger.warning("cron create: A-lane default fallback skips %s (does not serve %s)", lane, model)
+            logger.warning("cron create: A-lane default fallback skips %s (does not serve %s)", fallback_provider, model)
     if chain:
         job["fallback"] = chain
         job["allow_cross_provider_fallback"] = True
