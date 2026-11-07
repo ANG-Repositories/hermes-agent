@@ -22502,7 +22502,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_sendbacks(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
+    from hermes_cli import kanban_archive_read as _kar
+    _ctx_comments(lines, _kar.comments_with_archive(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -22592,7 +22593,8 @@ def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
 def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
     """Closed runs on this task (the active run is this worker), newest
     ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    from hermes_cli import kanban_archive_read as _kar  # R8 moves old cards' runs out (t_589fb988)
+    all_prior = [r for r in _kar.runs_with_archive(conn, task_id) if r.ended_at is not None]
     shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
     if not shown:
         return
@@ -22620,6 +22622,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
     """Done-parent handoffs: newest ``completed`` run's summary+metadata,
     falling back to ``task.result`` for pre-runs-table data. Stamped with a
     relative age so the worker re-verifies stale upstream results."""
+    from hermes_cli import kanban_archive_read as _kar  # a parent done > 14 d has its runs archived (R8)
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
@@ -22628,7 +22631,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         pt = get_task(conn, pid)
         if not pt or pt.status != "done":
             continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome in SUCCESS_RUN_OUTCOMES]
+        runs = [r for r in _kar.runs_with_archive(conn, pid) if r.outcome in SUCCESS_RUN_OUTCOMES]
         runs.sort(key=lambda r: r.started_at, reverse=True)
         run = runs[0] if runs else None
         if not wrote_header:

@@ -1471,6 +1471,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             pr_card_map = kpo.pr_card_map(conn, task.id)
         except kb.sqlite3.Error:  # older/minimal board schema: no PR list
             pr_card_map = {}
+        except kar.ArchiveUnreadable as exc:  # said out loud, never an empty PR list (t_589fb988)
+            pr_card_map = {"error": str(exc)}
 
     held = held_repo([c.body for c in comments]) if task.status in ("review", "blocked", "ready") else None
     from hermes_cli import kanban_show_suppressed as kss
@@ -1566,6 +1568,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if children:
         field("children", _fmt_links(child_links))
     for pr, others in (pr_card_map or {}).items():
+        if pr == "error":
+            field("pr-cards", f"unreadable: {others}")
+            continue
         field("pr-cards", f"{pr}: " + (", ".join(
             f"{o['id']} ({o['status']}, {o['assignee'] or '-'})" for o in others) or "none other"))
     if placement and (placement.get("running_on") or placement.get("last_placement")
