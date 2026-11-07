@@ -223,3 +223,43 @@ async def test_release_barrier_survives_cancellation_and_is_idempotent(rig, monk
     assert calls == [1]
     assert not active_sessions._read_entries(path)
 
+
+@pytest.mark.asyncio
+async def test_shutdown_joins_pending_acquisition_and_cleanup(rig, monkeypatch):
+    from types import SimpleNamespace
+    runner, path = rig
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    loop = asyncio.get_running_loop()
+    acquire = runner._claim_active_session_slot
+
+    def delayed(*args):
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(5)
+        return acquire(*args)
+
+    class AfterLeaseDrain(Exception):
+        pass
+
+    def after_drain():
+        assert not active_sessions._read_entries(path)
+        raise AfterLeaseDrain
+
+    monkeypatch.setattr(runner, "_claim_active_session_slot", delayed)
+    runner._active_api_run_count = after_drain
+    runner._restart_task = None
+    turn = asyncio.create_task(runner._handle_message(_make_event()))
+    stop = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        stop = asyncio.create_task(runner._stop_release_runtime_state(SimpleNamespace()))
+        await asyncio.sleep(0)
+        assert not stop.done()
+    finally:
+        proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    with pytest.raises(AfterLeaseDrain):
+        await stop
+    assert not runner._active_session_release_tasks
+
