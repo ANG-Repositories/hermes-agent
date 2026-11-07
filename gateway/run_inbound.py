@@ -1173,34 +1173,11 @@ class GatewayInboundMixin:
             return True, "Failed to prepare the boomerang turn."
         return False, None
 
-    async def _hm_cmd_fork_fan(self, event, source, _quick_key):
-        # Fork: /fork-fan <items> rewrites into a fork-fan skill invocation and falls through to normal
-        # dispatch (the /boomerang pattern). The skill runs plan -> one granted chunk per turn -> fold ->
-        # run; this handler never calls delegate_task itself.
-        from hermes_cli.fork_fan_command import USAGE, build_fork_fan_seed, parse_fork_fan_args
-        try:
-            opts, items = parse_fork_fan_args(event.get_command_args())
-        except ValueError as _ff_arg_exc:
-            return True, str(_ff_arg_exc)
-        if not items and not opts.get("where"):
-            return True, USAGE
-        try:
-            from agent.skill_commands import build_skill_invocation_message, resolve_skill_command_key
-            cmd_key = resolve_skill_command_key("fork-fan")
-            event.text = build_fork_fan_seed(
-                opts, items,
-                lambda instr: build_skill_invocation_message(cmd_key, instr) if cmd_key else None,
-            )
-        except Exception as _ff_exc:
-            logger.warning("fork-fan command rewrite failed: %s", _ff_exc)
-            return True, "Failed to prepare the fork-fan turn."
-        return False, None
-
     # Idle-path built-ins with bespoke flow (confirmations, prompt rewrites, one-shot MoA), each
     # handled by ``_hm_cmd_<name>`` → ``(handled, result)``; ``(False, None)`` falls through to the agent.
     _HM_CANONICAL_COMMANDS = frozenset({
         "new", "start", "egress", "learn", "plan", "init", "blueprint", "undo", "queue", "steer", "moa",
-        "boomerang", "fork-fan",
+        "boomerang",
     })
 
     async def _hm_dispatch_canonical_command(
@@ -1227,7 +1204,7 @@ class GatewayInboundMixin:
             async with self._async_profile_scope_for_source(source):
                 return True, await plain_handler(event)
         if canonical in self._HM_CANONICAL_COMMANDS:
-            return await getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")(event, source, _quick_key)
+            return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
         return False, None
 
     async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str) -> str:
