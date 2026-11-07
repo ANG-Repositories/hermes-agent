@@ -65,7 +65,7 @@ def test_mutations_check_real_text(board, monkeypatch, verb, cited, disabled):
         assert kb.list_comments(board, tid) == []
 
 
-@pytest.mark.parametrize("verb", ["specify", "resolve", "route", "batch", "foreign"])
+@pytest.mark.parametrize("verb", ["specify", "resolve", "decompose", "route", "batch", "foreign"])
 def test_composed_writes_refuse_before_journaling(board, monkeypatch, verb):
     tid = kb.create_task(board, title="composed scratch", assignee="human",
                          triage=True, require_home=False)
@@ -78,6 +78,11 @@ def test_composed_writes_refuse_before_journaling(board, monkeypatch, verb):
             kb.specify_triage_task(board, tid, body=text)
         elif verb == "resolve":
             kb.triage_resolve_task(board, tid, to="todo", reason=text, actor="operator")
+        elif verb == "decompose":
+            from hermes_cli.kanban_db_graph import decompose_triage_task
+            decompose_triage_task(board, tid, root_assignee="human", children=[
+                {"title": "safe child", "assignee": "human"},
+                {"title": "other child", "body": text, "assignee": "human"}])
         elif verb == "route":
             kb.set_model_override(board, tid, "other-model", "other-provider",
                                   audit_comment_author="operator", audit_comment_body=text)
@@ -91,6 +96,37 @@ def test_composed_writes_refuse_before_journaling(board, monkeypatch, verb):
     assert journal == []
     assert board.total_changes == before
     assert kb.get_task(board, tid).status == "triage"
+
+
+@pytest.mark.parametrize("verb", ["block", "schedule"])
+def test_cli_lifecycle_refuses_before_transition(board, monkeypatch, verb):
+    import argparse
+    from hermes_cli import kanban
+    tid = kb.create_task(board, title="lifecycle scratch", assignee="human", require_home=False)
+    args = argparse.Namespace(task_id=tid, reason=["Ace said ship it"], why=False,
+                              kind="needs_input", until=None, now=False, at="2099-01-01T00:00:00Z")
+    monkeypatch.setattr(kanban, "_bulk_ids", lambda args: [tid])
+    before = kb.get_task(board, tid).status
+    with pytest.raises(ValueError, match="ruling-citation"):
+        getattr(kanban, f"_cmd_{verb}")(args)
+    assert kb.get_task(board, tid).status == before
+    assert kb.list_comments(board, tid) == []
+
+
+@pytest.mark.parametrize("reason_field", ["pin_sub_reason", "force_model_reason"])
+def test_create_audit_reasons_refuse_without_journal(board, monkeypatch, reason_field):
+    from types import SimpleNamespace
+    monkeypatch.setattr(kb, "_require_known_model", lambda *a, **kw: SimpleNamespace(
+        reason="forced", force_reason="Ace said ship it"))
+    # The single-sub route validator is separately covered; isolate the audit writer.
+    monkeypatch.setattr("hermes_cli.model_policy.pin_sub_arg_error", lambda *a, **kw: None)
+    monkeypatch.setattr("hermes_cli.model_policy.validate_route_provider", lambda *a, **kw: None)
+    journal = []
+    monkeypatch.setattr(kb, "_journal_append", lambda *a, **kw: journal.append(a))
+    with pytest.raises(ValueError, match="ruling-citation"):
+        kb.create_task(board, title="audit scratch", assignee="human", require_home=False,
+                       **{reason_field: "Ace said ship it"})
+    assert journal == []
 
 
 def test_comment_reference_uses_target_board(board):

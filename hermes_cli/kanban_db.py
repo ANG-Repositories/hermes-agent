@@ -5171,7 +5171,7 @@ def _validate_foreign_action_comments(
     conn: sqlite3.Connection, actor: MutationActor, action: str, prev_home: Optional[str],
 ) -> None:
     """:func:`add_comment`'s refusals (:func:`_validate_comment_args`) for every
-    comment :func:`record_foreign_action` will write, with no database access.
+    comment :func:`record_foreign_action` will write, before any mutation.
     Run where the override is ACCEPTED, so a reason those comments cannot carry
     is refused before any guarded write journals (t_705b1458, Prism 34b90ddab22b)."""
     author = actor.profile or "user"
@@ -6757,6 +6757,14 @@ def create_task(
                 # The override comment is written after the card's first
                 # journaled event; judge it before the INSERT (Prism 8b7984d6e364 r14).
                 flagship_override_comment(flagship_override_author, flagship_override_reason, conn=conn)
+                audit_author = flagship_override_author or created_by or "operator"
+                if pin_sub_reason:
+                    from hermes_cli.model_policy import sub_pin_comment
+                    _validate_comment_args(audit_author, sub_pin_comment(
+                        provider_override, pin_sub_reason, fallback=bool(pin_sub_fallback)), conn=conn)
+                if _model_verdict.reason == "forced":
+                    _validate_comment_args(audit_author, _model_force_comment(
+                        provider_override, model_override, _model_verdict.force_reason or ""), conn=conn)
 
                 if tenant is None and parents:
                     # Parent order breaks ties in this soft namespace; an
@@ -7346,7 +7354,7 @@ def flagship_override_comment(
     actor: Optional[str], reason: Optional[str], *, conn=None,
 ) -> Optional[tuple[str, str]]:
     """The ``(author, body)`` :func:`authorize_flagship` would write, judged
-    with no database access: the authority (:func:`model_policy.require_flagship_authority`)
+    before any write: the authority (:func:`model_policy.require_flagship_authority`)
     and every refusal :func:`add_comment` applies to that author and body
     (:func:`_validate_comment_args`). ``None`` when no reason was given. Each
     caller that writes before ``authorize_flagship`` calls this first, so the
@@ -8651,7 +8659,7 @@ def _validate_comment_provenance(
 
 
 def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = False, conn=None) -> None:
-    """:func:`add_comment`'s author/body refusals, with no database access, so a
+    """:func:`add_comment`'s author/body refusals (read-only with ``conn``), so a
     batch can judge every comment it will insert before its first write
     (Prism d0b2bf482d38)."""
     if not body or not body.strip():
@@ -15560,6 +15568,8 @@ def request_changes(
         # Inline INSERT below bypasses add_comment's release-line guard: check before any write (t_80c7e5b9).
         from hermes_cli.kanban_close_on_guard import refusal as _close_on_refusal
 
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("comment", coverage_body)])
         close_on_error = _close_on_refusal(comment_author, coverage_body)
         if close_on_error:
             return False, close_on_error

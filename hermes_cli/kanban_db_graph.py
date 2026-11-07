@@ -117,6 +117,9 @@ def decompose_triage_task(
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
     _validate_children_graph(children)
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    for child in children:
+        validate_fields(conn, [("title", child["title"]), ("body", child.get("body"))])
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
     # (create_task, link_tasks, add_comment) must not be called in here.

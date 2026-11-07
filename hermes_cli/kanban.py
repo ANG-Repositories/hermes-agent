@@ -3733,6 +3733,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     failed: list[str] = []
     with kbc.connect_closing() as conn:
+        if reason:
+            kb._validate_comment_args(author, f"BLOCKED: {reason}", conn=conn)
         for tid in ids:
             # Provenance before the transition: blocking ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
@@ -3808,6 +3810,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        if reason:
+            kb._validate_comment_args(author, f"SCHEDULED: {reason}", conn=conn)
         for tid in ids:
             current = kb.get_task(conn, tid)
             # An already-scheduled card only gets its wake time (re)set; the
