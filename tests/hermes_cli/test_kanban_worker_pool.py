@@ -117,6 +117,29 @@ def _write_pool(fleet: Path, *, roles=None, sidecar=None):
     return sidecar
 
 
+@pytest.mark.parametrize("bad", [
+    {"roles": {}, "state": "active"},
+    {"roles": {"kanban-worker": {"slots": 0}}, "state": "active"},
+    {"roles": {"kanban-worker": {}}, "state": "invalid"},
+    None,
+])
+def test_reader_quarantines_invalid_role_host_not_whole_fleet(tmp_path, bad):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "ace-media": bad,
+        "studio-arm": {"roles": {}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+    assert any("ace-media" in w and "host dropped" in w for w in cfg.warnings)
+    assert any("studio-arm" in w and "non-empty" in w for w in cfg.warnings)
+    # Authoring validators remain strict; only the runtime read quarantines rows.
+    with pytest.raises(kwp.PoolError):
+        kwp.parse_roles(roles)
+
+
 def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     _write_pool(tmp_path)
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})

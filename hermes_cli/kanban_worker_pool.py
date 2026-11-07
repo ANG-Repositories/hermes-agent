@@ -386,8 +386,19 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     except (OSError, ValueError) as exc:
         return PoolConfig(warnings=(f"kanban pool: unreadable pool file: {exc}",),
                           refused="unreadable")
+    warnings: List[str] = []
     try:
-        roles = parse_roles(roles_doc) if roles_doc is not None else {}
+        roles = {}
+        if roles_doc is not None:
+            # Validate the envelope strictly before isolating individual host rows.
+            if not isinstance(roles_doc, dict) or not isinstance(roles_doc.get("hosts"), dict):
+                parse_roles(roles_doc)  # raises the canonical structural error
+            parse_roles({**roles_doc, "hosts": {}})
+            for hid, row in roles_doc["hosts"].items():
+                try:
+                    roles.update(parse_roles({**roles_doc, "hosts": {hid: row}}))
+                except PoolError as exc:
+                    warnings.append(f"kanban pool: {exc} (host dropped)")
     except PoolError as exc:
         return PoolConfig(warnings=(f"kanban pool: roles refused: {exc}",), refused="roles")
     with_role = {h for h, (r, _s) in roles.items() if ROLE in r}
@@ -404,7 +415,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             f"{ROLE} role in {ROLES_FILE}, so nothing spills (register hosts with "
             "`fleet-host kanban-enable`)",))
     if sidecar is None:
-        return PoolConfig(warnings=tuple(
+        return PoolConfig(warnings=tuple(warnings) + tuple(
             f"kanban pool: {h} has a {ROLE} role but {SIDECAR_FILE} is absent (host dropped)"
             for h in sorted(with_role)))
     errs = validate_sidecar(sidecar)
@@ -422,7 +433,6 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         # sidecar keeps it on the Studio, so a new profile never lands Studio-bound.
         gprofiles = derived_profiles(fleet_dir.parent / "profiles", sidecar["studio_only"])
     gcap = float(sidecar.get("capacity_pct", DEFAULT_CAPACITY))
-    warnings: List[str] = []
     hosts: List[PoolHost] = []
     disabled: List[str] = []
     policy = _policy.load(fleet_dir)
