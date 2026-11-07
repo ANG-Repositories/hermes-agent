@@ -271,3 +271,68 @@ def test_blackbox_rows_store_billed_columns_and_mark_the_deferred_row(tmp_path, 
     assert rows[0] == (0, 0, 0, 0, 1, None)
     assert rows[1] == (BILLED["input_tokens"], BILLED["cache_read_tokens"],
                        BILLED["cache_write_tokens"], OUTPUT, None, 2)
+
+
+def test_moa_finalizer_window_split_excludes_advisor_prompts(tmp_path, monkeypatch):
+    """/context's last-call split is the aggregator's own request, like context_used (Prism f40b9825fcf3)."""
+    from agent import turn_finalizer as tf
+
+    a = _agent(tmp_path, monkeypatch)
+    captured = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "on_session_end":
+            captured["turn_usage"] = kwargs.get("turn_usage")
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    usage = {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
+             "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 0}}
+    try:
+        a.client = _MoaClient(REF)
+        calls: list = []
+        _record(a, _response(usage), 1, calls)
+        tf.emit_session_end(
+            a, turn_id="turn", effective_task_id="task", completed=True, failed=False,
+            interrupted=False, turn_exit_reason="text_response(stop)",
+            original_user_message="go", final_response="ok", turn_calls=calls,
+        )
+    finally:
+        a.close()
+    tu = captured["turn_usage"]
+    assert tu["context_used"] == 100
+    assert tu["last_uncached_tokens"] == 100
+    # The bill still carries the advisors.
+    assert tu["input_tokens"] == 100 + REF.input_tokens
+
+
+def test_multi_request_relay_prices_at_the_per_request_tier(tmp_path, monkeypatch):
+    """Two 60k requests (each under Haiku 5.5's 100k tier) bill 120k at the BASE rate (Prism 5d68c042e279)."""
+    from decimal import Decimal
+
+    from plugins.blackbox.cost import compute_turn_cost
+
+    usage = {"prompt_tokens": 60_000, "completion_tokens": 0, "total_tokens": 60_000,
+             "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 0},
+             "upstream_requests": 2, "cumulative_prompt_tokens": 120_000,
+             "cumulative_prompt_tokens_details": {"input_tokens": 120_000, "cached_tokens": 0,
+                                                  "cache_creation_tokens": 0}}
+    route = {"provider": "anthropic", "model": "claude-haiku-5-5", "base_url": ""}
+    one = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=60_000), provider="anthropic")
+    assert 2 * one.amount_usd == Decimal("0.012")  # each request priced alone, at the base tier
+    a = _agent(tmp_path, monkeypatch)
+    try:
+        from agent import turn_usage
+
+        calls: list = []
+        turn_usage.record_response_usage(
+            a, _response(usage), messages=[{"role": "user", "content": "go"}], api_call_count=1,
+            api_duration=1.0, compression_attempts=0, max_compression_attempts=3,
+            turn_calls=calls, call_route=route)
+        assert a.session_input_tokens == 120_000
+        assert a.session_estimated_cost_usd == pytest.approx(0.012)
+    finally:
+        a.close()
+    cost, status, _ = compute_turn_cost("claude-haiku-5-5", "anthropic", None, calls)
+    assert status == "estimated"
+    assert cost == pytest.approx(0.012)
