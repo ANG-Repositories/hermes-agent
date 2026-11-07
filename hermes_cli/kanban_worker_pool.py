@@ -62,7 +62,9 @@ SIDECAR_FILE = "kanban-pool.json"
 # until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
 # kanban-worker joined (t_c834e0d8, bug class A: admission is measured use, never
 # a count): ``{}`` parses to ``PoolHost.slots = None``; a legacy count stays a ceiling.  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
-COUNT_FREE_ROLES = frozenset({"ci-runner", ROLE})
+# review-worker joined (t_e85e77b7): hermes-home #9338 made every Prism member row
+# ``{}``; refusing it refused the whole pool (``refused:roles``) and nothing spilled.
+COUNT_FREE_ROLES = frozenset({"ci-runner", "review-worker", ROLE})
 # A count-free kanban host's free slots for ONE plan (t_c834e0d8). A per-tick  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # stand-in so ``plan.slots`` / ``budget`` / load_gate.json stay finite ints; it is  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # not a concurrency count (running workers are not subtracted). Measured

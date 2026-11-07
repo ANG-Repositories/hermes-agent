@@ -166,8 +166,10 @@ def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path)
     assert kwp.parse_roles(doc({"ci-runner": {}})) == {"a": ({"ci-runner": None}, "active")}
     assert kwp.parse_roles(doc({"ci-runner": {"slots": 3}})) == {"a": ({"ci-runner": 3}, "active")}
     assert kwp.parse_roles(doc({"kanban-worker": {}})) == {"a": ({"kanban-worker": None}, "active")}
+    # review-worker is membership only since hermes-home#9338 (t_e85e77b7).
+    assert kwp.parse_roles(doc({"review-worker": {}})) == {"a": ({"review-worker": None}, "active")}
     with pytest.raises(kwp.PoolError, match=r'must be \{"slots": N\}'):
-        kwp.parse_roles(doc({"review-worker": {}}))
+        kwp.parse_roles(doc({"other-role": {}}))
     with pytest.raises(kwp.PoolError, match="ci-runner must be"):
         kwp.parse_roles(doc({"ci-runner": {"slots": 3, "x": 1}}))
     with pytest.raises(kwp.PoolError, match="slots must be 1..64"):
