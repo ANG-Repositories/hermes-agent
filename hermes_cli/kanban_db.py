@@ -15681,6 +15681,8 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        if is_worker_assignee(implementer):
+            _set_no_worker_locked(conn, task_id, False, source="request-changes")
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
@@ -15888,6 +15890,9 @@ def request_sendback(
                     )
                     if cur.rowcount != 1:
                         return False, "task changed during sendback"
+            target = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+            if is_worker_assignee(target):
+                _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": status,
@@ -15906,6 +15911,8 @@ def request_sendback(
             )
             if cur.rowcount != 1:
                 return False, "task changed during sendback"
+            if is_worker_assignee(implementer):
+                _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": new_status,

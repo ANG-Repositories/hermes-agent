@@ -6177,6 +6177,10 @@ def _dispatch_once_locked(
     # One clock read for the whole tick so every card in this pass sees the
     # same TTL and a window cannot expire halfway through a batch.
     _tick_now = int(time.time())
+    if not dry_run and not _admit:
+        from hermes_cli.kanban_no_worker import record_stranded
+
+        record_stranded(conn, now=_tick_now)
     if not dry_run:
         # Retire elapsed windows first: the rows are deleted, so each expiry
         # is reported exactly once and the routing below can never read a
