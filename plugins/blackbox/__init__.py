@@ -475,6 +475,36 @@ def _profile_name() -> str:
         return "default"
 
 
+def _placement_host() -> str | None:
+    """The box running THIS process's kanban-worker tools (t_c9fc6c9f).
+
+    A spilled worker carries ``KANBAN_WORKER_PLACEMENT`` (its pool host); the
+    boot record wins over the env, which the config bridge may have touched. A
+    dispatcher-owned worker with no placement runs on the Studio itself and is
+    ``studio-local``. Anything else (gateway, interactive CLI, a child process
+    that merely inherited a worker's env) is None.
+    """
+    import os
+
+    try:
+        if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+            return None
+        from agent.delegation_context import owns_kanban_worker_authority
+
+        if not owns_kanban_worker_authority():
+            return None
+        from hermes_cli import kanban_worker_hosts as kwh
+
+        return (
+            kwh.BOOT_PLACED_HOST
+            or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
+            or kwh.LOCAL_HOST_NAME
+        )
+    except Exception:
+        logger.debug("blackbox placement_host resolve failed", exc_info=True)
+        return None
+
+
 def _config() -> dict[str, Any] | None:
     try:
         # fork-parity: read through the canonical loader, not raw yaml. Upstream
@@ -749,6 +779,11 @@ def _build_record(
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
         cli_invocation_id=kwargs.get("cli_invocation_id"),
+        # A caller writing on another process's behalf (orphan repair) passes
+        # the key explicitly so this process's placement is never stamped.
+        placement_host=(
+            kwargs["placement_host"] if "placement_host" in kwargs else _placement_host()
+        ),
         # An explicit marker names how a turn that never finished was closed
         # (``signal_15``: the kanban dispatcher killed the worker;
         # ``orphan_repair``: synthesized by ``orphans --repair``). Otherwise a
