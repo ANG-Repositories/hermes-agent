@@ -155,6 +155,13 @@ class BoomerangWakeState:
             claims = self._claims_of(data)
             if key in claims:
                 return False
+            if entry.get("row") == "blocked_assess":
+                retries = self._retries_of(data)
+                spent = int(retries.get(entry["task_id"], 0))
+                entry["blocked_budget_exhausted"] = spent >= 1
+                if not entry["blocked_budget_exhausted"]:
+                    retries[entry["task_id"]] = spent + 1
+                    data["retries"] = retries
             claims[key] = dict(entry)
             data["claims"] = claims
             self._write(data)
@@ -288,6 +295,7 @@ ALLOWED = {
     # outside the card's state machine); ``handled`` writes only the receipt, the card stays in review.
     "own_repo_review_all_keys_answered": frozenset({"handled", "surface"}),
     "changes_requested": frozenset({"redispatch", "surface"}),
+    "blocked_assess": frozenset({"retry", "surface"}),
     "crash_first_occurrence": frozenset({"retry", "surface"}),
     # t_1e0ffee4: a review-deadman tier-1 page. comment_why_waits = the executor posts ONE bounded
     # why-waits comment (WHY_WAITS_FIELDS); the card stays in review.
@@ -676,8 +684,25 @@ def _review_deadman_brief(entry: dict) -> str:
     return "Do this attended read:\n" + "\n".join(s.format(**fields) for s in REVIEW_DEADMAN_STEPS) + "\n"
 
 
+def _blocked_brief(entry: dict) -> str:
+    return (
+        "Assess the block, not its label: read the latest card, block reason and comments; "
+        "check the named prerequisite with bounded read-only probes. needs_input/capability "
+        "is not proof that a human is needed. Do not mutate the card yourself. "
+        "If existing authority permits retry AND observed evidence proves the prerequisite "
+        "is now satisfied, return retry with nonempty evidence and "
+        '`"block_resolution": {"resolved": true, "authority": "existing", '
+        '"check": "<probe and observed result>"}`. Never retry just to see if it works. '
+        "No inferred approval for spending, outbound communication, destruction, credentials, "
+        "restarts or privilege changes. If any such approval is needed, access is missing, "
+        "or the block remains unresolved, return surface with the concrete blocker, attempted "
+        "checks and what the OWNER must assess next. The owner decides whether to ask Ace.\n"
+    )
+
+
 #: Row-specific instructions appended to the generic goal (keyed on the claim-time row).
-ROW_BRIEFS = {"own_repo_review_all_keys_answered": _review_all_answered_brief,
+ROW_BRIEFS = {"blocked_assess": _blocked_brief,
+              "own_repo_review_all_keys_answered": _review_all_answered_brief,
               "review_deadman": _review_deadman_brief}
 
 
@@ -930,6 +955,14 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     if action not in ALLOWED.get(live.get("row") or "", frozenset()):
         return {"ok": False, "action": action, "reason": f"action not allowed for {live.get('row')}",
                 "summary": summary, "refused": True, **finding}
+    if live.get("row") == "blocked_assess" and action == "retry":
+        resolution = verdict.get("block_resolution")
+        if (live.get("blocked_budget_exhausted") or not isinstance(resolution, dict)
+                or resolution.get("resolved") is not True
+                or resolution.get("authority") != "existing"
+                or not _first_line(resolution.get("check")) or not finding["evidence"]):
+            return {"ok": False, "action": "surface", "reason": "block resolution not established",
+                    "summary": summary, "surface": True, **finding}
     if action == "surface":
         return {"ok": False, "action": action, "reason": "child surfaced it", "summary": summary, "surface": True,
                 **finding}
@@ -1342,6 +1375,9 @@ async def _note_child_session(entry: dict, state: BoomerangWakeState) -> None:
 async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None:
     """The dispatched task: parent → child → verdict executor → one origin line."""
     key = entry["key"]
+    if entry.get("blocked_budget_exhausted"):
+        await _fail(runner, entry, "blocked assessment budget exhausted; owner assessment required", state)
+        return
     try:
         parent, mode = await parent_resolver(runner, entry)
         entry = await asyncio.to_thread(state.update_claim, key, state=STATE_RUNNING, inherit_mode=mode) or entry
