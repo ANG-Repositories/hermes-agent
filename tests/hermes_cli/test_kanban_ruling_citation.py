@@ -53,6 +53,7 @@ def test_mutations_check_real_text(board, monkeypatch, verb, cited, disabled):
         if verb == "edit":
             return kb.edit_task(board, tid, body=text)
         return kb.add_comment(board, tid, "operator", text)
+    original_body = kb.get_task(board, tid).body
     before = board.total_changes
     if cited or disabled:
         assert write()
@@ -60,7 +61,7 @@ def test_mutations_check_real_text(board, monkeypatch, verb, cited, disabled):
         with pytest.raises(ValueError, match="BLOCKED by ruling-citation"):
             write()
         assert board.total_changes == before
-        assert kb.get_task(board, tid).body is None
+        assert kb.get_task(board, tid).body == original_body
         assert kb.list_comments(board, tid) == []
 
 
