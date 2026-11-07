@@ -1203,6 +1203,12 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
             return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
             return False, _reasons.HOST_REACH, None
+    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals)
+    if need_hosts is not None:
+        if pin not in (None, PIN_ANY) and pin not in need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
+        if pin in (None, PIN_ANY) and not need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:

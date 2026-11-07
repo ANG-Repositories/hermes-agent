@@ -141,7 +141,23 @@ def test_needs_allowed_hosts():
     assert kwp.needs_allowed_hosts(DEC6D40F, kwp.PoolConfig(pool_hosts=(_host("ci-box"),))) == ()
 
 
-def test_portable_binds_studio_needs_and_a_pin_still_wins():
+def test_incident_pin_cannot_bypass_resource_needs():
+    # t_557cbc8f on ace-ai, one of the 11-04 lint hits (t_03b10f4f).
+    body = 'host: ace-ai\nDO NOT call skill_view("browser-access"); read reference with read_file.'
+    pool = kwp.PoolConfig(hosts=("ace-ai", "ci-box"), profiles=("alpha",),
+                          pool_hosts=(_host("ace-ai"), _host("ci-box")),
+                          caps={"ci-box": frozenset({"skills_tree"})})
+    def port(text, **kwargs):
+        return kwp.portable(workspace_kind="scratch", workspace_has_content=False,
+                            assignee="alpha", body=text, pool=pool, **kwargs)
+    assert kwp.card_needs(body) == {"skills_tree"}
+    assert port(body) == (False, "studio_needs", None)
+    assert port(body.replace("ace-ai", "ci-box")) == (True, None, "pin")
+    # Existing author-declared requirements remain authoritative in enforce mode.
+    assert port("requires: none\n" + body, body_signals=False) == (True, None, "pin")
+
+
+def test_portable_binds_studio_needs_even_with_a_pin():
     pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), pool_hosts=(_host("ci-box"),))
 
     def port(body):
@@ -150,7 +166,7 @@ def test_portable_binds_studio_needs_and_a_pin_still_wins():
     assert port(DEC6D40F) == (False, "studio_needs", None)
     assert port(SIX_AF0C092) == (False, "studio_needs", None)
     assert port(PLAIN_CODE) == (True, None, "policy")
-    assert port("host:ci-box\n" + DEC6D40F) == (True, None, "pin")   # the operator's call
+    assert port("host:ci-box\n" + DEC6D40F) == (False, "studio_needs", None)
     assert kwp.studio_affinity(DEC6D40F, (), pool) == ("studio_needs", "needs:skills_tree,vault")
 
 
