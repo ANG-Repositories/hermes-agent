@@ -637,6 +637,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> Dict[str, Any]:
+        from tools.browser_use_target import record_route
+        # Invalidate the old selection before executing (including failed/timed-out calls).
+        # Vault queries this exact daemon's selection, not the supervisor's first page.
+        record_route(task_id, env, local=bot_desktop_browser)
         _attach_vault_supervisor(env, task_id)
         try:
             return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}

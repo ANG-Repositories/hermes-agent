@@ -209,7 +209,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "dialog": dialog.to_dict()}
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
-                         await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
+                         await_promise: bool = True, timeout: float = 10.0,
+                         target_id: Optional[str] = None) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
@@ -228,8 +229,20 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
-            coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
-            return _schedule(coro, loop, timeout=timeout + 1)
+            async def evaluate():
+                pinned_session = session_id
+                if target_id:
+                    info = (await self._cdp("Target.getTargetInfo", {"targetId": target_id}, timeout=timeout))["result"]["targetInfo"]
+                    if info.get("type") != "page" or info.get("targetId") != target_id:
+                        raise RuntimeError("Selected Browser Use target is not a live page; select a tab and retry")
+                    attached = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
+                    pinned_session = attached["result"]["sessionId"]
+                try:
+                    return await self._cdp("Runtime.evaluate", params, session_id=pinned_session, timeout=timeout)
+                finally:
+                    if target_id:
+                        await self._cdp("Target.detachFromTarget", {"sessionId": pinned_session}, timeout=timeout)
+            return _schedule(evaluate(), loop, timeout=timeout + 1)
 
         try:
             response = _run_eval(return_by_value)

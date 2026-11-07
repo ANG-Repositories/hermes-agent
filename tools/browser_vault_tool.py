@@ -61,6 +61,16 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    from tools.browser_use_cli import is_browser_use_cli_mode
+    from tools.browser_use_target import route_for_task
+    if route_for_task(task_id) is not None or is_browser_use_cli_mode():
+        try:
+            supervisor = _ensure_supervisor(task_id)
+            sup = supervisor.evaluate_runtime(expression)
+            return {"success": bool(sup.get("ok")), "result": sup.get("result"),
+                    "error": sup.get("error", "")}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -95,7 +105,11 @@ def _ensure_supervisor(task_id: str):
     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
     Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_use_cli import is_browser_use_cli_mode
+    from tools.browser_use_target import route_for_task, supervisor_for_task
 
+    if route_for_task(task_id) is not None or is_browser_use_cli_mode():
+        return supervisor_for_task(task_id)
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
@@ -203,6 +217,10 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
     (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
     login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
+    from tools.browser_use_cli import is_browser_use_cli_mode
+    from tools.browser_use_target import route_for_task
+    if route_for_task(task_id) is not None or is_browser_use_cli_mode():
+        return None  # The selected target owns the origin, never the saved item.
     try:
         supervisor = _ensure_supervisor(task_id)
     except Exception:
@@ -776,6 +794,10 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
+    from tools.browser_use_target import route_for_task
+    route = route_for_task(task_id)
+    if route is not None:
+        return route.local
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import _shares_bot_desktop_browser
     return _shares_bot_desktop_browser(_active_sessions.get(_last_session_key(task_id or "default")) or {})
@@ -788,8 +810,28 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import run_fenced
 
-    session = _active_sessions.get(_last_session_key(task_id or "default")) or {}
-    res = run_fenced(session, lambda: {"raw": fn()})
+    from tools.browser_use_cli import is_browser_use_cli_mode
+    from tools.browser_use_target import begin, end, route_for_task
+
+    tid = task_id or "default"
+    route = route_for_task(tid)
+    session = ({"features": {"local": route.local}} if route is not None else
+               _active_sessions.get(_last_session_key(tid)) or {})
+
+    def pinned_op():
+        if route is None and not is_browser_use_cli_mode():
+            return {"raw": fn()}
+        try:
+            token = begin(tid)
+            try:
+                return {"raw": fn()}
+            finally:
+                end(token)
+        except Exception:
+            return {"raw": json.dumps({"success": False, "error_type": "selected_target_unavailable",
+                    "error": "Browser Use selected target changed, closed, or is unavailable; select a live tab with browser_exec and retry. Nothing was written."})}
+
+    res = run_fenced(session, pinned_op)
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
