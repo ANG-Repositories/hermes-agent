@@ -131,11 +131,17 @@ def compute_turn_cost(
                 cache_write_tokens_unknown=bool(call.get("cache_write_tokens_unknown")),
                 usage_unknown=bool(call.get("usage_unknown")),
             )
+            # A multi-request relay row bills several requests; the tier is one request's prompt.
+            tier_basis = call.get("tier_prompt_tokens")
+            tier_kw: dict[str, Any] = (
+                {} if tier_basis is None else {"tier_prompt_tokens": _int_value(tier_basis)}
+            )
             result = estimate_usage_cost(
                 call.get("model") or model,
                 usage,
                 provider=call.get("provider") or provider,
                 base_url=call.get("base_url") or base_url,
+                **tier_kw,
             )
         except Exception:
             unknown_count += 1
