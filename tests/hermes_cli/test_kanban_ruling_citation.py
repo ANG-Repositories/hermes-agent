@@ -65,6 +65,34 @@ def test_mutations_check_real_text(board, monkeypatch, verb, cited, disabled):
         assert kb.list_comments(board, tid) == []
 
 
+@pytest.mark.parametrize("verb", ["specify", "resolve", "route", "batch", "foreign"])
+def test_composed_writes_refuse_before_journaling(board, monkeypatch, verb):
+    tid = kb.create_task(board, title="composed scratch", assignee="human",
+                         triage=True, require_home=False)
+    journal = []
+    monkeypatch.setattr(kb, "_journal_append", lambda *a, **kw: journal.append(a))
+    text = "Ace said ship it"
+    before = board.total_changes
+    with pytest.raises(ValueError, match="ruling-citation"):
+        if verb == "specify":
+            kb.specify_triage_task(board, tid, body=text)
+        elif verb == "resolve":
+            kb.triage_resolve_task(board, tid, to="todo", reason=text, actor="operator")
+        elif verb == "route":
+            kb.set_model_override(board, tid, "other-model", "other-provider",
+                                  audit_comment_author="operator", audit_comment_body=text)
+        elif verb == "batch":
+            kb.apply_batch_route_writes(board, [kb.BatchRouteWrite(
+                task_id=tid, touch_model=True, model="other-model", provider="other-provider",
+                audit_comment_author="operator", audit_comment_body=text)])
+        else:
+            actor = kb.MutationActor(session_ids=("foreign",), profile="operator", operator=text)
+            kb.record_foreign_action(board, tid, "block", actor)
+    assert journal == []
+    assert board.total_changes == before
+    assert kb.get_task(board, tid).status == "triage"
+
+
 def test_comment_reference_uses_target_board(board):
     tid = kb.create_task(board, title="citation refs", assignee="human", require_home=False)
     good = kb.add_comment(board, tid, "operator", "source: 1568681380928295105")
