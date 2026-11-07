@@ -16,9 +16,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from . import admission, admission_demand, placement, work_estimate
+from . import admission, placement, work_estimate
 
 __all__ = ["admission", "admission_demand", "placement", "work_estimate"]
+
+
+def __getattr__(name):
+    # admission_demand imports fcntl/pwd at module top (POSIX-only); loading it eagerly made
+    # `import gateway.run` fail on native Windows. It loads on first use instead, root bound here.
+    if name != "admission_demand":
+        raise AttributeError(name)
+    import importlib
+
+    mod = importlib.import_module(f"{__name__}.admission_demand")
+    mod._root = _demand_root
+    return mod
 
 
 def _fleet_root() -> Path:
@@ -35,4 +47,3 @@ def _demand_root(root=None) -> Path:
 
 
 placement.fleet_root = _fleet_root
-admission_demand._root = _demand_root
