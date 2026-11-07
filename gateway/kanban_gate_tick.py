@@ -259,7 +259,7 @@ class GateTickBuilder:
             ledger_dir=pledger.ledger_dir(root),
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
             placement_table=kh.load_table(root),
-            placement_reservations=root / placement.RESERVATIONS_REL,
+            placement_reservations=kh.ledger_root() / placement.RESERVATIONS_REL,
             allocd=kh.allocd_mode(cfg),
         )
 
@@ -519,7 +519,7 @@ class GateTickBuilder:
             return None
         self._renewed_at = now
         try:
-            got = kh.renew_running(self._boards, self._connect, root / placement.RESERVATIONS_REL, now=now)
+            got = kh.renew_running(self._boards, self._connect, kh.ledger_root() / placement.RESERVATIONS_REL, now=now)
         except Exception as exc:
             self._log(logger.warning, f"kanban pool: reservation renewal failed: {exc}")
             return None

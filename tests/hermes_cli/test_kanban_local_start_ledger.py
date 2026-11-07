@@ -247,3 +247,21 @@ def test_a_null_stall_axis_on_a_linux_host_is_closed(pool_home, axis):
     assert keep == [] and held["ace-media"].startswith(f"unmeasured:{axis}"), held
     assert plan.take("alpha", pin="ace-media", job_id="t_pin") is None
     assert plan.refusal.startswith(f"pin_host_unified_admission (ace-media: unmeasured:{axis}"), plan.refusal
+
+
+def test_local_start_books_renews_and_releases_on_the_fleet_ledger_when_homes_differ(home, tmp_path, monkeypatch):
+    """Prism 681e7446f5d8: kanban_home() and placement.fleet_root() can be different directories. A local start must
+    book on the FLEET ledger (the one Prism, allocd and test-gate read), and its release must hit the same row."""
+    fleet = tmp_path / "fleet-root"
+    (fleet / "config").mkdir(parents=True)
+    (fleet / "config" / "fleet-hosts.json").write_text((home / "config" / "fleet-hosts.json").read_text())
+    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    from hermes_cli import kanban_headroom as kh
+    now = time.time()
+    rid = kh.book_local("t_x#1", None, now=now)
+    assert rid, "no booking"
+    assert placement.live_reservations(fleet / placement.RESERVATIONS_REL, now=now), "not on the fleet ledger"
+    assert not (home / placement.RESERVATIONS_REL).exists() or not placement.live_reservations(
+        home / placement.RESERVATIONS_REL, now=now), "booked on the board home instead"
+    kh.release_local(rid)
+    assert not placement.live_reservations(fleet / placement.RESERVATIONS_REL, now=now), "release missed the row"

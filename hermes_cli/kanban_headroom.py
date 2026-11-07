@@ -383,6 +383,12 @@ def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[s
         return why
 
 
+def ledger_root() -> Path:
+    """THE root of the shared reservation ledger (Prism 681e7446f5d8): the fleet root every other consumer reads
+    (allocd, Prism, test-gate, LoadGate.shared_leases), never the board home. Booking, renewal and release all use it."""
+    return placement.fleet_root()
+
+
 def book_local(job_id: Optional[str], job: Optional[placement.Job] = None, *, root: Optional[Path] = None,
                now: Optional[float] = None) -> Optional[str]:
     """Book a LOCAL start (this host, the ``local`` alias of the table) on the shared ledger BEFORE launch (t_02aa6d86,
@@ -391,10 +397,7 @@ def book_local(job_id: Optional[str], job: Optional[placement.Job] = None, *, ro
     admitter uses (as book_pin(check=True) does). Returns the reservation id, or None when there is no table or the
     table names no ``local`` host (nothing to book against, the pre-table behaviour). An unreadable ledger raises
     PlacementError: the caller does not start the worker (fail closed)."""
-    if root is None:
-        from hermes_cli.kanban_db import kanban_home
-        root = kanban_home()
-    root = Path(root)
+    root = Path(root) if root is not None else ledger_root()
     table = load_table(root)
     hid = table.resolve(LOCAL_HOST_ALIAS) if table is not None else None
     if hid is None:
