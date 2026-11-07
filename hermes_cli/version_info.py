@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tomllib
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -301,6 +302,34 @@ def get_version_info() -> VersionInfo:
 
     _cached_version_info = info
     return info
+
+
+class LazyHeaders(Mapping):
+    """Read-only headers built by *build* on first read. In a git checkout ``get_version_info()``
+    runs ~8 git subprocesses, so a module that puts the version in a header at import made every
+    fresh process that imported it pay them (t_a1bd70f8). Declare such headers with this instead."""
+
+    __slots__ = ("_build", "_data")
+
+    def __init__(self, build: Callable[[], Mapping[str, str]]) -> None:
+        self._build, self._data = build, None
+
+    def _headers(self) -> dict[str, str]:
+        if self._data is None:
+            self._data = dict(self._build())
+        return self._data
+
+    def __getitem__(self, key: str) -> str:
+        return self._headers()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._headers())
+
+    def __len__(self) -> int:
+        return len(self._headers())
+
+    def __repr__(self) -> str:
+        return repr(self._headers())
 
 
 def get_code_identity(refresh: bool = False) -> dict:

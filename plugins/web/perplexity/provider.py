@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 import httpx
 
 from agent.web_search_provider import WebSearchProvider
-from hermes_cli.version_info import get_version_info
+from hermes_cli.version_info import LazyHeaders, get_version_info
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +51,12 @@ _KEY_URL = "https://www.perplexity.ai/account/api"
 # Identify Hermes to Perplexity: the same static harness identity Hermes sends Kimi and
 # OpenCode, plus Perplexity's integration header. No per-user identifier and no separate
 # request; the call already carries the user's own API key.
-_HEADERS = {
+_HEADERS = LazyHeaders(lambda: {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
     "X-Title": "Hermes Agent",
     "User-Agent": f"HermesAgent/{get_version_info().base_version}",
     "X-Pplx-Integration": "hermes-agent",
-}
+})
 
 
 # Search API hard cap for search_type=web.
