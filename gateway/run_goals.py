@@ -558,10 +558,9 @@ class GatewayGoalsMixin:
         # Blank failed turns still need goal failure accounting; blank successful turns can
         # reset that streak without judging. An in-flight /loop tick must always be settled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        completed = (agent_result.get("completed") if isinstance(agent_result, dict)
-                     else getattr(event, "_goal_turn_completed", None)) is not False
         explicit_completed = (agent_result.get("completed") if isinstance(agent_result, dict)
                               else getattr(event, "_goal_turn_completed", None))
+        completed = explicit_completed is not False
         if final_text.strip() or explicit_completed is not None:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
