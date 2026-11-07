@@ -349,6 +349,20 @@ class GatewayGoalsMixin:
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None or not mgr.is_active():
             return
+        # The turn raised (e.g. agent construction failed): the reply is the gateway's error notice,
+        # not agent output. Judging it re-queued a continuation that failed the same way every ~10 s
+        # (2026-11-07 Agora). Pause durably instead; the error notice was already delivered.
+        _failed = getattr(event, "_goal_turn_failed", None) if event is not None else None
+        if _failed:
+            _sid = getattr(session_entry, "session_id", "?")
+            await self._run_in_executor_with_context(
+                lambda: mgr.pause(f"turn failed ({_failed}); fix the error, then /goal resume"))
+            logger.warning("goal for %s paused: turn failed with %s", _sid, _failed)
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(
+                    source, f"⏸ Goal paused — this turn failed ({_failed}) before the agent could answer. "
+                    "Fix the error (see `hermes logs`), then /goal resume.")
+            return
 
         _bg_procs, _active_deleg = None, 0
         with suppress(Exception):

@@ -253,3 +253,154 @@ async def test_compaction_during_turn_is_unknown_and_not_held(hermes_home):
 ])
 def test_turn_effect_classifier(messages, effect):
     assert classify_turn_effect(messages) == effect
+
+
+# ---------------------------------------------------------------------------
+# Failed turns must not drive the goal loop (2026-11-07 Agora incident): fresh-agent construction
+# raised ImportError on every turn, the judge read the generic error notice as progress, and a
+# synthetic continuation was queued every ~10 s.
+# ---------------------------------------------------------------------------
+
+
+def _real_adapter():
+    """A real BasePlatformAdapter (pending-message FIFO + drain) that records sends."""
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+    class _A(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+            self.sent = []
+
+        async def connect(self, *, is_reconnect: bool = False) -> bool:
+            return True
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            self.sent.append(str(content))
+            return SendResult(success=True, message_id="m1")
+
+        async def edit_message(self, chat_id, message_id, content, finalize=False):
+            return SendResult(success=True, message_id=message_id)
+
+        async def send_typing(self, chat_id, metadata=None) -> None:
+            return None
+
+        async def stop_typing(self, chat_id) -> None:
+            return None
+
+        async def get_chat_info(self, chat_id: str):
+            return {"id": chat_id}
+
+    return _A()
+
+
+def _failing_rig(monkeypatch, hermes_home, session_id):
+    """Real GatewayRunner._handle_message + real adapter + real post-turn goal hooks; only
+    ``_run_agent`` is replaced, by the ImportError agent construction raised in the incident."""
+    import sys
+    import types
+
+    from gateway import run as gateway_run
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *a, **k: 100_000)
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    adapter = _real_adapter()
+    src = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm", user_id="u1")
+    key = build_session_key(src)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._session_db = MagicMock()
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._cache_session_source = lambda _key, _source: None
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._get_guild_id = lambda _event: None
+    runner._should_send_voice_reply = lambda *_a, **_kw: False
+    runner.hooks = MagicMock()
+    runner.hooks.emit = MagicMock(side_effect=lambda *a, **k: asyncio.sleep(0))
+    entry = SessionEntry(session_key=key, session_id=session_id, created_at=datetime.now(),
+                         updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="dm")
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store._generate_session_key.return_value = key
+    runner.session_store.peek_session_id.return_value = session_id
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_platform_message_id.return_value = False
+    runner.session_store.has_input_owner.return_value = True
+    runner.session_store.transcript_tail_role.return_value = "user"
+    runner.session_store.clear_turn_active = lambda *_a, **_k: True
+    calls = []
+    state = {"broken": True}
+
+    async def fake_run_agent(message, **kwargs):
+        calls.append(message)
+        runner._release_running_agent_state(kwargs["session_key"], run_generation=kwargs["run_generation"])
+        if state["broken"]:
+            raise ImportError("The 'anthropic' package is required for the Anthropic provider: venv not installed")
+        return {"final_response": f"answer {len(calls)}", "messages": [], "api_calls": 2,
+                "history_offset": 0, "last_prompt_tokens": 0}
+
+    runner._run_agent = fake_run_agent
+    adapter.set_message_handler(runner._handle_message)
+    return runner, adapter, src, calls, state
+
+
+async def _settle(adapter, calls, expect, quiet=1.5, timeout=20.0):
+    """Wait for ``expect`` turns, then for the session to stay idle ``quiet`` s (a queued
+    continuation would start another turn inside that window); cancel whatever still runs."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while len(calls) < expect and loop.time() < deadline:
+        await asyncio.sleep(0.02)
+    idle_since = None
+    while loop.time() < deadline:
+        busy = any(not t.done() for t in list(adapter._session_tasks.values())) or adapter._pending_messages
+        if busy:
+            idle_since = None
+        elif idle_since is None:
+            idle_since = loop.time()
+        elif loop.time() - idle_since >= quiet:
+            break
+        await asyncio.sleep(0.02)
+    for task in list(adapter._session_tasks.values()):
+        if not task.done():
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_pauses_goal_instead_of_continuation_storm(monkeypatch, hermes_home):
+    from hermes_cli.goals import GoalManager, load_goal
+
+    sid = f"fail-{uuid.uuid4().hex[:8]}"
+    runner, adapter, src, calls, state = _failing_rig(monkeypatch, hermes_home, sid)
+    await asyncio.to_thread(lambda: GoalManager(sid).set("ship the fix"))
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "more to do", False, None, False)):
+        await adapter.handle_message(MessageEvent(text="go", message_type=MessageType.TEXT, source=src,
+                                                  message_id="go"))
+        await _settle(adapter, calls, 1)
+    assert len(calls) == 1, f"failed turn re-queued {len(calls) - 1} synthetic continuations"
+    goal = await asyncio.to_thread(load_goal, sid)
+    assert goal.status == "paused" and "ImportError" in (goal.paused_reason or "")
+    # Error visibility kept: the user saw the failure notice and the pause notice.
+    assert any("went wrong" in s for s in adapter.sent), adapter.sent
+    assert any("Goal paused" in s and "/goal resume" in s for s in adapter.sent), adapter.sent
+    # Durable: a fresh manager (a reload / restart) still reads paused.
+    assert await asyncio.to_thread(lambda: GoalManager(sid).is_active()) is False
+
+    # Repair, then the user resumes: the loop works again (normal continuation is queued).
+    state["broken"] = False
+    await asyncio.to_thread(lambda: GoalManager(sid).resume())
+    with patch("hermes_cli.goals.judge_goal", return_value=("done", "fixed", False, None, False)):
+        await adapter.handle_message(MessageEvent(text="retry", message_type=MessageType.TEXT, source=src,
+                                                  message_id="retry"))
+        await _settle(adapter, calls, 2)
+    assert calls[-1] == "retry"
+    assert (await asyncio.to_thread(load_goal, sid)).status == "done"

@@ -2235,6 +2235,9 @@ class GatewayTurnMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # The /goal hook reads this: an errored turn pauses the goal instead of judging the error reply.
+        with suppress(Exception):
+            event._goal_turn_failed = type(e).__name__
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
