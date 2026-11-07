@@ -412,6 +412,13 @@ def _cli(home: Path, tmp_path: Path, *argv: str, env_extra=None) -> subprocess.C
                           cwd=REPO_ROOT, timeout=120)
 
 
+@pytest.mark.slow_test(
+    180,
+    reason="13 sequential `hermes kanban obligation` CLI subprocesses, each paying full CLI startup (git "
+    "provenance probes); measured 44.9 s call + 7.7 s setup on the Studio at load ~30, past the 60 s cap on "
+    "the 4-way CI runner (run 41967745813 attempt 1). Events are written by exited subprocesses, so order is "
+    "serial; the overrun was wall time, not a race (t_741fc5c0)",
+)
 def test_cli_e2e_open_claim_progress_resolve_with_events_in_order(conn, home, tmp_path):
     _operator_state_db(home, "s-op")
     tid = _card(conn, session="s-op")
