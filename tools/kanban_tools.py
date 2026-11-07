@@ -860,7 +860,7 @@ def _handle_show(args: dict, **kw) -> str:
                      for r in reversed(runs[-_SHOW_MAX_RUNS:])],
             "runs_order": "newest_first",
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)}
+            "worker_context": _worker_context_or_error(kb, conn, tid)}
         omitted = {k: n for k, n in (("comments", len(comments) - _SHOW_MAX_COMMENTS),
                                      ("events", len(events) - _SHOW_MAX_EVENTS),
                                      ("runs", len(runs) - _SHOW_MAX_RUNS)) if n > 0}
@@ -883,6 +883,16 @@ def _handle_show(args: dict, **kw) -> str:
                 "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid),
                 **({"error": arch["error"]} if arch.get("error") else {})}
         return json.dumps(_bounded_show(out), ensure_ascii=False, default=str)
+
+
+def _worker_context_or_error(kb, conn, tid: str) -> str:
+    """An unreadable kanban-archive.db is named in place of the context, never rendered as less history."""
+    from hermes_cli import kanban_archive_read as kar
+
+    try:
+        return kb.build_worker_context(conn, tid)
+    except kar.ArchiveUnreadable as exc:
+        return "worker context unavailable: archived history unreadable (%s)" % exc
 
 
 @_kanban_handler("kanban_list")
