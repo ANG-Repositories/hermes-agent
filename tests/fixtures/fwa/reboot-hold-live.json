@@ -14,14 +14,16 @@
    "card": "t_fixture",
    "drive": true,
    "end": {
-    "backstop_until": 1794112600,
-    "boot_id_at_pause": "5f0c3b8e-1d2a-4c6e-9b7f-0a1b2c3d4e5f",
+    "backstop_until": 1794091600,
+    "boot_id_at_pause": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
     "grace_s": 600,
-    "kind": "reboot"
+    "kind": "reboot",
+    "rebooted_at": 1794069700,
+    "seen_up_at": 1794069940
    },
    "host": "ace-media",
-   "id": "20261107T120000Z-ace-media-a0000010",
-   "kind": "maintenance",
+   "id": "20261107T120000Z-ace-media-a000000e",
+   "kind": "pause",
    "lanes": [
     "kanban",
     "prism",
@@ -37,10 +39,10 @@
     "ci-failover"
    ],
    "owner": "card:t_fixture",
-   "reason": "fixture a0000010",
+   "reason": "fixture a000000e",
    "schema": 1,
    "since": 1794069400,
-   "until": 1794112600
+   "until": 1794091600
   }
  ],
  "host": "ace-media",

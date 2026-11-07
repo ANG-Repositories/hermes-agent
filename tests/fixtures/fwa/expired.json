@@ -14,7 +14,7 @@
    "card": "t_fixture",
    "drive": true,
    "end": {
-    "kind": "until",
+    "kind": "time",
     "until": 1794070000
    },
    "host": "ace-media",

@@ -42,7 +42,7 @@ def _hold(home, host="ci-box", *, lanes=("kanban", "ci", "prism"), since=None, u
     doc = {"schema": 1, "id": hid, "host": host, "kind": "pause", "lanes": list(lanes), "owner": "card:t_x",
            "drive": True, "by": "apollo", "card": "t_x", "reason": "fixture", "since": now - 60 if since is None
            else since, "until": now + 3600 if until is None else until}
-    doc["end"] = {"kind": "until", "until": doc["until"]}      # §5.4a: every hold carries an end
+    doc["end"] = {"kind": "time", "until": doc["until"]}      # §5.4a: every hold carries an end
     doc.update(extra)
     if doc.get("end") is None:
         doc.pop("end", None)
@@ -172,7 +172,8 @@ _BAD_ENDS = {
     "absent": None,
     "not-a-dict": "2h",
     "unknown-kind": {"kind": "forever"},
-    "until-mismatch": {"kind": "until", "until": 1},
+    "until-mismatch": {"kind": "time", "until": 1},
+    "grace-absent": {"kind": "reboot", "boot_id_at_pause": "b", "backstop_until": "NOW+1h"},
     "for-past-24h": "OVER",
     "reboot-no-backstop": {"kind": "reboot", "boot_id_at_pause": "b", "grace_s": 600},
     "reboot-grace-over-2h": {"kind": "reboot", "boot_id_at_pause": "b", "grace_s": 7201, "backstop_until": "NOW+1h"},
@@ -201,6 +202,15 @@ def test_missing_or_malformed_end_is_expired_with_one_log_line(home, case, caplo
     assert len(lines) == 1 and "expired" in lines[0], lines
 
 
+def test_verdict_alone_treats_an_endless_doc_as_expired():
+    """fwa_verdict is §5.4a-correct on its own, not only behind the loader: a dict with no end never holds."""
+    now = 1794070000
+    doc = {"schema": 1, "id": "x", "host": "ci-box", "lanes": ["kanban"], "since": now - 60, "until": now + 60}
+    assert kph.fwa_verdict([doc], "kanban", now) is None
+    doc["end"] = {"kind": "time", "until": now + 60}
+    assert kph.fwa_verdict([doc], "kanban", now)[1] == "x"
+
+
 def _reboot_hold(home, backstop, **end_extra):
     end = {"kind": "reboot", "boot_id_at_pause": "5f0c3b8e-1d2a-4c6e-9b7f-0a1b2c3d4e5f", "grace_s": 600,
            "backstop_until": backstop, **end_extra}
@@ -227,6 +237,26 @@ def test_reboot_hold_past_its_backstop_admits(home):
         _reboot_hold(home, now - 1)
         _res, spawned = _tick(conn, _plan())
         assert ids["A"] in {t for t, _ in spawned}
+
+
+def test_reboot_hold_released_by_sweep_stamps_admits(home):
+    """Home ``fwa.effective_end``: the sweep stamped rebooted_at and seen_up_at >= rebooted_at + grace_s."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _reboot_hold(home, now + 12 * 3600, rebooted_at=now - 900, seen_up_at=now - 200)
+        _res, spawned = _tick(conn, _plan())
+        assert ids["A"] in {t for t, _ in spawned}
+
+
+def test_reboot_hold_inside_grace_still_holds(home):
+    """Rebooted, but not yet seen up for grace_s: still held (the host is not back)."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _reboot_hold(home, now + 12 * 3600, rebooted_at=now - 300, seen_up_at=now - 10)
+        _res, spawned = _tick(conn, _plan())
+        assert ids["A"] not in {t for t, _ in spawned}
 
 
 def test_reboot_hold_archived_by_the_sweep_releases(home):

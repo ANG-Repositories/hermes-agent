@@ -14,7 +14,7 @@
    "card": "t_fixture",
    "drive": true,
    "host": "ace-media",
-   "id": "20261107T120000Z-ace-media-a0000012",
+   "id": "20261107T120000Z-ace-media-a0000010",
    "kind": "pause",
    "lanes": [
     "kanban",
@@ -31,7 +31,7 @@
     "ci-failover"
    ],
    "owner": "card:t_fixture",
-   "reason": "fixture a0000012",
+   "reason": "fixture a0000010",
    "schema": 1,
    "since": 1794069400,
    "until": 1794076600
