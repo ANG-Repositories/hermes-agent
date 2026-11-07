@@ -169,6 +169,18 @@ def test_no_github_client_refuses_own_pr_in_worker_draft_repo(monkeypatch):
     assert exc.value.prs == ["o/r#5"]
 
 
+@pytest.mark.parametrize("url", [PR_URL, "https://github.com/O/R/pull/5", "https://github.com/o/R/pull/5"])
+def test_unread_refuses_matches_worker_draft_repo_case_insensitively(url):
+    """t_6a6a7bc0: GitHub owner/repo are case-insensitive; the config lists "O/R", so every spelling of it
+    refuses when unreadable (byte-exact would fail open), and an unlisted repo never does."""
+    (ref,) = op.extract_pr_refs(url)
+    assert fr._unread_refuses(ref, "o/r#5", None) is True
+    assert fr._unread_refuses(ref, "O/R#5", {"o/r#5"}) is True
+    assert fr._unread_refuses(ref, "o/r#5", set()) is False
+    (other,) = op.extract_pr_refs("https://github.com/u/other/pull/5")
+    assert fr._unread_refuses(other, "u/other#5", None) is False
+
+
 def test_no_github_client_mentioned_or_unlisted_or_draft_ok_fails_open(monkeypatch):
     monkeypatch.setattr(fr, "_default_gh", lambda: None)
     refs = op.extract_pr_refs(PR_URL)
