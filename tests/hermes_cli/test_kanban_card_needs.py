@@ -157,6 +157,18 @@ def test_incident_pin_cannot_bypass_resource_needs():
     assert port("requires: none\n" + body, body_signals=False) == (True, None, "pin")
 
 
+def test_unpinned_needs_wait_keeps_the_soft_rule_ed96eb421c9c():
+    # Prism ed96eb421c9c: the pin-side needs check must not pre-empt soft_rule for an unpinned card.
+    pool = kwp.PoolConfig(hosts=("ace-ai", "ci-box"), profiles=("alpha",),
+                          pool_hosts=(_host("ace-ai"), _host("ci-box")), caps={})
+    body = 'DO NOT call skill_view("browser-access"); read reference with read_file.'
+    def port(text, **kwargs):
+        return kwp.portable(workspace_kind="scratch", workspace_has_content=False,
+                            assignee="alpha", body=text, pool=pool, **kwargs)
+    assert port(body, requires=(None, "requires_unsatisfied:browser")) == (False, "requires_unsatisfied:browser", None)
+    # `host: any` returns before soft_rule, so the needs check still binds it.
+    assert port("host: any\n" + body) == (False, "studio_needs", None)
+
 def test_portable_binds_studio_needs_even_with_a_pin():
     pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), pool_hosts=(_host("ci-box"),))
 
