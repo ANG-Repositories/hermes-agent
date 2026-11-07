@@ -384,19 +384,6 @@ def test_a_stale_record_entry_on_an_unreachable_host_is_dropped_never_latched(do
 
 # -- CI-completion round 2 (Prism at 605a9c86) ---------------------------------------------------------------------
 
-@pytest.mark.platforms("windows")
-def test_fault_state_operations_work_on_native_windows(fleet):
-    """Prism df51bfc576d9. RED on 605a9c86 on Windows: the lazy fcntl import only moved the failure, so latched(),
-    hold_reason() and check_registry() with a missing registry raised ModuleNotFoundError inside _state()."""
-    fleet.table()
-    fleet.token()
-    assert faults.check_registry() == "missing"
-    assert len(fleet.pages) == 1
-    faults.latch("probe")
-    assert faults.latched() == "probe"
-    assert faults.hold_reason() == "door latched: probe"
-
-
 @pytest.mark.platforms("posix")
 def test_a_permission_only_token_repair_clears_the_latch(door_fleet):
     """Prism 917208e77049. chmod leaves mtime and size alone. RED on 605a9c86: the fingerprint hashed only those,

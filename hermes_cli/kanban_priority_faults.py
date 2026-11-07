@@ -42,9 +42,17 @@ def _root() -> Path:
     return Path(placement.fleet_root())
 
 
+#: Same value and root rule as admission_demand.PRIORITY_REL / _root() (pinned by
+#: test_registry_path_matches_the_vendored_library). Computed here so the fault-state and registry-read path never
+#: imports the vendored admission_demand, whose module top imports POSIX-only fcntl/pwd (Prism 3e3d55eb04a0).
+PRIORITY_REL = Path("fleet") / "admission-priority.json"
+
+
 def _registry_path() -> Path:
-    from hermes_cli.fleet_placement import admission_demand
-    return Path(admission_demand._root()) / admission_demand.PRIORITY_REL
+    # The package's own root rule (bound onto admission_demand._root on first use); fleet_placement/__init__ has
+    # no POSIX-only imports, so this path is safe on native Windows.
+    from hermes_cli import fleet_placement
+    return Path(fleet_placement._demand_root()) / PRIORITY_REL
 
 
 def _table_path() -> Path:
