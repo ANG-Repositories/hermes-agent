@@ -5901,6 +5901,12 @@ def _ledger_mint_cap(conn: sqlite3.Connection, outcome: str, **fields: Any) -> N
         _log.debug("mint-cap ledger write failed", exc_info=True)
 
 
+def _ledger_on_commit(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Queue a ledger row for the outer COMMIT of the enclosing write_txn (kanban_db_connect.on_commit)."""
+    from hermes_cli.kanban_db_connect import on_commit
+    on_commit(conn, lambda: _ledger_mint_cap(conn, outcome, **fields))
+
+
 def mint_cap_bypass(conn: sqlite3.Connection, created_by: Optional[str]) -> Optional[dict]:
     """The kill switch is set and an automated ``created_by`` is at/over the DEFAULT cap: the mint that follows
     would have been refused. -> {created_by, count, cap, env}, else None. Ledgered as ``bypassed`` and a
@@ -6986,6 +6992,13 @@ def create_task(
                     _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
                 if mint_cap_bypassed:
                     _append_event(conn, task_id, "mint_cap_bypassed", mint_cap_bypassed)
+                # Prism 31f2934ed515: a create nested in a caller's write_txn only releases a savepoint here, so the
+                # ledger row of a card is queued for the OUTER commit (dropped on any rollback); never a row for a
+                # card that does not exist. A refusal (no card) stays an immediate append.
+                if mint_cap_forced:
+                    _ledger_on_commit(conn, "forced", task_id=task_id, **mint_cap_forced)
+                if mint_cap_bypassed:
+                    _ledger_on_commit(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
                 if mint_breaker_forced:
                     _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
@@ -7062,11 +7075,6 @@ def create_task(
                         )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
-            # After commit (a rolled-back create never ledgers a card that does not exist).
-            if mint_cap_forced:
-                _ledger_mint_cap(conn, "forced", task_id=task_id, **mint_cap_forced)
-            if mint_cap_bypassed:
-                _ledger_mint_cap(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
             if overlap_hits:
                 # After commit, fire-and-forget: a create never waits on Discord.
                 _kov.notify_logs(board, task_id, overlap_hits)
