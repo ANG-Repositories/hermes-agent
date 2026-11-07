@@ -267,13 +267,8 @@ def test_publication_reconciler_has_every_recovery_trigger_and_shared_lock():
     assert stable["concurrency"] == publication["concurrency"] == {
         "group": "stable-release", "cancel-in-progress": "false",
     }
-    assert {"workflow_dispatch", "workflow_run"} <= set(publication["on"])
-    assert publication["on"]["workflow_run"] == {
-        "workflows": ["Stable Release"], "types": ["completed"],
-        # fork: a ci-overflow-ledger data commit starts zero workflows (spec §5.3,
-        # tests/test_ci_overflow_workflow_contract.py::test_ledger_branch_commit_starts_no_workflow).
-        "branches-ignore": ["ci-overflow-ledger"],
-    }
+    # Public mirror policy disables automatic reconciliation, not its manual recovery path.
+    assert set(publication["on"]) == {"workflow_dispatch"}
     reconcile = publication["jobs"]["reconcile"]
     assert reconcile["environment"] == "release-signing"
     assert publication["permissions"] == {"contents": "write", "actions": "write"}

@@ -46,7 +46,8 @@ def test_archive_reader_accepts_bom_without_changing_pin_authority(tmp_path):
 def test_archive_gate_uses_bootstrap_python_and_trusted_exact_revision():
     workflow = load("archive-inputs.yml")
     assert not {"pull_request", "pull_request_target"} & workflow["on"].keys()
-    assert "workflow_dispatch" in workflow["on"] and "push" in workflow["on"]
+    # Public mirror policy (t_868e850a): keep the callable archive, not self-triggers.
+    assert set(workflow["on"]) == {"workflow_dispatch", "workflow_call"}
     job = workflow["jobs"]["archive-inputs"]
     assert job["environment"] == "release-signing"
     assert R2_ENV <= job["env"].keys()
@@ -89,7 +90,7 @@ def test_scheduled_and_main_r2_consumers_skip_without_credentials():
     assert r2_steps and all(needs_r2_credentials(s) for s in r2_steps)
 
     termux = load("termux-verify.yml")
-    assert termux["on"]["push"]["branches"] == ["main"] and "pull_request" in termux["on"]
+    assert set(termux["on"]) == {"workflow_dispatch", "workflow_call"}
     native = termux["jobs"]["native-runtime"]
     probe = termux["jobs"][native["needs"]]
     assert probe["environment"] == "release-signing"
