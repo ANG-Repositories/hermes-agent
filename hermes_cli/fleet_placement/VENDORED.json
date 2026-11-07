@@ -1,13 +1,14 @@
 {
   "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
   "source_repo": "ANG-Ventures/hermes-home",
-  "source_ref": "7155a6de7ead5daf8978ab4b133d0092e8828ecb",
-  "source_note": "hermes-home main 7155a6de7e (after #9369 merge f03300d924, t_3d0928f7): alloc_client + admission_demand are a PAIR (the client calls admission_demand.make_dirs_durable); admission carries cbef7a82 (t_430834ff fcfs batch order). alloc_client moved here from hermes_cli/ so its canonical _sibling package import resolves unmodified. Re-vendored by P4 t_0c5ef02e round 4.",
+  "source_ref": "f80cb446368ee1fdf09cb68a4d1f64c3cf6918ba",
+  "source_note": "hermes-home main 7155a6de7e (after #9369 merge f03300d924, t_3d0928f7): alloc_client + admission_demand are a PAIR (the client calls admission_demand.make_dirs_durable); admission carries cbef7a82 (t_430834ff fcfs batch order). alloc_client moved here from hermes_cli/ so its canonical _sibling package import resolves unmodified. Re-vendored by P4 t_0c5ef02e round 4; the alloc_client + admission_demand PAIR re-vendored from hermes-home main f80cb44636 (#9496, mark_protected anchor retry, Prism d50cba826e5e) by round 5. placement.py, admission.py and work_estimate.py are unchanged byte copies from 7155a6de7e (admission and work_estimate are identical at f80cb446; placement re-vendor is not this card's).",
   "vendored_at": "2026-11-06",
   "max_age_days": 21,
   "files": {
     "placement.py": {
       "source_path": "scripts/lib/placement.py",
+      "source_ref": "7155a6de7ead5daf8978ab4b133d0092e8828ecb",
       "sha256": "8fa68c8796322daf0568044851d15052ea407edbaa04eec920821724c69443e7"
     },
     "admission.py": {
@@ -24,7 +25,7 @@
     },
     "alloc_client.py": {
       "source_path": "scripts/lib/alloc_client.py",
-      "sha256": "b8a4e37199fe69abea7b882ef7754c9244404cbe76d88a708c4898683f375648"
+      "sha256": "7235d42e39ebbe27638a3c51990b24d2419f1794404466e6853c5cdd876627f2"
     }
   }
 }

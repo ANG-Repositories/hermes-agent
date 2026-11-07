@@ -214,6 +214,7 @@ def _protected(consumer: str) -> bool:
 
 
 _DURABLE_MARKERS: set = set()         # marker paths THIS process fsync'd (file + dir); a visible marker is not proof
+_UNPROVEN_TOP: dict = {}              # protected dir -> top of a chain whose sync failed after mkdir (retry walks up to it)
 
 
 def mark_protected(consumer: str) -> None:
@@ -224,7 +225,18 @@ def mark_protected(consumer: str) -> None:
     # up to the fleet root (mkdir may have made any of them, here or in a process that crashed before syncing) AND
     # up to the deepest pre-existing ancestor when mkdir created the fleet root itself (PLACEMENT_HOME nested under a
     # fresh path), before the marker is cached durable. One helper with admission_demand (t_3d0928f7).
-    _sibling("admission_demand").make_dirs_durable(d, through=root)
+    # When mkdir creates the fleet root itself, the pre-mkdir anchor above it is kept until the chain sync succeeds,
+    # so a retry after a failed ancestor fsync walks up to that anchor again rather than stopping at the now-existing
+    # root (Prism d50cba826e5e; same rule as admission_demand._writer).
+    key = str(d)
+    top = _UNPROVEN_TOP.get(key)
+    if top is None:
+        anchor = d
+        while not anchor.exists() and anchor.parent != anchor:
+            anchor = anchor.parent
+        top = _UNPROVEN_TOP[key] = anchor if anchor in root.parents else root
+    _sibling("admission_demand").make_dirs_durable(d, through=top)
+    _UNPROVEN_TOP.pop(key, None)
     # durable before any token use succeeds (Prism f5e6f9863e5c): a crash that loses the marker while a later token
     # removal survives would read as "no auth"; fsync the file AND its directory entry (OSError -> caller fails closed)
     fd = os.open(str(d / consumer), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
