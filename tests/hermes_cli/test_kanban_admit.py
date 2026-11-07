@@ -287,8 +287,10 @@ def test_admit_refuses_a_draining_pool_host(board, monkeypatch):
     assert _status(tid) == "ready"
 
 
-def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
+def test_a_stale_remote_pressure_sample_is_unmeasured_memory(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))   # no table: never the host's (t_2105a835)
 
     sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0,
                             pressure_text=json.dumps({"at": 1000.0, "mem_available_gb": 100.0}))
