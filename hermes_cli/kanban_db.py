@@ -98,17 +98,38 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return default
 
 
-def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
-    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
+def _git_out(
+    cwd: Path, *args: str, timeout: int = 30, workspace_probe: bool = False,
+) -> Optional[str]:
+    """Return git stdout, preserving executable failures on workspace probes.
+
+    A failed executable is not evidence that the workspace is not a repository.
+    Other callers retain the historical best-effort (None on failure) behavior.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, check=False,
+            timeout=timeout, check=False, stdin=subprocess.DEVNULL,
         )
+    except OSError as exc:
+        if workspace_probe and exc.filename == "git":
+            raise RuntimeError(f"git executable unavailable: {exc}") from exc
+        return None
     except Exception:
         return None
     if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        executable_failure = result.returncode in (126, 127) or (
+            "no such file or directory" in stderr.lower()
+            and ("exec" in stderr.lower() or re.search(
+                r"/[^\s:]*[/]git(?:-[\w.-]+)?(?=['\"\s:]|$)", stderr,
+            ))
+        )
+        if workspace_probe and executable_failure:
+            raise RuntimeError(
+                f"git executable unavailable (exit {result.returncode}): {stderr}"
+            )
         return None
     return (result.stdout or "").strip() or None
 
@@ -2559,6 +2580,7 @@ class Task:
     # Boomerang wake level (Ace 2026-10-22): True/False = the card's subscription level is
     # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
     boomerang_wake: Optional[bool] = None
+    asap: bool = False  # Explicit operator edit only; never inherited at creation.
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2578,6 +2600,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            asap=bool(g("asap")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
             pin_sub_reason=g("pin_sub_reason") or None,
@@ -5573,7 +5596,6 @@ def _origin_line(body: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 NEEDS_INPUT_PAGE_MIN_PRIORITY = 100
-NEEDS_INPUT_PAGE_ALERTS_PRIORITY = 200
 _NEEDS_INPUT_PAGE_OFF = "needs_input_page_off"
 _NEEDS_INPUT_PAGE_ON = "needs_input_page_on"
 # ``origin: discord <name> (<numeric channel id>) · session ...`` (see
@@ -5738,15 +5760,16 @@ def needs_input_page_candidates(
     comment newer than its latest block (answered, waiting on an unblock; see
     ``_ruled_since_block``), and has ``priority >= min_priority``
     OR an ``origin:`` line naming a numeric Discord channel. Each item carries
-    ``channel`` (origin channel id or None) and ``alerts`` (priority >= 200).
+    ``channel`` (origin channel id or None), ``session_id`` (the card's home
+    session, which the pager resolves to a chat when ``channel`` is None).
     """
     rows = list(conn.execute(
-        "SELECT id, title, body, priority, status, block_kind FROM tasks "
+        "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks "
         "WHERE status IN ('blocked', 'triage') AND block_kind = 'needs_input' ORDER BY id"
     ))
     if include_dependency:
         rows += list(conn.execute(
-            "SELECT id, title, body, priority, status, block_kind FROM tasks t "
+            "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks t "
             "WHERE status IN ('todo', 'blocked') AND block_kind = 'dependency' "
             "AND EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
             "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) IN (?, ?) "
@@ -5790,7 +5813,7 @@ def needs_input_page_candidates(
             "kind": row["block_kind"],
             "reason": reason or "(no reason given)",
             "channel": channel,
-            "alerts": priority >= NEEDS_INPUT_PAGE_ALERTS_PRIORITY,
+            "session_id": row["session_id"],
         })
     return out
 
@@ -5822,6 +5845,173 @@ class NearDuplicateError(ValueError):
     def __init__(self, message: str, duplicates: list[dict]):
         super().__init__(message)
         self.duplicates = duplicates
+
+
+# Per-creator mint cap (Ace 2026-11-05 12:59 PT, "do this immediately"): measured 2026-11-05, 710 cards
+# minted in 24 h on the default board, 477 of them by automation (main-tip-red 177, pager-owner-card 120,
+# landing-queue 93, ci-red-owner 38, live-edit-card 32, prism-page-card 17) feeding ~1,640 worker runs and
+# ~2,500 CI runs on hermes-home alone; CI runners then starved the Prism review pool to 0 placeable hosts.
+# Every minter passes through ``create_task``, so the cap lives here, not per script. A creator that is
+# not a human (``created_by`` empty / ``user`` / ``human:*``) may mint at most ``MINT_CAP_PER_DAY`` cards
+# per rolling 24 h; the (N+1)th raises :class:`MintCapError`. ``force_reason`` (CLI ``--force``) overrides
+# it and is ledgered as a ``mint_cap_forced`` event on the new card. Kill switch:
+# ``HERMES_KANBAN_MINT_CAP=0`` (env; ``HERMES_KANBAN_MINT_CAP=<n>`` resizes). Idempotent re-mints that
+# return an existing card never count: the check runs after the idempotency lookup.
+MINT_CAP_PER_DAY = 24
+MINT_CAP_WINDOW_S = 24 * 3600
+MINT_CAP_HUMAN_PREFIXES = ("human:",)
+MINT_CAP_HUMAN_NAMES = frozenset({"", "user", "operator", "apollo", "aegis"})
+
+
+class MintCapError(ValueError):
+    """``create_task`` refused: ``created_by`` is over its rolling-24 h mint cap."""
+
+    def __init__(self, message: str, created_by: str, count: int, cap: int):
+        super().__init__(message)
+        self.created_by = created_by
+        self.count = count
+        self.cap = cap
+
+
+def mint_cap() -> int:
+    """The live cap (``HERMES_KANBAN_MINT_CAP`` env, else :data:`MINT_CAP_PER_DAY`); 0 = off."""
+    return _env_int("HERMES_KANBAN_MINT_CAP", MINT_CAP_PER_DAY, minimum=0)
+
+
+def mint_cap_applies(created_by: Optional[str]) -> bool:
+    """True for an automated creator; humans and the operator CLI default are never capped."""
+    by = (created_by or "").strip()
+    if by.lower() in MINT_CAP_HUMAN_NAMES:
+        return False
+    return not any(by.lower().startswith(p) for p in MINT_CAP_HUMAN_PREFIXES)
+
+
+def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int] = None) -> int:
+    """Cards this creator minted in the trailing window, archived ones included (a reaped card still cost a run)."""
+    now = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE created_by = ? AND created_at > ?",
+        (created_by, now - MINT_CAP_WINDOW_S),
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
+    """Raise :class:`MintCapError` when ``created_by`` is an automated creator at or over the cap."""
+    cap = mint_cap()
+    if cap <= 0 or not mint_cap_applies(created_by):
+        return
+    by = (created_by or "").strip()
+    n = mint_count_24h(conn, by, now)
+    if n >= cap:
+        raise MintCapError(
+            "mint cap: created_by=%r has minted %d cards in the last 24 h (cap %d). One card per distinct "
+            "failing signature, not one per occurrence: reuse the open card (idempotency_key) or wait for "
+            "the window. Override: --force \"<why this card must exist now>\"; kill switch "
+            "HERMES_KANBAN_MINT_CAP=0." % (by, n, cap), by, n, cap)
+
+
+# Signature resolver + flap breaker (PRD plans/2026-11-05_machine-minted-cards-signature-dedup-prd.md, Ace
+# 2026-11-05 15:36 "spec out the real fix ... you do it then build it"). Phase-0 replay over 7 days: main-tip-red
+# minted 523 cards for 184 failure signatures (336 would have reused an existing card; 20 signatures closed 3+
+# times in a row with no code change), pager-owner-card 827 for 180. The idempotency key carries a per-occurrence
+# sha/epoch, so the same failure minted a fresh card per baseline/episode and the worker's whole job was to find
+# "already fixed on main". A minter passes ``signature`` = the key minus that suffix; the resolver answers from
+# ``tasks.signature`` (indexed) regardless of who minted.
+SIGNATURE_QUIET_S = 24 * 3600      # a card that CLOSED this recently still owns the signature
+SIGNATURE_FLAP_N = 3               # consecutive no-code closes that trip the breaker
+SIGNATURE_PAGE_PRODUCER = "kanban-mint-breaker"
+
+
+class MintBreakerError(ValueError):
+    """``create_task`` refused: the signature's last N cards all closed with no code change (a flapping detector)."""
+
+    def __init__(self, message: str, signature: str, cards: list[str]):
+        super().__init__(message)
+        self.signature = signature
+        self.cards = cards
+
+
+def signature_dedup_on() -> bool:
+    return _env_int("HERMES_KANBAN_SIGNATURE_DEDUP", 1, minimum=0) > 0
+
+
+def mint_breaker_on() -> bool:
+    return _env_int("HERMES_KANBAN_MINT_BREAKER", 1, minimum=0) > 0
+
+
+def signature_quiet_s() -> int:
+    return _env_int("HERMES_KANBAN_SIGNATURE_QUIET_S", SIGNATURE_QUIET_S, minimum=0)
+
+
+def signature_flap_n() -> int:
+    return _env_int("HERMES_KANBAN_SIGNATURE_FLAP_N", SIGNATURE_FLAP_N, minimum=1)
+
+
+def _signature_history(conn: sqlite3.Connection, signature: str, limit: int) -> list[dict]:
+    """Newest-first cards for ``signature`` with their close time and whether the close carried code.
+
+    ``closed_at`` = the newest ``completed``/``archived`` event; ``no_code`` = that event's payload has no
+    ``survivor`` of kind patch/bundle/landed/artifact and no ``superseded_by`` naming a PR (I4: evidence, never
+    the summary's prose). An open card has ``closed_at`` None.
+    """
+    rows = conn.execute(
+        "SELECT id, status, created_at FROM tasks WHERE signature = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (signature, limit)).fetchall()
+    out = []
+    for r in rows:
+        ev = conn.execute(
+            "SELECT created_at, payload FROM task_events WHERE task_id = ? AND kind IN ('completed', 'archived') "
+            "ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        closed_at, no_code = None, False
+        if ev is not None and r["status"] in ("done", "archived"):
+            closed_at = int(ev["created_at"])
+            try:
+                payload = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else (ev["payload"] or {})
+            except (TypeError, ValueError):
+                payload = {}
+            surv = payload.get("survivor") if isinstance(payload, dict) else None
+            kind = surv.get("kind") if isinstance(surv, dict) else None
+            sup = str(payload.get("superseded_by") or "") if isinstance(payload, dict) else ""
+            no_code = kind not in ("patch", "bundle", "landed", "artifact") and "/pull/" not in sup and "#" not in sup
+        out.append({"id": r["id"], "status": r["status"], "created_at": int(r["created_at"]),
+                    "closed_at": closed_at, "no_code": no_code})
+    return out
+
+
+def resolve_signature(conn: sqlite3.Connection, signature: Optional[str], created_by: Optional[str], *,
+                      now: Optional[int] = None, reuse: bool = True) -> Optional[str]:
+    """The card that already owns ``signature`` (open, or closed within the quiet window), else None.
+
+    Raises :class:`MintBreakerError` when the last :func:`signature_flap_n` cards for it all closed with no code
+    change. Inert for humans (:func:`mint_cap_applies`), a NULL signature, or ``HERMES_KANBAN_SIGNATURE_DEDUP=0``.
+    ``reuse=False`` (``kanban create --no-signature-reuse``): the caller has proven it needs a FRESH card (a possible
+    regression after the signature's card closed), so the open/quiet-window reuse is skipped while the breaker still
+    applies and the new card still stores the signature, keeping it in the breaker's history.
+    """
+    sig = (signature or "").strip()
+    if not sig or not signature_dedup_on() or not mint_cap_applies(created_by):
+        return None
+    now = int(time.time()) if now is None else int(now)
+    n = signature_flap_n()
+    hist = _signature_history(conn, sig, n)
+    if not hist:
+        return None
+    newest = hist[0]
+    if reuse and newest["closed_at"] is None:
+        _append_event(conn, newest["id"], "signature_remint", {"signature": sig, "created_by": created_by, "at": now})
+        return newest["id"]
+    if reuse and newest["closed_at"] is not None and now - newest["closed_at"] < signature_quiet_s():
+        _append_event(conn, newest["id"], "signature_remint",
+                      {"signature": sig, "created_by": created_by, "at": now, "quiet_window": True})
+        return newest["id"]
+    if mint_breaker_on() and len(hist) >= n and all(h["no_code"] for h in hist[:n]):
+        ids = [h["id"] for h in hist[:n]]
+        raise MintBreakerError(
+            "mint breaker: signature %r minted and closed %d times in a row with no code change (%s); the detector "
+            "or its baseline is stale, not the tree. Fix the detector, or override with --force \"<why>\"; kill "
+            "switch HERMES_KANBAN_MINT_BREAKER=0." % (sig, n, ", ".join(ids)), sig, ids)
+    return None
 
 
 def _near_dup_body(body: Optional[str]) -> str:
@@ -6079,8 +6269,17 @@ def create_task(
     workspace_of: Optional[str] = None,
     boomerang_wake: Optional[bool] = None,
     no_worker: bool = False,
+    signature: Optional[str] = None,
+    signature_reuse: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
+
+    ``signature`` (automated minters only): the failure's identity minus its per-occurrence sha/epoch
+    (``main-tip-red:<repo>/<unit>/<test>``, ``pager:<host>:<producer>:<key>``). :func:`resolve_signature`
+    returns the OPEN card for it, or the card that closed within :data:`SIGNATURE_QUIET_S`, instead of
+    minting; after :data:`SIGNATURE_FLAP_N` consecutive closes with no code change it raises
+    :class:`MintBreakerError` (``force_reason`` overrides, ledgered ``mint_breaker_forced``).
+    ``signature_reuse=False`` skips the reuse but keeps the breaker and stores the signature (a caller-proven fresh card).
 
     ``no_worker=True`` mints the card operator-only (the ``no_worker`` flag,
     see :func:`set_no_worker`): it never reaches a worker, so the assignee
@@ -6367,6 +6566,31 @@ def create_task(
             pr_owner_forced = {"owner": exc.owner["task_id"], "pr": exc.owner["pr"],
                                "reason": force_reason}
 
+    # Per-creator mint cap (see MINT_CAP_PER_DAY): after the idempotency lookup, so a re-mint that returns the
+    # existing card never counts; before the write txn, so a refusal holds no lock.
+    mint_cap_forced: Optional[dict] = None
+    mint_breaker_forced: Optional[dict] = None
+    # Signature resolver (see SIGNATURE_QUIET_S): an open or recently closed card for the same failure signature
+    # is returned instead of minting; a flapping signature raises unless forced.
+    if signature:
+        try:
+            with write_txn(conn):
+                owner = resolve_signature(conn, signature, created_by, reuse=signature_reuse)
+        except MintBreakerError as exc:
+            if not force_reason:
+                raise
+            mint_breaker_forced = {"signature": exc.signature, "cards": exc.cards, "reason": force_reason}
+        else:
+            if owner:
+                return owner
+    try:
+        check_mint_cap(conn, created_by)
+    except MintCapError as exc:
+        if not force_reason:
+            raise
+        mint_cap_forced = {"created_by": exc.created_by, "count": exc.count, "cap": exc.cap,
+                           "reason": force_reason}
+
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -6388,6 +6612,8 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+    from hermes_cli.kanban_db_workspace import refuse_runtime_tree_workspace
+    refuse_runtime_tree_workspace(workspace_kind, workspace_path)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -6603,8 +6829,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, boomerang_wake
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        workspace_of, boomerang_wake, signature
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6636,6 +6862,7 @@ def create_task(
                         brain,
                         workspace_of,
                         None if boomerang_wake is None else (1 if boomerang_wake else 0),
+                        signature,
                     ),
                 )
                 for pid in parents:
@@ -6733,6 +6960,10 @@ def create_task(
                     })
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
+                if mint_cap_forced:
+                    _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
+                if mint_breaker_forced:
+                    _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
                 # K5: a background delegation unit is not an incident a session
                 # mints; the gate would only comment and hold it for 10 min.

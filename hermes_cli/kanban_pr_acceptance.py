@@ -165,8 +165,16 @@ def collect_acceptance(contract: str, published_pr: str | None,
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
         stage = "read branch protection"
-        protection = (_api(f"repos/{repo}/branches/{quote(branch, safe='')}",
-                           profile_home=profile_home).get("protection") or {})
+        branch_obj = _api(f"repos/{repo}/branches/{quote(branch, safe='')}", profile_home=profile_home)
+        protection = branch_obj.get("protection") or {}
+        # Absence of required checks is a positive read, never a missing field (Prism 3dda6c19e7d5): a branch that
+        # reports ``protected`` without a readable ``protection`` body (reduced token, API shape change) must not
+        # look like an unprotected branch, or a contract repo lands with no CI evidence at all.
+        protected = branch_obj.get("protected")
+        if protected is True and not protection.get("required_status_checks"):
+            raise ValueError("branch is protected but its required checks are unreadable")
+        if protected is None and not protection:
+            raise ValueError("branch protection status is unreadable (no `protected` flag)")
         checks_cfg = protection.get("required_status_checks") or {}
         required = {(r["context"], r.get("app_id")) for r in checks_cfg.get("checks", [])}
         if set(checks_cfg.get("contexts", [])) - {c for c, _ in required}:
@@ -183,7 +191,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            receipt.update(ok=True, classification="local-only",
+                           detail="no repository-required checks: local-only",
+                           recovery="")
             return receipt
         stage = "read check runs and statuses"
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",

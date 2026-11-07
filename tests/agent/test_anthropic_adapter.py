@@ -3,7 +3,7 @@
 import json
 import sys
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -49,6 +49,59 @@ def test_missing_sdk_error_reports_why_the_lazy_install_did_not_land(monkeypatch
         build_anthropic_client("sk-ant-api03-test")
     assert str(restart) in str(excinfo.value)
     assert pm.install_hint("anthropic") not in str(excinfo.value)
+
+
+def test_missing_sdk_recovers_in_process_once_importable(monkeypatch):
+    """Regression (2026-11-07 Agora): one failed import cached None for the process, so every
+    turn raised ImportError until a restart, even after the operator published a generation with
+    the extra. A miss is retried after a backoff by adopting the selected generation and
+    re-importing (ensure_import / the lazy-install policy runs once, never per retry); a success
+    stays cached."""
+    import pm
+    from agent import anthropic_adapter
+    from pm.package import InstallError
+
+    installs = []
+
+    def ensure_import(extra):
+        installs.append(extra)
+        raise InstallError("venv", "venv not installed and lazy installs are disabled")
+
+    clock = [1000.0]
+    monkeypatch.setattr(pm, "ensure_import", ensure_import)
+    monkeypatch.setattr(anthropic_adapter, "time", SimpleNamespace(monotonic=lambda: clock[0]), raising=False)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk", ...)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_install_error", None)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk_retry_at", 0.0, raising=False)
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+
+    with pytest.raises(ImportError):
+        anthropic_adapter._require_sdk("the Anthropic provider")
+    # Within the backoff: still the cached miss, no import spin.
+    clock[0] += 1
+    with pytest.raises(ImportError):
+        anthropic_adapter._require_sdk("the Anthropic provider")
+
+    # The operator publishes a generation that carries the extra (`hermes pm install --extra
+    # anthropic`); the retry adopts it, which is what makes the SDK importable in this process.
+    import pm.environments_adopt as adopt_mod
+    fake_sdk = ModuleType("anthropic")
+    adopted = []
+
+    def adopt_selected(root):
+        adopted.append(root)
+        sys.modules["anthropic"] = fake_sdk
+        return True
+
+    monkeypatch.setattr(adopt_mod, "adopt_selected", adopt_selected)
+    clock[0] += 60
+    assert anthropic_adapter._require_sdk("the Anthropic provider") is fake_sdk
+    assert len(adopted) == 1
+    monkeypatch.setitem(sys.modules, "anthropic", None)  # success is cached, never re-imported
+    clock[0] += 60
+    assert anthropic_adapter._require_sdk("the Anthropic provider") is fake_sdk
+    assert len(adopted) == 1
+    assert installs == ["anthropic"], "the install/policy step must run once, never per retry"
 
 
 class TestBuildAnthropicClient:

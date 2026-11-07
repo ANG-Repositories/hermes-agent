@@ -141,7 +141,11 @@ or `kanban create --no-boomerang-wake` opts out for one card. Set the config kno
 to restore plain notify+wake for future cards; existing cards are unchanged. Worker-created
 cards do not inherit this default. A CLI create (`hermes kanban create`, which scripts and
 cron also drive) inherits it only when `kanban.cli_auto_subscribe` (default `false`) would
-subscribe it; `--boomerang-wake` still sets it explicitly. The knob is read on create;
+subscribe it, or when it names an explicit home (`--session <sid>`; tool `session_id`) whose
+session has a routable origin chat: then the card gets the level AND that home chat's
+`notify+wake` row even with no gateway identity in env (Ace 2026-11-06; scripts and cron mint
+most cards this way). Operator pseudo-homes and CLI/unknown sessions stay unsubscribed.
+`--boomerang-wake` still sets it explicitly. The knob is read on create;
 once this code is loaded, flipping it needs no restart. Loading this code into a running
 gateway does require a restart.
 

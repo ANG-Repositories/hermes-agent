@@ -406,3 +406,38 @@ def test_fork_child_has_no_clarify():
     child = _build(_warm_parent())
     assert child._inherit_mode == "fork"
     assert getattr(child, "clarify_callback", None) is None
+
+
+# ── fork-fan RC-8: per-child attribution on the ineligible line ────────────
+
+
+def test_log_ineligible_carries_delegation_and_task_after_existing_fields(caplog):
+    caplog.set_level(logging.INFO, logger="tools.delegate_tool")
+    fork.log_ineligible("warm", SimpleNamespace(session_id="20261107_000000_p"), delegation_id="deleg_ab12", task_index=3)
+    rec = [r.getMessage() for r in caplog.records if "fork_ineligible" in r.getMessage()][-1]
+    assert rec == ("boomerang.fork_ineligible reason=warm parent_session=20261107_000000_p "
+                   "delegation=deleg_ab12 task=3")
+
+
+def test_log_ineligible_without_ids_is_unchanged(caplog):
+    caplog.set_level(logging.INFO, logger="tools.delegate_tool")
+    fork.log_ineligible("no_live_parent", SimpleNamespace(session_id="s1"))
+    rec = [r.getMessage() for r in caplog.records if "fork_ineligible" in r.getMessage()][-1]
+    assert rec == "boomerang.fork_ineligible reason=no_live_parent parent_session=s1"
+
+
+def test_build_child_downgrade_line_names_its_delegation_and_task(caplog):
+    parent = _warm_parent()
+    child = _build(parent)
+    child._session_messages = parent._session_messages
+    child.last_served_by, child.last_served_at = _SEAT, time.time()
+    caplog.set_level(logging.INFO, logger="tools.delegate_tool")
+    with ExitStack() as stack:
+        _patches(stack)
+        stack.enter_context(patch("tools.delegate_tool._load_config", return_value={}))
+        _build_child_agent(
+            task_index=2, goal="verify the canary", context=None, toolsets=None, model=None,
+            max_iterations=5, task_count=3, parent_agent=child, inherit_mode="fork", delegation_id="deleg_feed",
+        )
+    assert "boomerang.fork_ineligible reason=fork_depth" in caplog.text
+    assert "delegation=deleg_feed task=2" in caplog.text
