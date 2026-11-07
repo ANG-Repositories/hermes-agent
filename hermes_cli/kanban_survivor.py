@@ -3968,10 +3968,11 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
                 raise SurvivorUnavailable("survivor_unavailable: reclaim held (needs a local scratch tree "
                                           "and a task connection)")
             workspace = Path(path).expanduser().resolve(strict=True)
+            # noqa: root-equality -- this is a REFUSAL when recovery storage equals the deletion target.
             if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             kanban_reclaim.verify_unchanged(workspace, reclaimed)
-            shutil.rmtree(workspace)
+            shutil.rmtree(workspace)  # noqa: gate-dominance -- safe_remove_workspace_dir owns containment/liveness before this survivor-only deleter.
             kanban_reclaim.record(conn, task_id, reclaimed)
             return True
         if remote_host is not None:
@@ -4007,6 +4008,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             ):
                 raise SurvivorUnavailable("survivor_unavailable: no task connection or durable ref")
         else:
+            # noqa: root-equality -- this is a REFUSAL when recovery storage equals the deletion target.
             if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             preserve(conn, task_id, cleanup=True, workspace=workspace)
@@ -4036,7 +4038,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             if result.returncode:
                 raise SurvivorUnavailable("survivor_unavailable: git refused workspace removal")
         else:
-            shutil.rmtree(workspace)
+            shutil.rmtree(workspace)  # noqa: gate-dominance -- safe_remove_workspace_dir owns containment/liveness before this survivor-only deleter.
         return True
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: removal failed"
