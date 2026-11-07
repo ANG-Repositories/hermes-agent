@@ -429,6 +429,7 @@ def _concurrent(action, sid):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [True, False])  # False: no turn-end pin, baseline omitted (Prism 8de03d473b72)
 @pytest.mark.parametrize("after_read", [1, 2])  # 1: after the manager loaded; 2: between pause read and write
 @pytest.mark.parametrize("action, status, goal, paused_reason, subgoals", [
     ("replace", "active", "a different goal", None, 0),
@@ -437,7 +438,7 @@ def _concurrent(action, sid):
     ("edit", "paused", "land the queue", "turn failed (ImportError)", 1),
 ])
 async def test_failed_turn_pause_loses_to_concurrent_goal_write(hermes_home, action, status, goal,
-                                                                  paused_reason, subgoals, after_read):
+                                                                  paused_reason, subgoals, after_read, pinned):
     from hermes_cli import goals as g
 
     runner, adapter, entry, src = _runner()
@@ -456,7 +457,8 @@ async def test_failed_turn_pause_loses_to_concurrent_goal_write(hermes_home, act
 
     with patch.object(g, "_load_goal_raw", racing_load):
         await runner._post_turn_goal_continuation(
-            session_entry=entry, source=src, final_response="error", event=_failed_event(), goal_pin=pin)
+            session_entry=entry, source=src, final_response="error", event=_failed_event(),
+            goal_pin=pin if pinned else None)
     assert fired
     after = await asyncio.to_thread(g.load_goal, sid)
     assert (after.status, after.goal, len(after.subgoals)) == (status, goal, subgoals)

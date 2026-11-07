@@ -1495,14 +1495,18 @@ class GoalManager:
     def pause_if_unchanged(self, reason: str, *, baseline: Any = _UNPINNED) -> bool:
         """Pause the goal a failed turn ran under, compare-and-set against a fresh read: a pause, clear,
         done or replacement written since the turn ended (or while this write lands) wins; a nonterminal
-        edit of the same activation (/subgoal) is kept and still paused. True if this call paused it."""
+        edit of the same activation (/subgoal) is kept and still paused. True if this call paused it.
+        ``baseline`` omitted: pinned once to the row this manager already holds, so a replacement
+        landing before the first read or during a CAS retry is never paused."""
+        if baseline is _UNPINNED:
+            baseline = self._stored
         db = _get_session_db() if self.session_id else None
         for _attempt in range(_STALE_RETRIES + 1):
             self._state, self._stored = _load_goal_raw(self.session_id, strict=True)
             state, raw = self._state, self._stored
             if state is None or state.status != "active":
                 return False
-            if baseline is not _UNPINNED and baseline != raw and not same_active_goal(_row_state(baseline), state):
+            if baseline != raw and not same_active_goal(_row_state(baseline), state):
                 return False
             if db is None:
                 self.pause(reason)
