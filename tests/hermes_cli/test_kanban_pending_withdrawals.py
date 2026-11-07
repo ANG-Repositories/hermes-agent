@@ -62,6 +62,42 @@ def test_pending_expires_at_server_waiting_ttl(door_fleet, monkeypatch, caplog):
         assert "expired pending withdrawal" in caplog.text
 
 
+def test_enqueue_again_cancels_obsolete_pending_withdrawal(door_fleet):
+    tid = _card()
+    uid = _uid(tid)
+    with kbc.connect_closing() as conn:
+        door.save_published(conn, set(), pending_withdrawals=[{
+            "host": POOL, "unit_id": uid, "first_seen": 100, "last_reason": "auth"}])
+        door.enqueue_here(alloc_client, conn, POOL, uid)
+        assert _pending(conn) == []
+        assert priority.publish_waiting(conn, {POOL: [{"id": tid, "asap": False}]}) == {}
+        assert uid in door_fleet.allocd.waiting(POOL)
+
+
+@pytest.mark.parametrize("reason", ["auth", "invalid", "transport", "bare", "absent"])
+def test_pending_retry_preserves_fault_taxonomy(door_fleet, monkeypatch, reason):
+    with kbc.connect_closing() as conn:
+        door.save_published(conn, set(), pending_withdrawals=[{
+            "host": POOL, "unit_id": "pending-id", "first_seen": 100, "last_reason": "auth"}])
+        monkeypatch.setattr("time.time", lambda: 100)
+        errors = {"auth": alloc_client.AuthorizeRefused("auth"),
+                  "invalid": alloc_client.AuthorizeRefused("invalid"),
+                  "transport": alloc_client.Unreachable("network"),
+                  "bare": alloc_client.Refused("unknown")}
+        if reason in errors:
+            def refused(*args):
+                raise errors[reason]
+            monkeypatch.setattr(alloc_client, "withdraw", refused)
+        result = priority.publish_waiting(conn, {})
+        assert bool(result) == (reason in ("invalid", "transport", "bare"))
+        assert bool(faults.latched()) == (reason in ("invalid", "bare"))
+        assert len(_pending(conn)) == (0 if reason == "absent" else 1)
+        if reason != "absent":
+            assert _pending(conn)[0]["first_seen"] == 100
+        with faults._state() as doc:
+            assert ("publish" in faults._transport(doc)) == (reason == "transport")
+
+
 def test_real_http404_is_not_auth_and_keeps_record(door_fleet, monkeypatch):
     uid = "http404-unit"
     monkeypatch.setattr(door_fleet.allocd, "route", lambda *a: (404, {"error": "missing endpoint"}))

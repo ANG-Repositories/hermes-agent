@@ -176,7 +176,9 @@ def enqueue_here(client, conn, hid, uid):
             raise
         receipt = client.enqueue("kanban", hid, uid, *need())
     units.add((hid, uid))
-    save_published(conn, units)
+    # This pair is wanted again; an old auth-refused withdrawal must not remove the renewed unit next tick.
+    pending = [p for p in load_pending_withdrawals(conn) if (p["host"], p["unit_id"]) != (hid, uid)]
+    save_published(conn, units, pending_withdrawals=pending)
     return receipt
 
 
