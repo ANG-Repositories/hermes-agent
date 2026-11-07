@@ -40,3 +40,19 @@ def test_checker_reports_and_clears_fixed_bash_paths(tmp_path):
     green = subprocess.run(command, capture_output=True, text=True, check=False)
     assert green.returncode == 0, green.stdout + green.stderr
     assert green.stdout.strip() == "Bash shebang check: 0 violation(s)"
+
+
+def test_byte_pinned_router_core_copies_are_not_scanned(tmp_path):
+    """The .github/router-core lints are byte copies pinned by sha256 (PIN.json); their selftest fixtures carry a
+    fixed-path bash shebang that cannot be edited here. Anything else under .github is still scanned."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    fixed = "#!" + "/bin/bash"
+    files = {".github/router-core/lint-x.py": 'S = "' + fixed + '\\n"\n', ".github/other.sh": fixed + "\n"}
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    subprocess.run(["git", "add", "--", *files], cwd=tmp_path, check=True)
+    out = subprocess.run([sys.executable, str(CHECKER), "--root", str(tmp_path)], capture_output=True, text=True,
+                         check=False)
+    assert out.stdout.splitlines() == [".github/other.sh:1: use #!/usr/bin/env bash",
+                                       "Bash shebang check: 1 violation(s)"]

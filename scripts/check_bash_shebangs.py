@@ -13,6 +13,8 @@ import subprocess
 
 
 FIXED_BASH = re.compile(rb"#![ \t]*/(?:usr/)?bin/bash\b")
+# Byte copies pinned by sha256 in .github/router-core/PIN.json (check_pin.py); fixes land at the source repo.
+PINNED_COPIES = ".github/router-core/"
 
 
 def check(root: Path) -> list[str]:
@@ -24,6 +26,8 @@ def check(root: Path) -> list[str]:
         if not name:
             continue
         relative = name.decode("utf-8", errors="surrogateescape")
+        if relative.startswith(PINNED_COPIES):
+            continue
         path = root / relative
         if path.is_symlink() or not path.is_file():
             continue

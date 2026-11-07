@@ -1,7 +1,6 @@
 {
   "_doc": "slots-vocabulary-lint config (t_21a7ace3; Ace 2026-10-20 05:0x voice msg 1562070136125394945: the word slots leaves the fleet-work-allocation vocabulary). paths = the kanban allocation code paths graded; allow = files under paths whose slot words mean something else (never graded); baseline = hits that existed when the lint landed, per file, only shrinks (CI grades it against the PR base copy). Lower a row with `python scripts/lints/slots-vocabulary-lint.py --print-counts`; drop it at 0. hermes_cli/fleet_placement/*.py are byte copies of hermes-home (t_29403e19): allowed here, graded at the source.",
   "paths": [
-    "hermes_cli/alloc_client.py",
     "hermes_cli/fleet_placement/*.py",
     "hermes_cli/placement_ledger.py",
     "hermes_cli/placement_policy.py",
