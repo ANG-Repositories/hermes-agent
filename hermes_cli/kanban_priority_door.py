@@ -115,7 +115,7 @@ def _published_path(conn):
 
 def load_published(conn) -> set:
     try:
-        doc = json.loads(_published_path(conn).read_text(encoding="utf-8"))
+        doc = json.loads(_published_path(conn).read_text(encoding="utf-8-sig"))
         return {(str(h), str(u)) for h, u in doc.get("units", [])}
     except (OSError, ValueError, TypeError, AttributeError):
         return set()

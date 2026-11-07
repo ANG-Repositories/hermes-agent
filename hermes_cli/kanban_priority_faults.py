@@ -105,11 +105,11 @@ def _state():
     """Read-modify-write of the state file under a flock; atomic replace on write."""
     path = _root() / STATE_REL
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path) + ".lock", "a", encoding="utf-8") as lock:
+    with open(str(path) + ".lock", "a", encoding="utf-8") as lock:  # windows-footgun: ok (append-mode lock file, never read)
         import fcntl                      # lazy: importing this module must not break native-Windows dispatch
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc = json.loads(path.read_text(encoding="utf-8-sig"))
             if not isinstance(doc, dict):
                 doc = {}
         except (OSError, ValueError):
