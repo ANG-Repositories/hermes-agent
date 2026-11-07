@@ -105,7 +105,7 @@ def _state():
     """Read-modify-write of the state file under a flock; atomic replace on write."""
     path = _root() / STATE_REL
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path) + ".lock", "a") as lock:
+    with open(str(path) + ".lock", "a", encoding="utf-8") as lock:
         import fcntl                      # lazy: importing this module must not break native-Windows dispatch
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
