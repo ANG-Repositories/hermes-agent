@@ -90,3 +90,23 @@ def test_ledger_write_failure_never_changes_the_outcome(kanban_home, monkeypatch
         kb.create_task(conn, title="a", created_by="prism-page-card")
         with pytest.raises(kb.MintCapError):
             kb.create_task(conn, title="b", created_by="prism-page-card")
+
+
+def test_a_rolled_back_outer_transaction_ledgers_no_forced_row(kanban_home, monkeypatch):
+    """Prism 31f2934ed515: create_task nested in a caller's write_txn only releases a savepoint; when the OUTER
+    transaction rolls back, the forced card never exists, so no `forced` row may be written. The same create
+    committed by its outer transaction ledgers exactly one row."""
+    monkeypatch.setenv("HERMES_KANBAN_MINT_CAP", "1")
+    with kb.connect() as conn:
+        kb.create_task(conn, title="a", created_by="main-tip-red")
+        with pytest.raises(RuntimeError):
+            with kb.write_txn(conn):
+                kb.create_task(conn, title="b", created_by="main-tip-red", force_reason="operator: needed now")
+                raise RuntimeError("swarm construction failed")
+        assert _rows(conn) == []
+        assert conn.execute("SELECT count(*) FROM tasks WHERE title='b'").fetchone()[0] == 0
+        with kb.write_txn(conn):
+            t = kb.create_task(conn, title="c", created_by="main-tip-red", force_reason="operator: needed now")
+            assert _rows(conn) == [], "ledgered before the outer commit"
+        rows = _rows(conn)
+    assert [(r["outcome"], r["task_id"]) for r in rows] == [("forced", t)]
