@@ -57,6 +57,9 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import socket
     monkeypatch.setattr(socket, "gethostname", lambda: LOCAL_NAME)
     kb.init_db()
+    # The placement table (mem_reserve_gb, threads) is this test's, never the host's:
+    # fleet_root() honours PLACEMENT_HOME first, and test-gate exports the live root (t_2105a835).
+    monkeypatch.setenv("PLACEMENT_HOME", str(kb.kanban_home()))
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "apollo", raising=False)
@@ -106,7 +109,8 @@ def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64, cpu_busy=0.99)
 
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (load1, load1))
     monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (cpu_busy, None))
-    monkeypatch.setattr(klg, "sample_psi", lambda: {})
+    monkeypatch.setattr(klg, "sample_psi", lambda: {
+        "psi_cpu_some10": 0.0, "psi_mem_some10": 0.0, "psi_io_some10": 0.0})
     monkeypatch.setattr(klg, "utilization_context", lambda: {
         "host": "mac-studio", "ceiling": None, "ceiling_reason": "",
         "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), "limits": ad.Limits(),
@@ -293,6 +297,27 @@ def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
                              placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
     assert m.mem_available_gb is None and "unmeasured" in ka.floor_refusal(m)
+
+
+@pytest.fixture
+def inherited_placement_home(tmp_path, monkeypatch):
+    """A PLACEMENT_HOME exported by the venue (test-gate exports ~/.hermes) whose table is unreadable."""
+    from hermes_cli.fleet_placement import placement as pl
+
+    venue = tmp_path / "venue-fleet-root"
+    (venue / pl.TABLE_REL).parent.mkdir(parents=True)
+    (venue / pl.TABLE_REL).write_text("{not json")
+    monkeypatch.setenv("PLACEMENT_HOME", str(venue))
+    return venue
+
+
+def test_an_inherited_placement_home_never_reaches_the_admit_floor(inherited_placement_home, board, monkeypatch):
+    """t_2105a835: the venue's placement table leaked a 128 GB reserve / NaN into every admit test."""
+    from hermes_cli.fleet_placement import placement as pl
+
+    assert pl.fleet_root() == kb.kanban_home()
+    _hot_local(monkeypatch, load1=10.0)
+    assert ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)["pid"] == 4242
 
 
 def test_an_unreadable_local_placement_table_refuses_instead_of_a_zero_reserve(board, monkeypatch):
