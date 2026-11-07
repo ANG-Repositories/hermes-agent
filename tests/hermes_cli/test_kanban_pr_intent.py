@@ -206,6 +206,41 @@ def test_rulings_come_from_ruling_comments_and_verification_from_handback(tmp_pa
     assert "live-evidence: no" in s and '"unit": "12 OK"' in s and "Shipped it." in s
 
 
+def test_complete_task_hands_check_an_intent_built_from_the_board(tmp_path, monkeypatch):
+    """End to end through kanban_db.complete_task on a real board: the card row + its `ruling:` comment + the
+    handback summary reach the PR body via the ``intent`` the freshness gate receives."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(op, "_default_query", lambda: (lambda repo, number: {"state": "OPEN"}))
+    monkeypatch.setenv("KANBAN_PRE_PR_SCRIPT", str(tmp_path / "absent.py"))
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    g = FakeGh(draft=False)
+    real_applier = pi.applier
+    monkeypatch.setattr(pi, "applier", lambda card, ver, gh=None: real_applier(card, ver, gh=g.api))
+    seen = {}
+
+    def fake_check(refs, **kw):
+        seen["intent"] = kw.get("intent")
+        if kw["intent"] is not None:
+            for ref in refs:
+                seen["status"] = kw["intent"](ref.repo, ref.number)
+        return {"prs": {}}
+    monkeypatch.setattr(fr, "check", fake_check)
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="daedalus", body=CARD_BODY)
+        kb.add_comment(conn, tid, "apollo", "ruling: keep Prism unchanged")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="Did it.\nlive-evidence: no", survivor_pr="o/r#5")
+    assert seen["status"].startswith("written")
+    assert g.body.startswith(pi.START) and f"`{tid}`" in g.body
+    assert "ruling: keep Prism unchanged" in g.body and "Did it." in g.body and "live-evidence: no" in g.body
+
+
 def test_no_live_github_under_pytest_without_injected_gh():
     assert pi.applier(_card(), ["x"]) is None
 
