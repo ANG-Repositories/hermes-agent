@@ -69,6 +69,7 @@ _IDLE_WAKE_HORIZON_S = 6 * 3600
 # No-progress stop: this many judged-``continue`` turns in a row with no tool call (the agent is only
 # answering the judge) pauses the goal. 0 disables.
 DEFAULT_NO_PROGRESS_TURNS = 4
+DEFAULT_MAX_INCOMPLETE_TURNS = 3
 # Turn effects (hermes_cli.goal_turn_effects) after which no continuation is queued unless the user
 # spoke: a wake/page/NO_REPLY answered with reads only changed nothing the next turn could act on.
 _NO_NUDGE_TURN_EFFECTS = frozenset({"read", "none"})
@@ -470,6 +471,7 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    consecutive_incomplete_turns: int = 0     # agent turns that failed before completion
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -517,7 +519,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_incomplete_turns", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at", "resumed_at")}
         return cls(
             goal=data.get("goal", ""),
@@ -1852,6 +1854,8 @@ class GoalManager:
         no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS, turn_effect: Optional[str] = None,
         user_spoke: bool = False, nudge_on_read_only_turns: bool = False,
         checkin_minutes: float = DEFAULT_CHECKIN_MINUTES, max_checkins: int = DEFAULT_MAX_IDLE_CHECKINS,
+        turn_completed: bool = True, max_incomplete_turns: int = DEFAULT_MAX_INCOMPLETE_TURNS,
+        human_message: bool = False,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -1873,6 +1877,28 @@ class GoalManager:
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        # Failed agent turns are not evidence for gates or the judge. Persist the streak so
+        # reloading the manager (or restarting the gateway) cannot restart a rapid retry loop.
+        if state.consecutive_incomplete_turns and (turn_completed or human_message):
+            state.consecutive_incomplete_turns = 0
+            state.clear_wait()
+            self._save()
+        if not turn_completed:
+            state.consecutive_incomplete_turns += 1
+            state.last_turn_at = time.time()
+            limit = max(1, int(max_incomplete_turns))
+            failures = state.consecutive_incomplete_turns
+            if failures >= limit:
+                delay = min(1800, 60 * 2 ** min(failures - limit, 5))
+                self.wait_for_seconds(delay, reason="consecutive incomplete agent turns")
+                message = (
+                    f"⏳ Goal parked after {failures} incomplete turns. Retrying in {delay}s "
+                    "with exponential backoff (up to 30 min). Send a message to reset retries."
+                ) if failures == limit else ""
+                return _decision("active", False, None, "incomplete", "agent turn did not complete", message)
+            self._save()
+            return _decision("active", True, self.next_continuation_prompt(), "incomplete",
+                             "agent turn did not complete", "")
         if real_event and state.idle_wakes:
             state.idle_wakes = 0
             self._save()

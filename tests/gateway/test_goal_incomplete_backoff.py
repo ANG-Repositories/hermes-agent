@@ -10,7 +10,8 @@ from hermes_cli import goals
 
 
 @pytest.mark.asyncio
-async def test_incomplete_turns_park_backoff_reset_and_notify_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("delivery", ["dict", "text", "streamed"])
+async def test_incomplete_turns_park_backoff_reset_and_notify_once(tmp_path, monkeypatch, delivery):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner = GatewayGoalsMixin()
     runner.config = {"goals": {"max_incomplete_turns": 3}}
@@ -24,11 +25,15 @@ async def test_incomplete_turns_park_backoff_reset_and_notify_once(tmp_path, mon
     source = SimpleNamespace(chat_id="origin")
     mgr = await asyncio.to_thread(goals.GoalManager, "incomplete")
     await asyncio.to_thread(mgr.set, "ship it")
-    clock = 2_000_000_000.0
+    clock = mgr.state.created_at
 
     async def turn(completed=False, text="This turn did not complete"):
+        event._goal_turn_completed = completed
+        event._streamed_final_response = text if delivery == "streamed" else ""
+        result = {"completed": completed, "final_response": text} if delivery == "dict" else (
+            text if delivery == "text" else None)
         await runner._run_post_turn_hooks(
-            agent_result={"completed": completed, "final_response": text},
+            agent_result=result,
             source=source, is_internal=event.internal, event=event, parts=("goal continuation",))
         return await asyncio.to_thread(goals.GoalManager, "incomplete")
 
@@ -51,9 +56,10 @@ async def test_incomplete_turns_park_backoff_reset_and_notify_once(tmp_path, mon
         mgr = await turn(completed=True, text="made progress")
         assert mgr.state.consecutive_incomplete_turns == 0
         assert judge.call_count == 1
+        runner._defer_goal_status_notice_after_delivery.reset_mock()  # exclude normal judge notice
         for _ in range(3):
             mgr = await turn()
-        assert runner._defer_goal_status_notice_after_delivery.await_count == 2
+        assert runner._defer_goal_status_notice_after_delivery.await_count == 1
         # A human message resets the prior failure streak even if its own turn fails.
         event.text, event.internal = "try again", False
         mgr = await turn()

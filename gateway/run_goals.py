@@ -336,6 +336,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str, event: Any = None, goal_pin: Any = None,
+        turn_completed: bool = True,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -385,7 +386,8 @@ class GatewayGoalsMixin:
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
         from hermes_cli.goals import (
-            DEFAULT_CHECKIN_MINUTES, DEFAULT_MAX_IDLE_CHECKINS, DEFAULT_NO_PROGRESS_TURNS, is_goal_synthetic_text,
+            DEFAULT_CHECKIN_MINUTES, DEFAULT_MAX_IDLE_CHECKINS, DEFAULT_NO_PROGRESS_TURNS,
+            DEFAULT_MAX_INCOMPLETE_TURNS, is_goal_synthetic_text,
         )
         # A turn the goal loop did not start (user message, worker/process result) re-arms idle check-ins.
         _real_event = event is not None and not is_goal_synthetic_text(getattr(event, "text", ""))
@@ -413,6 +415,8 @@ class GatewayGoalsMixin:
                 made_tool_calls=_made_tools, no_progress_turns=_no_progress,
                 turn_effect=_effect, user_spoke=_user_spoke or _goal_turn,
                 nudge_on_read_only_turns=_nudge_read_only, checkin_minutes=_checkin, max_checkins=_max_checkins,
+                turn_completed=turn_completed, human_message=_user_spoke,
+                max_incomplete_turns=self._goal_int_setting("max_incomplete_turns", DEFAULT_MAX_INCOMPLETE_TURNS),
             ),
         )
         _sid = getattr(session_entry, "session_id", "?")
@@ -554,13 +558,15 @@ class GatewayGoalsMixin:
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip():
+        completed = (agent_result.get("completed") if isinstance(agent_result, dict)
+                     else getattr(event, "_goal_turn_completed", None)) is not False
+        if final_text.strip() or not completed:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             if label not in parts:
                 continue
             try:
-                extra = {"event": event, "goal_pin": goal_pin} if label == "goal continuation" else {}
+                extra = {"event": event, "goal_pin": goal_pin, "turn_completed": completed} if label == "goal continuation" else {}
                 await hook(session_entry=session_entry, source=source, final_response=final_text, **extra)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
