@@ -32,9 +32,9 @@ POOL = kwp.PoolConfig(hosts=("ci-box", "ace-ai", "ace-media"), profiles=("alpha"
                       pool_hosts=(_host("ci-box"), _host("ace-ai"), _host("ace-media", enabled=False)))
 
 
-def _c(reason, placed="ci-box", body="do the thing", kind="capability", again=False):
+def _c(reason, placed="ci-box", body="do the thing", kind="capability", again=False, workspace_kind=None):
     return kpb.classify(kind=kind, reason=reason, placed_host=placed, body=body, pool=POOL,
-                        rerouted_before=again)
+                        rerouted_before=again, workspace_kind=workspace_kind)
 
 
 # -- classify (pure) ---------------------------------------------------------
@@ -240,6 +240,65 @@ def test_dry_run_tick_writes_nothing(kanban_home):
         kbd.dispatch_once(conn, dry_run=True, max_spawn=0, reconcile_orphans=False)
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "blocked"
         assert _events(conn, tid, kpb.REROUTED_EVENT) == []
+
+
+# -- t_dde97120: a repo path missing on the pool host is cured by a clone, never by a Studio pin ----
+
+# Verbatim block reason of t_02e30922 run 59308 (placed on ci-box, scratch workspace, 2026-11-05).
+T02E_REASON = ("Placed on ci-box, where required /Users/alexgierczyk/Projects/fleet-ops-scripts does not exist "
+               "(Python probe verified). Operator explicitly requires capability refusal in this case. Re-place on "
+               "Studio or authorize portable clone/test-gate workflow; no edits or tests performed.\n"
+               "unblock_when: ruling:t_02e30922-execution-repo-placement")
+
+
+def test_scratch_card_blocked_on_a_missing_repo_path_is_not_pinned_to_the_studio():
+    assert _c(T02E_REASON, workspace_kind="scratch") == ("clone", None)
+
+
+@pytest.mark.parametrize("reason", [
+    "/home/kanbanw/dev/hermes-home: No such file or directory on this host; re-run on the Studio.",
+    "Cannot proceed: ~/Projects/foo is missing on ace-ai. Re-run on the Studio.",
+])
+def test_other_missing_repo_path_shapes_take_the_clone_cure(reason):
+    assert _c(reason, workspace_kind="scratch") == ("clone", None)
+
+
+@pytest.mark.parametrize("reason", [
+    # names a Studio-only resource the capability map lists (vault): the pin stays
+    "~/Projects/notes does not exist here and the vault is Studio-only. Re-run on the Studio.",
+    # a missing path in the live home tree is Studio state, not a repo a clone recreates
+    "~/.hermes/state/pager does not exist on ci-box. Re-run on the Studio.",
+    CI_BOX_REASON,
+])
+def test_studio_only_resources_keep_the_studio_pin(reason):
+    assert _c(reason, workspace_kind="scratch") == ("reroute", kwp.PIN_STUDIO)
+
+
+def test_non_scratch_card_with_a_missing_repo_path_keeps_the_old_pin():
+    assert _c(T02E_REASON, workspace_kind="worktree") == ("reroute", kwp.PIN_STUDIO)
+    assert _c(T02E_REASON, workspace_kind=None) == ("reroute", kwp.PIN_STUDIO)
+
+
+def test_t02e30922_event_sequence_requeues_without_a_pin_and_escalates_on_a_second_block(kanban_home):
+    """Replay of t_02e30922: placed on ci-box, blocked kind=capability on the missing clone path.
+    Red on main: the tick prepends ``host: studio`` and the card never spills again."""
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "origin: cli\nMain CI on ANG-Ventures/fleet-ops-scripts is red", T02E_REASON)
+        res = _tick(conn)
+        assert res.placement_rerouted == [(tid, kpb.CLONE_CURE)]
+        row = conn.execute("SELECT status, body FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "ready"
+        assert "host:" not in row["body"]
+        assert kwp.resolve_pin(row["body"], POOL.hosts)[0] is None
+        (ev,) = _events(conn, tid, kpb.REROUTED_EVENT)
+        assert ev["from_host"] == "ci-box" and ev["to_host"] is None and ev["cure"] == kpb.CLONE_CURE
+        comments = [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))]
+        assert any("task-private clone" in c for c in comments)
+        # The clone cure is once only, like the pin: a second capability block pages instead.
+        assert kb.claim_task(conn, tid, claimer="alpha") is not None
+        assert kb.block_task(conn, tid, reason=T02E_REASON, kind="capability")
+        res = _tick(conn)
+        assert res.placement_rerouted == [] and res.placement_unroutable == [tid]
 
 
 # -- B: the reach matrix fails closed, so a vault card never spills (t_a32116ec) ---------------

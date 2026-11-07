@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import shlex
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
@@ -27,6 +28,13 @@ _MAX_HINT_CHARS = 32_000
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
 _COMMAND_TOOLS = {"terminal"}
 _MAX_ANCESTOR_WALK = 5  # ancestor levels walked per path — bounds deep-path scans
+# Automounter roots: on macOS every lookup of /home/<name> (and /net/<host>) runs automountd ->
+# /usr/libexec/od_user_homes, and a miss is never cached. A terminal command that names a REMOTE
+# pool path (`ssh kanbanw@ci-box cat /home/kanbanw/...`) made resolve()/is_dir() here spawn ~34
+# execs per tool call (t_e16044ad: 34.8k execs/min storm on the Studio). Such a path can only
+# yield a hint when the working dir itself lives under that root, so check lexically first.
+# macOS only: on Linux /home is a plain directory (and may symlink into the working dir).
+_AUTOMOUNT_ROOTS = ("/home", "/net", "/Network") if sys.platform == "darwin" else ()
 
 # Shared with broad recursive search probes so context discovery and search never drift into
 # different dependency/cache/build trees (those hold *copies* of context files, never authoritative ones).
@@ -209,6 +217,8 @@ class SubdirectoryHintTracker:
             p = Path(raw_path).expanduser()
             if not p.is_absolute():
                 p = self.working_dir / p
+            if self._outside_automount_root(p):
+                return
             p = p.resolve()
             if p.suffix or (p.exists() and p.is_file()):
                 p = p.parent
@@ -239,6 +249,18 @@ class SubdirectoryHintTracker:
             if token.startswith(("-", "http://", "https://", "git@")) or ("/" not in token and "." not in token):
                 continue
             self._add_path_candidate(token, candidates)
+
+    def _outside_automount_root(self, path: Path) -> bool:
+        """True when *path* sits under an automounter root the working dir is not under.
+
+        Lexical only (no filesystem call), so a remote-host path literal never reaches autofs.
+        """
+        lexical = os.path.normpath(str(path))
+        wd = str(self.working_dir)
+        for root in _AUTOMOUNT_ROOTS:
+            if (lexical == root or lexical.startswith(root + "/")) and not (wd == root or wd.startswith(root + "/")):
+                return True
+        return False
 
     def _within_working_dir(self, path: Path) -> bool:
         """Reject paths outside the working-dir tree: loading ~/.codex/AGENTS.md
