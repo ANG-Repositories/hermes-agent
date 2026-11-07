@@ -4344,10 +4344,15 @@ class GatewayTurnMixin:
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         if first_response:
+            # Text streaming off (no consumer, or an interim-only one): the final was never streamed,
+            # so "not confirmed" would misreport the normal send path as a delivery failure.
+            _final_streamed = _sc is not None and getattr(_sc, "stream_deltas_enabled", True)
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
                 if _already_streamed else
-                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing."
+                if _final_streamed else
+                "Queued follow-up for session %s: text streaming off; sending first response before continuing.",
                 session_key or "?",
             )
             try:

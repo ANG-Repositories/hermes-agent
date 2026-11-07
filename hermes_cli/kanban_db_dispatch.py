@@ -4937,6 +4937,13 @@ def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
     return hist, ends
 
 
+# Hysteresis state for _record_placement_waits (t_dde97120): ``{task_id: wait key}`` of a return to an
+# already-seen reason observed ONCE. Written on the second consecutive sample. Process-local by design: a
+# restart costs one extra tick of latency, never a wrong row. Bounded by a crude clear.
+_WAIT_RETURN_PENDING: dict = {}
+_WAIT_RETURN_PENDING_MAX = 20000
+
+
 def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
                             reached=(), local_binding: Optional[dict] = None) -> None:
     """One ``placement_wait`` task_event per held ready card
@@ -4995,16 +5002,32 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
                 host = _pr.named_hosts(code, detail)
             key = (code, route, host, _pr.keyed_detail(code, detail))
             episode = [h for h in hist.get(tid, ()) if h[0] > ends.get(tid, 0)]
+            # t_dde97120: a pacing cap is not a verdict. Once the episode has a verdict row, a pacing hold
+            # writes nothing, and the dedup / flap comparison runs over verdict rows only.
+            verdicts = [h for h in episode if _wait_key(h[2])[0] not in _pr.PACING_CODES]
+            if code in _pr.PACING_CODES and verdicts:
+                _WAIT_RETURN_PENDING.pop(tid, None)
+                continue
+            episode = verdicts or episode
             since = now
             if episode:
                 last_id, last_at, last = episode[0]
                 fresh = now - last_at < window
                 if _wait_key(last) == key:
+                    _WAIT_RETURN_PENDING.pop(tid, None)
                     if fresh:
                         continue
                     since = int(last.get("since") or last_at or now)
                 elif fresh:
                     recent = [_wait_key(p) for _i, at, p in episode if now - at < window]
+                    if key in recent[1:] and _WAIT_RETURN_PENDING.get(tid) != key:
+                        # Hysteresis: a RETURN to a reason already seen this window needs two
+                        # consecutive samples; one alternating tick is not a state change.
+                        _WAIT_RETURN_PENDING[tid] = key
+                        if len(_WAIT_RETURN_PENDING) > _WAIT_RETURN_PENDING_MAX:
+                            _WAIT_RETURN_PENDING.clear()
+                        continue
+                    _WAIT_RETURN_PENDING.pop(tid, None)
                     if key in recent[1:]:
                         # A->B->A inside the window: one ``flapping`` row,
                         # then quiet until the window passes.
@@ -7977,6 +8000,10 @@ def _dispatch_once_locked(
     _record_placement_waits(
         conn, result, row_route, dry_run, _wait_reached,
         local_binding=_pr.local_full_binding(spawn_paused, local_budget, local_spawned))
+    # A pause_hold label the CURRENT manifest no longer backs is ended every live tick (t_0c5a95ab): a card this
+    # tick never routes (no_worker, human lane) would otherwise read "held by <old manifest>" forever.
+    if not _admit:
+        _kph.clear_stale_labels(conn, result, dry_run, _pause_cache)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
