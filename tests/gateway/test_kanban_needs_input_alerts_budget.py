@@ -36,7 +36,7 @@ def calls(monkeypatch, tmp_path):
     monkeypatch.delenv("DISCORD_LOGS_CHANNEL", raising=False)
     out: list = []
     monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
-    monkeypatch.setattr(kw, "_notify_send", lambda script, msg, extra: out.append(extra) or True)
+    monkeypatch.setattr(kw, "_notify_send", lambda script, msg, extra, **kwargs: out.append(extra) or True)
     return out
 
 
@@ -133,7 +133,7 @@ def _alerts_homed_ticks(monkeypatch, tmp_path, priorities, alerts_results=None):
     results = iter(alerts_results or [])
     out: list = []
 
-    def fake_send(script, msg, extra):
+    def fake_send(script, msg, extra, **kwargs):
         out.append(extra)
         return next(results, True) if extra == ["--target", ALERTS] else True
 
@@ -221,6 +221,44 @@ def test_origin_line_channel_wins_over_the_session_chat(calls, root):
     assert calls == [["--target", OTHER]]
 
 
+def test_foreign_session_uses_its_transport_profile(monkeypatch, tmp_path, root):
+    con = sqlite3.connect(root / "profiles" / "coder" / "state.db")
+    con.execute("ALTER TABLE sessions ADD COLUMN transport_profile TEXT")
+    con.execute("UPDATE sessions SET transport_profile = 'receiving_bot'")
+    con.commit()
+    con.close()
+    sent = []
+    monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
+    monkeypatch.setattr(kw.subprocess, "run", lambda argv, **kwargs:
+                        sent.append(argv) or type("Result", (), {"returncode": 0})())
+    assert kw._send_needs_input_page("default", _item(None, 150, session_id="s_profile"))
+    assert len(sent) == 1
+    assert sent[0][sent[0].index("--profile") + 1] == "receiving_bot"
+    assert sent[0][-2:] == ["--target", OTHER]
+
+
+def test_failed_session_home_falls_back_once_per_card(monkeypatch, tmp_path, root):
+    sent = []
+    monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
+
+    def run(argv, **kwargs):
+        sent.append(argv)
+        failed = argv[-2:] == ["--target", OTHER]
+        return type("Result", (), {"returncode": 1 if failed else 0})()
+
+    monkeypatch.setattr(kw.subprocess, "run", run)
+    for now, reason in [(1000, "first"), (1001, "second"), (9000, "second")]:
+        pager = kw._NeedsInputPager(tmp_path / "ledger.json")
+        assert pager.observe([("default", _item(None, 150, reason, session_id="s_profile"))],
+                             kw._send_needs_input_page, {"default"}, now=now) == 1
+    alerts = [argv for argv in sent if argv[-2:] == ["--sev", "error"]]
+    assert len(alerts) == 1
+    assert "t_1" in alerts[0][3] and OTHER in alerts[0][3]
+    assert alerts[0][alerts[0].index("--profile") + 1] == "default"
+    assert sum(argv[-2:] == ["--target", LOGS] for argv in sent) == 2
+    assert sent[0][sent[0].index("--profile") + 1] == "coder"
+
+
 def test_candidates_carry_the_session_id(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -243,7 +281,7 @@ def _pager_run(monkeypatch, tmp_path, steps, results=None):
     results = iter(results or [])
     out: list = []
 
-    def fake_send(script, msg, extra):
+    def fake_send(script, msg, extra, **kwargs):
         out.append(extra)
         return next(results, True)
 

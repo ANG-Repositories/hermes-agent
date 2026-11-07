@@ -1397,11 +1397,11 @@ class _NeedsInputPager(_GuardStuckNotifier):
         return delivered
 
 
-def _notify_send(script: Path, message: str, extra: list) -> bool:
+def _notify_send(script: Path, message: str, extra: list, *, profile: str = "default") -> bool:
     try:
         proc = subprocess.run(
             [sys.executable, str(script), "--send", message, "--channel", "discord",
-             "--profile", "default", *extra],
+             "--profile", profile, *extra],
             check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=30,
         )
@@ -1454,13 +1454,19 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     channel = item.get("channel")
     if channel is not None and not str(channel).isdigit():
         channel = None  # numeric channel ids only
+    profile = "default"
     if channel is None:
-        from gateway.kanban_watchers_home import session_home_channel
+        from gateway.kanban_watchers_home import session_home_target
 
-        channel = session_home_channel(item.get("session_id"))
+        target = session_home_target(item.get("session_id"))
+        if target is not None:
+            channel, profile = target
     alerts_ch, logs_ch = _needs_input_channels()
     if channel and str(channel) != alerts_ch:
-        return _notify_send(script, message, ["--target", str(channel)])
+        if _notify_send(script, message, ["--target", str(channel)], profile=profile):
+            return True
+        message += f"\nHome delivery failed: discord:{channel} (profile {profile}); using fleet fallback."
+        channel = None
     from hermes_cli.kanban_db import NEEDS_INPUT_PAGE_MIN_PRIORITY
 
     try:

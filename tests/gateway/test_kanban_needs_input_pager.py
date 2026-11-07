@@ -201,7 +201,7 @@ def test_send_routes_origin_target_without_alerts_mirror(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
     monkeypatch.setattr(kw, "_notify_send",
-                        lambda script, msg, extra: calls.append((msg, extra)) or True)
+                        lambda script, msg, extra, **kwargs: calls.append((msg, extra)) or True)
     item = {"task_id": "t_1", "title": "p4", "priority": 150, "reason": "x" * 400,
             "channel": CHAN}
     assert kw._send_needs_input_page("default", item)
