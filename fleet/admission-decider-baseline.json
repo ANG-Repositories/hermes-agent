@@ -14,6 +14,7 @@
   "hermes_cli/kanban_load_gate.py": 2,
   "hermes_cli/kanban_wake_gate.py": 6,
   "hermes_cli/kanban_worker_pool.py": 1,
-  "hermes_cli/placement_ledger.py": 1
+  "hermes_cli/placement_ledger.py": 1,
+  "hermes_cli/placement_policy.py": 1
  }
 }

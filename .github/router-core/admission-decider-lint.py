@@ -25,8 +25,8 @@ a ratchet:
 
 One lint, four repos (t_22955b73): hermes-home owns it; fleet-ops-scripts, prism-router and hermes-agent vendor it
 byte-identical under .github/router-core/ (PIN.json) with their own fleet/admission-decider-baseline.json. A baseline
-may carry `scan` (dirs, "." = whole tree) and `library` (repo paths of that repo's admission library copy); absent =
-hermes-home's defaults below. scripts/admission-decider-census.py sums the four baselines into one line.
+may carry `scan` (dirs, "." = whole tree); `library` is required (repo paths of that repo's admission library copy).
+Absent scan uses hermes-home's defaults below. scripts/admission-decider-census.py sums the four baselines into one line.
 
   admission-decider-lint.py [--root DIR] [--update] [--base-ref SHA]
 """
@@ -49,8 +49,11 @@ BASELINE_REL = Path("fleet") / "admission-decider-baseline.json"
 SCAN = ("scripts", "fleet", "hooks", "bin", "cron")
 LIBRARY = frozenset({"scripts/lib/admission.py", "scripts/lib/admission_demand.py", "scripts/lib/placement.py",
                      "scripts/admission-decider-lint.py"})
-RX = re.compile(r"\b(cpu_busy|load1|load5|procs_running|runnable_ewma|occupancy|psi_cpu_some10|psi_cpu_some60|"
-                r"load_ratio|loadavg|getloadavg)\b[^\n=]{0,40}?(>=|<=|(?<![-=])>(?!>)|(?<!<)<(?![<=]))"
+METRIC = (r"\b(?:cpu_busy|load1|load5|procs_running|runnable_ewma|occupancy|psi_cpu_some10|psi_cpu_some60|"
+          r"load_ratio|loadavg|getloadavg)\b")
+OP = r"(?:>=|<=|(?<![-=])>(?!>)|(?<!<)<(?![<=])|\s-(?:gt|ge|lt|le)\s)"
+OPERAND = r"[^\n=;<>]{0,40}?"
+RX = re.compile(METRIC + OPERAND + OP + r"|" + OP + OPERAND + METRIC +
                 r"|\bncpu\s*//\s*\d|\bos\.getloadavg\(")
 SKIP = re.compile(r"(^|/)(tests?|fixtures|\.venv)/|(^|/)test_[^/]*$|_test\.py$|selftest"
                   r"|\.(md|json|ya?ml|txt|golden|plist|service|timer|conf|nft|env)$")
@@ -71,16 +74,18 @@ def _git_env():
     return {k: v for k, v in os.environ.items() if k not in _GIT_ENV}
 
 
-def tracked(root: Path, scan_dirs=SCAN):
+def tracked(root: Path, scan_dirs=SCAN, require_git=False):
     """git ls-files under SCAN when ``root`` IS the git worktree root; any other root (test-gate's synced remote tree,
     an export nested inside an unrelated checkout, Prism f121859a42a0) is walked."""
     env = _git_env()
     top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, env=env)
     same = top.returncode == 0 and Path(top.stdout.decode().strip()).resolve() == root.resolve()
     if same:
-        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *scan_dirs], capture_output=True, env=env)
+        out = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z", "--", *scan_dirs], capture_output=True, env=env)
         if out.returncode == 0:
             return [p for p in out.stdout.decode().split("\0") if p]
+    if same or require_git:
+        raise ScanError("git-tracked scan required; walk fallback is read-only")
     return walk(root, scan_dirs)
 
 
@@ -99,7 +104,7 @@ def walk(root: Path, scan_dirs=SCAN):
                 dirs.remove(".git")
             for f in files:
                 p = Path(dirpath) / f
-                if p.is_file() and not p.is_symlink():
+                if p.is_file():
                     out.append(p.relative_to(root).as_posix())
     if errs:
         e = errs[0]
@@ -109,6 +114,7 @@ def walk(root: Path, scan_dirs=SCAN):
 
 
 def hits_in(text: str) -> int:
+    # Physical-line ratchet, not a lexer: preserve shell expansions and quoted hashes.
     n = 0
     for line in text.splitlines():
         s = line.lstrip()
@@ -119,15 +125,33 @@ def hits_in(text: str) -> int:
     return n
 
 
-def scan(root: Path, scan_dirs=SCAN, library=LIBRARY) -> dict:
+def index_blob(root: Path, rel: str) -> bytes:
+    """Missing tracked source is not a deletion until removed from the index."""
+    env = _git_env()
+    entry = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "--stage", "-z", "--", rel],
+                           capture_output=True, env=env)
+    records = entry.stdout.rstrip(b"\0").split(b"\0")
+    header, _, name = records[0].partition(b"\t")
+    fields = header.split()
+    if (entry.returncode or len(records) != 1 or len(fields) != 3 or fields[2] != b"0" or
+            name != rel.encode() or fields[0] not in (b"100644", b"100755")):
+        raise ScanError(f"{rel}: unreadable worktree file; no regular index blob (missing symlink target or conflict)")
+    blob = subprocess.run(["git", "-C", str(root), "cat-file", "blob", fields[1].decode("ascii")],
+                          capture_output=True, env=env)
+    if blob.returncode:
+        raise ScanError(f"{rel}: index blob not readable")
+    return blob.stdout
+
+
+def scan(root: Path, scan_dirs=SCAN, library=LIBRARY, require_git=False) -> dict:
     out = {}
-    for rel in tracked(root, scan_dirs):
+    for rel in tracked(root, scan_dirs, require_git=require_git):
         if rel in library or rel in SELF or SKIP.search(rel) or not is_live_source(rel):
             continue
         try:
             raw = (root / rel).read_bytes()
         except FileNotFoundError:
-            continue                  # tracked but deleted in the worktree: absent code, nothing to count
+            raw = index_blob(root, rel)
         except OSError as exc:
             raise ScanError(f"{rel}: unreadable ({exc})") from exc
         if b"\0" in raw[:2048]:
@@ -140,17 +164,42 @@ def scan(root: Path, scan_dirs=SCAN, library=LIBRARY) -> dict:
 
 def config(doc: dict):
     """(scan dirs, library paths) a baseline declares; hermes-home's defaults when absent."""
-    return tuple(doc.get("scan") or SCAN), frozenset(doc.get("library") or LIBRARY)
+    dirs = doc.get("scan", SCAN)
+    if not isinstance(dirs, (list, tuple)) or not dirs:
+        raise ScanError("scan must be a nonempty list of literal relative directories")
+    for d in dirs:
+        if (not isinstance(d, str) or not d or d.startswith("/") or
+                any(c in d for c in ":*?[]\\\n\r\0") or ".." in d.split("/") or
+                (d != "." and any(part in ("", ".") for part in d.split("/")))):
+            raise ScanError(f"scan path must be a literal relative directory: {d!r}")
+    library = doc.get("library")
+    if not isinstance(library, list) or not all(isinstance(p, str) for p in library):
+        raise ScanError("library is required and must be a list of repo-relative paths")
+    return tuple(dirs), frozenset(library)
 
 
 def _show(root: Path, ref: str, rel: str):
-    """File text at ref, None when the path is absent there; ScanError when the commit itself is unreadable."""
+    """File text at ref; only a confirmed absent tree entry returns None. Unreadable objects abort."""
     env = _git_env()
     ok = subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"], capture_output=True, env=env)
     if ok.returncode != 0:
         raise ScanError(f"--base-ref {ref}: commit not readable (fetch it first)")
-    p = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{rel}"], capture_output=True, env=env)
-    return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else None
+    tree = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-tree", "-z", ref, "--", rel],
+                          capture_output=True, env=env)
+    if tree.returncode != 0:
+        raise ScanError(f"--base-ref {ref}: {rel}: tree not readable (fetch it first)")
+    if not tree.stdout:
+        return None
+    entries = tree.stdout.rstrip(b"\0").split(b"\0")
+    header, _, name = entries[0].partition(b"\t")
+    fields = header.split()
+    if len(entries) != 1 or len(fields) != 3 or fields[1] != b"blob" or name != rel.encode("utf-8"):
+        raise ScanError(f"--base-ref {ref}: {rel}: expected one blob entry")
+    p = subprocess.run(["git", "-C", str(root), "cat-file", "blob", fields[2].decode("ascii")],
+                       capture_output=True, env=env)
+    if p.returncode != 0:
+        raise ScanError(f"--base-ref {ref}: {rel}: blob not readable (fetch it first)")
+    return p.stdout.decode("utf-8", errors="replace")
 
 
 def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
@@ -165,6 +214,10 @@ def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
     except ValueError as exc:
         raise ScanError(f"baseline at base {ref[:12]} unparseable ({exc})") from exc
     bad = []
+    # Pre-migration home baselines omitted library; preserve the old fixed scope only
+    # for historical comparison. Current baselines must always declare it.
+    if "library" not in base_doc:
+        base_doc["library"] = sorted(LIBRARY)
     (b_scan, b_lib), (h_scan, h_lib) = config(base_doc), config(head_doc)
     if h_lib - b_lib:
         bad.append(f"library widened against base: {sorted(h_lib - b_lib)}")
@@ -196,11 +249,11 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"admission-decider-lint: FAIL baseline {bp} unreadable ({exc})")
         return 2
-    scan_dirs, library = config(doc)
     try:
+        scan_dirs, library = config(doc)
         if a.base_ref and set(a.base_ref) == {"0"}:
             raise ScanError(f"--base-ref {a.base_ref}: null sha")
-        now = scan(a.root, scan_dirs, library)
+        now = scan(a.root, scan_dirs, library, require_git=a.update)
         grew = baseline_drift(a.root, a.base_ref, doc) if a.base_ref else []
     except ScanError as exc:
         print(f"admission-decider-lint: FAIL scan aborted, baseline untouched: {exc}")
