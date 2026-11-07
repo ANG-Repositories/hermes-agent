@@ -259,6 +259,31 @@ def test_reboot_hold_inside_grace_still_holds(home):
         assert ids["A"] not in {t for t, _ in spawned}
 
 
+def test_reboot_hold_dark_after_reboot_keeps_its_backstop(home):
+    """AC-END (ii): rebooted long ago but last seen up before grace elapsed (ssh dark since) -> the backstop governs."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _reboot_hold(home, now + 12 * 3600, rebooted_at=now - 900, seen_up_at=now - 800)
+        _res, spawned = _tick(conn, _plan())
+        assert ids["A"] not in {t for t, _ in spawned}
+
+
+@pytest.mark.parametrize("doc", [{"schema": 1, "id": "x"}, {"schema": 2, "id": "x", "host": "ci-box", "lanes": ["kanban"]},
+                                 {"schema": 1, "id": "x", "host": "ci-box", "lanes": []}, ["not", "an", "object"]],
+                         ids=["no-host-lanes", "schema-2", "empty-lanes", "list"])
+def test_structurally_invalid_hold_file_holds_fail_closed(home, doc):
+    """Home ``fwa.valid`` != None (parseable but not a record) = unreadable: fail closed until mtime + 24 h. Only a
+    structurally valid record with a bad END is expired."""
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _hold(home, raw=json.dumps(doc))
+        res, spawned = _tick(conn, _plan())
+        r = _routes(res)[ids["A"]]
+        assert r["outcome"] == "held" and r["detail"].startswith("ci-box:fwa:unreadable:"), r
+        assert ids["A"] not in {t for t, _ in spawned}
+
+
 def test_reboot_hold_archived_by_the_sweep_releases(home):
     """The sweep archives a released reboot hold out of holds/<host>/; the next tick admits."""
     now = int(time.time())
