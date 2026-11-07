@@ -188,10 +188,10 @@
   },
   {
    "path": "hermes_cli/kanban_worker_pool.py",
-   "scope": "probe_host",
+   "scope": "_drop_stale_master",
    "kind": "ssh",
    "count": 1,
-   "reason": "grandfathered at the hermes-home #6501 re-pin (t_6b4d3881): pre-existing site the pinned lint could not see (injected runner= callable); Card B cutover inventory: route it through alloc_client.admit / placement.admit, then delete",
+   "reason": "moved from the probe_host row (t_64342f07): the probe's ungated spawn is now `ssh -O exit` to a stale ControlMaster, probe housekeeping that places no work; replaces the probe_host row, so the net row count is unchanged",
    "expires": "2027-01-15"
   },
   {

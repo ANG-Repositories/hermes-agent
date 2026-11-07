@@ -1595,7 +1595,7 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
                workspace_paths: Sequence[str] = (),
                memory: Optional[ProbeMemory] = None,
                now: Optional[float] = None) -> Union[None, Tuple[float, int], HostSample]:
-    """The sample from :func:`_probe_once`, or None (fail closed: 0 slots).
+    """The sample from :func:`_probe_once`, or None (fail closed).
 
     A failed probe is retried once on a direct (un-muxed) connection, so a
     stale ControlMaster or a slow handshake is not read as a dead host. A
