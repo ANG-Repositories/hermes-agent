@@ -31,6 +31,9 @@ def ctx(monkeypatch):
     monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
                                                     "psi_io_some10": 0.0})
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")   # no fleet demand file in a temp home
+    # the shared reservation ledger is the RUNNER HOST's real file: other consumers' live leases there are not this
+    # test's input (CI slice 5/5 read (3, None)); the ledger read has its own tests in test_kanban_local_start_ledger
+    monkeypatch.setattr(klg, "shared_leases", lambda host, *a, **k: [])
     return c
 
 

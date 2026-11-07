@@ -3044,7 +3044,7 @@ def _host_fault(exc: BaseException) -> Optional[dict]:
     so the card spills on the next tick instead of waiting."""
     from tools.process_registry import RestartSafeScopeUnavailable
 
-    if isinstance(exc, RestartSafeScopeUnavailable):
+    if isinstance(exc, (RestartSafeScopeUnavailable, LocalLedgerUnavailable)):
         return {}
     if isinstance(exc, _kb._kwh.RemoteWorkspaceUnavailable):
         _kb._kwh.note_board_fault(exc.host, exc.board, str(exc))
@@ -4292,6 +4292,48 @@ class _LaunchState:
     proc: Optional[subprocess.Popen] = None
 
 
+class LocalLedgerUnavailable(RuntimeError):
+    """A LOCAL start could not book its lease on the shared ledger (t_02aa6d86): the worker is not started. A host
+    fault (``_host_fault``), never charged to the card."""
+
+
+LOCAL_LEDGER_ENV = "KANBAN_LOCAL_LEDGER"
+
+
+def local_ledger_enabled(env=None) -> bool:
+    """``KANBAN_LOCAL_LEDGER`` (default on): "0" = a local start books nothing (the pre-t_02aa6d86 behaviour)."""
+    env = os.environ if env is None else env
+    return str(env.get(LOCAL_LEDGER_ENV, "1")).strip() != "0"
+
+
+def _book_local_start(conn: sqlite3.Connection, claimed: Task) -> Optional[str]:
+    """Doctrine rule 15 (t_02aa6d86): a start the Studio's own LoadGate admitted still books its lease on the shared
+    ledger BEFORE launch, so Prism / test-gate / allocd admissions on this host see it the same tick. The lease is a
+    ``local_admitted`` run event carrying the reservation: ``_end_run`` releases it and ``renew_running`` renews it,
+    exactly like a pool run's ``worker_placed`` row. No table / no ``local`` host = nothing booked (None). An
+    unreadable ledger or a failed event write raises LocalLedgerUnavailable: the worker does not start."""
+    if not local_ledger_enabled():
+        return None
+    from hermes_cli import kanban_headroom as _kh
+    from hermes_cli.fleet_placement import placement as _placement
+    unit = f"{claimed.id}#{claimed.current_run_id}"
+    try:
+        rid = _kh.book_local(unit, _placement.Job(profile=claimed.assignee or None))
+    except _placement.PlacementError as exc:
+        raise LocalLedgerUnavailable(f"local start not booked on the shared ledger: {exc}") from exc
+    if rid is None:
+        return None
+    try:
+        with _kbc.write_txn(conn):
+            _kb._append_event(conn, claimed.id, _kh.LOCAL_ADMITTED_EVENT,
+                              {"host": _kh.LOCAL_HOST_ALIAS, "unit": unit, _kh.RESERVATION_KEY: rid},
+                              run_id=claimed.current_run_id)
+    except Exception as exc:
+        _kh.release_local(rid)          # no event = nothing would ever release the row before its TTL
+        raise LocalLedgerUnavailable(f"local start lease {rid} not recorded on the run: {exc}") from exc
+    return rid
+
+
 def _launch_claimed(
     conn: sqlite3.Connection,
     claimed: Task,
@@ -4318,6 +4360,8 @@ def _launch_claimed(
 
     if not record_placement(conn, claimed.id, claimed.current_run_id, host):
         return _LAUNCH_NOT_OWNED
+    if host is None:
+        _book_local_start(conn, claimed)
     pid = spawn(claimed, workspace, **spawn_kwargs)
     state.launched, state.pid = True, pid
     if after_launch is not None:
@@ -4646,6 +4690,7 @@ def _dispatch_lane_task(
         from hermes_cli.kanban_continuation import record_placement
         if not record_placement(conn, claimed.id, claimed.current_run_id, None):
             return False
+        _book_local_start(conn, claimed)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))

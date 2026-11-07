@@ -80,6 +80,12 @@ VIA_ALLOC_CLIENT = "alloc_client"
 # reservation id after the replacement lives here, read back by run_reservation /
 # running_reservations after a restart (Prism 43f676a1839e).
 RESERVATION_REPLACED_EVENT = "placement_reservation_replaced"
+# Run event of a LOCAL (this host) start that booked its lease on the shared ledger (t_02aa6d86, doctrine rule 15):
+# ``{"host", placement_reservation}``. Deliberately not worker_placed: "no worker_placed" still means "ran here".
+LOCAL_ADMITTED_EVENT = "local_admitted"
+# The run events that carry a ledger reservation the run owns (release at run end, renew while live).
+RESERVATION_EVENTS = ("worker_placed", LOCAL_ADMITTED_EVENT)
+LOCAL_HOST_ALIAS = "local"
 SHADOW_REL = Path("var") / "alloc" / "shadow" / f"{CONSUMER}.jsonl"
 
 
@@ -377,6 +383,45 @@ def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[s
         return why
 
 
+def book_local(job_id: Optional[str], job: Optional[placement.Job] = None, *, root: Optional[Path] = None,
+               now: Optional[float] = None) -> Optional[str]:
+    """Book a LOCAL start (this host, the ``local`` alias of the table) on the shared ledger BEFORE launch (t_02aa6d86,
+    doctrine rule 15): the LoadGate still decides WHETHER this host has room; the start books the lease every other
+    consumer's admission on this host reads (Prism, test-gate, allocd). The row books the measured estimate the
+    admitter uses (as book_pin(check=True) does). Returns the reservation id, or None when there is no table or the
+    table names no ``local`` host (nothing to book against, the pre-table behaviour). An unreadable ledger raises
+    PlacementError: the caller does not start the worker (fail closed)."""
+    if root is None:
+        from hermes_cli.kanban_db import kanban_home
+        root = kanban_home()
+    root = Path(root)
+    table = load_table(root)
+    hid = table.resolve(LOCAL_HOST_ALIAS) if table is not None else None
+    if hid is None:
+        return None
+    rpath = root / placement.RESERVATIONS_REL
+    fp = table.footprint(CONSUMER, job.footprint if job is not None else None,
+                         profile=job.profile if job is not None else None)
+    with placement._locked(rpath):
+        t = time.time() if now is None else float(now)       # after the lock, as reserve() takes it
+        try:
+            ctx = placement.admit_context(CONSUMER, fp, now=t, job=job, table=table, root=root)
+            need, klass = ctx.need(hid), ctx.job_class
+        except placement.PlacementError:                     # no estimate inputs: the declared footprint, never nothing
+            need, klass = placement.need_of(fp), placement.job_class_for(CONSUMER, job)
+        booked = placement.Footprint(ram_gb=need.ram_gb, threads=need.cpus, scratch_gb=fp.scratch_gb,
+                                     gpu_mb=need.gpu_mib)
+        return placement._reserve_unlocked(rpath, hid, CONSUMER, booked, ttl_s=RESERVE_TTL_S, job_id=job_id, now=t,
+                                           admissions_path=rpath.parent / placement.ADMISSIONS_REL.name,
+                                           decision=None, job_class=klass)
+
+
+def release_local(rid: Optional[str], root: Optional[Path] = None) -> None:
+    """Refund a :func:`book_local` row whose start never launched (TTL bounds a failed refund)."""
+    if rid:
+        release_reservation(rid, root)
+
+
 def release_id(sig, rid: Optional[str]) -> None:
     if not rid or sig is None or getattr(sig, "placement_reservations", None) is None:
         return
@@ -672,11 +717,10 @@ def run_reservation(conn, task_id: str, run_id: Optional[int]) -> Tuple[Optional
     is ``alloc_client`` for an allocd-path take, else None (the in-process ledger)."""
     if run_id is None:
         return None, None
-    from hermes_cli import kanban_placement_reasons as _pr
     try:
         row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? "
-            "ORDER BY id DESC LIMIT 1", (task_id, run_id, _pr.WORKER_PLACED_EVENT)).fetchone()
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind IN (?, ?) "
+            "ORDER BY id DESC LIMIT 1", (task_id, run_id, *RESERVATION_EVENTS)).fetchone()
         doc = json.loads(row[0] or "{}") if row else {}
     except Exception as exc:
         _log.warning("kanban pool: placement reservation lookup failed for %s run %s: %s", task_id, run_id, exc)
@@ -758,12 +802,11 @@ def running_reservations(conn) -> List[Tuple[str, str, Optional[str]]]:
     """``(task_id, reservation id, via)`` for every RUNNING card whose current run's
     ``worker_placed`` event carries a headroom reservation (``via`` as in
     :func:`run_reservation`)."""
-    from hermes_cli import kanban_placement_reasons as _pr
     out: List[Tuple[str, str, Optional[str]]] = []
     for tid, run_id, payload in conn.execute(
             "SELECT t.id, e.run_id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
-            "WHERE t.status = 'running' AND e.kind = ? AND e.run_id IS NOT NULL "
-            "AND e.run_id = t.current_run_id", (_pr.WORKER_PLACED_EVENT,)).fetchall():
+            "WHERE t.status = 'running' AND e.kind IN (?, ?) AND e.run_id IS NOT NULL "
+            "AND e.run_id = t.current_run_id", RESERVATION_EVENTS).fetchall():
         try:
             doc = json.loads(payload or "{}")
             rid = doc.get(RESERVATION_KEY)
