@@ -2378,7 +2378,12 @@ class GatewayKanbanWatchersMixin:
                                     _red_seen = _ow.runner_state(self).red_seen if _s5 else {}
                                     if _wake_mode:
                                         for _ev in events:
-                                            if _s5_home and _ns.is_own_echo(_ev, _home_sid, True):
+                                            # t_fa08b93d: an operator-homed card has no home
+                                            # chat; the operator's own transition is still an echo.
+                                            if (_s5_home and _ns.is_own_echo(_ev, _home_sid, True)) or (
+                                                    _s5 and _ns.is_operator_own_echo(
+                                                        _ev, _home_sid,
+                                                        sub.get("notifier_profile") or notifier_profile)):
                                                 wake_noise[_ev.id] = _ns.REASON_OWN_ECHO
                                                 continue
                                             if _s5 and _ns.is_auto_route(_ev, _suppress_cfg):
