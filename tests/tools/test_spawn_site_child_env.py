@@ -54,8 +54,8 @@ def _openviking_server_seen(child_env, monkeypatch, names):
     real_popen, children = subprocess.Popen, []
 
     def _record(*args, **kwargs):
-        # Invoke the stand-in explicitly: managed CI Python paths exceed macOS
-        # shebang length limits (and can also contain spaces).
+        # Invoke the Python stand-in explicitly rather than relying on platform
+        # shebang parsing of the managed CI interpreter path.
         argv, *rest = args
         assert argv[0] == str(probe)
         children.append(real_popen([sys.executable, *argv], *rest, **kwargs))
