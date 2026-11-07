@@ -114,6 +114,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._recent_dialogs: List[DialogRecord] = []
         self._frames: Dict[str, FrameInfo] = {}
         self._active = False
+        self._detach_tasks: set[asyncio.Task] = set()
         # Supervisor loop machinery — populated in start().
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -241,7 +242,16 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     return await self._cdp("Runtime.evaluate", params, session_id=pinned_session, timeout=timeout)
                 finally:
                     if target_id:
-                        await self._cdp("Target.detachFromTarget", {"sessionId": pinned_session}, timeout=timeout)
+                        # Cleanup cannot turn a confirmed write into a retryable failure,
+                        # or spend the caller's remaining evaluation deadline.
+                        async def detach():
+                            with contextlib.suppress(Exception):
+                                await asyncio.wait_for(self._cdp(
+                                    "Target.detachFromTarget", {"sessionId": pinned_session},
+                                    timeout=1.0), timeout=1.0)
+                        task = asyncio.create_task(detach())
+                        self._detach_tasks.add(task)
+                        task.add_done_callback(self._detach_tasks.discard)
             return _schedule(evaluate(), loop, timeout=timeout + 1)
 
         try:

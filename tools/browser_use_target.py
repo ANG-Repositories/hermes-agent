@@ -71,11 +71,15 @@ def selected_target(route):
         raise RuntimeError("Browser Use selected target is closed or unavailable; select a live tab with browser_exec and retry") from None
 
 
-def begin(task_id):
+def begin(task_id, *, expected_route):
     route = route_for_task(task_id)
+    if route is not expected_route:
+        raise RuntimeError("Browser Use route changed after takeover fence selection; retry")
     if route is None:
         raise RuntimeError("No Browser Use route for this task/profile; open the page with browser_exec first")
     generation, target = selected_target(route)
+    if route_for_task(task_id) is not route:
+        raise RuntimeError("Browser Use route changed during target selection; retry")
     return _pin.set((task_id, route, generation, target))
 
 

@@ -38,7 +38,7 @@ def target_route(monkeypatch):
 def test_inspection_and_secret_write_pin_same_target(target_route, monkeypatch):
     target, route, selected, calls = target_route
     monkeypatch.setattr(vault, "_bot_desktop_browser_session", lambda tid: False)
-    token = target.begin("task")
+    token = target.begin("task", expected_route=route)
     try:
         assert vault._current_page_origin("task") == "https://idmsa.apple.com"
         assert vault._eval_js_secret("task", "synthetic-secret-expression")["success"]
@@ -53,7 +53,7 @@ def test_inspection_and_secret_write_pin_same_target(target_route, monkeypatch):
 @pytest.mark.parametrize("change", ["closed", "daemon", "endpoint"])
 def test_changed_target_fails_closed(target_route, change):
     target, route, selected, calls = target_route
-    token = target.begin("task")
+    token = target.begin("task", expected_route=route)
     try:
         if change == "closed":
             selected[1] = None
@@ -79,6 +79,74 @@ def test_redirect_reports_origin_mismatch_before_secret_read(target_route, monke
     assert result["error_type"] == "origin_mismatch"
     assert "https://idmsa.apple.com" in result["error"]
     assert [tid for _, tid in calls] == ["login-tab"]
+
+
+@pytest.mark.parametrize("initial_route", ["remote", "absent"])
+def test_route_change_between_fence_and_pin_refuses_before_secret_access(target_route, monkeypatch, initial_route):
+    target, route, selected, calls = target_route
+    if initial_route == "absent":
+        target._routes.clear()
+        monkeypatch.setattr(bu, "is_browser_use_cli_mode", lambda: False)
+        monkeypatch.setattr("tools.browser_tool._active_sessions", {})
+    fenced = []
+
+    def race(session, operation):
+        fenced.append(session.get("features", {}).get("local", False))
+        target.record_route("task", {"BU_CDP_WS": "ws://local-browser"}, local=True)
+        return operation()
+
+    monkeypatch.setattr("tools.browser_tool_session.run_fenced", race)
+    result = json.loads(vault._fenced_page_op(
+        "task", lambda: pytest.fail("secret access under stale remote fence")))
+    assert fenced == [False]
+    assert result["error_type"] == "selected_target_unavailable"
+    assert calls == []
+
+
+@pytest.mark.parametrize("cleanup", ["error", "timeout", "stalled"])
+def test_evaluation_success_is_not_overridden_or_delayed_by_detach(monkeypatch, cleanup):
+    import asyncio
+    from tools import browser_supervisor as sup
+
+    supervisor = sup.CDPSupervisor("cleanup-test", "ws://synthetic")
+    supervisor._active = True
+    supervisor._page_session_id = "initial"
+    monkeypatch.setattr(supervisor, "_loop", SimpleNamespace(is_running=lambda: True))
+    calls = []
+
+    async def cdp(method, params, **kwargs):
+        calls.append(method)
+        if method == "Target.getTargetInfo":
+            return {"result": {"targetInfo": {"type": "page", "targetId": "login"}}}
+        if method == "Target.attachToTarget":
+            return {"result": {"sessionId": "pinned"}}
+        if method == "Runtime.evaluate":
+            return {"result": {"result": {"value": "filled", "type": "string"}}}
+        if cleanup == "stalled":
+            await asyncio.Event().wait()
+        if cleanup == "timeout":
+            raise TimeoutError("synthetic detach timeout")
+        raise RuntimeError("synthetic detach failure")
+
+    def schedule(coro, loop, *, timeout):
+        async def run():
+            operation = asyncio.create_task(coro)
+            # All evaluation replies are immediate; cleanup must not be on its critical path.
+            await asyncio.sleep(0)
+            assert operation.done(), "detach consumed the evaluation result deadline"
+            response = operation.result()
+            # Run the wait_for child and cleanup exception handler, without wall-clock sleeps.
+            for _ in range(6):
+                await asyncio.sleep(0)
+            return response
+        return asyncio.run(run())
+
+    monkeypatch.setattr(supervisor, "_cdp", cdp)
+    monkeypatch.setattr(sup, "_schedule", schedule)
+    result = supervisor.evaluate_runtime("synthetic-write", target_id="login")
+    assert result == {"ok": True, "result": "filled", "result_type": "string"}
+    assert calls.count("Runtime.evaluate") == 1
+    assert "Target.detachFromTarget" in calls
 
 
 def test_no_route_never_falls_into_builtin(monkeypatch):

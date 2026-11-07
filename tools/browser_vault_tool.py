@@ -819,10 +819,12 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
                _active_sessions.get(_last_session_key(tid)) or {})
 
     def pinned_op():
-        if route is None and not is_browser_use_cli_mode():
-            return {"raw": fn()}
         try:
-            token = begin(tid)
+            if route_for_task(tid) is not route:
+                raise RuntimeError("Browser Use route changed after takeover fence selection")
+            if route is None and not is_browser_use_cli_mode():
+                return {"raw": fn()}
+            token = begin(tid, expected_route=route)
             try:
                 return {"raw": fn()}
             finally:
