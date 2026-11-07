@@ -13,6 +13,10 @@
    "by": "fixture",
    "card": "t_fixture",
    "drive": false,
+   "end": {
+    "kind": "until",
+    "until": 1794076600
+   },
    "host": "ace-media",
    "id": "20261107T120000Z-ace-media-a0000003",
    "kind": "reboot-lock",

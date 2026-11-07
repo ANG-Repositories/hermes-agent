@@ -1,18 +1,22 @@
 {
  "expect": {
-  "ci": "unreadable",
-  "ci-failover": "unreadable",
-  "cron": "unreadable",
-  "deploy": "unreadable",
-  "kanban": "unreadable",
-  "prism": "unreadable",
-  "reboot": "unreadable"
+  "ci": true,
+  "ci-failover": true,
+  "cron": true,
+  "deploy": true,
+  "kanban": true,
+  "prism": true,
+  "reboot": true
  },
  "holds": [
   {
    "by": "fixture",
    "card": "t_fixture",
    "drive": true,
+   "end": {
+    "kind": "until",
+    "until": 1794155801
+   },
    "host": "ace-media",
    "id": "20261107T120000Z-ace-media-a000000a",
    "kind": "pause",

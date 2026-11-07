@@ -1,12 +1,12 @@
 {
  "expect": {
-  "ci": "unreadable",
-  "ci-failover": "unreadable",
-  "cron": "unreadable",
-  "deploy": "unreadable",
-  "kanban": "unreadable",
-  "prism": "unreadable",
-  "reboot": "unreadable"
+  "ci": true,
+  "ci-failover": true,
+  "cron": true,
+  "deploy": true,
+  "kanban": true,
+  "prism": true,
+  "reboot": true
  },
  "holds": [
   {

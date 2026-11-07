@@ -13,6 +13,10 @@
    "by": "fixture",
    "card": "t_fixture",
    "drive": true,
+   "end": {
+    "kind": "until",
+    "until": 1794070000
+   },
    "host": "ace-media",
    "id": "20261107T120000Z-ace-media-a0000005",
    "kind": "pause",

@@ -36,8 +36,21 @@ is held when the legacy manifest holds it (above) OR a live fwa hold under ``<ka
 covers lane ``kanban``. :func:`fwa_valid` / :func:`fwa_verdict` re-implement hermes-home ``scripts/lib/fwa.py``
 ``valid`` + ``accepting`` (the fork cannot import hermes-home); parity is held by the golden fixtures under
 ``tests/fixtures/fwa/`` (byte copies of hermes-home's), pinned by :data:`FWA_FIXTURES_SHA`, which the home sweep
-reads from this file as text (§5.4 step 5). A hold past ``until`` never holds (I3); an unreadable/invalid hold file
-holds (fail closed, §5.2) until its mtime + 24 h; an unknown lane is ignored (§5.1). The resume pin lapses at
+reads from this file as text (§5.4 step 5). A hold past ``until`` never holds (I3); an unknown lane is ignored (§5.1).
+
+End condition (SPEC v0.4 §5.4a, Ace: "so things aren't just paused forever"): every hold carries
+``end: {"kind": "for"|"until", "until": T}`` or ``{"kind": "reboot", "boot_id_at_pause", "grace_s",
+"backstop_until": T}``, with ``T == until <= since + 24 h``. Two failure cases, two directions:
+
+* parseable JSON whose ``end`` is ABSENT or MALFORMED is EXPIRED: it does not hold, and one warning per file names it
+  (:func:`fwa_end_error`). The home sweep pages and archives it;
+* a file that does not parse as JSON (a write in progress, disk damage) or is otherwise invalid holds (fail closed,
+  §5.2) until its mtime + 24 h.
+
+A ``reboot`` hold ends when the host's boot id changed AND the host answered for ``grace_s``, or at
+``backstop_until``, whichever is first. The fork cannot read a host's boot id cheaply per tick, so here a reboot hold
+is live until ``backstop_until`` UNLESS the home sweep has archived it: the sweep owns the reboot check and moves the
+file out of ``holds/<host>/`` on release, which the next tick sees (I4). The resume pin lapses at
 ``resumed_at + 2 h`` (§5.3). Kill switch ``kanban.placement.pause_hold_source: fwa|manifest`` (default ``fwa``,
 §11): ``manifest`` drops the fwa arm and the pin lapse, which is the pre-B3 behaviour byte for byte.
 """
@@ -72,7 +85,7 @@ _warned_stale: set = set()
 
 #: sha256 over the sorted ``(name, bytes)`` of ``tests/fixtures/fwa/*.json`` (SPEC §5.1, RC-5). MUST equal hermes-home
 #: ``scripts/lib/fwa.py`` ``FWA_FIXTURES_SHA``; the home sweep compares the two as text (§5.4 step 5).
-FWA_FIXTURES_SHA = "e3529af13cda023d1ce3949ae4a470a359c0af3da9e003265507ca57e2b55b0a"
+FWA_FIXTURES_SHA = "f76dc8f1e33d8018100c559ed586c5f93c21c346fc489073a94347418604ea8b"
 FWA_LANE = "kanban"
 FWA_SCHEMA = 1
 FWA_MAX_HOLD_S = 24 * 3600
@@ -81,6 +94,11 @@ FWA_UNREADABLE_MAX_S = 24 * 3600
 #: a resume pin lapses this long after ``resumed_at`` whether or not ``new_run_id`` was stamped (§5.3)
 PIN_LAPSE_S = 2 * 3600
 SOURCE_FWA, SOURCE_MANIFEST = "fwa", "manifest"
+#: §5.4a end kinds whose hard end is ``end.until``; ``reboot`` ends at ``end.backstop_until`` in the fork
+FWA_TIME_ENDS = frozenset({"for", "until"})
+FWA_DEFAULT_GRACE_S = 600
+FWA_MAX_GRACE_S = 7200
+_warned_endless: set = set()
 
 
 class _Unreadable:
@@ -144,10 +162,46 @@ def _epoch(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
 
 
+def fwa_end_error(doc) -> Optional[str]:
+    """SPEC v0.4 §5.4a: None when ``doc["end"]`` is a well-formed end condition, else why not. A parseable hold with
+    an absent or malformed end is EXPIRED (it never holds); this is not the fail-closed unreadable path.
+
+    * ``{"kind": "for"|"until", "until": T}``: ``T == doc["until"]``;
+    * ``{"kind": "reboot", "boot_id_at_pause": B, "grace_s": G, "backstop_until": T}``: B a non-empty string,
+      ``0 <= G <= 7200`` (absent = the 600 default), ``T == doc["until"]``;
+    * either way ``since < T <= since + 24 h``."""
+    end = doc.get("end")
+    if not isinstance(end, dict):
+        return "no end condition" if end is None else "end is not an object"
+    kind = end.get("kind")
+    since, until = doc.get("since"), doc.get("until")
+    if kind in FWA_TIME_ENDS:
+        t = end.get("until")
+    elif kind == "reboot":
+        boot = end.get("boot_id_at_pause")
+        if not isinstance(boot, str) or not boot.strip():
+            return "end.boot_id_at_pause missing"
+        g = end.get("grace_s", FWA_DEFAULT_GRACE_S)
+        if not _epoch(g) or not 0 <= g <= FWA_MAX_GRACE_S:
+            return f"end.grace_s not in 0..{FWA_MAX_GRACE_S}"
+        t = end.get("backstop_until")
+        if t is None:
+            return "end.backstop_until missing (mandatory for a reboot hold)"
+    else:
+        return f"end.kind {kind!r} unknown"
+    if not _epoch(t) or not _epoch(since) or not _epoch(until) or t != until:
+        return "end does not match until"
+    if not since < t <= since + FWA_MAX_HOLD_S:
+        return "end not within since + 24 h"
+    return None
+
+
 def fwa_valid(doc) -> bool:
     """hermes-home ``fwa.valid`` (SPEC §5.1): the fields :func:`fwa_verdict` reads have their shape and the hold has
     an end, ``since < until <= since + 24 h``. Unknown lanes do NOT invalidate a doc (RC-5)."""
     if not isinstance(doc, dict) or doc.get("schema") != FWA_SCHEMA:
+        return False
+    if fwa_end_error(doc) is not None:
         return False
     for key in ("id", "host"):
         if not isinstance(doc.get(key), str) or not doc[key].strip():
@@ -167,6 +221,8 @@ def fwa_verdict(entries, lane: str, now: float):
     ``lane``. A valid hold holds iff ``since <= now < until`` and ``lane in lanes`` (I3: expired never holds); an
     unreadable or invalid entry holds every lane until ``mtime + 24 h`` (no mtime = holds)."""
     for e in entries:
+        if isinstance(e, dict) and fwa_end_error(e) is not None:
+            continue                                        # §5.4a: no / a malformed end = expired, never a hold
         if isinstance(e, _Unreadable) or not fwa_valid(e):
             mtime = e.mtime if isinstance(e, _Unreadable) else None
             if mtime is None or now < mtime + FWA_UNREADABLE_MAX_S:
@@ -232,9 +288,23 @@ def fwa_entries(host: str, cache: dict) -> list:
             except (OSError, ValueError, RecursionError):   # ValueError covers UnicodeDecodeError
                 out.append(_Unreadable(p.name, mtime))
                 continue
+            end_err = fwa_end_error(doc) if isinstance(doc, dict) else None
+            if end_err is not None:
+                _note_endless(p, mtime, end_err)
+                continue
             out.append(doc if fwa_valid(doc) else _Unreadable(p.name, mtime))
     cache[key] = out
     return out
+
+
+def _note_endless(path: Path, mtime: Optional[float], why: str) -> None:
+    """ONE warning per (file, mtime) per process: a hold with no / a malformed end is treated as expired."""
+    key = (str(path), mtime)
+    if key in _warned_endless:
+        return
+    _warned_endless.add(key)
+    _log.warning("kanban pause_hold: fwa hold %s has %s; treated as expired, it does not hold (SPEC §5.4a)",
+                 path, why)
 
 
 def _fwa_hold(origin_host: str, cache: dict, now: Optional[float] = None):
