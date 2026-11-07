@@ -30,6 +30,16 @@ Stale-hold fail-safes (t_0c5a95ab, Ace 2026-11-06 20:31 "the CI box is not pause
 Override: ``hermes kanban placement-holds --clear <id>`` ends one card's label (a task_event naming --operator);
 ``KANBAN_PAUSE_HOLD_STALE=0`` in the dispatcher's env turns off the lease/driver auto-clear and the pin-conflict
 grace, so a stale manifest holds exactly as before.
+
+FWA hold records (FWA pause/resume SPEC §5.1-§5.3, card B3 t_0b56b707): :func:`decide` DUAL-READS. A card of host H
+is held when the legacy manifest holds it (above) OR a live fwa hold under ``<kanban_home()>/state/fwa/holds/<H>/``
+covers lane ``kanban``. :func:`fwa_valid` / :func:`fwa_verdict` re-implement hermes-home ``scripts/lib/fwa.py``
+``valid`` + ``accepting`` (the fork cannot import hermes-home); parity is held by the golden fixtures under
+``tests/fixtures/fwa/`` (byte copies of hermes-home's), pinned by :data:`FWA_FIXTURES_SHA`, which the home sweep
+reads from this file as text (§5.4 step 5). A hold past ``until`` never holds (I3); an unreadable/invalid hold file
+holds (fail closed, §5.2) until its mtime + 24 h; an unknown lane is ignored (§5.1). The resume pin lapses at
+``resumed_at + 2 h`` (§5.3). Kill switch ``kanban.placement.pause_hold_source: fwa|manifest`` (default ``fwa``,
+§11): ``manifest`` drops the fwa arm and the pin lapse, which is the pre-B3 behaviour byte for byte.
 """
 
 from __future__ import annotations
@@ -60,6 +70,27 @@ STALE_EVENT_REASON = "stale pause manifest auto-cleared"
 STALE_ENV = "KANBAN_PAUSE_HOLD_STALE"
 _warned_stale: set = set()
 
+#: sha256 over the sorted ``(name, bytes)`` of ``tests/fixtures/fwa/*.json`` (SPEC §5.1, RC-5). MUST equal hermes-home
+#: ``scripts/lib/fwa.py`` ``FWA_FIXTURES_SHA``; the home sweep compares the two as text (§5.4 step 5).
+FWA_FIXTURES_SHA = "e3529af13cda023d1ce3949ae4a470a359c0af3da9e003265507ca57e2b55b0a"
+FWA_LANE = "kanban"
+FWA_SCHEMA = 1
+FWA_MAX_HOLD_S = 24 * 3600
+#: an unreadable hold file holds at most this long past its mtime (§5.2: a fail-closed file has an end too)
+FWA_UNREADABLE_MAX_S = 24 * 3600
+#: a resume pin lapses this long after ``resumed_at`` whether or not ``new_run_id`` was stamped (§5.3)
+PIN_LAPSE_S = 2 * 3600
+SOURCE_FWA, SOURCE_MANIFEST = "fwa", "manifest"
+
+
+class _Unreadable:
+    """An fwa hold file that cannot be parsed or fails :func:`fwa_valid`; ``mtime`` bounds how long it holds."""
+
+    __slots__ = ("name", "mtime")
+
+    def __init__(self, name: str, mtime: Optional[float]):
+        self.name, self.mtime = name, mtime
+
 
 class PauseHeld(Exception):
     """A run opener refused a card whose origin host is paused."""
@@ -88,6 +119,138 @@ def enabled() -> bool:
         _log.warning("kanban pause_hold: root config unreadable; hold stays on", exc_info=True)
         return True
     return value is not False and str(value).strip().lower() not in ("off", "false", "0", "no")
+
+
+def source() -> str:
+    """``kanban.placement.pause_hold_source`` (SPEC §11 B3 kill switch): ``fwa`` (default) dual-reads the fwa hold
+    records and the legacy manifest; ``manifest`` reads the manifest only, exactly as before B3. An unreadable config
+    or any other value is ``fwa``: the fwa arm only ADDS holds, so it is the fail-closed side."""
+    try:
+        from hermes_cli import kanban_db as _kb
+        placement = (_kb._board_home_kanban_cfg() or {}).get("placement") or {}
+        value = placement.get("pause_hold_source", SOURCE_FWA) if isinstance(placement, dict) else SOURCE_FWA
+    except Exception:
+        return SOURCE_FWA
+    return SOURCE_MANIFEST if str(value).strip().lower() == SOURCE_MANIFEST else SOURCE_FWA
+
+
+def fwa_root() -> Path:
+    """``<kanban_home()>/state/fwa/holds``: the FLEET root, never a profile home (SPEC §5.1 root rule)."""
+    from hermes_cli import kanban_db as _kb
+    return _kb.kanban_home() / "state" / "fwa" / "holds"
+
+
+def _epoch(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
+
+
+def fwa_valid(doc) -> bool:
+    """hermes-home ``fwa.valid`` (SPEC §5.1): the fields :func:`fwa_verdict` reads have their shape and the hold has
+    an end, ``since < until <= since + 24 h``. Unknown lanes do NOT invalidate a doc (RC-5)."""
+    if not isinstance(doc, dict) or doc.get("schema") != FWA_SCHEMA:
+        return False
+    for key in ("id", "host"):
+        if not isinstance(doc.get(key), str) or not doc[key].strip():
+            return False
+    lanes = doc.get("lanes")
+    if not isinstance(lanes, list) or not lanes or not all(isinstance(x, str) for x in lanes):
+        return False
+    since, until = doc.get("since"), doc.get("until")
+    if not _epoch(since) or not _epoch(until):
+        return False
+    return since < until <= since + FWA_MAX_HOLD_S
+
+
+def fwa_verdict(entries, lane: str, now: float):
+    """hermes-home ``fwa.accepting`` over already-loaded entries (dicts, or :class:`_Unreadable`) with
+    ``on_unreadable="hold"``: ``None`` = accepting, else ``(kind, id, doc_or_None)`` of the first hold covering
+    ``lane``. A valid hold holds iff ``since <= now < until`` and ``lane in lanes`` (I3: expired never holds); an
+    unreadable or invalid entry holds every lane until ``mtime + 24 h`` (no mtime = holds)."""
+    for e in entries:
+        if isinstance(e, _Unreadable) or not fwa_valid(e):
+            mtime = e.mtime if isinstance(e, _Unreadable) else None
+            if mtime is None or now < mtime + FWA_UNREADABLE_MAX_S:
+                return (UNREADABLE, e.name if isinstance(e, _Unreadable) else str((e or {}).get("id") or "?"), None)
+            continue
+        if e["since"] <= now < e["until"] and lane in e["lanes"]:
+            return (str(e.get("kind") or "pause"), e["id"], e)
+    return None
+
+
+def _host_names(host: str, cache: dict) -> set:
+    """``host`` plus its canonical id and aliases from ``config/fleet-hosts.json`` (SPEC §5.2), lower-cased. The
+    table is read once per tick (memo in ``cache``); an unreadable table leaves the name itself."""
+    table = cache.get(("fwa", "table"))
+    if table is None:
+        table = {}
+        try:
+            from hermes_cli.fleet_placement import placement as _pl
+            t = _pl.load_hosts()
+            for hid, (_src, aliases) in dict(t.declared).items():
+                table[hid.lower()] = {hid.lower(), *(str(a).lower() for a in aliases)}
+            for hid, h in t.hosts.items():
+                table.setdefault(hid.lower(), set()).update({hid.lower(), *(str(a).lower() for a in h.aliases)})
+        except Exception:
+            table = {}
+        cache[("fwa", "table")] = table
+    low = host.strip().lower()
+    names = {low}
+    for group in table.values():
+        if low in group:
+            names |= group
+    return names
+
+
+def fwa_entries(host: str, cache: dict) -> list:
+    """Every hold file of ``host`` (any alias's directory), parsed: a valid dict or an :class:`_Unreadable`. Per-tick
+    memo in ``cache`` (I4: never persisted across ticks). Lock, dot and tmp files are not holds."""
+    key = ("fwa", host)
+    if key in cache:
+        return cache[key]
+    out: list = []
+    base = fwa_root()
+    names = _host_names(host, cache)
+    try:
+        dirs = [d for d in base.iterdir() if d.is_dir() and d.name.lower() in names] if base.is_dir() else []
+    except OSError:
+        _log.warning("kanban pause_hold: %s unlistable; every %s card is HELD", base, host)
+        dirs = []
+        out.append(_Unreadable(str(base), None))
+    for d in sorted(dirs):
+        try:
+            files = sorted(p for p in d.iterdir() if p.suffix == ".json" and not p.name.startswith("."))
+        except OSError:
+            out.append(_Unreadable(d.name, None))
+            continue
+        for p in files:
+            mtime = None
+            try:
+                mtime = p.stat().st_mtime
+                doc = json.loads(p.read_text(encoding="utf-8-sig"))
+            except FileNotFoundError:
+                continue                                    # archived between listdir and read: not a hold
+            except (OSError, ValueError, RecursionError):   # ValueError covers UnicodeDecodeError
+                out.append(_Unreadable(p.name, mtime))
+                continue
+            out.append(doc if fwa_valid(doc) else _Unreadable(p.name, mtime))
+    cache[key] = out
+    return out
+
+
+def _fwa_hold(origin_host: str, cache: dict, now: Optional[float] = None):
+    """``("wait", "pause_hold (<host>:fwa:<kind>:<id> ...)")`` when an fwa hold covers lane kanban, else None."""
+    if source() != SOURCE_FWA:
+        return None
+    t = time.time() if now is None else float(now)
+    hit = fwa_verdict(fwa_entries(origin_host, cache), FWA_LANE, t)
+    if hit is None:
+        return None
+    kind, hid, doc = hit
+    if doc is None:
+        return ("wait", f"{CODE} ({origin_host}:fwa:{UNREADABLE}:{hid})")
+    until = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(doc["until"]))
+    by = str(doc.get("by") or doc.get("owner") or "?").replace("(", "[").replace(")", "]")
+    return ("wait", f"{CODE} ({origin_host}:fwa:{kind}:{hid} by {by} until {until})")
 
 
 def _valid(doc) -> bool:
@@ -147,8 +310,17 @@ def decide(origin_host: Optional[str], task_id: str, cache: dict):
 
 
 def _decide(origin_host, task_id, cache):
+    """Dual-read (SPEC §5.3, §8 P1): a legacy wait stands; else a live fwa hold on lane kanban waits (it beats a
+    resume pin: a held host takes no run, pinned or not); else the legacy pin / None."""
     if not origin_host:
         return None
+    legacy = _decide_manifest(origin_host, task_id, cache)
+    if legacy is not None and legacy[0] == "wait":
+        return legacy
+    return _fwa_hold(str(origin_host), cache) or legacy
+
+
+def _decide_manifest(origin_host, task_id, cache):
     doc = _load(str(origin_host), cache)
     if doc is None:
         return None
@@ -162,10 +334,25 @@ def _decide(origin_host, task_id, cache):
             return None
         return ("wait", f"{CODE} ({origin_host}:{doc.get('id') or '?'})")
     if phase in PIN_PHASES:
+        if _pin_lapsed(doc):
+            return None
         for unit in doc.get("units") or ():
             if unit.get("lane") == "kanban" and unit.get("id") == task_id:
                 return ("pin", str(origin_host)) if owes_run(unit) else None
     return None
+
+
+def _pin_lapsed(doc: dict, now: Optional[float] = None) -> bool:
+    """SPEC §5.3 (I-A class): a ``resumed`` manifest's pins lapse at ``resumed_at + PIN_LAPSE_S`` whether or not
+    ``new_run_id`` was stamped. ``resuming`` never lapses here (the driver is still running). Off under
+    ``pause_hold_source: manifest``."""
+    if doc.get("phase") != "resumed" or source() != SOURCE_FWA:
+        return False
+    at = doc.get("resumed_at")
+    if not _epoch(at):
+        return False
+    t = time.time() if now is None else float(now)
+    return t >= float(at) + PIN_LAPSE_S
 
 
 def owes_run(unit: dict) -> bool:
@@ -471,6 +658,20 @@ def holds(conn=None, *, now: Optional[float] = None) -> dict:
             "pins_owed": owed,
             "pin_conflict_expired": _pin_conflict_expired(d.name, {d.name: doc}, t),
         }
+    fwa: dict = {}
+    if source() == SOURCE_FWA:
+        base = fwa_root()
+        for d in sorted(p for p in base.iterdir() if p.is_dir()) if base.is_dir() else []:
+            rows = []
+            for e in fwa_entries(d.name, {("fwa", "table"): {}}):
+                if isinstance(e, _Unreadable):
+                    rows.append({"file": e.name, "unreadable": True,
+                                 "holds_kanban": fwa_verdict([e], FWA_LANE, t) is not None})
+                    continue
+                rows.append({"id": e["id"], "kind": e.get("kind"), "lanes": e["lanes"], "by": e.get("by"),
+                             "owner": e.get("owner"), "reason": e.get("reason"), "since": e["since"],
+                             "until": e["until"], "holds_kanban": fwa_verdict([e], FWA_LANE, t) is not None})
+            fwa[d.name] = rows
     cards = []
     if conn is not None:
         cache: dict = {}
@@ -479,7 +680,7 @@ def holds(conn=None, *, now: Optional[float] = None) -> dict:
             cards.append({"task_id": tid, "origin_host": origin, "label": detail,
                           "live": verdict is not None and verdict[0] == "wait",
                           "now": None if verdict is None else list(verdict)})
-    return {"now": int(t), "hosts": hosts, "cards": cards}
+    return {"now": int(t), "hosts": hosts, "fwa": fwa, "source": source(), "cards": cards}
 
 
 def clear_card(conn, task_id: str, operator: str) -> bool:
