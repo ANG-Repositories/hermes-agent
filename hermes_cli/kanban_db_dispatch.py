@@ -8000,6 +8000,10 @@ def _dispatch_once_locked(
     _record_placement_waits(
         conn, result, row_route, dry_run, _wait_reached,
         local_binding=_pr.local_full_binding(spawn_paused, local_budget, local_spawned))
+    # A pause_hold label the CURRENT manifest no longer backs is ended every live tick (t_0c5a95ab): a card this
+    # tick never routes (no_worker, human lane) would otherwise read "held by <old manifest>" forever.
+    if not _admit:
+        _kph.clear_stale_labels(conn, result, dry_run, _pause_cache)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
