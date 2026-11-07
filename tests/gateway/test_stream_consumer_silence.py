@@ -77,6 +77,52 @@ def _sent_and_edited(adapter):
     return texts
 
 
+@pytest.mark.asyncio
+async def test_human_fold_releases_internal_commentary_before_final():
+    from gateway.run_busy import GatewayBusySessionMixin
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.turn_context import TurnContext
+
+    runner = GatewayBusySessionMixin()
+    turn = SimpleNamespace(agent=None, event=None, ctx=None)
+    runner._session_state = lambda key: SimpleNamespace(turn=turn)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="test")
+    agent = object()
+    turn.agent = agent
+    turn.event = MessageEvent(text="wake", source=source, internal=True)
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(adapter, "test", StreamConsumerConfig(internal_event=True))
+    ctx = TurnContext(persist_user_display_kind="internal_notification",
+                      interim_assistant_messages_enabled=True, _run_still_current=lambda: True)
+    ctx.stream_consumer_holder[0] = consumer
+    turn.ctx = ctx
+    consumer.on_commentary("old commentary")
+    consumer._drain_queue()
+    assert consumer._internal_held == ["old commentary"]
+    human = MessageEvent(text="please answer", source=source, reply_expected=True)
+    await asyncio.to_thread(runner._fold_into_running_turn, agent, "test", human)
+    consumer.on_commentary("new commentary")
+    delivered = asyncio.Event()
+    original_send = adapter.send.side_effect
+    async def send(**kwargs):
+        if kwargs.get("content") == "new commentary":
+            delivered.set()
+        return SimpleNamespace(success=True, message_id="sent")
+    adapter.send.side_effect = send
+    task = asyncio.create_task(consumer.run())
+    try:
+        await asyncio.wait_for(delivered.wait(), 2)
+        assert _sent_and_edited(adapter) == ["old commentary", "new commentary"]
+        assert ctx.persist_user_display_kind == "internal_notification"
+        assert ctx.effective_display_kind is None
+    finally:
+        task.cancel()
+        await task
+        adapter.send.side_effect = original_send
+
+
 class TestStreamedSilenceSuppression:
     @pytest.mark.asyncio
     async def test_no_reply_only_stream_is_fully_suppressed(self):

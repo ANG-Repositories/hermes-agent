@@ -855,10 +855,20 @@ class GatewayBusySessionMixin:
         turn = self._session_state(session_key).turn
         if turn.agent is not running_agent:
             return None
+        ctx = turn.ctx
+        if ctx is not None and ctx._run_still_current is not None and not ctx._run_still_current():
+            return None
         if turn.event is not None and turn.event is not event:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
+        if ctx is not None and not getattr(event, "internal", False):
+            from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
+            if not is_machinery_display_kind(display_kind_for_event(event)):
+                ctx.human_engaged = True
+                consumer = ctx.stream_consumer_holder[0]
+                if consumer is not None and not (ctx.scheduled_heartbeat or ctx.mute_notification_reply):
+                    consumer.on_human_engagement()
         return turn
 
     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:

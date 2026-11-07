@@ -1719,7 +1719,8 @@ class GatewayTurnMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
-        _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
+        _silence_kind = agent_result.get(
+            "queued_terminal_display_kind", agent_result.get("effective_display_kind", persist_user_display_kind))
         _internal_turn = _silence_kind == "internal_notification"
         _intentional_silence = self._is_intentional_silence(
             agent_result, response, internal=_internal_turn,
@@ -4324,9 +4325,9 @@ class GatewayTurnMixin:
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(
             _delivery_result, first_response,
-            internal=turn_ctx.persist_user_display_kind == "internal_notification",
+            internal=turn_ctx.effective_display_kind == "internal_notification",
         ):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            if silence_allowed(turn_ctx.effective_display_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -4339,7 +4340,7 @@ class GatewayTurnMixin:
                 )
                 first_response = _unexpected_silence_reply()
                 _already_streamed = False
-        elif first_response and turn_ctx.persist_user_display_kind == "internal_notification":
+        elif first_response and turn_ctx.effective_display_kind == "internal_notification":
             from gateway.run import _gateway_surface_passes_raw_text
             if not _gateway_surface_passes_raw_text(turn_ctx.source.platform):
                 from gateway.response_filters import strip_internal_silence_marker_lines
@@ -5002,6 +5003,7 @@ class GatewayTurnMixin:
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
+                response["effective_display_kind"] = turn_ctx.effective_display_kind
             self._run_agent_evict_on_fallback(turn_ctx)
 
             # Interrupted OR queued message (/queue)?
