@@ -66,6 +66,21 @@ async def test_incomplete_turns_park_backoff_reset_and_notify_once(tmp_path, mon
         assert mgr.state.consecutive_incomplete_turns == 1
         assert not mgr.state.waiting_until
         assert not mgr.idle_wake_prompt(clock)  # no immediate recovery-loop wake
+        mgr = await turn(completed=True, text="")
+        assert mgr.state.consecutive_incomplete_turns == 0
+        assert judge.call_count == 1  # blank success only resets, never judges
+
+
+@pytest.mark.asyncio
+async def test_delivery_preserves_completion_before_returning_text():
+    from gateway.run_turn import GatewayTurnMixin
+
+    event = SimpleNamespace()
+    with patch("gateway.run_turn.diagnostic_wake_muted", return_value=True):
+        for completed in (False, True):
+            await GatewayTurnMixin()._hmwa_deliver_turn_response(
+                event, None, None, "test", 1, {"completed": completed}, [], "", "", False)
+            assert event._goal_turn_completed is completed
 
 
 @pytest.mark.asyncio

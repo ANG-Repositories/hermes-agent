@@ -260,6 +260,10 @@ goals:
   max_idle_checkins: 3
   # Pause after this many judged-continue turns in a row with no tool call (0 = off).
   no_progress_turns: 4
+  # Gateway: park after consecutive incomplete agent turns (minimum 1).
+  # Retry after 60s, then double up to 30 min; one notice per failure streak.
+  # A completed turn or human message resets the streak. Failed turns skip gates/judging.
+  max_incomplete_turns: 3
   # true = queue a continuation even after a read-only / no-tool turn nobody asked for.
   nudge_on_read_only_turns: false
 ```

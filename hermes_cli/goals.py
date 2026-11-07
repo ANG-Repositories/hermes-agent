@@ -1883,6 +1883,8 @@ class GoalManager:
             state.consecutive_incomplete_turns = 0
             state.clear_wait()
             self._save()
+        if turn_completed and not last_response.strip():
+            return _decision("active", False, None, "skipped", "empty completed response", "")
         if not turn_completed:
             state.consecutive_incomplete_turns += 1
             state.last_turn_at = time.time()
