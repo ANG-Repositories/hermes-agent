@@ -26,6 +26,10 @@ Stale-hold fail-safes (t_0c5a95ab, Ace 2026-11-06 20:31 "the CI box is not pause
   manifest no longer holds (``{cleared: true}``), so no reader sees a stale label for a card the dispatcher skips
   (no_worker / human lane cards are never routed, so their last label never moved);
 * :func:`holds` is the read model behind ``hermes kanban placement-holds``.
+
+Override: ``hermes kanban placement-holds --clear <id>`` ends one card's label (a task_event naming --operator);
+``KANBAN_PAUSE_HOLD_STALE=0`` in the dispatcher's env turns off the lease/driver auto-clear and the pin-conflict
+grace, so a stale manifest holds exactly as before.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ PIN_CONFLICT_GRACE_S = 900
 #: ``unit.resume.action`` values under which no post-resume run is owed (fleet-pause stamps them).
 SETTLED_ACTIONS = frozenset({"no_run_owed", "already_moved", "none"})
 STALE_EVENT_REASON = "stale pause manifest auto-cleared"
+STALE_ENV = "KANBAN_PAUSE_HOLD_STALE"
 _warned_stale: set = set()
 
 
@@ -169,25 +174,31 @@ def owes_run(unit: dict) -> bool:
     return resume.get("new_run_id") is None and resume.get("action") not in SETTLED_ACTIONS
 
 
+def stale_failsafe_on() -> bool:
+    """Kill switch ``KANBAN_PAUSE_HOLD_STALE=0`` (env, no deploy needed): turns off the lease/driver auto-clear and the
+    resume pin-conflict grace, so a stale manifest holds as it did before t_0c5a95ab. Default on."""
+    return os.environ.get(STALE_ENV, "1").strip().lower() not in ("0", "off", "false", "no")
+
+
 def _driver_alive(doc: dict) -> bool:
-    """The manifest's ``driver.pid`` exists on THIS host. No pid / a non-int = dead. EPERM = alive."""
+    """The manifest's ``driver.pid`` exists on THIS host. No pid / a non-int = dead. Cross-platform via psutil (a
+    core dependency); a probe that cannot run counts as alive, so the hold stands (fail closed)."""
     pid = (doc.get("driver") or {}).get("pid") if isinstance(doc.get("driver"), dict) else None
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+        import psutil
+        return bool(psutil.pid_exists(pid))
+    except Exception:
         return True
-    except OSError:
-        return False
-    return True
 
 
 def stale_reason(doc: dict, now: Optional[float] = None) -> Optional[str]:
     """Why a HOLD-phase manifest no longer holds, or None while it does: its lease (+ LEASE_GRACE_S) ran out and no
-    driver process is alive. A manifest without a numeric ``lease_until`` never goes stale here (fail closed)."""
+    driver process is alive. A manifest without a numeric ``lease_until`` never goes stale here (fail closed), and
+    nothing goes stale with ``KANBAN_PAUSE_HOLD_STALE=0``."""
+    if not stale_failsafe_on():
+        return None
     t = time.time() if now is None else float(now)
     lease = doc.get("lease_until")
     if not isinstance(lease, (int, float)) or isinstance(lease, bool):
@@ -284,7 +295,7 @@ def _pin_conflict_expired(host: str, cache: dict, now: Optional[float] = None) -
     """A ``resumed`` manifest whose ``resumed_at`` is more than PIN_CONFLICT_GRACE_S ago. ``resuming`` never
     expires here: the resume driver is still running and the pin is its fence."""
     doc = cache.get(str(host))
-    if not isinstance(doc, dict) or doc.get("phase") != "resumed":
+    if not stale_failsafe_on() or not isinstance(doc, dict) or doc.get("phase") != "resumed":
         return False
     at = doc.get("resumed_at")
     if not isinstance(at, (int, float)) or isinstance(at, bool):

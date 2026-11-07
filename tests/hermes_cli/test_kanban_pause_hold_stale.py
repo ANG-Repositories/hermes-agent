@@ -114,6 +114,44 @@ def test_stale_failsafe_never_lifts_a_live_pause(home, shape):
             kb.claim_task(conn, tid)
 
 
+def test_driver_probe_is_cross_platform_dead_pid_stale_live_pid_holds():
+    """The driver probe is psutil (never os.kill(pid, 0): on Windows that sends CTRL_C_EVENT). Dead pid = stale,
+    live pid = hold, on every OS."""
+    import os
+    lease = int(time.time()) - kph.LEASE_GRACE_S - 60
+    dead = {"phase": "paused", "lease_until": lease, "driver": {"pid": DEAD_PID}}
+    live = {"phase": "paused", "lease_until": lease, "driver": {"pid": os.getpid()}}
+    assert kph._driver_alive(dead) is False and kph._driver_alive(live) is True
+    assert "lease expired" in (kph.stale_reason(dead) or "")
+    assert kph.stale_reason(live) is None
+
+
+def test_driver_probe_that_cannot_run_keeps_the_hold(monkeypatch):
+    import psutil
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: (_ for _ in ()).throw(OSError("probe failed")))
+    doc = {"phase": "paused", "lease_until": int(time.time()) - kph.LEASE_GRACE_S - 60, "driver": {"pid": DEAD_PID}}
+    assert kph._driver_alive(doc) is True
+    assert kph.stale_reason(doc) is None
+
+
+def test_kill_switch_off_restores_the_old_hold(home, monkeypatch):
+    """KANBAN_PAUSE_HOLD_STALE=0: a lease-expired, driver-dead manifest holds again and a conflicting resume pin
+    waits past the grace, exactly as before the fail-safe."""
+    monkeypatch.setenv(kph.STALE_ENV, "0")
+    doc = {"phase": "paused", "lease_until": int(time.time()) - kph.LEASE_GRACE_S - 60, "driver": {"pid": DEAD_PID}}
+    assert kph.stale_reason(doc) is None
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="a", assignee="alpha", body="x")
+        _set(conn, tid, status="ready", origin_host="ci-box")
+        _write(home, {"schema": 2, "id": MID, "host": "ci-box", **doc, "units": []})
+        res, spawned = _tick(conn, _plan())
+        assert tid not in {t for t, _ in spawned}
+        assert _routes(res)[tid]["code"] == "pause_hold"
+        pin = _pin_card(conn, home, kph.PIN_CONFLICT_GRACE_S + 60)
+        res, _spawned = _tick(conn, _plan())
+        assert "resume_pin_conflict:host_studio" in _routes(res)[pin]["detail"]
+
+
 # -- (3) resume_pin_conflict on a resumed host ----------------------------------------------------------------
 
 def _pin_card(conn, home, resumed_ago):
