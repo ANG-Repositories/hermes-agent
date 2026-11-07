@@ -867,8 +867,17 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
             current = entry.get("assignee")   # RC-4: the CURRENT assignee only, never the child's pick
             if current and getattr(kb.get_task(conn, tid), "assignee", None) != current:
                 kb.assign_task(conn, tid, current, worker_ok=True)
-        elif status == "blocked":             # redispatch / retry of a parked card
+        elif status == "blocked" or entry.get("row") == "blocked_assess":
             kwargs = {"expect_block_event": int(entry["event_id"])} if entry.get("row") == "blocked_assess" else {}
+            if entry.get("row") == "blocked_assess":
+                from gateway.kanban_wake_disposition import card_tags, SURFACE_TAGS
+
+                current = kb.get_task(conn, tid)
+                if card_tags(current) & SURFACE_TAGS:
+                    raise RuntimeError("restricted card requires owner assessment")
+                # Pin exactly the policy-bearing text read above. The DB checks
+                # it under its writer lock, alongside the block-event CAS.
+                kwargs["expect_card_text"] = (current.title, current.body)
             if not kb.unblock_task(conn, tid, **kwargs):
                 raise RuntimeError("unblock refused")
         elif status in ("ready", "todo"):
@@ -1516,6 +1525,18 @@ async def dispatch_or_warn(runner: Any, entry_route: dict, **kw: Any) -> bool:
     """``dispatch`` for a wake path: True = a claim owns the event (this path's or the other
     path's), so the caller withholds its wake. A raised dispatch posts the warning line and
     returns False: the caller surfaces the wake (INV-6)."""
+    if getattr(kw.get("disposition"), "row", None) == "blocked_assess":
+        from gateway import kanban_home_route as _hr
+        from gateway import kanban_owner_wake as _ow
+
+        try:
+            home = await asyncio.to_thread(
+                _ow.resolve_owner, getattr(runner, "session_store", None),
+                kw.get("home_sid") or "", _hr.read_session_row)
+            if home is None or not _ow.is_chat_origin(home):
+                return False  # preserve native subscription delivery; no claim owns it
+        except Exception:
+            return False  # cannot establish the unresolved-handback destination
     try:
         await dispatch(runner, route=entry_route, **kw)
         return True   # accepted here, or already claimed by the other path: either way owned

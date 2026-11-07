@@ -1189,6 +1189,11 @@ The owner decides whether human input is required. The persisted claim spends
 one attempt atomically; repeated blocks share the existing per-card retry budget
 until completion/archive or explicit operator reset. Escalation handbacks are
 persisted for delivery retries. No new privileged actions are granted.
+If the owner cannot resolve to a supported chat origin (for example, an API or
+CLI session), blocked events retain native subscription wake delivery instead
+of being claimed by a child whose unresolved handback cannot be delivered.
+Restriction-bearing title/body text is checked again atomically with unblock;
+a concurrent edit refuses the retry and returns the obligation to the owner.
 
 Operator rollout: merge and deploy through the normal runtime lane, then obtain
 fresh per-instance approval before any gateway restart. Verify an opted-in

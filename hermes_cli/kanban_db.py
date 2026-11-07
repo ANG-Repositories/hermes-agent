@@ -16304,6 +16304,7 @@ def unblock_task(
     comment: Optional[tuple] = None,
     expect_block_event: Optional[int] = None,
     expect_last_comment: Optional[int] = None,
+    expect_card_text: Optional[tuple] = None,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -16320,6 +16321,8 @@ def unblock_task(
     that latest ``scheduled``/``schedule_wake_set`` event id, t_7f670c57) and that latest comment
     id (0 = none), checked inside the same IMMEDIATE txn as the flip. A card
     re-blocked or re-pointed in between returns False and is left alone.
+    ``expect_card_text`` pins ``(title, body)`` under that same lock, for callers
+    whose authorization decision depends on tags embedded in those fields.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -16330,6 +16333,10 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
+        if expect_card_text is not None:
+            row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or tuple(row) != expect_card_text:
+                return False
         if (expect_block_event is not None or expect_last_comment is not None) and not (
             _unblock_expectation_holds(conn, task_id, expect_block_event, expect_last_comment)
         ):

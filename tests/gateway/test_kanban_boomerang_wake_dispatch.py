@@ -324,6 +324,44 @@ def test_block_restricted_retry_is_not_authorized(env, tag):
         assert kb.get_task(conn, tid).status == "blocked"
 
 
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_block_restricted_edit_before_unblock(env, field):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    original = kb.unblock_task
+
+    def race(conn, task_id, **kwargs):
+        with kb.connect_closing() as other, kb.write_txn(other):
+            other.execute(f"UPDATE tasks SET {field} = '[spend] approval required' WHERE id = ?", (tid,))
+        return original(conn, task_id, **kwargs)
+
+    env["monkeypatch"].setattr(kb, "unblock_task", race)
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["probe healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "probe healthy"}))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert len(env["adapter"].handled) == 1
+
+
+@pytest.mark.parametrize("platform", [None, "api_server", "cli"])
+def test_block_nonchat_owner_preserves_notifier_wake(env, platform):
+    tid = _card(env)
+    _sub(tid)
+    owner = None if platform is None else SimpleNamespace(
+        origin=SimpleNamespace(platform=platform, chat_id=CHAT))
+    env["monkeypatch"].setattr(ow, "resolve_owner", lambda *_a: owner)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+    assert len(_tick(env)) == 1
+    assert not env["dispatched"]
+    assert not _claims()
+
+
 def test_block_claim_concurrent_budget(env):
     state = ah.BoomerangWakeState()
     barrier = threading.Barrier(2)
