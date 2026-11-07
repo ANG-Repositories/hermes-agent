@@ -11,6 +11,8 @@ the board loop.
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
@@ -53,6 +55,34 @@ _WAKING_SQL = (
     "ON p.id = l.parent_id WHERE l.child_id = t.id AND COALESCE(l.kind,'blocks') = 'blocks' "
     "AND p.status NOT IN ('done','archived'))) LIMIT 1"
 )
+
+
+def pool_health(root, pool) -> None:
+    """One fleet episode, checked on each planned tick, independently of admission.
+
+    The home pager owns durable de-duplication and recovery. Non-fleet installs
+    without the pager remain a no-op; a failed send is retried next tick.
+    """
+    script = root / "scripts" / "lib" / "episode_pager.py"
+    if not script.is_file():
+        logger.warning("kanban pool health: episode_pager.py missing at %s", script)
+        return
+    bad = pool.refused is not None or not pool.pool_hosts
+    args = ["page" if bad else "clear", "--producer", "kanban-pool-health",
+            "--key", "pool-unavailable"]
+    if bad:
+        args += ["--text", "Kanban pool unavailable: 0 usable hosts or refused pool files. "
+                 + "; ".join(pool.warnings)[:1500], "--remind-h", "inf"]
+    else:
+        args += ["--resolve-text", "Kanban pool recovered: usable hosts loaded."]
+    try:
+        result = subprocess.run([sys.executable, str(script), *args],
+                                stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=10)
+        if result.returncode:
+            logger.warning("kanban pool health pager failed: %s", result.stderr[:300])
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("kanban pool health pager unavailable", exc_info=True)
 
 
 def admitting_overflow(pool_cfg) -> bool:
@@ -436,6 +466,7 @@ class GateTickBuilder:
         default_remote = kwp.placement_default(cfg) == kwp.PLACEMENT_DEFAULT_REMOTE
         from hermes_cli import kanban_continuation as kc
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
+        pool_health(self._root(), pool)
         for warning in pool.warnings:
             self._log(logger.warning, warning)
         if pool.refused is not None:

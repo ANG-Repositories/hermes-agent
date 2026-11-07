@@ -140,6 +140,23 @@ def test_reader_quarantines_invalid_role_host_not_whole_fleet(tmp_path, bad):
         kwp.parse_roles(roles)
 
 
+def test_pool_health_pages_zero_or_refused_and_clears_on_recovery(tmp_path, monkeypatch):
+    from gateway import kanban_gate_tick as gt
+    script = tmp_path / "scripts" / "lib" / "episode_pager.py"
+    script.parent.mkdir(parents=True)
+    script.touch()
+    calls = []
+    monkeypatch.setattr(gt.subprocess, "run", lambda argv, **kw: (
+        calls.append((argv, kw)) or gt.subprocess.CompletedProcess(argv, 0, "quiet", "")))
+    gt.pool_health(tmp_path, kwp.PoolConfig())
+    gt.pool_health(tmp_path, kwp.PoolConfig(refused="roles", warnings=("broken roles",)))
+    gt.pool_health(tmp_path, kwp.PoolConfig(pool_hosts=(_host(),)))
+    assert [argv[2] for argv, _ in calls] == ["page", "page", "clear"]
+    assert all("kanban-pool-health" in argv and "pool-unavailable" in argv for argv, _ in calls)
+    assert "broken roles" in calls[1][0][calls[1][0].index("--text") + 1]
+    assert all(kw["timeout"] == 10 and kw["stdin"] == gt.subprocess.DEVNULL for _, kw in calls)
+
+
 def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     _write_pool(tmp_path)
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
