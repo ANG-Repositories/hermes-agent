@@ -1255,7 +1255,10 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
                                 outcome="failed", reason=reason, resurfaced=True, resurface_delivered=False,
                                 handback=handback_row(entry, result,
                                     turn_text=text or finding_text(entry, result, "owner assessment required")))
-        await asyncio.to_thread(record_surface, entry, reason)
+        try:
+            await asyncio.to_thread(record_surface, entry, reason)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: blocked escalation comment failed: %s", exc)
         await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
         return
     await post_line(runner, entry, f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}")
@@ -1635,6 +1638,9 @@ def _alive(key: str) -> bool:
 
 
 async def _lost(runner: Any, entry: dict, reason: str, state: BoomerangWakeState) -> None:
+    if entry.get("row") == "blocked_assess":
+        await _fail(runner, entry, f"blocked assessment lost: {reason}; owner assessment required", state)
+        return
     ok = await resurface(runner, entry)
     # The reconciler's observable (README §5, smoke step 4 / AC-11): it was the only boomerang-wake
     # outcome with no log line, so a correct re-surface read as FAIL live (2026-10-19 23:07).

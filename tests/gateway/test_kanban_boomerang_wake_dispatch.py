@@ -340,6 +340,24 @@ def test_block_claim_concurrent_budget(env):
     assert state.retries("t") == 1
 
 
+def test_block_lost_child_reconciles_to_owner_once(env):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "capability", "reason": "missing tool"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    _kill(env, entry)
+    state = ah.BoomerangWakeState()
+    asyncio.run(ah.reconcile(env["runner"], state=state))
+    asyncio.run(ah.reconcile(env["runner"], state=state))
+    assert len(env["dispatched"]) == 1
+    assert len(env["adapter"].handled) == 1
+    assert "blocked assessment lost" in env["adapter"].handled[0].text
+    assert not state.handbacks()
+
+
 def test_dispatch_raising_posts_warning_and_surfaces_the_wake(env):
     """INV-6: a failed dispatch is one warning line + today's wake; the event is not lost."""
     def boom(*_a, **_k):
