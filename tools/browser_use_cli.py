@@ -616,12 +616,20 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     route_err = _route_backend(env, session, task_id, bool(local))
     if route_err:
         return tool_error(route_err)
+    # Daemon IPC must have the same task/profile scope as the trusted vault route.
+    import hashlib
+    from hermes_constants import hermes_home_key
+    from tools.browser_tool_cdp import _resolve_cdp_override
+    endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+    daemon_scope = json.dumps([hermes_home_key(), task_id or "default", env.get("BU_NAME", "default"),
+                              _resolve_cdp_override(endpoint) if endpoint else ""])
+    env["BU_NAME"] = "hermes-" + hashlib.sha256(daemon_scope.encode()).hexdigest()[:40]
     bot_desktop_browser = bool(env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None))
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
-    if session and not private_browser:
+    if not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -640,10 +648,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         from tools.browser_use_target import record_route
         # Invalidate the old selection before executing (including failed/timed-out calls).
         # Vault queries this exact daemon's selection, not the supervisor's first page.
-        record_route(task_id, env, local=bot_desktop_browser)
+        record_route(task_id, env, local=bot_desktop_browser, ready=False)
         _attach_vault_supervisor(env, task_id)
         try:
-            return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
+            proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+            record_route(task_id, env, local=bot_desktop_browser, ready=proc.returncode == 0)
+            return {"proc": proc}
         except subprocess.TimeoutExpired:
             return {"error_result": tool_error(
                 f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "

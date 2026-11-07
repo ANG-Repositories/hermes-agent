@@ -15,6 +15,7 @@ class BrowserUseRoute:
     env: dict
     cdp_url: str
     local: bool
+    ready: bool = True
 
 
 _lock = threading.Lock()
@@ -27,10 +28,10 @@ def route_for_task(task_id):
         return _routes.get((hermes_home_key(), task_id or "default"))
 
 
-def record_route(task_id, env, local=False):
+def record_route(task_id, env, local=False, ready=True):
     from tools.browser_tool_cdp import _resolve_cdp_override
     endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
-    route = BrowserUseRoute(dict(env), _resolve_cdp_override(endpoint) if endpoint else "", local)
+    route = BrowserUseRoute(dict(env), _resolve_cdp_override(endpoint) if endpoint else "", local, ready)
     with _lock:
         _routes[(hermes_home_key(), task_id or "default")] = route
     return route
@@ -57,7 +58,7 @@ print(json.dumps({'pid': ping.get('pid'), 'target': tab.get('targetId')}))
 def selected_target(route):
     from tools.browser_use_cli import _find_cli
     cli = _find_cli()
-    if not cli or not route.cdp_url:
+    if not cli or not route.cdp_url or not route.ready:
         raise RuntimeError("Browser Use target unavailable; run browser_exec on a CDP-routed browser first")
     proc = subprocess.run([cli[0], "-c", _PROBE], env=route.env, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, timeout=15)
