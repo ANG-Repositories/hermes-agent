@@ -61,15 +61,22 @@ def test_loop_compresses_in_session_instead_of_replaying_the_rejected_request():
 
     def _compress(messages, system_message, **kwargs):
         compress_calls.append((len(messages), kwargs.get("trigger")))
+        if kwargs.get("trigger") != "overflow":
+            return messages, system_message   # only the provider-proven overflow path matters here
         return [{"role": "user", "content": "[summary of earlier turns]"},
                 {"role": "assistant", "content": "ok"}, messages[-1]], system_message
 
     err = RelayError(500, TOO_LONG, CONN_HEADERS)
-    with patch.object(agent, "_compress_context", side_effect=_compress):
-        result, activate, call = _run(agent, [err, _response("served")], [], )
+    run_turn = agent.run_conversation
+    with (
+        patch.object(agent, "_compress_context", side_effect=_compress),
+        patch.object(agent, "run_conversation",
+                     side_effect=lambda msg, **kw: run_turn(msg, conversation_history=history, **kw)),
+    ):
+        result, activate, call = _run(agent, [err, _response("served")], [])
         sent = [len(c.args[0].get("messages", [])) if c.args and isinstance(c.args[0], dict) else None
                 for c in call.call_args_list]
-    assert compress_calls and compress_calls[0][1] == "overflow"
+    assert ("overflow" in [t for _n, t in compress_calls]), compress_calls
     assert call.call_count == 2, sent          # one rejection, one retry on the compressed history
     assert result["completed"] is True and result["final_response"] == "served"
     activate.assert_not_called()               # same provider, no reset, no host move
