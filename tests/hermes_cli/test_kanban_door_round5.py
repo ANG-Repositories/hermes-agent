@@ -293,7 +293,7 @@ def test_an_unproven_operator_label_cannot_set_asap(operator, monkeypatch):
     tid = _card()
     monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV)
     with kbc.connect_closing() as conn:
-        with pytest.raises(PermissionError, match="unverified:default"):
+        with pytest.raises(PermissionError, match="'default' holds no operator token"):
             _set_asap(conn, tid, True)
         assert kb.get_task(conn, tid).asap is False
 
@@ -320,3 +320,63 @@ def test_faults_module_imports_without_fcntl(monkeypatch):
     import importlib
     monkeypatch.setitem(sys.modules, "fcntl", None)
     importlib.reload(faults)
+
+
+# -- round 6 (Prism at 7e57a9c9) ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("token", [False, True])
+def test_a_worker_dispatched_as_an_operator_profile_cannot_set_asap(operator, monkeypatch, token):
+    """Prism f1dbe6687476. A kanban worker whose profile is ``apollo`` unsets HERMES_KANBAN_TASK: ancestry is checked
+    first, by the process walk, so the operator label (and even the token) never admits it. RED on 7e57a9c9 without
+    the token: verified_profile_author returned the worker's profile ``apollo``, an operator label, and ASAP was set."""
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    tid = _card()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    if not token:
+        monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV)
+    with kbc.connect_closing() as conn:
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, worker_pid, worker_started_at, started_at) "
+                     "VALUES (?, 'apollo', 'running', ?, ?, 0)", (tid, os.getpid(), _process_fingerprint(os.getpid())))
+        conn.commit()
+        with pytest.raises(PermissionError, match="kanban worker 'apollo'"):
+            _set_asap(conn, tid, True)
+        assert kb.get_task(conn, tid).asap is False
+
+
+def test_an_operator_label_without_the_operator_token_cannot_set_asap(operator, monkeypatch):
+    """Round 6: the label is necessary, never sufficient; the operator token is required in addition."""
+    tid = _card()
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV)
+    monkeypatch.setattr("hermes_cli.kanban_identity._runs_under_operator_gateway", lambda name: True)
+    with kbc.connect_closing() as conn:
+        with pytest.raises(PermissionError, match="no operator token"):
+            _set_asap(conn, tid, True)
+        assert kb.get_task(conn, tid).asap is False
+
+
+@pytest.mark.parametrize("lost", ["host_left_table", "pair_token_gone"])
+def test_a_stale_record_entry_on_an_unreachable_host_is_dropped_never_latched(door_fleet, caplog, lost):
+    """Prism 7e404c636d6f. The durable record names a unit on a host that left the host table (or whose kanban@<host>
+    token is gone). RED on 7e57a9c9: every publish withdrew it, got Refused and latched class 2, forever."""
+    import logging
+    from hermes_cli import kanban_priority as priority
+    tid = _card()
+    uid = _uid(tid)
+    with kbc.connect_closing() as conn:
+        door.save_published(conn, {(POOL, uid)})
+    if lost == "host_left_table":
+        path = door_fleet.root / "config" / "fleet-hosts.json"
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        del doc["hosts"][POOL]
+        path.write_text(json.dumps(doc), encoding="utf-8")
+    else:
+        (door_fleet.root / alloc_client.TOKENS_REL / f"kanban@{POOL}").unlink()
+    caplog.set_level(logging.WARNING, logger="hermes_cli.kanban_priority")
+    with kbc.connect_closing() as conn:
+        for _ in range(2):                                   # the second publish must stay clean too
+            assert priority.publish_waiting(conn, {}) == {}
+            assert faults.latched() is None, faults.latched()
+        assert door.load_published(conn) == set()
+    dropped = [r for r in caplog.records if "dropped published unit" in r.getMessage()]
+    assert len(dropped) == 1 and uid in dropped[0].getMessage()

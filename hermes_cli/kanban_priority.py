@@ -11,19 +11,20 @@ _log = logging.getLogger(__name__)
 def set_asap(conn, task_id: str, flag: bool) -> bool:
     """Only an explicit, VERIFIED operator edit may mark (or clear) a card urgent; creation never copies it.
 
-    The operator is resolved here, never taken from the caller (round 5, Prism b37716b1f3e9): the CLI's verified
-    author (kanban_identity.verified_profile_author) reads process ancestry, so a worker that unsets
-    HERMES_KANBAN_TASK still resolves to its own profile, and an unproven operator label comes back
-    ``unverified:<name>``. Either is refused. A changed flag reaches the shared door unit in the same operation.
+    The operator is resolved here, never taken from the caller (round 5, Prism b37716b1f3e9). Any kanban worker in
+    the process ancestry is refused first, whatever profile it runs as (round 6); then the caller needs an operator
+    label AND the operator token. A changed flag reaches the shared door unit in the same operation.
     """
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_identity import is_operator_label, verified_profile_author
+    from hermes_cli.kanban_identity import is_operator_label
     from hermes_cli.profiles import current_profile_name
     if os.environ.get("HERMES_KANBAN_TASK") or kb._is_delegated_child():
         raise PermissionError("ASAP is operator-set only")
-    operator = verified_profile_author(current_profile_name("user") or "user")
-    if not is_operator_label(operator):
-        raise PermissionError(f"ASAP is operator-set only (caller resolves to {operator!r})")
+    _refuse_worker_ancestry()
+    # Round 6 (Prism f1dbe6687476): the label alone is not operator-ness; the operator token is required too.
+    operator = (current_profile_name("user") or "user").strip()
+    if not is_operator_label(operator) or kb._operator_token_state() != "ok":
+        raise PermissionError(f"ASAP is operator-set only (caller {operator!r} holds no operator token)")
     from hermes_cli.kanban_db import _home_session_guarded
     # The same ownership guard as operator model edits; a caller-supplied
     # label alone must never authorize a foreign session's mutation.
@@ -31,6 +32,21 @@ def set_asap(conn, task_id: str, flag: bool) -> bool:
     if ok:
         sync_door_asap(conn, task_id)
     return ok
+
+
+def _refuse_worker_ancestry() -> None:
+    """Worker ancestry is checked FIRST, by the process walk, before any operator identity (Prism f1dbe6687476): a
+    worker dispatched AS an operator profile still resolves to that profile, so the label cannot be the test.
+    An unreadable ancestry or an incomplete board scan cannot prove absence, so it refuses too."""
+    from hermes_cli import kanban_identity as ki
+    chain = ki._ancestry()
+    if not chain:
+        raise PermissionError("ASAP is operator-set only (process ancestry unreadable)")
+    worker = ki.worker_ancestor_profile()
+    if worker:
+        raise PermissionError(f"ASAP is operator-set only (caller runs under kanban worker {worker!r})")
+    if not ki._worker_rows(chain)[1]:
+        raise PermissionError("ASAP is operator-set only (a board was unreadable; worker ancestry unproven)")
 
 
 def _set_asap(conn, task_id, flag, *, operator):
@@ -186,6 +202,29 @@ def _classify(client, faults, exc, errors):
         raise _Stop(errors)
 
 
+def _table_hosts():
+    """Canonical host ids of the host table, or None when it cannot be read (then nothing is dropped)."""
+    from hermes_cli.fleet_placement import placement
+    try:
+        return set(placement.load_hosts().hosts)
+    except Exception:
+        return None
+
+
+def _auth_refusal(client, exc) -> bool:
+    """A stale-record withdraw we can never authenticate: no/unreadable pair token, or a typed ``auth`` refusal."""
+    if not isinstance(exc, client.Refused):
+        return False
+    return getattr(exc, "reason", "auth") == "auth"
+
+
+def _drop_stale(current, hid, uid, why) -> None:
+    """Round 6 (Prism 7e404c636d6f): a recorded unit on a host we cannot reach cannot be live for us; keeping it made
+    every publish withdraw it, get Refused and latch, forever. Drop it from the record with one line; never latch."""
+    current.discard((hid, uid))
+    _log.warning("kanban door: dropped published unit %s on %s from the record: %s", uid, hid, why)
+
+
 def _publish_waiting(conn, waiting, verdicts, client, door):
     from hermes_cli import kanban_priority_faults as faults
     plan = []
@@ -201,12 +240,19 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
     current = door.load_published(conn)
     wanted = {(hid, uid) for _, hid, rows in plan for _, uid in rows}
     errors = {}
+    known = _table_hosts()
     try:
         for hid, uid in sorted(current - wanted):
+            if known is not None and hid not in known:
+                _drop_stale(current, hid, uid, "host is no longer in the host table")
+                continue
             try:
                 client.withdraw("kanban", hid, uid)
                 current.discard((hid, uid))
             except (client.Refused, client.Unreachable) as exc:
+                if _auth_refusal(client, exc):
+                    _drop_stale(current, hid, uid, f"withdraw refused for auth ({exc})")
+                    continue
                 errors[(hid, uid)] = str(exc)        # still ours; retried after the fault clears
                 _classify(client, faults, exc, errors)
     finally:
