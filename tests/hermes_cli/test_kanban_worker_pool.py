@@ -290,6 +290,73 @@ def test_probe_host_one_ssh_call_parses_or_fails_closed():
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(0, "garbage")) is None
 
 
+def test_probe_stale_mux_retries_direct_not_unreachable():
+    """t_64342f07: the muxed probe failed on a stale ControlMaster / cold
+    handshake while the host answered ssh; one direct retry must read it."""
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append((argv, kw["timeout"]))
+        if "ControlPath=none" not in argv:
+            p = _Proc(255, "")
+            p.stderr = "mux_client_request_session: read from master failed: Broken pipe"
+            return p
+        return _Proc(0, "3.10 2.00 1.00 1/200 99\n16\n")
+
+    assert kwp.probe_host(_host(), runner=runner) == (3.1, 16)
+    assert len(calls) == 2
+    direct, timeout = calls[1]
+    assert "ControlMaster=no" in direct and "ConnectTimeout=10" in direct
+    assert timeout == kwp.DIRECT_PROBE_TIMEOUT_SECONDS
+
+
+def test_probe_failure_keeps_last_sample_then_unreachable_never_sticky():
+    mem = kwp.ProbeMemory()
+    ok = lambda a, **k: _Proc(0, "3.10 2.00 1.00 1/200 99\n16\n")
+
+    def down(argv, **kw):
+        raise kwp.subprocess.TimeoutExpired(argv, kw["timeout"])
+
+    h = _host()
+    assert kwp.probe_host(h, runner=ok, memory=mem, now=1000.0) == (3.1, 16)
+    assert kwp.probe_note(h, mem) == ""
+    for i in range(kwp.PROBE_GRACE_FAILS):
+        assert kwp.probe_host(h, runner=down, memory=mem, now=1060.0 + i) == (3.1, 16)
+    note = kwp.probe_note(h, mem)
+    assert "reusing last sample" in note and "timeout after" in note and "ssh probe kanbanw@ace-ai" in note
+    assert kwp.probe_host(h, runner=down, memory=mem, now=1200.0) is None
+    note = kwp.probe_note(h, mem)
+    assert f"failed {kwp.PROBE_GRACE_FAILS + 1}x" in note and "last tried" in note and "last ok" in note
+    assert "reusing" not in note
+    # Not sticky: the next good probe clears it.
+    assert kwp.probe_host(h, runner=ok, memory=mem, now=1260.0) == (3.1, 16)
+    assert kwp.probe_note(h, mem) == ""
+
+
+def test_probe_grace_expires_by_age():
+    mem = kwp.ProbeMemory()
+    h = _host()
+    kwp.probe_host(h, runner=lambda a, **k: _Proc(0, "1 1 1 1/1 1\n8\n"), memory=mem, now=0.0)
+    assert kwp.probe_host(h, runner=lambda a, **k: _Proc(255, ""), memory=mem,
+                          now=kwp.PROBE_GRACE_SECONDS + 1.0) is None
+
+
+def test_plan_unreachable_reason_names_probe_error(monkeypatch, tmp_path):
+    mem = kwp.ProbeMemory()
+    monkeypatch.setattr(kwp, "_PROBE_MEMORY", mem)
+    h = _host(slots=4)
+
+    def probe(host):
+        return kwp.probe_host(host, runner=lambda a, **k: _Proc(255, ""), memory=mem)
+
+    from hermes_cli import placement_policy as pp
+    signal = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=tmp_path, clock=lambda: 1.0)
+    p = kwp.plan([h], {}, probe=probe, signal=signal)
+    why = p.detail["ace-ai"]["pressure"]
+    assert why.startswith("host unreachable (ssh probe kanbanw@ace-ai failed 1x (mux: ssh rc=255; direct: ssh rc=255)")
+    assert "pool_unavailable (ace-ai: host unreachable (ssh probe" in p.full_reason()
+
+
 def _cgroup_ssh(argv, **kw):
     """A cgroup-quota'd Linux host (t_2dc3be98): ``nproc`` honours the probing
     user's CPUQuota (8) while the host has 24 online cores. The fake answers
