@@ -868,7 +868,8 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
             if current and getattr(kb.get_task(conn, tid), "assignee", None) != current:
                 kb.assign_task(conn, tid, current, worker_ok=True)
         elif status == "blocked":             # redispatch / retry of a parked card
-            if not kb.unblock_task(conn, tid):
+            kwargs = {"expect_block_event": int(entry["event_id"])} if entry.get("row") == "blocked_assess" else {}
+            if not kb.unblock_task(conn, tid, **kwargs):
                 raise RuntimeError("unblock refused")
         elif status in ("ready", "todo"):
             ok, detail = kb.requeue_task(conn, tid, actor=AUTHOR, reason=f"{entry['delegation_id']} {summary}")
@@ -976,6 +977,15 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
         why = _moved(live, kb, conn)
         if why:
             return {"ok": False, "action": action, "reason": why, "summary": summary}
+        if live.get("row") == "blocked_assess":
+            from gateway.kanban_wake_disposition import card_tags, SURFACE_TAGS
+
+            task = kb.get_task(conn, live["task_id"])
+            if card_tags(task) & SURFACE_TAGS:
+                return {"ok": False, "action": "surface", "reason": "restricted card requires owner assessment",
+                        "summary": summary, "surface": True, **finding}
+            if getattr(task, "status", None) != "blocked":
+                return {"ok": False, "action": action, "reason": "state moved", "summary": summary}
         if action == "land_inherited":
             degraded = _verify_land_inherited(live, verdict, kb, conn)
             if degraded:
@@ -1239,6 +1249,15 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
                 text: Optional[str] = None) -> None:
     """INV-6: one warning line + the original wake re-delivered, then terminal."""
+    if entry.get("row") == "blocked_assess":
+        result = {"summary": reason, "action": "surface", "detail": reason}
+        await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                                outcome="failed", reason=reason, resurfaced=True, resurface_delivered=False,
+                                handback=handback_row(entry, result,
+                                    turn_text=text or finding_text(entry, result, "owner assessment required")))
+        await asyncio.to_thread(record_surface, entry, reason)
+        await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
+        return
     await post_line(runner, entry, f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}")
     ok = await resurface(runner, entry, text)
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="failed",
@@ -1376,7 +1395,9 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
     """The dispatched task: parent → child → verdict executor → one origin line."""
     key = entry["key"]
     if entry.get("blocked_budget_exhausted"):
-        await _fail(runner, entry, "blocked assessment budget exhausted; owner assessment required", state)
+        live = await asyncio.to_thread(state.get_claim, key) or entry
+        if live.get("state") not in (STATE_CANCELLED, STATE_TERMINAL) and not live.get("resurfaced"):
+            await _fail(runner, live, "blocked assessment budget exhausted; owner assessment required", state)
         return
     try:
         parent, mode = await parent_resolver(runner, entry)

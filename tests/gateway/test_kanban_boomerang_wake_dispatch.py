@@ -240,6 +240,106 @@ def test_block_child_first(env, block_kind):
     assert len(env["dispatched"]) == 1
 
 
+@pytest.mark.parametrize("reason", ["missing capability", "restart requires approval", "unresolved transient"])
+def test_block_unresolved_reaches_owner_once(env, reason):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "capability", "reason": reason})
+    assert _tick(env) == []
+    entry = env["dispatched"][0]
+    final = _verdict(entry, "surface", summary=reason, evidence=["read prerequisite: unavailable"])
+    _run(env, entry, "completed", final)
+    _run(env, entry, "completed", final)
+    _tick(env)
+    assert len(env["adapter"].handled) == 1
+    assert reason in env["adapter"].handled[0].text
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert len([c for c in kb.list_comments(conn, tid) if "surfaced:" in c.body]) == 1
+
+
+def test_block_retry_requires_resolution_evidence(env):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "dependency unavailable"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "retry"))
+    assert len(env["adapter"].handled) == 1
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_block_resolved_retry_and_budget(env):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": "service unavailable"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["health probe: healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "health probe: healthy"}))
+    assert env["adapter"].handled == []
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        assert kb.get_task(conn, tid).status != "blocked"
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": "failed again"})
+    _tick(env)
+    second = env["dispatched"][-1]
+    assert second["blocked_budget_exhausted"] is True
+    _run(env, second, "completed", "must not run")
+    assert len(env["adapter"].handled) == 1
+    assert ah.BoomerangWakeState().retries(tid) == 1
+
+
+@pytest.mark.parametrize("auto,on", [(False, True), (True, False)])
+def test_block_legacy_and_kill_switch(env, auto, on):
+    _config(on)
+    tid = _card(env, auto=auto)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": "offline"})
+    assert _tick(env)
+    assert not env["dispatched"]
+
+
+@pytest.mark.parametrize("tag", ["spend", "outbound", "irreversible"])
+def test_block_restricted_retry_is_not_authorized(env, tag):
+    tid = _card(env, title=f"[{tag}] restricted")
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "approval"})
+    assert _tick(env) == []
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "retry",
+         block_resolution={"resolved": True, "authority": "existing", "check": "claimed approval"}))
+    assert len(env["adapter"].handled) == 1
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_block_claim_concurrent_budget(env):
+    state = ah.BoomerangWakeState()
+    barrier = threading.Barrier(2)
+    results = []
+    def claim():
+        barrier.wait()
+        results.append(state.claim("default:t:1", {"task_id": "t", "row": "blocked_assess"}))
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(results) == [False, True]
+    assert state.retries("t") == 1
+
+
 def test_dispatch_raising_posts_warning_and_surfaces_the_wake(env):
     """INV-6: a failed dispatch is one warning line + today's wake; the event is not lost."""
     def boom(*_a, **_k):

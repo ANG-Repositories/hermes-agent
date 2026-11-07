@@ -1176,6 +1176,30 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `lifecycle_home_digest_seconds` | `120` | Fold home-chat lines into one post per home chat once the oldest is this old. `0` = one post per line. |
 | `wake_owner_session` | `true` | A card event that needs its owner enqueues a handoff TURN into the card's home session when that session is live in an operator gateway: a `needs_input` block, a block whose reason names a time or precondition, a stalled/crashed/gave-up/timed-out worker, the last blocker of open children going done, or a review handback whose PR is red or dirty. One wake per card per 10 min; all cards due for one session go in one turn. The lifecycle line still posts. A card body line `wake: off` opts that card out. |
 | `wake_owner_profiles` | `["default", "aegis"]` | Gateway profiles whose sessions count as operator sessions for `wake_owner_session`. |
+
+Cards opted into `boomerang_wake` route blocked events (including `needs_input`
+and `capability`) through a bounded child assessment before waking the owner.
+The child reads the block and probes its prerequisite; a label alone does not
+establish that human input is needed. It may request the existing retry action
+only with observed resolution evidence and existing authority. Restricted
+`spend`, `outbound`, and `irreversible` cards can be assessed but cannot be
+unblocked by this handler. Unresolved blocks, missing access, refused verdicts,
+and exhausted attempts return to the owner for assessment, not directly to Ace.
+The owner decides whether human input is required. The persisted claim spends
+one attempt atomically; repeated blocks share the existing per-card retry budget
+until completion/archive or explicit operator reset. Escalation handbacks are
+persisted for delivery retries. No new privileged actions are granted.
+
+Operator rollout: merge and deploy through the normal runtime lane, then obtain
+fresh per-instance approval before any gateway restart. Verify an opted-in
+transient block is assessed without an owner turn, and an unresolved block
+reaches its owner once. This is a live acceptance step, not proven by unit tests.
+Rollback: use the existing boomerang-wake emergency stop file to restore direct
+wake handling; alternatively revert the change through normal review/deployment.
+Do not delete claims or retry state during rollback (that can replay events).
+
+| Key | Default | Description |
+| --- | --- | --- |
 | `wake_defer_ceiling_s` | `1200` | A wake the contention gate (`wake_load_gate`) downgrades for a HUMAN-owned card (a `human:*` assignee or reviewer; kinds `review_requested`, `blocked`, `block_loop_detected`) is DEFERRED, never dropped: the passive line posts as usual and a pending-wake row (`<HERMES_HOME>/gateway/kanban_pending_wakes.json`, survives restart) is re-evaluated every notifier poll. The wake fires with its original handoff text plus `(deferred Nm under <reason>)` when the gate clears or after this many seconds, whichever comes first; a row whose owner acted on the card meanwhile, or whose card went done/archived, is dropped with a `kanban wake deferred dropped` log line. For a human-owned wake the HOST half of the gate is the dispatcher LoadGate's `proc_paused` state, not load1 alone; the lane-headroom probe still applies. |
 | `notify_suppress` | `{enabled: true, kinds: [completed, archived], self_window_min: 30, closers: [...]}` | Redundant-notification filter on both the subscription notifier and the owner wake. An event whose kind is in `kinds` is withheld from the chat (no line, no wake) when the receiving side caused it itself: the event's `actor_session_id` is the card's home / subscriber session, its `actor_profile` is the home session's operator profile (`default`/`apollo` are one operator), or it was written by one of `closers` (the review-card merge pass) within `self_window_min` minutes after that operator's own `review_coverage` APPROVE on the card. A `notify_suppressed` task event (`event_id`, `kind`, `reason`, `actor`, `path`) records every withheld event, and with `lifecycle_channel` set the line still posts there tagged `[suppressed:<reason>]`. `review_requested`, `changes_requested`, `blocked`, `block_loop_detected`, `crashed`, `timed_out`, `gave_up`, `stalled`, `skipped_nonspawnable` and the last-blocker-done owner wake are never suppressed, whatever `kinds` says; an event with no resolvable actor or operator is delivered (fails open to noise). Subscriptions whose only delivery is the wake (`delivery_mode: wake`, `api_server`) are exempt. `actionable_only` (default `true`) also withholds the WAKE, never the line, when it carries no decision for the owner: a red handback whose every red is inherited from main, a red already woken at the same (card, PR, head, red-set), a handback whose card left `review` before the wake ran, the home session's own `changes_requested`/`review_requested`/`blocked`/`archived` echoed to the home chat, and a `changes_requested` a closer stamped (`actor_profile` exactly one of `closers`). Every withheld event is listed by `kanban show` under "Withheld notifications" (`withheld_notifications` in `--json`). `enabled: false` is the kill switch. |
 
