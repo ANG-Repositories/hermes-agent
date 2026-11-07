@@ -246,21 +246,20 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
     errors = {}
     known = _table_hosts()
     import time
-    from hermes_cli.fleet_placement import alloc_client
-    # Waiting units expire by demand freshness, NOT authorize_start's reservation TTL.
-    ttl = alloc_client._sibling("admission_demand").max_age_s()
     now = time.time()
     answered = False
     try:
+        # Reconcile desired ownership before destructive retries, even if enqueue later fails.
+        for entry in list(pending):
+            pair = (entry["host"], entry["unit_id"])
+            if pair in wanted:
+                current.add(pair)
+                pending.remove(entry)
         for entry in list(pending):
             hid, uid = entry["host"], entry["unit_id"]
             if known is not None and hid not in known:
                 pending.remove(entry)
                 _log.warning("kanban door: dropped pending withdrawal %s on %s: host left table", uid, hid)
-                continue
-            if now - entry["first_seen"] > ttl:
-                pending.remove(entry)
-                _log.info("kanban door: expired pending withdrawal %s on %s after %s seconds", uid, hid, ttl)
                 continue
             try:
                 client.withdraw("kanban", hid, uid)  # idempotent, including a unit already absent
