@@ -364,6 +364,15 @@ class LoadGate:
                   "procs": self.procs, "maxproc": self.proc_limit, **sample_psi()}
         leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
                   for ts, n in self._ramp for _ in range(int(n))]
+        try:
+            # t_02aa6d86 (doctrine rule 15): every OTHER consumer's lease on this host (Prism, test-gate, CI) is load
+            # this gate's ramp never saw; an unreadable shared ledger fails closed, never as "nothing booked"
+            leases += shared_leases(ctx["host"])
+        except Exception as exc:
+            why = f"utilization: shared ledger unreadable ({type(exc).__name__}: {exc}); refusing, fail closed"
+            self.state, self.allowance, self.last_reason = "saturated", 0, why
+            self.band, self.spill_reason = "spilling", "utilization"
+            return 0, why
         allowance, verdict = 0, None
         # the worker slice's own memory cap (Linux kanbanw.slice; None elsewhere = host axis only, Prism 616c5f0203bd)
         slice_mem = _ad.read_slice_memory(classes=(UTIL_CLASS,))
@@ -740,6 +749,26 @@ def sample_psi(root: str = "/proc/pressure") -> dict:
 
 
 UNIFIED_WORKLOAD = "kanban"
+
+
+def shared_leases(host: str, root=None, now: Optional[float] = None) -> list:
+    """The shared reservation ledger's live leases on ``host`` booked by every consumer BUT kanban (t_02aa6d86,
+    doctrine rule 15): a Prism review, a test-gate run or a CI runner admitted on this host is load the gate must
+    count before its sample shows it. Kanban's own rows are left out: the gate's ramp already carries every local
+    kanban start (its own spawns plus GateTickBuilder.seed_out_of_tick), so they would be booked twice. A missing
+    ledger is empty; an unreadable one raises (the caller fails closed)."""
+    from hermes_cli.fleet_placement import placement as _pl
+
+    base = Path(root) if root is not None else _pl.fleet_root()
+    rpath = base / _pl.RESERVATIONS_REL
+    if not rpath.exists():
+        return []
+    try:
+        table = _pl.load_hosts(base / _pl.TABLE_REL)
+    except Exception:            # no table: the ledger's own host names, matched as written
+        table = None
+    return [le for le in _pl.ledger_leases(rpath, now=now, table=table)
+            if le.host == host and not str(le.job_class).startswith(UNIFIED_WORKLOAD)]
 
 
 def unified_admit(env: Optional[dict] = None) -> bool:
