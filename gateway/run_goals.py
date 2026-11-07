@@ -355,8 +355,17 @@ class GatewayGoalsMixin:
         _failed = getattr(event, "_goal_turn_failed", None) if event is not None else None
         if _failed:
             _sid = getattr(session_entry, "session_id", "?")
-            await self._run_in_executor_with_context(
-                lambda: mgr.pause(f"turn failed ({_failed}); fix the error, then /goal resume"))
+            # CAS against the turn-end pin: a /goal pause, clear or replacement that landed since wins.
+            try:
+                paused = await self._run_in_executor_with_context(lambda: mgr.pause_if_unchanged(
+                    f"turn failed ({_failed}); fix the error, then /goal resume",
+                    **({"baseline": goal_pin[0]} if goal_pin else {})))
+            except Exception as exc:
+                logger.warning("goal for %s not paused after failed turn: %s", _sid, exc)
+                return
+            if not paused:
+                logger.info("goal for %s changed since the failed turn; left as is", _sid)
+                return
             logger.warning("goal for %s paused: turn failed with %s", _sid, _failed)
             if source is not None:
                 await self._defer_goal_status_notice_after_delivery(

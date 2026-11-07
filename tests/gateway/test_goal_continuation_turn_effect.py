@@ -404,3 +404,80 @@ async def test_failed_turn_pauses_goal_instead_of_continuation_storm(monkeypatch
         await _settle(adapter, calls, 2)
     assert calls[-1] == "retry"
     assert (await asyncio.to_thread(load_goal, sid)).status == "done"
+
+
+# Prism 89a770df5c2c: the failed-turn pause must not clobber a goal changed since the turn ended or
+# while the pause is written (the pause used a plain overwrite from a possibly stale manager).
+def _failed_event():
+    ev = MessageEvent(text="go", message_type=MessageType.TEXT, source=None, internal=False)
+    ev._goal_turn_failed = "ImportError"
+    return ev
+
+
+def _concurrent(action, sid):
+    from hermes_cli.goals import GoalManager
+
+    other = GoalManager(sid)
+    if action == "replace":
+        other.set("a different goal")
+    elif action == "clear":
+        other.clear()
+    elif action == "user_pause":
+        other.pause("user-paused")
+    else:  # nonterminal edit of the same active goal
+        other.add_subgoal("also check CI")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_read", [1, 2])  # 1: after the manager loaded; 2: between pause read and write
+@pytest.mark.parametrize("action, status, goal, paused_reason, subgoals", [
+    ("replace", "active", "a different goal", None, 0),
+    ("clear", "cleared", "land the queue", None, 0),
+    ("user_pause", "paused", "land the queue", "user-paused", 0),
+    ("edit", "paused", "land the queue", "turn failed (ImportError)", 1),
+])
+async def test_failed_turn_pause_loses_to_concurrent_goal_write(hermes_home, action, status, goal,
+                                                                  paused_reason, subgoals, after_read):
+    from hermes_cli import goals as g
+
+    runner, adapter, entry, src = _runner()
+    sid = entry.session_id
+    await asyncio.to_thread(_set_goal, sid)
+    pin = ((await asyncio.to_thread(lambda: g._load_goal_raw(sid, strict=True)))[1],)
+    real_load, reads, fired = g._load_goal_raw, [], []
+
+    def racing_load(*a, **k):  # the concurrent write lands right after the Nth goal read
+        out = real_load(*a, **k)
+        reads.append(1)
+        if len(reads) == after_read and not fired:
+            fired.append(1)
+            _concurrent(action, sid)
+        return out
+
+    with patch.object(g, "_load_goal_raw", racing_load):
+        await runner._post_turn_goal_continuation(
+            session_entry=entry, source=src, final_response="error", event=_failed_event(), goal_pin=pin)
+    assert fired
+    after = await asyncio.to_thread(g.load_goal, sid)
+    assert (after.status, after.goal, len(after.subgoals)) == (status, goal, subgoals)
+    assert (paused_reason in (after.paused_reason or "")) if paused_reason else not after.paused_reason
+    assert not adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_does_not_pause_a_goal_set_after_the_turn_ended(hermes_home):
+    """The turn-end pin is the old goal; a replacement set during the send was never run by the
+    failed turn and must stay active (no pause notice either)."""
+    from hermes_cli import goals as g
+
+    runner, adapter, entry, src = _runner()
+    sid = entry.session_id
+    await asyncio.to_thread(_set_goal, sid)
+    pin = ((await asyncio.to_thread(lambda: g._load_goal_raw(sid, strict=True)))[1],)
+    await asyncio.to_thread(lambda: g.GoalManager(sid).set("set during the send"))
+    await runner._post_turn_goal_continuation(
+        session_entry=entry, source=src, final_response="error", event=_failed_event(), goal_pin=pin)
+    after = await asyncio.to_thread(g.load_goal, sid)
+    assert (after.status, after.goal) == ("active", "set during the send")
+    await asyncio.sleep(0.05)
+    assert not any("Goal paused" in str(s) for s in adapter.sends)
