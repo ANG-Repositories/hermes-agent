@@ -225,15 +225,19 @@ def test_suppressor_withheld_event_is_never_dispatched(env):
     assert env["dispatched"] == [] and _claims() == {} and turns == []
 
 
-def test_needs_input_block_surfaces_and_is_never_dispatched(env):
-    """INV-5 through the real branch: a judgment event on an opted-in card wakes as today."""
+@pytest.mark.parametrize("block_kind", ["needs_input", "transient", "capability"])
+def test_block_child_first(env, block_kind):
+    """A label is not a decision: diagnose before waking the owner."""
     tid = _card(env)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn), \
             kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
-        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "A or B?"})  # noqa: SLF001
+        kb._append_event(conn, tid, "blocked", {"kind": block_kind, "reason": "A or B?"})  # noqa: SLF001
     turns = _tick(env)
-    assert env["dispatched"] == [] and len(turns) == 1
+    assert len(env["dispatched"]) == 1 and turns == []
+    assert env["dispatched"][0]["row"] == "blocked_assess"
+    _tick(env)
+    assert len(env["dispatched"]) == 1
 
 
 def test_dispatch_raising_posts_warning_and_surfaces_the_wake(env):
