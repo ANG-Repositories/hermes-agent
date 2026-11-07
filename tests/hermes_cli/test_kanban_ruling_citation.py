@@ -43,13 +43,13 @@ def check_fields(fields, comment_cites):
 @pytest.mark.parametrize("verb", ["create", "edit", "comment"])
 @pytest.mark.parametrize("cited,disabled", [(False, False), (True, False), (False, True)])
 def test_mutations_check_real_text(board, monkeypatch, verb, cited, disabled):
-    tid = kb.create_task(board, title="citation scratch", assignee="human", unhomed=True)
+    tid = kb.create_task(board, title="citation scratch", assignee="human", require_home=False)
     text = "Ace said ship it" + (" (Discord msg 1568681380928295105)" if cited else "")
     if disabled:
         monkeypatch.setenv("RULING_CITATION_LINT", "0")
     def write():
         if verb == "create":
-            return kb.create_task(board, title="new scratch", body=text, assignee="human", unhomed=True)
+            return kb.create_task(board, title="new scratch", body=text, assignee="human", require_home=False)
         if verb == "edit":
             return kb.edit_task(board, tid, body=text)
         return kb.add_comment(board, tid, "operator", text)
@@ -65,7 +65,7 @@ def test_mutations_check_real_text(board, monkeypatch, verb, cited, disabled):
 
 
 def test_comment_reference_uses_target_board(board):
-    tid = kb.create_task(board, title="citation refs", assignee="human", unhomed=True)
+    tid = kb.create_task(board, title="citation refs", assignee="human", require_home=False)
     good = kb.add_comment(board, tid, "operator", "source: 1568681380928295105")
     bad = kb.add_comment(board, tid, "operator", "no evidence")
     assert kb.edit_task(board, tid, body=f"Ace decided ship it (comment {good})")
