@@ -103,6 +103,7 @@ async def test_human_fold_releases_internal_commentary_before_final():
     assert consumer._internal_held == ["old commentary"]
     human = MessageEvent(text="please answer", source=source, reply_expected=True)
     await asyncio.to_thread(runner._fold_into_running_turn, agent, "test", human)
+    await asyncio.to_thread(runner._fold_into_running_turn, agent, "test", human)
     consumer.on_commentary("new commentary")
     delivered = asyncio.Event()
     original_send = adapter.send.side_effect
@@ -121,6 +122,96 @@ async def test_human_fold_releases_internal_commentary_before_final():
         task.cancel()
         await task
         adapter.send.side_effect = original_send
+
+
+@pytest.mark.parametrize("case", ["internal", "heartbeat", "stale", "wrong_agent", "muted", "scheduled", "display_off"])
+def test_fold_promotion_guards(case):
+    from gateway.run_busy import GatewayBusySessionMixin
+    from gateway.platforms.event import MessageEvent
+    from gateway.turn_context import TurnContext
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    runner = GatewayBusySessionMixin()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="test")
+    agent = object()
+    ctx = TurnContext(persist_user_display_kind="internal_notification",
+                      _run_still_current=lambda: case != "stale",
+                      mute_notification_reply=case == "muted",
+                      scheduled_heartbeat=case == "scheduled")
+    consumer = GatewayStreamConsumer(_make_adapter(), "test", StreamConsumerConfig(internal_event=True),
+                                     run_still_current=ctx._run_still_current)
+    if case != "display_off":
+        ctx.stream_consumer_holder[0] = consumer
+    opening = MessageEvent(text="wake", source=source, internal=True)
+    turn = SimpleNamespace(agent=agent, ctx=ctx, event=opening)
+    runner._session_state = lambda key: SimpleNamespace(turn=turn)
+    event = MessageEvent(text="request", source=source, internal=case == "internal", reply_expected=True)
+    if case == "heartbeat":
+        event._heartbeat_session_id = "heartbeat"
+    runner._fold_into_running_turn(object() if case == "wrong_agent" else agent, "test", event)
+    assert ctx.human_engaged == (case in {"muted", "scheduled", "display_off"})
+    assert consumer._queue.empty()
+    assert opening.internal is True
+    assert ctx.persist_user_display_kind == "internal_notification"
+
+
+@pytest.mark.asyncio
+async def test_promoted_reply_cannot_silently_disappear():
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.config import Platform
+
+    runner = GatewayTurnMixin()
+    runner.async_session_store = SimpleNamespace(clear_resume_pending=AsyncMock())
+    runner._clear_restart_failure_count = AsyncMock()
+    result = {"final_response": "NO_REPLY", "effective_display_kind": None, "messages": []}
+    response, silent, _ = await runner._hmwa_shape_agent_response(
+        result, SimpleNamespace(chat_id="test", platform=Platform.TELEGRAM), [],
+        SimpleNamespace(session_id="test"), None, None, 0, "test", "telegram", 0,
+        persist_user_display_kind="internal_notification", reply_expected=True)
+    assert not silent
+    assert response and response != "NO_REPLY"
+
+
+@pytest.mark.parametrize("quiet", ["off", "mute", "heartbeat", "enabled"])
+def test_promoted_stream_setup_preserves_display_switches(quiet):
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+    from gateway.config import StreamingConfig
+
+    adapter = _make_adapter()
+    ctx = TurnContext(
+        human_engaged=True, persist_user_display_kind="internal_notification",
+        source=SimpleNamespace(chat_id="test"), user_config={},
+        resolve_display_setting=lambda *args: False,
+        interim_assistant_messages_enabled=quiet != "off",
+        mute_notification_reply=quiet == "mute", scheduled_heartbeat=quiet == "heartbeat",
+        _run_still_current=lambda: True)
+    runner = SimpleNamespace(
+        config=SimpleNamespace(streaming=StreamingConfig()),
+        _delivery_adapter_for=lambda source: adapter,
+        _build_stream_consumer_config=lambda *a, **k: (StreamConsumerConfig(), None))
+    consumer, _, _, enabled = TurnRunner(runner, ctx)._setup_stream_consumer("telegram")
+    if quiet == "enabled":
+        assert enabled and consumer is not None
+        assert consumer._drain_queue().got_human_engagement
+    else:
+        assert consumer is None and not enabled
+
+
+@pytest.mark.asyncio
+async def test_queued_promotion_is_abandoned_after_generation_dies():
+    current = True
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(adapter, "test", StreamConsumerConfig(internal_event=True),
+                                     run_still_current=lambda: current)
+    consumer.on_commentary("never deliver")
+    consumer._drain_queue()
+    consumer.on_human_engagement()
+    current = False
+    await consumer.run()
+    assert not adapter.send.called
+    assert consumer.cfg.internal_event
 
 
 class TestStreamedSilenceSuppression:

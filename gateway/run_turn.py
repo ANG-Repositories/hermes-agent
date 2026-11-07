@@ -1727,7 +1727,7 @@ class GatewayTurnMixin:
         )
         if _internal_turn:
             _log_internal_silence_verdict(response, _intentional_silence, _platform_name, source)
-        _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
+        _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", agent_result.get("effective_reply_expected", reply_expected))
         if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
@@ -4588,8 +4588,8 @@ class GatewayTurnMixin:
             merged = {
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
-                "queued_terminal_display_kind": next_display_kind,
-                "queued_terminal_reply_expected": next_reply_expected,
+                "queued_terminal_display_kind": followup_result.get("effective_display_kind", next_display_kind),
+                "queued_terminal_reply_expected": followup_result.get("effective_reply_expected", next_reply_expected),
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
@@ -5003,7 +5003,6 @@ class GatewayTurnMixin:
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
-                response["effective_display_kind"] = turn_ctx.effective_display_kind
             self._run_agent_evict_on_fallback(turn_ctx)
 
             # Interrupted OR queued message (/queue)?
@@ -5040,6 +5039,9 @@ class GatewayTurnMixin:
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
             )
 
+        if isinstance(response, dict):
+            response["effective_display_kind"] = turn_ctx.effective_display_kind
+            response["effective_reply_expected"] = turn_ctx.reply_expected
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
         return response
