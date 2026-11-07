@@ -16,7 +16,6 @@ re-pages nor forgets a latch. Existing runs are never touched by anything here.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import logging
@@ -64,6 +63,11 @@ def registry_state() -> str:
     return "ok" if isinstance(doc, dict) else "unreadable"
 
 
+#: credentials the door path reads besides the kanban@<host> pair tokens: ``kanban`` authenticates the
+#: existing-owner reservation upgrade (authorize_start existing_consumer), ``asap-operator`` the urgency verb.
+_OTHER_TOKENS = ("kanban", "asap-operator")
+
+
 def _kanban_tokens():
     d = _root() / TOKENS_REL
     try:
@@ -72,15 +76,22 @@ def _kanban_tokens():
         return []
 
 
+def _door_credentials():
+    """EVERY credential file the door path reads (round 5, Prism d5a47f67cca8): repairing any of them must clear a
+    latch it caused. Absent files are listed too, so creating one changes the fingerprint."""
+    d = _root() / TOKENS_REL
+    return [*_kanban_tokens(), *(d / name for name in _OTHER_TOKENS)]
+
+
 def door_config_present() -> bool:
     """Any door config on this box: the host table or a kanban pair token."""
     return _table_path().exists() or bool(_kanban_tokens())
 
 
 def fingerprint() -> str:
-    """Changes when the token(s), host table or registry change (path, mtime, size)."""
+    """Changes when any door credential, the host table or the registry changes (path, mtime, size)."""
     h = hashlib.sha256()
-    for p in (_registry_path(), _table_path(), *_kanban_tokens()):
+    for p in (_registry_path(), _table_path(), *_door_credentials()):
         try:
             st = p.stat()
             h.update(f"{p}:{st.st_mtime_ns}:{st.st_size};".encode())
@@ -95,6 +106,7 @@ def _state():
     path = _root() / STATE_REL
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(str(path) + ".lock", "a") as lock:
+        import fcntl                      # lazy: importing this module must not break native-Windows dispatch
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))

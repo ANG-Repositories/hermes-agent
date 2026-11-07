@@ -4654,16 +4654,11 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    spawn = spawn_fn if spawn_fn is not None else _default_spawn
-    state = _LaunchState()
-    from hermes_cli.kanban_priority_door import spawn as _priority_spawn, DoorHeld, defer
     try:
         from hermes_cli.kanban_continuation import record_placement
         if not record_placement(conn, claimed.id, claimed.current_run_id, None):
             return False
-        pid = _priority_spawn(conn, claimed, str(workspace), host=None,
-                              spawn=lambda task, path: _call_spawn_fn(spawn, task, path, board),
-                              spawn_kwargs={}, state=state)
+        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -4674,10 +4669,6 @@ def _dispatch_lane_task(
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
         return True
-    except DoorHeld as exc:
-        defer(conn, claimed, exc)
-        result.placement_waits[claimed.id] = str(exc)
-        return False
     except Exception as exc:
         # The host refused the spawn (no restart-safe scope, no workspace
         # mount): nothing about the card ran, so it must not spend the card's
@@ -5982,6 +5973,14 @@ def _i0_counts(reason) -> bool:
 _I0_EXEMPT = frozenset({"unassigned", "per_profile_cap"})
 
 
+def _portable_goes_remote(local_free: bool, cap_only, plan, browser_joined: bool = False) -> bool:
+    """Does a ``portable`` row ask the pool before a local slot? The ONE rule: the spawn loop and the door
+    publisher (kanban_priority.waiting_by_host) both call it, so a card waits where it would start (round 5,
+    Prism a51c53f3bd02). A browser-joined row keeps the host its join was cut for."""
+    remote_first = bool(getattr(plan, "default_remote", False)) and not browser_joined
+    return not local_free or bool(cap_only) or remote_first
+
+
 def _last_resort_allowed(route: str, local_free: bool, cap_only, plan) -> bool:
     """Spawn a pool-refused row locally this tick? Only a ``portable`` row
     under ``kanban.placement.default: remote`` with local allowance left and no
@@ -6786,7 +6785,8 @@ def _dispatch_once_locked(
             _waiting = _priority.waiting_by_host(
                 [*ready_rows, *review_rows], spillover, routes=row_route, local_host="local", board=board,
                 default_assignee=default_assignee, conn=conn, caps=_caps,
-                cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports)
+                cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports,
+                local_budget=local_budget, browser_joins=result.browser_joins)
             _priority.publish_waiting(conn, _waiting, verdicts=_priority.verdicts_for_plan(spillover))
         except Exception as exc:
             _kb._log.warning("kanban door publication failed (starts remain fail-closed): %s", exc)
@@ -7655,11 +7655,10 @@ def _dispatch_once_locked(
         # A browser join is cut for the host _browser_gate saw (the Studio for a
         # portable row): remote-first would move it and the lease refuses
         # BROWSER_JOIN_HOST_MOVED every tick, so a joined row keeps that host.
-        _remote_first = (getattr(spillover, "default_remote", False)
-                         and row["id"] not in result.browser_joins)
         _forced_remote = force_host is not None and force_host != _FORCE_LOCAL
-        if _forced_remote or (force_host is None and (route in ("pin", "origin") or (route == "portable" and (
-                not local_free or _cap_only or _remote_first)))):
+        if _forced_remote or (force_host is None and (route in ("pin", "origin") or (
+                route == "portable" and _portable_goes_remote(local_free, _cap_only, spillover,
+                                                              row["id"] in result.browser_joins)))):
             # A refused take() NEVER falls through to a local spawn (I-11),
             # except a portable row under kanban.placement.default: remote,
             # which spawns locally as the LAST RESORT (spec v0.3 §3.1 step 2).
@@ -8268,6 +8267,8 @@ def _dispatch_once_locked(
                 spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _review_launch = _LaunchState()
+        from hermes_cli import kanban_priority_door as _review_door
         try:
             from hermes_cli.kanban_continuation import record_placement
             if not record_placement(conn, claimed.id, claimed.current_run_id,
@@ -8278,16 +8279,25 @@ def _dispatch_once_locked(
             if _review_origin_host:
                 _kb._kwh.prepare_remote_workspace(_review_origin_host, str(workspace))
             import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
-                if "board" in sig.parameters:
-                    kwargs['board'] = board
-                pid = _spawn(claimed, str(workspace), **kwargs)
-            except (TypeError, ValueError):
-                if _review_origin_host:
-                    raise
-                pid = _spawn(claimed, str(workspace))
+
+            def _review_spawn(task, path):
+                try:
+                    sig = inspect.signature(_spawn)
+                    kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
+                    if "board" in sig.parameters:
+                        kwargs['board'] = board
+                    return _spawn(task, path, **kwargs)
+                except (TypeError, ValueError):
+                    if _review_origin_host:
+                        raise
+                    return _spawn(task, path)
+            # The review start is a start like any other (round 5, Prism 7851057bf109): one door authorization,
+            # upgraded in place from the booked pin reservation, before the worker exists.
+            pid = _review_door.spawn(conn, claimed, str(workspace),
+                                     host=_review_origin_host.name if _review_origin_host else None,
+                                     spawn=_review_spawn, spawn_kwargs={}, state=_review_launch,
+                                     reservation_id=_review_rid)
+            _review_launch.launched = True
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
@@ -8309,7 +8319,17 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _review_door.DoorHeld as exc:
+            # No start was made: the claim goes back without penalty (or the card is blocked on a config fault),
+            # and the booked pin reservation is refunded, exactly as on the ready lane.
+            _review_door.defer(conn, claimed, exc)
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)
+            result.placement_waits[claimed.id] = str(exc)
         except Exception as exc:
+            if (_review_origin_host is not None and not _review_launch.launched
+                    and not _review_door.reservation_owned(conn, claimed.id, claimed.current_run_id)):
+                spillover.release(_review_origin_host, _review_rid)  # pre-launch failure; door owns an upgraded row
             # A host that cannot place the worker (no restart-safe scope,
             # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
             # the card's failure: the run is closed with ``infrastructure:

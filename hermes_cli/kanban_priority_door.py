@@ -102,6 +102,91 @@ def mark_asap_if_set(client, conn, hid, uid, task_id):
         return False
 
 
+# -- one owner record per board: which (host, unit id) this dispatcher has live at the door ----------------------
+# Durable (round 5, Prism 39f15c5b2c09): a restarted dispatcher still knows the old host of a card that moved, so it
+# withdraws there before enqueueing on the new one. A record lost anyway is recovered by lookup (enqueue_here).
+
+def _published_path(conn):
+    import hashlib
+    from hermes_cli import kanban_priority_faults as faults
+    board = hashlib.sha256(conn.execute("PRAGMA database_list").fetchone()[2].encode()).hexdigest()[:16]
+    return faults._root() / "var" / "kanban" / "door-published" / f"{board}.json"
+
+
+def load_published(conn) -> set:
+    try:
+        doc = json.loads(_published_path(conn).read_text(encoding="utf-8"))
+        return {(str(h), str(u)) for h, u in doc.get("units", [])}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return set()
+
+
+def save_published(conn, units) -> None:
+    import os
+    import tempfile
+    path = _published_path(conn)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".published.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"units": sorted([h, u] for h, u in units)}, fh)
+    os.replace(tmp, path)
+
+
+def _withdraw_elsewhere(client, hid, uid) -> bool:
+    """Find ``uid`` live on another host by asking the door (lookup_unit), withdraw it there. True if found."""
+    from hermes_cli.fleet_placement import placement
+    found = False
+    for other in placement.load_hosts().hosts:
+        if other == hid:
+            continue
+        try:
+            seen = client.lookup_unit("kanban", other, uid)
+        except client.Refused:
+            continue                                  # no pair token for that host: we never published there
+        if seen.get("state") == "waiting":
+            client.withdraw("kanban", other, uid)
+            found = True
+    return found
+
+
+def enqueue_here(client, conn, hid, uid):
+    """THE enqueue for a kanban unit (publisher and start boundary alike). A unit this board published on another
+    host is withdrawn there first; the door refuses one live id on two hosts (409 invalid). If it still answers
+    invalid (owner record lost), the unit is found by lookup on the other hosts, withdrawn and enqueued again: our
+    own placement disagreement is reconciled, never latched (round 5, Prism a51c53f3bd02 / 23ed3fd0945c)."""
+    units = load_published(conn)
+    for h, u in sorted(units):
+        if u == uid and h != hid:
+            client.withdraw("kanban", h, uid)
+            units.discard((h, u))
+    try:
+        receipt = client.enqueue("kanban", hid, uid, *need())
+    except client.AuthorizeRefused as exc:
+        if exc.reason != "invalid" or not _withdraw_elsewhere(client, hid, uid):
+            raise
+        receipt = client.enqueue("kanban", hid, uid, *need())
+    units.add((hid, uid))
+    save_published(conn, units)
+    return receipt
+
+
+def sync_asap(client, conn, hid, uid, task_id, receipt):
+    """Make the door unit's urgency equal the card's, both directions (round 5, Prism 2d873aa15a6e / 82278e729600).
+    The enqueue receipt carries the door's own record. Urgency on: mark_asap (operator capability, advisory). Urgency
+    off while the door still says asap: the door has no un-mark verb and a re-enqueue keeps asap, so the unit is
+    withdrawn and enqueued fresh (it loses its old arrival, the cost of clearing urgency)."""
+    row = conn.execute("SELECT asap FROM tasks WHERE id=?", (task_id,)).fetchone()
+    want = bool(row and row[0])
+    door = ((receipt or {}).get("door") or {}) if isinstance(receipt, dict) else {}
+    unit = next((u for u in door.get("waiting") or [] if isinstance(u, dict) and u.get("id") == uid), None)
+    have = bool(unit and unit.get("asap") is True)
+    if want and not have:
+        mark_asap_if_set(client, conn, hid, uid, task_id)
+    elif have and not want:
+        client.withdraw("kanban", hid, uid)
+        client.enqueue("kanban", hid, uid, *need())
+
+
 def _receipt(conn, task, doc):
     from hermes_cli import kanban_db as kb
     with kb.write_txn(conn):
@@ -170,8 +255,8 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
             raise DoorHeld("run already authorized; reconcile original start")
         try:
             # A direct spawn_now has not been through a publisher tick; a repeat enqueue keeps the arrival.
-            client.enqueue("kanban", hid, uid, *need())
-            mark_asap_if_set(client, conn, hid, uid, task.id)
+            receipt = enqueue_here(client, conn, hid, uid)
+            sync_asap(client, conn, hid, uid, task.id, receipt)
             ans = _authorize(client, hid, uid, reservation_id, kanban_headroom.RESERVE_TTL_S)
         except client.AuthorizeRefused as exc:
             if exc.reason == "spent_expired":

@@ -3577,7 +3577,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         if asap_arg is not None:
             from hermes_cli.kanban_priority import set_asap
             try:
-                if not set_asap(conn, args.task_id, asap_arg, operator=_profile_author()):
+                if not set_asap(conn, args.task_id, asap_arg):
                     return _err(f"cannot edit {args.task_id} (unknown id)")
             except PermissionError as exc:
                 return _err(str(exc))

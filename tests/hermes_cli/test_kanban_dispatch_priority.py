@@ -12,19 +12,24 @@ def test_asap_is_explicit_persisted_and_never_inherited(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     kb.init_db()
+    # the operator is PROVEN (operator token), never a caller-supplied string (round 5, Prism b37716b1f3e9)
+    (kb.kanban_home() / "kanban").mkdir(parents=True, exist_ok=True)
+    kb.operator_token_path().write_text("op\n", encoding="utf-8")
+    monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, "op")
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
     from hermes_cli.kanban_priority import set_asap
 
     with kb.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee=None)
-        assert set_asap(conn, parent, True, operator="apollo")
+        assert set_asap(conn, parent, True)
         child = kb.create_task(conn, title="child", assignee=None, parents=[parent])
         assert kb.get_task(conn, parent).asap is True
         assert kb.get_task(conn, child).asap is False
         monkeypatch.setenv("HERMES_KANBAN_TASK", child)
         with pytest.raises(PermissionError, match="operator"):
-            set_asap(conn, child, True, operator="worker")
+            set_asap(conn, child, True)
         monkeypatch.delenv("HERMES_KANBAN_TASK")
-        assert set_asap(conn, parent, False, operator="apollo")
+        assert set_asap(conn, parent, False)
         assert kb.get_task(conn, parent).asap is False
 
 

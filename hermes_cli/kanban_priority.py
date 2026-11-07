@@ -8,15 +8,29 @@ import os
 _log = logging.getLogger(__name__)
 
 
-def set_asap(conn, task_id: str, flag: bool, *, operator: str) -> bool:
-    """Only an explicit operator edit may mark a card urgent; creation never copies it."""
+def set_asap(conn, task_id: str, flag: bool) -> bool:
+    """Only an explicit, VERIFIED operator edit may mark (or clear) a card urgent; creation never copies it.
+
+    The operator is resolved here, never taken from the caller (round 5, Prism b37716b1f3e9): the CLI's verified
+    author (kanban_identity.verified_profile_author) reads process ancestry, so a worker that unsets
+    HERMES_KANBAN_TASK still resolves to its own profile, and an unproven operator label comes back
+    ``unverified:<name>``. Either is refused. A changed flag reaches the shared door unit in the same operation.
+    """
     from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_identity import is_operator_label, verified_profile_author
+    from hermes_cli.profiles import current_profile_name
     if os.environ.get("HERMES_KANBAN_TASK") or kb._is_delegated_child():
         raise PermissionError("ASAP is operator-set only")
+    operator = verified_profile_author(current_profile_name("user") or "user")
+    if not is_operator_label(operator):
+        raise PermissionError(f"ASAP is operator-set only (caller resolves to {operator!r})")
     from hermes_cli.kanban_db import _home_session_guarded
     # The same ownership guard as operator model edits; a caller-supplied
     # label alone must never authorize a foreign session's mutation.
-    return _home_session_guarded("set-asap")(_set_asap)(conn, task_id, flag, operator=operator)
+    ok = _home_session_guarded("set-asap")(_set_asap)(conn, task_id, flag, operator=operator)
+    if ok:
+        sync_door_asap(conn, task_id)
+    return ok
 
 
 def _set_asap(conn, task_id, flag, *, operator):
@@ -34,17 +48,40 @@ def _set_asap(conn, task_id, flag, *, operator):
     return True
 
 
+def sync_door_asap(conn, task_id, *, client=None) -> None:
+    """Bring the card's live door unit (if this board published one) to the card's urgency now. Best effort: the
+    next publish tick reconciles the same thing, so a door fault here is logged, never raised."""
+    from hermes_cli import kanban_priority_door as door
+    if not door.enabled():
+        return
+    uid = door.unit_id(conn, task_id)
+    live = [h for h, u in door.load_published(conn) if u == uid]
+    if not live:
+        return
+    client = client or door._client()
+    for hid in live:
+        try:
+            receipt = client.enqueue("kanban", hid, uid, *door.need())
+            door.sync_asap(client, conn, hid, uid, task_id, receipt)
+        except (client.Refused, client.Unreachable) as exc:
+            _log.warning("kanban door: ASAP change on %s not yet at the door (%s); next publish retries", task_id, exc)
+
+
 def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default_assignee=None,
-                    conn=None, caps=None, cap_only=None, worktree_ports=None):
+                    conn=None, caps=None, cap_only=None, worktree_ports=None, local_budget=None,
+                    browser_joins=None):
     """Use the dispatcher's resolved routes, never its pressure-filtered slot budget.
 
     No age or workload ordering is decided here. The common publisher selects its
     urgency-first visible window; retain explicit urgent cards before the slot cap.
     A card waits on exactly ONE host: the door keeps unit ids unique per workload
-    (hermes-home #9223), so a second host's enqueue is refused. Local-first: a
-    local/portable card waits here unless its constraints exclude this host, then on
-    the first eligible pool host in plan order; a pin/origin card on its host.
+    (hermes-home #9223). Local vs pool is the dispatcher's own rule
+    (kanban_db_dispatch._portable_goes_remote, round 5): a portable card goes to the pool when the
+    local allowance is used up, a capability restricts it, or kanban.placement.default is remote;
+    otherwise it waits locally. A pin/origin card waits on its host. The scorer may still pick a
+    different pool host at the start; enqueue_here withdraws the old-host unit then, never a latch.
     """
+    from hermes_cli.kanban_db_dispatch import _portable_goes_remote
     from hermes_cli.kanban_worker_pool import count_free
 
     out = {local_host: []}
@@ -66,6 +103,7 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
     free = {} if plan is None else {
         name: max(0, count_free(host, int(plan.detail.get(name, {}).get("running", 0))) - plan.taken.get(name, 0))
         for name, host in hosts.items()}
+    local_used = 0
     # Explicit urgent cards claim capacity first; otherwise the dispatcher's own row order.
     for card in [c for c in cards if c["asap"]] + [c for c in cards if not c["asap"]]:
         route, arg = routes.get(card["id"], ("local", None))
@@ -81,9 +119,14 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
                                      own_only.get(card["id"]),
                                      (worktree_ports or {}).get(card["id"]))
         allowed = None if only is None else {n.lower() for n in only}
-        if (route == "local" or (route == "portable" and not own_only.get(card["id"])
-                                 and (allowed is None or local_names & allowed))):
+        local_free = local_budget is None or local_used < local_budget
+        remote = (route == "portable" and plan is not None
+                  and _portable_goes_remote(local_free, own_only.get(card["id"]), plan,
+                                            card["id"] in (browser_joins or {})))
+        if route == "local" or (route == "portable" and not remote
+                                and (allowed is None or local_names & allowed)):
             out[local_host].append(card)
+            local_used += 1
             continue
         if plan is None:
             continue
@@ -105,10 +148,12 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
 def publish_waiting(conn, waiting, *, verdicts=None, client=None):
     """Enqueue/withdraw only this board's own units through the pair door; never replace a host queue.
 
-    Withdrawals run first, so a card that moved host is gone from the old host before the new
-    host's enqueue (the door refuses a live id on two hosts). Fault taxonomy (2026-11-05): a Refused
-    (missing token, typed auth/invalid) latches the door (class 2); an Unreachable starts the transport
-    backoff (class 3); either stops this publish. Returns {(host, unit_id): error} for what failed.
+    Every destination host is resolved BEFORE any door call; one the host table does not name is the class-2 config
+    latch, never a silent skip (round 5, Prism ba4c7620e475). Withdrawals run first, so a card that moved host is gone
+    from the old host before the new host's enqueue. The owner record is durable (var/kanban/door-published), so a
+    restarted dispatcher still withdraws a moved card (Prism 39f15c5b2c09). Fault taxonomy (2026-11-05): a Refused
+    (missing token, typed auth/invalid) latches the door (class 2); an Unreachable starts the transport backoff
+    (class 3); either stops this publish. Returns {(host, unit_id): error} for what failed.
     """
     from hermes_cli import kanban_priority_door as door
     from hermes_cli import kanban_priority_faults as faults
@@ -143,25 +188,29 @@ def _classify(client, faults, exc, errors):
 
 def _publish_waiting(conn, waiting, verdicts, client, door):
     from hermes_cli import kanban_priority_faults as faults
-    from hermes_cli.fleet_placement import placement
-    table = placement.load_hosts()
-    cpus, ram_gb = door.need()
-    key = conn.execute("PRAGMA database_list").fetchone()[2]
-    current = _published.setdefault(key, set())
     plan = []
     for host, cards in waiting.items():
-        hid = table.resolve(host)
-        if hid:
-            plan.append((host, hid, [(card, door.unit_id(conn, card["id"])) for card in cards]))
+        if not cards:
+            continue                                 # nothing waits there: no destination to validate
+        try:
+            hid = door.canonical_host(host)
+        except door.DoorFault as exc:
+            faults.latch(f"door publish: {exc}")
+            raise _Stop({(host, None): str(exc)}) from exc
+        plan.append((host, hid, [(card, door.unit_id(conn, card["id"])) for card in cards]))
+    current = door.load_published(conn)
     wanted = {(hid, uid) for _, hid, rows in plan for _, uid in rows}
     errors = {}
-    for hid, uid in sorted(current - wanted):
-        try:
-            client.withdraw("kanban", hid, uid)
-            current.discard((hid, uid))
-        except (client.Refused, client.Unreachable) as exc:
-            errors[(hid, uid)] = str(exc)            # still ours; retried after the fault clears
-            _classify(client, faults, exc, errors)
+    try:
+        for hid, uid in sorted(current - wanted):
+            try:
+                client.withdraw("kanban", hid, uid)
+                current.discard((hid, uid))
+            except (client.Refused, client.Unreachable) as exc:
+                errors[(hid, uid)] = str(exc)        # still ours; retried after the fault clears
+                _classify(client, faults, exc, errors)
+    finally:
+        door.save_published(conn, current)
     for host, hid, rows in plan:
         # The capacity fact only (last writer wins); units are managed per id below.
         try:
@@ -172,17 +221,13 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
             _classify(client, faults, exc, errors)
         for card, uid in rows:
             try:
-                client.enqueue("kanban", hid, uid, cpus, ram_gb)
+                receipt = door.enqueue_here(client, conn, hid, uid)
+                door.sync_asap(client, conn, hid, uid, card["id"], receipt)
             except (client.Refused, client.Unreachable) as exc:
                 errors[(hid, uid)] = str(exc)
                 _classify(client, faults, exc, errors)
-            current.add((hid, uid))
-            door.mark_asap_if_set(client, conn, hid, uid, card["id"])
     faults.note_success("publish")                   # publish health only; never clears the authorize history
     return errors
-
-
-_published = {}
 
 
 def verdicts_for_plan(plan):
