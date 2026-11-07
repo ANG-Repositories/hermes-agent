@@ -49,6 +49,8 @@ def test_sendback_releases_no_worker(board, sendback):
     events = [e for e in kb.list_events(board, tid) if e.kind == "no_worker_cleared"]
     assert len(events) == 1
     assert events[0].payload["source"] == ("sendback" if sendback else "request-changes")
+    preview = dispatch.dispatch_once(board, dry_run=True)
+    assert tid not in preview.skipped_no_worker
     assert kb.claim_task(board, tid) is not None
 
 
