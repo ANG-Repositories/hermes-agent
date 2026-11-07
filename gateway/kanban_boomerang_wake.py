@@ -1203,14 +1203,50 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
         return False
 
 
+#: The RC-3 freshness refusals (``_moved`` and the write path wrapping it): the card moved under
+#: the claim, a normal supersede, not a fault (t_ce8bd439).
+_SUPERSEDE_REASONS = frozenset({"state moved", "write refused: state moved"})
+
+
+def _card_status(entry: dict) -> str:
+    from hermes_cli import kanban_db as kb
+
+    try:
+        conn = kb.connect(board=entry.get("board"))
+        try:
+            return str(getattr(kb.get_task(conn, entry["task_id"]), "status", None) or "?")
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("kanban boomerang-wake: status read for %s failed: %s", entry.get("task_id"), exc)
+        return "?"
+
+
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
                 text: Optional[str] = None) -> None:
-    """Commit the original wake obligation before any best-effort delivery."""
+    """Commit the original wake obligation before any best-effort delivery. A freshness refusal
+    (the card moved under the claim) is a supersede, not a fault (t_ce8bd439): the handback keeps
+    only the re-delivered wake, the origin chat gets no line, and one #logs line records it."""
+    superseded = reason in _SUPERSEDE_REASONS
     handback = handback_row(entry, {"summary": reason},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
-    handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
-    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="failed",
+    if superseded:
+        handback[1]["parts"] = [PART_TURN]
+        handback[1]["line"] = ""
+    else:
+        handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                            outcome="superseded" if superseded else "failed",
                             reason=reason, resurfaced=True, resurface_delivered=False, handback=handback)
+    if superseded:
+        status = await asyncio.to_thread(_card_status, entry)
+        line = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before the wake ran; "
+                f"original wake re-delivered")
+        logger.info("kanban boomerang-wake: %s", line)
+        try:
+            post_logs(line)
+        except Exception as exc:
+            logger.debug("kanban boomerang-wake: superseded #logs line failed: %s", exc)
     await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
 
 

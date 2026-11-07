@@ -354,7 +354,28 @@ def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
     _run(env, entry, "failed", "rate_limit")
     assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: child failed") for s in env["adapter"].sent)
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
-    assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "failed"
+
+
+def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):
+    """t_ce8bd439: the card left the claim-time status before the verdict ran. No origin-chat
+    line, one #logs line, the original wake still re-surfaces, outcome superseded."""
+    logs: list = []
+    env["monkeypatch"].setattr(ah, "post_logs", logs.append)
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        assert kb.reopen_task(conn, tid, actor="ci-sendback", reason="CI red")[0]
+    _run(env, entry, "completed", _verdict(entry, "complete"))
+    assert env["adapter"].sent == [], env["adapter"].sent
+    assert logs == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
+                    f"original wake re-delivered"], logs
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
+    assert claim["reason"] == "state moved" and claim["resurface_delivered"] is True
 
 
 def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
