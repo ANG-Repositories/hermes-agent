@@ -2559,6 +2559,7 @@ class Task:
     # Boomerang wake level (Ace 2026-10-22): True/False = the card's subscription level is
     # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
     boomerang_wake: Optional[bool] = None
+    asap: bool = False  # Explicit operator edit only; never inherited at creation.
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2578,6 +2579,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            asap=bool(g("asap")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
             pin_sub_reason=g("pin_sub_reason") or None,

@@ -28,6 +28,7 @@ import pytest
 from gateway import kanban_gate_tick as kgt
 from hermes_cli.fleet_placement import admission as ad
 from hermes_cli.fleet_placement import admission_demand as dmd
+from tests.hermes_cli.demand_fixture import write_demand
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_load_gate as klg
@@ -65,7 +66,7 @@ def _gate():
 
 
 def test_d8_studio_spawn_held_back_while_prism_queues_on_it(studio):
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["mac-studio"], root=studio)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["mac-studio"], root=studio)
     g = _gate()
     a, why = g.admit(5.0, now=1000.0, running=0, cpu_busy=0.86)   # 0.86 + 1/32 = 0.891 < 0.90: room for one alone
     assert a == 0, (a, why)
@@ -74,7 +75,7 @@ def test_d8_studio_spawn_held_back_while_prism_queues_on_it(studio):
 
 
 def test_d8_kill_switch_restores_admit(studio, monkeypatch):
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["mac-studio"], root=studio)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["mac-studio"], root=studio)
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
     g = _gate()
     a, why = g.admit(5.0, now=1000.0, running=0, cpu_busy=0.86)
@@ -83,8 +84,8 @@ def test_d8_kill_switch_restores_admit(studio, monkeypatch):
 
 
 def test_d8_lower_class_demand_never_holds_kanban(studio):
-    dmd.publish("ci", 64, ad.Estimate(cpus=4.0, ram_gb=4.0), root=studio)
-    dmd.publish("test-gate", 9, ad.Estimate(cpus=4.0, ram_gb=16.0), root=studio)
+    write_demand("ci", 64, ad.Estimate(cpus=4.0, ram_gb=4.0), root=studio)
+    write_demand("test-gate", 9, ad.Estimate(cpus=4.0, ram_gb=16.0), root=studio)
     a, why = _gate().admit(5.0, now=1000.0, running=0, cpu_busy=0.50)
     assert a == 4 and why is None, (a, why)                         # max_spawn_per_tick, nothing held back
 
@@ -98,7 +99,7 @@ def test_d8_prism_queue_restricted_by_alias_holds_kanban_back(studio, monkeypatc
         "hosts": {"mac-studio": {"cores": 24, "threads": 32, "mem_total_gb": 512, "mem_reserve_gb": 128,
                                  "cores_reserve": 4, "consumers": {}, "aliases": ["studio", "local"]}}}), encoding="utf-8")
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(studio))
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["studio"], root=studio)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["studio"], root=studio)
     a, why = _gate().admit(5.0, now=1000.0, running=0, cpu_busy=0.86)
     assert a == 0 and "held_back:kanban for prism 64 queued" in (why or ""), (a, why)
 
@@ -194,7 +195,7 @@ def test_d7_prism_queue_on_ci_box_holds_the_kanban_take_there(home):
     f = Fleet(t0)
     f.busy["ci-box"] = 0.885                                      # alone: 0.885 + 2/256 = 0.893 fits; with 2 prism seats: 0.901
     assert placement.admission_mode() == "utilization"
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
     plan = _plan(home, f)
     host = plan.take("alpha")
     assert host is not None and host.name != "ci-box", plan.refusal
@@ -206,7 +207,7 @@ def test_d7_kill_switch_keeps_todays_pick(home, monkeypatch):
     t0 = time.time()
     f = Fleet(t0)
     f.busy["ci-box"] = 0.885
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
     plan = _plan(home, f)
     assert kh.unified_filter(plan, list(HOSTS), None) == (list(HOSTS), {})   # inert: Prism's queue not read
@@ -219,7 +220,7 @@ def test_d7_every_host_held_refuses_the_take(home):
     t0 = time.time()
     f = Fleet(t0)
     f.busy = {"ci-box": 0.885, "ace-ai": 0.86, "ace-media": 0.86}
-    dmd.publish("prism", 64, PRISM_UNIT, root=home, now=t0)       # hosts null: Prism may run anywhere
+    write_demand("prism", 64, PRISM_UNIT, root=home, now=t0)       # hosts null: Prism may run anywhere
     plan = _plan(home, f)
     assert plan.take("alpha") is None
     assert plan.refusal.startswith("unified_admission (") and "held_back:kanban for prism" in plan.refusal
@@ -274,7 +275,7 @@ def test_d7_pinned_take_passes_the_one_rule_too(home):
     t0 = time.time()
     f = Fleet(t0)
     f.busy["ci-box"] = 0.885
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
     plan = _plan(home, f)
     assert plan.take("alpha", pin="ci-box") is None
     assert plan.refusal.startswith("pin_host_unified_admission (ci-box: held_back:kanban for prism 64 queued")
@@ -306,7 +307,7 @@ def _kanban_rows(home):
 
 def _plan_mode(home, fleet, allocd, monkeypatch):
     if allocd == "on":       # alloc_client's in-process fallback (router-off): the same ledger, allocd's own path
-        from hermes_cli import alloc_client
+        from hermes_cli.fleet_placement import alloc_client
         (home / "var" / "alloc").mkdir(parents=True, exist_ok=True)
         (home / "var" / "alloc" / "router-off").write_text("", encoding="utf-8")
         monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: True)
@@ -336,7 +337,7 @@ def test_two_concurrent_takes_where_only_one_fits_the_class_rule_admit_exactly_o
     t0 = time.time()
     f = Fleet(t0)
     f.busy["ci-box"] = 0.880
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
     a, b = _plan_mode(home, f, allocd, monkeypatch), _plan_mode(home, f, allocd, monkeypatch)
     real, raced = kh.unified_filter, []
 
@@ -384,7 +385,21 @@ def test_pinned_take_books_the_learned_estimate_it_was_admitted_on(home, monkeyp
 
 # ---------------------------------------------------------------------------------- demand publication
 
-def test_tick_publishes_ready_demand(home):
+@pytest.fixture
+def door(monkeypatch):
+    """allocd's pair door faked at the client (hermes-home #9223: publish_queue is the only queue writer)."""
+    from hermes_cli.fleet_placement import alloc_client
+    sent = []
+
+    def publish_queue(workload, host, queued, unit, *, unified, timeout=None):
+        sent.append({"workload": workload, "host": host, "queued": queued, "unit": dict(unit), "unified": unified})
+        return {"ok": True}
+
+    monkeypatch.setattr(alloc_client, "publish_queue", publish_queue)
+    return sent
+
+
+def test_tick_publishes_ready_demand(home, door):
     with kb.connect_closing() as conn:
         for i in range(3):
             kb.create_task(conn, title=f"c{i}", assignee="alpha")
@@ -392,12 +407,13 @@ def test_tick_publishes_ready_demand(home):
     b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet", kanban_cfg=lambda: {},
                             ledger=lambda boards: {}, connect=lambda board=None: kb.connect())
     assert b.publish_demand([{"slug": "default"}]) == 3
-    doc = json.loads((home / "var" / "placement" / "demand" / "kanban.json").read_text(encoding="utf-8"))
-    assert doc["workload"] == "kanban" and doc["queued"] == 3 and doc["hosts"] is None
-    assert doc["unit"] == {"cpus": 2.0, "ram_gb": 3.0, "gpu_mib": 0.0}
+    # a portable card may run on any table host: the old ``hosts: null`` is one pair publish per host
+    assert sorted(d["host"] for d in door) == sorted(TABLE["hosts"])
+    assert all(d["workload"] == "kanban" and d["queued"] == 3 and d["unified"] is True for d in door)
+    assert all(d["unit"] == {"cpus": 2.0, "ram_gb": 3.0, "gpu_mib": 0.0} for d in door)
 
 
-def test_tick_demand_skips_operator_only_cards(home):
+def test_tick_demand_skips_operator_only_cards(home, door):
     """Prism 8d48747ae751: no_worker=1 cards are dropped before spawn; publishing them reserved kanban capacity on
     every host for work that never runs."""
     with kb.connect_closing() as conn:
@@ -411,7 +427,7 @@ def test_tick_demand_skips_operator_only_cards(home):
     assert b.publish_demand([{"slug": "default"}]) == 1
 
 
-def test_tick_demand_skips_human_and_unassigned_cards(home):
+def test_tick_demand_skips_human_and_unassigned_cards(home, door):
     """t_365e5753 (2026-10-30): 135 ready cards assigned human:apollo (review/operator lanes the dispatcher never
     spawns) were published as kanban demand 163 and held back ~110 CI runners on ci-box under the ONE rule while 146
     workflow runs queued. Only cards a worker would actually spawn for are demand: the same predicate the
@@ -428,8 +444,7 @@ def test_tick_demand_skips_human_and_unassigned_cards(home):
     b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet", kanban_cfg=lambda: {},
                             ledger=lambda boards: {}, connect=lambda board=None: kb.connect())
     assert b.publish_demand([{"slug": "default"}]) == 2
-    doc = json.loads((home / "var" / "placement" / "demand" / "kanban.json").read_text(encoding="utf-8"))
-    assert doc["queued"] == 2
+    assert door and all(d["queued"] == 2 for d in door)
 
 
 def test_tick_publishes_nothing_under_the_kill_switch(home, monkeypatch):
@@ -508,7 +523,7 @@ def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypat
     refused and released, since
     unified_filter's local pre-check cannot see allocd's ledger. Router host (one ledger): the local check still runs,
     and a row allocd says it booked but the shared file lacks is refused as before, whatever the reply says."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
 
     t0 = time.time()
     f = Fleet(t0)
@@ -534,7 +549,7 @@ def test_remote_plain_allocd_grants_cannot_overrun_the_class_rule(home, monkeypa
     """Prism 11efd32500fc repro: off the router host, a router that runs only placement.admit() grants every take; the
     local pre-check reads an empty dispatcher ledger and passes both. Under the unified rule neither plain grant may
     stand (the second would project 0.880 + (4+2)/256 > 0.90 with Prism's demand held); both are released."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
 
     t0 = time.time()
     f = Fleet(t0)
@@ -557,7 +572,7 @@ def remote_allocd(home, monkeypatch):
     """A kanban dispatcher OFF the router host, taking through a real HTTP allocd (FakeAllocd mirrors hermes-home
     scripts/allocd.py, including its unified confirm). The local pre-check is a pass-through: off the router it reads
     the dispatcher's own file, which never holds allocd's rows (Prism 11efd32500fc), so only allocd can refuse."""
-    from hermes_cli import alloc_client
+    from hermes_cli.fleet_placement import alloc_client
     from tests.hermes_cli.test_kanban_allocd_route import FakeAllocd
 
     def make(fleet, *, legacy=False):
@@ -612,7 +627,7 @@ def test_two_remote_takes_against_a_full_class_second_refused(home, remote_alloc
     t0 = time.time()
     f = Fleet(t0)
     f.busy["ci-box"] = 0.880
-    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    write_demand("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
     plan, fake = remote_allocd(f)
     assert plan.take("alpha", only=["ci-box"], job_id="t_r1") is not None, plan.refusal
     assert plan.take("alpha", only=["ci-box"], job_id="t_r2") is None
@@ -655,7 +670,7 @@ def test_unified_refusal_code_is_in_the_shared_take_vocabulary(home):
     t0 = time.time()
     f = Fleet(t0)
     f.busy = {"ci-box": 0.885, "ace-ai": 0.86, "ace-media": 0.86}
-    dmd.publish("prism", 64, PRISM_UNIT, root=home, now=t0)
+    write_demand("prism", 64, PRISM_UNIT, root=home, now=t0)
     plan = _plan(home, f)
     assert plan.take("alpha") is None
     assert pr.take_refusal_code(plan.refusal) == pr.UNIFIED_ADMISSION
