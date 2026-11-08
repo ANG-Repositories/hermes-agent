@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -321,6 +322,68 @@ def test_backfill_skips_runs_with_placement_reapply_failures(tmp_path, failures)
     out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
     assert out.returncode == 0, out.stderr
     assert _host(turns, "tw") == (None if failures else "ci-box")
+    assert _host(turns, "tl") == "studio-local"
+
+
+@pytest.mark.parametrize("backend", ["ssh", "docker", "modal"])
+def test_unplaced_remote_backend_is_not_studio(no_worker_env, monkeypatch, backend):
+    from tools import terminal_tool
+
+    _worker(monkeypatch)
+    monkeypatch.setattr(terminal_tool, "_ensure_terminal_env_bridged", lambda: None)
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    assert _build().placement_host is None
+
+
+def test_abandoned_subagent_record_outside_child_context(db, no_worker_env, monkeypatch):
+    _worker(monkeypatch, placement_host="ci-box")
+    rec = blackbox._abandoned_record(
+        {"turn_id": "abandoned-child", "session_id": "child", "is_subagent": True}, {},
+    )
+    assert rec.is_subagent
+    store.insert_turn(rec)
+    assert _host(db, "abandoned-child") is None
+    assert _build().placement_host == "ci-box"
+
+
+def test_backfill_open_run_is_overlap_only(tmp_path):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(board) as conn:
+        conn.execute("UPDATE task_runs SET ended_at = NULL WHERE id = 7")
+    module = runpy.run_path(str(SCRIPT))
+    assert ("worker-7:task:tw", "ci-box") not in module["_plan"](turns, board, "daedalus")
+    # Even an unfinished run with no host/provenance must block another run.
+    with sqlite3.connect(board) as conn:
+        conn.execute("INSERT INTO task_runs VALUES "
+                     "(12, 't_next', 'daedalus', 1995, NULL, NULL, NULL)")
+    assert module["_plan"](turns, board, "daedalus") == []
+
+
+def test_backfill_revalidates_turn_after_backup(tmp_path, monkeypatch):
+    home, turns, board = _seed_backfill(tmp_path)
+    module = runpy.run_path(str(SCRIPT))
+    real_connect = sqlite3.connect
+
+    class BackupConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            result = super().execute(sql, parameters)
+            if sql.startswith("VACUUM INTO"):
+                # A provisional row changes after planning, before the update.
+                with real_connect(turns) as other:
+                    other.execute("UPDATE turns SET ts_end = 5001 WHERE turn_id = ?",
+                                  ("worker-7:task:tw",))
+            return result
+
+    def connect(database, *args, **kwargs):
+        if str(database) == str(turns):
+            kwargs["factory"] = BackupConnection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--home", str(home), "--board", str(board),
+                                     "--profile", "daedalus", "--apply"])
+    assert module["main"]() == 0
+    assert _host(turns, "tw") is None
     assert _host(turns, "tl") == "studio-local"
 
 

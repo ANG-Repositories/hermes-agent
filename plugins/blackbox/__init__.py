@@ -499,7 +499,13 @@ def _placement_host() -> str | None:
         # placement. Mixed-host runs cannot truthfully carry a single host.
         if kwh.reapply_failures():
             return None
-        return kwh.BOOT_PLACED_HOST or kwh.LOCAL_HOST_NAME
+        if kwh.BOOT_PLACED_HOST:
+            return kwh.BOOT_PLACED_HOST
+        # Unplaced workers can inherit a remote profile backend. Resolve through
+        # the same config bridge as terminal rather than assuming Studio-local.
+        from tools.terminal_tool import _get_env_config
+
+        return kwh.LOCAL_HOST_NAME if _get_env_config()["env_type"] == "local" else None
     except Exception:
         logger.debug("blackbox placement_host resolve failed", exc_info=True)
         return None
@@ -782,6 +788,7 @@ def _build_record(
         # A caller writing on another process's behalf (orphan repair) passes
         # the key explicitly so this process's placement is never stamped.
         placement_host=(
+            None if is_subagent else
             kwargs["placement_host"] if "placement_host" in kwargs else _placement_host()
         ),
         # An explicit marker names how a turn that never finished was closed

@@ -24,6 +24,7 @@ import json
 import sqlite3
 import sys
 from collections import Counter
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,17 +34,19 @@ LOCAL_HOST_NAME = "studio-local"  # hermes_cli.kanban_worker_hosts.LOCAL_HOST_NA
 WORKER_PLATFORMS = ("", "cli")
 
 
-def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]:
+def _plan(turns_db: Path, board_db: Path, profile: str, *,
+          turns_conn: sqlite3.Connection | None = None) -> list[tuple[str, str]]:
     with sqlite3.connect(board_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30) as board:
         run_cols = {r[1] for r in board.execute("PRAGMA table_info(task_runs)")}
         if "metadata" not in run_cols:
             return []  # No positive worker-session provenance in this board.
         runs = board.execute(
-            "SELECT started_at, COALESCE(ended_at, 9e18), host, metadata FROM task_runs "
+            "SELECT started_at, ended_at, host, metadata FROM task_runs "
             "WHERE profile = ?",
             (profile,),
         ).fetchall()
-    with sqlite3.connect(turns_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30) as conn:
+    with (nullcontext(turns_conn) if turns_conn is not None else
+          sqlite3.connect(turns_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
         if "placement_host" not in cols:
             sys.exit(f"{turns_db}: no placement_host column yet (deploy the schema first)")
@@ -64,11 +67,11 @@ def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]
         end = ts_end
         if end < ts_start:
             continue
-        overlapping = [(s, e, h, m) for s, e, h, m in runs if s <= end and ts_start <= e]
+        overlapping = [(s, e, h, m) for s, e, h, m in runs if s <= end and (e is None or ts_start <= e)]
         if len(overlapping) != 1:
             continue
         start, stop, host, metadata = overlapping[0]
-        if not (start <= ts_start <= stop) or not host or not host.strip():
+        if stop is None or not (start <= ts_start <= stop) or not host or not host.strip():
             continue
         try:
             provenance = json.loads(metadata or "null")
@@ -107,9 +110,13 @@ def main() -> int:
         conn.execute("VACUUM INTO ?", (str(backup),))
     print(f"backup={backup}")
     with sqlite3.connect(str(turns_db), timeout=30) as conn:
+        # The backup/plan may race provisional-row updates. Revalidate under the
+        # write lock so neither turn contents nor eligibility can change mid-apply.
+        conn.execute("BEGIN IMMEDIATE")
+        current = set(_plan(turns_db, args.board, args.profile, turns_conn=conn))
         cur = conn.executemany(
             "UPDATE turns SET placement_host = ? WHERE turn_id = ? AND placement_host IS NULL",
-            [(h, t) for t, h in plan],
+            [(h, t) for t, h in plan if (t, h) in current],
         )
         print(f"stamped={cur.rowcount}")
     return 0
