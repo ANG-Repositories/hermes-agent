@@ -193,17 +193,20 @@ def _js_hits(text: str, lang: str) -> int:
     root = parser.parse(source).root_node
     if root.has_error:
         raise ScanError(f"unreadable {lang} syntax: tree-sitter rejected source")
-    lines = text.splitlines()
     owners = set()
     statements = {"expression_statement", "lexical_declaration", "variable_declaration",
                   "return_statement", "throw_statement", "if_statement", "while_statement",
-                  "do_statement", "for_statement", "switch_statement"}
+                  "do_statement", "for_statement", "switch_statement", "field_definition",
+                  "public_field_definition", "assignment_pattern", "export_statement"}
     literals = {"string", "string_fragment", "comment", "regex"}
 
     def metric(node):
         stack = [node]
         while stack:
             item = stack.pop()
+            if item.type == "string" and item.parent is not None and item.parent.type == "subscript_expression":
+                if item.parent.child_by_field_name("index") == item and re.fullmatch(METRIC, item.text.decode()[1:-1]):
+                    return True
             if item.type in literals:
                 continue
             if item.type in ("identifier", "property_identifier") and re.fullmatch(METRIC, item.text.decode()):
@@ -211,9 +214,16 @@ def _js_hits(text: str, lang: str) -> int:
             stack.extend(item.named_children)
         return False
 
+    waived = set()
     stack = [(root, root)]
     while stack:
         node, owner = stack.pop()
+        if node.type == "comment" and WAIVER.encode() in node.text:
+            previous = node.prev_named_sibling
+            if previous is not None and previous.end_point.row == node.start_point.row:
+                owner = previous if previous.type in statements else owner
+            waived.add((owner.start_byte, owner.end_byte))
+            continue
         if node.type in literals:
             continue
         if node.type in statements:
@@ -221,17 +231,12 @@ def _js_hits(text: str, lang: str) -> int:
         if node.type == "binary_expression":
             op = node.child_by_field_name("operator")
             if op is not None and op.text in (b">", b"<", b">=", b"<=") and metric(node):
-                # A waiver belongs only to the owning statement, including its
-                # trailing comment, never a sibling inside an enclosing callback.
-                end = owner.end_point.row
-                if owner.type in ("if_statement", "while_statement", "do_statement", "for_statement", "switch_statement"):
-                    condition = owner.child_by_field_name("condition")
-                    if condition is not None:
-                        end = condition.end_point.row
-                if not any(WAIVER in line for line in lines[owner.start_point.row:end + 1]):
-                    owners.add((owner.start_byte, owner.end_byte))
+                # Expressions not enclosed by a known statement own themselves;
+                # they must never collapse into a whole-file/root allowance.
+                target = node if owner == root else owner
+                owners.add((target.start_byte, target.end_byte))
         stack.extend((child, owner) for child in node.named_children)
-    return len(owners)
+    return len(owners - waived)
 
 
 def _count_singly(lines) -> int:
