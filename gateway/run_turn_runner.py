@@ -2429,6 +2429,8 @@ class TurnRunner:
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
+            # /goal reads this to tell a productive iteration-limit handoff from a failed turn.
+            "turn_exit_reason": result.get("turn_exit_reason"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),

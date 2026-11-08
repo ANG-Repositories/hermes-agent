@@ -84,18 +84,18 @@ def test_blank_success_preserves_retry_recovery(tmp_path, monkeypatch, claimed):
         clock = deadline
         assert mgr.idle_wake_prompt(checkin_minutes=0)
     with patch.object(goals, "judge_goal") as judge:
-        decision = mgr.evaluate_after_turn("", turn_completed=True)
+        decision = mgr.evaluate_after_turn("", turn_completed=True, max_incomplete_turns=1)
     judge.assert_not_called()
     assert not decision["should_continue"]
     mgr = goals.GoalManager("blank-retry")
-    assert mgr.state.consecutive_incomplete_turns == 0
     assert mgr.state.incomplete_retry_wait
+    assert mgr.state.waiting_until == (deadline if not claimed else clock + 120)
     for _ in range(2):
-        clock = mgr.state.waiting_until
+        clock, prior = mgr.state.waiting_until, mgr.state.waiting_until - clock
         assert mgr.idle_wake_prompt(checkin_minutes=0)
-        mgr.evaluate_after_turn("", turn_completed=True)
+        mgr.evaluate_after_turn("", turn_completed=True, max_incomplete_turns=1)
         mgr = goals.GoalManager("blank-retry")
-        assert mgr.state.incomplete_retry_wait and mgr.state.waiting_until == clock + 60
+        assert mgr.state.incomplete_retry_wait and mgr.state.waiting_until - clock > prior
     assert mgr.idle_wake_prompt(mgr.state.waiting_until - 1, checkin_minutes=0) is None
     assert mgr.idle_wake_prompt(mgr.state.waiting_until, checkin_minutes=0)
 
@@ -248,3 +248,100 @@ async def test_iteration_handoff_is_counted_not_retried(tmp_path, monkeypatch, d
     assert mgr.state.turns_used == int(productive)
     assert judge.call_count == int(productive)
     assert mgr.state.status == ("paused" if productive else "active")
+
+
+def _run_sync_result(monkeypatch, raw):
+    """The real TurnRunner.run_sync reconstruction of an agent result (not the raw dict)."""
+    import gateway.run as gateway_run
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.session import SessionSource
+    from gateway.turn_context import TurnContext
+
+    monkeypatch.setattr(gateway_run, "_current_max_iterations", lambda: 1)
+    runner = SimpleNamespace(
+        _resolve_session_agent_runtime=lambda **_k: ("m", {"provider": "p"}),
+        _pre_agent_fallback_notice=None, _provider_routing=None,
+        _resolve_session_reasoning_config=lambda **_k: None,
+        _resolve_session_service_tier=lambda **_k: None,
+        _resolve_turn_agent_config=lambda *a: {},
+        _announce_and_persist_served_route=lambda **_k: None,
+        _get_system_prompt_for_channel=lambda *a, **k: "", _ephemeral_system_prompt="")
+    ctx = TurnContext(source=SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="dm"),
+                      session_key="slack:C1", user_config={}, message="continue")
+    turn = TurnRunner(runner, ctx)
+    agent = SimpleNamespace(model="m", provider="p")
+    ctx.agent_holder[0] = agent
+    stubs = {
+        "_setup_stream_consumer": lambda *_a: (None, None, None, False),
+        "_resolve_turn_agent": lambda *_a: (agent, True),
+        "_wire_turn_agent_callbacks": lambda *_a, **_k: None,
+        "_load_turn_history": lambda *_a: ([], None, []),
+        "_prepare_turn_message": lambda *_a, **_k: (None, None),
+        "_run_conversation_with_approval": lambda *_a: dict(raw),
+        "_finish_stream_consumer": lambda *_a: None,
+        "_sync_session_after_run": lambda *_a: (False, None, 0),
+        "_announce_chat_pin_mismatch": lambda *_a: None,
+        "_append_auto_media_tags": lambda text, *_a: text,
+    }
+    for name, fn in stubs.items():
+        monkeypatch.setattr(turn, name, fn)
+    return turn.run_sync()
+
+
+@pytest.mark.asyncio
+async def test_run_sync_iteration_handoff_reaches_goal_judge(tmp_path, monkeypatch):
+    """Production boundary: the handoff exit reason survives TurnRunner.run_sync into the goal hook."""
+    from gateway.run_turn import GatewayTurnMixin
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {"completed": False, "failed": False, "interrupted": False, "api_calls": 1,
+           "turn_exit_reason": "max_iterations_reached(1/1)", "final_response": "saved implementation"}
+    result = _run_sync_result(monkeypatch, raw)
+    assert result["turn_exit_reason"] == raw["turn_exit_reason"]
+    runner = GatewayGoalsMixin()
+    runner.config = {}
+    runner._run_in_executor_with_context = asyncio.to_thread
+    runner.async_session_store = SimpleNamespace(get_or_create_session=AsyncMock(
+        return_value=SimpleNamespace(session_id="runsync")))
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._delivery_adapter_for = lambda source: None
+    runner._session_key_for_source = lambda source: "test"
+    event = SimpleNamespace(text="[Continuing toward your standing goal]\nGoal: ship it", internal=True)
+    with patch("gateway.run_turn.diagnostic_wake_muted", return_value=True):
+        await GatewayTurnMixin()._hmwa_deliver_turn_response(
+            event, None, None, "test", 1, result, [], "", "", False)
+    mgr = await asyncio.to_thread(goals.GoalManager, "runsync")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
+    with patch.object(goals, "judge_goal", return_value=("continue", "more", False, None, False)) as judge:
+        await runner._run_post_turn_hooks(
+            agent_result=result, source=SimpleNamespace(chat_id="origin"), is_internal=True,
+            event=event, parts=("goal continuation",))
+    mgr = await asyncio.to_thread(goals.GoalManager, "runsync")
+    assert judge.call_count == 1
+    assert (mgr.state.turns_used, mgr.state.status, mgr.state.consecutive_incomplete_turns) == (1, "paused", 0)
+
+
+def test_blank_retry_successes_are_bounded(tmp_path, monkeypatch):
+    """Blank/silent retry turns back off and charge the turn budget; they never loop every 60s."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mgr = goals.GoalManager("blank-bound")
+    mgr.set("ship it", max_turns=4)
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+    delays, wakes = [], 0
+    with patch.object(goals, "judge_goal") as judge:
+        while mgr.state.status == "active" and wakes < 20:
+            clock = mgr.state.waiting_until
+            assert mgr.idle_wake_prompt(checkin_minutes=0)
+            wakes += 1
+            mgr.evaluate_after_turn("", turn_completed=True, max_incomplete_turns=1)
+            mgr = goals.GoalManager("blank-bound")
+            if mgr.state.status == "active":
+                delays.append(mgr.state.waiting_until - clock)
+    judge.assert_not_called()
+    assert mgr.state.status == "paused" and mgr.state.turns_used == 4
+    assert wakes == 4
+    assert delays == sorted(delays) and delays[-1] > delays[0]
+    assert mgr.idle_wake_prompt(clock + 7200, checkin_minutes=0) is None

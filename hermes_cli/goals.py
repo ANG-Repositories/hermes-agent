@@ -1902,11 +1902,25 @@ class GoalManager:
         blank_success = turn_completed and not last_response.strip()
         retry_recovery = state.incomplete_retry_wait or (
             bool(state.idle_wake_attempt) and state.idle_wake_attempt.startswith("retry:"))
+        if blank_success and retry_recovery and not human_message:
+            # A blank/muted/[SILENT] success queues no successor and proves no progress: keep a
+            # pending recovery timer, and charge a claimed retry like a failure (streak backoff +
+            # turn budget) so silent retries can never loop at a fixed cadence.
+            if not state.incomplete_retry_wait:
+                state.consecutive_incomplete_turns += 1
+                state.turns_used += 1
+                state.last_turn_at = time.time()
+                if state.turns_used >= state.max_turns:
+                    state.clear_wait()
+                    return self._budget_pause(state, "skipped", "empty completed retry")
+                excess = state.consecutive_incomplete_turns - max(1, int(max_incomplete_turns))
+                self._park("empty completed retry", incomplete_retry_wait=True,
+                           waiting_until=time.time() + min(1800, 60 * 2 ** min(max(excess, 0), 5)))
+            return _decision("active", False, None, "skipped", "empty completed response", "")
         if (state.consecutive_incomplete_turns or retry_recovery) and (turn_completed or human_message):
             state.consecutive_incomplete_turns = 0
-            # A blank/muted success queues no successor: keep its recovery timer, or
-            # re-park a claimed retry. Resetting the streak must not strand the goal.
             if blank_success and retry_recovery:
+                # A human's blank turn resets the streak but must not strand a claimed retry.
                 if not state.incomplete_retry_wait:
                     self._park("empty completed retry", waiting_until=time.time() + 60,
                                incomplete_retry_wait=True)
