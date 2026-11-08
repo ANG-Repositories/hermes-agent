@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 def reject_background_admission(*, reason, children, task_list, live_deleg_id, live_writers,
                                 dispatch=None):
     from hermes_cli.observability.shared_metrics_loop import finish_delegation_unit
-    from tools.delegate_tool import _teardown
+    from tools.delegate_tool import _door_lock, _door_slot, _teardown
     from tools.delegation_live_log import update_manifest_statuses
 
     results = []
@@ -24,7 +24,13 @@ def reject_background_admission(*, reason, children, task_list, live_deleg_id, l
             logger.warning("Rejected delegation cleanup failed: %s", label, exc_info=True)
 
     for index, child in enumerate(children):
-        cleanup(f"child_{index}", lambda: _teardown(child, "admission_rejected"))
+        def close_child():
+            _teardown(child, "admission_rejected")
+            # False from teardown also means an idempotent already-closed no-op.
+            with _door_lock:
+                return _door_slot(child)["closed"]
+
+        cleanup(f"child_{index}", close_child)
         entry = {"task_index": index, "status": "rejected", "reason": reason,
                  "summary": "Background admission rejected; child did not start.",
                  "api_calls": 0, "duration_seconds": 0.0}

@@ -232,3 +232,25 @@ def test_cleanup_fault_preserves_truthful_nonstart(admission, monkeypatch, targe
     assert result["cleanup_pending"] == [label]
     assert not entered.is_set()
     assert not ad._records
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_rejection_cleanup_distinguishes_closed_from_deferred(monkeypatch, held):
+    from tools import delegate_tool as dt
+    from tools.delegate_tool_admission import reject_background_admission
+
+    child = Mock()
+    if held:
+        assert dt._hold_run(child)
+    else:
+        assert dt._teardown(child, "already_closed")
+    try:
+        result = json.loads(reject_background_admission(
+            reason="pool_capacity", children=[child], task_list=[{"goal": "test"}],
+            live_deleg_id=None, live_writers=[]))
+        assert result.get("cleanup_pending", []) == (["child_0"] if held else [])
+        assert child.close.call_count == (0 if held else 1)
+    finally:
+        if held:
+            dt._release_hold(child, run=True)
+    assert child.close.call_count == 1
