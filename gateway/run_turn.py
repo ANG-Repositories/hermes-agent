@@ -4864,22 +4864,16 @@ class GatewayTurnMixin:
             ):
                 break
             _elapsed_mins = int((time.time() - _notify_start) // 60)
-            # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
+            # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail. A call in
+            # flight >= 1 min shows its elapsed time (+ delegate children) instead of the bare tool name.
+            from gateway.inflight_tool_status import heartbeat_status_detail
             _status_detail = ""
             _want_iteration_detail = bool(
                 disp.resolve_display_setting(disp.user_config, disp.platform_key, "busy_ack_detail", True)
             )
             _a = self._agent_activity_summary(agent_holder[0])
             with suppress(Exception):
-                if _a:
-                    _parts = []
-                    if _want_iteration_detail:
-                        _parts.append(format_iteration_progress(_a["api_call_count"], _a["max_iterations"]))
-                    _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                    if _action:
-                        _parts.append(str(_action))
-                    if _parts:
-                        _status_detail = " — " + ", ".join(_parts)
+                _status_detail = heartbeat_status_detail(_a, agent_holder[0], _want_iteration_detail)
             _heartbeat_text = (
                 disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
