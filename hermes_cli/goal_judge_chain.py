@@ -67,6 +67,13 @@ def _cleanup_finished(home, timeout=0):
 
 def _stop(proc, home, deadline, finished):
     """Retain ownership until reaped; a stuck kill must not hold the judge caller."""
+    if proc.returncode is not None:
+        # communicate() already reaped this worker; thread scheduling must not
+        # turn a completed response into cleanup_pending on a busy host.
+        with _CLEANUP_LOCK:
+            _CLEANUPS.pop(home, None)
+            finished.set()
+        return True
     def reap():
         from agent.deadline import kill_process_tree
         while True:

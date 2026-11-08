@@ -268,6 +268,17 @@ def test_worker_failure_advances_without_false_completion(tmp_path, monkeypatch,
     assert result[0] == 'blocked' and not result[2] and not result[4]
 
 
+def test_already_reaped_worker_does_not_wait_for_cleanup_thread(tmp_path, monkeypatch):
+    from hermes_cli import goal_judge_chain as chain
+    from types import SimpleNamespace
+    finished = threading.Event()
+    home = str(tmp_path)
+    chain._CLEANUPS[home] = finished
+    monkeypatch.setattr(chain.threading, 'Thread', lambda **kw: pytest.fail('already reaped'))
+    assert chain._stop(SimpleNamespace(returncode=0), home, time.monotonic(), finished)
+    assert finished.is_set() and home not in chain._CLEANUPS
+
+
 @pytest.mark.parametrize('cancel', [False, True])
 def test_stuck_cleanup_retains_owner_and_inhibits_retry(tmp_path, monkeypatch, cancel):
     from hermes_cli import goal_judge_chain as chain
