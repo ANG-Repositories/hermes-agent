@@ -124,6 +124,57 @@ async def test_human_fold_releases_internal_commentary_before_final():
         adapter.send.side_effect = original_send
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth_cap", [False, True])
+async def test_receiving_turn_policy_survives_queued_return(monkeypatch, tmp_path, depth_cap):
+    from tests.gateway.test_queued_followup_turn_clock_and_leftover_steer import _drive, SESSION_KEY, _source
+    from gateway.platforms.event import MessageEvent
+    from gateway.turn_context import TurnContext
+
+    contexts = []
+    runner_ref = []
+    previous = TurnContext(persist_user_display_kind="internal_notification")
+
+    def prepare(runner):
+        runner_ref.append(runner)
+        runner._MAX_INTERRUPT_DEPTH = 0 if depth_cap else 5
+        runner._session_state(SESSION_KEY).turn.event = MessageEvent(
+            text="opening", source=_source(), reply_expected=False, internal=True)
+        build = runner._run_agent_build_turn_context
+
+        def build_turn(*args, **kwargs):
+            # Reused agent identity can still be published while its old ctx is present.
+            runner._session_state(SESSION_KEY).turn.ctx = previous
+            kwargs["persist_user_display_kind"] = "internal_notification"
+            kwargs["reply_expected"] = True
+            ctx, turn_runner, adapter = build(*args, **kwargs)
+            contexts.append(ctx)
+            return ctx, turn_runner, adapter
+
+        runner._run_agent_build_turn_context = build_turn
+
+    def script(idx, queue_followup):
+        runner = runner_ref[0]
+        ctx = contexts[-1]
+        # Do not wait for the 50ms tracker: steer can arrive before its next tick.
+        agent = ctx.agent_holder[0]
+        runner._session_state(SESSION_KEY).turn.agent = agent
+        runner._fold_into_running_turn(agent, SESSION_KEY, MessageEvent(
+            text="human steer", source=_source(), reply_expected=False))
+        if idx == 0:
+            queue_followup("queued")
+        return {"final_response": "NO_REPLY", "messages": [], "api_calls": 1}
+
+    _, _, _, result = await _drive(monkeypatch, tmp_path, script, prepare=prepare)
+    assert not previous.human_engaged, "steer promoted the previous cached-agent context"
+    assert all(ctx.human_engaged for ctx in contexts)
+    assert all(ctx.reply_expected is True for ctx in contexts), "opening event overwrote receiving obligation"
+    assert all(ctx.persist_user_display_kind == "internal_notification" for ctx in contexts)
+    prefix = "effective" if depth_cap else "queued_terminal"
+    assert result[prefix + "_display_kind"] is None
+    assert result[prefix + "_reply_expected"] is True
+
+
 @pytest.mark.parametrize("case", ["internal", "heartbeat", "stale", "wrong_agent", "muted", "scheduled", "display_off"])
 def test_fold_promotion_guards(case):
     from gateway.run_busy import GatewayBusySessionMixin

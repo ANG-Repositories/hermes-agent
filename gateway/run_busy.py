@@ -855,13 +855,15 @@ class GatewayBusySessionMixin:
         turn = self._session_state(session_key).turn
         if turn.agent is not running_agent:
             return None
-        ctx = turn.ctx
+        ctx = getattr(running_agent, "_gateway_receiving_turn_context", turn.ctx)
         if ctx is not None and ctx._run_still_current is not None and not ctx._run_still_current():
             return None
         if turn.event is not None and turn.event is not event:
             turn.event.absorb_reply_expected(event)
-            if turn.ctx is not None:
-                turn.ctx.reply_expected = turn.event.reply_expected
+        # The slot event can be the opening event of a recursive queue chain.
+        # Merge into the receiving context, never copy policy back from that parent.
+        if ctx is not None and ctx.reply_expected is not True and event.reply_expected is not False:
+            ctx.reply_expected = event.reply_expected
         if ctx is not None and not getattr(event, "internal", False):
             from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
             if not is_machinery_display_kind(display_kind_for_event(event)):

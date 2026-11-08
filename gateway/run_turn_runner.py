@@ -1669,6 +1669,9 @@ class TurnRunner:
             agent.stream_delta_callback = None
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
+        # Bind policy synchronously before accepting steering; the async slot tracker
+        # may still hold the previous context when this cached agent is reused.
+        agent._gateway_receiving_turn_context = ctx
         ctx.agent_holder[0] = agent  # interrupt support
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)

@@ -5007,6 +5007,12 @@ class GatewayTurnMixin:
 
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
+            # Export before any queued/depth-cap/stale-goal return. Both values
+            # can be returned by the follow-up helper and need this turn's policy.
+            for turn_result in (response, result):
+                if isinstance(turn_result, dict):
+                    turn_result["effective_display_kind"] = turn_ctx.effective_display_kind
+                    turn_result["effective_reply_expected"] = turn_ctx.reply_expected
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             if (turn_ctx.run_generation is not None and session_key
