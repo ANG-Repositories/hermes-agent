@@ -2152,6 +2152,11 @@ def _build_child_agent(
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     child._boomerang_route_source = ("live-parent" if inherit_parent_route else
                                      "explicit-child" if explicit_child_route else "delegation-default")
+    child._boomerang_route_provenance = (
+        "session-rehydrated" if inherit_parent_route
+        and getattr(parent_agent, "_boomerang_route_source", None) == "session-rehydrated"
+        else child._boomerang_route_source
+    )
     child._boomerang_parent_route = {
             "source": "parent", "model": rt["model"],
             "provider": rt.get("requested_provider") or rt["provider"], "api_mode": rt["api_mode"],
@@ -2167,7 +2172,7 @@ def _build_child_agent(
         "boomerang.route delegation=%s owner=%s child=%s requested=%s effective=%s source=%s provider=%s model=%s fallbacks=%d disabled=%s",
         delegation_id or "-", parent_sid or "-", getattr(child, "session_id", "-"),
         inherit_mode or ("summary" if inherit_context else "none"), mode or "none",
-        child._boomerang_route_source, rt.get("requested_provider") or rt.get("provider"),
+        child._boomerang_route_provenance, rt.get("requested_provider") or rt.get("provider"),
         rt.get("model"), len(rt.get("fallback_model") or []), not bool(rt.get("fallback_model")),
     )
     if mode == "fork":

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import kanban_boomerang_wake as wake
+import run_agent  # Load bootstrap before the per-test home-I/O guard.
 
 
 def test_cold_parent_uses_session_identity_and_effective_policy(monkeypatch):
@@ -22,7 +23,8 @@ def test_cold_parent_uses_session_identity_and_effective_policy(monkeypatch):
         _pre_agent_fallback_notice="foreground-notice",
     )
     monkeypatch.setattr("run_agent.AIAgent", lambda **kw: (seen.update(kw) or SimpleNamespace()))
-    wake._db_parent(runner, home)
+    parent = wake._db_parent(runner, home)
+    assert parent._boomerang_route_source == "session-rehydrated"
     assert seen["model"] == "pinned-model"
     assert seen["fallback_model"] == chain
     assert calls[0]["session_key"] == home.session_key

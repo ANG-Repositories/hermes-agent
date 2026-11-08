@@ -45,7 +45,7 @@ def test_detached_two_profile_process_isolation(tmp_path):
                        TOKIO_WORKER_THREADS="2", PYTHONPATH=str(Path(__file__).resolve().parents[2]))
             log = stack.enter_context((job / "child.log").open("w"))
             proc = subprocess.Popen([sys.executable, str(Path(__file__).parent / "fixtures/boomerang_detached_child.py"), str(job)],
-                                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                    env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(proc)
             cases.append((name, sentinel, key, trace, job, proc))
         try:

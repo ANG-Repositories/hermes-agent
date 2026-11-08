@@ -1253,6 +1253,7 @@ def _db_parent(runner: Any, home: Any) -> Any:
     kw["fallback_model"] = runner._refresh_fallback_model()
     agent = AIAgent(**kw, session_id=getattr(home, "session_id", None), quiet_mode=True,
                     skip_memory=True, skip_context_files=True)
+    agent._boomerang_route_source = "session-rehydrated"
     agent._session_messages = runner.session_store.load_transcript(home.session_id)
     return agent
 
