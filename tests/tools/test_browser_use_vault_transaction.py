@@ -108,7 +108,7 @@ def test_isolated_probe_real_installed_harness_ipc(monkeypatch, tmp_path):
     import zipfile
     import tempfile
     from pathlib import Path
-    wheel = Path(__file__).resolve().parents[3] / 'deps/browser_harness-0.1.13-py3-none-any.whl'
+    wheel = Path(__file__).resolve().parents[2] / 'deps/browser_harness-0.1.13-py3-none-any.whl'
     site = tmp_path / 'site'
     if wheel.exists():
         with zipfile.ZipFile(wheel) as archive:
