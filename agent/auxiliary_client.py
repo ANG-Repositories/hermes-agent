@@ -5846,7 +5846,11 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         return _route_client(req, client, final_model)
     # Try custom first, then API-key providers (Codex excluded here:
     # falling through to Codex with no model is a stale-constant trap).
-    for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+    from agent.auxiliary_attempt import single_attempt_config
+    resolvers = (_try_custom_endpoint,) if single_attempt_config(req.task) is not None else (
+        _try_custom_endpoint, _resolve_api_key_provider,
+    )
+    for try_fn in resolvers:
         client, default = try_fn()
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)

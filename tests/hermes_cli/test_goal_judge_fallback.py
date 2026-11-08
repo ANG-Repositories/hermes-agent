@@ -34,7 +34,7 @@ def endpoint():
             self.end_headers()
             self.wfile.write(json.dumps({'id': 'test', 'model': model, 'choices': [
                 {'index': 0, 'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': value}}
-            ]}).encode())
+            ], 'usage': {'prompt_tokens': 11, 'completion_tokens': 3, 'total_tokens': 14}}).encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -97,7 +97,7 @@ def test_malformed_cannot_complete_and_success_resets(tmp_path, monkeypatch, end
 def test_profile_chain_isolation(tmp_path, monkeypatch, endpoint):
     from hermes_constants import set_hermes_home_override
     url, calls, replies = endpoint
-    replies['primary'] = '{"verdict":"continue","reason":"valid"}'
+    replies['primary'] = '{"verdict":"continue","reason":"確認 — café 🚀"}'
     for name in ('a', 'b', 'a'):
         home = tmp_path / name
         configure(home, url)
@@ -105,11 +105,56 @@ def test_profile_chain_isolation(tmp_path, monkeypatch, endpoint):
         try:
             result = goals.judge_goal('verify', 'evidence')
             assert result[0] == 'continue' and not result[2] and not result[4]
+            assert result[1] == '確認 — café 🚀'
             from agent.auxiliary_client import _client_cache_key
             assert str(home) in str(_client_cache_key('custom', async_mode=False, model='primary'))
         finally:
             set_hermes_home_override(None)
     assert calls == ['primary', 'primary', 'primary']
+
+
+def test_single_attempt_custom_does_not_discover_cloud(monkeypatch):
+    from agent import auxiliary_client as ac
+    from agent.auxiliary_attempt import single_attempt
+    cloud = []
+    monkeypatch.setattr(ac, '_try_custom_endpoint', lambda: (None, None))
+    monkeypatch.setattr(ac, '_resolve_api_key_provider', lambda: cloud.append(True) or (None, None))
+    for provider in ('custom', 'ollama'):
+        with single_attempt('goal_judge', dict(provider=provider, model='local-model')):
+            client, _ = ac.resolve_provider_client(provider, 'local-model', task='goal_judge')
+            assert client is None
+    assert cloud == []
+
+
+def test_child_usage_reaches_parent_session_and_ledger(tmp_path, monkeypatch, endpoint):
+    from agent import aux_accounting as accounting
+    import agent.chat_completion_helpers as helpers
+    from unittest.mock import Mock
+    url, calls, replies = endpoint
+    configure(tmp_path, url)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    replies['primary'] = '{}'
+    replies['sol'] = '{"verdict":"continue","reason":"valid"}'
+    db = Mock()
+    ledger = Mock()
+    monkeypatch.setattr(helpers, '_emit_aux_api_call_record', ledger)
+    session_token = accounting.set_accounting_context(db, 'owned-session')
+    ledger_token = accounting.set_blackbox_turn(object(), 'owned-turn')
+    try:
+        result = goals.judge_goal('verify', 'evidence')
+    finally:
+        accounting.reset_blackbox_turn(ledger_token)
+        accounting.reset_accounting_context(session_token)
+    assert result[0] == 'continue' and not result[2] and not result[4]
+    assert calls == ['primary', 'sol']
+    assert db.record_auxiliary_usage.call_count == ledger.call_count == 2
+    assert [call.kwargs['model'] for call in db.record_auxiliary_usage.call_args_list] == calls
+    for call in db.record_auxiliary_usage.call_args_list:
+        assert call.args == ('owned-session', 'goal_judge')
+        assert call.kwargs['input_tokens'] == 11
+        assert call.kwargs['output_tokens'] == 3
+    assert [call.kwargs['model'] for call in ledger.call_args_list] == calls
+    assert all(call.kwargs['usage'].input_tokens == 11 for call in ledger.call_args_list)
 
 
 def test_deadline_and_cancel_reap_request_owner(tmp_path, monkeypatch):

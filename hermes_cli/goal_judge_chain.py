@@ -105,12 +105,14 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
         _CLEANUPS[home] = finished
     try:
         env = served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
+        env['PYTHONIOENCODING'] = 'utf-8'
         payload = json.dumps(dict(route=route, messages=messages, max_tokens=max_tokens))
         # -m uses THIS source checkout, not the installed runtime's editable root.
         proc = subprocess.Popen(
             [sys.executable, '-m', 'hermes_cli.goal_judge_chain'],
             cwd=str(Path(__file__).resolve().parent.parent), env=env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding='utf-8',
         )
     except (OSError, ValueError, TypeError):
         with _CLEANUP_LOCK:
@@ -146,6 +148,8 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
                         'ok', 'unavailable', 'timeout', 'invalid_output', 'configuration', 'request_error',
                     } or (outcome.get('category') == 'ok' and not isinstance(outcome.get('content'), str)):
                         outcome = dict(category='worker_error')
+                from agent.aux_accounting import replay_aux_accounting
+                replay_aux_accounting(outcome.pop('accounting', []))
                 break
             except subprocess.TimeoutExpired:
                 pending = None
@@ -188,6 +192,14 @@ def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=N
 
 
 def _worker(payload):
+    from agent.aux_accounting import capture_aux_accounting
+    with capture_aux_accounting() as accounting:
+        result = _worker_result(payload)
+    result['accounting'] = accounting
+    return result
+
+
+def _worker_result(payload):
     from agent.auxiliary_attempt import single_attempt
     from agent.auxiliary_client import call_llm
     from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
