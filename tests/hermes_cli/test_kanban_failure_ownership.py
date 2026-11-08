@@ -227,6 +227,83 @@ def test_pending_limit_is_per_producer(board, monkeypatch):
     assert board.execute("SELECT count(*) FROM failure_bindings WHERE state='pending'").fetchone()[0] == 0
 
 
+def assert_responsibility(conn):
+    for episode in conn.execute("SELECT * FROM failure_episodes WHERE state='active'"):
+        bindings = conn.execute("SELECT * FROM failure_bindings WHERE episode_id=? AND state IN ('bound','pending')",
+                                (episode['episode_id'],)).fetchall()
+        assert len(bindings) == 1
+        assert json.loads(bindings[0]['provenance_json']).get('producer') in fo.PRODUCERS
+
+
+@pytest.mark.parametrize('order', list(itertools.permutations(range(3))))
+@pytest.mark.parametrize('task_kind', ['repair', 'diagnostic'])
+def test_pending_boundary_continuity(board, order, task_kind):
+    enroll(board)
+    values = [observation('A', task_kind=task_kind),
+              observation('B', 'pass', 'b', run_id=2),
+              observation('C', 'failure', 'c', run_id=3, task_kind=task_kind)]
+    for index in order:
+        fo.observe_failure(board, publish(board, values[index]), producer='ci-red-owner')
+        assert_responsibility(board)
+    card = fo.prepare_card(board, title='repair', body='action and acceptance', assignee=None, session_id='operator')
+    result, = fo.reconcile_pending(board, producer='ci-red-owner', card_spec=card)
+    assert result.action == task_kind.upper()
+    assert_responsibility(board)
+    assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='healed'").fetchone()[0] == 1
+
+
+def test_disabled_replay_after_enrollment(board):
+    obs = observation()
+    assert admit(board, obs).action == 'DISABLED'
+    enroll(board)
+    result = admit(board, obs)
+    assert result.action == 'REPAIR'
+    assert_responsibility(board)
+    assert admit(board, obs).action == 'REPLAY'
+    assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('order', list(itertools.permutations(range(3))))
+def test_delayed_prefix_keeps_verified_boundary(board, order):
+    enroll(board)
+    values = [replace(observation('A'), lineage=('a'*40,)),
+              observation('B', 'pass', 'b', run_id=2),
+              observation('C', 'failure', 'c', run_id=3)]
+    for index in order:
+        admit(board, values[index])
+        assert_responsibility(board)
+    assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='healed'").fetchone()[0] == 1
+    assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0] == 1
+
+
+def test_incomparable_pass_does_not_resurrect_healed_red(board):
+    enroll(board)
+    admit(board, observation())
+    admit(board, observation('B', 'pass', 'b', run_id=2))
+    unrelated = replace(observation('unrelated', 'pass', 'x', run_id=3), lineage=('x'*40,))
+    result = admit(board, unrelated)
+    assert result.action == 'HEALED'
+    assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0] == 0
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('task_kind', ['repair', 'diagnostic'])
+def test_adoption_detach_keeps_routable_identity(board, task_kind):
+    enroll(board)
+    obs = observation(task_kind=task_kind)
+    original = admit(board, obs)
+    adopted_card = kb.create_task(board, title='human repair', session_id='operator', session_explicit=True)
+    adopted = fo.adopt_owner(board, original.episode_id, adopted_card,
+                             expected_revision=original.revision, provenance_ref=publish(board, obs))
+    assert_responsibility(board)
+    fo.detach_owner(board, adopted.episode_id, expected_revision=adopted.revision, reason='replace')
+    assert_responsibility(board)
+    card = fo.prepare_card(board, title='repair', body='action and acceptance', assignee=None, session_id='operator')
+    result, = fo.reconcile_pending(board, producer='ci-red-owner', card_spec=card)
+    assert result.action == task_kind.upper()
+    assert_responsibility(board)
+
+
 def test_publication_failure_no_receipt_or_owner(board,monkeypatch):
     def fail(*args):
         raise OSError('injected durable publication failure')
