@@ -392,7 +392,7 @@ def test_shutdown_watchdog_preserves_resume_and_spool(tmp_path, mode, negative):
     store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
     entry = store.lookup_by_session_key(build_session_key(_make_event().source))
     assert entry.resume_pending == (negative != "no-mark")
-    payloads = [p.read_text() for p in tmp_path.rglob("*.json")]
+    payloads = [p.read_text() for p in (tmp_path / "gateway/restart_followups").glob("*.json")]
     held = any("held queue survives" in p and "queue_held" in p for p in payloads)
     adapter = any("adapter queue survives" in p for p in payloads)
     assert held == adapter == (negative != "no-spool")
