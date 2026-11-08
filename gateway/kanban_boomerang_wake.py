@@ -581,11 +581,15 @@ def card_snapshot(board: Optional[str], task_id: str) -> dict:
         top = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
                            (task_id,)).fetchone()[0]
         pr, head = _pr_and_head(kb, conn, task_id)
+        last_comment = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
     finally:
         conn.close()
     return {"status": getattr(task, "status", None), "assignee": getattr(task, "assignee", None),
             "top_event_id": int(top or 0), "pr": pr, "head": head,
-            "card_text": [getattr(task, "title", None), getattr(task, "body", None)]}
+            "card_text": [getattr(task, "title", None), getattr(task, "body", None)],
+            "last_comment": int(last_comment)}
 
 
 # --- delegation ledger (boomerang skill Step 0 shape) -------------------------------------
@@ -882,6 +886,10 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                 if not isinstance(assessed_text, list) or len(assessed_text) != 2:
                     raise RuntimeError("assessed card text unavailable")
                 kwargs["expect_card_text"] = tuple(assessed_text)
+                last_comment = entry.get("assessed_last_comment")
+                if not isinstance(last_comment, int):
+                    raise RuntimeError("assessed comment revision unavailable")
+                kwargs["expect_last_comment"] = last_comment
             if not kb.unblock_task(conn, tid, **kwargs):
                 raise RuntimeError("unblock refused")
         elif status in ("ready", "todo"):
@@ -1240,8 +1248,15 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
     from gateway import kanban_owner_wake as _ow
 
     try:
+        home_sid = entry.get("home_sid") or ""
+        if entry.get("kind") == "blocked":
+            from hermes_cli import kanban_db as kb
+
+            current = await asyncio.to_thread(_ow.read_card, kb, entry.get("board"), entry["task_id"])
+            # Never fall back to a former owner when a card was rehomed or lost its home.
+            home_sid = (current or {}).get("session_id") or ""
         home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
-                                       entry.get("home_sid") or "", _hr.read_session_row)
+                                       home_sid, _hr.read_session_row)
         if home is None or not _ow.is_chat_origin(home):
             logger.warning("kanban boomerang-wake: no live home for %s; wake not re-surfaced", entry.get("task_id"))
             return False
@@ -1501,6 +1516,7 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         "status": snap["status"], "assignee": snap["assignee"], "pr": snap["pr"], "head": snap["head"],
         "cursor_event_id": max(int(event_id), snap["top_event_id"]),
         "assessed_card_text": snap["card_text"],
+        "assessed_last_comment": snap["last_comment"],
         "home_sid": home_sid or "", "route": dict(route or {}), "path": path,
         "title": str(_field(task, "title") or "")[:160], "wake_text": wake_text,
         "verdict_nonce": secrets.token_hex(8), "delegation_id": mint_delegation_id(),

@@ -396,6 +396,97 @@ def test_block_api_subscription_with_chat_home_keeps_native_wake(env):
     assert not env["dispatched"]
 
 
+@pytest.mark.parametrize("block_kind", ["capability", "transient"])
+@pytest.mark.parametrize("auto,on", [(True, True), (False, True), (True, False)])
+def test_block_owner_only_admission(env, block_kind, auto, on):
+    _config(on)
+    tid = _card(env, auto=auto)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": block_kind, "reason": "service offline"})
+    assert _tick(env) == []
+    assert len(env["dispatched"]) == int(auto and on)
+    if auto and on:
+        entry = env["dispatched"][0]
+        assert entry["path"] == "owner-wake"
+        _run(env, entry, "completed", _verdict(entry, "surface", summary="service still offline"))
+        assert len(env["adapter"].handled) == 1
+    _tick(env)
+    assert len(env["dispatched"]) == int(auto and on)
+
+
+@pytest.mark.parametrize("timing", ["before_verdict", "inside_unblock"])
+def test_block_withdrawn_comment_authority(env, timing):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+        kb.add_comment(conn, tid, "operator", "Retry once service is healthy")
+    _tick(env)
+    entry = env["dispatched"][0]
+    def withdraw():
+        with kb.connect_closing() as other:
+            kb.add_comment(other, tid, "operator", "Approval withdrawn; do not retry")
+    if timing == "before_verdict":
+        withdraw()
+    else:
+        original = kb.unblock_task
+        def race(conn, task_id, **kwargs):
+            withdraw()
+            return original(conn, task_id, **kwargs)
+        env["monkeypatch"].setattr(kb, "unblock_task", race)
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["probe healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "probe healthy"}))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert len(env["adapter"].handled) == 1
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_block_escalation_follows_rehome(env, pending):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "capability"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    new_home = env["runner"].session_store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id="new-owner-chat", chat_type="group", user_id=HUMAN))
+    real_deliver = ow.deliver_turn
+    targets = []
+    async def deliver(runner, home, text, cards):
+        targets.append(home.session_key)
+        return await real_deliver(runner, home, text, cards)
+    env["monkeypatch"].setattr(ow, "deliver_turn", deliver)
+    final = _verdict(entry, "surface", summary="missing capability")
+    if pending:
+        async def refuse(*args, **kwargs):
+            return False
+        env["monkeypatch"].setattr(ow, "deliver_turn", refuse)
+        _run(env, entry, "completed", final)
+        assert ah.BoomerangWakeState().handbacks()
+        env["monkeypatch"].setattr(ow, "deliver_turn", deliver)
+    if pending:
+        # A temporarily unhomed card retains the obligation, never uses the old home.
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET session_id = NULL WHERE id = ?", (tid,))
+        asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
+        assert targets == []
+        assert ah.BoomerangWakeState().handbacks()
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET session_id = ? WHERE id = ?", (new_home.session_key, tid))
+    if pending:
+        asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
+    else:
+        _run(env, entry, "completed", final)
+    asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
+    assert targets == [new_home.session_key]
+    assert len(env["adapter"].handled) == 1
+    assert not ah.BoomerangWakeState().handbacks()
+
+
 def test_block_claim_concurrent_budget(env):
     state = ah.BoomerangWakeState()
     barrier = threading.Barrier(2)
