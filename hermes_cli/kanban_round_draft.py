@@ -237,7 +237,8 @@ def run_from_env() -> dict:
         from hermes_cli import kanban_db as _kb
         with _kbc.connect_closing() as conn:
             task = _kb.get_task(conn, task_id)
-            if (task is None or str(task.current_run_id) != run_id
+            claim = _kb._latest_event(conn, task_id, "claimed", int(run_id))
+            if (task is None or task.status != "running" or str(task.current_run_id) != run_id or claim is None
                     or _kb._retry_status_for_run(conn, task_id, int(run_id)) == "review"):
                 return {}
             records = flip_records(conn, task_id)
