@@ -204,6 +204,9 @@ def test_sigkill_escalation_reaches_a_tool_that_outlived_its_leader(_isolated, t
 
 # ── 2d058dbbdb27: a spawned child is never lost to a pid.json failure ──────
 def test_pid_file_failure_after_popen_still_returns_the_live_child(_isolated, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
+                        lambda command, **kw: SimpleNamespace(mode="in_process", argv=command))
     real_popen = subprocess.Popen
 
     def _popen(argv, **kwargs):
@@ -643,6 +646,9 @@ def test_the_detached_worker_refuses_a_process_handoff_it_cannot_deliver(tmp_pat
 
 # 65089d8d2a59: the worker runs PM's dependency boot (lease + activate) before its imports
 def test_spawned_worker_is_marked_to_boot_pm_dependencies(_isolated, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
+                        lambda command, **kw: SimpleNamespace(mode="in_process", argv=command))
     seen: dict = {}
     real_popen = subprocess.Popen
 
