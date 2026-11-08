@@ -1331,7 +1331,8 @@ def _dispatch(**kwargs) -> Dict[str, Any]:
 
     with retirement.work() as admitted:
         if not admitted:
-            return {"status": "rejected", "error": "backend is retiring; reconnect to continue"}
+            return {"status": "rejected", "reason": "backend_retiring",
+                    "error": "backend is retiring; reconnect to continue"}
         return _dispatch_admitted(**kwargs)
 
 
@@ -1393,7 +1394,7 @@ def _dispatch_admitted(
     with _records_lock:
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
-            return {"status": "rejected", "error": capacity_error}
+            return {"status": "rejected", "reason": "pool_capacity", "error": capacity_error}
         if durable_spec is not None:
             profile_home = _registry_path().parent.parent
             durable, rejection = _store.persist_dispatch(
@@ -1411,7 +1412,7 @@ def _dispatch_admitted(
                 return {
                     "status": "rejected",
                     "reason": rejection,
-                    "error": "Durable async delegation registry unavailable; run synchronously.",
+                    "error": "Durable async delegation registry unavailable; no children started.",
                 }
             record["attempt_id"] = durable["attempt"]["attempt_id"]
             record["owner_boot_id"] = current_boot_id or ""

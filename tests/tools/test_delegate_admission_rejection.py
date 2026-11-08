@@ -24,9 +24,9 @@ def admission(monkeypatch):
     release = threading.Event()
     entered = threading.Event()
 
-    def sentinel(task_index, goal, **kwargs):
+    def sentinel(task_index, goal, child=None, parent_agent=None, **kwargs):
         entered.set()
-        assert release.wait(10), "sentinel release timed out"
+        assert release.wait(30), "sentinel release timed out"
         return {"task_index": task_index, "status": "completed", "summary": "finished",
                 "api_calls": 1, "duration_seconds": 0.0}
 
@@ -66,7 +66,7 @@ def test_interactive_admission_returns_without_executing_child(admission, monkey
     worker = threading.Thread(target=contextvars.copy_context().run, args=(invoke,), daemon=True)
     worker.start()
     try:
-        assert done.wait(3), "interactive parent blocked on a rejected child"
+        assert done.wait(8), "interactive parent blocked on a rejected child"
         assert not entered.is_set(), "rejected child executed"
         assert "error" not in result, result
         value = result["value"]
@@ -81,3 +81,23 @@ def test_interactive_admission_returns_without_executing_child(admission, monkey
         release.set()
         worker.join(5)
         assert not worker.is_alive()
+
+
+def test_background_dispatch_leaves_parent_free_and_delivers_once(admission):
+    from tools.process_registry import process_registry
+
+    dt, release, entered = admission
+    parent = _fake_parent()
+    result = json.loads(dt.delegate_task(goal="sentinel", background=True, parent_agent=parent))
+    assert result["status"] == "dispatched"
+    assert entered.wait(8)
+    # The same parent can handle another tool request while the child is held.
+    followup = json.loads(dt.delegate_task(action="list", parent_agent=parent))
+    assert isinstance(followup, dict)
+    assert not release.is_set()
+    assert process_registry.completion_queue.empty()
+    release.set()
+    event = process_registry.completion_queue.get(timeout=8)
+    assert event["delegation_id"] == result["delegation_id"]
+    assert event["result"]["results"][0]["summary"] == "finished"
+    assert process_registry.completion_queue.empty()

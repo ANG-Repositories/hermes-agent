@@ -4749,6 +4749,14 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        from tools.delegate_tool_admission import reject_background_admission
+
+        def _reject_admission(reason, dispatch=None):
+            return reject_background_admission(
+                reason=reason, children=_child_agents, task_list=task_list,
+                live_deleg_id=live_deleg_id, live_writers=live_writers, dispatch=dispatch,
+            )
+
         try:
             _durable_spec, _gateway_boot_id = _build_durable_background_spec(
                 task_list=task_list,
@@ -4773,16 +4781,10 @@ def delegate_task(
         except Exception as exc:
             logger.error(
                 "delegate_task: durable restart intent unavailable (%s); "
-                "running synchronously rather than launching untracked work",
+                "background admission rejected; no children started",
                 exc,
             )
-            _sync_result = _execute_and_aggregate()
-            if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "Restart-safe background persistence was unavailable, so "
-                    "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
-                )
-            return json.dumps(_sync_result, ensure_ascii=False)
+            return _reject_admission("durable_intent_unavailable")
         # Kanban runtime (docs/dev/delegate-background-on-kanban-runtime.md §5.1-5.2): an eligible durable
         # unit runs as one card on the internal ``delegations`` board, in its own process. The allowlist
         # fails closed: any condition not positively true keeps today's in-process unit (I6).
@@ -4861,19 +4863,6 @@ def delegate_task(
                               and getattr(live_writers[_ti], "path", None) is not None},
         )
 
-        if (
-            _durable_spec is not None
-            and dispatch.get("status") == "rejected"
-            and dispatch.get("reason") in {"registry_cap", "registry_error"}
-        ):
-            _sync_result = _execute_and_aggregate()
-            if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "Restart-safe background persistence was unavailable, so "
-                    "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
-                )
-            return json.dumps(_sync_result, ensure_ascii=False)
-
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
@@ -4934,34 +4923,7 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
-        )
-        _cap_result = _execute_and_aggregate()
-        _fallback_event_id = dispatch.get("fallback_event_id")
-        if _fallback_event_id:
-            from tools.async_delegation import acknowledge_outbox_event
-
-            acknowledge_outbox_event(
-                _fallback_event_id,
-                outcome="dropped",
-                reason="fallback_ran",
-                profile_home=dispatch.get("_registry_profile_home") or None,
-            )
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        return _reject_admission(dispatch.get("reason") or "admission_unavailable", dispatch)
 
     # ----- Synchronous path -----
     # A recovered async unit (_recovery_spec) delivers only via its own
