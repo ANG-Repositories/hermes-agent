@@ -14,6 +14,7 @@ import threading
 import time
 
 import pytest
+import run_agent  # Bootstrap recovery before the per-test home-I/O guard.
 from types import SimpleNamespace
 
 from gateway import kanban_boomerang_wake as ah

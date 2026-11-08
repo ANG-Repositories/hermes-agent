@@ -1,6 +1,6 @@
 # Parent routing build checkpoint
 
-Task: t_99abe991. Implementation is partial; not approved for landing or activation.
+Task: t_99abe991. Historical receipts below are checkpoint evidence, not approval for landing or activation. The correction-round section supersedes earlier acceptance claims.
 
 ## Executed evidence
 
@@ -34,7 +34,7 @@ HTTP cases enforce 30-second alarms; bound the execution process to 180 seconds 
 - Hermetic HTTP fixture now suppresses unrelated plugin/relay boot and context probes, keeps SQLite registry checks for private new DBs, and shortens the actual retry sleep at both definition and imported call-site seams. Cold first summary alone passed 1 in 8.97s. No deadline increased.
 - Real notifier dispatch -> persisted claim -> busy/cold canonical parent -> actual delegate/conversation/fallback -> nonce verdict -> real executor/receipt -> adapter delivery: 3 passed in 62.95s before DB-fixture cleanup. Combined HTTP + auto-dispatch rerun: 13 passed in 73.19s. ALR-shaped primary and same-vendor `/anthropic/v1/messages` each fail; CPA-shaped OpenAI chat/SSE succeeds on `/v1/chat/completions`, with distinct synthetic credentials. This is protocol integration, not vendor availability.
 - Actual two subprocess/profile homes use production `_child_main`, profile `.env` credential resolution, persisted task reconstruction and real local HTTP: 1 passed in 28.20s. Each returned its own nonce on its own selected URL/model/key despite changed worker/provider defaults. Plugins/MCP startup and metadata probes are explicitly suppressed by child harness; actual platform launch/supervisor admission is not claimed.
-- Snapshot-timeout arm holds the real per-agent lock: zero provider requests, terminal failed claim retains original wake, `resurfaced=true`, `resurface_delivered=false` after adapter refuses admission. Owner obligation is not lost.
+- Historical snapshot-timeout arm held the real lock and sent zero requests, but incorrectly accepted `resurfaced=true`, `resurface_delivered=false` without a pending handback. That was wake loss, not acceptance; corrected below.
 - Newly discovered: documented pin-refused summary reconstruction did not exist in this tree (no `pin_refused` code). Implementing narrow explicit relay-503/header refusal propagation and one summary rebuild using captured route; fingerprint/pin-refused constructor tests pending.
 - Existing Linux wake hang reproduced: default SessionDB open traverses host `/proc/*/fd` under home-I/O guard. Passing `HERMES_STATE_DELETED_WAL_CHECK=registry` in outer shell is scrubbed by test isolation; set it in the scratch-DB fixture. Prior multi-file run stopped bounded after no result, not called green. Base comparison remains pending.
 
@@ -72,7 +72,31 @@ Sanitized per-case traces are committed at `evidence/continuation-wire-traces.js
 - Independent final-head review/certification belongs to Apollo. Full-tree CI was not run locally; these are named narrow subsystem receipts.
 - Detached subprocess proof uses two actual OS processes and the real `_child_main`/record reconstruction/credential resolver, but suppresses plugin/MCP startup and does not certify OS supervisor spawn admission or restart/relaunch exactly-once integration. Two profiles use distinct endpoints/keys/models with explicit disabled chains; cross-vendor traversal is proven separately through automatic wakes.
 - Cold session/channel precedence and corruption refusal are separately tested; not every precedence/corrupt-on-disk case has its own full HTTP dispatch row. Actual credential-sync writer concurrency is proven, but decorator-removal mutation coverage for every route writer is not exhaustive.
-- Resolved by operator commit f4738af4fda2: cold construction logs `session-rehydrated` provenance while retaining the internal inheritance policy used by recovery. Red-first provenance regression failed before the fix; 26 routing/session tests passed afterward. Independent operator integration rerun at f4738af: 15 passed in 31.67s, exit 0. Final scoped independent delta review APPROVE; production activation remains pending.
+- Operator commit f4738af4fda2 adds cold `session-rehydrated` provenance. Its independent integration receipt was 15 passed in 31.67s. The prior approval was withdrawn at 8450a69a; it does not apply to the correction head. Production activation remains pending.
 - HTTP alarms remain 30s per case; combined integration receipt is below 180s, but test-gate placement time is outside that bound and no independent 180s process-group supervisor is shipped.
 
 No production configuration, runtime tree, tracking board or gateway process was modified.
+
+## Operator-requested correction round (reviewed base 8450a69a)
+
+The six-key scope is corrective, not a new architecture or a production acceptance waiver.
+
+- `1f01758726e8`: endpoint/key mismatch now fails closed before copying or constructing a recovered runtime. Saved endpoints may only use credentials resolved for that endpoint. Named `custom:<name>` references use the existing resolver. The previous provider-default-key plus saved-foreign-URL test was unsafe and replaced. Red assertion: DID NOT RAISE; matching credentials remain accepted and mismatched lookup issues no HTTP request or credential-bearing error.
+- `55306c3b0721`: removed automatic pin-refusal summary replacement. A refused first request returns the existing `error` result and normal subtree/registry cleanup; no second child exists outside the dispatcher's cancellation ownership. This deliberately withdraws the earlier automatic-rebuild capability. Constructor-time fingerprint downgrade remains supported.
+- `664f668ffaf9`: `_fail` atomically persists the original turn and warning via the existing pending-handback mechanism before terminalizing. Actual snapshot-lock timeout now proves first refusal, pending turn, reconciliation admission exactly once, and cleared obligation. No second delivery subsystem added.
+- `b289dfdf1cf2`: owner lookup and profile context entry are inside the dispatch failure boundary. Both injected exceptions now terminalize with the original wake durably pending, rather than escaping the task.
+- `beea9b15e31c`: HTTP alarm is a context manager entered before endpoint/session/agent setup; all setup exceptions restore handler/timer. Parent starts as None. The cold-first SDK import occurs at collection to avoid metadata enumeration against guarded home during a test.
+- `90de20f8c829`: virtual endpoints require their owning provider: MoA's local facade or a registered external-process ACP profile. Ordinary background ACP/MoA routes traverse durable-spec construction and completion/interrupt tests. HTTP providers cannot impersonate these virtual transports; credential-bearing routes remain refused.
+
+Observed receipts (same repository interpreter; sanctioned `test-gate`, cache disabled):
+
+- Red route/fingerprint/auto tranche: 5 failed, 24 passed in 28.24s. Owner/scope red: 2 failed. These are assertion failures, not setup failures.
+- Final HTTP + automatic dispatch + owner/scope tranche: 20 passed in 50.69s.
+- Final persistence + fingerprint tranche: 28 passed in 9.54s.
+- Entire background-interrupt file plus parent routing matrix: 31 passed in 17.57s.
+- Cold summary and setup-exception alone: 2 passed, 9 deselected in 11.38s.
+- Two real detached profile subprocesses with endpoint-bound named custom references: 1 passed in 11.35s. A generic OpenAI default key is intentionally insufficient for the saved foreign endpoint; the old detached fixture failed closed after the security fix and was corrected to use a real symbolic reference.
+
+Background CI attribution: job 128679699643 at old head contains three actual 60-second harness failures and three `a detached unit must not run in-process` assertions. The immutable 8450a69a control reproduces that six-node set. The fake child lacked concrete route metadata and MagicMock fabricated values that durable-spec serialization rejected; the fixture now declares the actual route contract. This does not weaken production persistence checks. Other CI dependency-download failures are not counted as passes, and no blind rerun was launched.
+
+`scripts/run_tests.sh` was attempted through the gate and refused by the worker suite policy. The executed commands use `test-gate <repo>/venv/bin/python -m pytest -q -o addopts= <one to three named files>`. Full-tree CI, merge, deployment, restart and real-provider production smoke remain operator-owned and unverified. Production deviations: none.
