@@ -1597,7 +1597,11 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 1
-    assert "restarting" in adapter.sent[0] and "Send any message" in adapter.sent[0]
+    text = adapter.sent[0]
+    assert text.count("Hermes is restarting") == 1
+    # An idle home gets lifecycle status, not an active-task claim or ping request.
+    assert "task" not in text.lower() and "work" not in text.lower()
+    assert "message" not in text.lower() and "online" not in text.lower()
 
 
 @pytest.mark.asyncio
