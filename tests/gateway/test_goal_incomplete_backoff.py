@@ -90,6 +90,12 @@ def test_blank_success_preserves_retry_recovery(tmp_path, monkeypatch, claimed):
     mgr = goals.GoalManager("blank-retry")
     assert mgr.state.consecutive_incomplete_turns == 0
     assert mgr.state.incomplete_retry_wait
+    for _ in range(2):
+        clock = mgr.state.waiting_until
+        assert mgr.idle_wake_prompt(checkin_minutes=0)
+        mgr.evaluate_after_turn("", turn_completed=True)
+        mgr = goals.GoalManager("blank-retry")
+        assert mgr.state.incomplete_retry_wait and mgr.state.waiting_until == clock + 60
     assert mgr.idle_wake_prompt(mgr.state.waiting_until - 1, checkin_minutes=0) is None
     assert mgr.idle_wake_prompt(mgr.state.waiting_until, checkin_minutes=0)
 

@@ -1748,11 +1748,14 @@ class GoalManager:
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
         s = self._state
-        if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
+        if s is None:
+            return False
+        had_wait = bool(s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until)
+        if not had_wait and s.idle_wake_attempt is None:
             return False
         s.clear_wait()
         self._save()
-        return True
+        return had_wait
 
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
