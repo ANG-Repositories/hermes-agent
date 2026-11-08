@@ -375,6 +375,10 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     #     reach the live board through a pin or through a home nested under
     #     ~/.hermes. Tests of pin precedence opt out with ``kanban_pins``.
     monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    # fleet_placement resolves PLACEMENT_HOME before the kanban root; an inherited one
+    # (test-gate exported ~/.hermes) made tests rewrite the LIVE config/fleet-hosts.json
+    # (t_dbacd1f2). Tests of PLACEMENT_HOME precedence set it themselves.
+    monkeypatch.delenv("PLACEMENT_HOME", raising=False)
 
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend

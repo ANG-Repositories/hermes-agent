@@ -46,6 +46,23 @@ def test_kanban_worker_count_is_never_read_as_capacity():
     assert kwp.parse_roles(other) == {"a": ({"review-worker": 5}, "active")}
 
 
+def test_count_free_review_worker_row_does_not_refuse_the_pool(tmp_path):
+    """hermes-home #9338 wrote ``"review-worker": {}`` on every Prism member; the
+    parser refused the whole pool (``refused:roles``), so nothing spilled (t_e85e77b7)."""
+    (tmp_path / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ace-media": {"roles": {"review-worker": {}, "kanban-worker": {"slots": 12}, "ci-runner": {}},
+                      "state": "active"},
+        "nas-fleet": {"roles": {"review-worker": {}}, "state": "active"},
+    }}), encoding="utf-8")
+    (tmp_path / kwp.SIDECAR_FILE).write_text(json.dumps({
+        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-media"], "profiles": ["alpha"],
+        "hosts": {"ace-media": {"enabled": True, "absence": "optional"}},
+    }), encoding="utf-8")
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert cfg.refused is None, cfg.warnings
+    assert [h.name for h in cfg.pool_hosts] == ["ace-media"]
+
+
 def test_live_slot_counts_do_not_shape_the_pool_budget(tmp_path):
     """The live fleet-roles shape (kanban-worker 12 / 12 / 24): every host plans the runaway stop, never 12."""
     (tmp_path / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {

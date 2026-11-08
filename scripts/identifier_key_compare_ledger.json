@@ -599,8 +599,8 @@
   },
   "hermes_cli/kanban_pr_freshness.py::_unread_refuses::fold::repo::if ref.repo.casefold() not in worker_draft_repos():": {
    "verdict": "kept",
-   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and worker_draft_repos() folds its set the same way (same comparand as _owns_draft), so the folded repo IS the canonical key; byte-exact would treat a worker-draft repo written in another case as foreign.",
-   "where": "hermes_cli/kanban_pr_freshness.py:458 _unread_refuses"
+   "why": "GitHub owner/repo names are case-insensitive, and worker_draft_repos() casefolds its set, so the casefolded repo is the canonical key (same as _owns_draft). A byte-exact compare would let an unreadable PR in a listed repo written in another case (o/r vs O/R) fail open, which is the hermes-home#8231 draft-to-review hole this refusal closes.",
+   "where": "hermes_cli/kanban_pr_freshness.py:457 _unread_refuses (t_5c6c67c5)"
   },
   "hermes_cli/kanban_round_draft.py::draft_at_round_start::fold::repo::if ref.repo.casefold() not in repos:": {
    "verdict": "kept",

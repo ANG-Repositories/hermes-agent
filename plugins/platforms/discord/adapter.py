@@ -130,6 +130,9 @@ _DISCORD_COMMAND_DRIFT_CHECK_INTERVAL_SECONDS = 3600.0
 # can't spin forever re-POSTing every ~1s and leave a permanent "is typing…"
 # bubble after the response was already sent. A healthy POST resets the counter.
 _DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES = 5
+# Discord expires typing after 10s. Leave headroom for HTTP/event-loop latency;
+# rate-limit backoff still takes precedence over this healthy refresh cadence.
+_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS = 5.0
 # Discord caps global slash commands at 100/app; exceeding it fails the ENTIRE sync (error 30032).
 _DISCORD_MAX_APP_COMMANDS = 100
 # ``discord.slash_commands`` — per-profile scope of this bot's native slash menu.
@@ -5256,7 +5259,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         Discord's TYPING_START gateway event is unreliable in DMs for bots.
         Instead, start a background loop that hits the typing endpoint every
-        12 seconds (typing indicator lasts ~10s).  The loop is cancelled when
+        5 seconds (Discord expires the indicator after 10s), leaving latency
+        headroom on healthy requests. The loop is cancelled when
         stop_typing() is called (after the response is sent).
 
         Rate-limit handling: if a 429 is encountered, the loop logs a
@@ -5303,6 +5307,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         async def _typing_loop() -> None:
             consecutive_failures = 0
+            successful_posts = 0
+            exit_reason = "stopped_or_superseded"
+            logger.debug("Discord typing loop started for %s", chat_id)
             try:
                 # Stop when the stop_event fires OR our turn is superseded —
                 # the latter terminates an orphan whose stop_typing never ran.
@@ -5313,8 +5320,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             "POST", "/channels/{channel_id}/typing", channel_id=chat_id,
                         )
                         await self._client.http.request(route)
+                        successful_posts += 1
                         consecutive_failures = 0
                     except asyncio.CancelledError:
+                        exit_reason = "cancelled"
                         return
                     except Exception as e:
                         # Don't die on a single 429 — backoff and continue,
@@ -5323,12 +5332,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         consecutive_failures += 1
                         retry_after = self._extract_discord_retry_after(e)
                         if retry_after is None:
-                            logger.debug(
-                                "Discord typing indicator failed for %s: %s",
-                                chat_id, e,
+                            exit_reason = "request_failed"
+                            logger.warning(
+                                "Discord typing indicator failed for %s (%s); loop ending",
+                                chat_id, type(e).__name__,
                             )
                             return
                         if consecutive_failures >= _DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES:
+                            exit_reason = "rate_limit_cap"
                             logger.warning(
                                 "Typing indicator giving up for %s after %d "
                                 "consecutive rate-limited POSTs",
@@ -5341,10 +5352,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         )
                         await _interruptible_sleep(retry_after)
                         continue
-                    await _interruptible_sleep(12)
+                    await _interruptible_sleep(_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS)
             except asyncio.CancelledError:
-                pass
+                exit_reason = "cancelled"
             finally:
+                logger.debug(
+                    "Discord typing loop ended for %s: reason=%s successful_posts=%d",
+                    chat_id, exit_reason, successful_posts,
+                )
                 # Only clear shared state if WE are still the registered owner —
                 # never clobber a newer turn's loop that already replaced us.
                 if self._typing_tasks.get(chat_id) is asyncio.current_task():

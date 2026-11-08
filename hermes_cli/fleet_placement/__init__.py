@@ -1,4 +1,5 @@
-"""Byte copies of hermes-home ``scripts/lib/{placement,admission,work_estimate,admission_demand}.py`` (t_29403e19).
+"""Byte copies of hermes-home ``scripts/lib/{placement,admission,work_estimate,admission_demand,alloc_client}.py``
+(t_29403e19).
 
 The fleet has ONE placement scorer and ONE admission predicate; the fork may not import hermes-home code, so it
 carries copies. ``VENDORED.json`` pins the source ref and each file's sha256, and
@@ -15,9 +16,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from . import admission, admission_demand, placement, work_estimate
+from . import admission, placement, work_estimate
 
 __all__ = ["admission", "admission_demand", "placement", "work_estimate"]
+
+
+def __getattr__(name):
+    # admission_demand imports fcntl/pwd at module top (POSIX-only); loading it eagerly made
+    # `import gateway.run` fail on native Windows. It loads on first use instead, root bound here.
+    if name != "admission_demand":
+        raise AttributeError(name)
+    import importlib
+
+    mod = importlib.import_module(f"{__name__}.admission_demand")
+    mod._root = _demand_root
+    return mod
 
 
 def _fleet_root() -> Path:
@@ -34,4 +47,3 @@ def _demand_root(root=None) -> Path:
 
 
 placement.fleet_root = _fleet_root
-admission_demand._root = _demand_root

@@ -98,17 +98,38 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return default
 
 
-def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
-    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
+def _git_out(
+    cwd: Path, *args: str, timeout: int = 30, workspace_probe: bool = False,
+) -> Optional[str]:
+    """Return git stdout, preserving executable failures on workspace probes.
+
+    A failed executable is not evidence that the workspace is not a repository.
+    Other callers retain the historical best-effort (None on failure) behavior.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, check=False,
+            timeout=timeout, check=False, stdin=subprocess.DEVNULL,
         )
+    except OSError as exc:
+        if workspace_probe and exc.filename == "git":
+            raise RuntimeError(f"git executable unavailable: {exc}") from exc
+        return None
     except Exception:
         return None
     if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        executable_failure = result.returncode in (126, 127) or (
+            "no such file or directory" in stderr.lower()
+            and ("exec" in stderr.lower() or re.search(
+                r"/[^\s:]*[/]git(?:-[\w.-]+)?(?=['\"\s:]|$)", stderr,
+            ))
+        )
+        if workspace_probe and executable_failure:
+            raise RuntimeError(
+                f"git executable unavailable (exit {result.returncode}): {stderr}"
+            )
         return None
     return (result.stdout or "").strip() or None
 
@@ -2559,6 +2580,7 @@ class Task:
     # Boomerang wake level (Ace 2026-10-22): True/False = the card's subscription level is
     # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
     boomerang_wake: Optional[bool] = None
+    asap: bool = False  # Explicit operator edit only; never inherited at creation.
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2578,6 +2600,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            asap=bool(g("asap")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
             pin_sub_reason=g("pin_sub_reason") or None,
@@ -5573,7 +5596,6 @@ def _origin_line(body: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 NEEDS_INPUT_PAGE_MIN_PRIORITY = 100
-NEEDS_INPUT_PAGE_ALERTS_PRIORITY = 200
 _NEEDS_INPUT_PAGE_OFF = "needs_input_page_off"
 _NEEDS_INPUT_PAGE_ON = "needs_input_page_on"
 # ``origin: discord <name> (<numeric channel id>) · session ...`` (see
@@ -5738,15 +5760,16 @@ def needs_input_page_candidates(
     comment newer than its latest block (answered, waiting on an unblock; see
     ``_ruled_since_block``), and has ``priority >= min_priority``
     OR an ``origin:`` line naming a numeric Discord channel. Each item carries
-    ``channel`` (origin channel id or None) and ``alerts`` (priority >= 200).
+    ``channel`` (origin channel id or None), ``session_id`` (the card's home
+    session, which the pager resolves to a chat when ``channel`` is None).
     """
     rows = list(conn.execute(
-        "SELECT id, title, body, priority, status, block_kind FROM tasks "
+        "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks "
         "WHERE status IN ('blocked', 'triage') AND block_kind = 'needs_input' ORDER BY id"
     ))
     if include_dependency:
         rows += list(conn.execute(
-            "SELECT id, title, body, priority, status, block_kind FROM tasks t "
+            "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks t "
             "WHERE status IN ('todo', 'blocked') AND block_kind = 'dependency' "
             "AND EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
             "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) IN (?, ?) "
@@ -5790,7 +5813,7 @@ def needs_input_page_candidates(
             "kind": row["block_kind"],
             "reason": reason or "(no reason given)",
             "channel": channel,
-            "alerts": priority >= NEEDS_INPUT_PAGE_ALERTS_PRIORITY,
+            "session_id": row["session_id"],
         })
     return out
 
@@ -5957,11 +5980,14 @@ def _signature_history(conn: sqlite3.Connection, signature: str, limit: int) -> 
 
 
 def resolve_signature(conn: sqlite3.Connection, signature: Optional[str], created_by: Optional[str], *,
-                      now: Optional[int] = None) -> Optional[str]:
+                      now: Optional[int] = None, reuse: bool = True) -> Optional[str]:
     """The card that already owns ``signature`` (open, or closed within the quiet window), else None.
 
     Raises :class:`MintBreakerError` when the last :func:`signature_flap_n` cards for it all closed with no code
     change. Inert for humans (:func:`mint_cap_applies`), a NULL signature, or ``HERMES_KANBAN_SIGNATURE_DEDUP=0``.
+    ``reuse=False`` (``kanban create --no-signature-reuse``): the caller has proven it needs a FRESH card (a possible
+    regression after the signature's card closed), so the open/quiet-window reuse is skipped while the breaker still
+    applies and the new card still stores the signature, keeping it in the breaker's history.
     """
     sig = (signature or "").strip()
     if not sig or not signature_dedup_on() or not mint_cap_applies(created_by):
@@ -5972,10 +5998,10 @@ def resolve_signature(conn: sqlite3.Connection, signature: Optional[str], create
     if not hist:
         return None
     newest = hist[0]
-    if newest["closed_at"] is None:
+    if reuse and newest["closed_at"] is None:
         _append_event(conn, newest["id"], "signature_remint", {"signature": sig, "created_by": created_by, "at": now})
         return newest["id"]
-    if now - newest["closed_at"] < signature_quiet_s():
+    if reuse and newest["closed_at"] is not None and now - newest["closed_at"] < signature_quiet_s():
         _append_event(conn, newest["id"], "signature_remint",
                       {"signature": sig, "created_by": created_by, "at": now, "quiet_window": True})
         return newest["id"]
@@ -6244,6 +6270,7 @@ def create_task(
     boomerang_wake: Optional[bool] = None,
     no_worker: bool = False,
     signature: Optional[str] = None,
+    signature_reuse: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6252,6 +6279,7 @@ def create_task(
     returns the OPEN card for it, or the card that closed within :data:`SIGNATURE_QUIET_S`, instead of
     minting; after :data:`SIGNATURE_FLAP_N` consecutive closes with no code change it raises
     :class:`MintBreakerError` (``force_reason`` overrides, ledgered ``mint_breaker_forced``).
+    ``signature_reuse=False`` skips the reuse but keeps the breaker and stores the signature (a caller-proven fresh card).
 
     ``no_worker=True`` mints the card operator-only (the ``no_worker`` flag,
     see :func:`set_no_worker`): it never reaches a worker, so the assignee
@@ -6547,7 +6575,7 @@ def create_task(
     if signature:
         try:
             with write_txn(conn):
-                owner = resolve_signature(conn, signature, created_by)
+                owner = resolve_signature(conn, signature, created_by, reuse=signature_reuse)
         except MintBreakerError as exc:
             if not force_reason:
                 raise
@@ -6584,6 +6612,8 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+    from hermes_cli.kanban_db_workspace import refuse_runtime_tree_workspace
+    refuse_runtime_tree_workspace(workspace_kind, workspace_path)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
