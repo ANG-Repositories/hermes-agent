@@ -62,6 +62,47 @@ class BrowserRemotePlacementTest(unittest.TestCase):
         ctx = self.context({"front_door": True, "ssh": True})
         self.assertEqual(hc.evaluate("requires: screen", (), ctx).hard_rule, "requires:screen")
 
+    def test_unobserved_static_host_is_excluded_only_with_remote_observations(self):
+        from dataclasses import replace
+        ctx = self.context({"front_door": True, "ssh": True})
+        ctx = replace(ctx, pool_hosts=("ace-ai", "ci-box"), cmap=replace(
+            ctx.cmap, hosts={"ci-box": frozenset({"browser-session"})}))
+        self.assertEqual(hc.evaluate("requires: browser-session", (), ctx).only, ("ace-ai",))
+        self.assertEqual(hc.evaluate("requires: browser-session", (), ctx,
+                                    pin_host="ci-box").wait,
+                         "BROWSER_REMOTE_UNREACHABLE:front_door")
+        legacy = replace(ctx, cmap=replace(ctx.cmap, browser_remote={}))
+        self.assertIsNone(hc.evaluate("requires: browser-session", (), legacy,
+                                     pin_host="ci-box").hard_rule)
+
+
+def test_workspace_browser_pin_waits_on_its_own_failed_leg(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from tests.hermes_cli.test_kanban_host_capabilities import _plan
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {})
+    monkeypatch.setattr(kbd, "_native_command_profile", lambda *a: False)
+    kb.init_db()
+    ctx = BrowserRemotePlacementTest().context({"front_door": True, "ssh": False})
+    ctx = replace(ctx, pool_hosts=("ace-ai", "ci-box"), cmap=replace(
+        ctx.cmap, browser_remote={"ace-ai": {"front_door": True, "ssh": False},
+                                  "ci-box": {"front_door": True, "ssh": True}}))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="browser", assignee="alpha",
+                             body="requires: browser-session", workspace_kind="scratch")
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        binds = {tid: ("workspace_of", "owner", "ace-ai")}
+        assert kbd._route_row(conn, row, _plan(), caps=ctx, binds=binds,
+                              linked_ids={}, lineage_mode="none") == (
+                                  "wait", "BROWSER_REMOTE_UNREACHABLE:ssh")
+        healthy = replace(ctx, cmap=replace(ctx.cmap, browser_remote={
+            "ace-ai": {"front_door": True, "ssh": True}}))
+        assert kbd._route_row(conn, row, _plan(), caps=healthy, binds=binds,
+                              linked_ids={}, lineage_mode="none") == ("pin", "ace-ai")
+
 
 if __name__ == "__main__":
     unittest.main()
