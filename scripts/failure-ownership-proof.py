@@ -10,6 +10,20 @@ import signal
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
+
+
+def executed_arm(report, selected, expected):
+    """A zero exit is insufficient: every pinned case must execute and pass."""
+    try:
+        cases = ET.parse(report).getroot().findall('.//testcase')
+        names = [c.get('name', '') for c in cases]
+        return (len(cases) == expected and len(set(names)) == expected
+                and all(n == selected or n.startswith(selected + '[') for n in names)
+                and all(not list(c) or all(x.tag in ('properties', 'system-out', 'system-err')
+                                          for x in c) for c in cases))
+    except (OSError, ET.ParseError):
+        return False
 
 
 def main():
@@ -36,11 +50,12 @@ def main():
                 else 'test_sigkill_transaction_boundary_retry')
     command = [sys.executable, '-m', 'pytest', '-o', 'addopts=', '-q', '-s',
                f'tests/hermes_cli/test_kanban_failure_ownership.py::{selected}',
-               '--basetemp', str(root / 'pytest')]
+               '--basetemp', str(root / 'pytest'), '--junitxml', str(root / 'executed.xml')]
     env = dict(os.environ, HERMES_HOME=str(root / 'home'), TMPDIR=str(root))
     env.pop('HERMES_KANBAN_DB', None)
     # A proof arm must execute its pinned test, regardless of caller pytest flags.
     env.pop('PYTEST_ADDOPTS', None)
+    env.pop('PYTEST_PLUGINS', None)
     started = time.monotonic()
     with (root / 'output.log').open('wb') as output:
         child = subprocess.Popen(command, cwd=repo, env=env, stdin=subprocess.DEVNULL,
@@ -58,7 +73,10 @@ def main():
                 os.killpg(child.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only acceptance arm
             except ProcessLookupError:
                 pass
-    summary = dict(arm=args.arm, pid=child.pid, exit_code=rc,
+    verified = executed_arm(root / 'executed.xml', selected, 1 if args.arm == 'atomic' else 12)
+    if rc == 0 and not verified:
+        rc = 3
+    summary = dict(arm=args.arm, pid=child.pid, exit_code=rc, executed_verified=verified,
                    elapsed_seconds=time.monotonic()-started, command=command,
                    log=str(root / 'output.log'))
     (root / 'summary.json').write_text(json.dumps(summary, indent=2)+'\n', encoding='utf-8')

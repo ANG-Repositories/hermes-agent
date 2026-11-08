@@ -27,8 +27,24 @@ def test_proof_runner_clears_inherited_pytest_options(tmp_path, monkeypatch):
     monkeypatch.setattr(module['subprocess'], 'Popen', Child)
     monkeypatch.setattr(module['os'], 'killpg', lambda *args: None)
     monkeypatch.setattr(sys, 'argv', [str(script), '--arm', 'atomic', '--scratch', str(tmp_path / 'proof')])
-    assert module['main']() == 0
+    assert module['main']() == 3  # zero child exit without execution report is refused
     assert 'PYTEST_ADDOPTS' not in captured
+
+
+@pytest.mark.parametrize('body,accepted', [
+    ('<testcase name="p"/>', True),
+    ('<testcase name="p"><skipped/></testcase>', False),
+    ('<testcase name="p"><failure/></testcase>', False),
+    ('<testcase name="other"/>', False),
+    ('', False),
+    ('<testcase name="p"/><testcase name="p"/>', False),
+])
+def test_proof_execution_report_refuses_nonexecution(tmp_path, body, accepted):
+    import runpy
+    module = runpy.run_path(str(Path(__file__).resolve().parents[2] / 'scripts/failure-ownership-proof.py'))
+    report = tmp_path / 'report.xml'
+    report.write_text('<testsuites><testsuite>' + body + '</testsuite></testsuites>')
+    assert module['executed_arm'](report, 'p', 1) is accepted
 
 
 def test_trigger_replacement_has_no_committed_gap(board):
