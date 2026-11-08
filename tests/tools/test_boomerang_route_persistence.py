@@ -52,6 +52,16 @@ def test_virtual_provider_route_roundtrip(monkeypatch, provider, endpoint):
     assert restored.requested_provider == provider
 
 
+@pytest.mark.parametrize("provider,endpoint", [("openai", "acp://copilot"), ("openai", "moa://local"),
+                                               ("moa", "moa://foreign")])
+def test_virtual_endpoint_requires_owning_provider(provider, endpoint):
+    p = parent()
+    p.provider = p.requested_provider = provider
+    p.base_url = endpoint
+    with pytest.raises(ValueError, match="endpoint"):
+        persist_route(p)
+
+
 @pytest.mark.parametrize("chain", [None, "auto", {"provider": "openai"}, [None], ["openai"],
                                     [{}], [{"provider": 1, "model": "m"}], [{"provider": "openai", "model": []}]])
 def test_malformed_persisted_chain_refused_before_credentials(monkeypatch, chain):

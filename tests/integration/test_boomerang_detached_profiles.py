@@ -24,15 +24,15 @@ def test_detached_two_profile_process_isolation(tmp_path):
             home.mkdir()
             key = "SYNTHETIC-SECRET-" + name
             (home / ".env").write_text("OPENAI_API_KEY=" + key + "\n")
-            # Recovery may change model defaults, never the endpoint bound to this key.
-            (home / "config.yaml").write_text("model:\n  provider: openai\n  default: wrong-current-default\n  base_url: " + base + "/cross-vendor/v1\ndelegation:\n  model: wrong-worker-default\n  fallback_providers: []\n")
-            p = SimpleNamespace(model="selected-" + name, provider="openai", requested_provider="openai",
+            # Keep an endpoint-bound credential reference while unrelated defaults change.
+            (home / "config.yaml").write_text("model:\n  provider: openai\n  default: wrong-current-default\ncustom_providers:\n- name: selected\n  base_url: " + base + "/cross-vendor/v1\n  api_key_env: OPENAI_API_KEY\n  api_mode: chat_completions\ndelegation:\n  model: wrong-worker-default\n  fallback_providers: []\n")
+            p = SimpleNamespace(model="selected-" + name, provider="custom", requested_provider="custom:selected",
                 api_mode="chat_completions", base_url=base + "/cross-vendor/v1", api_key=key,
                 request_overrides={}, _fallback_chain=[])
             route = persist_route(p)
             record = {"execution": {"model": p.model, "provider": "openai", "api_mode": p.api_mode,
                 "fallback_chain": [], "max_iterations": 4, "toolsets": [], "parent_toolsets": [],
-                "credential_ref": {"source": "provider", "provider": "openai", "inherited_route": True}},
+                "credential_ref": {"source": "provider", "provider": "custom:selected", "inherited_route": True}},
                 "route": {"parent_session_id": "20261108_000000_" + name, "platform": "discord"},
                 "source": {"tasks": [{"goal": "Return the response verbatim", "inherit_mode": "summary",
                     "route_source": "live-parent", "parent_route": route, "materialized_prefill_messages": []}]}}
