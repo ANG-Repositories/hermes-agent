@@ -22,7 +22,9 @@ Dry-run is the default; ``--apply`` takes a WAL-safe VACUUM INTO backup first.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
+import math
 import sqlite3
 import sys
 from collections import Counter
@@ -33,6 +35,36 @@ from pathlib import Path
 LOCAL_RUN_HOST = "studio"
 # A worker turn is recorded by the CLI; a gateway turn on these platforms never ran in a worker.
 WORKER_PLATFORMS = ("", "cli")
+
+
+def _run_index(runs: list) -> tuple[list, list]:
+    """Runs sorted by start, plus, for every prefix, the two runs with the
+    latest end (open = +inf): O(R log R) once instead of a scan per turn."""
+    runs = sorted(runs, key=lambda r: r[0])
+    top: list = [(None, None)]
+    first = second = None
+    for run in runs:
+        end = math.inf if run[1] is None else run[1]
+        if first is None or end > first[0]:
+            first, second = (end, run), first
+        elif second is None or end > second[0]:
+            second = (end, run)
+        top.append((first, second))
+    return [r[0] for r in runs], top
+
+
+def _only_overlap(index: tuple[list, list], ts_start, ts_end):
+    """The single run overlapping [ts_start, ts_end], else None (none or 2+).
+
+    Runs starting by ``ts_end`` overlap iff they end at or after ``ts_start``;
+    two such runs exist iff the prefix's second-latest end reaches it."""
+    starts, top = index
+    first, second = top[bisect.bisect_right(starts, ts_end)]
+    if first is None or first[0] < ts_start:
+        return None
+    if second is not None and second[0] >= ts_start:
+        return None
+    return first[1]
 
 
 def _plan(turns_db: Path, board_db: Path, profile: str, *,
@@ -58,6 +90,7 @@ def _plan(turns_db: Path, board_db: Path, profile: str, *,
             f"SELECT turn_id, ts_start, ts_end, {platform} FROM turns "
             "WHERE placement_host IS NULL"
         ).fetchall()
+    index = _run_index(runs)
     plan = []
     for turn_id, ts_start, ts_end, plat in rows:
         # agent.turn_facade: <session_id>:<effective_task_id>:<nonce>.
@@ -70,10 +103,10 @@ def _plan(turns_db: Path, board_db: Path, profile: str, *,
         end = ts_end
         if end < ts_start:
             continue
-        overlapping = [(s, e, h, m) for s, e, h, m in runs if s <= end and (e is None or ts_start <= e)]
-        if len(overlapping) != 1:
-            continue
-        start, stop, host, metadata = overlapping[0]
+        only = _only_overlap(index, ts_start, end)
+        if only is None:
+            continue  # no run, or two or more (open/unknown-host runs included)
+        start, stop, host, metadata = only
         if stop is None or not (start <= ts_start <= stop) or not host or not host.strip():
             continue
         try:

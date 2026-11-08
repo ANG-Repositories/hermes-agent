@@ -39,6 +39,12 @@ def no_worker_env(monkeypatch):
     for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_OWNER_PID", kwh.PLACEMENT_ENV):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
+    # Local backend baseline, independent of an inherited TERMINAL_ENV or a
+    # config bridge; remote-backend cases override it explicitly.
+    from tools import terminal_tool
+
+    monkeypatch.setattr(terminal_tool, "_ensure_terminal_env_bridged", lambda: None)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
 
 
 def _columns(path):
@@ -129,6 +135,24 @@ def test_failed_placement_reapply_suppresses_live_host(db, no_worker_env, monkey
         }),
     }) == "ci-box"
     assert _build().placement_host is None
+
+
+@pytest.mark.parametrize("applied, expected", [("ace-media", None), ("ci-box", "ci-box")])
+def test_successful_reapply_must_match_boot_host(db, no_worker_env, monkeypatch, applied, expected):
+    # Prism 2f2377ff612f: a reapply that SUCCEEDS onto another host moved the
+    # tools off the boot placement; the boot host is no longer the actual host.
+    _worker(monkeypatch, placement_host="ci-box")
+    monkeypatch.setattr(kwh, "_reapply", {"failed": 0, "warned": False})
+    recorded = []
+    monkeypatch.setattr(kwh, "_record_reapply_failure", recorded.append)
+    environ = {kwh.PLACEMENT_ENV: json.dumps({
+        "host": applied, "env": {"TERMINAL_ENV": "ssh", "TERMINAL_SSH_HOST": applied},
+    })}
+    assert kwh.reapply_or_record("terminal", environ=environ) == applied
+    assert environ["TERMINAL_SSH_HOST"] == applied  # the tool call really targets it
+    assert recorded == ([] if expected else [1])  # run metadata carries the mismatch
+    store.insert_turn(_build(turn_id="reapplied_" + applied))
+    assert _host(db, "reapplied_" + applied) == expected
 
 
 def test_boot_record_wins_over_mutated_env(no_worker_env, monkeypatch):
@@ -478,3 +502,77 @@ def test_backfill_apply_stamps_only_covered_null_rows(tmp_path):
     assert _host(turns, "tx") == "keep"
     assert _host(turns, "tg") is None
     assert _host(turns, "ta") is None
+
+
+class _Counted(float):
+    """A timestamp that counts every ordering comparison made on it."""
+    ops = 0
+
+    def _counting(name):  # noqa: N805 - class-body helper
+        base = getattr(float, name)
+
+        def method(self, other):
+            _Counted.ops += 1
+            return base(self, other)
+        return method
+
+    __lt__ = _counting("__lt__")
+    __le__ = _counting("__le__")
+    __gt__ = _counting("__gt__")
+    __ge__ = _counting("__ge__")
+    del _counting
+
+
+class _Rows(list):
+    def fetchall(self):
+        return list(self)
+
+
+class _FakeConn:
+    def __init__(self, cols, rows):
+        self.cols, self.rows = cols, rows
+
+    def execute(self, sql, *params):
+        if sql.startswith("PRAGMA"):
+            return _Rows((i, c) for i, c in enumerate(self.cols))
+        return _Rows(self.rows)
+
+
+def test_backfill_run_lookup_is_not_quadratic():
+    # Prism 525c863d6abc: comparisons, not wall time. One closed run and one
+    # turn per window; a per-turn scan of every run costs ~R*T comparisons.
+    n = 1000
+    runs = [(_Counted(i * 100), _Counted(i * 100 + 50), "ci-box",
+             json.dumps({"worker_session_id": f"w{i}"})) for i in range(n)]
+    turns = [(f"w{i}:task:n", _Counted(i * 100 + 10), _Counted(i * 100 + 20), "cli")
+             for i in range(n)]
+    module = runpy.run_path(str(SCRIPT))
+    _Counted.ops = 0
+    plan = module["_plan"](Path("turns.db"), Path("kanban.db"), "daedalus",
+                           turns_conn=_FakeConn(["turn_id", "placement_host"], turns),
+                           board_conn=_FakeConn(["metadata"], runs))
+    assert len(plan) == n
+    # O((R+T) log R) is ~3e4 here; the old per-turn scan made ~1.5e6.
+    assert _Counted.ops < 10 * 2 * n * n.bit_length(), _Counted.ops
+
+
+def test_backfill_run_index_matches_full_scan():
+    # The index must keep the full scan's verdict: exactly one overlapping run,
+    # with open runs (ended_at NULL) and boundary ties counted as overlaps.
+    import random
+
+    module = runpy.run_path(str(SCRIPT))
+    rng = random.Random(0xC9FC)
+    for _ in range(300):
+        runs = []
+        for i in range(rng.randrange(0, 8)):
+            start = rng.randrange(0, 60)
+            end = None if rng.random() < 0.2 else start + rng.randrange(0, 20)
+            runs.append((start, end, f"h{i}", None))
+        index = module["_run_index"](runs)
+        for _ in range(20):
+            ts_start = rng.randrange(0, 80)
+            ts_end = ts_start + rng.randrange(0, 10)
+            scan = [r for r in runs if r[0] <= ts_end and (r[1] is None or ts_start <= r[1])]
+            assert module["_only_overlap"](index, ts_start, ts_end) == (
+                scan[0] if len(scan) == 1 else None), (runs, ts_start, ts_end)
