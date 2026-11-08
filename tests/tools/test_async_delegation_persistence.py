@@ -597,6 +597,29 @@ def test_record_cap_rejects_without_deleting_live_records_and_counts_degradation
     gate.set()
 
 
+def test_record_cap_full_of_settled_terminal_records_admits_new_dispatch(monkeypatch):
+    """A registry at cap made only of finished, fully delivered records must evict the oldest one
+    and admit the new dispatch — not degrade every delegate_task to sync (2026-11-08 incident:
+    256 done/failed, 0 pending, week of registry_cap fallbacks)."""
+    monkeypatch.setattr(ad, "_MAX_REGISTRY_RECORDS", 2)
+    monkeypatch.setattr(ad._store, "MAX_REGISTRY_RECORDS", 2)
+    old = _running_record(delegation_id="old")
+    old.update({"state": "done", "updated_at": time.time() - 60, "outbox": [{"state": "delivered"}]})
+    newer = _running_record(delegation_id="newer")
+    newer.update({"state": "failed", "outbox": []})
+    ad._write_registry_for_tests({"schema_version": 1, "updated_at": time.time(),
+                                  "records": {"old": old, "newer": newer}})
+    result, gate = _dispatch()
+    assert result["status"] != "rejected", result
+    records = _load()["records"]
+    assert "old" not in records          # oldest settled record evicted to make room
+    assert "newer" in records
+    assert result["delegation_id"] in records
+    assert len(records) == 2
+    assert ad.observability_counters()["sync_fallback_registry_cap"] == 0
+    gate.set()
+
+
 def test_resume_disabled_does_not_mutate_or_dispatch(monkeypatch):
     record = _running_record()
     _write_record(record)

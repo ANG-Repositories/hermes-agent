@@ -5846,7 +5846,11 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         return _route_client(req, client, final_model)
     # Try custom first, then API-key providers (Codex excluded here:
     # falling through to Codex with no model is a stale-constant trap).
-    for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+    from agent.auxiliary_attempt import single_attempt_config
+    resolvers = (_try_custom_endpoint,) if single_attempt_config(req.task) is not None else (
+        _try_custom_endpoint, _resolve_api_key_provider,
+    )
+    for try_fn in resolvers:
         client, default = try_fn()
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)
@@ -6961,6 +6965,10 @@ _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """Config dict for auxiliary.<task>, or {} when unavailable. Plugin-registered tasks get their
     declared defaults layered under user config (user wins); built-in defaults live in DEFAULT_CONFIG."""
+    from agent.auxiliary_attempt import single_attempt_config
+    attempt_config = single_attempt_config(task)
+    if attempt_config is not None:
+        return attempt_config
     if not task:
         return {}
     try:
@@ -8146,6 +8154,9 @@ def _resolve_call_client(
             api_key=resolved_api_key, api_mode=resolved_api_mode, main_runtime=main_runtime,
             task=task)
         effective_provider = _effective_provider_for_client(client, resolved_provider)
+        from agent.auxiliary_attempt import single_attempt_config
+        if client is None and single_attempt_config(task) is not None:
+            raise AuxiliaryClientUnavailable("configured attempt has no available client")
         if client is None:
             # Explicit provider with no credentials: honor the task fallback_chain before
             # raising (fallback entries may use OAuth / credential-pool auth).
@@ -8268,7 +8279,9 @@ def _prepare_aux_request(
     # Route-scoped resilience for the COMPACTION summarizer (PRD 2026-06-25): ``_aux_task`` is added
     # ONLY for the Anthropic wrapper (its adapter threads the timeout it otherwise drops + forces
     # max_retries=0); other aux tasks keep the SDK default retries (AC-13).
-    client, _scope_kwargs = _scope_client_for_task(client, task, effective_timeout)
+    from agent.auxiliary_attempt import single_attempt_config
+    client, _scope_kwargs = _scope_client_for_task(
+        client, "compression" if single_attempt_config(task) is not None else task, effective_timeout)
     kwargs.update(_scope_kwargs)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     client_base = str(getattr(client, "base_url", "") or "")
@@ -9074,7 +9087,8 @@ def _call_llm_impl(
         return _validate_llm_response(
             _relay_sync_completion(
                 client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
-                create=lambda request: _create_with_progress(
+                create=lambda request: (
+                    _create_with_progress_once if _single_attempt else _create_with_progress)(
                     client, request, task,
                     force_stream=_provider_requires_stream(
                         request_provider, req.base_info or req.resolved_base_url),
@@ -9082,6 +9096,10 @@ def _call_llm_impl(
             ),
             task, **validate_kw,
         )
+    from agent.auxiliary_attempt import single_attempt_config
+    _single_attempt = single_attempt_config(task) is not None
+    if _single_attempt:
+        return _primary(provider=request_provider, base_url=req.base_info)
     try:
         # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
         # transient blips before escalating to fallback — a dropped connection shouldn't

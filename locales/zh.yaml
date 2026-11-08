@@ -917,8 +917,11 @@ gateway:
     action_shutting_down: "正在关闭"
     action_restarting: "正在重启"
     cron_interrupted: "⚠️ 定时任务 '{job}' 因 Hermes {action}而被中断；本次运行没有结果。它会按计划再次运行，或在 Hermes 恢复后用 `hermes cron run {job}` 立即运行。"
-    notice_shutdown: "⚠️ Hermes 正在关闭——你当前的任务将被中断。恢复上线后，发送任意消息，我会尝试从中断处继续。"
-    notice_restart: "⚠️ Hermes 正在重启——你当前的任务将被中断。重启后发送任意消息，我会尝试从你离开的地方继续。"
+    notice_shutdown: "⚠️ Hermes 正在停止。"
+    notice_restart: "⚠️ Hermes 正在重启。"
+    active_interruption: "你当前的任务可能会中断。"
+    continue_prompt: "如果 Hermes 恢复上线，你可以请求继续中断的工作。"
+    continue_auto: "如果 Hermes 恢复上线且通过恢复检查，中断的工作可能会自动继续。"
   startup:
     handoff_thread_title: "Hermes——{title}"
     restarted: "♻ 网关已成功重启。你的会话继续有效。"
