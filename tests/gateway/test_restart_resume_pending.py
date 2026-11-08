@@ -1818,10 +1818,14 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # Pre-claim must be visible immediately.
     assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
-    # Let the guarded task, the background task, and the late-arrival
-    # drain task all settle.
-    for _ in range(20):
-        await asyncio.sleep(0.02)
+    # Join the resume owner first: its finally releases the pre-claim so
+    # the adapter's late-arrival drain can run the agent. Each adapter task
+    # can schedule a successor, so join successive snapshots until quiescent.
+    # A timeout bounds a broken lifecycle; elapsed time is not completion.
+    async with asyncio.timeout(10):
+        await asyncio.gather(*tuple(runner._background_tasks))
+        while adapter._background_tasks:
+            await asyncio.gather(*tuple(adapter._background_tasks))
 
     # Exactly one agent run for the resumed session — not zero (the
     # pre-claim did not swallow the resume) and not two (no duplicate).
