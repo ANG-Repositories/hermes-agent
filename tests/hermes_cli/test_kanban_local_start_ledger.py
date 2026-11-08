@@ -265,3 +265,83 @@ def test_local_start_books_renews_and_releases_on_the_fleet_ledger_when_homes_di
         home / placement.RESERVATIONS_REL, now=now), "booked on the board home instead"
     kh.release_local(rid)
     assert not placement.live_reservations(fleet / placement.RESERVATIONS_REL, now=now), "release missed the row"
+
+
+# ---- one root (Prism 87f95a7e001f / baca55317404 / c17555de1567): the gate tick's renewal gate, its reaper and the
+# target signal's table/ledger pair all read the fleet root (kh.ledger_root()), never the board home.
+
+def _fleet_only(home, tmp_path, monkeypatch, table=TABLE):
+    fleet = tmp_path / "fleet-root"
+    (fleet / "config").mkdir(parents=True)
+    (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(table), encoding="utf-8")
+    (home / "config" / "fleet-hosts.json").unlink()
+    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    return fleet
+
+
+def _builder(**kw):
+    from gateway import kanban_gate_tick as gt
+    b = gt.GateTickBuilder(None, fleet_dir=lambda: kb.kanban_home() / "fleet", kanban_cfg=lambda: kw.get("cfg", {}),
+                           ledger=lambda boards: kb.count_running_by_placement(boards),
+                           connect=lambda board=None: kb.connect(board=board))
+    b._boards = [{"slug": "default"}]
+    return b
+
+
+def test_gate_tick_renews_local_lease_when_table_only_at_fleet_root(home, tmp_path, monkeypatch):
+    fleet = _fleet_only(home, tmp_path, monkeypatch)
+    t0 = time.time()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="local", assignee="alpha")
+        _dispatch_one(conn, [])
+        assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
+    (row,) = _ledger(fleet)
+    assert not kh.table_path(home).exists() and _ledger(home) == []
+    got = _builder().renew_reservations(now=time.time() + kh.RENEW_EVERY_S + 60)
+    assert got is not None and got["renewed"] == 1 and got["lapsed"] == 0, got
+    assert _ledger(fleet)[0]["until"] > row["until"]
+    assert placement.live_reservations(fleet / placement.RESERVATIONS_REL, now=t0 + kh.RESERVE_TTL_S + 120)
+
+
+def test_gate_tick_reaps_the_fleet_ledger(home, tmp_path, monkeypatch):
+    fleet = _fleet_only(home, tmp_path, monkeypatch)
+    now = time.time()
+    placement.reserve("mac-studio", "kanban", placement.Footprint(ram_gb=3, threads=1), ttl_s=5,
+                      job_id="t_dead#1", path=fleet / placement.RESERVATIONS_REL, now=now - 100)
+    got = _builder().renew_reservations(now=now + kh.RENEW_EVERY_S + 60)
+    assert got is not None and got.get("reaped") == 1, got
+    assert _ledger(fleet) == []
+    assert [(a["job_id"], a["decision"]) for a in _admissions(fleet)][-1] == ("t_dead#1", "expired")
+    assert not (home / placement.RESERVATIONS_REL).exists()
+
+
+def test_target_signal_table_and_ledger_share_the_fleet_root(home, tmp_path, monkeypatch):
+    other = json.loads(json.dumps(TABLE))
+    other["hosts"]["board-only"] = other["hosts"].pop("mac-studio")
+    other["default_first"] = "board-only"
+    (home / "config" / "fleet-hosts.json").write_text(json.dumps(other), encoding="utf-8")
+    fleet = tmp_path / "fleet-root"
+    (fleet / "config").mkdir(parents=True)
+    (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
+    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    from gateway import kanban_gate_tick as gt
+    monkeypatch.setattr(gt, "read_signal_enabled", lambda cfg: True)
+    sig = _builder().target_signal({})
+    assert sig is not None and sig.placement_table is not None
+    assert Path(sig.placement_reservations).parent.parent.parent == fleet
+    assert "mac-studio" in sig.placement_table.hosts and "board-only" not in sig.placement_table.hosts
+
+
+def test_gate_tick_renewal_control_table_at_both_roots(home, tmp_path, monkeypatch):
+    """Control: with the table at both roots (the pre-split layout) renewal and reaping still target the fleet ledger."""
+    fleet = tmp_path / "fleet-root"
+    (fleet / "config").mkdir(parents=True)
+    (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
+    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="local", assignee="alpha")
+        _dispatch_one(conn, [])
+    (row,) = _ledger(fleet)
+    got = _builder().renew_reservations(now=time.time() + kh.RENEW_EVERY_S + 60)
+    assert got["renewed"] == 1 and got["reaped"] == 0, got
+    assert _ledger(fleet)[0]["until"] > row["until"] and _ledger(home) == []
