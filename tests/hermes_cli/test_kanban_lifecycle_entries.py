@@ -35,6 +35,9 @@ def test_review_entry_binds_implementer_before_any_exit(conn, current_run):
     conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES('raw-review','Raw review','review',1)")
     payload = conn.execute("SELECT payload FROM task_events WHERE task_id='raw-review' AND kind='review_requested'").fetchone()[0]
     assert json.loads(payload)["implementer"] == "human:operator"
+    kb._append_event(conn, "raw-review", "review_requested", {"summary": "verified"})
+    payload = conn.execute("SELECT payload FROM task_events WHERE task_id='raw-review' AND kind='review_requested'").fetchone()[0]
+    assert json.loads(payload)["implementer"] == "human:operator"
 
 
 def test_human_ready_is_operator_todo_and_cannot_promote(conn):

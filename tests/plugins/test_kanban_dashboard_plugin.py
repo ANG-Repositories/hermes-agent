@@ -144,8 +144,8 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     try:
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET status = 'scheduled' WHERE id = ?",
-                (task["id"],),
+                "UPDATE tasks SET status = 'scheduled', next_eligible_at = ? WHERE id = ?",
+                (2_000_000_000, task["id"]),
             )
     finally:
         conn.close()

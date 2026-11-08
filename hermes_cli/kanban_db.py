@@ -9213,12 +9213,14 @@ def _append_event(
         # handoff writer has finished. Finalize that row rather than publish two
         # handoffs (and two notifications) for the same entry.
         provisional = conn.execute(
-            "SELECT id FROM task_events WHERE task_id=? AND kind='review_requested' "
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_requested' "
             "AND json_valid(payload) AND json_extract(payload,'$.source')='lifecycle_entry_repair' "
             "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested')",
             (task_id, task_id),
         ).fetchone()
         if provisional is not None:
+            payload = {**json.loads(provisional[1]), **(payload or {})}
+            payload.pop("source", None)
             conn.execute(
                 "UPDATE task_events SET run_id=?,payload=?,actor_profile=?,actor_session_id=? WHERE id=?",
                 (run_id, _json_or_null(payload), actor_profile, actor_session_id, provisional[0]),

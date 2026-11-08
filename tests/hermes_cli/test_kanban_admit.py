@@ -758,7 +758,7 @@ def _site_triggers():
     def human_lane(m, ctx):
         upd("UPDATE tasks SET assignee='human:apollo' WHERE id=?", ctx)
         m.setattr(profiles, "profile_exists", lambda name: not str(name).startswith("human"))
-        return "studio", "twin", "not a spawnable profile"
+        return "studio", "twin", "status is todo"
 
     def pause_pre(m, ctx):
         m.setattr(kph, "held_routes", lambda rows, cache: {r["id"]: ("wait", "pause_hold (test)") for r in rows})
