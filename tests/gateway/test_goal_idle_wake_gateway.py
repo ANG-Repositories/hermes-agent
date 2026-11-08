@@ -216,8 +216,20 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
             return await runner._handle_message(event)
         reached.set()
         await release.wait()
-        event._goal_execution_started = True
-        return None
+        runner.hooks = SimpleNamespace(emit=AsyncMock())
+        runner._hmwa_resolve_session = AsyncMock(return_value=(event.source, entry, key))
+        runner._hmwa_check_persisted_route = AsyncMock(return_value=None)
+        runner._hmwa_prepare_turn = AsyncMock(return_value=(
+            runner._PreparedTurn([], "", "retry", "retry", None, None), {}))
+        runner._pinned_channel_inputs = lambda *a, **kw: ("", event.source)
+        runner._clear_session_env = lambda tokens: None
+
+        async def model(**kwargs):
+            assert event._goal_execution_started is True
+            raise asyncio.CancelledError  # execution began; settlement must not refund it
+
+        runner._run_agent = model
+        return await runner._handle_message_with_agent_admitted(event, event.source, key, 1)
 
     adapter.set_message_handler(handler)
     await runner._goal_idle_wake_one(entry, 0, 3)
