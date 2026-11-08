@@ -560,7 +560,9 @@ class GatewayGoalsMixin:
         hooks = [("loop completion", self._post_turn_loop_completion)]
         explicit_completed = (agent_result.get("completed") if isinstance(agent_result, dict)
                               else getattr(event, "_goal_turn_completed", None))
-        completed = explicit_completed is not False
+        from agent.turn_failure_copy import is_max_iteration_handoff
+
+        completed = explicit_completed is not False or is_max_iteration_handoff(agent_result)
         if final_text.strip() or explicit_completed is not None:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
@@ -801,8 +803,6 @@ class GatewayGoalsMixin:
         )
 
         checkin_minutes = self._goal_int_setting("checkin_minutes", DEFAULT_CHECKIN_MINUTES)
-        if not checkin_minutes:
-            return
         max_checkins = self._goal_int_setting("max_idle_checkins", DEFAULT_MAX_IDLE_CHECKINS)
         await self._warm_goals_session_db("goal idle wake")
         sids = set(await self._run_in_executor_with_context(list_active_goal_session_ids))

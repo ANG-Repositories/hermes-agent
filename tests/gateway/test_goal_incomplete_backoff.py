@@ -137,13 +137,14 @@ def test_reset_preserves_unrelated_wait(tmp_path, monkeypatch, reset, barrier):
     if barrier == "timer":
         mgr.wait_for_seconds(3600, "deployment")
     elif barrier == "session":
+        monkeypatch.setattr(goals, "_session_waiting", lambda sid: True)
         mgr.wait_on_session("deployment", "deployment")
     else:
         monkeypatch.setattr(goals, "_pid_alive", lambda pid: True)
         mgr.wait_on(12345, "deployment")
     before = (mgr.state.waiting_until, mgr.state.waiting_on_pid, mgr.state.waiting_on_session,
               mgr.state.waiting_reason, mgr.state.waiting_since)
-    with patch.object(goals, "judge_goal") as judge:
+    with patch.object(goals, "judge_goal", return_value=("continue", "more", False, None, False)) as judge:
         decision = mgr.evaluate_after_turn(
             "made progress", turn_completed=reset == "completed", human_message=reset == "human")
     assert (mgr.state.waiting_until, mgr.state.waiting_on_pid, mgr.state.waiting_on_session,

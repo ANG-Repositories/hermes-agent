@@ -472,6 +472,7 @@ class GoalState:
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
     consecutive_incomplete_turns: int = 0     # agent turns that failed before completion
+    incomplete_retry_wait: bool = False       # only the retry loop owns this wait barrier
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -532,6 +533,7 @@ class GoalState:
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_reason=data.get("waiting_reason"),
+            incomplete_retry_wait=bool(data.get("incomplete_retry_wait", False)),
             checkin_minutes=int(data["checkin_minutes"]) if data.get("checkin_minutes") is not None else -1,
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
@@ -549,6 +551,7 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
     def clear_wait(self) -> None:
+        self.incomplete_retry_wait = False
         self.waiting_on_pid = None
         self.waiting_on_session = None
         self.waiting_until = 0.0
@@ -562,7 +565,7 @@ class GoalState:
 # GoalState fields an idle wake mutates (accounting + the wait barrier it consumes).
 _IDLE_WAKE_FIELDS = (
     "idle_wakes", "last_idle_wake_at", "waiting_on_pid", "waiting_on_session", "waiting_until",
-    "waiting_on_delegations", "waiting_reason", "waiting_since",
+    "waiting_on_delegations", "waiting_reason", "waiting_since", "incomplete_retry_wait",
 )
 
 
@@ -1881,8 +1884,12 @@ class GoalManager:
         # reloading the manager (or restarting the gateway) cannot restart a rapid retry loop.
         if state.consecutive_incomplete_turns and (turn_completed or human_message):
             state.consecutive_incomplete_turns = 0
-            state.clear_wait()
+            if state.incomplete_retry_wait:
+                state.clear_wait()
             self._save()
+        # A completed/human turn may reset retry state, never a deployment/process barrier.
+        if not turn_completed and not state.incomplete_retry_wait and self.is_waiting():
+            return self._waiting_decision(state)
         if turn_completed and not last_response.strip():
             return _decision("active", False, None, "skipped", "empty completed response", "")
         if not turn_completed:
@@ -1892,7 +1899,8 @@ class GoalManager:
             failures = state.consecutive_incomplete_turns
             if failures >= limit:
                 delay = min(1800, 60 * 2 ** min(failures - limit, 5))
-                self.wait_for_seconds(delay, reason="consecutive incomplete agent turns")
+                self._park("consecutive incomplete agent turns",
+                           waiting_until=time.time() + delay, incomplete_retry_wait=True)
                 message = (
                     f"⏳ Goal parked after {failures} incomplete turns. Retrying in {delay}s "
                     "with exponential backoff (up to 30 min). Send a message to reset retries."
@@ -2037,7 +2045,7 @@ class GoalManager:
         if s is None or s.status != "active":
             return None
         minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
-        if not minutes or minutes <= 0:
+        if (checkin_minutes <= 0 or minutes <= 0) and not s.incomplete_retry_wait:
             return None
         now = time.time() if now is None else now
         if now - max(s.last_turn_at, s.last_idle_wake_at, s.waiting_since, s.created_at) > _IDLE_WAKE_HORIZON_S:

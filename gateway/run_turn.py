@@ -2176,7 +2176,11 @@ class GatewayTurnMixin:
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         _entered = time.monotonic()
         # Delivery returns text/None rather than the result dict; preserve completion for /goal.
-        event._goal_turn_completed = agent_result.get("completed") is not False
+        from agent.turn_failure_copy import is_max_iteration_handoff
+
+        event._goal_turn_completed = (
+            agent_result.get("completed") is not False or is_max_iteration_handoff(agent_result)
+        )
         # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
         with suppress(Exception):
             event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
