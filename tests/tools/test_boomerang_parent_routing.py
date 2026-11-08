@@ -215,7 +215,7 @@ def test_route_snapshot_has_bounded_wait():
         thread.join(5)
 
 
-@pytest.mark.parametrize("source", ["delegation-default", "explicit-child"])
+@pytest.mark.parametrize("source", ["delegation-default", "explicit-child", "mixed-parent-first", "mixed-direct-first"])
 @pytest.mark.parametrize("same_endpoint", [False, True])
 def test_direct_recovery_uses_endpoint_bound_delegation_key(monkeypatch, source, same_endpoint):
     parent = SimpleNamespace(model="parent", provider="openrouter", api_mode="chat_completions",
@@ -243,26 +243,44 @@ def test_direct_recovery_uses_endpoint_bound_delegation_key(monkeypatch, source,
         "base_url": route["base_url"] if same_endpoint else "http://different/v1"})
     task = {"goal": "restore direct child", "route_source": source, "parent_route": route,
             "credential_ref": {"source": "delegation_config"}, "materialized_prefill_messages": []}
+    tasks = [task]
+    inherited_route = {**route, "provider": "openrouter", "model": "inherited-child",
+        "base_url": route["base_url"] if same_endpoint else "http://different/v1",
+        "fallback_chain": [{"provider": "openrouter", "model": "inherited-backup"}]}
+    if source.startswith("mixed"):
+        task["route_source"] = "delegation-default"
+        inherited = {"goal": "restore inherited child", "route_source": "live-parent",
+            "inherit_mode": "summary", "parent_route": inherited_route,
+            "credential_ref": {"source": "provider", "provider": "openrouter"},
+            "materialized_prefill_messages": []}
+        tasks = [inherited, task] if source == "mixed-parent-first" else [task, inherited]
     record = {"execution": {"model": route["model"], "provider": "custom", "base_url": route["base_url"],
               "fallback_chain": [], "credential_ref": {"source": "delegation_config"}}, "route": {}}
-    result = json.loads(dt.delegate_task(tasks=[task], parent_agent=parent, _recovery_spec=record))
+    result = json.loads(dt.delegate_task(tasks=tasks, parent_agent=parent, _recovery_spec=record))
     assert not result.get("error"), result
-    assert captured[0]["api_key"] == "delegation-key"
-    assert captured[0]["model"] == route["model"]
-    assert captured[0]["fallback_model"] == route["fallback_chain"]
-    assert captured[0]["providers_allowed"] == ["selected-lane"]
-    assert captured[0]["request_overrides"] == route["request_overrides"]
+    selected = next(kw for kw in captured if kw["model"] == route["model"])
+    assert selected["api_key"] == "delegation-key"
+    assert selected["fallback_model"] == route["fallback_chain"]
+    assert selected["providers_allowed"] == ["selected-lane"]
+    assert selected["request_overrides"] == route["request_overrides"]
+    if source.startswith("mixed"):
+        other = next(kw for kw in captured if kw["model"] == inherited_route["model"])
+        assert other["api_key"] == "WRONG-provider-key"  # correct provider source, not the direct config
+        assert other["fallback_model"] == inherited_route["fallback_chain"]
+        assert [kw["model"] for kw in captured] == [t["parent_route"]["model"] for t in tasks]
     # A rotated endpoint or removed key must not expose the unrelated provider key.
     captured.clear()
+    network = []
+    monkeypatch.setattr("httpx.Client.send", lambda *a, **kw: network.append(kw))
     config["base_url"] = "http://rotated/v1"
     refused = json.loads(dt.delegate_task(tasks=[task], parent_agent=parent, _recovery_spec=record))
     assert "endpoint credentials" in refused["error"]
-    assert captured == [] and "WRONG-provider-key" not in json.dumps(refused)
+    assert captured == [] and not network and "WRONG-provider-key" not in json.dumps(refused)
     config["base_url"] = route["base_url"]
     config["api_key"] = ""
     refused = json.loads(dt.delegate_task(tasks=[task], parent_agent=parent, _recovery_spec=record))
     assert "credentials could not be resolved" in refused["error"]
-    assert captured == [] and "parent-key" not in json.dumps(refused)
+    assert captured == [] and not network and "parent-key" not in json.dumps(refused)
 
 
 def test_persist_route_uses_constructed_fallback_chain():
