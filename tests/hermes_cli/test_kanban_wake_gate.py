@@ -331,6 +331,65 @@ def test_fallback_admission_preserves_frozen_launch_credentials(tmp_path, monkey
         secret_scope.reset_multiplex_context(multiplex)
 
 
+def test_fallback_admission_pinned_launch_ignores_secondary_env_mirror(tmp_path, monkeypatch):
+    """A mirrored served home must not inherit the pinned launch's frozen secrets."""
+    import os
+
+    import hermes_constants
+    from agent import secret_scope
+    from hermes_cli import fallback_config, kanban_provider_health as health, profiles
+    from hermes_cli.kanban_wake_gate import _default_lane_probe
+    from tui_gateway import launch_profile_policy
+
+    launch, secondary = tmp_path / "launch", tmp_path / "secondary"
+    launch.mkdir()
+    secondary.mkdir()
+    (secondary / "config.yaml").write_text(
+        "model:\n  provider: zai\n  default: glm-5.1\n"
+        "fallback_providers:\n  - source: wake-pinned-test\n")
+    (secondary / ".env").write_text("WAKE_SECONDARY_SECRET=file-only\n")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("WAKE_PINNED_SECRET", "launch-only-synthetic")
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    # Preserve any embedding host pin when monkeypatch restores this test's state.
+    monkeypatch.setattr(hermes_constants, "_PINNED_PROCESS_HERMES_HOME", None)
+    hermes_constants.pin_process_hermes_home(launch)
+    launch_profile_policy.capture_launch_env()
+    monkeypatch.setenv("HERMES_HOME", str(secondary))
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(secondary))
+    monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
+    monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
+    monkeypatch.setattr(health, "configured_box_health", lambda: False)
+    monkeypatch.setattr(health, "_fetch", lambda *a: {"eligible_count": 0})
+    seen = []
+
+    def source(entry):
+        seen.append((secret_scope.get_secret("WAKE_PINNED_SECRET"),
+                     secret_scope.get_secret("WAKE_SECONDARY_SECRET"),
+                     hermes_constants.get_hermes_home(),
+                     secret_scope.current_secret_scope_home()))
+        return []
+
+    monkeypatch.setitem(fallback_config._CHAIN_SOURCES, "wake-pinned-test", source)
+    multiplex = secret_scope.set_multiplex_context(True)
+    caller = secret_scope.set_secret_scope(
+        {"WAKE_PINNED_SECRET": "caller-synthetic"}, profile_home="caller")
+    home_token = hermes_constants.set_hermes_home_override(launch)
+    try:
+        assert hermes_constants.get_routing_process_hermes_home() == launch
+        assert _default_lane_probe("secondary").startswith("lane zai capped;")
+        assert seen == [(None, "file-only", secondary, str(secondary))]
+        assert secret_scope.get_secret("WAKE_PINNED_SECRET") == "caller-synthetic"
+        assert secret_scope.current_secret_scope_home() == "caller"
+        assert hermes_constants.get_hermes_home() == launch
+        assert os.environ["HERMES_HOME"] == str(secondary)
+        assert hermes_constants.get_routing_process_hermes_home() == launch
+    finally:
+        hermes_constants.reset_hermes_home_override(home_token)
+        secret_scope.reset_secret_scope(caller)
+        secret_scope.reset_multiplex_context(multiplex)
+
+
 def test_cpu_max_interval_is_configurable(tmp_path):
     cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90, "cpu_max_interval": 30}}}
     cpu = CpuDelta(0.95)

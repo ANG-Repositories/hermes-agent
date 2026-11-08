@@ -344,7 +344,7 @@ def _default_lane_probe(profile: str) -> Optional[str]:
         return None
     from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
     from hermes_cli.profiles import resolve_profile_env
-    from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from hermes_constants import get_routing_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
     from tui_gateway.launch_profile_policy import launch_secret_scope
 
     home = Path(resolve_profile_env(profile))
@@ -352,7 +352,7 @@ def _default_lane_probe(profile: str) -> Optional[str]:
     try:
         # Derived sources need the owner's credentials. Only the launch home
         # may inherit its frozen env-only injection; secondary homes stay isolated.
-        if home.resolve() == get_process_hermes_home().resolve():
+        if home.resolve() == get_routing_process_hermes_home().resolve():
             secrets = launch_secret_scope(home)
         else:
             secrets = build_profile_secret_scope(home)
