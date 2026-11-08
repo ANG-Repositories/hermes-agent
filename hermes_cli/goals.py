@@ -856,6 +856,23 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "… [truncated]"
 
 
+# Identifies this process in retry claims: a claim from a dead claimant can be recovered.
+_PROCESS_INSTANCE = uuid4().hex[:12]
+
+
+def _orphaned_retry_claim(token: Optional[str]) -> bool:
+    """A ``retry:<pid>:<instance>:<id>`` claim whose claiming process is gone (it died between
+    claim and settlement, so nothing will dispatch or refund it). A live claimant fences it."""
+    parts = (token or "").split(":")
+    if len(parts) != 4 or parts[0] != "retry" or parts[2] == _PROCESS_INSTANCE:
+        return False
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        return False
+    return pid == os.getpid() or not _pid_alive(pid)
+
+
 def _pid_alive(pid: int) -> bool:
     """Liveness via ``gateway.status._pid_exists`` (psutil + ctypes/POSIX fallback). Never uses
     ``os.kill(pid, 0)``: on Windows that routes to CTRL_C_EVENT and hard-kills the target's console
@@ -1935,8 +1952,13 @@ class GoalManager:
         if turn_completed and not last_response.strip():
             return _decision("active", False, None, "skipped", "empty completed response", "")
         if not turn_completed:
+            # An executed failure spent model budget; unexecuted wakes never reach here (refunded).
             state.consecutive_incomplete_turns += 1
+            state.turns_used += 1
             state.last_turn_at = time.time()
+            if state.turns_used >= state.max_turns:
+                state.clear_wait()
+                return self._budget_pause(state, "incomplete", "agent turn did not complete")
             limit = max(1, int(max_incomplete_turns))
             failures = state.consecutive_incomplete_turns
             if failures >= limit:
@@ -2084,9 +2106,10 @@ class GoalManager:
         if s is None or s.status != "active":
             return None
         minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
-        if (checkin_minutes <= 0 or minutes <= 0) and not s.incomplete_retry_wait:
+        orphan = _orphaned_retry_claim(s.idle_wake_attempt)
+        if (checkin_minutes <= 0 or minutes <= 0) and not s.incomplete_retry_wait and not orphan:
             return None
-        retry_wake = s.incomplete_retry_wait
+        retry_wake = s.incomplete_retry_wait or orphan
         now = time.time() if now is None else now
         if now - max(s.last_turn_at, s.last_idle_wake_at, s.waiting_since, s.created_at) > _IDLE_WAKE_HORIZON_S:
             return None  # stale/abandoned goal: never wake it out of the blue
@@ -2096,6 +2119,9 @@ class GoalManager:
             if now < s.waiting_until:
                 return None
             self.stop_waiting()
+            prompt = self.next_continuation_prompt()
+            counted = False
+        elif orphan:  # the claimant died before settling: re-offer the same retry
             prompt = self.next_continuation_prompt()
             counted = False
         elif s.waiting_on_pid is not None or s.waiting_on_session is not None:
@@ -2122,7 +2148,24 @@ class GoalManager:
         if counted:
             s.idle_wakes += 1
         s.last_idle_wake_at = now
-        s.idle_wake_attempt = ("retry:" if retry_wake else "idle:") + uuid4().hex
+        s.idle_wake_attempt = (
+            f"retry:{os.getpid()}:{_PROCESS_INSTANCE}:{uuid4().hex}" if retry_wake else "idle:" + uuid4().hex)
+        if orphan:
+            # Compare-and-set: of two processes recovering the same orphan, exactly one dispatches.
+            db = _get_session_db() if self.session_id else None
+            if db is not None:
+                s.revision += 1
+                raw = s.to_json()
+                try:
+                    won = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+                except Exception as exc:
+                    logger.debug("GoalManager: retry reclaim write failed: %s", exc)
+                    won = False
+                if not won:
+                    self._state, self._stored = _load_goal_raw(self.session_id)
+                    return None
+                self._stored = raw
+                return prompt
         self._save()
         return prompt
 

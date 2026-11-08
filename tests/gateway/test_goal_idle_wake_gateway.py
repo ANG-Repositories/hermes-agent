@@ -91,7 +91,7 @@ async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary, edit
     runner, adapter, received, key = rig
     monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
     mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
-    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=2)  # the arming failure spends one
     clock = mgr.state.created_at
     monkeypatch.setattr(goals.time, "time", lambda: clock)
     await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
@@ -152,7 +152,7 @@ async def test_retry_wake_rejected_before_admission_is_refunded(rig, monkeypatch
     runner, adapter, received, key = rig
     monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
     mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
-    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=2)  # the arming failure spends one
     clock = mgr.state.created_at
     monkeypatch.setattr(goals.time, "time", lambda: clock)
     await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
@@ -200,7 +200,7 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
     judge = Mock(return_value=("continue", "more", False, None, False))
     monkeypatch.setattr(goals, "judge_goal", judge)
     mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
-    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=2)  # the arming failure spends one
     clock = mgr.state.created_at
     monkeypatch.setattr(goals.time, "time", lambda: clock)
     await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
@@ -278,7 +278,8 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
     assert received[0]._gateway_accepted is True
     restored = await asyncio.to_thread(goals.GoalManager, "goal-sess")
     judge.assert_not_called()
-    assert restored.state.status == "active" and restored.state.turns_used == 0
+    # Only the executed arming failure is charged; an unexecuted wake would exhaust 2/2 and pause.
+    assert restored.state.status == "active" and restored.state.turns_used == 1
     if edit and outcome != "cap":
         assert restored.state.subgoals == ["keep criterion"]
     assert restored.state.incomplete_retry_wait is (outcome != "execute")

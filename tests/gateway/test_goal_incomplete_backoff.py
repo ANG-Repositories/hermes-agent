@@ -50,7 +50,7 @@ async def test_incomplete_turns_park_backoff_reset_and_notify_once(tmp_path, mon
             assert mgr.idle_wake_prompt(clock + delay)
             clock += delay
         assert judge.call_count == 0
-        assert mgr.state.turns_used == 0
+        assert mgr.state.turns_used == 9  # every executed failure spends budget
         assert runner._defer_goal_status_notice_after_delivery.await_count == 1
         assert runner._defer_goal_status_notice_after_delivery.call_args.args[0] is source
         mgr = await turn(completed=True, text="made progress")
@@ -245,9 +245,10 @@ async def test_iteration_handoff_is_counted_not_retried(tmp_path, monkeypatch, d
             source=SimpleNamespace(chat_id="origin"), is_internal=True, event=event, parts=("goal continuation",))
     mgr = await asyncio.to_thread(goals.GoalManager, "handoff")
     productive = not failed and not interrupted
-    assert mgr.state.turns_used == int(productive)
+    assert mgr.state.turns_used == 1  # a failed turn is not retried for free either
     assert judge.call_count == int(productive)
-    assert mgr.state.status == ("paused" if productive else "active")
+    assert mgr.state.status == "paused"
+    assert mgr.state.consecutive_incomplete_turns == int(not productive)
 
 
 def _run_sync_result(monkeypatch, raw):
@@ -342,6 +343,101 @@ def test_blank_retry_successes_are_bounded(tmp_path, monkeypatch):
                 delays.append(mgr.state.waiting_until - clock)
     judge.assert_not_called()
     assert mgr.state.status == "paused" and mgr.state.turns_used == 4
-    assert wakes == 4
+    assert wakes == 3  # the initial executed failure already spent one turn
     assert delays == sorted(delays) and delays[-1] > delays[0]
     assert mgr.idle_wake_prompt(clock + 7200, checkin_minutes=0) is None
+
+
+@pytest.mark.asyncio
+async def test_executed_failures_consume_turn_budget(tmp_path, monkeypatch):
+    """Executed failed retries charge max_turns; an unexecuted (route-refused) wake never does."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayGoalsMixin()
+    runner.config = {"goals": {"max_incomplete_turns": 1}}
+    runner._run_in_executor_with_context = asyncio.to_thread
+    runner.async_session_store = SimpleNamespace(get_or_create_session=AsyncMock(
+        return_value=SimpleNamespace(session_id="fail-budget")))
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._delivery_adapter_for = lambda source: None
+    runner._session_key_for_source = lambda source: "test"
+    mgr = await asyncio.to_thread(goals.GoalManager, "fail-budget")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=3)
+    clock = mgr.state.created_at
+
+    async def wake_turn(executed):
+        event = SimpleNamespace(text="[Continuing toward your standing goal]\nGoal: ship it", internal=True,
+                                _goal_idle_wake=True, _goal_execution_started=executed,
+                                _goal_turn_completed=False)
+        await runner._run_post_turn_hooks(
+            agent_result={"completed": False, "final_response": "This turn did not complete"},
+            source=SimpleNamespace(chat_id="origin"), is_internal=True, event=event, parts=("goal continuation",))
+        return await asyncio.to_thread(goals.GoalManager, "fail-budget")
+
+    wakes = 0
+    with patch("hermes_cli.goals.time.time", side_effect=lambda: clock), patch.object(goals, "judge_goal") as judge:
+        mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+        mgr = await asyncio.to_thread(goals.GoalManager, "fail-budget")
+        assert mgr.state.turns_used == 1
+        while mgr.state.status == "active" and wakes < 20:
+            clock = mgr.state.waiting_until
+            assert mgr.idle_wake_prompt(checkin_minutes=0)
+            mgr = await wake_turn(executed=False)  # route refusal: settled by refund, not the judge
+            assert mgr.state.turns_used == 1 + wakes
+            mgr = await wake_turn(executed=True)
+            wakes += 1
+    judge.assert_not_called()
+    assert (mgr.state.status, mgr.state.turns_used, wakes) == ("paused", 3, 2)
+    assert mgr.idle_wake_prompt(clock + 7200, checkin_minutes=0) is None
+
+
+_CHILD = r"""
+import sys, time
+from hermes_cli import goals
+mgr = goals.GoalManager("orphan")
+if sys.argv[1] == "fail":
+    mgr.set("ship it")
+    mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+    print(mgr.state.waiting_until, flush=True)
+else:
+    print(bool(mgr.idle_wake_prompt(float(sys.argv[2]), checkin_minutes=0)), flush=True)
+    if sys.argv[1] == "claim-and-hold":
+        sys.stdin.read()  # alive until the parent closes stdin: dispatch still owned
+"""
+
+
+def _child(tmp_path, *args, hold=False):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {**os.environ, "HERMES_HOME": str(tmp_path),
+           "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+    proc = subprocess.Popen([sys.executable, "-c", _CHILD, *args], env=env, text=True,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    line = proc.stdout.readline().strip()
+    if not hold:
+        proc.communicate("", timeout=60)
+    return line, proc
+
+
+def test_retry_claim_survives_claimant_death(tmp_path, monkeypatch):
+    """A retry claimed by a process that died before dispatch/settlement is re-offered with
+    check-ins off; a live claimant fences it, and only one of two racing reclaimers wins."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    deadline = float(_child(tmp_path, "fail")[0])
+    out, holder = _child(tmp_path, "claim-and-hold", str(deadline), hold=True)
+    assert out == "True"
+    try:
+        mgr = goals.GoalManager("orphan")
+        assert not mgr.state.incomplete_retry_wait and not mgr.state.waiting_until
+        assert mgr.idle_wake_prompt(deadline + 1, checkin_minutes=0) is None  # live owner: fenced
+    finally:
+        holder.communicate("", timeout=60)  # the claimant exits without dispatching
+    racer = goals.GoalManager("orphan")
+    mgr = goals.GoalManager("orphan")
+    assert mgr.idle_wake_prompt(deadline + 2, checkin_minutes=0)
+    assert racer.idle_wake_prompt(deadline + 2, checkin_minutes=0) is None  # lost the reclaim
+    owner = goals.GoalManager("orphan").state.idle_wake_attempt
+    assert owner == mgr.state.idle_wake_attempt and owner.startswith("retry:")
+    assert goals.GoalManager("orphan").idle_wake_prompt(deadline + 3, checkin_minutes=0) is None
