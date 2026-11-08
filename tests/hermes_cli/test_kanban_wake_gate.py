@@ -264,7 +264,7 @@ def test_fallback_admission_binds_owner_scope_and_restores_caller(tmp_path, monk
             "fallback_providers:\n  - source: wake-scope-test\n")
         (home / ".env").write_text(f"WAKE_TEST_SECRET={profile}\n")
         homes[profile] = home
-    monkeypatch.setattr(profiles, "resolve_profile_env", homes.__getitem__)
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(homes[p]))
     monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
     monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
     monkeypatch.setattr(health, "configured_box_health", lambda: False)
@@ -306,7 +306,7 @@ def test_fallback_admission_preserves_frozen_launch_credentials(tmp_path, monkey
     monkeypatch.setenv("HERMES_HOME", str(launch))
     monkeypatch.setenv("WAKE_LAUNCH_SECRET", "injected-at-launch")
     monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
-    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: launch)
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(launch))
     monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
     monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
     monkeypatch.setattr(health, "configured_box_health", lambda: False)

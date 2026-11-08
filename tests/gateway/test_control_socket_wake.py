@@ -100,7 +100,7 @@ def capped_primary_routes(store, tmp_path, monkeypatch):
         "model:\n  provider: zai\n  default: glm-5.1\n"
         "fallback_providers:\n  - provider: deepseek\n    model: deepseek-v4-flash\n"
     )
-    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: home)
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(home))
     monkeypatch.setattr(health, "configured_probes", lambda: {
         "zai": "https://primary.invalid/health", "deepseek": "https://fallback.invalid/health"})
     monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})

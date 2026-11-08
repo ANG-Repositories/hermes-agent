@@ -347,7 +347,7 @@ def _default_lane_probe(profile: str) -> Optional[str]:
     from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
     from tui_gateway.launch_profile_policy import launch_secret_scope
 
-    home = resolve_profile_env(profile)
+    home = Path(resolve_profile_env(profile))
     home_token = set_hermes_home_override(home)
     try:
         # Derived sources need the owner's credentials. Only the launch home
