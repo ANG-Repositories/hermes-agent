@@ -5,9 +5,11 @@
 A historical turn needs positive provenance: the session prefix of its turn_id
 must match ``worker_session_id`` in the covering task_runs.metadata. Time overlap alone
 does not prove worker ownership. Exactly one run of this profile may overlap
-the turn, including runs whose host is unknown; that run must cover the whole
-turn and have a known host (``studio`` -> ``studio-local``). Missing provenance,
-overlapping runs, gateway turns and already stamped rows are left unchanged.
+the turn, including runs whose host is unknown; the turn must start in that
+run and have a known host (``studio`` -> ``studio-local``). A final turn can end
+after its own completion tool closes the run. Missing provenance, placement
+reapplication failures, overlapping runs, gateway turns and already stamped rows
+are left unchanged.
 
 Dry-run is the default; ``--apply`` takes a WAL-safe VACUUM INTO backup first.
 
@@ -32,7 +34,7 @@ WORKER_PLATFORMS = ("", "cli")
 
 
 def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]:
-    with sqlite3.connect(f"file:{board_db}?mode=ro", uri=True, timeout=30) as board:
+    with sqlite3.connect(board_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30) as board:
         run_cols = {r[1] for r in board.execute("PRAGMA table_info(task_runs)")}
         if "metadata" not in run_cols:
             return []  # No positive worker-session provenance in this board.
@@ -41,7 +43,7 @@ def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]
             "WHERE profile = ?",
             (profile,),
         ).fetchall()
-    with sqlite3.connect(f"file:{turns_db}?mode=ro", uri=True, timeout=30) as conn:
+    with sqlite3.connect(turns_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
         if "placement_host" not in cols:
             sys.exit(f"{turns_db}: no placement_host column yet (deploy the schema first)")
@@ -66,7 +68,7 @@ def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]
         if len(overlapping) != 1:
             continue
         start, stop, host, metadata = overlapping[0]
-        if not (start <= ts_start and end <= stop) or not host or not host.strip():
+        if not (start <= ts_start <= stop) or not host or not host.strip():
             continue
         try:
             provenance = json.loads(metadata or "null")
@@ -74,6 +76,8 @@ def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]
             continue
         if not isinstance(provenance, dict) or provenance.get("worker_session_id") != session_id:
             continue
+        if provenance.get("placement_reapply_failed", 0):
+            continue  # The run may contain Studio calls despite its remote host.
         plan.append((turn_id, LOCAL_HOST_NAME if host == LOCAL_RUN_HOST else host))
     return plan
 

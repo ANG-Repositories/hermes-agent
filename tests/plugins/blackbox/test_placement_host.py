@@ -246,6 +246,65 @@ def test_backfill_skips_unfinished_turn(tmp_path, end):
     assert _host(turns, "tw") is None
 
 
+@pytest.mark.parametrize("target", ["board", "turns"])
+def test_backfill_escapes_sqlite_uri_paths(tmp_path, target):
+    home, turns, board = _seed_backfill(tmp_path)
+    if target == "board":
+        renamed = board.with_name("kanban#prod?.db")
+        board.rename(renamed)
+        board = renamed
+    else:
+        renamed = home.with_name("home#prod?")
+        home.rename(renamed)
+        home = renamed
+        turns = home / "blackbox" / "turns.db"
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tw") == "ci-box"
+    assert not (tmp_path / "kanban").exists()
+    if target == "turns":
+        assert not (tmp_path / "home").exists()
+
+
+def test_backfill_final_turn_may_finish_after_run_closes(tmp_path):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(turns) as conn:
+        conn.execute("UPDATE turns SET ts_start = 1099.5, ts_end = 1102.5 "
+                     "WHERE turn_id = 'worker-7:task:tw'")
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tw") == "ci-box"
+
+
+@pytest.mark.parametrize("case", ["starts_after_close", "competing_run"])
+def test_backfill_final_turn_still_requires_unambiguous_run(tmp_path, case):
+    home, turns, board = _seed_backfill(tmp_path)
+    start = 1100.5 if case == "starts_after_close" else 1099.5
+    with sqlite3.connect(turns) as conn:
+        conn.execute("UPDATE turns SET ts_start = ?, ts_end = 1102.5 "
+                     "WHERE turn_id = 'worker-7:task:tw'", (start,))
+    if case == "competing_run":
+        with sqlite3.connect(board) as conn:
+            conn.execute("INSERT INTO task_runs VALUES "
+                         "(12, 't_next', 'daedalus', 1101, 1200, NULL, NULL)")
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tw") is None
+
+
+@pytest.mark.parametrize("failures", [0, 1, 3])
+def test_backfill_skips_runs_with_placement_reapply_failures(tmp_path, failures):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(board) as conn:
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = 7",
+                     (json.dumps({"worker_session_id": "worker-7",
+                                  "placement_reapply_failed": failures}),))
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tw") == (None if failures else "ci-box")
+    assert _host(turns, "tl") == "studio-local"
+
+
 def _run(*args):
     return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
                           text=True, timeout=60)
