@@ -535,8 +535,9 @@ def browser_remote_refusal(record: Any) -> Optional[str]:
 def _host_caps(ctx: CapabilityTick, host: str) -> frozenset:
     caps = ctx.cmap.hosts.get(host, frozenset())
     record = ctx.cmap.browser_remote.get(host)
-    if record is not None:
-        # A recorded failed leg vetoes a stale/static browser advertisement too.
+    if ctx.cmap.browser_remote:
+        # Once remote probing is enabled, an unobserved host is not a grant.
+        # Failed legs also veto stale/static browser advertisements.
         if browser_remote_refusal(record) is None:
             return caps | {"browser-session"}
         return caps - {"browser-session"}
@@ -616,8 +617,8 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         enforced=tuple(enforced),
         observed=_first(warned),
         body_ignored=ignored,
-        wait=(browser_remote_refusal(ctx.cmap.browser_remote[pin_host.lower()])
-              if pin_host and pin_host.lower() in ctx.cmap.browser_remote
+        wait=(browser_remote_refusal(ctx.cmap.browser_remote.get(pin_host.lower()))
+              if pin_host and ctx.cmap.browser_remote
               and any(r.cap == "browser-session" for r in binding) else None),
     )
 

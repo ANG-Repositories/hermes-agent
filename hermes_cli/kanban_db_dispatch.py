@@ -5308,10 +5308,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     verdict = None
     if caps is not None:
         from hermes_cli import kanban_host_capabilities as _khc
+        # A remote workspace binding is mandatory, just like a body host pin.
+        cap_pin = bind[2] if bind and bind[2] else pin
         verdict = _khc.evaluate(
             row["body"], skills, caps,
-            pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
-            any_pin=pin == _kwp.PIN_ANY)
+            pin_host=cap_pin if cap_pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
+            any_pin=cap_pin == _kwp.PIN_ANY)
         if verdict.body_ignored and caps_out is not None:
             # Advisory body pin no host may serve (t_640a4ea0): placed without it, recorded.
             caps_out.setdefault("body_ignored", {})[row["id"]] = verdict.body_ignored[0]
