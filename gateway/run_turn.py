@@ -4996,6 +4996,7 @@ class GatewayTurnMixin:
             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
         )
 
+        response = None
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
@@ -5044,10 +5045,13 @@ class GatewayTurnMixin:
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
             )
+            # Cleanup can await while this turn still accepts steering. Refresh only
+            # this owner's objects: recursive follow-ups return their own policy.
+            for turn_result in (response, turn_ctx.result_holder[0]):
+                if isinstance(turn_result, dict):
+                    turn_result["effective_display_kind"] = turn_ctx.effective_display_kind
+                    turn_result["effective_reply_expected"] = turn_ctx.reply_expected
 
-        if isinstance(response, dict):
-            response["effective_display_kind"] = turn_ctx.effective_display_kind
-            response["effective_reply_expected"] = turn_ctx.reply_expected
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
         return response

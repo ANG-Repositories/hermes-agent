@@ -175,6 +175,71 @@ async def test_receiving_turn_policy_survives_queued_return(monkeypatch, tmp_pat
     assert result[prefix + "_reply_expected"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["depth_cap", "discarded", "recursive"])
+async def test_cleanup_steer_updates_only_returned_owner_policy(monkeypatch, tmp_path, path):
+    from tests.gateway.test_queued_followup_turn_clock_and_leftover_steer import _drive, SESSION_KEY, _source
+    from gateway.platforms.event import MessageEvent
+
+    contexts = []
+    runner_ref = []
+
+    def prepare(runner):
+        runner_ref.append(runner)
+        runner._MAX_INTERRUPT_DEPTH = 0 if path == "depth_cap" else 5
+        build = runner._run_agent_build_turn_context
+        cleanup = runner._run_agent_cleanup_turn_tasks
+
+        def build_turn(*args, **kwargs):
+            kwargs["persist_user_display_kind"] = "internal_notification"
+            kwargs["reply_expected"] = False
+            ctx, worker, adapter = build(*args, **kwargs)
+            contexts.append(ctx)
+            return ctx, worker, adapter
+
+        async def cleanup_turn(ctx, **kwargs):
+            # Accepted human steer during an awaited cleanup, after return selection.
+            await asyncio.sleep(0)
+            if ctx is contexts[0]:
+                agent = ctx.agent_holder[0]
+                runner._session_state(SESSION_KEY).turn.agent = agent
+                runner._fold_into_running_turn(agent, SESSION_KEY, MessageEvent(
+                    text="late human steer", source=_source(), reply_expected=True))
+            await cleanup(ctx, **kwargs)
+
+        runner._run_agent_build_turn_context = build_turn
+        runner._run_agent_cleanup_turn_tasks = cleanup_turn
+        if path == "discarded":
+            async def discard(**kwargs):
+                return None
+            runner._prepare_profile_scoped_inbound_message_text = discard
+
+    def script(idx, queue_followup):
+        if idx == 0:
+            if path == "recursive":
+                # Parent is human-engaged; the terminal internal child must stay quiet.
+                runner = runner_ref[0]
+                agent = contexts[0].agent_holder[0]
+                runner._session_state(SESSION_KEY).turn.agent = agent
+                runner._fold_into_running_turn(agent, SESSION_KEY, MessageEvent(
+                    text="parent human steer", source=_source(), reply_expected=True))
+            queue_followup("queued")
+        return {"final_response": "NO_REPLY", "messages": [], "api_calls": 1}
+
+    _, _, calls, result = await _drive(monkeypatch, tmp_path, script, prepare=prepare)
+    assert all(ctx.persist_user_display_kind == "internal_notification" for ctx in contexts)
+    if path == "recursive":
+        assert len(calls) == 2
+        assert result["queued_terminal_display_kind"] == "internal_notification"
+        assert result["queued_terminal_reply_expected"] is False
+        assert result["effective_reply_expected"] is False
+    else:
+        assert len(calls) == 1
+        assert contexts[0].human_engaged
+        assert result["effective_display_kind"] is None
+        assert result["effective_reply_expected"] is True
+
+
 @pytest.mark.parametrize("case", ["internal", "heartbeat", "stale", "wrong_agent", "muted", "scheduled", "display_off"])
 def test_fold_promotion_guards(case):
     from gateway.run_busy import GatewayBusySessionMixin
