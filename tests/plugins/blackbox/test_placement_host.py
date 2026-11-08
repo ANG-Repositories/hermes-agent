@@ -210,7 +210,7 @@ def _seed_backfill(tmp_path):
                  " started_at INTEGER, ended_at INTEGER, host TEXT)")
     conn.executemany("INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?)", [
         (7, "t_a", "daedalus", 990, 1100, "ci-box"),
-        (8, "t_b", "daedalus", 1990, 2100, "studio"),
+        (8, "t_b", "daedalus", 1990, 2100, "studio-local"),
         (9, "t_c", "daedalus", 2990, 3100, "ci-box"),
         (10, "t_d", "daedalus", 2995, 3100, "ace-media"),
         (11, "t_e", "other", 4990, 5100, "ci-box"),   # another profile's run
@@ -359,7 +359,8 @@ def test_backfill_open_run_is_overlap_only(tmp_path):
     assert module["_plan"](turns, board, "daedalus") == []
 
 
-def test_backfill_revalidates_turn_after_backup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("changed", ["turn", "provenance"])
+def test_backfill_revalidates_turn_after_backup(tmp_path, monkeypatch, changed):
     home, turns, board = _seed_backfill(tmp_path)
     module = runpy.run_path(str(SCRIPT))
     real_connect = sqlite3.connect
@@ -369,9 +370,15 @@ def test_backfill_revalidates_turn_after_backup(tmp_path, monkeypatch):
             result = super().execute(sql, parameters)
             if sql.startswith("VACUUM INTO"):
                 # A provisional row changes after planning, before the update.
-                with real_connect(turns) as other:
-                    other.execute("UPDATE turns SET ts_end = 5001 WHERE turn_id = ?",
-                                  ("worker-7:task:tw",))
+                if changed == "turn":
+                    with real_connect(turns) as other:
+                        other.execute("UPDATE turns SET ts_end = 5001 WHERE turn_id = ?",
+                                      ("worker-7:task:tw",))
+                else:
+                    with real_connect(board) as other:
+                        other.execute("UPDATE task_runs SET metadata = ? WHERE id = 7",
+                                      (json.dumps({"worker_session_id": "worker-7",
+                                                   "placement_reapply_failed": 1}),))
             return result
 
     def connect(database, *args, **kwargs):
@@ -385,6 +392,64 @@ def test_backfill_revalidates_turn_after_backup(tmp_path, monkeypatch):
     assert module["main"]() == 0
     assert _host(turns, "tw") is None
     assert _host(turns, "tl") == "studio-local"
+
+
+def test_backfill_open_run_failure_between_reads(tmp_path, monkeypatch):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(board) as conn:
+        conn.execute("UPDATE task_runs SET ended_at = NULL WHERE id = 7")
+    module = runpy.run_path(str(SCRIPT))
+    real_connect = sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if str(database).startswith(turns.resolve().as_uri()):
+            with real_connect(board) as other:
+                other.execute("UPDATE task_runs SET metadata = ? WHERE id = 7",
+                              (json.dumps({"worker_session_id": "worker-7",
+                                           "placement_reapply_failed": 1}),))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    assert ("worker-7:task:tw", "ci-box") not in module["_plan"](turns, board, "daedalus")
+
+
+def test_backfill_studio_dispatch_is_not_execution_provenance(tmp_path):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(board) as conn:
+        conn.execute("UPDATE task_runs SET host = 'studio' WHERE id = 8")
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tl") is None
+
+
+def test_backfill_board_locked_through_apply(tmp_path, monkeypatch):
+    home, turns, board = _seed_backfill(tmp_path)
+    module = runpy.run_path(str(SCRIPT))
+    real_connect = sqlite3.connect
+    blocked = []
+
+    class ApplyConnection(sqlite3.Connection):
+        def executemany(self, sql, parameters):
+            if sql.startswith("UPDATE turns SET placement_host"):
+                with real_connect(board, timeout=0) as other:
+                    try:
+                        other.execute("UPDATE task_runs SET metadata = '{}' WHERE id = 7")
+                    except sqlite3.OperationalError as exc:
+                        assert "locked" in str(exc)
+                        blocked.append(True)
+            return super().executemany(sql, parameters)
+
+    def connect(database, *args, **kwargs):
+        if str(database) == str(turns):
+            kwargs["factory"] = ApplyConnection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--home", str(home), "--board", str(board),
+                                     "--profile", "daedalus", "--apply"])
+    assert module["main"]() == 0
+    assert blocked == [True]
+    assert _host(turns, "tw") == "ci-box"
 
 
 def _run(*args):

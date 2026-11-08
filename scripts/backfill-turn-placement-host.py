@@ -6,7 +6,8 @@ A historical turn needs positive provenance: the session prefix of its turn_id
 must match ``worker_session_id`` in the covering task_runs.metadata. Time overlap alone
 does not prove worker ownership. Exactly one run of this profile may overlap
 the turn, including runs whose host is unknown; the turn must start in that
-closed run and have a known host (``studio`` -> ``studio-local``). Open runs
+closed run and have a known execution host. Dispatcher-only ``studio`` is
+not evidence of local execution and is skipped. Open runs
 only count for overlap detection. A final turn can end
 after its own completion tool closes the run. Missing provenance, placement
 reapplication failures, overlapping runs, gateway turns and already stamped rows
@@ -30,14 +31,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 LOCAL_RUN_HOST = "studio"
-LOCAL_HOST_NAME = "studio-local"  # hermes_cli.kanban_worker_hosts.LOCAL_HOST_NAME
 # A worker turn is recorded by the CLI; a gateway turn on these platforms never ran in a worker.
 WORKER_PLATFORMS = ("", "cli")
 
 
 def _plan(turns_db: Path, board_db: Path, profile: str, *,
-          turns_conn: sqlite3.Connection | None = None) -> list[tuple[str, str]]:
-    with sqlite3.connect(board_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30) as board:
+          turns_conn: sqlite3.Connection | None = None,
+          board_conn: sqlite3.Connection | None = None) -> list[tuple[str, str]]:
+    with (nullcontext(board_conn) if board_conn is not None else
+          sqlite3.connect(board_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)) as board:
         run_cols = {r[1] for r in board.execute("PRAGMA table_info(task_runs)")}
         if "metadata" not in run_cols:
             return []  # No positive worker-session provenance in this board.
@@ -82,7 +84,10 @@ def _plan(turns_db: Path, board_db: Path, profile: str, *,
             continue
         if provenance.get("placement_reapply_failed", 0):
             continue  # The run may contain Studio calls despite its remote host.
-        plan.append((turn_id, LOCAL_HOST_NAME if host == LOCAL_RUN_HOST else host))
+        # `studio` is the dispatcher host, not evidence of the tool backend.
+        if host == LOCAL_RUN_HOST:
+            continue
+        plan.append((turn_id, host))
     return plan
 
 
@@ -110,16 +115,19 @@ def main() -> int:
     with sqlite3.connect(str(turns_db), timeout=30) as conn:
         conn.execute("VACUUM INTO ?", (str(backup),))
     print(f"backup={backup}")
-    with sqlite3.connect(str(turns_db), timeout=30) as conn:
-        # The backup/plan may race provisional-row updates. Revalidate under the
-        # write lock so neither turn contents nor eligibility can change mid-apply.
-        conn.execute("BEGIN IMMEDIATE")
-        current = set(_plan(turns_db, args.board, args.profile, turns_conn=conn))
-        cur = conn.executemany(
-            "UPDATE turns SET placement_host = ? WHERE turn_id = ? AND placement_host IS NULL",
-            [(h, t) for t, h in plan if (t, h) in current],
-        )
-        print(f"stamped={cur.rowcount}")
+    # Lock the provenance database through the turns commit as well: a turns
+    # lock alone cannot stop task_runs metadata changing after revalidation.
+    with sqlite3.connect(args.board.resolve().as_uri() + "?mode=rw", uri=True, timeout=30) as board:
+        board.execute("BEGIN IMMEDIATE")
+        with sqlite3.connect(str(turns_db), timeout=30) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = set(_plan(turns_db, args.board, args.profile,
+                                turns_conn=conn, board_conn=board))
+            cur = conn.executemany(
+                "UPDATE turns SET placement_host = ? WHERE turn_id = ? AND placement_host IS NULL",
+                [(h, t) for t, h in plan if (t, h) in current],
+            )
+            print(f"stamped={cur.rowcount}")
     return 0
 
 
