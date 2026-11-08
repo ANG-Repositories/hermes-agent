@@ -98,6 +98,35 @@ def test_overlapping_later_passes_heal_delayed_failure(board, order):
     assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0] == 0
 
 
+def test_disabled_evidence_can_be_reattested_after_policy_change(board):
+    from dataclasses import replace
+    obs = h.observation('disabled-before-enrollment')
+    assert h.admit(board, obs).action == 'DISABLED'
+    h.enroll(board)
+    with h.kb.write_txn(board):
+        board.execute('UPDATE failure_authority SET policy_generation=2')
+    refreshed = replace(obs, policy_generation=2)
+    decision = h.admit(board, refreshed)
+    assert decision.action == 'REPAIR'
+    assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0] == 1
+    stored = board.execute('SELECT data FROM failure_observations').fetchone()[0]
+    assert h.json.loads(stored)['policy_generation'] == 2
+
+
+def test_reattest_cannot_change_disabled_source_facts(board):
+    from dataclasses import replace
+    obs = h.observation('immutable-source')
+    assert h.admit(board, obs).action == 'DISABLED'
+    h.enroll(board)
+    with h.kb.write_txn(board):
+        board.execute('UPDATE failure_authority SET policy_generation=2')
+    with pytest.raises(ValueError, match='source replay changed payload'):
+        h.admit(board, replace(obs, policy_generation=2, sha='d'*40))
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
+    stored = board.execute('SELECT data FROM failure_observations').fetchone()[0]
+    assert h.json.loads(stored)['policy_generation'] == 1
+
+
 def test_late_lineage_reconstruction_preserves_single_binding(board):
     from dataclasses import replace
     h.enroll(board)

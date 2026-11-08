@@ -438,7 +438,14 @@ def observe_failure(conn, ref, *, producer, card_spec=None):
         prior = conn.execute('SELECT * FROM failure_observations WHERE source_key=?',(obs.source_key,)).fetchone()
         if prior:
             if prior['data'] != _json(asdict(obs)):
-                raise ValueError('source replay changed payload')
+                # Only unprocessed, disabled evidence may acquire a current-policy
+                # attestation. Every source fact remains immutable.
+                previous = json.loads(prior['data'])
+                previous['policy_generation'] = obs.policy_generation
+                if prior['disposition'] != 'DISABLED' or _json(previous) != _json(asdict(obs)):
+                    raise ValueError('source replay changed payload')
+                conn.execute('UPDATE failure_observations SET receipt=?,data=? WHERE obs_id=?',
+                             (ref.token, _json(asdict(obs)), prior['obs_id']))
             if prior['disposition'] != 'DISABLED' or not enabled:
                 return Decision('REPLAY',prior['key_id'],prior['episode_id'],prior['card_id'],reason=prior['disposition'])
         key_id = None
