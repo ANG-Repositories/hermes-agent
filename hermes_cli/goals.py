@@ -16,7 +16,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -949,6 +949,11 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if data is None:
         return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
 
+    if not (isinstance(data.get("verdict"), str) and data["verdict"].strip().lower() in {"done", "blocked", "continue", "wait"}):
+        if "verdict" in data or not isinstance(data.get("done"), bool):
+            return "continue", "judge reply did not match verdict schema", True, None
+    if "reason" in data and not isinstance(data["reason"], str):
+        return "continue", "judge reason did not match verdict schema", True, None
     reason = str(data.get("reason") or "").strip() or "no reason provided"
     verdict_raw = data.get("verdict")
     if isinstance(verdict_raw, str):
@@ -982,7 +987,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+    return "continue", "judge wait verdict had no valid target", True, None
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -1041,6 +1046,7 @@ def judge_goal(
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
     completion_handoff: bool = False,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1095,6 +1101,11 @@ def judge_goal(
             "whether the substantive work is done.\n"
         )
     try:
+        from hermes_cli.goal_judge_chain import chain_config, judge_chain
+        policy = chain_config(timeout)
+        if policy is not None:
+            return judge_chain(policy, system_prompt, prompt, _goal_judge_max_tokens(), _parse_judge_response,
+                               cancel_check=cancel_check)
         raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
@@ -1122,6 +1133,15 @@ def goal_judge_available() -> bool:
     """
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
+        from hermes_cli.goal_judge_chain import chain_config
+        try:
+            policy = chain_config(_goal_judge_timeout())
+        except (ValueError, TypeError):
+            return True  # configured but invalid: judge must report failure, never bypass the gate
+        if policy is not None:
+            # Explicit chain exists even when its primary cannot currently resolve. Let
+            # the bounded judge report exhaustion rather than silently bypassing it.
+            return True
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
         return False
@@ -1893,9 +1913,24 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
+        activation = replace(state)
+
+        def judge_cancelled():
+            # User verbs can mutate state in place, including pause followed by resume.
+            if not same_active_goal(activation, self._state):
+                return True
+            # A failed read is not a user stop. The save CAS still fences stale verdicts.
+            if _get_session_db() is None:
+                return False
+            current, raw = _load_goal_raw(self.session_id, strict=True)
+            if raw and current is None:
+                raise ValueError('unreadable goal state')
+            return not same_active_goal(activation, current)
+
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
+            cancel_check=judge_cancelled,
         )
         state.last_verdict = verdict
         state.last_reason = reason
