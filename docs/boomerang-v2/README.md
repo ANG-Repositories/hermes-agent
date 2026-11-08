@@ -23,6 +23,36 @@ A boomerang child inherits the parent conversation in one of two modes (D-14):
 `summary` instead and the gateway logs `boomerang.fork_ineligible reason=<reason>` (INV-2).
 A forked child never ships a near-fork that silently writes cold.
 
+### Routing is independent of context mode
+
+The [parent-routing contract](parent-routing-inheritance-spec.md) applies to fork,
+branch, explicit summary and automatic summary downgrade. Without an explicit
+call-level child model/provider/credential override, a boomerang takes its parent's
+active route and effective fallback chain, not `delegation.model/provider` defaults.
+An explicit empty parent chain remains disabled. Ordinary delegations retain their
+existing configuration precedence. A deliberately different child route uses summary
+context rather than claiming a byte-identical fork.
+
+A busy parent's route is snapshotted separately from its database transcript; it is
+not reset to its configured primary. With no live parent, the gateway restores the
+resolved owner's session `/model` preference, then channel overrides, then defaults,
+using the normal gateway fallback policy. Unreadable persisted preferences or missing
+credentials fail closed. No historical transient fallback is guessed after restart.
+
+Existing durable delegation records carry per-task non-secret routing provenance,
+identity and fallback policy. Execution resolves credentials again within the owning
+profile. Credential-bearing request headers or non-symbolic fallback secrets cannot
+be serialized: durable launch refuses that policy rather than silently widening or
+erasing it. Legacy records without a resolved fallback policy report routing-unavailable.
+`boomerang.route` logs requested/effective mode, owner/child sessions, route source,
+provider/model and fallback count; it excludes endpoints, headers and credentials.
+
+The synthetic-provider HTTP acceptance suite is
+`tests/integration/test_boomerang_parent_routing_http.py`. It drives the real boomerang
+parent resolver and child retry loop through two quota failures into a cross-vendor
+SSE sentinel, including detached JSON reconstruction and active-fallback inheritance.
+This proves routing integration, not real vendor availability or deployed activation.
+
 ## 1. Which mode each entry point uses (spec §5.6)
 
 | Entry point | `inherit_context` | Mode you get |

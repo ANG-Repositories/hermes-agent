@@ -33,6 +33,8 @@ def recover_route_parent(parent, route):
 
     if not isinstance(route, dict) or not route.get("provider") or not route.get("model"):
         raise ValueError("boomerang routing-unavailable: incomplete persisted identity")
+    if _carries_credential(route) or "fallback_chain" not in route:
+        raise ValueError("boomerang routing-unavailable: invalid persisted policy")
     runtime = _resolve_runtime_agent_kwargs_for_provider(route["provider"], target_model=route["model"])
     if not runtime.get("api_key") or not runtime.get("base_url"):
         raise ValueError("boomerang routing-unavailable: credentials could not be resolved")

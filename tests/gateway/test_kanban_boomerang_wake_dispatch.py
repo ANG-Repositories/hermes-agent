@@ -958,9 +958,14 @@ def _resolve(monkeypatch, runner, *, mode="fork", wait_s=0.0):
 
 
 def test_busy_parent_fold_logs_parent_busy(monkeypatch, caplog):
+    parent = SimpleNamespace(model="active", provider="active", base_url="http://active",
+                             api_key="synthetic", client=None, _client_kwargs={}, _fallback_chain=[])
+    runner = _Runner(running={"k1": parent})
+    runner.session_store = SimpleNamespace(load_transcript=lambda sid: [])
     with caplog.at_level("INFO", logger="tools.delegate_tool"):
-        out = _resolve(monkeypatch, _Runner(running={"k1": object()}))
-    assert out == ("db-parent", "summary")
+        out = _resolve(monkeypatch, runner)
+    assert out[1] == "summary" and out[0].model == parent.model
+    assert out[0] is not parent
     assert "boomerang.fork_ineligible reason=parent_busy parent_session=20261020_000000_parent" in caplog.text
 
 

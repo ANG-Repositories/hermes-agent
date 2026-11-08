@@ -2033,7 +2033,7 @@ def _build_child_agent(
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
         model=model or getattr(parent_agent, "model", None), toolsets=child_toolsets, session_ref=child_session_ref,
     )
-    rt = _resolve_child_runtime(
+    rt = {} if inherit_parent_route else _resolve_child_runtime(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
@@ -2050,6 +2050,7 @@ def _build_child_agent(
         )
         rt["fallback_model"] = copy.deepcopy(getattr(route_parent, "_fallback_chain", []))
         override_request_overrides = copy.deepcopy(getattr(route_parent, "request_overrides", {}) or {})
+        override_provider = None
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -4124,7 +4125,8 @@ def delegate_task(
         _routing_tasks = tasks if isinstance(tasks, list) and tasks else [
             {"inherit_context": inherit_context, "inherit_mode": inherit_mode}]
         _only_parent_routes = not (model or provider or credentials_cfg is not None) and all(
-            resolve_inherit_mode(t.get("inherit_context", inherit_context), t.get("inherit_mode", inherit_mode))
+            (resolve_inherit_mode(t.get("inherit_context", inherit_context), t.get("inherit_mode", inherit_mode))
+             and (not _recovery_spec or t.get("route_source") not in ("explicit-child", "delegation-default")))
             for t in _routing_tasks if isinstance(t, dict))
         creds = _resolve_delegation_credentials({} if _only_parent_routes else routing_cfg, parent_agent)
     except ValueError as exc:
