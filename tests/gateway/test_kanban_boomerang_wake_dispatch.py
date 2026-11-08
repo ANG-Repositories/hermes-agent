@@ -1215,3 +1215,26 @@ def test_db_parent_sends_the_configured_gateway_model(monkeypatch):
     ah._db_parent(runner, home)
     assert seen["model"] == "fallback-model" and "_fallback_notice" not in seen
 
+
+
+
+# --- t_3151f3fd: a routed review_deadman on a boomerang card is ONE child, routed to the recipient ------------------
+def test_routed_review_deadman_on_boomerang_card_is_one_child_routed_to_the_recipient(env):
+    other = "1502228850338435153"
+    rcpt = env["runner"].session_store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id=other, chat_type="group", user_id=HUMAN))
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "review_deadman", {
+            "by": "kanban-review-deadman", "waiting_min": 25, "episode": 1, "cycle": 0,
+            "recipient_route": "alerts-home", "recipient_session_key": rcpt.session_key,
+            "recipient_chat": other, "recipient_profile": "default"})
+    turns = _tick(env)
+    assert turns == [], [t.text for t in turns]
+    assert len(env["dispatched"]) == 1, env["dispatched"]
+    d = env["dispatched"][0]
+    assert d["row"] == "review_deadman" and d["path"] == "owner-wake"
+    assert str(d["route"]["chat_id"]) == other, d["route"]
+    env["runner"]._kanban_owner_wake_state.last_wake.clear()
+    _tick(env)
+    assert len(env["dispatched"]) == 1, "an active child: no second dispatch"

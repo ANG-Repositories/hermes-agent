@@ -1055,3 +1055,43 @@ def test_rejected_sub_wake_falls_back_to_the_owner_wake(env):
     handled = _tick(env)
     owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
     assert len(owner_turns) == 1 and tid in owner_turns[0].text, [e.text for e in handled]
+
+
+
+# --- t_3151f3fd: a routed review_deadman event wakes the recipient the producer resolved --------------------------
+def _recipient_session(env):
+    return env["store"].get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id=OTHER_CHAT, chat_type="group", user_id=HUMAN))
+
+
+@pytest.mark.parametrize("route", ["alerts-home", "fallback"])
+def test_routed_review_deadman_wakes_the_named_recipient_not_the_home(env, route):
+    """hermes-home review deadman, card homed to an #alerts session: the event names the operator sub's session.
+    One turn into THAT session; the home session gets nothing."""
+    rcpt = _recipient_session(env)
+    tid = _card(env)
+    _event(tid, "review_deadman", {"by": "kanban-review-deadman", "waiting_min": 25, "episode": 1, "cycle": 0,
+                                   "recipient_route": route, "recipient_session_key": rcpt.session_key,
+                                   "recipient_chat": OTHER_CHAT, "recipient_profile": "default"})
+    handled = _tick(env)
+    assert len(handled) == 1, [e.text for e in handled]
+    ev = handled[0]
+    assert ev.metadata["gateway_session_key"] == rcpt.session_key
+    assert ev.source.chat_id == OTHER_CHAT and tid in ev.text
+    assert len(_tick(env)) == 1, "no second turn on the next tick"
+
+
+def test_home_route_review_deadman_still_wakes_the_home(env):
+    tid = _card(env)
+    _event(tid, "review_deadman", {"by": "kanban-review-deadman", "waiting_min": 25, "episode": 1, "cycle": 0})
+    [ev] = _tick(env)
+    assert ev.metadata["gateway_session_key"] == env["owner"].session_key
+
+
+def test_routed_recipient_is_read_only_from_review_deadman_events():
+    assert ow.routed_recipient({"kind": "review_deadman", "payload": {
+        "recipient_route": "alerts-home", "recipient_session_key": "k"}}) == "k"
+    assert ow.routed_recipient({"kind": "review_deadman", "payload": {
+        "recipient_route": "home", "recipient_session_key": "k"}}) == ""
+    assert ow.routed_recipient({"kind": "blocked", "payload": {
+        "recipient_route": "fallback", "recipient_session_key": "k"}}) == ""
