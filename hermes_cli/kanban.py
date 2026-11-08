@@ -1018,8 +1018,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _author = args.created_by or _profile_author()
             _default_priority = None
             if args.priority is None:  # live band for a person/operator create (t_febbdb61)
-                _default_priority = live_band_default(
-                    conn, args.created_by or (_author if _author in _LIVE_BAND_OPERATORS else HUMAN_CREATED_BY))
+                _priority_author = args.created_by or (
+                    _author if _author == "default" or _author in _LIVE_BAND_OPERATORS else HUMAN_CREATED_BY)
+                # argparse's historical default is "user"; preserve that persisted author,
+                # but retain the verified root alias for operator eligibility.
+                if _priority_author == HUMAN_CREATED_BY and _profile_author() == "default":
+                    _priority_author = "default"
+                _default_priority = live_band_default(conn, _priority_author)
                 if _default_priority is None:
                     _default_priority = create_default_priority(args.created_by)
             _event_mark = kb.max_event_id(conn)

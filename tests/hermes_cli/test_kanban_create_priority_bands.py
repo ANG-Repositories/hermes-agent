@@ -145,6 +145,24 @@ def test_live_band_contextvar_cron_keeps_machine_default(kanban_home, monkeypatc
         clear_cron_session(token)
 
 
+def test_live_band_inferred_root_cli_alias(kanban_home, monkeypatch):
+    from gateway.session_context import set_cron_session, clear_cron_session
+    monkeypatch.setattr(kc, "_profile_author", lambda: "default")
+    monkeypatch.setattr(kb, "classify_create_origin", lambda: "script")
+    _seed_spawns([170, 170, 170])
+    assert _create_priority("root filing") == 170
+    with kbc.connect_closing() as conn:
+        assert next(t.created_by for t in kb.list_tasks(conn) if t.title == "root filing") == "user"
+    token = set_cron_session()
+    try:
+        assert _create_priority("scheduled maintenance") == 0
+    finally:
+        clear_cron_session(token)
+    assert _create_priority("root explicit", "--priority", "5") == 5
+    monkeypatch.setenv("KANBAN_LIVE_BAND", "off")
+    assert _create_priority("root disabled") == 0
+
+
 def test_live_band_default_gateway_alias_preserves_author(kanban_home, monkeypatch):
     from gateway.session_context import set_session_vars, restore_session_vars
     from tools import kanban_tools as kt
