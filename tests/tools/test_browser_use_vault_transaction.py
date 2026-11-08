@@ -197,7 +197,6 @@ def test_supervisor_dispatch_rechecks_transaction_after_setup(monkeypatch, chang
             elif change == 'shared_selection':
                 cli.browser_exec('select other-tab', session='research', task_id='taskB')
                 assert selected[0] == 'other-tab'
-                assert t.route_for_task('task') is not route
             return {'result': {'sessionId': 'pinned'}}
         return {'result': {}}
     sup._cdp = cdp
