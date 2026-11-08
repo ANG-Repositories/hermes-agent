@@ -59,10 +59,13 @@ def test_operator_home_predicate():
 def test_any_operator_profile_session_drives_operator_card(kanban_home, profile):
     with kb.connect_closing() as conn:
         tid = _operator_card(conn)
+        completion = _operator_card(conn)
         with kb.mutation_actor(session_ids=(APOLLO_SID,), profile=profile):
             assert kb.unblock_task(conn, tid)
-            assert kb.complete_task(conn, tid, result="rebased")
-        assert kb.get_task(conn, tid).status == "done"
+            assert kb.complete_task(conn, completion, result="rebased")
+        # Human work resumes in the operator queue, never the dispatch queue.
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb.get_task(conn, completion).status == "done"
         # Owned outright: no takeover, no re-home.
         assert kb.get_task(conn, tid).session_id == kb.OPERATOR_HOME_SESSION
 
