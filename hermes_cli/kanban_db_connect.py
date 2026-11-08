@@ -712,6 +712,8 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     _count_statements_on(conn)
     try:
         conn.row_factory = sqlite3.Row
+        from hermes_cli.kanban_failure_ownership import install_marker
+        install_marker(conn)
         conn.text_factory = _kb._lossy_text
         with _INIT_LOCK:
             # WAL doesn't work on network filesystems; the helper falls back to
@@ -835,6 +837,8 @@ def connect(
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _kb._ensure_status_audit(conn)
+                from hermes_cli.kanban_failure_ownership import migrate
+                migrate(conn)
                 _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 
