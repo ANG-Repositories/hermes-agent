@@ -560,3 +560,67 @@ def test_absent_hold_root_is_no_hold(home):
         assert kph.decide("ci-box", ids["A"], {}) is None
         kb.claim_task(conn, ids["A"])
         assert _runs(conn, ids["A"]) == 1
+
+
+# -- round 3b (Prism round 1 @ c9450a3c: 1de03430bf61 / 71b4b90b5c73) -------------------------------------------------
+
+@pytest.mark.parametrize("aliases", [7, True, "ci", {"a": 1}, [1, None, "ci"]], ids=["int", "bool", "str", "dict", "mixed"])
+def test_malformed_registry_aliases_never_hold_the_fleet(home, aliases):
+    """1de03430bf61: a bad optional ``aliases`` on an UNRELATED row resolves no aliases; it must not turn decide()
+    into a fail-closed hold for every origin (dispatcher tick and direct claim)."""
+    _registry(home, {"unrelated": {"aliases": aliases}, "ci-box": {"aliases": ["ci"]}})
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _res, spawned = _tick(conn, _plan())
+        assert {ids["A"], ids["C"]} <= {t for t, _ in spawned}
+        assert kph.decide("ace-ai", "t_any", {}) is None
+
+
+def _unorigined(conn, body):
+    tid = kb.create_task(conn, title="no origin", assignee="alpha", body=body)
+    _set(conn, tid, status="ready", origin_host=None)
+    return tid
+
+
+def test_held_destination_refuses_a_body_pin_with_no_origin(home):
+    """71b4b90b5c73: origin_host NULL + ``host: ci-box`` in the body: the fwa hold on ci-box still refuses the start,
+    with the fwa reason in placement_wait, and no run is opened."""
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "host: ci-box\ndo the thing")
+        _hold(home)
+        res, spawned = _tick(conn, _plan())
+        assert tid not in {t for t, _ in spawned}
+        why = res.placement_waits.get(tid, "")
+        assert why.startswith(f"pause_hold (ci-box:fwa:pause:{HID} ") and "stage=destination" in why, why
+        assert _runs(conn, tid) == 0
+
+
+def test_held_destination_is_skipped_by_a_portable_pick(home):
+    """A portable card with no origin never lands on the held host; it places elsewhere in the pool."""
+    with kb.connect_closing() as conn:
+        tids = [_unorigined(conn, "do the thing") for _ in range(6)]
+        _hold(home)
+        plan = _plan()
+        plan.default_remote = True                           # remote-first: the pool picks among ci-box / ace-ai
+        _res, spawned = _tick(conn, plan)
+        hosts = {h for t, h in spawned if t in tids}
+        assert "ci-box" not in hosts, spawned
+        assert "ace-ai" in hosts, spawned
+
+
+def test_destination_fence_is_off_under_the_kill_switch(home, monkeypatch):
+    """Dormant == identical: ``pause_hold_source: manifest`` ignores fwa holds on the destination too."""
+    _source(monkeypatch, "manifest")
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "host: ci-box\ndo the thing")
+        _hold(home)
+        _res, spawned = _tick(conn, _plan())
+        assert (tid, "ci-box") in spawned, spawned
+
+
+def test_unheld_destination_pin_spawns(home):
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "host: ci-box\ndo the thing")
+        _hold(home, host="ace-ai")
+        _res, spawned = _tick(conn, _plan())
+        assert (tid, "ci-box") in spawned, spawned

@@ -272,15 +272,18 @@ def _registry(cache: dict) -> dict:
         hosts = doc.get("hosts") if isinstance(doc, dict) else None
         for hid, row in (hosts if isinstance(hosts, dict) else {}).items():
             row = row if isinstance(row, dict) else {}
-            names = {str(hid).lower(), *(str(a).lower() for a in row.get("aliases") or () if isinstance(a, str))}
+            aliases = row.get("aliases")                   # optional: only a list counts (Prism 1de03430bf61)
+            aliases = aliases if isinstance(aliases, list) else ()
+            names = {str(hid).lower(), *(a.lower() for a in aliases if isinstance(a, str))}
             ssh = (row.get("net") or {}).get("ssh_alias") if isinstance(row.get("net"), dict) else None
             if isinstance(ssh, str) and ssh:
                 names.add(ssh.lower())
             table[str(hid).lower()] = names
     except FileNotFoundError:
         pass
-    except (OSError, ValueError, RecursionError, AttributeError):
+    except Exception:                                      # any bad shape resolves no aliases, never a fleet hold
         _log.warning("kanban pause_hold: %s unreadable; fwa hold aliases unresolved", path)
+        table = {}
     cache[key] = table
     return table
 
@@ -392,6 +395,31 @@ def _fwa_hold(origin_host: str, cache: dict, now: Optional[float] = None):
     until = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(fwa_effective_end(doc)))
     by = str(doc.get("by") or doc.get("owner") or "?").replace("(", "[").replace(")", "]")
     return ("wait", f"{CODE} ({origin_host}:fwa:{kind}:{hid} by {by} until {until})")
+
+
+def destination_wait(host: Optional[str], cache: dict) -> Optional[str]:
+    """The placement_wait reason when an fwa hold covers lane kanban on the host a worker would START on, else None
+    (Prism 71b4b90b5c73: the origin fence alone lets a ``host:`` pin or a portable pick place new work on a held
+    host). The fwa arm only: with ``pause_hold_source: manifest`` or ``pause_hold: off`` it is None, so dormant ==
+    pre-B3. Never raises; an unexpected failure holds that destination (fail closed)."""
+    if not host or not enabled():
+        return None
+    try:
+        hit = _fwa_hold(str(host), cache)
+    except Exception:
+        _log.warning("kanban pause_hold: destination check for %s failed; destination HELD", host, exc_info=True)
+        return f"{CODE} ({host}:fwa:{UNREADABLE} stage=destination)"
+    return None if hit is None else f"{hit[1][:-1]} stage=destination)"
+
+
+def held_destinations(names, cache: dict) -> dict:
+    """``{host: reason}`` for every candidate pool host a live fwa hold closes to new kanban work this tick."""
+    out = {}
+    for n in names or ():
+        why = destination_wait(n, cache)
+        if why is not None:
+            out[n] = why
+    return out
 
 
 def _valid(doc) -> bool:

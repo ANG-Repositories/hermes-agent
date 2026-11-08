@@ -7645,6 +7645,17 @@ def _dispatch_once_locked(
             if route == "portable":
                 _only, _job = _portable_only(conn, row, row_assignee, spillover, _caps, _cap_only,
                                              _worktree_ports.get(row["id"]))
+            # FWA destination fence (Prism 71b4b90b5c73): a live fwa hold on lane kanban closes a host to NEW work
+            # whatever the card's origin. A pin to it waits; a portable pick skips it.
+            _held_dest = _kph.held_destinations(list(spillover.hosts), _pause_cache)
+            _pin_dest = force_host if _forced_remote else (route_arg if route in ("pin", "origin") else None)
+            _pin_held = next((w for h, w in _held_dest.items() if _pin_dest and h.lower() == str(_pin_dest).lower()),
+                             None)
+            if _pin_held is not None:
+                result.placement_waits[row["id"]] = _pin_held
+                continue
+            if _held_dest and route == "portable":
+                _only = [h for h in (_only if _only is not None else spillover.hosts) if h not in _held_dest]
             _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
             # Scorer-backed takes (pins included) book a reservation for this card.
             _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
@@ -7677,6 +7688,11 @@ def _dispatch_once_locked(
                 if not _last_resort_allowed(route, local_free, _cap_only, spillover):
                     result.placement_waits[row["id"]] = _refusal
                     continue
+            _dest_wait = _kph.destination_wait(placed_host.name, _pause_cache) if placed_host is not None else None
+            if _dest_wait is not None:                     # belt: the chosen host is re-checked before any start
+                spillover.release(placed_host, _rid)
+                result.placement_waits[row["id"]] = _dest_wait
+                continue
             # Layer 0b (t_ecfd5591, F14): never spawn a card whose ATTACHED skills need
             # an enforced capability the chosen host lacks (a stale route's belt).
             _gap = _attached_skill_gap(row, placed_host.name, _caps) if placed_host is not None else None
