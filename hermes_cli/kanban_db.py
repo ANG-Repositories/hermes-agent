@@ -15681,7 +15681,9 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
-        if is_worker_assignee(implementer):
+        # A composed reassignment owns its final route and worker_ok release;
+        # its intermediate implementer must not clear a non-worker hold.
+        if not nested and is_worker_assignee(implementer):
             _set_no_worker_locked(conn, task_id, False, source="request-changes")
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
