@@ -199,6 +199,14 @@ def test_external_transition_before_first_handback_stays_held(rig):
     assert rig.handback()["draft_held"] and rig.log == []
 
 
+@pytest.mark.parametrize("snapshot", [None, {"pages": []}])
+def test_unproved_transition_leaves_draft_for_operator(rig, monkeypatch, snapshot):
+    monkeypatch.setattr(rd, "latest_transition", lambda *a: snapshot)
+    report = rig.start(101)
+    assert "operator handback required" in report["o/r#1"]
+    assert not rig.marks and rig.state["pr"]["draft"]
+
+
 def test_new_host_operations_are_pinned(monkeypatch):
     monkeypatch.setenv("GH_HOST", "foreign.invalid")
     calls = []
