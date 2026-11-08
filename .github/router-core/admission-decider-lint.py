@@ -179,7 +179,8 @@ def _statements(lines, bares=None):
         # callback. Split only after a complete preceding segment; wrapped RHS
         # expressions still stay together.
         assignment = re.match(r"\s*(?:(?:const|let|var)\s+)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*=(?!=|>)", bare)
-        if seg and (_STMT_START.match(bare) or (assignment and not _continues(seg_bares))):
+        call = re.match(r"\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\(", bare)
+        if seg and (_STMT_START.match(bare) or ((assignment or call) and not _continues(seg_bares))):
             out.append((seg, True))
             seg, seg_bares = [], []
         seg.append(ln)
