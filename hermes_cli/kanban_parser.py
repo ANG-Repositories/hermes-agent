@@ -207,6 +207,12 @@ def live_band_default(conn, author: str | None, origin: str | None = None) -> in
     if ((os.environ.get("KANBAN_PRIORITY_BANDS") or "").strip().lower() == "off"
             or (os.environ.get("KANBAN_LIVE_BAND") or "").strip().lower() in off):
         return None
+    from gateway.session_context import is_cron_session
+
+    # Task-local cron scope outranks process/profile identity, including root's alias.
+    if is_cron_session():
+        return None
+    author = "apollo" if author == "default" else author  # eligibility only; never rewrite the creator
     origin = origin or kb.classify_create_origin()
     if author == HUMAN_CREATED_BY:
         eligible = origin not in _MINTER_ORIGINS
@@ -483,7 +489,8 @@ _SPECS = [
              help="Subscription level 'boomerang wake': mechanical wakes on this card are "
                   "handled by a background boomerang child (the calling chat subscribes "
                   "--boomerang-wake). Defaults to kanban.auto_subscribe_boomerang "
-                   "for operator creates with a gateway origin."),
+                   "for operator creates with a gateway origin or a --session whose home "
+                   "has a routable chat."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -652,6 +659,12 @@ _SPECS = [
              help="Read this load_gate.json instead of <root>/load_gate.json"),
         _json_flag(help="Emit the dict the text is printed from"),
     ], help="Where cards run and why they wait (read-only; no probe)"),
+    _cmd("placement-holds", [
+        _arg("--clear", metavar="TASK_ID",
+             help="End this card's open pause_hold label now (a live hold is re-derived next tick)"),
+        _arg("--operator", default=None, help="Who clears it (recorded on the event)"),
+        _json_flag(help="Emit the dict the text is printed from"),
+    ], help="Fleet-pause holds: every host manifest (live or stale) and every card labelled pause_hold"),
     # rehome (t_808bc8e6)
     _cmd("rehome", [
         _arg("task_id"),
@@ -787,6 +800,12 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, metavar="N",
              help="Set the dispatch priority (higher first); records priority_set."),
+        _group(
+            _arg("--asap", action="store_const", const=True, dest="asap", default=None,
+                 help="Operator-only: send this card to the front of the host door"),
+            _arg("--no-asap", action="store_const", const=False, dest="asap",
+                 help="Clear this card's explicit urgency"),
+        ),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
         _arg("--model", dest="model_override", metavar="MODEL",

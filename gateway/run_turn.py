@@ -2235,6 +2235,9 @@ class GatewayTurnMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # The /goal hook reads this: an errored turn pauses the goal instead of judging the error reply.
+        with suppress(Exception):
+            event._goal_turn_failed = type(e).__name__
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -4344,10 +4347,15 @@ class GatewayTurnMixin:
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         if first_response:
+            # Text streaming off (no consumer, or an interim-only one): the final was never streamed,
+            # so "not confirmed" would misreport the normal send path as a delivery failure.
+            _final_streamed = _sc is not None and getattr(_sc, "stream_deltas_enabled", True)
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
                 if _already_streamed else
-                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing."
+                if _final_streamed else
+                "Queued follow-up for session %s: text streaming off; sending first response before continuing.",
                 session_key or "?",
             )
             try:

@@ -123,3 +123,42 @@ def test_kanban_create_tool_default_uses_live_band(kanban_home, monkeypatch):
         assert kt._tool_default_priority(conn) == 170
         monkeypatch.setattr(kt, "_persisted_identity", lambda: "landing-queue")
         assert kt._tool_default_priority(conn) == 0
+
+
+@pytest.mark.parametrize("author", ["default", "daedalus-opus"])
+def test_live_band_contextvar_cron_keeps_machine_default(kanban_home, monkeypatch, author):
+    from gateway.session_context import set_cron_session, clear_cron_session
+    from tools import kanban_tools as kt
+    for name in ("HERMES_CRON_SESSION", "HERMES_CRON_JOB_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(kb, "classify_create_origin", lambda: "gateway")
+    monkeypatch.setattr(kt, "_persisted_identity", lambda: author)
+    _seed_spawns([170, 170, 170])
+    token = set_cron_session()
+    try:
+        with kbc.connect_closing() as conn:
+            assert kp.live_band_default(conn, author) is None
+            assert kt._tool_default_priority(conn) == 0
+        assert _create_priority("cron card", "--created-by", author) == 0
+        assert _create_priority("explicit cron", "--created-by", author, "--priority", "5") == 5
+    finally:
+        clear_cron_session(token)
+
+
+def test_live_band_default_gateway_alias_preserves_author(kanban_home, monkeypatch):
+    from gateway.session_context import set_session_vars, restore_session_vars
+    from tools import kanban_tools as kt
+    monkeypatch.setattr(kb, "classify_create_origin", lambda: "gateway")
+    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
+    _seed_spawns([170, 170, 170])
+    tokens = set_session_vars(platform="discord", profile="default", cron_session="")
+    try:
+        with kbc.connect_closing() as conn:
+            assert kp.live_band_default(conn, "default") == 170
+            assert kt._tool_default_priority(conn) == 170
+            assert kt._persisted_identity() == "default"
+            monkeypatch.setenv("KANBAN_LIVE_BAND", "off")
+            assert kt._tool_default_priority(conn) == 0
+        assert _create_priority("alias off", "--created-by", "default") == 0
+    finally:
+        restore_session_vars(tokens)

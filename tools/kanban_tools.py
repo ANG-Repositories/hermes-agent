@@ -1549,7 +1549,11 @@ def _handle_create(args: dict, **kw) -> str:
             worker=_is_dispatcher_owned_worker(),
             subscribed=bool(not unhomed and _auto_wake(args.get("wake"))
                             and _resolve_notify_target()
-                            and cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True)))
+                            and cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True))
+            # Ace 2026-11-06: an explicit home with a routable chat is subscribed too,
+            # whatever the caller's env (script/cron creates carry no gateway identity).
+            or bool(not unhomed and args.get("session_id") and session_id
+                    and routable_home_target(session_id) is not None))
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), parents_kind=parents_kind, continues=args.get("continues"),
@@ -1604,7 +1608,10 @@ def _handle_create(args: dict, **kw) -> str:
                        explicit_home=((kb.get_task(conn, new_tid).session_id or "",
                                        _current_session_id()
                                        or get_session_env("HERMES_SESSION_ID", "") or None)
-                                      if args.get("session_id") and session_id else None)),
+                                      if args.get("session_id") and session_id else None),
+                       # Ace 2026-11-06: the env-less home row is the boomerang default's
+                       # half; an opt-out (or worker) create keeps today's no-row behaviour.
+                       home_fallback=bool(boomerang) and not _is_dispatcher_owned_worker()),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
@@ -1723,7 +1730,8 @@ def _auto_wake(wake: Optional[bool]) -> bool:
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = None,
-                          explicit_home: Optional[tuple[str, Optional[str]]] = None) -> bool:
+                          explicit_home: Optional[tuple[str, Optional[str]]] = None,
+                          home_fallback: bool = False) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
@@ -1736,7 +1744,34 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = Non
                 return False
         except Exception:
             pass  # unreadable config keeps the user-friendly default (True)
-    return subscribe_calling_session(conn, task_id, wake=wake, explicit_home=explicit_home)
+    return subscribe_calling_session(conn, task_id, wake=wake, explicit_home=explicit_home,
+                                     home_fallback=home_fallback)
+
+
+def routable_home_target(home_sid: Optional[str], *,
+                         wake: Optional[bool] = None) -> Optional[dict[str, Any]]:
+    """The notify sub for an explicit home session's own chat, or None.
+
+    Ace 2026-11-06 ("make it the default and automatic"): a create that names its home
+    (``--session <sid>`` / ``session_id``) and whose home resolves to a routable origin
+    chat defaults to boomerang wake and subscribes that chat, even when the caller's env
+    carries no gateway identity (scripts, cron, execute_code). Operator pseudo-homes,
+    unknown sessions, CLI/TUI/API origins and an unreadable state.db all return None:
+    the create then behaves exactly as before (no level, no row)."""
+    from hermes_cli import kanban_db as _kb
+    from gateway import kanban_home_route as _hr
+
+    home_sid = (home_sid or "").strip()
+    if not home_sid or _kb.is_operator_home(home_sid):
+        return None
+    try:
+        row = _hr.read_session_row(home_sid)
+    except _hr.SessionLookupError as exc:
+        logger.warning("kanban: home %s unreadable (%s); no home default", home_sid, exc)
+        return None
+    if _hr.home_from_row(home_sid, row).target is None:
+        return None
+    return resolve_notify_target_for_source(json.loads(row["origin_json"]), wake=wake)
 
 
 def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
@@ -1783,6 +1818,7 @@ def subscribe_calling_session(
     conn: Any, task_id: str, *, require_platform_identity: bool = False,
     wake: Optional[bool] = None, takeover: bool = False,
     explicit_home: Optional[tuple[str, Optional[str]]] = None,
+    home_fallback: bool = False,
 ) -> bool:
     """Resolve the calling session's delivery identity and write a notify sub.
     Shared by the agent-tool auto-subscribe path (:func:`_maybe_auto_subscribe`) and
@@ -1790,12 +1826,18 @@ def subscribe_calling_session(
     in ``hermes_cli.kanban._cmd_create``). See ``_resolve_notify_target`` for the
     identity rules. ``explicit_home=(home_sid, caller_sid)``: the create named its home
     explicitly; a home that is not the caller's subscribes the home (:func:`_home_target`).
+    ``home_fallback``: when the caller has no channel of its own (script/cron), an explicit
+    home with a routable chat is subscribed directly (:func:`routable_home_target`).
     Any exception is logged at WARNING and swallowed (False)."""
     target = None
     try:
         target = _resolve_notify_target(
             require_platform_identity=require_platform_identity, wake=wake)
-        if target is None:
+        if target is None and home_fallback and explicit_home is not None:
+            target = routable_home_target(explicit_home[0], wake=wake)
+            if target is None:
+                return False
+        elif target is None:
             return False  # CLI / cron / test — no persistent channel
         if explicit_home is not None:
             target = _home_target(task_id, explicit_home[0], explicit_home[1], target,

@@ -162,6 +162,15 @@ each change. A failed candidate does not replace the selected environment or
 silently disable other plugins. If preparation succeeds, a running Hermes process
 can still require a restart to activate the new environment.
 
+The Anthropic provider SDK does not keep a failed import for the whole process. After
+a miss it retries at most every 30 seconds: it adopts the currently selected
+generation (`pm.environments_adopt.adopt_selected`, which refuses when a loaded module
+would change) and imports again. It never re-runs `ensure_import`, so it installs
+nothing and `security.allow_lazy_installs` still decides installs. After
+`hermes pm install --extra anthropic`, a running gateway picks up the SDK on its next
+retry when adoption is safe, and otherwise still needs a restart. A successful import
+stays cached.
+
 Ordinary Hermes application updates preserve user plugin directories. Explicit
 plugin updates can change the selected plugin's files. A wrapper with no Python
 dependency declaration does not join the shared environment. Its external

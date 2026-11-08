@@ -412,3 +412,36 @@ def test_policy_env_reference_is_expanded(monkeypatch, tmp_path):
         "model:\n  codex_context_policy: ${CODEX_POLICY_T27A85D2C}\n",
     )
     assert mm.codex_context_policy() == "advertised"
+
+
+# -- a catalog that advertises a NON-272K window below the verified cap -------
+
+@pytest.mark.parametrize(
+    "policy, model, expected",
+    [
+        ("large", "gpt-6.1-terra", 872_000),
+        ("large", "gpt-6.1-sol", 900_000),
+        ("advertised", "gpt-6.1-terra", 500_000),
+        ("advertised", "gpt-6.1-terra-900k", 872_000),
+    ],
+)
+def test_500k_advertisement_bumps_to_verified_cap_per_policy(monkeypatch, tmp_path, policy, model, expected):
+    """Live codex catalog 2026-11-06: gpt-6.1-terra / gpt-6.1-sol advertise 500,000 with
+    max_context_window 872,000 (terra accepted an 832,408-token request). For those slugs 500K
+    is a stale advertisement and bumps exactly like 272K does, capped at the catalog max;
+    ``advertised`` keeps the bare slug on what the catalog says."""
+    _use_config(monkeypatch, tmp_path, f"model:\n  codex_context_policy: {policy}\n")
+    fake = MagicMock()
+    fake.status_code = 200
+    fake.json.return_value = {"models": [
+        {"slug": "gpt-6.1-terra", "context_window": 500_000, "max_context_window": 872_000},
+        {"slug": "gpt-6.1-sol", "context_window": 500_000, "max_context_window": 950_000},
+    ]}
+    mm._codex_oauth_context_cache = {}
+    with patch("agent.model_metadata.model_metadata_http.get", return_value=fake), \
+         patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+         patch("agent.model_metadata.save_context_length"):
+        ctx = mm.get_model_context_length(
+            model=model, base_url=_CODEX_URL, api_key=_codex_jwt("tok"), provider="openai-codex",
+        )
+    assert ctx == expected
