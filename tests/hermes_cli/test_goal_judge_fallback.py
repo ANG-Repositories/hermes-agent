@@ -236,6 +236,41 @@ def test_pause_cancels_chain_without_failure_increment(tmp_path, monkeypatch):
     assert persisted.turns_used == 0
 
 
+@pytest.mark.parametrize('change', ['pause', 'replace', 'resume', 'clear'])
+@pytest.mark.parametrize('verdict', ['done', 'continue'])
+def test_no_db_goal_change_cancels_inflight_verdict(tmp_path, monkeypatch, endpoint, change, verdict):
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+    url, calls, replies = endpoint
+    configure(tmp_path, url)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(goals, '_get_session_db', lambda: None)
+    manager = goals.GoalManager('memory-stop')
+    manager.set('deliver')
+    changed = []
+
+    def respond():
+        # The real child is waiting on HTTP when the owning manager changes.
+        if change == 'replace':
+            manager.set('replacement')
+        elif change == 'clear':
+            manager.clear()
+        else:
+            manager.pause('user stop')
+            if change == 'resume':
+                manager.resume()
+        changed.append(manager.state.to_json() if manager.state else None)
+        return json.dumps(dict(verdict=verdict, reason='late verdict'))
+
+    replies['primary'] = respond
+    with pytest.raises(AuxiliaryExplicitCancellation):
+        manager.evaluate_after_turn('evidence')
+    assert calls == ['primary']
+    assert changed == [manager.state.to_json() if manager.state else None]
+    if manager.state:
+        assert manager.state.consecutive_transport_failures == 0
+        assert manager.state.consecutive_parse_failures == 0
+
+
 @pytest.mark.parametrize('failure', ['spawn', 'json', 'shape', 'exit', 'pipe'])
 def test_worker_failure_advances_without_false_completion(tmp_path, monkeypatch, failure):
     import subprocess

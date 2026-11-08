@@ -16,7 +16,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1913,14 +1913,19 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
+        activation = replace(state)
+
         def judge_cancelled():
+            # User verbs can mutate state in place, including pause followed by resume.
+            if not same_active_goal(activation, self._state):
+                return True
             # A failed read is not a user stop. The save CAS still fences stale verdicts.
             if _get_session_db() is None:
                 return False
             current, raw = _load_goal_raw(self.session_id, strict=True)
             if raw and current is None:
                 raise ValueError('unreadable goal state')
-            return not same_active_goal(state, current)
+            return not same_active_goal(activation, current)
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
