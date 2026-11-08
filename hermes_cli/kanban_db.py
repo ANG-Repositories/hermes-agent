@@ -12025,12 +12025,21 @@ def complete_task(
                     with write_txn(conn):
                         _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
 
+            def _consume_round_mark(key):
+                with write_txn(conn):
+                    current = mark_records(conn, task_id).get(key)
+                    if current != _round_marks.get(key) or not current or current.get("consumed"):
+                        raise ValueError("round draft mark already consumed or replaced")
+                    consumed = dict(current, consumed=True)
+                    _append_event(conn, task_id, "round_draft_marked", {"marked": {key: consumed}})
+                    _round_marks[key] = consumed
+
             def _freshness_gate(refs, allow_arm):
                 try:
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
-                        round_runs=_round_runs, marked=_round_marks,
+                        round_runs=_round_runs, marked=_round_marks, consume=_consume_round_mark,
                     )
                 except _fresh.DraftPrError as draft_err:
                     _record_flips(draft_err.flipped)

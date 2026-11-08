@@ -464,7 +464,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
           flipped: Optional[dict] = None, evaluate: Optional[ArmFn] = None,
-          event_land: Optional[bool] = None, round_runs=None, marked=None) -> dict:
+          event_land: Optional[bool] = None, round_runs=None, marked=None, consume=None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -534,9 +534,15 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if pr.get("draft") is True:
             held = _operator_hold(flip_records.get(key.lower()), pr)
-            if held and _rd.round_marked(mark_records.get(key.lower()), str(((pr.get("head") or {}).get("sha")) or ""),
-                                         flip_records.get(key.lower()), round_runs):
-                held = ""  # t_c418eebc: one of this card's runs drafted this head for its round, not an operator hold
+            mark = mark_records.get(key.lower())
+            if mark is not None:
+                owned = (_rd.round_marked(mark, str(((pr.get("head") or {}).get("sha")) or ""),
+                                          flip_records.get(key.lower()), round_runs)
+                         and _rd.current_transition(mark, _rd.gh_snapshot if gh is gh_api else gh, ref.repo, ref.number)
+                         and consume is not None)
+                held = "" if owned else "round draft ownership unproved or consumed; leave draft for operator ready"
+            if held and mark is None:
+                held += "; no authenticated round transition"
             if held:
                 # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
                 entry["draft_held"] = held
@@ -570,6 +576,16 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         flipped_now: dict = {}
         for ref, key, pr, entry in own_drafts.values():
             at = int(time.time())  # BEFORE the flip: every post-ready run starts after it
+            if key.lower() in mark_records:
+                # Burn before the remote write: a crash or uncertain response must not reuse authority.
+                try:
+                    if consume is None:
+                        raise ValueError("round draft consumption unavailable")
+                    consume(key.lower())
+                except Exception:
+                    _log.warning("round draft consumption failed for %s; operator ready required", key, exc_info=True)
+                    failed.append(key)
+                    continue
             if ready is ace_gate_ready:
                 rc = ace_gate_ready(ref.repo, ref.number, task_id=task_id)
             else:

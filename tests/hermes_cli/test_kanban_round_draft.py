@@ -20,9 +20,16 @@ def rig(monkeypatch):
     monkeypatch.setattr(op, "FLEET_OWNERS", {"o"})
     monkeypatch.setattr(fr, "worker_draft_repos", lambda: {"o/r"})
     monkeypatch.delenv("KANBAN_ROUND_DRAFT", raising=False)
-    state = {"pr": {"state": "open", "draft": False, "head": {"sha": SHA, "ref": "worker/" + CARD}}, "comments": []}
+    monkeypatch.delenv("KANBAN_HANDOFF_FRESHNESS", raising=False)
+    monkeypatch.delenv("KANBAN_HANDOFF_DRAFT_FLIP", raising=False)
+    state = {"pr": {"state": "open", "draft": False, "head": {"sha": SHA, "ref": "worker/" + CARD}},
+             "comments": [], "events": []}
 
     def gh(*args):
+        if args[0] == "user":
+            return {"id": 7}
+        if args[0] == "repos/o/r/issues/1/timeline?per_page=100":
+            return {"pages": [json.loads(json.dumps(state["events"]))]}
         if args[0] == "repos/o/r/pulls/1":
             return json.loads(json.dumps(state["pr"]))
         if args[0].startswith("repos/o/r/issues/1/comments"):
@@ -35,6 +42,7 @@ def rig(monkeypatch):
         if state.get("draft_fails"):
             return False
         state["pr"]["draft"] = True
+        state["events"].append({"id": len(state["events"]) + 1, "event": "convert_to_draft", "actor": {"id": 7}})
         return True
 
     def comment(repo, n, body):
@@ -54,7 +62,7 @@ def rig(monkeypatch):
                                                   persist=marks.__setitem__),
         handback=lambda **kw: fr.check(op.extract_pr_refs("o/r#1"), task_id=CARD, allow_arm=False, gh=gh,
                                        flipped=records, ready=ready, round_runs={"101", "102"},
-                                       marked=marks, **kw))
+                                       marked=marks, consume=lambda key: marks[key].update(consumed=True), **kw))
 
 
 def test_round_start_drafts_own_ready_pr_and_marks_it(rig):
@@ -73,8 +81,8 @@ def test_forged_mark_comment_does_not_clear_an_operator_hold(rig):
 
 
 def test_persisted_mark_by_own_run_at_head_readies(rig):
-    rig.state["pr"]["draft"] = True
-    rig.marks["o/r#1"] = {"run": "101", "head": SHA, "at": 2}
+    rig.start(101)
+    rig.log.clear()
     assert rig.handback()["draft_flipped"] == ["o/r#1"] and rig.log == [("ready", "o/r", 1)]
 
 
@@ -127,7 +135,8 @@ def test_kill_switch_foreign_branch_and_closed_pr_untouched(rig, monkeypatch):
     assert rig.start(101) == {"o/r#1": "skip: not open"} and rig.log == []
 
 
-def test_worker_boot_reads_the_cards_flip_receipt_from_the_board(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reviewer", [False, True])
+def test_worker_boot_reads_the_cards_flip_receipt_from_the_board(tmp_path, monkeypatch, reviewer):
     """run_from_env against a real temp board: the receipt (handoff_draft_flipped) and run id drive the draft."""
     from pathlib import Path
     from hermes_cli import kanban_db as kb
@@ -143,15 +152,62 @@ def test_worker_boot_reads_the_cards_flip_receipt_from_the_board(tmp_path, monke
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "handoff_draft_flipped", {"flipped": {"o/r#1": {"head": SHA, "at": 1}}})
         assert rd.card_run_ids(conn, tid) == {str(run)}
+        if reviewer:
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "claimed", {"source_status": "review"}, run_id=run)
     seen = []
     monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run))
     monkeypatch.setattr(rd, "draft_at_round_start",
                         lambda *a, **kw: seen.append(a) or kw["persist"]("o/r#1", {"run": a[1], "head": SHA, "at": 2}))
     rd.run_from_env()
+    if reviewer:
+        assert seen == []
+        return
     assert seen == [(tid, str(run), {"o/r#1": {"head": SHA, "at": 1}})]
     with kb.connect() as conn:   # the mark is on the card, written by the kernel from the worker's own run id
         assert rd.mark_records(conn, tid) == {"o/r#1": {"run": str(run), "head": SHA, "at": 2}}
+
+
+@pytest.mark.parametrize("switch", ["KANBAN_HANDOFF_FRESHNESS", "KANBAN_HANDOFF_DRAFT_FLIP"])
+def test_disabled_paired_switch_never_drafts(rig, monkeypatch, switch):
+    monkeypatch.setenv(switch, "0")
+    assert rig.start(101) == {} and rig.log == []
+
+
+@pytest.mark.parametrize("external_actor", [7, 99])
+def test_later_ready_redraft_and_same_second_reuse_stay_held(rig, monkeypatch, external_actor):
+    monkeypatch.setattr(rd.time, "time", lambda: 2)
+    rig.start(101)
+    rig.log.clear()
+    assert rig.handback()["draft_flipped"] == ["o/r#1"]
+    assert rig.marks["o/r#1"]["consumed"]
+    rig.state["pr"]["draft"] = True
+    rig.state["events"].extend([
+        {"id": 2, "event": "ready_for_review", "actor": {"id": external_actor}},
+        {"id": 3, "event": "convert_to_draft", "actor": {"id": external_actor}},
+    ])
+    rig.log.clear()
+    assert rig.handback()["draft_held"] and rig.log == []
+
+
+def test_external_transition_before_first_handback_stays_held(rig):
+    rig.start(101)
+    rig.state["events"].append({"id": 9, "event": "convert_to_draft", "actor": {"id": 99}})
+    rig.log.clear()
+    assert rig.handback()["draft_held"] and rig.log == []
+
+
+def test_new_host_operations_are_pinned(monkeypatch):
+    monkeypatch.setenv("GH_HOST", "foreign.invalid")
+    calls = []
+    monkeypatch.setattr(rd.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)) or
+                        SimpleNamespace(returncode=0, stdout='{"id":7}'))
+    rd.gh_draft("o/r", 1)
+    rd.gh_comment("o/r", 1, "receipt")
+    rd.gh_snapshot("user")
+    assert all(kw["env"]["GH_HOST"] == "github.com" for _, kw in calls)
+    assert calls[0][0][calls[0][0].index("--repo") + 1] == "https://github.com/o/r"
 
 
 def test_ready_carries_owner_card_to_ace_gate(tmp_path, monkeypatch):

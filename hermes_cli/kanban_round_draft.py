@@ -87,16 +87,53 @@ def round_marked(mark, head: str, record, own_runs: Optional[Iterable] = None) -
     if own_runs is not None and str(mark.get("run") or "") not in {str(r) for r in own_runs}:
         return False
     try:
-        return float(mark.get("at") or 0) > float(record.get("at") or 0)
+        return not mark.get("consumed") and float(mark.get("at") or 0) >= float(record.get("at") or 0)
     except (TypeError, ValueError):
         return False
 
 
+def gh_snapshot(path: str):
+    """Pinned REST reads; timeline pagination is complete before any ownership decision."""
+    timeline = "/timeline?" in path
+    argv = ["gh", "api", "--hostname", "github.com"]
+    if timeline:
+        argv += ["--paginate", "--slurp"]
+    try:
+        proc = subprocess.run(argv + [path], stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=60,
+                              check=False, env=dict(os.environ, GH_HOST="github.com"))
+        if proc.returncode:
+            return None
+        data = json.loads(proc.stdout)
+        return {"pages": data} if timeline else data
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def latest_transition(gh, repo: str, number: int):
+    data = gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")
+    pages = data.get("pages") if isinstance(data, dict) else None
+    if not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
+        return None
+    events = [e for page in pages for e in page if isinstance(e, dict)
+              and e.get("event") in {"convert_to_draft", "ready_for_review"}]
+    return events[-1] if events else None
+
+
+def current_transition(mark, gh, repo: str, number: int) -> bool:
+    if not isinstance(mark, dict) or mark.get("consumed") or not mark.get("transition_id") or not mark.get("actor_id"):
+        return False
+    event = latest_transition(gh, repo, number)
+    return bool(event and event.get("event") == "convert_to_draft"
+                and event.get("id") == mark["transition_id"]
+                and (event.get("actor") or {}).get("id") == mark["actor_id"])
+
+
 def gh_draft(repo: str, number: int) -> bool:
     try:
-        proc = subprocess.run(["gh", "pr", "ready", str(number), "--repo", repo, "--undo"],
-                              capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=60, check=False)
+        proc = subprocess.run(["gh", "pr", "ready", str(number), "--repo", f"https://github.com/{repo}", "--undo"],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60, check=False, env=dict(os.environ, GH_HOST="github.com"))
     except (OSError, subprocess.SubprocessError) as exc:
         _log.warning("round draft: gh pr ready --undo %s#%s failed: %s", repo, number, exc)
         return False
@@ -108,9 +145,10 @@ def gh_draft(repo: str, number: int) -> bool:
 
 def gh_comment(repo: str, number: int, body: str) -> bool:
     try:
-        proc = subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/issues/{number}/comments",
+        proc = subprocess.run(["gh", "api", "--hostname", "github.com", "-X", "POST", f"repos/{repo}/issues/{number}/comments",
                                "-f", f"body={body}"], capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=60, check=False)
+                              errors="replace", timeout=60, check=False, stdin=subprocess.DEVNULL,
+                              env=dict(os.environ, GH_HOST="github.com"))
     except (OSError, subprocess.SubprocessError) as exc:
         _log.warning("round draft: mark on %s#%s failed: %s", repo, number, exc)
         return False
@@ -130,10 +168,10 @@ def draft_at_round_start(task_id: str, run_id, records: dict, *, gh=None, draft:
     from hermes_cli import kanban_pr_freshness as fr
     from hermes_cli.kanban_open_pr import branch_names_card, extract_pr_refs, is_fleet_ref
     report: dict = {}
-    if not enabled() or not task_id or not run_id or not records:
+    if not enabled() or not fr.enabled() or not fr.worker_draft_flip_enabled() or not task_id or not run_id or not records:
         return report
     if gh is None:
-        gh = fr._default_gh()
+        gh = None if os.environ.get("PYTEST_CURRENT_TEST") else gh_snapshot
         if gh is None:
             return report
     draft = draft or gh_draft
@@ -162,12 +200,25 @@ def draft_at_round_start(task_id: str, run_id, records: dict, *, gh=None, draft:
         if pr.get("draft") is True:
             report[key] = "skip: already draft"   # a dead run's marked draft (adopted) or someone else's hold
             continue
+        actor = gh("user")
+        before = latest_transition(gh, ref.repo, ref.number)
+        if not isinstance(actor, dict) or not actor.get("id"):
+            report[key] = "skip: authenticated actor unavailable; operator handback required"
+            continue
         if not draft(ref.repo, ref.number):
             report[key] = "draft failed (logged; round runs CI per push)"
             continue
+        transition = latest_transition(gh, ref.repo, ref.number)
+        if (not transition or transition.get("event") != "convert_to_draft" or not transition.get("id")
+                or (before and transition.get("id") == before.get("id"))
+                or (transition.get("actor") or {}).get("id") != actor["id"]):
+            report[key] = "drafted; transition ownership unproved; operator handback required"
+            _log.warning("round draft: %s %s", key, report[key])
+            continue
         if persist is not None:
             try:
-                persist(key, {"run": str(run_id), "head": head, "at": time.time()})
+                persist(key, {"run": str(run_id), "head": head, "at": time.time(),
+                              "transition_id": transition["id"], "actor_id": actor["id"]})
             except Exception:  # noqa: BLE001 -- unpersisted mark = the handback treats the draft as a hold
                 _log.warning("round draft: persisting mark for %s failed", key, exc_info=True)
         posted = comment(ref.repo, ref.number, mark_line(run_id, head))
@@ -185,7 +236,12 @@ def run_from_env() -> dict:
         if not task_id or not run_id.isdigit() or not enabled():
             return {}
         from hermes_cli import kanban_db_connect as _kbc
+        from hermes_cli import kanban_db as _kb
         with _kbc.connect_closing() as conn:
+            task = _kb.get_task(conn, task_id)
+            if (task is None or str(task.current_run_id) != run_id
+                    or _kb._retry_status_for_run(conn, task_id, int(run_id)) == "review"):
+                return {}
             records = flip_records(conn, task_id)
 
         def persist(key: str, mark: dict) -> None:
