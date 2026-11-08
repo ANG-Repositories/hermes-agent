@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -69,6 +70,7 @@ _IDLE_WAKE_HORIZON_S = 6 * 3600
 # No-progress stop: this many judged-``continue`` turns in a row with no tool call (the agent is only
 # answering the judge) pauses the goal. 0 disables.
 DEFAULT_NO_PROGRESS_TURNS = 4
+DEFAULT_MAX_INCOMPLETE_TURNS = 3
 # Turn effects (hermes_cli.goal_turn_effects) after which no continuation is queued unless the user
 # spoke: a wake/page/NO_REPLY answered with reads only changed nothing the next turn could act on.
 _NO_NUDGE_TURN_EFFECTS = frozenset({"read", "none"})
@@ -470,6 +472,9 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    consecutive_incomplete_turns: int = 0     # agent turns that failed before completion
+    incomplete_retry_wait: bool = False       # only the retry loop owns this wait barrier
+    idle_wake_attempt: Optional[str] = None   # survives compatible edits, revoked by new waits
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -517,7 +522,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_incomplete_turns", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at", "resumed_at")}
         return cls(
             goal=data.get("goal", ""),
@@ -530,6 +535,8 @@ class GoalState:
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_reason=data.get("waiting_reason"),
+            incomplete_retry_wait=bool(data.get("incomplete_retry_wait", False)),
+            idle_wake_attempt=data.get("idle_wake_attempt"),
             checkin_minutes=int(data["checkin_minutes"]) if data.get("checkin_minutes") is not None else -1,
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
@@ -547,6 +554,8 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
     def clear_wait(self) -> None:
+        self.idle_wake_attempt = None
+        self.incomplete_retry_wait = False
         self.waiting_on_pid = None
         self.waiting_on_session = None
         self.waiting_until = 0.0
@@ -560,7 +569,7 @@ class GoalState:
 # GoalState fields an idle wake mutates (accounting + the wait barrier it consumes).
 _IDLE_WAKE_FIELDS = (
     "idle_wakes", "last_idle_wake_at", "waiting_on_pid", "waiting_on_session", "waiting_until",
-    "waiting_on_delegations", "waiting_reason", "waiting_since",
+    "waiting_on_delegations", "waiting_reason", "waiting_since", "incomplete_retry_wait", "idle_wake_attempt",
 )
 
 
@@ -766,9 +775,9 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
     """Give back a recorded idle wake that was never dispatched (the session turned busy or was
     /stop-ped meanwhile), so it does not consume a check-in. Read, compare and write run in ONE
     write transaction, so a pause/clear from any surface either lands first (and the goal is left
-    alone) or after (and sees the restored fields). The give-back applies only while the stored row
-    is byte-identical to the row the wake saved (``after["_row"]``): any save since then, including
-    a replacement goal whose fields happen to equal the post-wake values, wins and is left alone.
+    alone) or after (and sees the restored fields). The activation and unique wake-attempt token
+    own the refund, not the whole row: compatible edits survive. New waits, unwait, replacement,
+    resume or another evaluation revoke ownership and are left alone.
     Returns True when anything changed."""
     db = _get_session_db() if session_id and before else None
     execute_write = getattr(db, "_execute_write", None)
@@ -778,15 +787,19 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
 
     def _txn(conn) -> bool:
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if not row or not after.get("_row") or row[0] != after["_row"]:
-            return False  # the row is no longer the one this wake wrote (another save or another goal)
-        state = GoalState.from_json(row[0]) if row and row[0] else None
-        if state is None or state.status != "active":
+        if not row or not after.get("_row"):
+            return False
+        state = GoalState.from_json(row[0])
+        owner = GoalState.from_json(after["_row"])
+        if (not same_active_goal(owner, state) or not owner.idle_wake_attempt
+                or state.idle_wake_attempt != owner.idle_wake_attempt
+                or any(getattr(state, f) != after.get(f) for f in _IDLE_WAKE_FIELDS)):
             return False
         changed = [f for f in _IDLE_WAKE_FIELDS if f in before and getattr(state, f) == after.get(f) != before[f]]
         for field in changed:
             setattr(state, field, before[field])
         if changed:
+            state.revision += 1
             conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
         return bool(changed)
 
@@ -841,6 +854,50 @@ def _truncate(text: str, limit: int) -> str:
     if not text:
         return ""
     return text if len(text) <= limit else text[:limit] + "… [truncated]"
+
+
+# Identifies this process in retry claims: a claim from a dead claimant can be recovered.
+_PROCESS_INSTANCE = uuid4().hex[:12]
+
+
+def _process_start_time(pid: int) -> Optional[int]:
+    try:
+        from gateway.status import get_process_start_time
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _new_retry_claim() -> str:
+    pid = os.getpid()
+    start = _process_start_time(pid)
+    fingerprint = str(start) if start is not None else "unknown"
+    return f"retry:{pid}:{fingerprint}:{_PROCESS_INSTANCE}:{uuid4().hex}"
+
+
+def _orphaned_retry_claim(token: Optional[str]) -> bool:
+    """Recover proven-dead/replaced claimants; unknown identity stays fenced."""
+    parts = (token or "").split(":")
+    if len(parts) not in (4, 5) or parts[0] != "retry":
+        return False
+    instance = parts[-2]
+    if instance == _PROCESS_INSTANCE:
+        return False
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        return False
+    if pid == os.getpid() or not _pid_alive(pid):
+        return True
+    if len(parts) == 5:
+        current = _process_start_time(pid)
+        if current is not None and parts[2] != "unknown":
+            try:
+                recorded = int(parts[2])
+                return recorded > 0 and int(current) > 0 and recorded != int(current)
+            except (ValueError, TypeError):
+                return False
+    return False
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1755,11 +1812,14 @@ class GoalManager:
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
         s = self._state
-        if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
+        if s is None:
+            return False
+        had_wait = bool(s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until)
+        if not had_wait and s.idle_wake_attempt is None:
             return False
         s.clear_wait()
         self._save()
-        return True
+        return had_wait
 
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
@@ -1787,7 +1847,9 @@ class GoalManager:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
             still = False
-        if not still:
+        # Observation (e.g. /loop arbitration) must not consume a pending retry wake.
+        # idle_wake_prompt clears it only when claiming the continuation.
+        if not still and not s.incomplete_retry_wait:
             self.stop_waiting()
         return still
 
@@ -1872,6 +1934,8 @@ class GoalManager:
         no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS, turn_effect: Optional[str] = None,
         user_spoke: bool = False, nudge_on_read_only_turns: bool = False,
         checkin_minutes: float = DEFAULT_CHECKIN_MINUTES, max_checkins: int = DEFAULT_MAX_IDLE_CHECKINS,
+        turn_completed: bool = True, max_incomplete_turns: int = DEFAULT_MAX_INCOMPLETE_TURNS,
+        human_message: bool = False,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -1893,9 +1957,69 @@ class GoalManager:
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        # Real events re-arm check-ins even when the agent turn fails before judging.
         if real_event and state.idle_wakes:
             state.idle_wakes = 0
             self._save()
+        # Failed agent turns are not evidence for gates or the judge. Persist the streak so
+        # reloading the manager (or restarting the gateway) cannot restart a rapid retry loop.
+        blank_success = turn_completed and not last_response.strip()
+        retry_recovery = state.incomplete_retry_wait or (
+            bool(state.idle_wake_attempt) and state.idle_wake_attempt.startswith("retry:"))
+        if blank_success and retry_recovery and not human_message:
+            # A blank/muted/[SILENT] success queues no successor and proves no progress: keep a
+            # pending recovery timer, and charge a claimed retry like a failure (streak backoff +
+            # turn budget) so silent retries can never loop at a fixed cadence.
+            if not state.incomplete_retry_wait:
+                state.consecutive_incomplete_turns += 1
+                state.turns_used += 1
+                state.last_turn_at = time.time()
+                if state.turns_used >= state.max_turns:
+                    state.clear_wait()
+                    return self._budget_pause(state, "skipped", "empty completed retry")
+                excess = state.consecutive_incomplete_turns - max(1, int(max_incomplete_turns))
+                self._park("empty completed retry", incomplete_retry_wait=True,
+                           waiting_until=time.time() + min(1800, 60 * 2 ** min(max(excess, 0), 5)))
+            return _decision("active", False, None, "skipped", "empty completed response", "")
+        if (state.consecutive_incomplete_turns or retry_recovery) and (turn_completed or human_message):
+            state.consecutive_incomplete_turns = 0
+            if blank_success and retry_recovery:
+                # A human's blank turn resets the streak but must not strand a claimed retry.
+                if not state.incomplete_retry_wait:
+                    self._park("empty completed retry", waiting_until=time.time() + 60,
+                               incomplete_retry_wait=True)
+            elif state.incomplete_retry_wait:
+                state.clear_wait()
+            self._save()
+        if not blank_success:
+            state.idle_wake_attempt = None
+        # A completed/human turn may reset retry state, never a deployment/process barrier.
+        if not turn_completed and not state.incomplete_retry_wait and self.is_waiting():
+            return self._waiting_decision(state)
+        if turn_completed and not last_response.strip():
+            return _decision("active", False, None, "skipped", "empty completed response", "")
+        if not turn_completed:
+            # An executed failure spent model budget; unexecuted wakes never reach here (refunded).
+            state.consecutive_incomplete_turns += 1
+            state.turns_used += 1
+            state.last_turn_at = time.time()
+            if state.turns_used >= state.max_turns:
+                state.clear_wait()
+                return self._budget_pause(state, "incomplete", "agent turn did not complete")
+            limit = max(1, int(max_incomplete_turns))
+            failures = state.consecutive_incomplete_turns
+            if failures >= limit:
+                delay = min(1800, 60 * 2 ** min(failures - limit, 5))
+                self._park("consecutive incomplete agent turns",
+                           waiting_until=time.time() + delay, incomplete_retry_wait=True)
+                message = (
+                    f"⏳ Goal parked after {failures} incomplete turns. Retrying in {delay}s "
+                    "with exponential backoff (up to 30 min). Send a message to reset retries."
+                ) if failures == limit else ""
+                return _decision("active", False, None, "incomplete", "agent turn did not complete", message)
+            self._save()
+            return _decision("active", True, self.next_continuation_prompt(), "incomplete",
+                             "agent turn did not complete", "")
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
@@ -2044,8 +2168,10 @@ class GoalManager:
         if s is None or s.status != "active":
             return None
         minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
-        if not minutes or minutes <= 0:
+        orphan = _orphaned_retry_claim(s.idle_wake_attempt)
+        if (checkin_minutes <= 0 or minutes <= 0) and not s.incomplete_retry_wait and not orphan:
             return None
+        retry_wake = s.incomplete_retry_wait or orphan
         now = time.time() if now is None else now
         if now - max(s.last_turn_at, s.last_idle_wake_at, s.waiting_since, s.created_at) > _IDLE_WAKE_HORIZON_S:
             return None  # stale/abandoned goal: never wake it out of the blue
@@ -2054,7 +2180,13 @@ class GoalManager:
         if s.waiting_until:
             if now < s.waiting_until:
                 return None
-            self.stop_waiting()
+            if retry_wake:
+                s.clear_wait()  # persist timer consumption only with the claim CAS below
+            else:
+                self.stop_waiting()
+            prompt = self.next_continuation_prompt()
+            counted = False
+        elif orphan:  # the claimant died before settling: re-offer the same retry
             prompt = self.next_continuation_prompt()
             counted = False
         elif s.waiting_on_pid is not None or s.waiting_on_session is not None:
@@ -2078,9 +2210,43 @@ class GoalManager:
             counted = True
         if not prompt:
             return None
-        if counted:
-            s.idle_wakes += 1
-        s.last_idle_wake_at = now
+        if not orphan:
+            if counted:
+                s.idle_wakes += 1
+            s.last_idle_wake_at = now
+            s.idle_wake_attempt = (
+                _new_retry_claim() if retry_wake else "idle:" + uuid4().hex)
+        if orphan:
+            # The dead claimant may have executed before dying. Charge once and
+            # back off, never immediately replay a potentially crashing turn.
+            s.turns_used += 1
+            s.consecutive_incomplete_turns += 1
+            s.idle_wake_attempt = None
+            s.last_turn_at = now
+            s.waiting_since = now
+            s.waiting_reason = "retry claimant exited before settlement"
+            s.incomplete_retry_wait = s.turns_used < s.max_turns
+            s.waiting_until = (now + min(1800, 60 * 2 ** min(max(
+                s.consecutive_incomplete_turns - 1, 0), 5))) if s.incomplete_retry_wait else 0.0
+            if not s.incomplete_retry_wait:
+                s.status = "paused"
+            prompt = None
+        if retry_wake:
+            # Both recovery settlement and eventual timer dispatch require ownership CAS.
+            db = _get_session_db() if self.session_id else None
+            if db is not None:
+                s.revision += 1
+                raw = s.to_json()
+                try:
+                    won = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+                except Exception as exc:
+                    logger.debug("GoalManager: retry reclaim write failed: %s", exc)
+                    won = False
+                if not won:
+                    self._state, self._stored = _load_goal_raw(self.session_id)
+                    return None
+                self._stored = raw
+                return prompt
         self._save()
         return prompt
 
