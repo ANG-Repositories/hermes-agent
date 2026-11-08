@@ -75,6 +75,26 @@ def test_unsupported_backend_cannot_reuse_builtin_session(pages, monkeypatch):
     assert current.locator("input").input_value() == wrong.locator("input").input_value() == ""
 
 
+def test_rejected_targets_do_not_receive_dialog_bridge(pages, monkeypatch):
+    current, wrong, _, _, _, sup, _ = pages
+    # A newly created unrelated page has never been supervised.
+    untouched = current.context.new_page()
+    untouched.goto("https://other.example.test/untouched")
+    before = untouched.evaluate("({a: String(alert), c: String(confirm), p: String(prompt)})")
+    marker = "fixtureOnlyCurrent"
+    current.evaluate(f"window.{marker} = true")
+    # Force the unrelated target first, independent of Chromium enumeration order.
+    original = sup._cdp
+    async def ordered(method, *args, **kwargs):
+        result = await original(method, *args, **kwargs)
+        if method == "Target.getTargets":
+            result["result"]["targetInfos"].sort(key=lambda t: not t.get("url", "").endswith("/untouched"))
+        return result
+    monkeypatch.setattr(sup, "_cdp", ordered)
+    assert sup.focus_page("", accept=f"window.{marker} === true")["ok"]
+    assert untouched.evaluate("({a: String(alert), c: String(confirm), p: String(prompt)})") == before
+
+
 def test_navigation_current_page_wins_over_first_same_origin_tab(pages):
     current, wrong, *_ = pages
     out = fill()

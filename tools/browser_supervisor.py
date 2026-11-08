@@ -277,8 +277,6 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         async def _attach(target_id: str) -> str:
             attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
             sid = attach["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=timeout)
-            await self._install_dialog_bridge(sid)
             return sid
 
         async def _focus() -> Dict[str, Any]:
@@ -302,6 +300,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     if not probe.get("result", {}).get("result", {}).get("value"):
                         await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
                         continue
+                # Rejected tabs must remain untouched: the dialog bridge mutates window APIs.
+                await self._enable_page_domains(sid, timeout=timeout)
+                await self._install_dialog_bridge(sid)
                 with self._state_lock:
                     self._page_session_id = sid
                 return {"ok": True, "url": url}
