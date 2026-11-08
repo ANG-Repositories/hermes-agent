@@ -96,6 +96,8 @@ Observed receipts (same repository interpreter; sanctioned `test-gate`, cache di
 - Entire background-interrupt file plus parent routing matrix: 31 passed in 17.57s.
 - Cold summary and setup-exception alone: 2 passed, 9 deselected in 11.38s.
 - Two real detached profile subprocesses with endpoint-bound named custom references: 1 passed in 11.35s. A generic OpenAI default key is intentionally insufficient for the saved foreign endpoint; the old detached fixture failed closed after the security fix and was corrected to use a real symbolic reference.
+- Entire wake-dispatch/default-handback files: 86 passed in 88.00s after their fake runners supplied the required owner/scope seam. Initial 7 failures included one late-bootstrap home-I/O violation and six incomplete runner doubles; no production guard was relaxed.
+- Fresh automatic busy/snapshot wire run: 2 passed, 2 deselected in 9.19s. Sanitized request/nonce receipt: `evidence/correction-wire-traces.json`; synthetic key equality remains asserted in executable tests. Snapshot's printed claim precedes reconciliation; the test additionally requires pending turn, one later admission and cleared row.
 
 Background CI attribution: job 128679699643 at old head contains three actual 60-second harness failures and three `a detached unit must not run in-process` assertions. The immutable 8450a69a control reproduces that six-node set. The fake child lacked concrete route metadata and MagicMock fabricated values that durable-spec serialization rejected; the fixture now declares the actual route contract. This does not weaken production persistence checks. Other CI dependency-download failures are not counted as passes, and no blind rerun was launched.
 
