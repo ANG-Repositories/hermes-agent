@@ -195,7 +195,7 @@ def fork_constructor_overrides(parent: Any) -> Dict[str, Any]:
     return {
         "ephemeral_system_prompt": getattr(parent, "ephemeral_system_prompt", None),
         "prefill_messages": copy.deepcopy(getattr(parent, "prefill_messages", None)) or None,
-        "request_overrides": dict(getattr(parent, "request_overrides", None) or {}),
+        "request_overrides": copy.deepcopy(getattr(parent, "request_overrides", None) or {}),
     }
 
 

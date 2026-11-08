@@ -48,4 +48,6 @@ def recover_route_parent(parent, route):
     view._client_kwargs = {"api_key": view.api_key, "base_url": view.base_url}
     view._fallback_chain = copy.deepcopy(route.get("fallback_chain") or [])
     view.request_overrides = copy.deepcopy(route.get("request_overrides") or {})
+    for name, value in (route.get("routing_filters") or {}).items():
+        setattr(view, name, copy.deepcopy(value))
     return view

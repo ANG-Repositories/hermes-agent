@@ -1967,6 +1967,7 @@ def _build_child_agent(
     delegation_id: Optional[str] = None,
     inherit_parent_route: bool = False,
     explicit_child_route: bool = False,
+    parent_route_snapshot: Any = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -2042,7 +2043,8 @@ def _build_child_agent(
     )
     if inherit_parent_route:
         from agent.route_snapshot import snapshot_parent
-        route_parent = snapshot_parent(parent_agent)
+        route_parent = parent_route_snapshot or snapshot_parent(parent_agent)
+        _call_args["parent_route_snapshot"] = route_parent
         rt = _resolve_child_runtime(
             route_parent, delegation_cfg, route_parent.api_key, model=None, override_provider=None,
             override_base_url=None, override_api_key=None, override_api_mode=None,
@@ -2121,7 +2123,7 @@ def _build_child_agent(
         "request_overrides": request_overrides,
     }
     if mode == "fork":
-        _prefix_kwargs = _fork.fork_constructor_overrides(parent_agent)
+        _prefix_kwargs = _fork.fork_constructor_overrides(route_parent if inherit_parent_route else parent_agent)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
         try:
@@ -2150,12 +2152,14 @@ def _build_child_agent(
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     child._boomerang_route_source = ("live-parent" if inherit_parent_route else
                                      "explicit-child" if explicit_child_route else "delegation-default")
-    if inherit_parent_route:
-        child._boomerang_parent_route = {
+    child._boomerang_parent_route = {
             "source": "parent", "model": rt["model"],
             "provider": rt.get("requested_provider") or rt["provider"], "api_mode": rt["api_mode"],
             "fallback_chain": copy.deepcopy(rt["fallback_model"]),
-            "request_overrides": copy.deepcopy(override_request_overrides),
+            "request_overrides": copy.deepcopy(request_overrides),
+            "routing_filters": {key: copy.deepcopy(rt.get(key)) for key in (
+                "providers_allowed", "providers_ignored", "providers_order", "provider_sort",
+                "provider_require_parameters", "provider_data_collection")},
         }
     child._context_inherited = context_inherited
     logger.info(
@@ -3642,7 +3646,7 @@ def _build_durable_background_spec(
         if children and index < len(children):
             built = children[index]
             persisted["route_source"] = getattr(built, "_boomerang_route_source", "delegation-default")
-            if getattr(built, "_boomerang_route_source", None) == "live-parent":
+            if isinstance(getattr(built, "_boomerang_parent_route", None), dict):
                 from tools.delegate_tool_routing import persist_route
                 persisted["parent_route"] = persist_route(built)
         if task_images and index < len(task_images) and task_images[index]:

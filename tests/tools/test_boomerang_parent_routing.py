@@ -115,3 +115,39 @@ def test_recovered_routes_are_secret_free_and_session_isolated(monkeypatch):
     with pytest.raises(ValueError, match="incomplete persisted identity"):
         recover_route_parent(parent, {"model": "missing-provider"})
     assert calls == ["a", "b", "a"]
+
+
+def test_real_credential_sync_cannot_publish_mixed_endpoint():
+    from agent.client_lifecycle import ClientLifecycleMixin
+    from agent.route_snapshot import snapshot_parent
+    entered, release, attempted, finished = (threading.Event() for _ in range(4))
+
+    class PausingDict(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if key == "api_key":
+                entered.set()
+                assert release.wait(5)
+
+    parent = SimpleNamespace(model="a", provider="a", base_url="http://new", api_key="NEW",
+                             client=None, _client_kwargs=PausingDict(base_url="http://old", api_key="OLD"))
+    writer = threading.Thread(target=lambda: ClientLifecycleMixin._sync_client_kwargs_credentials(parent))
+    captured = []
+
+    def read():
+        attempted.set()
+        captured.append(snapshot_parent(parent))
+        finished.set()
+
+    writer.start()
+    assert entered.wait(5)
+    reader = threading.Thread(target=read)
+    reader.start()
+    assert attempted.wait(5)
+    try:
+        assert not finished.wait(0.1), "snapshot escaped while real credential writer was incomplete"
+    finally:
+        release.set()
+        writer.join(5)
+        reader.join(5)
+    assert (captured[0].base_url, captured[0].api_key) == ("http://new", "NEW")

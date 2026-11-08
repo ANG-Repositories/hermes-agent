@@ -559,6 +559,7 @@ class ClientLifecycleMixin:
         self._abort_request_slot_client(_ANTHROPIC_SLOT, client, reason=reason)
 
     # ------------------------------------------------------------------ credential refresh
+    @route_mutation
     def _sync_client_kwargs_credentials(self) -> None:
         """Mirror ``self.api_key`` / ``self.base_url`` into the OpenAI-style client kwargs."""
         self._client_kwargs["api_key"] = self.api_key
@@ -570,6 +571,7 @@ class ClientLifecycleMixin:
         self._sync_client_kwargs_credentials()
         return self._replace_primary_openai_client(reason=reason)
 
+    @route_mutation
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
             return False
@@ -607,6 +609,7 @@ class ClientLifecycleMixin:
             return False
         return self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
 
+    @route_mutation
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:
         # Portal serves anthropic/* on the native Messages route, so either client kind may hold the expiring JWT.
         if self.provider != "nous" or self.api_mode not in ("chat_completions", "anthropic_messages"):
@@ -747,6 +750,7 @@ class ClientLifecycleMixin:
         # Adopt only while the session still runs on the registry default or the previously-seen env value.
         return (base_url, api_key) != prev and current_base in {default_base, prev[0]} and not unchanged
 
+    @route_mutation
     def _try_refresh_env_client_credentials(self) -> bool:
         """Adopt ``~/.hermes/.env`` credential/base-url edits at the turn boundary (a Settings save updates ``.env``
         but a live worker keeps init-time values). Adoption rule: ``_should_adopt_env_credentials``.
@@ -789,6 +793,7 @@ class ClientLifecycleMixin:
         logger.info("Applied updated .env credentials for %s: endpoint %s", self.provider, redact_url(self.base_url))
         return True
 
+    @route_mutation
     def _try_refresh_vertex_client_credentials(self) -> bool:
         """Re-mint the Vertex OAuth2 token (~1h TTL; long sessions 401 on the expired bearer) and rebuild the client."""
         if self.api_mode != "chat_completions" or self.provider != "vertex":
@@ -814,6 +819,7 @@ class ClientLifecycleMixin:
         self._apply_client_headers_for_base_url(str(self.base_url or ""))
         return self._replace_primary_openai_client(reason=reason)
 
+    @route_mutation
     def _try_refresh_copilot_client_credentials(self) -> bool:
         """Refresh Copilot credentials and rebuild the shared OpenAI client (caller enforces the single-shot guard).
 
@@ -878,6 +884,7 @@ class ClientLifecycleMixin:
             logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
         return ok
 
+    @route_mutation
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.

@@ -10,6 +10,7 @@ import json
 import signal
 import threading
 import uuid
+from contextlib import nullcontext
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -69,11 +70,14 @@ def endpoints(sentinel):
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize("scenario", ["summary", "downgrade", "busy", "cold", "detached", "active-fallback"])
+@pytest.mark.parametrize("scenario", ["summary", "downgrade", "busy", "cold", "detached", "active-fallback", "disabled", "auto-wake"])
 def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scenario):
     from openai import OpenAI
     import model_tools
     import agent.auxiliary_client as auxiliary
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionStore, SessionSource
 
     monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr(model_tools, "check_toolset_requirements", lambda **kw: {})
@@ -87,27 +91,53 @@ def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scena
     with endpoints(sentinel) as (base, trace):
         chain = [{"provider": "openrouter", "model": "second-model", "base_url": base + "/second/v1"},
                  {"provider": "openai", "model": "cross-model", "base_url": base + "/cross-vendor/v1"}]
+        if scenario == "disabled":
+            chain = []
 
         def resolve(provider, model=None, **kw):
             return OpenAI(api_key="synthetic-key", base_url=kw["explicit_base_url"], max_retries=0), model
 
         monkeypatch.setattr(auxiliary, "resolve_provider_client", resolve)
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        home = store.get_or_create_session(SessionSource(platform=Platform.DISCORD, chat_id="synthetic", chat_type="group"))
+        store.set_model_override(home.session_key, {"provider": "openrouter", "model": "parent-pin"})
         parent = AIAgent(model="parent-pin", provider="openrouter", api_mode="chat_completions",
                          api_key="synthetic-key", base_url=base + "/primary/v1", fallback_model=chain,
-                         enabled_toolsets=[], quiet_mode=True, skip_memory=True, skip_context_files=True)
+                         enabled_toolsets=[], quiet_mode=True, skip_memory=True, skip_context_files=True,
+                         session_id=home.session_id)
         parent._session_messages = [{"role": "assistant", "content": "parent context"}]
         if scenario == "active-fallback":
             assert parent._try_activate_fallback()
-        home = SimpleNamespace(session_id=parent.session_id, session_key="agent:main:discord:group:synthetic", origin=None)
-        store = SimpleNamespace(load_transcript=lambda sid: parent._session_messages)
-        runner = SimpleNamespace(session_store=store,
-                                 _resolve_session_agent_runtime=lambda **kw: (parent.model, {"provider": parent.provider, "api_mode": parent.api_mode, "api_key": parent.api_key, "base_url": parent.base_url}),
-                                 _refresh_fallback_model=lambda: chain)
-        monkeypatch.setattr("gateway.kanban_owner_wake.resolve_owner", lambda *a: home)
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config, runner.session_store = config, store
+        runner._session_model_overrides = {}
+        runner._refresh_fallback_model = lambda: chain
+        runner._reresolve_model_override_credentials = lambda value: {
+            "model": "parent-pin", "provider": "openrouter", "api_mode": "chat_completions",
+            "api_key": "synthetic-key", "base_url": base + "/primary/v1"}
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *a, **kw: "wrong-global-default")
         monkeypatch.setattr(wake, "_live_agent", lambda *a: (None, False) if scenario == "cold" else (parent, scenario == "busy"))
         try:
             selected, mode = asyncio.run(wake.resolve_parent(runner, {"home_sid": parent.session_id, "mode": "fork" if scenario == "downgrade" else "summary"}, wait_s=0))
-            if scenario == "detached":
+            if scenario == "auto-wake":
+                state = wake.BoomerangWakeState(tmp_path / "wake-state.json")
+                entry = {"key": "synthetic|nonce|1", "task_id": "synthetic-nonce", "home_sid": home.session_id,
+                         "delegation_id": "synthetic-auto-wake", "mode": "summary", "row": "completed",
+                         "wake_text": "synthetic nonce", "verdict_nonce": "abc123", "state": "claimed"}
+                state.claim(entry["key"], entry)
+                completed = []
+                runner._async_profile_scope_for_source = lambda source: nullcontext()
+                async def deliver(*a, **kw):
+                    return 0
+                monkeypatch.setattr(wake, "deliver_handbacks", deliver)
+                monkeypatch.setattr(wake, "execute_verdict", lambda entry, final, **kw: (completed.append(final) or {"ok": True, "summary": final, "action": "complete"}))
+                monkeypatch.setattr(wake, "deadman_owner_acted", lambda entry: False)
+                monkeypatch.setattr(wake, "_breadcrumb", lambda *a: None)
+                monkeypatch.setattr(wake, "ledger_append", lambda *a: None)
+                asyncio.run(wake.run_entry(runner, entry, state))
+                status, final = ("completed", completed[0]) if completed else ("failed", "no executor handback")
+            elif scenario == "detached":
                 from gateway.session_context import set_session_vars, restore_session_vars
                 from tools.delegate_detached import build_parent_and_runner
                 captured_children = []
@@ -153,6 +183,11 @@ def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scena
                 status, final = wake.run_child(selected, "Return the provider's response verbatim.", mode)
             (tmp_path / "wire-trace.json").write_text(json.dumps({"scenario": scenario, "trace": trace, "status": status, "final": final}, indent=2))
             print(json.dumps({"scenario": scenario, "trace": trace, "status": status, "sentinel": sentinel, "final": final}))
+            if scenario == "disabled":
+                assert status == "failed"
+                assert sentinel not in final
+                assert [row["lane"] for row in trace] == ["primary"]
+                return
             assert status == "completed", final
             assert sentinel in final
             expected_lanes = ["second", "cross-vendor"] if scenario == "active-fallback" else ["primary", "second", "cross-vendor"]
