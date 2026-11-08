@@ -95,6 +95,7 @@ Observed receipts (same repository interpreter; sanctioned `test-gate`, cache di
 - Final persistence + fingerprint tranche: 28 passed in 9.54s.
 - Entire background-interrupt file plus parent routing matrix: 31 passed in 17.57s.
 - Cold summary and setup-exception alone: 2 passed, 9 deselected in 11.38s.
+- Immutable old HTTP harness setup-failure control: 1 failed in 3.07s with `setup exception leaked SIGALRM handler`; cleanup in the control restores the leaked alarm even on assertion failure. The first control attempt failed earlier on SDK metadata/home isolation and is not the alarm reproduction.
 - Two real detached profile subprocesses with endpoint-bound named custom references: 1 passed in 11.35s. A generic OpenAI default key is intentionally insufficient for the saved foreign endpoint; the old detached fixture failed closed after the security fix and was corrected to use a real symbolic reference.
 - Entire wake-dispatch/default-handback files: 86 passed in 88.00s after their fake runners supplied the required owner/scope seam. Initial 7 failures included one late-bootstrap home-I/O violation and six incomplete runner doubles; no production guard was relaxed.
 - Fresh automatic busy/snapshot wire run: 2 passed, 2 deselected in 9.19s. Sanitized request/nonce receipt: `evidence/correction-wire-traces.json`; synthetic key equality remains asserted in executable tests. Snapshot's printed claim precedes reconciliation; the test additionally requires pending turn, one later admission and cleared row.
