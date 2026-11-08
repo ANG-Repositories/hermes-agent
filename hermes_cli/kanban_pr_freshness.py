@@ -514,7 +514,10 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     evaluate = evaluate or spawn_evaluate
     ev_on = event_land_enabled() if event_land is None else event_land
     flip_records = {str(k).lower(): v for k, v in (flipped or {}).items() if isinstance(v, dict)}
-    mark_records = {str(k).lower(): v for k, v in (marked or {}).items() if isinstance(v, dict)}
+    # Normalize lookup only; consumption must address the exact persisted event key.
+    mark_keys = {str(k).lower(): k for k, v in (marked or {}).items()
+                 if _rd.enabled() and isinstance(v, dict) and not v.get("consumed")}
+    mark_records = {key: marked[original] for key, original in mark_keys.items()}
 
     views = []
     drafts = []
@@ -581,7 +584,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
                 try:
                     if consume is None:
                         raise ValueError("round draft consumption unavailable")
-                    consume(key.lower())
+                    consume(mark_keys[key.lower()])
                 except Exception:
                     _log.warning("round draft consumption failed for %s; operator ready required", key, exc_info=True)
                     failed.append(key)

@@ -121,6 +121,65 @@ def test_persisted_mark_at_stale_head_or_before_flip_stays_held(rig):
     assert rig.handback()["draft_held"] and rig.log == []
 
 
+@pytest.mark.parametrize("kill_switch", [False, True])
+def test_historical_mark_does_not_hold_later_new_head_draft(rig, monkeypatch, kill_switch):
+    rig.start(101)
+    assert rig.handback()["draft_flipped"] == ["o/r#1"]
+    if kill_switch:
+        monkeypatch.setenv("KANBAN_ROUND_DRAFT", "0")
+        rig.marks["o/r#1"].pop("consumed")
+    rig.state["pr"]["head"]["sha"] = "b" * 40
+    rig.state["pr"]["draft"] = True
+    rig.log.clear()
+    assert rig.handback()["draft_flipped"] == ["o/r#1"]
+    assert rig.log == [("ready", "o/r", 1)]
+
+
+def test_mixed_case_persisted_mark_is_consumed_by_real_handback(tmp_path, monkeypatch):
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(op, "FLEET_OWNERS", {"o"})
+    monkeypatch.setattr(fr, "worker_draft_repos", lambda: {"o/r"})
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
+    monkeypatch.setattr(kb, "_pre_pr_refusals", lambda *a, **kw: [])
+    monkeypatch.setattr(kb, "is_milestone_card", lambda *a: True)
+    monkeypatch.setattr(op, "_default_query", lambda: lambda *a: {"state": "OPEN"})
+    state = {"draft": True}
+    ready_calls = []
+
+    def gh(path, *a):
+        if "/pulls/" in path:
+            return {"state": "open", "draft": state["draft"],
+                    "head": {"sha": SHA, "ref": "worker/" + tid}}
+        if "/timeline?" in path:
+            return {"pages": [[{"id": 8, "event": "convert_to_draft", "actor": {"id": 7}}]]}
+        return None
+
+    def ready(repo, number):
+        ready_calls.append((repo, number))
+        state["draft"] = False
+        return 0
+
+    monkeypatch.setattr(fr, "_default_gh", lambda: gh)
+    monkeypatch.setattr(fr, "_default_ready", lambda: ready)
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="mixed case round", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.get_task(conn, tid).current_run_id
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_draft_flipped",
+                             {"flipped": {"O/R#1": {"head": SHA, "at": 1}}})
+            kb._append_event(conn, tid, "round_draft_marked", {"marked": {"O/R#1": {
+                "run": str(run), "head": SHA, "at": 2, "actor_id": 7, "transition_id": 8}}})
+        assert kb.complete_task(conn, tid, summary="mixed case handback",
+                                metadata={"pr_url": "https://github.com/O/R/pull/1"}, expected_run_id=run)
+        assert rd.mark_records(conn, tid)["O/R#1"]["consumed"] is True
+    assert ready_calls == [("O/R", 1)]
+
+
 def test_draft_failure_logs_and_continues_without_retry(rig):
     rig.state["draft_fails"] = True
     assert rig.start(101) == {"o/r#1": "draft failed (logged; round runs CI per push)"}
