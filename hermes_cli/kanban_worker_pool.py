@@ -1440,12 +1440,23 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
     tail = f"; {_boards_cmd(workspaces_root)}" if workspaces_root else ""
     if workspace_paths:
         tail += f"; {_states_cmd(workspace_paths)}"
-    if pressure_path is None:
-        return f"cat /proc/loadavg; {_NCPU_CMD}{tail}"
     import shlex
-    # ONE round-trip (RC9): the age is remote_now - at, both from this host.
-    return (f"cat /proc/loadavg; {_NCPU_CMD}; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
-            f"{tail}")
+    # Python's native APIs work on Linux and Darwin. A single JSON envelope
+    # prevents missing commands/files from shifting CPU/clock/pressure fields.
+    script = (
+        "import json,os,sys,time\n"
+        "load=os.getloadavg()\n"
+        "pressure=''\n"
+        "if len(sys.argv)>1:\n"
+        " try:\n"
+        "  with open(sys.argv[1], encoding='utf-8') as f: pressure=f.read()\n"
+        " except OSError: pass\n"
+        "print('@@hermes-probe-v1')\n"
+        "print(json.dumps(dict(schema=1,load1=load[0],load5=load[1],"
+        "ncpu=os.cpu_count(),remote_now=time.time(),pressure_text=pressure)))\n"
+    )
+    args = " " + shlex.quote(pressure_path) if pressure_path is not None else ""
+    return f"python3 -c {shlex.quote(script)}{args}{tail}"
 
 
 def _probe_once(h: PoolHost, runner: Callable, *,
@@ -1510,6 +1521,27 @@ def _probe_once(h: PoolHost, runner: Callable, *,
         if not sep:
             return None, "probe output missing board list"  # fail closed
         boards = frozenset(b.strip() for b in listed.split("\n") if b.strip())
+    if out.startswith("@@hermes-probe-v1\n"):
+        import math
+        try:
+            doc = json.loads(out.split("\n", 1)[1])
+            if doc.get("schema") != 1:
+                raise ValueError("schema")
+            load1, load5 = doc["load1"], doc["load5"]
+            ncpu, remote_now = doc["ncpu"], doc["remote_now"]
+            if (type(ncpu) is not int or ncpu <= 0
+                    or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0
+                           for v in (load1, load5, remote_now))
+                    or not isinstance(doc["pressure_text"], str)):
+                raise ValueError("axes")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, "invalid structured probe output"
+        if pressure_path is None and boards is None and states is None:
+            return (load1, ncpu), ""
+        return HostSample(load1, ncpu, remote_now, doc["pressure_text"], boards,
+                          load5=load5, workspace_states=states), ""
+    # Compatibility for cached/injected legacy probes. New commands always
+    # emit the versioned envelope; never interpret a damaged envelope as lines.
     lines = out.split("\n")
     try:
         load1 = float(lines[0].split()[0])
