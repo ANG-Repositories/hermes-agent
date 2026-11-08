@@ -848,11 +848,24 @@ def _route_blacksmith_slices(
     print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
 
 
-def _route_self_hosted_last_n(matrix: dict, raw: str | None, event: str | None, same_repo: str | None) -> None:
+# The only ref whose jobs the org runner group `universal-ci-public` serves
+# (restricted to tests.yml@refs/heads/main). A trusted merge_group or same-repo
+# PR run routed to universal-ci would queue on labels no group can place.
+_LAST_N_REF = "refs/heads/main"
+
+
+def _last_n_placeable(event: str | None, ref: str | None) -> bool:
+    return (event or "").strip() == "push" and (ref or "").strip() == _LAST_N_REF
+
+
+def _route_self_hosted_last_n(matrix: dict, raw: str | None, event: str | None, same_repo: str | None,
+                              ref: str | None = None) -> None:
     """Final routing boundary: untrusted code never leaves standard hosted.
 
     An unset/empty last-N preserves the explicit legacy routing knobs. Explicit
     zero, negative or malformed counts override them with all-hosted routing.
+    A nonempty last-N on a trusted run that the public runner group cannot serve
+    (anything but push:main) also routes all-hosted: the knob never strands jobs.
     """
     if not _blacksmith_trusted(event, same_repo):
         for slice_ in matrix["slice"]:
@@ -863,6 +876,8 @@ def _route_self_hosted_last_n(matrix: dict, raw: str | None, event: str | None, 
     try:
         count = max(0, min(int(raw), len(matrix["slice"])))
     except ValueError:
+        count = 0
+    if not _last_n_placeable(event, ref):
         count = 0
     ordered = sorted(matrix["slice"], key=lambda slice_: slice_["index"])
     for i, slice_ in enumerate(ordered):
@@ -2077,6 +2092,11 @@ def main() -> int:
         help="'true' when a pull_request head is in this repository (not a fork).",
     )
     parser.add_argument(
+        "--ref",
+        default=None,
+        help="github.ref; --self-hosted-last-n routes only on push to refs/heads/main.",
+    )
+    parser.add_argument(
         "--self-hosted-labels",
         metavar="JSON",
         default=_HOSTED_RUNNER_LABELS,
@@ -2185,7 +2205,7 @@ def main() -> int:
         "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--full-slices", "--files", "--files-from",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--self-hosted-last-n", "--arm-hosted-slices",
-        "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
+        "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo", "--ref",
         "--min-tests", "--strict-noop", "--no-strict-noop",
         "--junit-dir", "--result-file",
     }
@@ -2374,7 +2394,7 @@ def main() -> int:
                 scoped_matrix, args.blacksmith_slices, args.event, args.same_repo
             )
             _route_self_hosted_last_n(
-                scoped_matrix, args.self_hosted_last_n, args.event, args.same_repo
+                scoped_matrix, args.self_hosted_last_n, args.event, args.same_repo, args.ref
             )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
@@ -2486,7 +2506,7 @@ def main() -> int:
             matrix, args.blacksmith_slices, args.event, args.same_repo
         )
         _route_self_hosted_last_n(
-            matrix, args.self_hosted_last_n, args.event, args.same_repo
+            matrix, args.self_hosted_last_n, args.event, args.same_repo, args.ref
         )
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))

@@ -28,15 +28,28 @@ def generate(tmp_path, *args):
     return [s['runs_on'] for s in json.loads(proc.stdout)['slice']]
 
 
-@pytest.mark.parametrize('event,same', [('push', 'false'), ('merge_group', 'false'), ('pull_request', 'true')])
-def test_trusted_last_three(tmp_path, event, same):
+def test_trusted_push_main_last_three(tmp_path):
+    assert generate(tmp_path, '--self-hosted-last-n=3', '--event', 'push',
+                    '--same-repo', 'false', '--ref', 'refs/heads/main') == [HOSTED] * 3 + [LOCAL] * 3
+
+
+@pytest.mark.parametrize('event,same,ref', [
+    ('merge_group', 'false', 'refs/heads/gh-readonly-queue/main/pr-1'),
+    ('pull_request', 'true', 'refs/pull/1/merge'),
+    ('push', 'false', 'refs/heads/feature'),
+    ('push', 'false', ''),
+])
+def test_trusted_but_unplaceable_stays_hosted(tmp_path, event, same, ref):
+    # group 15 serves tests.yml@refs/heads/main only: a trusted non-main run routed
+    # to universal-ci would queue on labels no runner group can place.
     assert generate(tmp_path, '--self-hosted-last-n=3', '--event', event,
-                    '--same-repo', same) == [HOSTED] * 3 + [LOCAL] * 3
+                    '--same-repo', same, '--ref', ref) == [HOSTED] * 6
 
 
 @pytest.mark.parametrize('raw,count', [('', 0), ('0', 0), ('-1', 0), ('garbage', 0), ('1.5', 0), ('999999999999999999999999', 6)])
 def test_counts_fail_closed_and_clamp(tmp_path, raw, count):
-    assert generate(tmp_path, f'--self-hosted-last-n={raw}', '--event=push') == [HOSTED] * (6-count) + [LOCAL] * count
+    assert generate(tmp_path, f'--self-hosted-last-n={raw}', '--event=push',
+                    '--ref=refs/heads/main') == [HOSTED] * (6-count) + [LOCAL] * count
 
 
 @pytest.mark.parametrize('event,same', [('pull_request', 'false'), ('pull_request', ''), ('workflow_dispatch', 'true'), ('pull_request_target', 'true'), ('', '')])
@@ -59,7 +72,7 @@ def test_plugin_scoped_matrix_obeys_last_n_and_trust(tmp_path, event, same):
                   if p.is_dir() and any(p.glob('test_*.py')))
     labels = generate(tmp_path, '--test-scope', f'plugin:{plugin}',
                       '--self-hosted-last-n=1', '--self-hosted-labels', LOCAL,
-                      '--event', event, '--same-repo', same)
+                      '--event', event, '--same-repo', same, '--ref', 'refs/heads/main')
     assert labels == ([HOSTED] * (len(labels) - 1) + [LOCAL]
                       if event == 'push' else [HOSTED] * len(labels))
 
@@ -75,3 +88,4 @@ def test_workflow_plumbing_and_matrix_have_independent_fork_guard():
     text = (ROOT / '.github/workflows/tests.yml').read_text()
     assert 'CI_SELF_HOSTED_LAST_N: ${{ vars.CI_SELF_HOSTED_LAST_N }}' in text
     assert '--self-hosted-last-n="$CI_SELF_HOSTED_LAST_N"' in text
+    assert 'GH_REF: ${{ github.ref }}' in text and '--ref="$GH_REF"' in text
