@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -473,6 +474,7 @@ class GoalState:
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
     consecutive_incomplete_turns: int = 0     # agent turns that failed before completion
     incomplete_retry_wait: bool = False       # only the retry loop owns this wait barrier
+    idle_wake_attempt: Optional[str] = None   # survives compatible edits, revoked by new waits
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -534,6 +536,7 @@ class GoalState:
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_reason=data.get("waiting_reason"),
             incomplete_retry_wait=bool(data.get("incomplete_retry_wait", False)),
+            idle_wake_attempt=data.get("idle_wake_attempt"),
             checkin_minutes=int(data["checkin_minutes"]) if data.get("checkin_minutes") is not None else -1,
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
@@ -551,6 +554,7 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
     def clear_wait(self) -> None:
+        self.idle_wake_attempt = None
         self.incomplete_retry_wait = False
         self.waiting_on_pid = None
         self.waiting_on_session = None
@@ -565,7 +569,7 @@ class GoalState:
 # GoalState fields an idle wake mutates (accounting + the wait barrier it consumes).
 _IDLE_WAKE_FIELDS = (
     "idle_wakes", "last_idle_wake_at", "waiting_on_pid", "waiting_on_session", "waiting_until",
-    "waiting_on_delegations", "waiting_reason", "waiting_since", "incomplete_retry_wait",
+    "waiting_on_delegations", "waiting_reason", "waiting_since", "incomplete_retry_wait", "idle_wake_attempt",
 )
 
 
@@ -771,9 +775,9 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
     """Give back a recorded idle wake that was never dispatched (the session turned busy or was
     /stop-ped meanwhile), so it does not consume a check-in. Read, compare and write run in ONE
     write transaction, so a pause/clear from any surface either lands first (and the goal is left
-    alone) or after (and sees the restored fields). The give-back applies only while the stored row
-    is byte-identical to the row the wake saved (``after["_row"]``): any save since then, including
-    a replacement goal whose fields happen to equal the post-wake values, wins and is left alone.
+    alone) or after (and sees the restored fields). The activation and unique wake-attempt token
+    own the refund, not the whole row: compatible edits survive. New waits, unwait, replacement,
+    resume or another evaluation revoke ownership and are left alone.
     Returns True when anything changed."""
     db = _get_session_db() if session_id and before else None
     execute_write = getattr(db, "_execute_write", None)
@@ -783,15 +787,19 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
 
     def _txn(conn) -> bool:
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if not row or not after.get("_row") or row[0] != after["_row"]:
-            return False  # the row is no longer the one this wake wrote (another save or another goal)
-        state = GoalState.from_json(row[0]) if row and row[0] else None
-        if state is None or state.status != "active":
+        if not row or not after.get("_row"):
+            return False
+        state = GoalState.from_json(row[0])
+        owner = GoalState.from_json(after["_row"])
+        if (not same_active_goal(owner, state) or not owner.idle_wake_attempt
+                or state.idle_wake_attempt != owner.idle_wake_attempt
+                or any(getattr(state, f) != after.get(f) for f in _IDLE_WAKE_FIELDS)):
             return False
         changed = [f for f in _IDLE_WAKE_FIELDS if f in before and getattr(state, f) == after.get(f) != before[f]]
         for field in changed:
             setattr(state, field, before[field])
         if changed:
+            state.revision += 1
             conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
         return bool(changed)
 
@@ -1888,11 +1896,22 @@ class GoalManager:
             self._save()
         # Failed agent turns are not evidence for gates or the judge. Persist the streak so
         # reloading the manager (or restarting the gateway) cannot restart a rapid retry loop.
-        if state.consecutive_incomplete_turns and (turn_completed or human_message):
+        blank_success = turn_completed and not last_response.strip()
+        retry_recovery = state.incomplete_retry_wait or (
+            bool(state.idle_wake_attempt) and state.idle_wake_attempt.startswith("retry:"))
+        if (state.consecutive_incomplete_turns or retry_recovery) and (turn_completed or human_message):
             state.consecutive_incomplete_turns = 0
-            if state.incomplete_retry_wait:
+            # A blank/muted success queues no successor: keep its recovery timer, or
+            # re-park a claimed retry. Resetting the streak must not strand the goal.
+            if blank_success and retry_recovery:
+                if not state.incomplete_retry_wait:
+                    self._park("empty completed retry", waiting_until=time.time() + 60,
+                               incomplete_retry_wait=True)
+            elif state.incomplete_retry_wait:
                 state.clear_wait()
             self._save()
+        if not blank_success:
+            state.idle_wake_attempt = None
         # A completed/human turn may reset retry state, never a deployment/process barrier.
         if not turn_completed and not state.incomplete_retry_wait and self.is_waiting():
             return self._waiting_decision(state)
@@ -2050,6 +2069,7 @@ class GoalManager:
         minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
         if (checkin_minutes <= 0 or minutes <= 0) and not s.incomplete_retry_wait:
             return None
+        retry_wake = s.incomplete_retry_wait
         now = time.time() if now is None else now
         if now - max(s.last_turn_at, s.last_idle_wake_at, s.waiting_since, s.created_at) > _IDLE_WAKE_HORIZON_S:
             return None  # stale/abandoned goal: never wake it out of the blue
@@ -2085,6 +2105,7 @@ class GoalManager:
         if counted:
             s.idle_wakes += 1
         s.last_idle_wake_at = now
+        s.idle_wake_attempt = ("retry:" if retry_wake else "idle:") + uuid4().hex
         self._save()
         return prompt
 

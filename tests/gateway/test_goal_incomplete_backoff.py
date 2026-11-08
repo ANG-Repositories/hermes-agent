@@ -71,6 +71,29 @@ async def test_incomplete_turns_park_backoff_reset_and_notify_once(tmp_path, mon
         assert judge.call_count == 1  # blank success only resets, never judges
 
 
+@pytest.mark.parametrize("claimed", [False, True])
+def test_blank_success_preserves_retry_recovery(tmp_path, monkeypatch, claimed):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mgr = goals.GoalManager("blank-retry")
+    mgr.set("ship it")
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+    deadline = mgr.state.waiting_until
+    if claimed:
+        clock = deadline
+        assert mgr.idle_wake_prompt(checkin_minutes=0)
+    with patch.object(goals, "judge_goal") as judge:
+        decision = mgr.evaluate_after_turn("", turn_completed=True)
+    judge.assert_not_called()
+    assert not decision["should_continue"]
+    mgr = goals.GoalManager("blank-retry")
+    assert mgr.state.consecutive_incomplete_turns == 0
+    assert mgr.state.incomplete_retry_wait
+    assert mgr.idle_wake_prompt(mgr.state.waiting_until - 1, checkin_minutes=0) is None
+    assert mgr.idle_wake_prompt(mgr.state.waiting_until, checkin_minutes=0)
+
+
 @pytest.mark.asyncio
 async def test_delivery_preserves_completion_before_returning_text():
     from gateway.run_turn import GatewayTurnMixin

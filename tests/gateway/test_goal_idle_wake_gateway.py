@@ -85,11 +85,13 @@ async def test_timer_parked_goal_is_woken_when_the_deadline_passes(rig):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("edit", [False, True])
 @pytest.mark.parametrize("boundary", ["claim", "recheck", "admission"])
-async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary):
+async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary, edit):
     runner, adapter, received, key = rig
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
     mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
-    await asyncio.to_thread(mgr.set, "ship it")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
     clock = mgr.state.created_at
     monkeypatch.setattr(goals.time, "time", lambda: clock)
     await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
@@ -119,6 +121,10 @@ async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary):
     task = asyncio.create_task(runner._goal_idle_wake_one(entry, 0, 3))
     try:
         await asyncio.wait_for(reached.wait(), 5)
+        if edit:
+            def add_criterion():
+                goals.GoalManager("goal-sess").add_subgoal("keep this criterion")
+            await asyncio.to_thread(add_criterion)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -144,8 +150,9 @@ async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary):
 @pytest.mark.asyncio
 async def test_retry_wake_rejected_before_admission_is_refunded(rig, monkeypatch):
     runner, adapter, received, key = rig
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
     mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
-    await asyncio.to_thread(mgr.set, "ship it")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
     clock = mgr.state.created_at
     monkeypatch.setattr(goals.time, "time", lambda: clock)
     await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
@@ -184,13 +191,15 @@ async def test_retry_wake_rejected_before_admission_is_refunded(rig, monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["cap", "cancel", "execute"])
-async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypatch, outcome):
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("outcome", ["cap", "cancel", "execute", "route"])
+async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypatch, outcome, edit):
     from unittest.mock import AsyncMock
 
     runner, adapter, received, key = rig
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
     mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
-    await asyncio.to_thread(mgr.set, "ship it")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
     clock = mgr.state.created_at
     monkeypatch.setattr(goals.time, "time", lambda: clock)
     await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
@@ -220,8 +229,20 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
             return reply
         reached.set()
         await release.wait()
+        if edit:
+            await asyncio.to_thread(lambda: goals.GoalManager("goal-sess").add_subgoal("keep criterion"))
         runner.hooks = SimpleNamespace(emit=AsyncMock())
         runner._hmwa_resolve_session = AsyncMock(return_value=(event.source, entry, key))
+        if outcome == "route":
+            runner._persisted_session_route_identity = lambda k: SimpleNamespace(state="unavailable")
+            runner._async_session_store = SimpleNamespace(
+                _store=runner.session_store, get_or_create_session=AsyncMock(return_value=entry))
+            runner._defer_goal_status_notice_after_delivery = AsyncMock()
+            reply = await runner._handle_message_with_agent_admitted(event, event.source, key, 1)
+            assert "No provider request" in reply
+            await runner._run_post_turn_hooks(agent_result=reply, source=event.source,
+                                             is_internal=True, event=event, parts=("goal continuation",))
+            return reply
         runner._hmwa_check_persisted_route = AsyncMock(return_value=None)
         runner._hmwa_prepare_turn = AsyncMock(return_value=(
             runner._PreparedTurn([], "", "retry", "retry", None, None), {}))
@@ -243,6 +264,8 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
         # An accepted turn that has not settled must not be refunded prematurely.
         assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
         if outcome == "cancel":
+            if edit:
+                await asyncio.to_thread(lambda: goals.GoalManager("goal-sess").add_subgoal("keep criterion"))
             processing.cancel()
         else:
             release.set()
@@ -267,6 +290,53 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
         await _drain(adapter)
         assert len(received) == 2
         assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["edit", "pause", "clear", "replace", "resume", "wait", "unwait", "new-claim", "evaluate"])
+async def test_retry_refund_respects_attempt_owner(rig, monkeypatch, mutation):
+    monkeypatch.setattr(goals.time, "time", lambda: 1000.0)
+
+    def scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+        before = mgr.idle_wake_snapshot()
+        assert mgr.idle_wake_prompt(1060, checkin_minutes=0)
+        after = mgr.idle_wake_snapshot()
+        other = goals.GoalManager("goal-sess")
+        if mutation == "edit":
+            other.add_subgoal("preserved")
+        elif mutation == "pause":
+            other.pause()
+        elif mutation == "clear":
+            goals.clear_goal("goal-sess")
+        elif mutation == "replace":
+            other.set("g")  # deliberately identical goal + timestamp
+        elif mutation == "resume":
+            other.pause()
+            other.resume()
+        elif mutation == "wait":
+            other.wait_for_seconds(100, "deployment")
+        elif mutation == "unwait":
+            other.stop_waiting()
+        elif mutation == "new-claim":
+            assert other.idle_wake_prompt(3000, checkin_minutes=30)
+        else:
+            other.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+        saved = goals.load_goal("goal-sess").to_json()
+        undone = goals.undo_idle_wake("goal-sess", before, after)
+        state = goals.load_goal("goal-sess")
+        if mutation == "edit":
+            assert undone
+            assert state.subgoals == ["preserved"]
+            assert state.incomplete_retry_wait and state.waiting_until == before["waiting_until"]
+            assert not goals.undo_idle_wake("goal-sess", before, after)  # settle exactly once
+        else:
+            assert not undone
+            assert state.to_json() == saved
+
+    await asyncio.to_thread(scenario)
 
 
 @pytest.mark.asyncio

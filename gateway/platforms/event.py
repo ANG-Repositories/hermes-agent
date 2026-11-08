@@ -101,6 +101,8 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Idle wake hooks require a concrete execution receipt (never ingress metadata).
+    _goal_idle_wake: bool = field(default=False, init=False, repr=False, compare=False)
     # Goal retry ownership transfers only when the runner reaches execution, not adapter spawn.
     _goal_execution_started: bool = field(default=False, init=False, repr=False, compare=False)
     # Armed by /queue run (queue_mgmt.restage_held): this event was staged by a release and is being

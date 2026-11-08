@@ -563,7 +563,9 @@ class GatewayGoalsMixin:
         from agent.turn_failure_copy import is_max_iteration_handoff
 
         completed = explicit_completed is not False or is_max_iteration_handoff(agent_result)
-        if final_text.strip() or explicit_completed is not None:
+        unexecuted_wake = (getattr(event, "_goal_idle_wake", False) is True
+                           and getattr(event, "_goal_execution_started", False) is not True)
+        if not unexecuted_wake and (final_text.strip() or explicit_completed is not None):
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             if label not in parts:
@@ -873,7 +875,8 @@ class GatewayGoalsMixin:
         def _still_active() -> bool:
             # Strict (Prism 99ea851df13d): a failed read is not proof another writer ended the goal.
             try:
-                return mgr.reload(strict=True) is not None and mgr.is_active()
+                return (mgr.reload(strict=True) is not None and mgr.is_active()
+                        and mgr.state.idle_wake_attempt == after.get("idle_wake_attempt"))
             except Exception as exc:
                 logger.debug("goal idle wake for %s: post-save reload failed: %s", quick_key, exc)
                 return False
@@ -907,6 +910,7 @@ class GatewayGoalsMixin:
                         quick_key, session_id, prompt.splitlines()[0][:80],
                     )
                     event = self._synthetic_prompt_event(source, prompt, internal=True)
+                    event._goal_idle_wake = True
                     event.metadata["gateway_session_key"] = quick_key
                     def _admit(key: str) -> bool:
                         # Final eligibility check, run by the adapter at the claim itself (Prism
