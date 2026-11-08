@@ -297,6 +297,8 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
            "at": time.time(), "at_source": "authorization_receipt_received"}
     try:
         _receipt(conn, task, doc)
+        if time.time() >= doc["until"]:
+            raise DoorCancelled("authorization expired before launch; retry with new ID")
         yield
     except BaseException:
         # Caller must stop an already-created worker before propagating an error.

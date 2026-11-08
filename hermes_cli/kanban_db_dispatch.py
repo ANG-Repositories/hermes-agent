@@ -3383,6 +3383,29 @@ def _set_worker_pid(
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool
     with _kbc.write_txn(conn):
+        launching_run_id = run_id if run_id is not None else _kb._current_run_id(conn, task_id)
+        # Correlate even a late start with its launching run, never its successor.
+        from hermes_cli.kanban_priority_door import EVENT
+        authorization = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+            (task_id, launching_run_id, EVENT)).fetchone()
+        if authorization is not None:
+            import hashlib
+            grant = json.loads(authorization[0])
+            route = (placement or {}).get("route_class")
+            entry = (placement or {}).get("entry")
+            if entry == "spawn_now":
+                boundary = "forced"
+            elif route == "pin":
+                boundary = "pinned"
+            elif route == "local":
+                boundary = "local"
+            else:
+                boundary = "dispatch"
+            source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+            spawn_payload.update({k: grant[k] for k in ("host", "unit_id", "reservation_id")})
+            spawn_payload.update(consumer="kanban", process_id=int(pid), at=time.time(),
+                                 boundary=boundary, source_ref=f"sha256:{source}:_set_worker_pid")
         if run_id is not None:
             held = conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
@@ -3407,29 +3430,6 @@ def _set_worker_pid(
                 "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                 (int(pid), started_at, run_id),
             )
-        # Join on the launching run, never a pid or nearest timestamp. A dormant
-        # door leaves no authorization fields; local_admitted remains accounting.
-        from hermes_cli.kanban_priority_door import EVENT
-        authorization = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? ORDER BY id DESC LIMIT 1",
-            (task_id, run_id, EVENT)).fetchone()
-        if authorization is not None:
-            import hashlib
-            grant = json.loads(authorization[0])
-            route = (placement or {}).get("route_class")
-            entry = (placement or {}).get("entry")
-            if entry == "spawn_now":
-                boundary = "forced"
-            elif route == "pin":
-                boundary = "pinned"
-            elif route == "local":
-                boundary = "local"
-            else:
-                boundary = "dispatch"
-            source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-            spawn_payload.update({k: grant[k] for k in ("host", "unit_id", "reservation_id")})
-            spawn_payload.update(consumer="kanban", process_id=int(pid), at=time.time(),
-                                 boundary=boundary, source_ref=f"sha256:{source}:_set_worker_pid")
         _kb._append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
         if placement is not None:
             from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
@@ -4340,6 +4340,9 @@ def _book_local_start(conn: sqlite3.Connection, claimed: Task) -> Optional[str]:
     ``local_admitted`` run event carrying the reservation: ``_end_run`` releases it and ``renew_running`` renews it,
     exactly like a pool run's ``worker_placed`` row. No table / no ``local`` host = nothing booked (None). An
     unreadable ledger or a failed event write raises LocalLedgerUnavailable: the worker does not start."""
+    from hermes_cli import kanban_priority_door as door
+    if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
+        raise door.DoorHeld("run already authorized; reconcile original start")
     if not local_ledger_enabled():
         return None
     from hermes_cli import kanban_headroom as _kh
@@ -4387,6 +4390,9 @@ def _launch_claimed(
     from hermes_cli.kanban_continuation import record_placement
     from hermes_cli import kanban_placement_reasons as _pr
 
+    from hermes_cli import kanban_priority_door as door
+    if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
+        raise door.DoorHeld("run already authorized; reconcile original start")
     if not record_placement(conn, claimed.id, claimed.current_run_id, host):
         return _LAUNCH_NOT_OWNED
     if host is None:
@@ -8238,16 +8244,17 @@ def _dispatch_once_locked(
             import inspect
 
             def _review_spawn(task, path):
+                kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
                 try:
                     sig = inspect.signature(_spawn)
-                    kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
-                    if "board" in sig.parameters:
-                        kwargs['board'] = board
-                    return _spawn(task, path, **kwargs)
                 except (TypeError, ValueError):
                     if _review_origin_host:
                         raise
-                    return _spawn(task, path)
+                else:
+                    if "board" in sig.parameters:
+                        kwargs['board'] = board
+                # Execution errors may follow process creation; never retry a spawn.
+                return _spawn(task, path, **kwargs)
             # The review start is a start like any other (round 5, Prism 7851057bf109): one door authorization,
             # upgraded in place from the booked pin reservation, before the worker exists.
             pid = _review_door.spawn(conn, claimed, str(workspace),

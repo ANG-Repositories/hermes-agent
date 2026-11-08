@@ -14,7 +14,14 @@ requires an allocd producer extension or joining its authoritative lease row.
 `spawned` joins authorization by exact task/run and retains canonical host,
 unit/lease, consumer, process_id, acknowledgement `at`, boundary and a SHA256
 source identity. The existing PID fingerprint/start token remains unchanged.
-No PID means no spawned event; late/lost-claim spawns remain explicitly marked.
+No PID means no spawned event; late/lost-claim spawns remain explicitly marked
+and join the authorization of the supplied launching run, never a successor.
+The receipt deadline is checked after its durable write, immediately before
+entering launch; expiry cancels/releases that attempt and requires a fresh ID.
+A recorded authorization prevents re-entry before local capacity booking, including
+review bookings. Review callback arguments are selected by signature inspection
+before execution: an execution-time TypeError/ValueError is a failure, never
+permission to invoke an externally effective spawn twice.
 `source_ref` identifies dispatcher source bytes, not an assertion that a Git
 commit is deployed. Capture the runtime release revision independently.
 
