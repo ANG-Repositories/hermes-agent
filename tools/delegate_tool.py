@@ -3587,6 +3587,47 @@ def _regate_inherited_child_tier(child, parent_agent, explicit_tier_overrides) -
 
 
 # ── fork: durable background spec + restart recovery (t_1191e078 #1104; gateway/run.py caller) ──
+def _durable_intent_expected(cfg: Dict[str, Any]) -> bool:
+    """True when a background unit dispatched now would carry restart-durable intent (a routable
+    gateway session with resume_on_restart on), so its admission also needs a durable registry slot."""
+    if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
+        return False
+    try:
+        from gateway.session_context import get_session_env
+
+        source_name = get_session_env("HERMES_SESSION_SOURCE", "")
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        return False
+    return source_name != "tui" and bool(platform)
+
+
+def _background_not_started(dispatch: Dict[str, Any], goals: List[str], children=()) -> str:
+    """The tool result for a background delegation that was REFUSED: nothing ran, nothing will.
+
+    Built children (a refusal after construction) are closed unrun. The parent's turn returns now;
+    it never joins the work synchronously in place of the refused background unit."""
+    for _c in children:
+        with _quiet("background refusal: child close failed", exc_info=True):
+            _teardown(_c, "background_rejected")
+    reason = dispatch.get("reason") or "rejected"
+    logger.warning("delegate_task: background admission refused (reason=%s, %d task(s)); nothing started",
+                   reason, len(goals))
+    return json.dumps({
+        "status": "rejected",
+        "mode": "background",
+        "reason": reason,
+        "started": False,
+        "count": len(goals),
+        "goals": goals,
+        "error": dispatch.get("error") or "background delegation was not admitted",
+        "note": (
+            "No subagent was started and none will run for this call. Retry later, pass "
+            "background=false to run it in this turn, or do the work yourself."
+        ),
+    }, ensure_ascii=False)
+
+
 def _build_durable_background_spec(
     *,
     task_list: List[Dict[str, Any]],
@@ -3611,15 +3652,12 @@ def _build_durable_background_spec(
     """Build the non-secret restart intent for a routable gateway session. Call-level inputs that
     delegate_task applies outside ``task_list`` (top-level ``images`` / ``output_schema`` / ``skills``)
     are written into each persisted task: reconstruction rebuilds the children from the tasks alone."""
-    if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
+    if not _durable_intent_expected(cfg):
         return None, None
     try:
         from gateway.session_context import get_session_env
 
-        source_name = get_session_env("HERMES_SESSION_SOURCE", "")
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        if source_name == "tui" or not platform:
-            return None, None
         profile = get_session_env("HERMES_SESSION_PROFILE", "") or "default"
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
@@ -4256,6 +4294,77 @@ def delegate_task(
     if _budget_err:
         return tool_error(_budget_err)
 
+    # Capture the ORIGINATING session's wake target BEFORE any child agent is
+    # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
+    # set_current_session_id(child.session_id), which clobbers the
+    # HERMES_SESSION_ID ContextVar and os.environ with the subagent's internal
+    # id before the background-dispatch code below would read it. The
+    # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
+    # api_server) is untouched by child construction, so read it here and
+    # thread it through the dispatch.
+    from tools.async_delegation import _current_origin_session_id
+
+    _origin_wake_sid = _current_origin_session_id()
+    try:
+        from gateway.session_context import get_session_env
+
+        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+    except Exception:
+        _origin_ui_session_id = ""
+    _origin_owner_transport, _origin_owner_session_record = (
+        _capture_gateway_steer_authority(_origin_ui_session_id)
+    )
+
+    if background:
+        # Finite sessions cannot route a detached subagent result back to the
+        # agent after their turn/process ends. This includes stateless HTTP
+        # requests (#10760) and one-shot Kanban workers (#63169). Fall back to
+        # SYNCHRONOUS execution so the result returns in this same turn instead
+        # of handing out a handle with no durable consumer (requirement of the
+        # caller, not a fallback: an admission refusal below never runs inline).
+        # Finite chat (-Q/--oneshot/non-TTY stdio, HERMES_SINGLE_QUERY_SESSION=1) owns no later turn to
+        # consume a detached result; its lifecycle marker forces the inline join even when a
+        # wake-capable session id is bound (upstream 49ef015ca3).
+        _finite = False
+        try:
+            from gateway.session_context import async_delivery_supported, get_session_env
+            _finite = get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1"
+            _async_ok = (not _finite) and async_delivery_supported()
+        except Exception:
+            _async_ok = True
+
+        _wake_sid = ""
+        if not _async_ok and not _finite:
+            # The adapter itself cannot push, but if a raw session id is
+            # bound (the API server always binds one — see
+            # ApiServerAdapter._bind_api_server_session), gateway.wake can
+            # still reach the session by self-POSTing /v1/chat/completions
+            # with that id in X-Hermes-Session-Id once the batch completes.
+            # Only fall back to forced-sync execution when there is truly no
+            # session id to wake. Uses the origin captured before child
+            # construction (see _origin_wake_sid above) — reading
+            # HERMES_SESSION_ID here would return the subagent's internal id.
+            _wake_sid = _origin_wake_sid
+            if _wake_sid:
+                logger.info(
+                    "delegate_task: async delivery unsupported on this "
+                    "session, but a session id is bound (%s) — dispatching "
+                    "in the background and waking the session via self-post "
+                    "when it completes instead of forcing synchronous "
+                    "execution.",
+                    _wake_sid,
+                )
+                _async_ok = True
+        if _async_ok:
+            # Admission BEFORE any child is built: a refusal costs zero child sessions and returns
+            # now. A background call never degrades into a synchronous join of the same work.
+            from tools.async_delegation import preflight_admission
+
+            _refusal = preflight_admission(
+                max_async_children=_get_max_async_children(), durable=_durable_intent_expected(cfg))
+            if _refusal is not None:
+                return _background_not_started(_refusal, [t["goal"] for t in task_list])
+
     overall_start = time.monotonic()
     results = []
 
@@ -4289,27 +4398,6 @@ def delegate_task(
         int(recovery_max_spawn_raw)
         if isinstance(recovery_max_spawn_raw, (int, str))
         else None
-    )
-
-    # Capture the ORIGINATING session's wake target BEFORE any child agent is
-    # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
-    # set_current_session_id(child.session_id), which clobbers the
-    # HERMES_SESSION_ID ContextVar and os.environ with the subagent's internal
-    # id before the background-dispatch code below would read it. The
-    # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
-    # api_server) is untouched by child construction, so read it here and
-    # thread it through the dispatch.
-    from tools.async_delegation import _current_origin_session_id
-
-    _origin_wake_sid = _current_origin_session_id()
-    try:
-        from gateway.session_context import get_session_env
-
-        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
-    except Exception:
-        _origin_ui_session_id = ""
-    _origin_owner_transport, _origin_owner_session_record = (
-        _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
     # Build all child agents on the main thread (thread-safe construction).
@@ -4684,46 +4772,6 @@ def delegate_task(
         )
         from tools.approval import get_current_session_key
 
-        # Finite sessions cannot route a detached subagent result back to the
-        # agent after their turn/process ends. This includes stateless HTTP
-        # requests (#10760) and one-shot Kanban workers (#63169). Fall back to
-        # SYNCHRONOUS execution so the result returns in this same turn instead
-        # of handing out a handle with no durable consumer. Mirrors the
-        # pool-at-capacity inline fallback below.
-        # Finite chat (-Q/--oneshot/non-TTY stdio, HERMES_SINGLE_QUERY_SESSION=1) owns no later turn to
-        # consume a detached result; its lifecycle marker forces the inline join even when a
-        # wake-capable session id is bound (upstream 49ef015ca3).
-        _finite = False
-        try:
-            from gateway.session_context import async_delivery_supported, get_session_env
-            _finite = get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1"
-            _async_ok = (not _finite) and async_delivery_supported()
-        except Exception:
-            _async_ok = True
-
-        _wake_sid = ""
-        if not _async_ok and not _finite:
-            # The adapter itself cannot push, but if a raw session id is
-            # bound (the API server always binds one — see
-            # ApiServerAdapter._bind_api_server_session), gateway.wake can
-            # still reach the session by self-POSTing /v1/chat/completions
-            # with that id in X-Hermes-Session-Id once the batch completes.
-            # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
-            _wake_sid = _origin_wake_sid
-            if _wake_sid:
-                logger.info(
-                    "delegate_task: async delivery unsupported on this "
-                    "session, but a session id is bound (%s) — dispatching "
-                    "in the background and waking the session via self-post "
-                    "when it completes instead of forcing synchronous "
-                    "execution.",
-                    _wake_sid,
-                )
-                _async_ok = True
-
         if not _async_ok:
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
@@ -4867,18 +4915,11 @@ def delegate_task(
                 routing_cfg=routing_cfg,
             )
         except Exception as exc:
-            logger.error(
-                "delegate_task: durable restart intent unavailable (%s); "
-                "running synchronously rather than launching untracked work",
-                exc,
-            )
-            _sync_result = _execute_and_aggregate()
-            if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "Restart-safe background persistence was unavailable, so "
-                    "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
-                )
-            return json.dumps(_sync_result, ensure_ascii=False)
+            logger.error("delegate_task: durable restart intent unavailable (%s); refusing the background unit", exc)
+            return _background_not_started(
+                {"reason": "durable_intent_error",
+                 "error": f"restart-safe background persistence unavailable: {type(exc).__name__}"},
+                _goals, _child_agents)
         # Kanban runtime (docs/dev/delegate-background-on-kanban-runtime.md §5.1-5.2): an eligible durable
         # unit runs as one card on the internal ``delegations`` board, in its own process. The allowlist
         # fails closed: any condition not positively true keeps today's in-process unit (I6).
@@ -4957,19 +4998,6 @@ def delegate_task(
                               and getattr(live_writers[_ti], "path", None) is not None},
         )
 
-        if (
-            _durable_spec is not None
-            and dispatch.get("status") == "rejected"
-            and dispatch.get("reason") in {"registry_cap", "registry_error"}
-        ):
-            _sync_result = _execute_and_aggregate()
-            if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "Restart-safe background persistence was unavailable, so "
-                    "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
-                )
-            return json.dumps(_sync_result, ensure_ascii=False)
-
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
@@ -5004,12 +5032,12 @@ def delegate_task(
             if _kanban is not None and _runtime in (None, KANBAN_SPAWNED_RUNTIME):
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
-                    "steer/list are not available for it; /stop still cancels it.")
+                    "steer/list are not available for it; /stop does not cancel it (delegate_task action='stop' does).")
             elif _detached is not None:
                 payload["detached"] = True
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
-                    "steer/list are not available for it; /stop still cancels it."
+                    "steer/list are not available for it; /stop does not cancel it (delegate_task action='stop' does)."
                 )
             elif any(isinstance(s, str) and s for s in _sids):
                 payload["subagent_ids"] = _sids
@@ -5030,15 +5058,8 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
-        )
-        _cap_result = _execute_and_aggregate()
+        # Refused (pool at capacity, registry full/unreadable, schedule failure, retiring backend): the
+        # built children never ran. Close them and tell the model the truth; never join them inline.
         _fallback_event_id = dispatch.get("fallback_event_id")
         if _fallback_event_id:
             from tools.async_delegation import acknowledge_outbox_event
@@ -5046,18 +5067,10 @@ def delegate_task(
             acknowledge_outbox_event(
                 _fallback_event_id,
                 outcome="dropped",
-                reason="fallback_ran",
+                reason="not_started",
                 profile_home=dispatch.get("_registry_profile_home") or None,
             )
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        return _background_not_started(dispatch, _goals, _child_agents)
 
     # ----- Synchronous path -----
     # A recovered async unit (_recovery_spec) delivers only via its own
@@ -5115,8 +5128,9 @@ _DESCRIPTION_HEAD = (
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
     "- Tasks needing user interaction -> subagents cannot ask questions\n"
-    "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /stop, /new, "
-    "or process exit halts running subagents (whole tree); each returns an 'interrupted' completion with partial output.\n\n"
+    "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /new or "
+    "process exit halts running subagents (whole tree), /stop halts only this turn's synchronous ones; each returns "
+    "an 'interrupted' completion with partial output.\n\n"
     "RULES:\n"
     "- Children know nothing of this conversation: pass everything needed via 'context', including any required "
     "output language, tone, or style (e.g. \"respond in Chinese\").\n"

@@ -653,13 +653,16 @@ class GatewayAgentCacheMixin:
             except Exception:
                 logger.warning("queue hold skipped on /stop for %s", session_key, exc_info=True)
         from gateway.run import _AGENT_PENDING_SENTINEL
-        # The turn's hard interrupt reaches only its in-turn children; background delegations were
-        # detached at dispatch and would otherwise run to completion and wake the session later.
-        # Each interrupted unit still returns as a completion (status=interrupted, partial output).
-        from tools.async_delegation import interrupt_for_session
-        interrupt_for_session(
-            session_key=session_key, reason=invalidation_reason,
-            parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
+        # The turn's hard interrupt reaches only its in-turn children. Background delegations were
+        # detached at dispatch and belong to the async registry: /stop (and /queue run) end the
+        # parent's TURN only, so those units keep running and deliver through the outbox (Ace
+        # 2026-11-08, t_8c4608e6; delegate_task action='stop' ends one). A session reset (/new)
+        # leaves them no return address, so it still cancels them.
+        if not (_reason.startswith("stop_command") or _reason == "queue_run"):
+            from tools.async_delegation import interrupt_for_session
+            interrupt_for_session(
+                session_key=session_key, reason=invalidation_reason,
+                parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # Superseded-turn write gate (agent/session_persistence.py): the displaced turn's late
             # tool results must not land in the transcript the successor turn now owns.
