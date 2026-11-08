@@ -5,12 +5,43 @@ import copy
 
 from tools.async_delegation_store import _carries_credential, persistable_fallback_chain
 
+_ROUTING_FILTERS = frozenset({"providers_allowed", "providers_ignored", "providers_order", "provider_sort",
+                             "provider_require_parameters", "provider_data_collection"})
+
+
+def _validate_policy(route):
+    """Validate before credential lookup; empty is resolved-disabled, None is not."""
+    chain = route.get("fallback_chain")
+    if (_carries_credential(route) or not isinstance(chain, list)
+            or not isinstance(route.get("request_overrides", {}), dict)
+            or not isinstance(route.get("routing_filters", {}), dict)
+            or set(route.get("routing_filters", {})) - _ROUTING_FILTERS):
+        raise ValueError("boomerang routing-unavailable: invalid persisted policy")
+    for rung in chain:
+        if (not isinstance(rung, dict)
+                or not isinstance(rung.get("provider"), str) or not rung["provider"].strip()
+                or not isinstance(rung.get("model"), str) or not rung["model"].strip()):
+            raise ValueError("boomerang routing-unavailable: invalid persisted policy")
+    for item in [route, *chain]:
+        endpoint = item.get("base_url")
+        if endpoint is not None:
+            from urllib.parse import urlsplit
+            try:
+                parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
+                valid = parsed and parsed.scheme in ("http", "https") and parsed.hostname and not parsed.fragment
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("boomerang routing-unavailable: invalid persisted policy endpoint")
+
+
 
 def persist_route(agent):
     captured = getattr(agent, "_boomerang_parent_route", None)
     route = copy.deepcopy(captured) if isinstance(captured, dict) else {"source": "parent", "model": agent.model,
              "provider": getattr(agent, "requested_provider", None) or agent.provider,
              "api_mode": agent.api_mode,
+             "base_url": agent.base_url,
              "fallback_chain": copy.deepcopy(agent._fallback_chain),
              "request_overrides": copy.deepcopy(getattr(agent, "request_overrides", {}) or {})}
     original_chain = route["fallback_chain"] or []
@@ -24,6 +55,7 @@ def persist_route(agent):
     overrides.pop("extra_headers", None)
     if _carries_credential(route):
         raise ValueError("boomerang routing-unavailable: route policy contains credentials")
+    _validate_policy(route)
     return route
 
 
@@ -31,10 +63,11 @@ def recover_route_parent(parent, route):
     from agent.route_snapshot import snapshot_parent
     from gateway.run import _resolve_runtime_agent_kwargs_for_provider
 
-    if not isinstance(route, dict) or not route.get("provider") or not route.get("model"):
+    if (not isinstance(route, dict)
+            or not isinstance(route.get("provider"), str) or not route["provider"].strip()
+            or not isinstance(route.get("model"), str) or not route["model"].strip()):
         raise ValueError("boomerang routing-unavailable: incomplete persisted identity")
-    if _carries_credential(route) or "fallback_chain" not in route:
-        raise ValueError("boomerang routing-unavailable: invalid persisted policy")
+    _validate_policy(route)
     runtime = _resolve_runtime_agent_kwargs_for_provider(route["provider"], target_model=route["model"])
     if not runtime.get("api_key") or not runtime.get("base_url"):
         raise ValueError("boomerang routing-unavailable: credentials could not be resolved")
@@ -42,8 +75,8 @@ def recover_route_parent(parent, route):
     view.model = route["model"]
     view.provider = runtime["provider"]
     view.requested_provider = route["provider"]
-    view.base_url = runtime["base_url"]
-    view.api_mode = runtime.get("api_mode") or route.get("api_mode")
+    view.base_url = route.get("base_url") or runtime["base_url"]
+    view.api_mode = route.get("api_mode") or runtime.get("api_mode")
     view.api_key = runtime["api_key"]
     view._client_kwargs = {"api_key": view.api_key, "base_url": view.base_url}
     view._fallback_chain = copy.deepcopy(route.get("fallback_chain") or [])

@@ -40,18 +40,29 @@ using the normal gateway fallback policy. Unreadable persisted preferences or mi
 credentials fail closed. No historical transient fallback is guessed after restart.
 
 Existing durable delegation records carry per-task non-secret routing provenance,
-identity and fallback policy. Execution resolves credentials again within the owning
+identity, selected safe endpoint, protocol and fallback policy. An explicit selected
+endpoint wins over a provider's current default during recovery. Userinfo/credential
+query URLs are refused, never persisted. Malformed persisted chains (including null,
+strings and non-route rungs) fail before credential lookup; `[]` remains disabled.
+Execution resolves credentials again within the owning
 profile. Credential-bearing request headers or non-symbolic fallback secrets cannot
 be serialized: durable launch refuses that policy rather than silently widening or
 erasing it. Legacy records without a resolved fallback policy report routing-unavailable.
 `boomerang.route` logs requested/effective mode, owner/child sessions, route source,
 provider/model and fallback count; it excludes endpoints, headers and credentials.
 
-The synthetic-provider HTTP acceptance suite is
-`tests/integration/test_boomerang_parent_routing_http.py`. It drives the real boomerang
-parent resolver and child retry loop through two quota failures into a cross-vendor
-SSE sentinel, including detached JSON reconstruction and active-fallback inheritance.
-This proves routing integration, not real vendor availability or deployed activation.
+The synthetic-provider HTTP acceptance suites are
+`tests/integration/test_boomerang_parent_routing_http.py`,
+`tests/integration/test_boomerang_auto_routing.py` and
+`tests/integration/test_boomerang_detached_profiles.py`. They drive real
+notifier/owner-wake dispatch, scratch claim/board executor receipts, busy/cold
+session reconstruction, child retry/fallback and two separate profile subprocesses.
+The auto-wake primary/same-vendor lanes speak Anthropic Messages and the permitted
+cross-vendor lane speaks CPA-shaped OpenAI chat/SSE; each uses synthetic credentials.
+Plugin/MCP startup and model probes are suppressed; retry timing alone is shortened.
+External platform delivery is an in-memory adapter. Socket tripwires reject non-loopback
+connections. This proves routing integration, not real vendor availability or deployed activation.
+See [build receipts and remaining limits](build-review-status.md) before landing.
 
 ## 1. Which mode each entry point uses (spec §5.6)
 

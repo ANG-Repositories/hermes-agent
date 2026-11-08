@@ -65,6 +65,7 @@ def _config(on: bool) -> None:
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_STATE_DELETED_WAL_CHECK", "registry")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     for var in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_SESSION_ID",
                 "HERMES_PROFILE_NAME", "HERMES_PROFILE"):

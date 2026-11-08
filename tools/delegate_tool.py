@@ -2155,6 +2155,7 @@ def _build_child_agent(
     child._boomerang_parent_route = {
             "source": "parent", "model": rt["model"],
             "provider": rt.get("requested_provider") or rt["provider"], "api_mode": rt["api_mode"],
+            "base_url": rt.get("base_url"),
             "fallback_chain": copy.deepcopy(rt["fallback_model"]),
             "request_overrides": copy.deepcopy(request_overrides),
             "routing_filters": {key: copy.deepcopy(rt.get(key)) for key in (
@@ -2185,6 +2186,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
         _arm_first_request_pin(child, parent_agent, "fork")
+        child._fork_rebuild_args = {**_call_args, "inherit_mode": "summary", "inherit_context": True}
         child._context_inherited = "fork"
         child._boomerang_fork_log_pending = True   # one `boomerang.fork served_by=…` line
     else:
@@ -2784,6 +2786,20 @@ def _run_single_child(
                 _child_future, child, child_timeout, hung_seconds
             )
         except Exception as _timeout_exc:
+            from tools.delegate_tool_fork import ForkPinRefused, log_ineligible
+            if isinstance(_timeout_exc, ForkPinRefused):
+                log_ineligible("pin_refused", parent_agent, task_index=task_index,
+                               delegation_id=getattr(child, "_delegation_id", None))
+                rebuild = child._fork_rebuild_args
+                _teardown(child, "fork pin refused")
+                folded = _build_child_preserving_parent_tools(**rebuild)
+                for attr in ("_delegation_id", "_delegate_output_schema", "_delegate_origin_ui_session_id",
+                             "_delegate_saved_tool_names"):
+                    if attr in vars(child):
+                        setattr(folded, attr, copy.deepcopy(vars(child)[attr]))
+                return _run_single_child(task_index, goal, folded, parent_agent,
+                    owner_session_id=owner_session_id, owner_transport=owner_transport,
+                    owner_session_record=owner_session_record, **_kwargs)
             # Timed out ≠ dead. A child still working (it made API calls or
             # has live descendants) keeps running; report TIMED_OUT_RUNNING
             # with live handles so the caller waits/steers instead of
@@ -4319,7 +4335,7 @@ def delegate_task(
                 _task_inherits_route = False
             _route_parent = parent_agent
             if _recovery_spec and _task_inherits_route and "parent_route" not in t:
-                if "fallback_chain" not in recovery_execution:
+                if not isinstance(recovery_execution.get("fallback_chain"), list):
                     raise ValueError("boomerang routing-unavailable: legacy record has unresolved parent fallback policy")
             if _recovery_spec and t.get("parent_route") is not None:
                 from tools.delegate_tool_routing import recover_route_parent

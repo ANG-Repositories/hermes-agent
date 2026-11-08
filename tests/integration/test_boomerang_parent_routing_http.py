@@ -23,7 +23,7 @@ from tools import delegate_tool as dt
 
 
 @contextmanager
-def endpoints(sentinel):
+def endpoints(sentinel, *, reply=None):
     trace = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -36,18 +36,20 @@ def endpoints(sentinel):
                 self.send_error(404)
                 return
             lane = self.path.split("/")[1]
-            trace.append({"ordinal": len(trace) + 1, "lane": lane, "model": body["model"]})
+            trace.append({"ordinal": len(trace) + 1, "lane": lane, "model": body["model"],
+                          "path": self.path, "auth": self.headers.get("Authorization") or self.headers.get("x-api-key")})
+            response_text = reply(body) if reply else sentinel
             if lane != "cross-vendor":
                 self.send_response(429)
-                payload = {"error": {"message": "insufficient_quota: synthetic provider exhausted", "type": "insufficient_quota", "code": "insufficient_quota"}}
+                payload = {"type": "error", "error": {"message": "insufficient_quota: synthetic provider exhausted", "type": "insufficient_quota", "code": "insufficient_quota"}}
             else:
                 self.send_response(200)
                 payload = {"id": "synthetic-response", "object": "chat.completion", "created": 1,
-                           "model": body["model"], "choices": [{"index": 0, "message": {"role": "assistant", "content": sentinel}, "finish_reason": "stop"}],
+                           "model": body["model"], "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}],
                            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}
             if lane == "cross-vendor" and body.get("stream"):
                 chunk = {"id": "synthetic-response", "object": "chat.completion.chunk", "created": 1,
-                         "model": body["model"], "choices": [{"index": 0, "delta": {"role": "assistant", "content": sentinel}, "finish_reason": "stop"}]}
+                         "model": body["model"], "choices": [{"index": 0, "delta": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}]}
                 encoded = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
                 content_type = "text/event-stream"
             else:
@@ -67,6 +69,35 @@ def endpoints(sentinel):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_http_runtime(monkeypatch):
+    """Remove unrelated boot/probes and shorten the actual retry sleep, not failover."""
+    import hermes_cli.plugins as plugins
+    import agent.model_metadata as metadata
+    import agent.turn_recovery as recovery
+    import agent.relay_runtime as relay
+    import socket
+    connect = socket.socket.connect
+    def loopback_only(sock, address):
+        if isinstance(address, tuple) and address[0] not in ("127.0.0.1", "::1", "localhost"):
+            raise AssertionError("HTTP fixture attempted a non-loopback connection")
+        return connect(sock, address)
+    monkeypatch.setattr(socket.socket, "connect", loopback_only)
+    monkeypatch.setattr(plugins, "discover_plugins", lambda *a, **kw: None)
+    monkeypatch.setattr(metadata, "get_model_context_length", lambda *a, **kw: 256000)
+    monkeypatch.setattr(metadata, "_resolve_custom_endpoint_context_length", lambda *a, **kw: 256000)
+    # These are private, newly-created DBs: no foreign process can hold an older WAL.
+    # Keep the registry guard; do not enumerate every host /proc fd under home_io_guard.
+    monkeypatch.setenv("HERMES_STATE_DELETED_WAL_CHECK", "registry")
+    monkeypatch.setattr(relay._ProcessRelayPluginConfiguration, "_activate",
+                        lambda *a, **kw: relay._RelayPluginConfigurationState.DISABLED)
+    import agent.turn_api_error as api_error
+    sleep = recovery.interruptible_backoff_sleep
+    short_sleep = lambda agent, wait_time, *a, **kw: sleep(agent, min(wait_time, 0.001), *a, **kw)
+    monkeypatch.setattr(recovery, "interruptible_backoff_sleep", short_sleep)
+    monkeypatch.setattr(api_error, "interruptible_backoff_sleep", short_sleep)
 
 
 @pytest.mark.platforms("posix")
@@ -188,12 +219,12 @@ def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scena
                 assert sentinel not in final
                 assert [row["lane"] for row in trace] == ["primary"]
                 return
-            assert status == "completed", final
-            assert sentinel in final
+            assert status == "completed", "routing contract: completed: " + final
+            assert sentinel in final, "routing contract: sentinel missing"
             expected_lanes = ["second", "cross-vendor"] if scenario == "active-fallback" else ["primary", "second", "cross-vendor"]
             expected_models = ["second-model", "cross-model"] if scenario == "active-fallback" else ["parent-pin", "second-model", "cross-model"]
-            assert [row["lane"] for row in trace] == expected_lanes
-            assert [row["model"] for row in trace] == expected_models
+            assert [row["lane"] for row in trace] == expected_lanes, "routing contract: lanes"
+            assert [row["model"] for row in trace] == expected_models, "routing contract: models"
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous_handler)
@@ -214,5 +245,5 @@ def test_route_mutants_cannot_return_sentinel(monkeypatch, tmp_path, mutation):
         return child
 
     monkeypatch.setattr(dt, "_build_child_agent", mutated)
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="routing contract: (completed|sentinel|lanes|models)"):
         test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, "downgrade")
