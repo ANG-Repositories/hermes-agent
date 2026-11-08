@@ -2,8 +2,8 @@
 # SCHEDULE: manual (operator runs once per profile store after the placement_host column deploys)
 """Backfill ``turns.placement_host`` for one profile's Blackbox store (t_c9fc6c9f).
 
-A historical turn needs positive provenance: its session_id must match the
-``worker_session_id`` in the covering task_runs.metadata. Time overlap alone
+A historical turn needs positive provenance: the session prefix of its turn_id
+must match ``worker_session_id`` in the covering task_runs.metadata. Time overlap alone
 does not prove worker ownership. Exactly one run of this profile may overlap
 the turn, including runs whose host is unknown; that run must cover the whole
 turn and have a known host (``studio`` -> ``studio-local``). Missing provenance,
@@ -45,18 +45,21 @@ def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
         if "placement_host" not in cols:
             sys.exit(f"{turns_db}: no placement_host column yet (deploy the schema first)")
-        if "session_id" not in cols:
-            return []
         platform = "COALESCE(platform, '')" if "platform" in cols else "''"
         rows = conn.execute(
-            f"SELECT turn_id, ts_start, ts_end, {platform}, session_id FROM turns "
+            f"SELECT turn_id, ts_start, ts_end, {platform} FROM turns "
             "WHERE placement_host IS NULL"
         ).fetchall()
     plan = []
-    for turn_id, ts_start, ts_end, plat, session_id in rows:
-        if plat not in WORKER_PLATFORMS or not ts_start or not session_id:
+    for turn_id, ts_start, ts_end, plat in rows:
+        # agent.turn_facade: <session_id>:<effective_task_id>:<nonce>.
+        parts = turn_id.rsplit(":", 2)
+        if len(parts) != 3 or not all(parts):
             continue
-        end = ts_end or ts_start
+        session_id = parts[0]
+        if plat not in WORKER_PLATFORMS or not ts_start or not ts_end:
+            continue
+        end = ts_end
         if end < ts_start:
             continue
         overlapping = [(s, e, h, m) for s, e, h, m in runs if s <= end and ts_start <= e]

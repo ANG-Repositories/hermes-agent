@@ -495,11 +495,7 @@ def _placement_host() -> str | None:
             return None
         from hermes_cli import kanban_worker_hosts as kwh
 
-        return (
-            kwh.BOOT_PLACED_HOST
-            or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
-            or kwh.LOCAL_HOST_NAME
-        )
+        return kwh.BOOT_PLACED_HOST or kwh.LOCAL_HOST_NAME
     except Exception:
         logger.debug("blackbox placement_host resolve failed", exc_info=True)
         return None

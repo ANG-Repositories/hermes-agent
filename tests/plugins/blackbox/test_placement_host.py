@@ -52,7 +52,8 @@ def _host(path, turn_id):
     conn = sqlite3.connect(str(path))
     try:
         return conn.execute(
-            "SELECT placement_host FROM turns WHERE turn_id = ?", (turn_id,)
+            "SELECT placement_host FROM turns WHERE turn_id = ? OR turn_id LIKE ?",
+            (turn_id, "%:task:" + turn_id),
         ).fetchone()[0]
     finally:
         conn.close()
@@ -68,6 +69,7 @@ def _build(**kwargs):
 def _worker(monkeypatch, *, placement_host=None, owner_pid=None):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadbeef")
     monkeypatch.setenv("HERMES_KANBAN_OWNER_PID", str(owner_pid or os.getpid()))
+    monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", placement_host)
     if placement_host:
         monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps(
             {"host": placement_host, "env": {"TERMINAL_ENV": "ssh"}}))
@@ -168,10 +170,11 @@ def _seed_backfill(tmp_path):
     home = tmp_path / "home"
     turns = home / "blackbox" / "turns.db"
     turns.parent.mkdir(parents=True)
+    with patch("plugins.blackbox.store._db_path", return_value=turns):
+        store._connect().close()
     conn = sqlite3.connect(str(turns))
-    conn.execute("CREATE TABLE turns (turn_id TEXT PRIMARY KEY, platform TEXT, ts_start REAL,"
-                 " ts_end REAL, placement_host TEXT)")
-    conn.executemany("INSERT INTO turns VALUES (?, ?, ?, ?, ?)", [
+    conn.executemany("INSERT INTO turns (turn_id, platform, ts_start, ts_end, placement_host) "
+                     "VALUES (?, ?, ?, ?, ?)", [
         ("tw", "cli", 1000.0, 1010.0, None),      # inside run 7 window on ci-box
         ("tl", "cli", 2000.0, 2010.0, None),      # inside local run 8
         ("tn", "cli", 5000.0, 5010.0, None),      # no run covers it
@@ -195,9 +198,8 @@ def _seed_backfill(tmp_path):
     conn.commit()
     conn.close()
     with sqlite3.connect(turns) as conn:
-        conn.execute("ALTER TABLE turns ADD COLUMN session_id TEXT")
-        conn.execute("UPDATE turns SET session_id = CASE turn_id WHEN 'tw' THEN 'worker-7' "
-                     "WHEN 'tl' THEN 'worker-8' ELSE 'interactive' END")
+        conn.execute("UPDATE turns SET turn_id = 'worker-7:task:tw' WHERE turn_id = 'tw'")
+        conn.execute("UPDATE turns SET turn_id = 'worker-8:task:tl' WHERE turn_id = 'tl'")
     with sqlite3.connect(board) as conn:
         conn.execute("ALTER TABLE task_runs ADD COLUMN metadata TEXT")
         conn.executemany("UPDATE task_runs SET metadata = ? WHERE id = ?", [
@@ -210,7 +212,8 @@ def _seed_backfill(tmp_path):
 def test_backfill_time_overlap_is_not_worker_provenance(tmp_path):
     home, turns, board = _seed_backfill(tmp_path)
     with sqlite3.connect(turns) as conn:
-        conn.execute("UPDATE turns SET session_id = 'interactive' WHERE turn_id = 'tw'")
+        conn.execute("UPDATE turns SET turn_id = 'interactive:task:tw' "
+                     "WHERE turn_id = 'worker-7:task:tw'")
     out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
     assert out.returncode == 0, out.stderr
     assert _host(turns, "tw") is None
@@ -222,6 +225,22 @@ def test_backfill_counts_all_overlapping_runs(tmp_path, host):
     with sqlite3.connect(board) as conn:
         conn.execute("INSERT INTO task_runs VALUES (12, 't_unknown', 'daedalus', 995, 1090, ?, NULL)",
                      (host,))
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tw") is None
+
+
+def test_local_boot_ignores_later_placement_env(no_worker_env, monkeypatch):
+    _worker(monkeypatch)
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": "ci-box"}))
+    assert _build().placement_host == "studio-local"
+
+
+@pytest.mark.parametrize("end", [None, 0])
+def test_backfill_skips_unfinished_turn(tmp_path, end):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(turns) as conn:
+        conn.execute("UPDATE turns SET ts_end = ? WHERE turn_id = 'worker-7:task:tw'", (end,))
     out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
     assert out.returncode == 0, out.stderr
     assert _host(turns, "tw") is None
