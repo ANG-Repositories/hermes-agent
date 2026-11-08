@@ -949,6 +949,9 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if data is None:
         return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
 
+    if not (isinstance(data.get("verdict"), str) and data["verdict"].strip().lower() in {"done", "blocked", "continue", "wait"}):
+        if "verdict" in data or not isinstance(data.get("done"), bool):
+            return "continue", "judge reply did not match verdict schema", True, None
     reason = str(data.get("reason") or "").strip() or "no reason provided"
     verdict_raw = data.get("verdict")
     if isinstance(verdict_raw, str):
@@ -1095,6 +1098,10 @@ def judge_goal(
             "whether the substantive work is done.\n"
         )
     try:
+        from hermes_cli.goal_judge_chain import chain_config, judge_chain
+        policy = chain_config(timeout)
+        if policy is not None:
+            return judge_chain(policy, system_prompt, prompt, _goal_judge_max_tokens(), _parse_judge_response)
         raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
