@@ -47,8 +47,9 @@ def install(conn: sqlite3.Connection) -> None:
                 CAST(strftime('%s','now') AS INTEGER));
         END
     """)
+    conn.execute("DROP TRIGGER IF EXISTS tasks_review_handoff")
     conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS tasks_review_handoff
+        CREATE TRIGGER tasks_review_handoff
         AFTER UPDATE OF status ON tasks
         WHEN NEW.status = 'review' AND OLD.status != 'review'
           AND NOT EXISTS (
@@ -61,6 +62,8 @@ def install(conn: sqlite3.Connection) -> None:
             INSERT INTO task_events(task_id, kind, payload, created_at)
             VALUES(NEW.id, 'review_requested', json_object(
                 'implementer', COALESCE(
+                    (SELECT profile FROM task_runs WHERE id=OLD.current_run_id
+                     AND task_id=NEW.id AND length(profile)>0),
                     (SELECT profile FROM task_runs WHERE task_id=NEW.id
                      AND outcome IN ('completed','review_requested') AND profile IS NOT NULL
                      ORDER BY id DESC LIMIT 1),

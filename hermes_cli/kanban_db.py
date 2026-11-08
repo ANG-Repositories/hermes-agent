@@ -6880,8 +6880,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, boomerang_wake, signature
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        workspace_of, boomerang_wake, signature, next_eligible_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6914,6 +6914,7 @@ def create_task(
                         workspace_of,
                         None if boomerang_wake is None else (1 if boomerang_wake else 0),
                         signature,
+                        int(until) if until is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -9636,10 +9637,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked') "
-            "AND COALESCE(assignee, '') != 'human' "
-            "AND COALESCE(assignee, '') NOT LIKE 'human:%'"
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
+            "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -9666,6 +9665,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if all(p["status"] in ("done", "archived") and p["kind"] != LINK_KIND_AFTER_MERGE
                    for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
+                if (resume_status == "ready" and
+                        (row["assignee"] == "human" or (row["assignee"] or "").startswith("human:"))):
+                    continue
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
                     # recover -> respawn -> exhaust -> block forever). The

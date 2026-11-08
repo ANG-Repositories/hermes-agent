@@ -13,8 +13,12 @@ def conn(tmp_path: Path):
         yield db
 
 
-def test_review_entry_binds_implementer_before_any_exit(conn):
+@pytest.mark.parametrize("current_run", [False, True])
+def test_review_entry_binds_implementer_before_any_exit(conn, current_run):
     tid = kb.create_task(conn, title="Recovered review", assignee="builder")
+    if current_run:
+        conn.execute("INSERT INTO task_runs(task_id,profile,status,outcome,started_at) VALUES(?,'old-builder','completed','completed',1)", (tid,))
+        kb.claim_task(conn, tid)
     conn.execute("UPDATE tasks SET status='review',assignee='human:apollo' WHERE id=?", (tid,))
     event = conn.execute(
         "SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1",
@@ -47,6 +51,10 @@ def test_human_ready_is_operator_todo_and_cannot_promote(conn):
     assert kb.assign_task(conn, tid, "builder")
     kb.recompute_ready(conn)
     assert kb.get_task(conn, tid).status == "ready"
+    conn.execute("UPDATE tasks SET status='todo',assignee='human:apollo' WHERE id=?", (tid,))
+    kb._append_event(conn, tid, "dependency_wait", {"source_status": "review", "kind": "dependency"})
+    kb.recompute_ready(conn)
+    assert kb.get_task(conn, tid).status == "review"
 
 
 def test_untyped_block_requires_a_recovery_predicate(conn):
@@ -69,3 +77,9 @@ def test_legacy_repair_is_dry_run_first_and_idempotent(conn):
     assert (report["before"], report["after"]) == (1, 0)
     assert kb.get_task(conn, tid).status == "todo"
     assert repair(conn, apply=True)["before"] == 0
+    held = kb.create_task(conn, title="Legacy review hold", assignee="reviewer")
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (held,))
+    kb._append_event(conn, held, "blocked", {"source_status": "review"})
+    conn.commit()
+    repair(conn, apply=True)
+    assert kb._resume_status_from_events(conn, held) == "review"

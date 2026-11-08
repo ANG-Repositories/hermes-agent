@@ -197,7 +197,7 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             run_id = owner.current_run_id
             def reclaim():
                 with connect() as rival:
-                    assert kb.block_task(rival, tid, reason="Reassigned during acceptance")
+                    assert kb.block_task(rival, tid, reason="Reassigned during acceptance", kind="needs_input")
                     assert kb.unblock_task(rival, tid)
                     github["replacement"] = kb.claim_task(rival, tid).current_run_id
             github.update(conclusion=conclusion, race=reclaim)

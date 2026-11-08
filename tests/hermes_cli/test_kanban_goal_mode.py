@@ -675,8 +675,7 @@ def test_goal_loop_block_path_passes_the_ownership_guard(monkeypatch):
         c = _kb.connect()
         try:
             _kb.block_task(
-                c, task_id, reason=reason, expected_run_id=_cli._goal_loop_run_id(task_id)
-            )
+                c, task_id, reason=reason, expected_run_id=_cli._goal_loop_run_id(task_id), kind="needs_input")
         finally:
             c.close()
 

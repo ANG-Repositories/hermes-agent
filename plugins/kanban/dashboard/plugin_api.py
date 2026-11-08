@@ -760,7 +760,8 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "blocked": lambda conn, tid, p: kanban_db.block_task(
+        conn, tid, reason=getattr(p, "block_reason", None), kind="needs_input"),
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(
         conn, tid, reason=getattr(p, "block_reason", None), wake_at=p.wake_at),
     "review": lambda conn, tid, p: kanban_db.request_review(

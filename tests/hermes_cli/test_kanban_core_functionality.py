@@ -427,7 +427,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         assert task.last_heartbeat_at is None
 
         assert kbd.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
-        assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
+        assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id, kind="needs_input")
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()

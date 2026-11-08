@@ -61,9 +61,18 @@ def repair(conn: sqlite3.Connection, *, apply: bool = False) -> dict:
                     conn.execute("UPDATE tasks SET body=COALESCE(body,'') || ? WHERE id=?",
                                  ("\nunblock_when: event:" + change["event"], tid))
                 else:
+                    from hermes_cli import kanban_db as kb
+                    # Classification must not change the phase an unblock resumes.
+                    prior_factory = conn.row_factory
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        source_status = kb._resume_status_from_events(conn, tid)
+                    finally:
+                        conn.row_factory = prior_factory
                     conn.execute("UPDATE tasks SET status='blocked',block_kind='needs_input' WHERE id=?", (tid,))
                     conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
-                                 (tid, "blocked", json.dumps({"kind": "needs_input", "reason": change["reason"]}), now))
+                                 (tid, "blocked", json.dumps({"kind": "needs_input", "reason": change["reason"],
+                                                             "source_status": source_status}), now))
                 conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
                              (tid, "lifecycle_repaired", json.dumps(change), now))
             remaining = plan(conn)

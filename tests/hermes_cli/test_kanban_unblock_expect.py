@@ -27,7 +27,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 def _blocked(conn, reason="unblock_when: after:+1m"):
     t = kb.create_task(conn, title="parked", assignee="daedalus")
-    assert kb.block_task(conn, t, reason=reason)
+    assert kb.block_task(conn, t, reason=reason, kind="needs_input")
     return t
 
 
