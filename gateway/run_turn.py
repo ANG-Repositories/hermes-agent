@@ -224,6 +224,7 @@ class GatewayTurnMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
         persisted_route_lookup: Optional["PersistedSessionRouteLookup"] = None,
+        background: bool = False,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -244,7 +245,8 @@ class GatewayTurnMixin:
         # Every exit path starts clean: the /model-override fast path returns before the pop below,
         # and hygiene/inbound callers resolve without a turn runner consuming the stash — a stale
         # notice must never attach to another session's next turn (#74349).
-        self._pre_agent_fallback_notice = None
+        if not background:
+            self._pre_agent_fallback_notice = None
 
         persisted_identity = None
         route_lookup = None
@@ -338,15 +340,17 @@ class GatewayTurnMixin:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
         # runner surfaces it through the agent's one-shot fallback notice (#74349).
-        self._pre_agent_fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+        fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
             model = runtime_model
-        if unavailable_override and not self._pre_agent_fallback_notice:
+        if unavailable_override and not fallback_notice:
             from hermes_cli.fallback_config import pre_agent_fallback_notice
-            self._pre_agent_fallback_notice = pre_agent_fallback_notice(
+            fallback_notice = pre_agent_fallback_notice(
                 unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
+        if not background:
+            self._pre_agent_fallback_notice = fallback_notice
 
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
         if cfg and source is not None:
@@ -2235,6 +2239,9 @@ class GatewayTurnMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # The /goal hook reads this: an errored turn pauses the goal instead of judging the error reply.
+        with suppress(Exception):
+            event._goal_turn_failed = type(e).__name__
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -4344,10 +4351,15 @@ class GatewayTurnMixin:
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         if first_response:
+            # Text streaming off (no consumer, or an interim-only one): the final was never streamed,
+            # so "not confirmed" would misreport the normal send path as a delivery failure.
+            _final_streamed = _sc is not None and getattr(_sc, "stream_deltas_enabled", True)
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
                 if _already_streamed else
-                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing."
+                if _final_streamed else
+                "Queued follow-up for session %s: text streaming off; sending first response before continuing.",
                 session_key or "?",
             )
             try:

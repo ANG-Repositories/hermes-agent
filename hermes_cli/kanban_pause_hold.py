@@ -13,6 +13,23 @@ The manifest ``<kanban_home()>/state/fleet-pause/<host>/manifest.json`` is writt
 Path root is ``kanban_home()``, never a profile ``HERMES_HOME``. A missing manifest = no pause; an unreadable one
 holds every card of that host (fail closed). Kill switch ``kanban.placement.pause_hold: on|off`` (default on),
 read by both layers through :func:`enabled`.
+
+Stale-hold fail-safes (t_0c5a95ab, Ace 2026-11-06 20:31 "the CI box is not paused anymore ... some kind of fail safe"):
+
+* a hold-phase manifest past ``lease_until + LEASE_GRACE_S`` whose ``driver.pid`` is not alive is treated as
+  resumed: :func:`decide` holds nothing and #alerts gets ONE "stale pause manifest auto-cleared" page per manifest
+  id (latch ``<host>/stale-cleared.<id>.json``);
+* a resume pin is owed only while the unit still awaits its first run (``resume.new_run_id`` unset and
+  ``resume.action`` not a settled one); a pin that conflicts with the card's own route waits at most
+  ``PIN_CONFLICT_GRACE_S`` after ``resumed_at`` and then routes ordinarily, so a resumed host never holds;
+* :func:`clear_stale_labels` ends, on every live tick, the open ``placement_wait pause_hold`` of a card the current
+  manifest no longer holds (``{cleared: true}``), so no reader sees a stale label for a card the dispatcher skips
+  (no_worker / human lane cards are never routed, so their last label never moved);
+* :func:`holds` is the read model behind ``hermes kanban placement-holds``.
+
+Override: ``hermes kanban placement-holds --clear <id>`` ends one card's label (a task_event naming --operator);
+``KANBAN_PAUSE_HOLD_STALE=0`` in the dispatcher's env turns off the lease/driver auto-clear and the pin-conflict
+grace, so a stale manifest holds exactly as before.
 """
 
 from __future__ import annotations
@@ -33,6 +50,15 @@ HOLD_PHASES = frozenset({"draining", "paused", "paused-forced", "paused-partial"
 PIN_PHASES = frozenset({"resuming", "resumed"})
 STATUS_FILE = "hold-status.json"
 _UNREADABLE = object()
+#: a hold-phase manifest stays a hold this long past ``lease_until`` (= hermes-home host_window.GRACE_S).
+LEASE_GRACE_S = 900
+#: a resume pin that conflicts with the card's own route waits this long after ``resumed_at``, then lets go.
+PIN_CONFLICT_GRACE_S = 900
+#: ``unit.resume.action`` values under which no post-resume run is owed (fleet-pause stamps them).
+SETTLED_ACTIONS = frozenset({"no_run_owed", "already_moved", "none"})
+STALE_EVENT_REASON = "stale pause manifest auto-cleared"
+STALE_ENV = "KANBAN_PAUSE_HOLD_STALE"
+_warned_stale: set = set()
 
 
 class PauseHeld(Exception):
@@ -130,14 +156,91 @@ def _decide(origin_host, task_id, cache):
         return ("wait", f"{CODE} ({origin_host}:{UNREADABLE})")
     phase = doc.get("phase")
     if phase in HOLD_PHASES:
+        why = stale_reason(doc)
+        if why:
+            _note_stale(str(origin_host), doc, why)
+            return None
         return ("wait", f"{CODE} ({origin_host}:{doc.get('id') or '?'})")
     if phase in PIN_PHASES:
         for unit in doc.get("units") or ():
             if unit.get("lane") == "kanban" and unit.get("id") == task_id:
-                if (unit.get("resume") or {}).get("new_run_id") is None:
-                    return ("pin", str(origin_host))
-                return None
+                return ("pin", str(origin_host)) if owes_run(unit) else None
     return None
+
+
+def owes_run(unit: dict) -> bool:
+    """A resumed kanban unit still owed its first post-resume run (the resume pin applies)."""
+    resume = unit.get("resume") or {}
+    return resume.get("new_run_id") is None and resume.get("action") not in SETTLED_ACTIONS
+
+
+def stale_failsafe_on() -> bool:
+    """Kill switch ``KANBAN_PAUSE_HOLD_STALE=0`` (env, no deploy needed): turns off the lease/driver auto-clear and the
+    resume pin-conflict grace, so a stale manifest holds as it did before t_0c5a95ab. Default on."""
+    return os.environ.get(STALE_ENV, "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _driver_alive(doc: dict) -> bool:
+    """The manifest's ``driver.pid`` exists on THIS host. No pid / a non-int = dead. Cross-platform via psutil (a
+    core dependency); a probe that cannot run counts as alive, so the hold stands (fail closed)."""
+    pid = (doc.get("driver") or {}).get("pid") if isinstance(doc.get("driver"), dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        import psutil
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        return True
+
+
+def stale_reason(doc: dict, now: Optional[float] = None) -> Optional[str]:
+    """Why a HOLD-phase manifest no longer holds, or None while it does: its lease (+ LEASE_GRACE_S) ran out and no
+    driver process is alive. A manifest without a numeric ``lease_until`` never goes stale here (fail closed), and
+    nothing goes stale with ``KANBAN_PAUSE_HOLD_STALE=0``."""
+    if not stale_failsafe_on():
+        return None
+    t = time.time() if now is None else float(now)
+    lease = doc.get("lease_until")
+    if not isinstance(lease, (int, float)) or isinstance(lease, bool):
+        return None
+    if t < float(lease) + LEASE_GRACE_S or _driver_alive(doc):
+        return None
+    pid = (doc.get("driver") or {}).get("pid") if isinstance(doc.get("driver"), dict) else None
+    return (f"phase {doc.get('phase')} lease expired {int((t - float(lease)) // 60)} min ago and the driver "
+            f"(pid {pid}) is gone")
+
+
+def _pager():
+    """``(argv_prefix)`` sender for the stale page, or None in a hermetic home (no notify.py: never page)."""
+    from hermes_cli import kanban_budget as _kbudget
+    script = _kbudget._notify_script_path()
+    if script is None:
+        return None
+    import sys
+    return lambda body: _kbudget._run_notify([sys.executable, script, "--sev", "error", "--send", body]) is not False
+
+
+def _note_stale(host: str, doc: dict, why: str) -> None:
+    """ONE #alerts page per stale manifest id, latched on disk only after the send went out. Never raises."""
+    mid = str(doc.get("id") or "?")
+    try:
+        latch = root() / host / f"stale-cleared.{mid}.json"
+        if latch.exists():
+            return
+        if mid not in _warned_stale:
+            _warned_stale.add(mid)
+            _log.warning("kanban pause_hold: %s %s treated as resumed: %s", host, mid, why)
+        send = _pager()
+        if send is None:
+            return
+        body = (f"🧹 {STALE_EVENT_REASON}: fleet-pause {host} {mid} ({why}). The dispatcher no longer holds {host} "
+                f"cards on it. Resume or abandon it properly: `fleet-pause status {host}`, then "
+                f"`fleet-pause resume {host}` / `fleet-pause abandon {host} --reason ...`.")
+        if send(body):
+            latch.write_text(json.dumps({"id": mid, "host": host, "why": why, "at": int(time.time())}),
+                             encoding="utf-8")
+    except Exception:
+        _log.warning("kanban pause_hold: stale page for %s %s failed", host, mid, exc_info=True)
 
 
 def _row(r, key):
@@ -188,6 +291,19 @@ def _pin_conflict(r, current, host: str, conn=None, pool=None, caps=None) -> Opt
     return None
 
 
+def _pin_conflict_expired(host: str, cache: dict, now: Optional[float] = None) -> bool:
+    """A ``resumed`` manifest whose ``resumed_at`` is more than PIN_CONFLICT_GRACE_S ago. ``resuming`` never
+    expires here: the resume driver is still running and the pin is its fence."""
+    doc = cache.get(str(host))
+    if not stale_failsafe_on() or not isinstance(doc, dict) or doc.get("phase") != "resumed":
+        return False
+    at = doc.get("resumed_at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return False
+    t = time.time() if now is None else float(now)
+    return t - float(at) >= PIN_CONFLICT_GRACE_S
+
+
 def _write_status(mode: str, now: float) -> None:
     from hermes_cli import kanban_db_dispatch as _kbd
     try:
@@ -235,6 +351,11 @@ def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *
             continue
         current = row_route.get(r["id"]) if lane == "ready" else None
         conflict = _pin_conflict(r, current, verdict[1], conn, pool, caps)
+        if conflict is not None and _pin_conflict_expired(verdict[1], cache):
+            # The pin can never be honoured (the card's own route forbids the origin) and the card can never earn
+            # the first run that would retire the pin: past the grace it routes ordinarily (t_0c5a95ab).
+            kept.append(r)
+            continue
         if conflict is not None:
             why = f"{CODE} ({verdict[1]}:resume_pin_conflict:{conflict})"
             if lane == "review":
@@ -257,6 +378,121 @@ def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *
         # RC-P3-1: with no pool plan a pin route reaches spillover.take(None); wait like a body pin does (I-11).
         row_route[r["id"]] = verdict if planned else ("wait", "pool_unavailable")
     return kept if lane == "review" else rows
+
+
+def _open_pause_labels(conn) -> list:
+    """``[(task_id, origin_host, detail)]``: ready/review cards whose LATEST placement_wait is an open (not cleared,
+    no episode end after it) ``pause_hold``."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    end = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
+    rows = conn.execute(
+        "SELECT t.id, t.origin_host, e.payload FROM tasks t "
+        "JOIN task_events e ON e.id = (SELECT MAX(id) FROM task_events WHERE task_id = t.id AND kind = ?) "
+        "WHERE t.status IN ('ready', 'review') AND NOT EXISTS (SELECT 1 FROM task_events x "
+        "  WHERE x.task_id = t.id AND x.id > e.id AND x.kind IN (%s))" % ",".join("?" * len(end)),
+        (_pr.PLACEMENT_WAIT_EVENT, *end),
+    ).fetchall()
+    out = []
+    for tid, origin, raw in rows:
+        try:
+            p = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(p, dict) or p.get("cleared"):
+            continue
+        code = p.get("code") or str(p.get("reason") or "").split(" ", 1)[0]
+        if code == CODE:
+            out.append((tid, origin, p.get("detail")))
+    return out
+
+
+def clear_stale_labels(conn, result, dry_run: bool, cache: dict) -> list:
+    """End the open ``pause_hold`` placement_wait of every card the CURRENT manifest no longer holds and this tick
+    did not hold for another reason: one ``{cleared: true, reason}`` event each. Returns the cleared ids.
+
+    The hold itself is always re-derived from the manifest by :func:`decide`; this only retires the LABEL a card
+    keeps when the dispatcher never routes it again (no_worker, a human-lane assignee, a card whose origin_host was
+    dropped). 11-06: t_1bf66aac / t_6aa3a051 read ``pause_hold (ci-box:...)`` 37 h after ci-box resumed and its
+    manifest was archived. Best-effort, never raises; nothing on a dry run or with the switch off."""
+    if dry_run or not enabled():
+        return []
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_placement_reasons as _pr
+    try:
+        waits = getattr(result, "placement_waits", None) or {}
+        stale = []
+        for tid, origin, detail in _open_pause_labels(conn):
+            if tid in waits:
+                continue                           # this tick holds it: its own wait row is current
+            verdict = decide(origin, tid, cache)
+            if verdict is not None and verdict[0] == "wait":
+                continue
+            doc = cache.get(str(origin)) if origin else None
+            now_reads = ("card has no origin_host" if not origin else
+                         f"{origin} manifest phase {doc.get('phase')}" if isinstance(doc, dict) else
+                         f"{origin} has no manifest.json")
+            stale.append((tid, f"{CODE} ({detail}) no longer holds: {now_reads}"))
+        if not stale:
+            return []
+        with _kb.write_txn(conn):
+            for tid, why in stale:
+                _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, {"cleared": True, "reason": why})
+        return [t for t, _ in stale]
+    except Exception:
+        _log.warning("kanban pause_hold: could not clear stale pause_hold labels", exc_info=True)
+        return []
+
+
+def holds(conn=None, *, now: Optional[float] = None) -> dict:
+    """Read model for ``hermes kanban placement-holds``: every host manifest under :func:`root` with whether it
+    holds right now, and (with ``conn``) the cards carrying an open ``pause_hold`` label, each marked live/stale."""
+    t = time.time() if now is None else float(now)
+    hosts = {}
+    base = root()
+    for d in sorted(p for p in base.iterdir() if p.is_dir()) if base.is_dir() else []:
+        doc = _load(d.name, {})
+        if doc is None:
+            hosts[d.name] = {"manifest": None, "holds": False, "why": "no manifest.json (archived or never paused)"}
+            continue
+        if doc is _UNREADABLE:
+            hosts[d.name] = {"manifest": None, "holds": True, "why": "manifest unreadable: every card HELD"}
+            continue
+        phase = doc.get("phase")
+        stale = stale_reason(doc, t) if phase in HOLD_PHASES else None
+        owed = [u.get("id") for u in doc.get("units") or () if u.get("lane") == "kanban" and owes_run(u)] \
+            if phase in PIN_PHASES else []
+        hosts[d.name] = {
+            "manifest": doc.get("id"), "phase": phase, "lease_until": doc.get("lease_until"),
+            "resumed_at": doc.get("resumed_at"),
+            "driver_pid": (doc.get("driver") or {}).get("pid") if isinstance(doc.get("driver"), dict) else None,
+            "driver_alive": _driver_alive(doc),
+            "holds": phase in HOLD_PHASES and not stale,
+            "why": stale or (f"phase {phase}" if phase in HOLD_PHASES else f"phase {phase}: not a hold"),
+            "pins_owed": owed,
+            "pin_conflict_expired": _pin_conflict_expired(d.name, {d.name: doc}, t),
+        }
+    cards = []
+    if conn is not None:
+        cache: dict = {}
+        for tid, origin, detail in _open_pause_labels(conn):
+            verdict = decide(origin, tid, cache)
+            cards.append({"task_id": tid, "origin_host": origin, "label": detail,
+                          "live": verdict is not None and verdict[0] == "wait",
+                          "now": None if verdict is None else list(verdict)})
+    return {"now": int(t), "hosts": hosts, "cards": cards}
+
+
+def clear_card(conn, task_id: str, operator: str) -> bool:
+    """Operator verb: end ``task_id``'s open pause_hold label now (``{cleared: true}``). It does NOT lift a live
+    hold: the next tick re-derives it from the manifest and writes a fresh wait. True when a label was open."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_placement_reasons as _pr
+    if not any(tid == task_id for tid, _o, _d in _open_pause_labels(conn)):
+        return False
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, _pr.PLACEMENT_WAIT_EVENT,
+                          {"cleared": True, "reason": f"operator clear: {operator}"})
+    return True
 
 
 def refuse_if_held(conn, task_id: str) -> None:

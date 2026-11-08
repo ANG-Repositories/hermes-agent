@@ -452,17 +452,22 @@ def reapply_or_record(tool: str, environ: Optional[MutableMapping[str, str]] = N
         host = reapply_placement_env(environ)
     except Exception as exc:  # the counter is the point; never break the tool
         host, why = None, f"{type(exc).__name__}: {exc}"
-    if host is not None or not boot:
+    if host == boot or (host is not None and not boot):
         return host
+    # A re-apply that lands on ANOTHER host than the boot placement also ran
+    # this call off the boot host: same counter (Prism 2f2377ff612f).
+    where = "on the Studio" if host is None else f"on {host}, not boot host {boot}"
+    if host is not None:
+        why = "placement env names another host"
     _reapply["failed"] += 1
     if not _reapply["warned"]:
         _reapply["warned"] = True
         _log.warning(
-            "kanban worker placement re-apply failed on %s: %s; this call ran on the Studio",
-            tool, why,
+            "kanban worker placement re-apply failed on %s: %s; this call ran %s",
+            tool, why, where,
         )
     _record_reapply_failure(_reapply["failed"])
-    return None
+    return host
 
 
 def reapply_failures() -> int:

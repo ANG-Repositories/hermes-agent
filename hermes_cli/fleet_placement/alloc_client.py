@@ -1,8 +1,4 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
-# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 2fe117cbcb (hermes-home#4462 merge, t_dc9a0f9a + t_314b3ea5;
-# sha256 fbbd8a806628a79acc2d0ff981d75c29b48d3eb5c9f2333a51efa88519971cb3) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. The ONLY
-# local change is the placement import (hermes_cli.fleet_placement.placement, not sys.path + import placement); tests/hermes_cli/test_kanban_allocd_route.py checks
-# the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
 
     import alloc_client as ac
@@ -70,8 +66,49 @@ import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
-from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy (hermes-home: sys.path + import placement)
+if not __package__:                      # hermes-home scripts/lib: siblings are top-level modules
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+
+def _sibling(name: str):
+    """A sibling library module: ``<package>.<name>`` when this file is vendored inside a package (hermes-agent
+    hermes_cli/fleet_placement/), else the top-level module on scripts/lib (hermes-home). Lazy, so a remote
+    door-only client never imports the capacity scorer."""
+    if name == "placement":
+        if __package__:
+            from . import placement as module
+        else:
+            import placement as module
+    elif name == "admission_demand":
+        if __package__:
+            from . import admission_demand as module
+        else:
+            import admission_demand as module
+    else:
+        raise ValueError(f"unknown alloc_client sibling: {name}")
+    return module
+
+
+class _Placement:
+    """Capacity/fallback dependencies are optional for remote door-only clients."""
+    def __getattr__(self, name):
+        return getattr(_sibling("placement"), name)
+
+
+placement = _Placement()
+
+
+def _fleet_root() -> Path:
+    """Fleet root: preserve legacy placement resolution when available; standalone uses explicit root."""
+    env = os.environ.get("PLACEMENT_HOME")
+    if env:
+        return Path(env)
+    try:
+        return placement.fleet_root()
+    except ModuleNotFoundError:
+        return Path(__file__).resolve().parents[2]
+
+DEMAND_BINDINGS_REL = Path("var") / "alloc" / "demand-bindings"
 DEFAULT_URL = "http://127.0.0.1:18850"
 TIMEOUT_S = 2.0                      # spec §6: a client-side 2 s timeout fires only when allocd is wedged
 FALLBACK_BUDGET_S = 2.8              # the whole call (allocd attempt + fallback flock wait) answers within this
@@ -102,7 +139,7 @@ def url() -> str:
 
 
 def pressure_path(path=None) -> Path:
-    return Path(path) if path is not None else placement.fleet_root() / PRESSURE_REL
+    return Path(path) if path is not None else _fleet_root() / PRESSURE_REL
 
 
 def read_samples(path=None, *, now: float):
@@ -122,7 +159,7 @@ def read_samples(path=None, *, now: float):
 
 def log_event(kind: str, **fields) -> None:
     """Best-effort events.jsonl line (kanban-placement-watch counts kinds there). Never raises."""
-    p = placement.fleet_root() / EVENTS_REL
+    p = _fleet_root() / EVENTS_REL
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as fh:
@@ -140,11 +177,35 @@ class TokenUnreadable(Refused):
     """A token file exists but is empty or unreadable: fail closed, never "no auth"."""
 
 
+#: authorize_start refusal enum (ruling p2-unknown-receipt-spent-recovery, 2026-11-05 10:15). Consumer action:
+#:   spent_expired  RAISED: authorized earlier, lease gone. Run the kind's own existence check, release if absent,
+#:                  then enqueue a NEW unit id. Never retry this id.
+#:   auth, invalid  RAISED: config/identity/schema fault. Stop and page; never retried blind.
+#:   queued_behind  returned (authorized False): an earlier unit holds the window. Wait, retry the SAME id.
+#:   capacity       returned (authorized False): admission says no room. Wait, retry the SAME id.
+#:   not_enqueued   returned (authorized False): id not in the door queue (withdrawn / heartbeat-expired /
+#:                  never enqueued). enqueue() the SAME id again, then retry.
+#: spent_live is never a refusal: it is the reused:true receipt of the live lease.
+AUTHORIZE_REASONS = ("spent_expired", "auth", "invalid", "queued_behind", "capacity", "not_enqueued")
+_RAISED_REASONS = ("spent_expired", "auth", "invalid")
+#: token name of the operator capability that may mark a unit ASAP (mark_asap); the pair token alone never can
+ASAP_OPERATOR = "asap-operator"
+
+
+class AuthorizeRefused(Refused):
+    """A terminal, TYPED authorize_start refusal; ``reason`` is one of spent_expired | auth | invalid."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
 def _protected(consumer: str) -> bool:
     """True once ``consumer`` has had a token (minted, or read by any client/allocd): var/alloc/protected/<consumer>.
     A stat error other than "missing" counts as protected (fail closed)."""
     try:
-        os.stat(placement.fleet_root() / PROTECTED_REL / consumer)
+        os.stat(_fleet_root() / PROTECTED_REL / consumer)
         return True
     except FileNotFoundError:
         return False
@@ -153,12 +214,29 @@ def _protected(consumer: str) -> bool:
 
 
 _DURABLE_MARKERS: set = set()         # marker paths THIS process fsync'd (file + dir); a visible marker is not proof
+_UNPROVEN_TOP: dict = {}              # protected dir -> top of a chain whose sync failed after mkdir (retry walks up to it)
 
 
 def mark_protected(consumer: str) -> None:
     """Record that ``consumer`` uses a token, so a later MISSING token file is refused, never "no auth"."""
-    d = placement.fleet_root() / PROTECTED_REL
-    d.mkdir(parents=True, exist_ok=True)
+    root = _fleet_root()
+    d = root / PROTECTED_REL
+    # a NEWLY created directory is durable only once its entry in the parent is (t_430834ff): fsync every ancestor
+    # up to the fleet root (mkdir may have made any of them, here or in a process that crashed before syncing) AND
+    # up to the deepest pre-existing ancestor when mkdir created the fleet root itself (PLACEMENT_HOME nested under a
+    # fresh path), before the marker is cached durable. One helper with admission_demand (t_3d0928f7).
+    # When mkdir creates the fleet root itself, the pre-mkdir anchor above it is kept until the chain sync succeeds,
+    # so a retry after a failed ancestor fsync walks up to that anchor again rather than stopping at the now-existing
+    # root (Prism d50cba826e5e; same rule as admission_demand._writer).
+    key = str(d)
+    top = _UNPROVEN_TOP.get(key)
+    if top is None:
+        anchor = d
+        while not anchor.exists() and anchor.parent != anchor:
+            anchor = anchor.parent
+        top = _UNPROVEN_TOP[key] = anchor if anchor in root.parents else root
+    _sibling("admission_demand").make_dirs_durable(d, through=top)
+    _UNPROVEN_TOP.pop(key, None)
     # durable before any token use succeeds (Prism f5e6f9863e5c): a crash that loses the marker while a later token
     # removal survives would read as "no auth"; fsync the file AND its directory entry (OSError -> caller fails closed)
     fd = os.open(str(d / consumer), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -181,7 +259,7 @@ def _token(consumer: str) -> Optional[str]:
     (review r3, Prism 092aba2d5cc6). An empty or non-plain consumer name is refused outright."""
     if not isinstance(consumer, str) or not consumer or consumer in (".", "..") or "/" in consumer or "\x00" in consumer:
         raise Refused(f"consumer name required (got {consumer!r})")
-    p = placement.fleet_root() / TOKENS_REL / consumer
+    p = _fleet_root() / TOKENS_REL / consumer
     try:
         tok = p.read_text(encoding="utf-8-sig").strip()
     except FileNotFoundError:
@@ -194,7 +272,7 @@ def _token(consumer: str) -> Optional[str]:
         raise TokenUnreadable(f"{p}: empty")
     # an EXISTING marker is not enough (Prism 768d6f7d34aa): one left visible by a failed fsync is not durable, so
     # re-commit until THIS process has seen both fsyncs succeed for it
-    if str(placement.fleet_root() / PROTECTED_REL / consumer) not in _DURABLE_MARKERS:
+    if str(_fleet_root() / PROTECTED_REL / consumer) not in _DURABLE_MARKERS:
         try:
             mark_protected(consumer)       # first use protects it: a token removed later never reads as "no auth"
         except OSError as exc:
@@ -208,9 +286,235 @@ class Unreachable(Exception):
     """allocd did not give an answer this client can act on (a liveness fault, not a refusal)."""
 
 
+_PUBLISHED_UNITS = {}
+
+
+def _unit_request(workload, host, unit_id, op, *, need_cpu=None, need_mem_gb=None,
+                  timeout=TIMEOUT_S):
+    admission_demand = _sibling("admission_demand")
+    body = {"schema": 1, "workload": workload, "host": host, "id": unit_id, "op": op}
+    if op == "enqueue":
+        body.update(need_cpu=need_cpu, need_mem_gb=need_mem_gb)
+    admission_demand.validate_door(body, admission_demand.load_priority())
+    identity = f"{workload}@{host}"
+    token = _token(identity)
+    if not token or not _protected(identity):
+        raise Refused("provisioned demand publisher token required")
+    code, result = _door_call(body, timeout=timeout, token=token)
+    if (code != 200 or result.get("schema") != 1 or result.get("host") != host
+            or result.get("workload") != workload or result.get("ok") is not True):
+        raise Unreachable("invalid unit receipt")
+    return result
+
+
+def _door_call(body, *, timeout, token, headers=None, base_url=None):
+    """POST /demand/publish. A 403 is TYPED: AuthorizeRefused("auth") (bad pair token, missing operator capability,
+    or a live unit another pair owns: t_810c9012 round 4), never a bare Refused a caller must string-match."""
+    try:
+        code, result = _call("/demand/publish", body, timeout=timeout, token=token, headers=headers, base_url=base_url)
+        if code != 200:
+            raise AuthorizeRefused(result.get("reason", "invalid"), result.get("error", "door refused"))
+        return code, result
+    except Refused as exc:
+        if isinstance(exc, AuthorizeRefused):
+            raise
+        if "HTTP 403" in str(exc):
+            raise AuthorizeRefused("auth", str(exc)) from None
+        if "HTTP 400" in str(exc):
+            raise AuthorizeRefused("invalid", str(exc)) from None
+        raise
+
+
+def publish_queue(workload, host, queued, unit, *, unified, timeout=TIMEOUT_S):
+    """Publish the class's aggregate queue (``queued`` units of ``unit`` = {cpus, ram_gb, gpu_mib}) for ``host``
+    through the pair door; ``unified`` = the publisher's <WORKLOAD>_UNIFIED_ADMIT switch. The server stamps ``at``.
+    Replaces the deleted local admission_demand.publish (t_810c9012 round 4: one code path, one owner model)."""
+    admission_demand = _sibling("admission_demand")
+    body = {"schema": 1, "workload": workload, "host": host, "op": "queue", "queued": int(queued),
+            "unified": bool(unified), "unit": {k: float(unit[k]) for k in ("cpus", "ram_gb", "gpu_mib")}}
+    admission_demand.validate_door(body, admission_demand.load_priority())
+    identity = f"{workload}@{host}"
+    token = _token(identity)
+    if not token or not _protected(identity):
+        raise Refused("provisioned demand publisher token required")
+    code, result = _door_call(body, timeout=timeout, token=token)
+    if (code != 200 or result.get("schema") != 1 or result.get("host") != host
+            or result.get("workload") != workload or result.get("ok") is not True):
+        raise Unreachable("invalid queue receipt")
+    return result
+
+
+def enqueue(workload, host, unit_id, need_cpu, need_mem_gb, *, timeout=TIMEOUT_S):
+    """Assert one globally unique per-attempt ID; repeat preserves server arrival."""
+    return _unit_request(workload, host, unit_id, "enqueue", need_cpu=need_cpu,
+                         need_mem_gb=need_mem_gb, timeout=timeout)
+
+
+def withdraw(workload, host, unit_id, *, timeout=TIMEOUT_S):
+    """Idempotently withdraw only this caller's stable unit ID."""
+    return _unit_request(workload, host, unit_id, "withdraw", timeout=timeout)
+
+
+def mark_asap(workload, host, unit_id, *, timeout=TIMEOUT_S):
+    """Mark ONE already-enqueued unit urgent; its arrival is kept. Operator only: sends the pair token AND the
+    ``asap-operator`` capability; without it allocd answers 403 -> Refused. 409 (``not_enqueued`` / ``asap_cap``)
+    -> Refused. Urgency is never inherited and never carried by enqueue (ruling p4-trusted-asap-unit-merge)."""
+    admission_demand = _sibling("admission_demand")
+    body = {"schema": 1, "workload": workload, "host": host, "id": unit_id, "op": "mark_asap"}
+    admission_demand.validate_door(body, admission_demand.load_priority())
+    identity = f"{workload}@{host}"
+    token = _token(identity)
+    if not token or not _protected(identity):
+        raise Refused("provisioned demand publisher token required")
+    op_token = _token(ASAP_OPERATOR)
+    if not op_token:
+        raise Refused("asap operator capability required")
+    code, result = _door_call(body, timeout=timeout, token=token,
+                              headers={"X-Operator-Authorization": f"Bearer {op_token}"})
+    if code == 409:
+        raise Refused(f"mark_asap refused: {result.get('reason', 'conflict')}")
+    if code != 200 or result.get("ok") is not True or result.get("host") != host:
+        raise Unreachable("invalid mark_asap receipt")
+    return result
+
+
+def lookup_unit(workload, host, unit_id, *, timeout=TIMEOUT_S) -> dict:
+    """Where is this unit now? Call it after a lost authorize_start reply, BEFORE any retry.
+    Returns {state, ...}: ``waiting`` (+position, arrival, asap) | ``authorized`` (+reservation_id, until: the live
+    lease, adopt it, never start twice) | ``spent_expired`` (reconcile as in AUTHORIZE_REASONS) | ``unknown``.
+    Read-only on the server. Refused on auth/schema, Unreachable on transport."""
+    identity = f"{workload}@{host}"
+    token = _token(identity)
+    if not token or not _protected(identity):
+        raise Refused("provisioned demand publisher token required")
+    code, result = _call("/demand/lookup", {"schema": 1, "workload": workload, "host": host, "id": unit_id},
+                         timeout=timeout, token=token)
+    if (code != 200 or result.get("schema") != 1 or result.get("id") != unit_id
+            or result.get("state") not in ("waiting", "authorized", "spent_expired", "unknown")):
+        raise Unreachable("invalid unit lookup receipt")
+    return result
+
+
+def publish_demand(workload: str, host: str, waiting: list, verdict: Mapping, *,
+                   base_url: Optional[str] = None, timeout_s: float = TIMEOUT_S) -> dict:
+    """Merge this process's pending IDs and LWW verdict; never replace a sibling queue.
+
+    waiting contains stable id, need_cpu, need_mem_gb, asap:false; verdict contains
+    admittable:bool, binding:str, deficit_cpu:float. Server stamps every clock.
+    Refused covers authentication/validation; Unreachable covers transport/bad replies.
+    """
+    admission_demand = _sibling("admission_demand")
+    req = {"schema": 1, "workload": workload, "host": host, "waiting": waiting, "verdict": dict(verdict)}
+    admission_demand.validate_door(req, admission_demand.load_priority())
+    identity = f"{workload}@{host}"
+    token = _token(identity)
+    if not token or not _protected(identity):
+        raise Refused("provisioned demand publisher token required")
+    data = json.dumps(req, allow_nan=False).encode()
+    if len(data) > 65536:
+        raise Refused("demand publication exceeds 64 KiB")
+    request = urllib.request.Request((base_url or url()).rstrip("/") + "/demand/publish", data=data,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with _OPENER.open(request, timeout=timeout_s) as response:
+            result = json.loads(response.read(65537))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            raise AuthorizeRefused("auth", "demand publication refused HTTP 403") from None
+        if 400 <= exc.code < 500:
+            raise Refused(f"demand publication refused HTTP {exc.code}") from None
+        raise Unreachable(f"demand publication HTTP {exc.code}") from None
+    except (OSError, ValueError) as exc:
+        raise Unreachable("demand publication unavailable") from exc
+    if not (isinstance(result, dict) and result.get("schema") == 1 and result.get("host") == host
+            and result.get("workload") == workload and isinstance(result.get("door"), dict)
+            and admission_demand._num(result["door"].get("at"))):
+        raise Unreachable("invalid demand receipt")
+    key = (workload, host, base_url or url())
+    current = {u["id"] for u in waiting}
+    for unit_id in _PUBLISHED_UNITS.get(key, set()) - current:
+        # Only this process's acknowledged IDs, never a whole-pair replacement.
+        # The same endpoint is used even when the caller provided an explicit URL.
+        body = {"schema": 1, "workload": workload, "host": host, "id": unit_id, "op": "withdraw"}
+        code, reply = _door_call(body, timeout=timeout_s, token=token, base_url=base_url)
+        if code != 200 or reply.get("ok") is not True:
+            raise Unreachable("withdraw unavailable")
+    _PUBLISHED_UNITS[key] = current
+    return result
+
+
+def authorize_start(workload: str, host: str, unit_id: str, *, ttl_s: float = 90,
+                    timeout: float = TIMEOUT_S, existing_reservation_id: Optional[str] = None,
+                    existing_consumer: Optional[str] = None, local_venue_override: bool = False) -> dict:
+    """Consume ONE unit at the actual start boundary. No fallback; retry is idempotent.
+
+    Return authorized, reservation_id, until, reused. A wait answer is {authorized: False, reason, detail} with
+    reason queued_behind | capacity | not_enqueued; spent_expired / auth / invalid RAISE AuthorizeRefused (a Refused)
+    with ``.reason`` set. See AUTHORIZE_REASONS for each consumer action. After a lost reply, lookup_unit() first.
+    A reused true receipt never permits a second spawn: caller reconciles the original attempt.
+    renew/release use consumer=f'{workload}@{host}', with existing lease lifecycle.
+    """
+    identity = f"{workload}@{host}"
+    try:
+        tok = _token(identity)
+    except Refused as exc:
+        raise AuthorizeRefused("auth", str(exc)) from None
+    if not tok or not _protected(identity):
+        raise AuthorizeRefused("auth", "provisioned demand publisher token required")
+    body = {"schema": 1, "workload": workload, "host": host, "id": unit_id, "ttl_s": ttl_s,
+            "local_venue_override": local_venue_override}
+    headers = {}
+    # Every refusal below is typed (round 2, finding 6): a bad argument is ``invalid``, a missing/empty/unreadable
+    # capability credential is ``auth``; never a bare Refused a caller would have to string-match.
+    if local_venue_override:
+        try:
+            local_token = _token("test-gate-local-venue")
+        except Refused as exc:
+            raise AuthorizeRefused("auth", str(exc)) from None
+        if not local_token:
+            raise AuthorizeRefused("auth", "trusted local venue capability required")
+        headers["X-Local-Venue-Authorization"] = f"Bearer {local_token}"
+    if existing_reservation_id is not None or existing_consumer is not None:
+        if (not isinstance(existing_reservation_id, str) or not existing_reservation_id
+                or not isinstance(existing_consumer, str) or not existing_consumer):
+            raise AuthorizeRefused("invalid", "existing reservation and owner required together")
+        try:
+            owner_token = _token(existing_consumer)
+        except TokenUnreadable as exc:
+            raise AuthorizeRefused("auth", str(exc)) from None
+        except Refused as exc:             # a malformed owner name
+            raise AuthorizeRefused("invalid", str(exc)) from None
+        if not owner_token:
+            raise AuthorizeRefused("auth", "protected existing reservation owner required")
+        body.update(existing_reservation_id=existing_reservation_id, existing_consumer=existing_consumer)
+        headers["X-Reservation-Authorization"] = f"Bearer {owner_token}"
+    try:
+        code, result = _call("/demand/authorize", body, timeout=timeout, token=tok, headers=headers)
+    except Refused as exc:                 # 400 / 403: schema or identity, never a wait
+        raise AuthorizeRefused("invalid" if "HTTP 400" in str(exc) else "auth", str(exc)) from None
+    if code in (409, 410):
+        reason = result.get("reason")
+        if code == 410:                    # a pre-enum allocd: a spent id
+            reason = "spent_expired"
+        if reason not in AUTHORIZE_REASONS:
+            raise Unreachable(f"untyped authorize refusal {reason!r}")
+        if reason in _RAISED_REASONS:
+            raise AuthorizeRefused(reason, str(result.get("detail") or ""))
+        return {"authorized": False, "reason": reason, "detail": str(result.get("detail") or "")}
+    if (code != 200 or result.get("schema") != 1 or result.get("host") != host
+            or result.get("workload") != workload or result.get("id") != unit_id
+            or not isinstance(result.get("reservation_id"), str) or not result["reservation_id"]
+            or type(result.get("reused")) is not bool):
+        raise Unreachable("invalid authorization receipt")
+    _OWNER[result["reservation_id"]] = identity
+    # The door now owns this lease's recovery lifecycle, including an idempotently reused upgrade.
+    _FALLBACK_ISSUED.pop(result["reservation_id"], None)
+    return {**result, "authorized": True}
+
+
 def _router_host() -> str:
     try:
-        doc = json.loads((placement.fleet_root() / placement.TABLE_REL).read_text(encoding="utf-8-sig"))
+        doc = json.loads((_fleet_root() / placement.TABLE_REL).read_text(encoding="utf-8-sig"))
         r = doc.get("router") if isinstance(doc, dict) else None
         h = r.get("host") if isinstance(r, dict) else None
         return h if isinstance(h, str) and h else DEFAULT_ROUTER_HOST
@@ -254,7 +558,7 @@ def _owner(rid: str, consumer: str) -> str:
     ``consumer`` (allocd then checks the row's owner token). A known owner that is not ``consumer`` is Refused."""
     _token(consumer)                       # validates the name (empty -> Refused) and the caller's own token file
     owner = _OWNER.get(rid)
-    if owner is None and ledger_is_local():   # only the router host's ledger is allocd's (split-ledger rule)
+    if owner is None and "@" not in consumer and ledger_is_local():   # only the router host's ledger is allocd's (split-ledger rule)
         try:
             for row in placement._read_ledger(placement.reservations_path())["rows"]:
                 if row.get("id") == rid:
@@ -270,9 +574,11 @@ def _owner(rid: str, consumer: str) -> str:
 _UNSET = object()
 
 
-def _call(path: str, body: dict, *, timeout: float, token=_UNSET) -> tuple:
+def _call(path: str, body: dict, *, timeout: float, token=_UNSET, headers=None, base_url=None) -> tuple:
     data = json.dumps(body, sort_keys=True).encode()
-    req = urllib.request.Request(url() + path, data=data, method="POST", headers={"Content-Type": "application/json"})
+    req = urllib.request.Request((base_url or url()).rstrip("/") + path, data=data, method="POST", headers={"Content-Type": "application/json"})
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
     tok = _token(str(body.get("consumer") or "")) if token is _UNSET else token
     if tok:
         req.add_header("Authorization", f"Bearer {tok}")
@@ -296,6 +602,16 @@ def _call(path: str, body: dict, *, timeout: float, token=_UNSET) -> tuple:
         raise Unreachable(f"HTTP {exc.code}") from exc         # 5xx, 503 router-off, 408/429
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise Unreachable(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _receipt(code: int, out, field: str) -> bool:
+    """A lifecycle reply: 200 must carry a boolean ``field`` (else Unreachable, so strict/fallback handling runs,
+    never "gone" and never AttributeError: t_430834ff); any other code allocd answered (410 gone, 409) is False."""
+    if code == 200:
+        if not isinstance(out, dict) or type(out.get(field)) is not bool:
+            raise Unreachable(f"invalid {field} receipt")
+        return out[field]
+    return False
 
 
 def _fallback_admit(consumer: str, *, job_id: str, ttl_s: float, klass: Optional[str], footprint, job_kw: Mapping,
@@ -349,7 +665,7 @@ def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0,
         if stale_after_s is not None:
             body["stale_after_s"] = float(stale_after_s)
     try:
-        if (placement.fleet_root() / ROUTER_OFF_REL).exists():
+        if (_fleet_root() / ROUTER_OFF_REL).exists():
             raise Unreachable("router-off file present")
         code, out = _call("/admit", body, timeout=timeout, token=tok)
         if code == 200 and isinstance(out, dict) and out.get("host") and out.get("reservation_id"):
@@ -380,7 +696,7 @@ def shadow_admit(consumer: str, *, job_id: Optional[str] = None, klass: Optional
             "footprint": footprint, "job": dict(job or {}), "previous": previous, "shadow": True}
     if candidates is not None:
         body["candidates"] = list(candidates)
-    if (placement.fleet_root() / ROUTER_OFF_REL).exists():
+    if (_fleet_root() / ROUTER_OFF_REL).exists():
         raise Unreachable("router-off file present")
     code, out = _call("/admit", body, timeout=timeout, token=tok)
     if code == 200 and isinstance(out, dict) and out.get("shadow") is True:
@@ -399,7 +715,7 @@ def _local_ledger_op(op: str, rid: str, consumer: str, why: str, t0: float, fn) 
     """Run ``fn`` on the local ledger when it IS allocd's (bounded flock); None = not run (remote / wedged lock).
     ``fn`` passes ``owner=`` so placement verifies the row's owner UNDER the ledger lock: a mismatch is Refused,
     never a mutation (Prism dc3cb6019576: _owner() falls back to the caller when its ledger read failed)."""
-    if not ledger_is_local():
+    if "@" in consumer or not ledger_is_local():
         log_event("allocd_unreachable_remote", consumer=consumer, reservation=rid, op=op, error=why, url=url())
         return None
     log_event("allocd_unreachable", consumer=consumer, reservation=rid, op=op, error=why)
@@ -412,23 +728,41 @@ def _local_ledger_op(op: str, rid: str, consumer: str, why: str, t0: float, fn) 
         return None
 
 
-def release(reservation_id: str, *, consumer: str, timeout: float = TIMEOUT_S) -> bool:
+def release(reservation_id: str, *, consumer: str, timeout: float = TIMEOUT_S, actual: Optional[Mapping] = None,
+            actual_source: Optional[str] = None) -> bool:
     """End a reservation; allocd first, the same ledger in-process when allocd is unreachable AND this is allocd's
     host. Idempotent. ``consumer`` is required and must be the reservation's owner. Raises ``Refused`` on a terminal
-    answer (never released behind allocd's back)."""
+    answer (never released behind allocd's back). ``actual`` + ``actual_source`` (FWA spec I-9): the job's measured
+    use and who measured it, sent on both routes; a source the allow-list refuses still ends the lease, unrecorded."""
     t0 = time.monotonic()
     rid = _current(reservation_id)
     owner = _owner(rid, consumer)
     tok = _token(owner)
+    body: dict = {"reservation_id": rid, "consumer": owner}
+    if actual is not None:
+        body.update(actual=dict(actual), actual_source=actual_source)
+
+    refused = None
+
+    def _local(lt):
+        nonlocal refused
+        try:
+            return placement.release(rid, lock_timeout_s=lt, owner=owner, actual=actual, actual_source=actual_source)
+        except placement.ActualRefused as exc:
+            refused = str(exc)
+            return placement.release(rid, lock_timeout_s=lt, owner=owner)
     try:
-        code, out = _call("/release", {"reservation_id": rid, "consumer": owner}, timeout=timeout, token=tok)
-        ok = code == 200 and bool(out.get("released"))
+        code, out = _call("/release", body, timeout=timeout, token=tok)
+        ok = _receipt(code, out, "released")
+        refused = out.get("actual_refused") if isinstance(out, dict) else None
     except Unreachable as exc:
-        ok = bool(_local_ledger_op("release", rid, consumer, str(exc), t0,
-                                   lambda lt: placement.release(rid, lock_timeout_s=lt, owner=owner)))
+        ok = bool(_local_ledger_op("release", rid, consumer, str(exc), t0, _local))
     _FALLBACK_ISSUED.pop(rid, None)
     if ok:
         _OWNER.pop(rid, None)
+    if refused:
+        log_event("actual_refused", consumer=owner, reservation=rid, reason=refused)
+        raise Refused(f"actual refused after lease release: {refused}")
     return ok
 
 
@@ -476,7 +810,7 @@ def _extend(rid: str, owner: str, ttl_s: float, timeout: float) -> bool:
     try:
         code, out = _call("/renew", {"reservation_id": rid, "ttl_s": ttl_s, "consumer": owner}, timeout=timeout,
                           token=tok)
-        return code == 200 and bool(out.get("renewed"))
+        return _receipt(code, out, "renewed")
     except Unreachable as exc:
         return bool(_local_ledger_op("renew", rid, owner, str(exc), t0,
                                      lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt, owner=owner)))
@@ -499,7 +833,7 @@ def renew(reservation_id: str, *, ttl_s: float, consumer: str, timeout: float = 
     try:
         code, out = _call("/renew", {"reservation_id": rid, "ttl_s": ttl_s, "consumer": owner}, timeout=timeout,
                           token=tok)
-        ok = code == 200 and bool(out.get("renewed"))
+        ok = _receipt(code, out, "renewed")
     except Unreachable as exc:
         res = _local_ledger_op("renew", rid, consumer, str(exc), t0,
                                lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt, owner=owner))
