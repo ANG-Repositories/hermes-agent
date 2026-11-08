@@ -41,8 +41,9 @@ def _operator_card(conn):
     tid = kb.create_task(
         conn, title="rebase X", assignee="human:apollo",
         session_id=kb.OPERATOR_HOME_SESSION, session_explicit=True,
+        initial_status="blocked",
     )
-    assert kb.block_task(conn, tid, reason="needs a rebase", kind="needs_input")
+    assert kb.get_task(conn, tid).status == "blocked"
     return tid
 
 
@@ -84,9 +85,10 @@ def test_non_operator_session_still_refused(kanban_home, mutate):
 def test_unhomed_card_stays_foreign_to_operator(kanban_home):
     """Only the operator pseudo-session is shared; ``unhomed`` is unchanged."""
     with kb.connect_closing() as conn:
-        tid = kb.create_task(conn, title="legacy cron card", assignee="human:apollo")
+        tid = kb.create_task(conn, title="legacy cron card", assignee="human:apollo",
+                             initial_status="blocked")
         assert kb.get_task(conn, tid).unhomed
-        assert kb.block_task(conn, tid, reason="x", kind="needs_input")
+        assert kb.get_task(conn, tid).status == "blocked"
         with kb.mutation_actor(session_ids=(APOLLO_SID,), profile="apollo"):
             with pytest.raises(kb.ForeignSessionMutationError, match="UNHOMED"):
                 kb.unblock_task(conn, tid)
