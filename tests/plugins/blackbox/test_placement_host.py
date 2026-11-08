@@ -132,6 +132,17 @@ def test_child_that_inherited_worker_env_is_null(no_worker_env, monkeypatch):
     assert _build().placement_host is None
 
 
+@pytest.mark.parametrize("context_name", ["delegated_child_context", "non_dispatcher_owned_context"])
+def test_in_process_non_worker_context_is_null(no_worker_env, monkeypatch, context_name):
+    from agent import delegation_context
+
+    _worker(monkeypatch, placement_host="ci-box")
+    assert _build().placement_host == "ci-box"
+    with getattr(delegation_context, context_name)():
+        assert _build().placement_host is None
+    assert _build().placement_host == "ci-box"
+
+
 def test_explicit_none_kwarg_suppresses_own_host(no_worker_env, monkeypatch):
     _worker(monkeypatch, placement_host="ci-box")
     assert _build(placement_host=None).placement_host is None
@@ -183,7 +194,37 @@ def _seed_backfill(tmp_path):
     ])
     conn.commit()
     conn.close()
+    with sqlite3.connect(turns) as conn:
+        conn.execute("ALTER TABLE turns ADD COLUMN session_id TEXT")
+        conn.execute("UPDATE turns SET session_id = CASE turn_id WHEN 'tw' THEN 'worker-7' "
+                     "WHEN 'tl' THEN 'worker-8' ELSE 'interactive' END")
+    with sqlite3.connect(board) as conn:
+        conn.execute("ALTER TABLE task_runs ADD COLUMN metadata TEXT")
+        conn.executemany("UPDATE task_runs SET metadata = ? WHERE id = ?", [
+            (json.dumps({"worker_session_id": "worker-7"}), 7),
+            (json.dumps({"worker_session_id": "worker-8"}), 8),
+        ])
     return home, turns, board
+
+
+def test_backfill_time_overlap_is_not_worker_provenance(tmp_path):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(turns) as conn:
+        conn.execute("UPDATE turns SET session_id = 'interactive' WHERE turn_id = 'tw'")
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tw") is None
+
+
+@pytest.mark.parametrize("host", [None, "", "ci-box"])
+def test_backfill_counts_all_overlapping_runs(tmp_path, host):
+    home, turns, board = _seed_backfill(tmp_path)
+    with sqlite3.connect(board) as conn:
+        conn.execute("INSERT INTO task_runs VALUES (12, 't_unknown', 'daedalus', 995, 1090, ?, NULL)",
+                     (host,))
+    out = _run("--home", str(home), "--board", str(board), "--profile", "daedalus", "--apply")
+    assert out.returncode == 0, out.stderr
+    assert _host(turns, "tw") is None
 
 
 def _run(*args):

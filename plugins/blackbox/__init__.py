@@ -489,9 +489,9 @@ def _placement_host() -> str | None:
     try:
         if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
             return None
-        from agent.delegation_context import owns_kanban_worker_authority
+        from agent.delegation_context import is_dispatcher_owned_worker_context
 
-        if not owns_kanban_worker_authority():
+        if not is_dispatcher_owned_worker_context():
             return None
         from hermes_cli import kanban_worker_hosts as kwh
 

@@ -2,14 +2,12 @@
 # SCHEDULE: manual (operator runs once per profile store after the placement_host column deploys)
 """Backfill ``turns.placement_host`` for one profile's Blackbox store (t_c9fc6c9f).
 
-Old rows predate the column. A kanban worker turn ran inside exactly one
-``task_runs`` row of the board, and that row records where it executed
-(``host``: a pool host id, or ``studio`` for a local run). A NULL-host turn of
-this profile whose whole window [ts_start, ts_end] sits inside exactly ONE such
-run gets that run's host (``studio`` -> ``studio-local``). Turns covered by no
-run, by more than one run (concurrent workers of one profile: ambiguous), or
-written by a gateway platform are left NULL. Rows that already carry a host are
-never touched.
+A historical turn needs positive provenance: its session_id must match the
+``worker_session_id`` in the covering task_runs.metadata. Time overlap alone
+does not prove worker ownership. Exactly one run of this profile may overlap
+the turn, including runs whose host is unknown; that run must cover the whole
+turn and have a known host (``studio`` -> ``studio-local``). Missing provenance,
+overlapping runs, gateway turns and already stamped rows are left unchanged.
 
 Dry-run is the default; ``--apply`` takes a WAL-safe VACUUM INTO backup first.
 
@@ -20,6 +18,7 @@ Dry-run is the default; ``--apply`` takes a WAL-safe VACUUM INTO backup first.
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from collections import Counter
@@ -34,29 +33,44 @@ WORKER_PLATFORMS = ("", "cli")
 
 def _plan(turns_db: Path, board_db: Path, profile: str) -> list[tuple[str, str]]:
     with sqlite3.connect(f"file:{board_db}?mode=ro", uri=True, timeout=30) as board:
+        run_cols = {r[1] for r in board.execute("PRAGMA table_info(task_runs)")}
+        if "metadata" not in run_cols:
+            return []  # No positive worker-session provenance in this board.
         runs = board.execute(
-            "SELECT started_at, COALESCE(ended_at, 9e18), host FROM task_runs "
-            "WHERE profile = ? AND host IS NOT NULL AND host != ''",
+            "SELECT started_at, COALESCE(ended_at, 9e18), host, metadata FROM task_runs "
+            "WHERE profile = ?",
             (profile,),
         ).fetchall()
     with sqlite3.connect(f"file:{turns_db}?mode=ro", uri=True, timeout=30) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
         if "placement_host" not in cols:
             sys.exit(f"{turns_db}: no placement_host column yet (deploy the schema first)")
+        if "session_id" not in cols:
+            return []
         platform = "COALESCE(platform, '')" if "platform" in cols else "''"
         rows = conn.execute(
-            f"SELECT turn_id, ts_start, ts_end, {platform} FROM turns "
+            f"SELECT turn_id, ts_start, ts_end, {platform}, session_id FROM turns "
             "WHERE placement_host IS NULL"
         ).fetchall()
     plan = []
-    for turn_id, ts_start, ts_end, plat in rows:
-        if plat not in WORKER_PLATFORMS or not ts_start:
+    for turn_id, ts_start, ts_end, plat, session_id in rows:
+        if plat not in WORKER_PLATFORMS or not ts_start or not session_id:
             continue
         end = ts_end or ts_start
-        hosts = {h for s, e, h in runs if s <= ts_start and end <= e}
-        if len(hosts) != 1:
+        if end < ts_start:
             continue
-        host = hosts.pop()
+        overlapping = [(s, e, h, m) for s, e, h, m in runs if s <= end and ts_start <= e]
+        if len(overlapping) != 1:
+            continue
+        start, stop, host, metadata = overlapping[0]
+        if not (start <= ts_start and end <= stop) or not host or not host.strip():
+            continue
+        try:
+            provenance = json.loads(metadata or "null")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(provenance, dict) or provenance.get("worker_session_id") != session_id:
+            continue
         plan.append((turn_id, LOCAL_HOST_NAME if host == LOCAL_RUN_HOST else host))
     return plan
 
