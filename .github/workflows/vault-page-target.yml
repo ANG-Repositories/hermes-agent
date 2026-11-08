@@ -1,10 +1,6 @@
 name: Vault page targeting
 on:
-  pull_request:
-    paths:
-      - 'tools/browser_vault_tool.py'
-      - 'tests/tools/test_browser_vault*.py'
-      - '.github/workflows/vault-page-target.yml'
+  workflow_call:
   workflow_dispatch:
 permissions:
   contents: read
