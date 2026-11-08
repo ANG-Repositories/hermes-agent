@@ -495,6 +495,45 @@ def _chrome_tree(browser: int) -> dict[int, tuple[float, bool]]:
     return tree
 
 
+def _remember_chrome_tree(
+    tree: dict[int, tuple[float, bool]], snapshot: dict[int, tuple[float, bool]],
+) -> None:
+    for pid, identity in snapshot.items():
+        if pid not in tree:
+            tree[pid] = identity
+            _STARTED.append((pid, identity[0]))
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("recycled", [False, True])
+def test_saved_chrome_tree_teardown_preserves_process_identity(tmp_path, monkeypatch, recycled):
+    # Drive the real fixture teardown with synthetic identities, never real signals.
+    with monkeypatch.context() as m:
+        fixture = conn.__wrapped__(tmp_path, m)
+        next(fixture)
+        signals = []
+        births = {1234: 10.0, 5678: 30.0}
+        m.setattr(kb, "_member_birth", births.get)
+        m.setattr(os, "getpgid", lambda pid: pid)
+        m.setattr(os, "killpg", lambda pid, sig: signals.append(pid))
+        m.setattr(os, "kill", lambda pid, sig: signals.append(pid))
+        try:
+            tree = {}
+            _remember_chrome_tree(tree, {1234: (10.0, True)})
+            if recycled:
+                births[1234] = 20.0
+            _remember_chrome_tree(tree, {
+                1234: (births[1234], True), 5678: (30.0, True),
+            })
+            if recycled:
+                assert (1234, births[1234]) not in _STARTED
+            assert tree[1234] == (10.0, True)
+        finally:
+            with pytest.raises(StopIteration):
+                next(fixture)
+        assert set(signals) == ({5678} if recycled else {1234, 5678})
+
+
 def _tree_survivors(tree: dict[int, tuple[float, bool]]) -> list[int]:
     return [pid for pid, (born, _) in tree.items()
             if kb._member_birth(pid) == born and kb._pid_alive(pid)]
@@ -537,7 +576,9 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
         tree = _chrome_tree(browser)
     assert any(h for _, h in tree.values()), \
         f"Chrome did not start its helpers; drill proves nothing ({tree})"
-    _track(*tree)
+    observed = tree
+    tree = {}
+    _remember_chrome_tree(tree, observed)
     # The live per-run census sees the browser too (Linux Chrome erases its
     # environ window; the profile path under the card workspace names it).
     key = (tid, str(task.current_run_id))
@@ -558,8 +599,7 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
         time.sleep(0.05)
     assert worker.pid in exited
     assert kb._pid_alive(browser), "Chrome died with its worker; drill proves nothing"
-    tree.update(_chrome_tree(browser))  # helpers that came up since (pid still ours)
-    _track(*tree)
+    _remember_chrome_tree(tree, _chrome_tree(browser))
 
     assert kb.reap_exited_worker_leftovers(conn, exited, grace=5.0) == [tid]
     deadline = time.monotonic() + 15
