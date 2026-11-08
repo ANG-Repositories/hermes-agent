@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import run_agent
 
 from tools import delegate_tool as dt
 
