@@ -42,9 +42,15 @@ _PAGE_BINDING: ContextVar[Any] = ContextVar("vault_page_binding", default=None)
 
 
 def _pin_page(task_id):
-    from tools.browser_tool import _active_sessions, _last_session_key, _session_info_owned_by_task
+    from tools.browser_tool import (
+        _active_sessions, _last_session_key, _session_info_owned_by_task,
+        _is_camofox_mode, _is_browser_use_cli_mode,
+    )
     from tools.browser_tool_session import _run_browser_command
 
+    # Never reuse a stale built-in session while another backend owns navigation.
+    if _is_camofox_mode() or _is_browser_use_cli_mode():
+        return None
     key = _last_session_key(task_id)
     session = _active_sessions.get(key)
     if session is None or not _session_info_owned_by_task(session, task_id, key):
@@ -235,6 +241,8 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         focused = supervisor.focus_page("", accept=f"window[{witness}] === true")
         if not focused.get("ok"):
             return {"success": False, "error_type": "page_changed", "error": "Bound document no longer exists"}
+        if not _binding_is_current(binding) or not _eval_js(task_id, "true").get("result"):
+            return {"success": False, "error_type": "page_changed", "error": "Browser page changed during target selection"}
         expression = (f"window[{witness}] === true ? ({expression}) : "
                       "JSON.stringify({refused: 'origin_changed'})")
     sup = supervisor.evaluate_runtime(expression)

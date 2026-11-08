@@ -33,6 +33,8 @@ def pages(monkeypatch, request):
         port, ws_path = (Path(profile) / "DevToolsActivePort").read_text().splitlines()[:2]
         sup = CDPSupervisor("fixture-task", f"ws://127.0.0.1:{port}{ws_path}")
         sup.start()
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
         key = request.param
         session = {"owner_task_id": "fixture-task", "session_key": key}
         monkeypatch.setitem(bt._active_sessions, key, session)
@@ -60,6 +62,17 @@ def pages(monkeypatch, request):
 
 def fill():
     return json.loads(vault.browser_vault_fill("fixture-address", task_id="fixture-task"))
+
+
+def test_unsupported_backend_cannot_reuse_builtin_session(pages, monkeypatch):
+    current, wrong, _, _, _, _, calls = pages
+    for mode in ("_is_camofox_mode", "_is_browser_use_cli_mode"):
+        with monkeypatch.context() as patch:
+            patch.setattr(bt, mode, lambda: True)
+            out = fill()
+            assert out["error_type"] == "page_binding_required", out
+    assert calls == []
+    assert current.locator("input").input_value() == wrong.locator("input").input_value() == ""
 
 
 def test_navigation_current_page_wins_over_first_same_origin_tab(pages):
@@ -108,13 +121,20 @@ def test_foreign_task_cannot_use_supervisor_or_current_page(pages):
     assert current.locator("input").input_value() == wrong.locator("input").input_value() == ""
 
 
-def test_navigation_after_target_selection_is_atomically_refused(pages, monkeypatch):
-    current, wrong, _, _, _, sup, _ = pages
+@pytest.mark.parametrize("race", ["navigation", "tab_switch", "session_swap"])
+def test_navigation_after_target_selection_is_atomically_refused(pages, monkeypatch, race):
+    current, wrong, driver, _, _, sup, _ = pages
     focus = sup.focus_page
 
     def raced_focus(*args, **kwargs):
         result = focus(*args, **kwargs)
-        current.goto("https://site.example.test/new-document")
+        if race == "navigation":
+            current.goto("https://site.example.test/new-document")
+        elif race == "tab_switch":
+            driver["page"] = wrong
+        else:
+            key = bt._last_session_key("fixture-task")
+            monkeypatch.setitem(bt._active_sessions, key, dict(bt._active_sessions[key]))
         return result
 
     monkeypatch.setattr(sup, "focus_page", raced_focus)
