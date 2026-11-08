@@ -1240,6 +1240,10 @@ class TurnRunner:
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
+                    # Fold can race setup from another thread. Publish first, then recheck:
+                    # either the folder sees this consumer or this check sees its promotion.
+                    if ctx.human_engaged:
+                        stream_consumer.on_human_engagement()
                     # #105341: a consumer created only for interim commentary (text streaming off)
                     # is never fed the final reply's deltas — mark it so the duplicate-risk
                     # diagnostic in ``_run_agent_mark_streamed_delivery`` stays silent.
@@ -1665,6 +1669,9 @@ class TurnRunner:
             agent.stream_delta_callback = None
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
+        # Bind policy synchronously before accepting steering; the async slot tracker
+        # may still hold the previous context when this cached agent is reused.
+        agent._gateway_receiving_turn_context = ctx
         ctx.agent_holder[0] = agent  # interrupt support
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)
