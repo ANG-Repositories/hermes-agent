@@ -235,10 +235,18 @@ def revert_fork_overlay(child: Any, undo: Dict[str, Any]) -> None:
     child._inherit_mode = "summary"
 
 
-def log_ineligible(reason: str, parent: Any) -> None:
+def log_ineligible(reason: str, parent: Any, *, delegation_id: Any = None, task_index: Any = None) -> None:
+    """One ``boomerang.fork_ineligible`` line. ``delegation=<id> task=<i>`` ride after the
+    original fields (existing greps still match) when the caller knows them, so a mixed
+    fork/fold batch maps per child."""
+    extra = ""
+    if delegation_id:
+        extra += " delegation=" + str(delegation_id).replace(" ", "_")
+    if task_index is not None:
+        extra += f" task={task_index}"
     logger.info(
-        "boomerang.fork_ineligible reason=%s parent_session=%s",
-        reason, str(getattr(parent, "session_id", "") or "-").replace(" ", "_"),
+        "boomerang.fork_ineligible reason=%s parent_session=%s%s",
+        reason, str(getattr(parent, "session_id", "") or "-").replace(" ", "_"), extra,
     )
 
 

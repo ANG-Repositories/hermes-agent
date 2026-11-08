@@ -987,6 +987,21 @@ def _site_triggers():
         ctx["launched"] = True                               # spawned, then the claim was gone
         return "studio", "twin", "did not spawn"
 
+    def door_held(m, ctx):
+        # The pair door answers queued_behind at launch: the claim returns, no process starts.
+        from hermes_cli import kanban_priority_door as kpd
+        ctx["admitted"] = True                               # the override event precedes the launch
+        m.setattr(kpd, "spawn", lambda *a, **k: (_ for _ in ()).throw(kpd.DoorHeld("queued_behind (test)")))
+        return "studio", "twin", "held: queued_behind \\(test\\)"
+
+    def door_hold(m, ctx):
+        # Door mode with a latched config fault / transport backoff: the tick starts nothing.
+        from hermes_cli import kanban_priority_door as kpd
+        from hermes_cli import kanban_priority_faults as kpf
+        m.setattr(kpd, "enabled", lambda: True)
+        m.setattr(kpf, "hold_reason", lambda: "door latched (test)")
+        return "studio", "twin", "total:door_hold"
+
     # HOST ADMISSION: the one axis admit turns off. The tick refuses, admit spawns.
     def load_gate_paused(m, ctx):
         m.setattr(kbd, "_route_first_enabled", lambda: False)
@@ -1069,6 +1084,8 @@ def _site_triggers():
         "continue: _btok is not None": join_refused,
         "continue: _btok is None and (not _kb._claim_still_held(conn, claimed))": join_claim_lost,
         "fail: except Exception (try: result.browser_joins.get)": launch,
+        "fail: except DoorHeld (try: result.browser_joins.get)": door_held,
+        "return: _door_hold": door_hold,
         "continue: outcome == _LAUNCH_NOT_OWNED": launch_not_owned,
         "continue: outcome == _LAUNCH_CLAIM_LOST": launch_claim_lost,
         "return: (spillover is None or spillover.budget <= 0) and (not route_first)": load_gate_paused,

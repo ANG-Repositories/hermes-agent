@@ -753,6 +753,12 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, metavar="N",
              help="Set the dispatch priority (higher first); records priority_set."),
+        _group(
+            _arg("--asap", action="store_const", const=True, dest="asap", default=None,
+                 help="Operator-only: send this card to the front of the host door"),
+            _arg("--no-asap", action="store_const", const=False, dest="asap",
+                 help="Clear this card's explicit urgency"),
+        ),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
         _arg("--model", dest="model_override", metavar="MODEL",

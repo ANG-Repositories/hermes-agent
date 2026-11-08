@@ -3605,13 +3605,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     add_skills = list(getattr(args, "skills", None) or [])
     clear_skills = bool(getattr(args, "clear_skills", False))
     do_skills = bool(add_skills) or clear_skills
+    asap_arg = getattr(args, "asap", None)
     boomerang_arg = getattr(args, "boomerang_wake", None)
 
     if result is None and (summary is not None or raw_meta is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     if (not do_result and not do_fields and not do_model and not do_session
             and no_worker is None and new_priority is None and page is None and not do_skills
-            and boomerang_arg is None):
+            and boomerang_arg is None and asap_arg is None):
         return _err(
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
             "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
@@ -3619,6 +3620,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
     rc = 0
     with kbc.connect_closing() as conn:
+        if asap_arg is not None:
+            from hermes_cli.kanban_priority import set_asap
+            try:
+                if not set_asap(conn, args.task_id, asap_arg):
+                    return _err(f"cannot edit {args.task_id} (unknown id)")
+            except PermissionError as exc:
+                return _err(str(exc))
+            print(f"{args.task_id}: ASAP {'on' if asap_arg else 'off'}")
         if new_priority is not None and not _set_priority(conn, args.task_id, new_priority):
             return 1
         if no_worker is not None:

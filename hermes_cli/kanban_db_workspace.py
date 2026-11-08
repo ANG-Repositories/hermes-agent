@@ -812,7 +812,7 @@ def _maybe_emit_scratch_tip(
 # ---------------------------------------------------------------------------
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
-    out = _kb._git_out(path, "rev-parse", "--show-toplevel")
+    out = _kb._git_out(path, "rev-parse", "--show-toplevel", workspace_probe=True)
     if out is None:
         return None
     try:

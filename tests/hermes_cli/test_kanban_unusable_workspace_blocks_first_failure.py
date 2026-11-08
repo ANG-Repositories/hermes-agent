@@ -19,6 +19,7 @@ reason that names the fix.
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -267,6 +268,66 @@ def test_missing_default_workdir_is_not_treated_as_permanent():
     """
     exc = ValueError("board 'default' has no default_workdir set")
     assert kb._unusable_workspace_reason(exc) is None
+
+
+@pytest.mark.parametrize("failure", ["shim", "exec", "stderr"])
+def test_git_executable_failure_retries_then_blocks_with_named_reason(
+    conn, tmp_path, monkeypatch, failure,
+):
+    repo = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True,
+                   stdin=subprocess.DEVNULL)
+    task_id = kb.create_task(
+        conn, title="git executable temporarily unavailable", assignee="daedalus-opus",
+        workspace_kind="worktree", workspace_path=str(repo),
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    if failure == "shim":
+        shim = bin_dir / "git"
+        shim.write_text('#!/bin/sh\nexec /missing/scripts/git-config-guard.sh "$@"\n')
+        shim.chmod(0o755)
+    elif failure == "stderr":
+        shim = bin_dir / "git"
+        shim.write_text(
+            '#!/bin/sh\nprintf "%s\\n" '
+            '"/Users/alexgierczyk/.hermes/var/gh-shim/git: line 2: '
+            '/Users/alexgierczyk/.hermes/scripts/git-config-guard.sh: '
+            'No such file or directory" >&2\nexit 1\n'
+        )
+        shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run, failure_limit=2)
+    row = _task_row(conn, task_id)
+    assert row["status"] == "ready"
+    assert row["consecutive_failures"] == 1
+    assert "git executable unavailable" in row["last_failure_error"]
+    assert "re-create" not in row["last_failure_error"]
+
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run, failure_limit=2)
+    row = _task_row(conn, task_id)
+    assert row["status"] == "blocked"
+    assert row["consecutive_failures"] == 2
+    assert "git executable unavailable" in row["last_failure_error"]
+    assert "re-create" not in row["last_failure_error"]
+
+
+@pytest.mark.parametrize("metadata", ["missing", "corrupt"])
+def test_missing_git_metadata_still_blocks_on_first_failure(conn, tmp_path, metadata):
+    repo = tmp_path / "not-a-checkout"
+    repo.mkdir()
+    if metadata == "corrupt":
+        (repo / ".git").write_text("gitdir: /missing/worktree-metadata\n")
+    task_id = kb.create_task(
+        conn, title="checkout without git metadata", assignee="daedalus-opus",
+        workspace_kind="worktree", workspace_path=str(repo),
+    )
+    kbd.dispatch_once(conn, spawn_fn=_spawn_should_not_run)
+    row = _task_row(conn, task_id)
+    assert row["status"] == "blocked"
+    assert row["block_kind"] == "capability"
+    assert "workspace is unusable" in row["last_failure_error"]
 
 
 def test_operator_fix_survives_the_500_char_truncation(conn, tmp_path):
