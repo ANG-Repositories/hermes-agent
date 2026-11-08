@@ -11,17 +11,21 @@ def record_reopened_candidate(conn, task_id, *, actor, reviewer, reason, run_id)
         "SELECT profile, metadata FROM task_runs WHERE task_id = ? AND id = ?",
         (task_id, run_id),
     ).fetchone() if run_id is not None else None
-    implementer = kb._nonblank_str(payload.get("implementer"))
-    if implementer is None and run is not None:
-        implementer = kb._nonblank_str(run["profile"])
+    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    reviewer = reviewer or kb._nonblank_str(row["assignee"])
+    implementer = kb._nonblank_str(run["profile"]) if run is not None else None
+    if implementer is None or kb.is_human_reviewer(implementer) or implementer == reviewer:
+        implementer = kb._nonblank_str(payload.get("implementer"))
     # A never-run candidate is bound to the operator-selected implementer, not
     # to the reviewer the reopen is about to assign.
     if implementer is None:
-        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
         implementer = kb._nonblank_str(row["assignee"])
     if implementer is None or kb.is_human_reviewer(implementer) or implementer == reviewer:
         raise ValueError("review reopen requires a non-reviewer implementer binding")
     metadata = kb._json_dict(run["metadata"]) if run is not None else {}
+    # Candidate identity is indivisible: a partial new identity must never pick
+    # up the other half from an older review.
+    identity = metadata if metadata.get("pr_url") or metadata.get("head_sha") else payload
     kb._append_event(conn, task_id, "review_requested", {
         "summary": kb._first_line(reason, 400),
         "implementer": implementer,
@@ -29,8 +33,7 @@ def record_reopened_candidate(conn, task_id, *, actor, reviewer, reason, run_id)
         "reviewer": reviewer,
         "provenance": "implementation_run" if run is not None else "operator-bound",
         "actor": actor,
-        **{key: metadata.get(key, payload.get(key)) for key in ("pr_url", "head_sha")
-           if metadata.get(key, payload.get(key))},
+        **{key: identity[key] for key in ("pr_url", "head_sha") if identity.get(key)},
     }, run_id=run_id)
 
 

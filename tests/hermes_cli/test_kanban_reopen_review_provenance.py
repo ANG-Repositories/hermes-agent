@@ -55,6 +55,49 @@ def test_existing_candidate_reopen_can_be_sent_back(board):
     assert event.payload["provenance"] == "operator-bound"
 
 
+@pytest.mark.parametrize("metadata, expected_identity", [
+    ({"pr_url": "https://github.com/example/repo/pull/45"},
+     {"pr_url": "https://github.com/example/repo/pull/45"}),
+    ({"head_sha": "b" * 40}, {"head_sha": "b" * 40}),
+    ({}, {"pr_url": "https://github.com/example/repo/pull/44", "head_sha": "a" * 40}),
+])
+def test_reopen_binds_candidate_run_without_mixing_review_identity(board, metadata, expected_identity):
+    tid = kb.create_task(board, title="new candidate", assignee="devB")
+    claimed = kb.claim_task(board, tid)
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "review_requested", {
+            "implementer": "devA", "reviewer": "human:apollo",
+            "pr_url": "https://github.com/example/repo/pull/44", "head_sha": "a" * 40,
+        })
+        kb._end_run(board, tid, outcome="completed", status="done", metadata=metadata)
+        board.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id=?", (tid,))
+    assert kb.reopen_task(board, tid, actor="operator", reason="new candidate",
+                          to_status="review") == (True, None)
+    event = [e for e in kb.list_events(board, tid) if e.kind == "review_requested"][-1]
+    assert event.payload["implementer"] == claimed.assignee
+    assert event.payload["implementer_run_id"] == claimed.current_run_id
+    assert {k: event.payload[k] for k in ("pr_url", "head_sha") if k in event.payload} == expected_identity
+
+
+@pytest.mark.parametrize("run_profile", ["dev", "human:apollo"])
+def test_reopen_retains_effective_reviewer_and_valid_implementer(board, monkeypatch, run_profile):
+    tid = kb.create_task(board, title="retained reviewer", assignee="dev")
+    claimed = kb.claim_task(board, tid)
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "review_requested", {
+            "implementer": "dev", "reviewer": "human:apollo",
+        })
+        kb._end_run(board, tid, outcome="completed", status="done")
+        board.execute("UPDATE task_runs SET profile=? WHERE id=?", (run_profile, claimed.current_run_id))
+        board.execute("UPDATE tasks SET status='done', assignee='human:apollo', claim_lock=NULL WHERE id=?", (tid,))
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: None)
+    assert kb.reopen_task(board, tid, actor="operator", reason="retain reviewer",
+                          to_status="review") == (True, None)
+    event = [e for e in kb.list_events(board, tid) if e.kind == "review_requested"][-1]
+    assert event.payload["reviewer"] == kb.get_task(board, tid).assignee == "human:apollo"
+    assert event.payload["implementer"] == "dev"
+
+
 def test_missing_review_handoff_is_an_integrity_finding(board, monkeypatch, capsys):
     from hermes_cli import kanban
     from hermes_cli.kanban_diagnostics import compute_task_diagnostics
@@ -67,8 +110,9 @@ def test_missing_review_handoff_is_an_integrity_finding(board, monkeypatch, caps
     task = kb.get_task(board, tid)
     findings = compute_task_diagnostics(task, kb.list_events(board, tid), [])
     assert any(d.kind == "review_missing_handoff" for d in findings)
-    assert any(e["task_id"] == tid and e["reason"] == "review_missing_handoff"
-               for e in kb.review_awaiting_human(board, stale_minutes=999999))
+    # Integrity is reported by show/the dedicated failsafe, not the age-based
+    # reviewer alert: a fresh spawnable review must remain eligible for dispatch.
+    assert kb.review_awaiting_human(board, stale_minutes=999999) == []
     assert kanban._cmd_show(Namespace(task_id=tid, json=True)) == 0
     import json
     shown = json.loads(capsys.readouterr().out)

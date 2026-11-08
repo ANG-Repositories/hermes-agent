@@ -14779,10 +14779,7 @@ def review_awaiting_human(
             and profile_exists is not None
             and profile_exists(assignee)
         )
-        from hermes_cli.kanban_review_handoff import missing_handoff
-        if missing_handoff(conn, row["id"]):
-            reason = "review_missing_handoff"
-        elif not assignee or not spawnable:
+        if not assignee or not spawnable:
             reason = "non_spawnable"
         elif age_minutes >= stale_minutes:
             reason = "stale"
