@@ -95,6 +95,22 @@ async def test_incomplete_limit_is_configurable(tmp_path, monkeypatch):
     assert decision["message"]
 
 
+def test_loop_observation_does_not_consume_due_retry(tmp_path, monkeypatch):
+    from hermes_cli.loops import goal_blocks_loop_tick
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mgr = goals.GoalManager("loop-retry")
+    mgr.set("ship it")
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+    clock = mgr.state.waiting_until
+    assert goal_blocks_loop_tick("loop-retry")
+    mgr = goals.GoalManager("loop-retry")
+    assert mgr.idle_wake_prompt(clock, checkin_minutes=0)
+    assert not mgr.idle_wake_prompt(clock + 1, checkin_minutes=0)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("global_minutes,goal_minutes", [(0, -1), (30, 0)])
 async def test_retry_wakes_with_checkins_disabled(tmp_path, monkeypatch, global_minutes, goal_minutes):

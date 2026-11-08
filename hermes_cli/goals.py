@@ -1772,7 +1772,9 @@ class GoalManager:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
             still = False
-        if not still:
+        # Observation (e.g. /loop arbitration) must not consume a pending retry wake.
+        # idle_wake_prompt clears it only when claiming the continuation.
+        if not still and not s.incomplete_retry_wait:
             self.stop_waiting()
         return still
 
