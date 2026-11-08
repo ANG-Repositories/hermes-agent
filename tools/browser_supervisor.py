@@ -63,7 +63,11 @@ def _schedule(coro, loop, *, timeout: float):
     fut = safe_schedule_threadsafe(coro, loop)
     if fut is None:
         raise _LoopUnavailable("Browser supervisor loop unavailable")
-    return fut.result(timeout=timeout)
+    try:
+        return fut.result(timeout=timeout)
+    except TimeoutError:
+        fut.cancel()
+        raise
 
 
 def _fail(error: str) -> Dict[str, Any]:
@@ -211,7 +215,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
                          await_promise: bool = True, timeout: float = 10.0,
-                         target_id: Optional[str] = None) -> Dict[str, Any]:
+                         target_id: Optional[str] = None, deadline: Optional[float] = None,
+                         dispatch_guard=None) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
@@ -226,24 +231,49 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if not session_id:
             return _fail("supervisor has no attached page session")
 
+        expires = min(deadline if deadline is not None else float("inf"), time.monotonic() + timeout)
+        gate = threading.Lock()
+        state = {"revoked": False, "outcome": "not_dispatched"}
+        quiesced = threading.Event()
+
+        def remaining():
+            budget = expires - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("Browser evaluation deadline expired")
+            return budget
+
         def _run_eval(by_value: bool) -> Dict[str, Any]:
-            # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
             async def evaluate():
                 pinned_session = session_id
-                if target_id:
-                    info = (await self._cdp("Target.getTargetInfo", {"targetId": target_id}, timeout=timeout))["result"]["targetInfo"]
-                    if info.get("type") != "page" or info.get("targetId") != target_id:
-                        raise RuntimeError("Selected Browser Use target is not a live page; select a tab and retry")
-                    attached = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
-                    pinned_session = attached["result"]["sessionId"]
+                attached = False
                 try:
-                    return await self._cdp("Runtime.evaluate", params, session_id=pinned_session, timeout=timeout)
-                finally:
                     if target_id:
-                        # Cleanup cannot turn a confirmed write into a retryable failure,
-                        # or spend the caller's remaining evaluation deadline.
+                        info = (await self._cdp("Target.getTargetInfo", {"targetId": target_id}, timeout=remaining()))["result"]["targetInfo"]
+                        if info.get("type") != "page" or info.get("targetId") != target_id:
+                            raise RuntimeError("Selected Browser Use target is not a live page; select a tab and retry")
+                        reply = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=remaining())
+                        pinned_session = reply["result"]["sessionId"]
+                        attached = True
+                    # Revocation and dispatch are serialized even if cancellation is
+                    # delayed by setup. Once authorized, loss of an ACK is UNKNOWN.
+                    with gate:
+                        if state["revoked"]:
+                            raise TimeoutError("Browser evaluation was cancelled")
+                        budget = remaining()
+                        guard = dispatch_guard() if dispatch_guard else contextlib.nullcontext()
+                        guard.__enter__()
+                        state["outcome"] = "unknown"
+                    try:
+                        response = await self._cdp("Runtime.evaluate", params,
+                            session_id=pinned_session, timeout=budget)
+                        state["outcome"] = "acknowledged"
+                        return response
+                    finally:
+                        guard.__exit__(None, None, None)
+                finally:
+                    if attached:
                         async def detach():
                             with contextlib.suppress(Exception):
                                 await asyncio.wait_for(self._cdp(
@@ -252,7 +282,25 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                         task = asyncio.create_task(detach())
                         self._detach_tasks.add(task)
                         task.add_done_callback(self._detach_tasks.discard)
-            return _schedule(evaluate(), loop, timeout=timeout + 1)
+                    quiesced.set()
+
+            async def bounded():
+                try:
+                    return await asyncio.wait_for(evaluate(), timeout=remaining())
+                finally:
+                    quiesced.set()
+            # The loop enforces the absolute deadline. The sync timeout is a
+            # watchdog only; its revocation also prevents late setup dispatch.
+            try:
+                return _schedule(bounded(), loop, timeout=max(0.0, expires - time.monotonic()) + 1)
+            except Exception:
+                with gate:
+                    state["revoked"] = True
+                # Do not return a definitely-not-dispatched outcome while setup
+                # still owns a coroutine capable of reaching the write boundary.
+                if not quiesced.wait(1):
+                    state["outcome"] = "unknown"
+                raise
 
         try:
             response = _run_eval(return_by_value)
@@ -260,8 +308,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # Deep-serializing live DOM nodes / NodeLists / Window can blow past
             # CDP's recursion guard (``Object reference chain is too long``).
             # Retry once with returnByValue=False so Chrome returns the description.
-            if not (return_by_value and "reference chain is too long" in str(exc).lower()):
-                return _err(exc)
+            if target_id or dispatch_guard or not (return_by_value and "reference chain is too long" in str(exc).lower()):
+                return {"ok": False, "outcome": state["outcome"],
+                        "error": ("Browser evaluation outcome unknown; it may have run. Inspect the page before retrying."
+                                  if state["outcome"] == "unknown" else "Browser evaluation was not dispatched; select a live tab and retry.")}
             try:
                 response = _run_eval(False)
             except Exception as exc2:

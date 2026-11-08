@@ -825,13 +825,19 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
             if route is None and not is_browser_use_cli_mode():
                 return {"raw": fn()}
             token = begin(tid, expected_route=route)
-            try:
-                return {"raw": fn()}
-            finally:
-                end(token)
         except Exception:
             return {"raw": json.dumps({"success": False, "error_type": "selected_target_unavailable",
+                    "outcome": "not_dispatched",
                     "error": "Browser Use selected target changed, closed, or is unavailable; select a live tab with browser_exec and retry. Nothing was written."})}
+        try:
+            return {"raw": fn()}
+        except Exception:
+            # The callback may already have dispatched a fill (or saved an item).
+            # Never misreport an arbitrary callback failure as a pre-write refusal.
+            return {"raw": json.dumps({"success": False, "error_type": "operation_outcome_unknown",
+                    "outcome": "unknown", "error": "Vault operation outcome unknown; inspect the page and saved item before retrying."})}
+        finally:
+            end(token)
 
     res = run_fenced(session, pinned_op)
     return res["raw"] if "raw" in res else json.dumps(res)

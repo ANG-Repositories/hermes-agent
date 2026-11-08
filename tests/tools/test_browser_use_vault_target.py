@@ -144,8 +144,11 @@ def test_evaluation_success_is_not_overridden_or_delayed_by_detach(monkeypatch, 
     def schedule(coro, loop, *, timeout):
         async def run():
             operation = asyncio.create_task(coro)
-            # All evaluation replies are immediate; cleanup must not be on its critical path.
-            await asyncio.sleep(0)
+            # wait_for adds scheduler turns but cleanup must remain detached.
+            for _ in range(8):
+                if operation.done():
+                    break
+                await asyncio.sleep(0)
             assert operation.done(), "detach consumed the evaluation result deadline"
             response = operation.result()
             # Run the wait_for child and cleanup exception handler, without wall-clock sleeps.
@@ -182,7 +185,10 @@ def test_selected_probe_uses_named_route_and_fixed_argv(monkeypatch):
     monkeypatch.setattr(target.subprocess, "run", run)
     assert target.selected_target(route) == (42, "login-tab")
     assert seen[0][1]["env"]["BU_NAME"] == "named-session"
-    assert seen[0][0] == ["python", "-c", target._PROBE]
+    import sys
+    assert seen[0][0][:4] == [sys.executable, "-I", "-c", target._PROBE]
+    assert "PYTHONPATH" not in seen[0][1]["env"]
+    assert all(isinstance(root, str) for root in json.loads(seen[0][0][4]))
 
 
 def test_profile_and_task_route_isolation(monkeypatch):
