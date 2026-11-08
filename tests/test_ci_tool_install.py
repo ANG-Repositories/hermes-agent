@@ -80,15 +80,18 @@ def test_fallback_download_fails_closed(tmp_path, mode, requests):
 @pytest.mark.skipif(not shutil.which("bash") or not shutil.which("sha256sum"), reason="Linux installer tools required")
 @pytest.mark.parametrize("arch,suffix", [("x86_64", "x64"), ("aarch64", "arm64")])
 @pytest.mark.parametrize("tool", ["ripgrep", "gitleaks", "hadolint"])
-def test_corrupt_release_rejected_before_install(tmp_path, arch, suffix, tool):
+@pytest.mark.parametrize("fallback", [False, True])
+def test_corrupt_release_rejected_before_install(tmp_path, arch, suffix, tool, fallback):
     shim = tmp_path / "shim"
     shim.mkdir()
     (shim / "uname").write_text(f"#!/bin/sh\nprintf '%s\\n' {arch}\n")
+    (shim / "sleep").write_text("#!/bin/sh\nexit 0\n")
     (shim / "curl").write_text(
         '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n'
         '  if [ "$1" = -o ]; then shift; output=$1; fi\n'
         '  url=$1; shift\ndone\n'
-        'printf "%s\\n" "$url" > "$URL_LOG"\n'
+        'printf "%s\\n" "$url" >> "$URL_LOG"\n'
+        'case "$FALLBACK:$url" in 1:https://github.com/*) exit 22 ;; esac\n'
         'printf "corrupt release" > "$output"\n'
     )
     for executable in shim.iterdir():
@@ -97,14 +100,23 @@ def test_corrupt_release_rejected_before_install(tmp_path, arch, suffix, tool):
     path_file = tmp_path / "github-path"
     url_log = tmp_path / "url"
     env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
-           "GITHUB_PATH": str(path_file), "URL_LOG": str(url_log)}
+           "GITHUB_PATH": str(path_file), "URL_LOG": str(url_log), "FALLBACK": str(int(fallback))}
     result = subprocess.run(["bash", str(INSTALLER), tool, str(destination)],
-                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
     assert "FAILED" in result.stdout
     assert not destination.exists()
     assert not path_file.exists()
-    url = url_log.read_text()
+    urls = url_log.read_text().splitlines()
+    url = urls[0]
+    if fallback:
+        ids = {"ripgrep": (307306614, 307306472), "gitleaks": (173813554, 173813549),
+               "hadolint": (84037697, 84037701)}
+        repo = "BurntSushi/ripgrep" if tool == "ripgrep" else f"{tool}/{tool}"
+        asset_id = ids[tool][arch == "aarch64"]
+        assert urls == [url, f"https://api.github.com/repos/{repo}/releases/assets/{asset_id}"]
+    else:
+        assert len(urls) == 1
     if tool == "ripgrep":
         assert f"-{arch}-unknown-linux-" in url
     elif tool == "gitleaks":
