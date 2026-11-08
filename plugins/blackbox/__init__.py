@@ -475,6 +475,42 @@ def _profile_name() -> str:
         return "default"
 
 
+def _placement_host() -> str | None:
+    """The box running THIS process's kanban-worker tools (t_c9fc6c9f).
+
+    A spilled worker carries ``KANBAN_WORKER_PLACEMENT`` (its pool host); the
+    boot record wins over the env, which the config bridge may have touched. A
+    dispatcher-owned worker with no placement is ``studio-local`` only when
+    its resolved terminal backend is local. Anything else (gateway, interactive CLI, a child process
+    that merely inherited a worker's env) is None.
+    """
+    import os
+
+    try:
+        if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+            return None
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if not is_dispatcher_owned_worker_context():
+            return None
+        from hermes_cli import kanban_worker_hosts as kwh
+
+        # A failed bridge reapply can run tools locally despite a remote boot
+        # placement. Mixed-host runs cannot truthfully carry a single host.
+        if kwh.reapply_failures():
+            return None
+        if kwh.BOOT_PLACED_HOST:
+            return kwh.BOOT_PLACED_HOST
+        # Unplaced workers can inherit a remote profile backend. Resolve through
+        # the same config bridge as terminal rather than assuming Studio-local.
+        from tools.terminal_tool import _get_env_config
+
+        return kwh.LOCAL_HOST_NAME if _get_env_config()["env_type"] == "local" else None
+    except Exception:
+        logger.debug("blackbox placement_host resolve failed", exc_info=True)
+        return None
+
+
 def _config() -> dict[str, Any] | None:
     try:
         # fork-parity: read through the canonical loader, not raw yaml. Upstream
@@ -749,6 +785,12 @@ def _build_record(
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
         cli_invocation_id=kwargs.get("cli_invocation_id"),
+        # A caller writing on another process's behalf (orphan repair) passes
+        # the key explicitly so this process's placement is never stamped.
+        placement_host=(
+            None if is_subagent else
+            kwargs["placement_host"] if "placement_host" in kwargs else _placement_host()
+        ),
         # An explicit marker names how a turn that never finished was closed
         # (``signal_15``: the kanban dispatcher killed the worker;
         # ``orphan_repair``: synthesized by ``orphans --repair``). Otherwise a
