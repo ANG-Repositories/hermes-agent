@@ -310,6 +310,9 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: Install pinned admission parser into the test environment
+        run: uv pip install --python "$HERMES_PYTHON" -r .github/router-core/admission-decider-requirements.txt
+
       - name: Check SQLite runs WAL
         # Hermes picks DELETE journal mode on a SQLite with the WAL-reset
         # bug. If the PM-pinned interpreter links one, every WAL test silently

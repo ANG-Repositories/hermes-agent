@@ -24,6 +24,15 @@ class AdmissionBaselineTests(unittest.TestCase):
             rc = LINT.main(list(args))
         return rc, output.getvalue()
 
+    def test_python_slice_installs_parser_in_its_test_environment(self):
+        workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+        setup = workflow.index("      - name: Set up locked Python and test dependencies")
+        run = workflow.index("      - name: Run tests (${{ matrix.slice.name }})", setup)
+        self.assertIn(
+            'uv pip install --python "$HERMES_PYTHON" -r .github/router-core/admission-decider-requirements.txt',
+            workflow[setup:run],
+        )
+
     def test_checked_in_baseline_matches_current_tree(self):
         rc, output = self.run_lint("--root", str(ROOT))
         self.assertEqual(rc, 0, output)
