@@ -141,6 +141,48 @@ async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary):
 
 
 @pytest.mark.asyncio
+async def test_retry_wake_rejected_before_admission_is_refunded(rig, monkeypatch):
+    runner, adapter, received, key = rig
+    mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    await asyncio.to_thread(mgr.set, "ship it")
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
+    clock = mgr.state.waiting_until
+    before = mgr.idle_wake_snapshot()
+    entry = runner.session_store.list_sessions()[0]
+    entry.session_key = key + ":stale-route"
+    events = []
+    real_handle = adapter.handle_message
+
+    async def handle(event):
+        events.append(event)
+        await real_handle(event)
+
+    adapter.handle_message = handle
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    assert len(events) == 1
+    assert events[0]._gateway_accepted is False
+    assert events[0]._admission_check is not None  # real adapter returned before admission
+    assert received == []
+    restored = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    for field, value in before.items():
+        if field != "_row":  # refund persists a new revision, not the old serialized row
+            assert restored.idle_wake_snapshot()[field] == value
+    assert restored.state.incomplete_retry_wait
+
+    entry.session_key = key  # routing repaired; checkins remain disabled
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    await _drain(adapter)
+    assert len(received) == 1
+    assert events[-1]._gateway_accepted is True
+    assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    await _drain(adapter)
+    assert len(received) == 1  # accepted retries are not refunded
+
+
+@pytest.mark.asyncio
 async def test_busy_session_is_never_woken(rig):
     runner, adapter, received, key = rig
     await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window

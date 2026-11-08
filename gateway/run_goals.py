@@ -895,7 +895,6 @@ class GatewayGoalsMixin:
                 if not prompt:
                     return
                 event = None
-                delivered = False
                 try:
                     # Writers outside this lock (CLI/TUI on the same session) may have ended the goal since
                     # the wake's save, or the re-read failed: give the wake back either way.
@@ -909,21 +908,15 @@ class GatewayGoalsMixin:
                     )
                     event = self._synthetic_prompt_event(source, prompt, internal=True)
                     event.metadata["gateway_session_key"] = quick_key
-                    refused = []
-
                     def _admit(key: str) -> bool:
                         # Final eligibility check, run by the adapter at the claim itself (Prism
                         # eb13daf988ed): no await separates it from the session claim or queue.
-                        if _ineligible(key):
-                            refused.append(key)
-                            return False
-                        return True
+                        return not _ineligible(key)
 
                     event._admission_check = _admit
                     await adapter.handle_message(event)
-                    delivered = not refused
                 finally:
-                    # Cancellation may occur during the post-claim reload or the adapter's
-                    # pre-admission channel lookup. Never consume a retry that did not start.
-                    if not delivered and not getattr(event, "_gateway_accepted", False):
+                    # A normal return may reject routing before admission; cancellation may also
+                    # interrupt channel lookup. Only the concrete receipt transfers ownership.
+                    if not getattr(event, "_gateway_accepted", False):
                         await asyncio.shield(self._run_in_executor_with_context(_refund))
