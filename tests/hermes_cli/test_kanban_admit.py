@@ -57,6 +57,9 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import socket
     monkeypatch.setattr(socket, "gethostname", lambda: LOCAL_NAME)
     kb.init_db()
+    # The placement table (mem_reserve_gb, threads) is this test's, never the host's:
+    # fleet_root() honours PLACEMENT_HOME first, and test-gate exports the live root (t_2105a835).
+    monkeypatch.setenv("PLACEMENT_HOME", str(kb.kanban_home()))
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "apollo", raising=False)
@@ -284,8 +287,10 @@ def test_admit_refuses_a_draining_pool_host(board, monkeypatch):
     assert _status(tid) == "ready"
 
 
-def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
+def test_a_stale_remote_pressure_sample_is_unmeasured_memory(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))   # no table: never the host's (t_2105a835)
 
     sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0,
                             pressure_text=json.dumps({"at": 1000.0, "mem_available_gb": 100.0}))
@@ -294,6 +299,27 @@ def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
                              placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
     assert m.mem_available_gb is None and "unmeasured" in ka.floor_refusal(m)
+
+
+@pytest.fixture
+def inherited_placement_home(tmp_path, monkeypatch):
+    """A PLACEMENT_HOME exported by the venue (test-gate exports ~/.hermes) whose table is unreadable."""
+    from hermes_cli.fleet_placement import placement as pl
+
+    venue = tmp_path / "venue-fleet-root"
+    (venue / pl.TABLE_REL).parent.mkdir(parents=True)
+    (venue / pl.TABLE_REL).write_text("{not json")
+    monkeypatch.setenv("PLACEMENT_HOME", str(venue))
+    return venue
+
+
+def test_an_inherited_placement_home_never_reaches_the_admit_floor(inherited_placement_home, board, monkeypatch):
+    """t_2105a835: the venue's placement table leaked a 128 GB reserve / NaN into every admit test."""
+    from hermes_cli.fleet_placement import placement as pl
+
+    assert pl.fleet_root() == kb.kanban_home()
+    _hot_local(monkeypatch, load1=10.0)
+    assert ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)["pid"] == 4242
 
 
 def test_an_unreadable_local_placement_table_refuses_instead_of_a_zero_reserve(board, monkeypatch):
@@ -961,6 +987,21 @@ def _site_triggers():
         ctx["launched"] = True                               # spawned, then the claim was gone
         return "studio", "twin", "did not spawn"
 
+    def door_held(m, ctx):
+        # The pair door answers queued_behind at launch: the claim returns, no process starts.
+        from hermes_cli import kanban_priority_door as kpd
+        ctx["admitted"] = True                               # the override event precedes the launch
+        m.setattr(kpd, "spawn", lambda *a, **k: (_ for _ in ()).throw(kpd.DoorHeld("queued_behind (test)")))
+        return "studio", "twin", "held: queued_behind \\(test\\)"
+
+    def door_hold(m, ctx):
+        # Door mode with a latched config fault / transport backoff: the tick starts nothing.
+        from hermes_cli import kanban_priority_door as kpd
+        from hermes_cli import kanban_priority_faults as kpf
+        m.setattr(kpd, "enabled", lambda: True)
+        m.setattr(kpf, "hold_reason", lambda: "door latched (test)")
+        return "studio", "twin", "total:door_hold"
+
     # HOST ADMISSION: the one axis admit turns off. The tick refuses, admit spawns.
     def load_gate_paused(m, ctx):
         m.setattr(kbd, "_route_first_enabled", lambda: False)
@@ -1043,6 +1084,8 @@ def _site_triggers():
         "continue: _btok is not None": join_refused,
         "continue: _btok is None and (not _kb._claim_still_held(conn, claimed))": join_claim_lost,
         "fail: except Exception (try: result.browser_joins.get)": launch,
+        "fail: except DoorHeld (try: result.browser_joins.get)": door_held,
+        "return: _door_hold": door_hold,
         "continue: outcome == _LAUNCH_NOT_OWNED": launch_not_owned,
         "continue: outcome == _LAUNCH_CLAIM_LOST": launch_claim_lost,
         "return: (spillover is None or spillover.budget <= 0) and (not route_first)": load_gate_paused,

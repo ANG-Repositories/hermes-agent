@@ -1046,6 +1046,11 @@ def _relay_verdict(c: _Ctx) -> Optional[Verdict]:
         relay_class, _src = _relay_error_class(c.error)
     except Exception:  # noqa: BLE001
         relay_class = None
+    if relay_class == "conn" and any(p in c.msg for p in _CONTEXT_OVERFLOW_PATTERNS):
+        # The relay stamps ``conn`` on EVERY bridge 500, including the CLI's deterministic
+        # "Prompt is too long" result. Read as transport it replays the same oversized request
+        # until the retries run out (Agora 2026-11-07); let the status/text pipeline see it.
+        return None
     verdict = _RELAY_CLASS_VERDICTS.get(relay_class) if relay_class else None
     if verdict is not None:
         return verdict
