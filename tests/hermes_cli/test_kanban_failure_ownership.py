@@ -1,5 +1,11 @@
 """Disposable-board acceptance for the inert authority (never the fleet board)."""
 import json
+import itertools
+import multiprocessing
+import os
+import signal
+import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -36,3 +42,177 @@ def test_disabled_does_not_create_or_wake(board):
     assert result.action == 'DISABLED'
     assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
     assert board.execute('SELECT count(*) FROM task_events').fetchone()[0] == 0
+
+
+def enroll(conn):
+    # Test-only direct policy seeding. Production enrollment has NO public API.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE failure_producers SET enabled=1,enrolled=1")
+        conn.execute("UPDATE failure_authority SET mode='on'")
+
+
+def observation(source='red', result='failure', sha='a', **kw):
+    return fo.Observation(key=key(), source_key=source, result=result, sha=sha*40,
+                          run_id=kw.pop('run_id', 1), attempt=1, job_id=1,
+                          lineage=('a'*40,'b'*40,'c'*40), policy_generation=1,
+                          complete=result=='pass', **kw)
+
+
+def publish(conn, obs):
+    return fo.publish_evidence(conn, json.dumps(fo.asdict(obs)).encode(), verifier=lambda _:obs)
+
+
+def admit(conn, obs, producer='ci-red-owner'):
+    card = fo.prepare_card(conn,title='repair',body='bounded action; acceptance: test_x',
+                           assignee=None,session_id='operator')
+    return fo.observe_failure(conn,publish(conn,obs),producer=producer,card_spec=card)
+
+
+def test_atomic_replay_distinct_and_claim(board):
+    enroll(board)
+    red = observation()
+    first = admit(board,red)
+    assert first.action=='REPAIR'
+    assert admit(board,red).action=='REPLAY'
+    second = admit(board,replace(red,source_key='red2'))
+    assert second.card_id==first.card_id
+    distinct = admit(board,replace(red,key=key('tests/test_x.py::test_a'),source_key='other'))
+    assert distinct.card_id != first.card_id
+    with kb.write_txn(board):
+        board.execute('UPDATE failure_producers SET enabled=0,enrolled=0')
+        assert fo.recheck_for_claim(board,first.card_id).action=='claim'
+        assert fo.recheck_for_claim(board,first.card_id,expected_revision=-1).action=='retry'
+        assert kb._claim_and_open_run(board,first.card_id,'ready','scratch:1',200,100)
+    assert board.execute('SELECT count(*) FROM task_runs').fetchone()[0]==1
+
+
+def test_healed_shared_claim_creates_zero_runs(board):
+    enroll(board)
+    red = admit(board,observation())
+    heal = admit(board,observation('green','pass','b',run_id=2))
+    assert heal.action=='HEALED'
+    with kb.write_txn(board):
+        assert fo.recheck_for_claim(board,red.card_id).action=='healed'
+        assert kb._claim_and_open_run(board,red.card_id,'ready','scratch:1',200,100) is None
+    assert board.execute('SELECT count(*) FROM task_runs').fetchone()[0]==0
+    assert board.execute('SELECT workspace_path FROM tasks').fetchone()[0] is None
+
+
+@pytest.mark.parametrize('order',list(itertools.permutations(range(3))))
+def test_late_healing_boundary_and_recurrence(board,order):
+    enroll(board)
+    observations=[observation('A'),observation('B','pass','b',run_id=2),observation('C','failure','c',run_id=3)]
+    for i in order:
+        admit(board,observations[i])
+    episodes=board.execute('SELECT state,healed_obs,predecessor FROM failure_episodes ORDER BY generation').fetchall()
+    assert len(episodes)==2
+    assert sorted(r['state'] for r in episodes)==['active','healed']
+    assert board.execute("SELECT count(*) FROM failure_bindings b JOIN failure_episodes e USING(episode_id) WHERE b.state='bound' AND e.state='active'").fetchone()[0]==1
+    count=board.execute('SELECT count(*) FROM tasks').fetchone()[0]
+    assert admit(board,observations[0]).action=='REPLAY'
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==count
+
+
+def test_invalid_receipts_missing_blob_and_stale_policy(board):
+    ref=publish(board,observation())
+    for forged in (True,fo.EvidenceRef('forged',ref.digest),fo.EvidenceRef(ref.token,'0'*64)):
+        with pytest.raises(ValueError):
+            fo.observe_failure(board,forged,producer='ci-red-owner')
+    blob=fo._blob_root(board)/ref.digest
+    blob.unlink()
+    with pytest.raises(FileNotFoundError):
+        fo.observe_failure(board,ref,producer='ci-red-owner')
+    ref=publish(board,observation('again'))
+    with kb.write_txn(board):
+        board.execute('UPDATE failure_authority SET policy_generation=2')
+    with pytest.raises(ValueError,match='stale evidence policy'):
+        fo.observe_failure(board,ref,producer='ci-red-owner')
+    assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0]==0
+
+
+def test_unknown_force_push_and_skipped_preserve_failure(board):
+    enroll(board)
+    red=admit(board,observation())
+    unknown=admit(board,replace(observation('skip'),result='unknown',complete=False,reason='skipped',retry_cursor='page:2'))
+    assert unknown.action=='EVIDENCE_PENDING'
+    assert board.execute('SELECT retry_state FROM failure_unresolved').fetchone()[0]
+    admit(board,replace(observation('force','pass','b'),lineage=('b'*40,)))
+    with kb.write_txn(board):
+        assert fo.recheck_for_claim(board,red.card_id).action=='claim'
+    with pytest.raises(ValueError,match='incomplete'):
+        publish(board,replace(observation('badpass','pass','b'),complete=False))
+
+
+def test_terminal_delete_reopen_and_adopt_cas(board):
+    enroll(board)
+    red=admit(board,observation())
+    with kb.write_txn(board):
+        with pytest.raises(sqlite3.IntegrityError):
+            board.execute('DELETE FROM tasks WHERE id=?',(red.card_id,))
+        board.execute("UPDATE tasks SET status='done' WHERE id=?",(red.card_id,))
+    pending=board.execute("SELECT * FROM failure_bindings WHERE state='pending'").fetchone()
+    assert pending is not None
+    replacement=admit(board,observation('replacement'))
+    assert replacement.card_id != red.card_id
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status='ready' WHERE id=?",(red.card_id,))
+        assert fo.recheck_for_claim(board,red.card_id).action=='healed'
+    assert fo.adopt_owner(board,replacement.episode_id,red.card_id,expected_revision=-1,provenance_ref=publish(board,observation('adopt'))).action=='retry'
+
+
+def test_pending_validation_never_claims_owned(board):
+    enroll(board)
+    result=fo.observe_failure(board,publish(board,observation()),producer='ci-red-owner',card_spec=None)
+    assert result.action=='EVIDENCE_PENDING' and result.card_id is None
+    assert board.execute("SELECT count(*) FROM failure_bindings WHERE state='pending'").fetchone()[0]==1
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==0
+
+
+def test_legacy_writer_floor(board):
+    # Old ordinary semantics remain unchanged until a producer is enrolled.
+    with kb.write_txn(board):
+        kb._insert_task_row(board,dict(id='old',title='old',status='ready',created_at=1,created_by='ci-red-owner'))
+    enroll(board)
+    with pytest.raises(sqlite3.IntegrityError,match='incompatible writer'):
+        with kb.write_txn(board):
+            kb._insert_task_row(board,dict(id='bypass',title='bad',status='ready',created_at=1,created_by='ci-red-owner'))
+    assert admit(board,observation()).action=='REPAIR'
+
+
+def _race_worker(path,root,index,barrier,queue):
+    assert Path(path).resolve().is_relative_to(Path(root).resolve())
+    conn=kb.connect(Path(path))
+    try:
+        obs=observation('race-'+str(index))
+        ref=publish(conn,obs)
+        card=fo.prepare_card(conn,title='repair',body='action and acceptance',assignee=None,session_id='operator')
+        barrier.wait(timeout=90)
+        result=fo.observe_failure(conn,ref,producer=fo.PRODUCERS[index%4],card_spec=card)
+        queue.put((result.action,result.card_id))
+    finally:
+        conn.close()
+
+
+def test_real_32_process_four_producer_race(board):
+    enroll(board)
+    path=board.execute('PRAGMA database_list').fetchone()[2]
+    root=str(Path(path).parent)
+    ctx=multiprocessing.get_context('spawn')
+    barrier=ctx.Barrier(32)
+    queue=ctx.Queue()
+    children=[ctx.Process(target=_race_worker,args=(path,root,i,barrier,queue)) for i in range(32)]
+    try:
+        for child in children: child.start()
+        results=[queue.get(timeout=150) for _ in children]
+        for child in children:
+            child.join(timeout=10)
+            assert child.exitcode==0
+        assert len({r[1] for r in results})==1
+        assert sum(r[0]=='REPAIR' for r in results)==1
+        assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0]==32
+        assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==1
+        print('32 processes / 4 producer labels: one card, 32 observations; parent pid',os.getpid())
+    finally:
+        for child in children:
+            if child.is_alive(): child.kill()
+            child.join(timeout=5)

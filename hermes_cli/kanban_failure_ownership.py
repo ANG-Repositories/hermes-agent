@@ -265,7 +265,9 @@ def _reduce(conn,key_id,obs_id,obs):
     values = [dict(json.loads(r['data']), obs_id=r['obs_id']) for r in rows]
     lineage = obs.lineage
     ambiguous = len(set(lineage)) != len(lineage) or any(
-        _order(a,b,lineage) is None for i,a in enumerate(values) for b in values[i+1:])
+        _order(a,b,lineage) is None or
+        (_order(a,b,lineage) == 0 and a['result'] != b['result'])
+        for i,a in enumerate(values) for b in values[i+1:])
     if any(v['sha'] not in lineage for v in values):
         ambiguous = True
     old = conn.execute("SELECT * FROM failure_episodes WHERE key_id=? AND state='active'", (key_id,)).fetchone()
