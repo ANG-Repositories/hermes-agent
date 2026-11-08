@@ -93,3 +93,95 @@ async def test_incomplete_limit_is_configurable(tmp_path, monkeypatch):
     assert not decision["should_continue"]
     assert mgr.state.waiting_until > 0
     assert decision["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_minutes,goal_minutes", [(0, -1), (30, 0)])
+async def test_retry_wakes_with_checkins_disabled(tmp_path, monkeypatch, global_minutes, goal_minutes):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayGoalsMixin()
+    runner.config = {"goals": {"checkin_minutes": global_minutes}}
+    runner._run_in_executor_with_context = asyncio.to_thread
+    runner._warm_goals_session_db = AsyncMock()
+    entry = SimpleNamespace(session_id="retry-off", origin=object(), suspended=False)
+    runner.session_store = SimpleNamespace(list_sessions=lambda: [entry])
+    prompts = []
+
+    async def wake(entry, minutes, max_checkins):
+        mgr = await asyncio.to_thread(goals.GoalManager, entry.session_id)
+        prompts.append(await asyncio.to_thread(
+            mgr.idle_wake_prompt, deadline, checkin_minutes=minutes, max_checkins=max_checkins))
+
+    runner._goal_idle_wake_one = wake
+    mgr = await asyncio.to_thread(goals.GoalManager, entry.session_id)
+    await asyncio.to_thread(mgr.set, "ship it")
+    await asyncio.to_thread(mgr.set_checkin_minutes, goal_minutes)
+    await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
+    deadline = mgr.state.waiting_until
+    assert mgr.idle_wake_prompt(deadline - 1, checkin_minutes=global_minutes) is None
+    await runner._goal_idle_wake_scan()
+    assert prompts and prompts[0]
+    mgr = await asyncio.to_thread(goals.GoalManager, entry.session_id)
+    assert mgr.idle_wake_prompt(deadline + 3600, checkin_minutes=global_minutes) is None
+    await asyncio.to_thread(mgr.wait_for_seconds, 1, "deployment")
+    assert mgr.idle_wake_prompt(mgr.state.waiting_until, checkin_minutes=global_minutes) is None
+
+
+@pytest.mark.parametrize("reset", ["completed", "human"])
+@pytest.mark.parametrize("barrier", ["timer", "session", "pid"])
+def test_reset_preserves_unrelated_wait(tmp_path, monkeypatch, reset, barrier):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mgr = goals.GoalManager("wait-owner")
+    mgr.set("ship it")
+    mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+    if barrier == "timer":
+        mgr.wait_for_seconds(3600, "deployment")
+    elif barrier == "session":
+        mgr.wait_on_session("deployment", "deployment")
+    else:
+        monkeypatch.setattr(goals, "_pid_alive", lambda pid: True)
+        mgr.wait_on(12345, "deployment")
+    before = (mgr.state.waiting_until, mgr.state.waiting_on_pid, mgr.state.waiting_on_session,
+              mgr.state.waiting_reason, mgr.state.waiting_since)
+    with patch.object(goals, "judge_goal") as judge:
+        decision = mgr.evaluate_after_turn(
+            "made progress", turn_completed=reset == "completed", human_message=reset == "human")
+    assert (mgr.state.waiting_until, mgr.state.waiting_on_pid, mgr.state.waiting_on_session,
+            mgr.state.waiting_reason, mgr.state.waiting_since) == before
+    assert not decision["should_continue"]
+    judge.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["dict", "text", "streamed"])
+@pytest.mark.parametrize("failed,interrupted", [(False, False), (True, False), (False, True)])
+async def test_iteration_handoff_is_counted_not_retried(tmp_path, monkeypatch, delivery, failed, interrupted):
+    from gateway.run_turn import GatewayTurnMixin
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayGoalsMixin()
+    runner.config = {}
+    runner._run_in_executor_with_context = asyncio.to_thread
+    runner.async_session_store = SimpleNamespace(get_or_create_session=AsyncMock(
+        return_value=SimpleNamespace(session_id="handoff")))
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._delivery_adapter_for = lambda source: None
+    runner._session_key_for_source = lambda source: "test"
+    event = SimpleNamespace(text="[Continuing toward your standing goal]\nGoal: ship it", internal=True)
+    result = {"completed": False, "failed": failed, "interrupted": interrupted,
+              "turn_exit_reason": "max_iterations_reached(1/1)", "final_response": "saved implementation"}
+    with patch("gateway.run_turn.diagnostic_wake_muted", return_value=True):
+        await GatewayTurnMixin()._hmwa_deliver_turn_response(
+            event, None, None, "test", 1, result, [], "", "", False)
+    event._streamed_final_response = result["final_response"] if delivery == "streamed" else ""
+    mgr = await asyncio.to_thread(goals.GoalManager, "handoff")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=1)
+    with patch.object(goals, "judge_goal", return_value=("continue", "more", False, None, False)) as judge:
+        await runner._run_post_turn_hooks(
+            agent_result=result if delivery == "dict" else (result["final_response"] if delivery == "text" else None),
+            source=SimpleNamespace(chat_id="origin"), is_internal=True, event=event, parts=("goal continuation",))
+    mgr = await asyncio.to_thread(goals.GoalManager, "handoff")
+    productive = not failed and not interrupted
+    assert mgr.state.turns_used == int(productive)
+    assert judge.call_count == int(productive)
+    assert mgr.state.status == ("paused" if productive else "active")
