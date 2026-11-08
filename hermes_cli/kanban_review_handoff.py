@@ -11,9 +11,9 @@ def record_reopened_candidate(conn, task_id, *, actor, reviewer, reason, run_id)
         "SELECT profile, metadata FROM task_runs WHERE task_id = ? AND id = ?",
         (task_id, run_id),
     ).fetchone() if run_id is not None else None
-    implementer = kb._nonblank_str(run["profile"]) if run is not None else None
-    if implementer is None:
-        implementer = kb._nonblank_str(payload.get("implementer"))
+    implementer = kb._nonblank_str(payload.get("implementer"))
+    if implementer is None and run is not None:
+        implementer = kb._nonblank_str(run["profile"])
     # A never-run candidate is bound to the operator-selected implementer, not
     # to the reviewer the reopen is about to assign.
     if implementer is None:

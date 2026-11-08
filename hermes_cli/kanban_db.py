@@ -16142,8 +16142,11 @@ def reopen_task(
         ).fetchone()
         if to_status == "review":
             from hermes_cli.kanban_review_handoff import record_reopened_candidate
-            record_reopened_candidate(conn, task_id, actor=actor, reviewer=review_assignee,
-                                      reason=reason, run_id=int(candidate_run["id"]) if candidate_run else None)
+            try:
+                record_reopened_candidate(conn, task_id, actor=actor, reviewer=review_assignee,
+                                          reason=reason, run_id=int(candidate_run["id"]) if candidate_run else None)
+            except ValueError as exc:
+                return False, str(exc)
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
