@@ -97,10 +97,25 @@ BEGIN SELECT RAISE(ABORT,'failure_authority: incompatible writer; retain source 
 
 
 def migrate(conn):
-    conn.executescript(SCHEMA)
-    conn.executemany('INSERT OR IGNORE INTO failure_producers(producer) VALUES(?)',
-                     ((p,) for p in PRODUCERS))
-    conn.commit()
+    # executescript commits before running: execute complete statements inside a
+    # savepoint instead, preserving a caller's transaction and atomic trigger DDL.
+    conn.execute('SAVEPOINT failure_schema_migration')
+    try:
+        statement = ''
+        for line in SCHEMA.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                conn.execute(statement)
+                statement = ''
+        if statement.strip():
+            raise ValueError('incomplete failure authority schema')
+        conn.executemany('INSERT OR IGNORE INTO failure_producers(producer) VALUES(?)',
+                         ((p,) for p in PRODUCERS))
+        conn.execute('RELEASE failure_schema_migration')
+    except BaseException:
+        conn.execute('ROLLBACK TO failure_schema_migration')
+        conn.execute('RELEASE failure_schema_migration')
+        raise
 
 
 def _json(value):
@@ -302,8 +317,16 @@ def _reduce(conn,key_id,obs_id,obs):
     # Incomparable passes add uncertainty, not a new red or revoked boundary.
     values = [v for v in values if v['result'] == 'failure' or
               all(compare(v, f) is not None for f in failures)]
-    ambiguous = any(compare(a, b) is None or
-                    (compare(a, b) == 0 and a['result'] != b['result'])
+    def segment_order(a, b):
+        order = compare(a, b)
+        # Unordered passes with identical relationships to every failure define
+        # the same healing cut. Tie-break only their representation, not evidence.
+        if order is None and a['result'] == b['result'] == 'pass' and all(
+                compare(a, f) == compare(b, f) for f in failures):
+            return (a['source_key'] > b['source_key']) - (a['source_key'] < b['source_key'])
+        return order
+    ambiguous = any(segment_order(a, b) is None or
+                    (segment_order(a, b) == 0 and a['result'] != b['result'])
                     for i, a in enumerate(values) for b in values[i+1:])
     old = conn.execute("SELECT * FROM failure_episodes WHERE key_id=? AND state='active'", (key_id,)).fetchone()
     if ambiguous:
@@ -314,7 +337,7 @@ def _reduce(conn,key_id,obs_id,obs):
             'SELECT m.obs_id FROM failure_memberships m JOIN failure_episodes e USING(episode_id) WHERE e.key_id=? AND e.healed_obs IS NOT NULL', (key_id,))}
         values = [v for v in failures if v['obs_id'] not in healed]
     else:
-        values.sort(key=cmp_to_key(compare))
+        values.sort(key=cmp_to_key(segment_order))
     segments, current = [], None
     for value in values:
         if value['result']=='failure':
@@ -394,7 +417,7 @@ def _bind(conn,episode,obs,card,producer):
     try:
         with write_txn(conn,allow_nested=True):
             tid = _create_owner(conn,card,producer)
-            conn.execute("UPDATE failure_bindings SET card_id=?,state='bound',generation=generation+1 WHERE binding_id=?",(tid,bid))
+            conn.execute("UPDATE failure_bindings SET card_id=?,state='bound',detector_only=1,generation=generation+1 WHERE binding_id=?",(tid,bid))
     except (ValueError,kb.MintCapError) as exc:
         conn.execute('UPDATE failure_bindings SET reason=? WHERE binding_id=?',(str(exc),bid))
         return Decision('EVIDENCE_PENDING',episode['key_id'],episode['episode_id'],revision=episode['revision'],reason=str(exc))

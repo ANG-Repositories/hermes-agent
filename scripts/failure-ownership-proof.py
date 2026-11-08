@@ -39,6 +39,8 @@ def main():
                '--basetemp', str(root / 'pytest')]
     env = dict(os.environ, HERMES_HOME=str(root / 'home'), TMPDIR=str(root))
     env.pop('HERMES_KANBAN_DB', None)
+    # A proof arm must execute its pinned test, regardless of caller pytest flags.
+    env.pop('PYTEST_ADDOPTS', None)
     started = time.monotonic()
     with (root / 'output.log').open('wb') as output:
         child = subprocess.Popen(command, cwd=repo, env=env, stdin=subprocess.DEVNULL,
