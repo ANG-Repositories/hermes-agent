@@ -31,6 +31,10 @@ def _neutral_local_host(monkeypatch):
     not depend on which runner it lands on (a runner named ``ci`` is a ci-box alias in these fixtures)."""
     import socket
     monkeypatch.setattr(socket, "gethostname", lambda: "fwa-test-runner.lan")
+    monkeypatch.setattr(socket, "getfqdn", lambda name="": name)     # hermetic: no resolver lookup
+    monkeypatch.setattr(kph, "_FQDN_MEMO", {})
+
+
 HID = "20261107T150000Z-ci-box-fwa00001"
 
 
@@ -694,3 +698,88 @@ def test_local_fence_is_off_under_the_kill_switch(home, monkeypatch):
         _hold(home)
         _res, spawned = _tick(conn, _plan())
         assert tid in {t for t, _ in spawned}, spawned
+
+
+# -- round 5 (Prism round 3 @ 18481866: b256ef26919e / 34935fb58782 / 9fb3e16068f3) ---------------------------------
+
+def _deleg_board():
+    from hermes_cli import kanban_delegations_board as kdb
+    kb.create_board(kdb.DELEGATIONS_BOARD)
+    return kdb.DELEGATIONS_BOARD
+
+
+def test_spawn_now_refuses_a_local_start_on_a_held_host(home, monkeypatch):
+    """b256ef26919e: the immediate delegation path (spawn_now) starts locally; an origin-less unit must not open a run
+    while the dispatcher's host carries a live fwa kanban hold."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    board = _deleg_board()
+    _local_is(monkeypatch, "ci-box")
+    _hold(home)
+    calls = []
+    with kb.connect_closing(board=board) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="alpha")
+        with pytest.raises(kbd.SpawnNowError, match=r"pause_hold \(ci-box:fwa:.*stage=destination\)"):
+            kbd.spawn_now(conn, tid, board=board, spawn_fn=lambda *a, **k: calls.append(a) or 4242)
+        task = kb.get_task(conn, tid)
+        assert calls == [] and task.status == "ready" and task.current_run_id is None
+
+
+def test_spawn_now_starts_on_an_unheld_host_and_under_the_kill_switch(home, monkeypatch):
+    from hermes_cli import kanban_db_dispatch as kbd
+    board = _deleg_board()
+    _local_is(monkeypatch, "ci-box")
+    _hold(home)
+    _source(monkeypatch, "manifest")                    # dormant == identical
+    with kb.connect_closing(board=board) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="alpha")
+        assert kbd.spawn_now(conn, tid, board=board, spawn_fn=lambda *a, **k: 4242) == 4242
+
+
+def test_held_local_review_reserves_no_capacity_ahead_of_a_runnable_ready_card(home, monkeypatch):
+    """34935fb58782: an origin-less review on a held local host cannot start, so it must not take the one spawn slot
+    ahead of a lower-priority ready card pinned to an unheld remote host. Before the fix neither ran."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    _local_is(monkeypatch, "ci-box")
+    with kb.connect_closing() as conn:
+        rid = kb.create_task(conn, title="review", assignee="alpha", body="do the thing", priority=10)
+        _set(conn, rid, status="review", origin_host=None)
+        tid = kb.create_task(conn, title="pinned", assignee="alpha", body="host: ace-ai\ndo the thing", priority=0)
+        _set(conn, tid, status="ready", origin_host=None)
+        _hold(home)
+        spawned = []
+
+        def spawn(task, workspace, *, board=None, placement=None):
+            spawned.append((task.id, placement.name if placement else "studio"))
+            return 4242
+
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=1, spawn_limit=8, spillover=_plan(),
+                                reconcile_orphans=False)
+        assert (tid, "ace-ai") in spawned, (spawned, res.placement_waits)
+        assert "stage=destination" in res.placement_waits.get(rid, ""), res.placement_waits
+        assert _runs(conn, rid) == 0
+
+
+def test_local_fence_reads_the_resolved_fqdn(home, monkeypatch):
+    """9fb3e16068f3: ``gethostname`` returns a short name the registry does not know; the resolved FQDN carries the
+    held host's name. The local fence must check the full resolved name, not only the stripped short form."""
+    import socket
+    _registry(home, {"ci-box": {"aliases": ["ci-box.tail0000.ts.net"]}})
+    monkeypatch.setattr(socket, "gethostname", lambda: "ci")
+    monkeypatch.setattr(socket, "getfqdn", lambda name="": "ci-box.tail0000.ts.net" if name == "ci" else name)
+    _hold(home)
+    assert kph.local_names() == ["ci", "ci-box", "ci-box.tail0000.ts.net"]
+    why = kph.local_destination_wait({})
+    assert why is not None and "stage=destination" in why, why
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "do the thing")
+        _res, spawned = _tick(conn, _plan())
+        assert tid not in {t for t, _ in spawned}, spawned
+
+
+def test_fqdn_is_resolved_once_per_process(home, monkeypatch):
+    import socket
+    calls = []
+    monkeypatch.setattr(socket, "getfqdn", lambda name="": calls.append(name) or name)
+    for _ in range(3):
+        kph.local_names()
+    assert calls == ["fwa-test-runner.lan"]

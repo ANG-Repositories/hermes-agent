@@ -56,6 +56,7 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # hostname, so on a pool host (ace-ai) `local` would otherwise BE that host.
     import socket
     monkeypatch.setattr(socket, "gethostname", lambda: LOCAL_NAME)
+    monkeypatch.setattr(socket, "getfqdn", lambda name="": name)   # the local fence's FQDN read: no resolver
     kb.init_db()
     # The placement table (mem_reserve_gb, threads) is this test's, never the host's:
     # fleet_root() honours PLACEMENT_HOME first, and test-gate exports the live root (t_2105a835).

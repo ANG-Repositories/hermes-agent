@@ -423,11 +423,46 @@ def local_host() -> str:
         return ""
 
 
+_FQDN_MEMO: dict = {}
+
+
+def _fqdn(name: str) -> str:
+    """``socket.getfqdn(name)`` once per process per hostname (a resolver lookup; never per tick on the hot path)."""
+    if name not in _FQDN_MEMO:
+        import socket
+        try:
+            _FQDN_MEMO[name] = str(socket.getfqdn(name) or "")
+        except Exception:
+            _FQDN_MEMO[name] = ""
+    return _FQDN_MEMO[name]
+
+
+def local_names() -> list:
+    """Every name the dispatcher's own host may be held under, short form first: ``gethostname()`` and its resolved
+    FQDN, each as written and with the domain stripped (Prism 9fb3e16068f3: a host whose ``gethostname`` is short
+    but whose registry/hold name is only reachable from the full name must still be fenced). Lower-cased, de-duped."""
+    import socket
+    try:
+        raw = str(socket.gethostname() or "").strip().lower()
+    except OSError:
+        raw = ""
+    out: list = []
+    for full in (raw, _fqdn(raw).strip().lower() if raw else ""):
+        for n in (full.split(".", 1)[0], full):
+            if n and n not in out:
+                out.append(n)
+    return out
+
+
 def local_destination_wait(cache: dict) -> Optional[str]:
-    """:func:`destination_wait` for a LOCAL start (no pool host chosen: a local route or the last-resort fallback,
-    Prism fe6a1ad69c44). An unknown hostname is no destination check (the origin fence still applies)."""
-    host = local_host()
-    return destination_wait(host, cache) if host else None
+    """:func:`destination_wait` for a LOCAL start (no pool host chosen: a local route, the last-resort fallback,
+    Prism fe6a1ad69c44, or an immediate ``spawn_now`` launch, Prism b256ef26919e), over every name in
+    :func:`local_names`. An unknown hostname is no destination check (the origin fence still applies)."""
+    for host in local_names():
+        why = destination_wait(host, cache)
+        if why is not None:
+            return why
+    return None
 
 
 def held_destinations(names, cache: dict) -> dict:

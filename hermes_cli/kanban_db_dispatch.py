@@ -4456,6 +4456,11 @@ def spawn_now(
 def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spawn_fn) -> int:
     from hermes_cli import kanban_pause_hold as _kph
 
+    # The immediate path always starts LOCALLY: the dispatcher's own host is the destination, so the same local
+    # fence as a tick's local start applies before any run opens (Prism b256ef26919e). Off under the kill switch.
+    _local_wait = _kph.local_destination_wait({})
+    if _local_wait is not None:
+        raise SpawnNowError(f"{task_id}: pause hold: {_local_wait}")
     try:
         claimed = _kb.claim_task(conn, task_id)
     except _kph.PauseHeld as exc:
@@ -6765,6 +6770,24 @@ def _dispatch_once_locked(
                                      lane="review", planned=spillover is not None, entry=entry,
                                      pins_out=_review_pause_pins,
                                      pool=spillover.config if spillover is not None else None, caps=_caps)
+        # FWA destination fence BEFORE any review reservation (Prism 34935fb58782): a review that cannot start
+        # this tick must not hold budget ahead of ready rows (``_review_ahead``) or a pool admission
+        # (``review_pool_reserve``). Only rows held on EVERY route they could take are dropped here; a review whose
+        # route is decided in the loop (continuation origin vs local) keeps the in-loop check below.
+        _kept_reviews = []
+        for _rrow in review_rows:
+            if _rrow["id"] in _review_pause_pins:
+                _rwhy = _kph.destination_wait(_review_pause_pins[_rrow["id"]], _pause_cache)
+            elif _rrow["origin_host"] and _kcont_lost.mode(_root_kanban_cfg()) == "enforce":
+                _rwhy = _kph.destination_wait(_rrow["origin_host"], _pause_cache)
+                _rwhy = _rwhy if _rwhy is not None and _kph.local_destination_wait(_pause_cache) is not None else None
+            else:
+                _rwhy = _kph.local_destination_wait(_pause_cache)
+            if _rwhy is not None:
+                result.placement_waits[_rrow["id"]] = _rwhy
+                continue
+            _kept_reviews.append(_rrow)
+        review_rows = _kept_reviews
     # Review-lane fairness (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews. Priority settles
