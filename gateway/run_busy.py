@@ -435,13 +435,22 @@ class GatewayBusySessionMixin:
             if session_key not in pending.values():
                 locks.pop(session_key, None)
 
+    async def _active_session_io(self, fn, *args):
+        # The registry already serializes every write at flock. Queue on the
+        # loop instead of consuming a shared executor thread per lock waiter.
+        lock = getattr(self, "_active_session_io_lock", None)
+        if lock is None:
+            lock = self._active_session_io_lock = asyncio.Lock()
+        async with lock:
+            return await asyncio.to_thread(fn, *args)
+
     async def _await_active_session_claim(self, session_key, source):
         """Keep ownership until a cancelled worker has returned its exact lease.
 
         Cancelling an executor await does not stop its thread. Shield and join it,
         including repeated cancellation, before unwinding the pending generation.
         """
-        worker = asyncio.create_task(asyncio.to_thread(
+        worker = asyncio.create_task(self._active_session_io(
             self._claim_active_session_slot, session_key, source,
         ))
         cancelled = False
@@ -479,7 +488,7 @@ class GatewayBusySessionMixin:
             return existing
         async def release():
             try:
-                await asyncio.to_thread(lease.release)
+                await self._active_session_io(lease.release)
             except Exception:
                 # Cleanup must not replace a completed reply, the turn's error,
                 # or cancellation. Keep the durable failure visible in the log.

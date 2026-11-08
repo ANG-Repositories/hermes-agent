@@ -2330,6 +2330,7 @@ class GatewayShutdownMixin:
     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
         from gateway.run import GatewayRunner
+        await self._preserve_pending_session_claims()
         for _task in list(self._background_tasks):
             # _restart_task awaits _stop_task: cancelling it would tunnel into _stop_impl and skip _shutdown_event.set().
             if _task is self._stop_task or _task is self._restart_task:
@@ -2341,7 +2342,6 @@ class GatewayShutdownMixin:
         self._background_tasks.clear()
         # Acquisitions own their worker until it returns, even when cancelled.
         # Join them before draining the durable releases they may enqueue.
-        await self._preserve_pending_session_claims()
         _claims = tuple(getattr(self, "_active_session_claim_tasks", ()))
         for _claim in _claims:
             _claim.cancel()
