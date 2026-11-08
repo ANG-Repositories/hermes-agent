@@ -106,7 +106,7 @@ def parse_card(body):
             plan.extend(lines)
         elif h.startswith("declared file scope") or h.startswith("scope"):
             continue
-        elif any(RULING_RE.match(x) for x in lines):
+        elif h.rstrip(":").strip() in ("ruling", "rulings") or any(RULING_RE.match(x) for x in lines):
             rulings.extend(lines)
         else:
             if ask:
@@ -182,10 +182,14 @@ def card_from_board(conn, task_id: str) -> Optional[dict]:
     row = conn.execute("SELECT id, title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if not row:
         return None
+    from hermes_cli.kanban_identity import is_operator_label
+
     body = str(row[2] or "")
     rulings = []
-    for (text,) in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)).fetchall():
+    for text, author in conn.execute(
+            "SELECT body, author FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)).fetchall():
+        if not is_operator_label(author):
+            continue
         text = str(text or "").strip()
         if text and COMMENT_RULING_RE.match(text.splitlines()[0]):
             # One paragraph per comment: the renderer splits on blank lines and classifies a paragraph by
@@ -229,7 +233,11 @@ def library_path() -> Optional[Path]:
 def render(card: dict, verification: list) -> tuple:
     """-> (section, renderer) where renderer is ``library`` or ``fallback``."""
     lib = library_path()
-    if lib is not None:
+    # Older fleet libraries classify heading-only rulings as ask and clip them.
+    # Keep those cards on the corrected renderer until the shared library catches up.
+    heading_rulings = any((head or "").lower().rstrip(":").strip() in ("ruling", "rulings")
+                         for head, _lines in _blocks(card.get("body", "")))
+    if lib is not None and not heading_rulings:
         tmp = []
         try:
             for payload in (json.dumps({"task": card}), "\n".join(verification)):

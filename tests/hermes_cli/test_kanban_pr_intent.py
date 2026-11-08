@@ -192,7 +192,7 @@ def test_end_marker_in_card_text_round_trips():
 def test_rulings_come_from_ruling_comments_and_verification_from_handback(tmp_path):
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE tasks (id TEXT, title TEXT, body TEXT)")
-    conn.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT)")
+    conn.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT, author TEXT DEFAULT 'apollo')")
     conn.execute("INSERT INTO tasks VALUES (?, ?, ?)", (TASK, "T", CARD_BODY))
     conn.executemany("INSERT INTO task_comments (task_id, body) VALUES (?, ?)",
                      [(TASK, "ruling: no router change\n\nsecond paragraph of the ruling"),
@@ -239,6 +239,39 @@ def test_complete_task_hands_check_an_intent_built_from_the_board(tmp_path, monk
     assert seen["status"].startswith("written")
     assert g.body.startswith(pi.START) and f"`{tid}`" in g.body
     assert "ruling: keep Prism unchanged" in g.body and "Did it." in g.body and "live-evidence: no" in g.body
+
+
+@pytest.mark.parametrize("heading", ["Rulings", "Ruling", "Rulings:"])
+def test_heading_only_rulings_survive_long_ask(heading):
+    body = "## Ask\n" + "x" * 4000 + f"\n\n## {heading}\n\nKeep v1 support.\n\nNever delete rows."
+    section = pi.build_section(TASK, "T", body)
+    assert "Keep v1 support." in section and "Never delete rows." in section
+    assert pi.parse_card(body)["rulings"] == ["Keep v1 support.", "Never delete rows."]
+
+
+def test_heading_rulings_use_corrected_renderer_even_with_old_library(monkeypatch, tmp_path):
+    lib = tmp_path / "pr_intent.py"
+    lib.write_text("raise AssertionError('old library must not render heading rulings')\n")
+    monkeypatch.setattr(pi, "library_path", lambda: lib)
+    card = _card("## Ask\n" + "x" * 4000 + "\n\n## Rulings\n\nKeep v1 support.")
+    section, renderer = pi.render(card, [])
+    assert renderer == "fallback" and "Keep v1 support." in section
+
+
+def test_untrusted_ruling_comments_are_not_published():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE tasks (id TEXT, title TEXT, body TEXT)")
+    conn.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT)")
+    conn.execute("INSERT INTO tasks VALUES (?, ?, ?)", (TASK, "T", CARD_BODY))
+    conn.executemany("INSERT INTO task_comments (task_id, author, body) VALUES (?, ?, ?)",
+                     [(TASK, author, f"ruling: from {author}") for author in
+                      ("apollo", "human:ace", "daedalus", "unverified:apollo", "", "apollo [subagent]")])
+    card = pi.card_from_board(conn, TASK)
+    assert "ruling: from apollo\n" in card["body"]
+    assert "ruling: from human:ace" in card["body"]
+    for author in ("daedalus", "unverified:apollo", "apollo [subagent]"):
+        assert f"ruling: from {author}" not in card["body"]
+    assert "ruling: from \n" not in card["body"]
 
 
 def test_no_live_github_under_pytest_without_injected_gh():
