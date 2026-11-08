@@ -233,7 +233,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
 
         expires = min(deadline if deadline is not None else float("inf"), time.monotonic() + timeout)
         gate = threading.Lock()
-        state = {"revoked": False, "outcome": "not_dispatched"}
+        state = {"revoked": False, "outcome": "not_dispatched", "response": None}
         quiesced = threading.Event()
 
         def remaining():
@@ -268,6 +268,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     try:
                         response = await self._cdp("Runtime.evaluate", params,
                             session_id=pinned_session, timeout=budget)
+                        state["response"] = response
                         state["outcome"] = "acknowledged"
                         return response
                     finally:
@@ -286,7 +287,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
 
             async def bounded():
                 try:
-                    return await asyncio.wait_for(evaluate(), timeout=remaining())
+                    budget = remaining()
+                    return await asyncio.wait_for(evaluate(), timeout=budget)
                 finally:
                     quiesced.set()
             # The loop enforces the absolute deadline. The sync timeout is a
@@ -300,6 +302,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 # still owns a coroutine capable of reaching the write boundary.
                 if not quiesced.wait(1):
                     state["outcome"] = "unknown"
+                if state["outcome"] == "acknowledged":
+                    return state["response"]
                 raise
 
         try:
@@ -308,7 +312,13 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # Deep-serializing live DOM nodes / NodeLists / Window can blow past
             # CDP's recursion guard (``Object reference chain is too long``).
             # Retry once with returnByValue=False so Chrome returns the description.
-            if target_id or dispatch_guard or not (return_by_value and "reference chain is too long" in str(exc).lower()):
+            if not target_id and dispatch_guard is None:
+                if not (return_by_value and "reference chain is too long" in str(exc).lower()):
+                    return _err(exc)
+                with gate:
+                    state["revoked"] = False
+                quiesced.clear()
+            else:
                 return {"ok": False, "outcome": state["outcome"],
                         "error": ("Browser evaluation outcome unknown; it may have run. Inspect the page before retrying."
                                   if state["outcome"] == "unknown" else "Browser evaluation was not dispatched; select a live tab and retry.")}

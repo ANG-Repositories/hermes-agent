@@ -61,6 +61,92 @@ def test_route_replaced_in_final_probe_cannot_dispatch(monkeypatch):
         t.end(token)
 
 
+@pytest.mark.parametrize('change', ['route', 'lease', 'deadline'])
+def test_supervisor_dispatch_rechecks_transaction_after_setup(monkeypatch, change):
+    import time
+    from dataclasses import replace
+    from tools.bot_desktop import lease
+    monkeypatch.setattr(t, '_routes', {})
+    monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
+    epoch = [7]
+    monkeypatch.setattr(lease, 'assert_agent_may_act', lambda profile=None: SimpleNamespace(epoch=epoch[0]))
+    route = t.record_route('task', {'BU_CDP_WS': 'ws://synthetic'}, local=True)
+    monkeypatch.setattr(t, 'selected_target', lambda _: (1, 'login'))
+    token = t.begin('task', expected_route=route)
+    tx = t._pin.get()
+    if change == 'deadline':
+        tx = replace(tx, deadline=time.monotonic() - 1)
+    sup = s.CDPSupervisor('synthetic', 'ws://synthetic')
+    sup._loop = SimpleNamespace(is_running=lambda: True)
+    sup._active, sup._page_session_id = True, 'initial'
+    calls = []
+    async def cdp(method, params=None, **kw):
+        calls.append(method)
+        if method == 'Target.getTargetInfo':
+            return {'result': {'targetInfo': {'type': 'page', 'targetId': 'login'}}}
+        if method == 'Target.attachToTarget':
+            if change == 'route':
+                t.record_route('task', {'BU_CDP_WS': 'ws://replacement'})
+            elif change == 'lease':
+                epoch[0] += 1
+            return {'result': {'sessionId': 'pinned'}}
+        return {'result': {}}
+    sup._cdp = cdp
+    monkeypatch.setattr(s, '_schedule', lambda coro, loop, **kw: asyncio.run(coro))
+    try:
+        result = sup.evaluate_runtime('synthetic-write', target_id='login', dispatch_guard=tx.dispatch)
+        assert not result['ok']
+        assert result['outcome'] == 'not_dispatched'
+        assert 'Runtime.evaluate' not in calls
+    finally:
+        t.end(token)
+
+
+@pytest.mark.platforms('posix')
+def test_isolated_probe_real_installed_harness_ipc(monkeypatch, tmp_path):
+    import socket
+    import zipfile
+    import tempfile
+    from pathlib import Path
+    wheel = Path(__file__).resolve().parents[3] / 'deps/browser_harness-0.1.13-py3-none-any.whl'
+    site = tmp_path / 'site'
+    if wheel.exists():
+        with zipfile.ZipFile(wheel) as archive:
+            archive.extractall(site)
+    else:
+        from importlib.metadata import distribution, PackageNotFoundError
+        try:
+            site = Path(distribution('browser-harness').locate_file(''))
+        except PackageNotFoundError:
+            pytest.skip('browser-harness not installed; optional downloaded wheel unavailable')
+    private_runtime = tempfile.TemporaryDirectory(prefix='bu-')
+    runtime = Path(private_runtime.name)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(runtime / 'bu.sock'))
+    server.listen()
+    server.settimeout(5)
+    requests = []
+    def serve():
+        for _ in range(2):
+            conn, _ = server.accept()
+            with conn:
+                request = json.loads(conn.recv(4096))
+                requests.append(request['meta'])
+                reply = {'pid': 123} if request['meta'] == 'ping' else {'targetId': 'login'}
+                conn.sendall(json.dumps(reply).encode() + b'\n')
+    thread = threading.Thread(target=serve)
+    thread.start()
+    monkeypatch.setattr('sysconfig.get_path', lambda _: str(site))
+    route = t.BrowserUseRoute({'BU_NAME': 'scoped', 'BH_RUNTIME_DIR': str(runtime),
+        'BH_TMP_DIR': str(runtime)}, 'ws://synthetic', False)
+    try:
+        assert t.selected_target(route) == (123, 'login')
+        thread.join(5)
+        assert requests == ['ping', 'current_tab']
+    finally:
+        server.close()
+        thread.join(5)
+
 @pytest.mark.parametrize('phase', ['setup', 'dispatch'])
 def test_real_loop_timeout_revokes_setup_or_reports_unknown(phase):
     loop = asyncio.new_event_loop()

@@ -62,9 +62,15 @@ for root in json.loads(sys.argv[1]):
         path = Path(dist.locate_file(entry)).resolve()
         if path != Path(root).resolve() / 'browser_harness' / '_ipc.py' or entry.hash.mode != 'sha256':
             continue
-        digest = base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest()).decode().rstrip('=')
-        if digest != entry.hash.value:
-            raise RuntimeError('browser-harness integrity check failed')
+        for item in files.values():
+            if not str(item).startswith('browser_harness/') or item.hash is None:
+                continue
+            installed = Path(dist.locate_file(item)).resolve()
+            if not installed.is_relative_to(Path(root).resolve()) or item.hash.mode != 'sha256':
+                raise RuntimeError('browser-harness invalid installation record')
+            digest = base64.urlsafe_b64encode(hashlib.sha256(installed.read_bytes()).digest()).decode().rstrip('=')
+            if digest != item.hash.value:
+                raise RuntimeError('browser-harness integrity check failed')
         sys.path.insert(0, str(Path(root).resolve()))
         break
     else:

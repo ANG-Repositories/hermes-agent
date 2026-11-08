@@ -174,6 +174,7 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         return {"success": True, "result": sup.get("result")}
     return {
         "success": False,
+        "outcome": sup.get("outcome", "unknown"),
         "error_type": "supervisor_required"
         if "supervisor" in str(sup.get("error") or "").lower()
         else "eval_failed",
@@ -411,7 +412,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
     del code
     if not result.get("success"):
-        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+        return json.dumps({"success": False, "outcome": result.get("outcome", "unknown"),
+                           "error": str(result.get("error") or "fill failed")[:200]})
     parsed = _parse_json_result(result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
@@ -598,7 +600,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         )
     if not fill_result.get("success"):
         err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
-        out = {"success": False, "error": err}
+        out = {"success": False, "error": err, "outcome": fill_result.get("outcome", "unknown")}
         if fill_result.get("error_type"):
             out["error_type"] = fill_result["error_type"]
         return json.dumps(out)
