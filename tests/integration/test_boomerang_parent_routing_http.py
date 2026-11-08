@@ -69,7 +69,7 @@ def endpoints(sentinel):
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize("scenario", ["summary", "downgrade", "busy", "cold", "detached"])
+@pytest.mark.parametrize("scenario", ["summary", "downgrade", "busy", "cold", "detached", "active-fallback"])
 def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scenario):
     from openai import OpenAI
     import model_tools
@@ -96,6 +96,8 @@ def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scena
                          api_key="synthetic-key", base_url=base + "/primary/v1", fallback_model=chain,
                          enabled_toolsets=[], quiet_mode=True, skip_memory=True, skip_context_files=True)
         parent._session_messages = [{"role": "assistant", "content": "parent context"}]
+        if scenario == "active-fallback":
+            assert parent._try_activate_fallback()
         home = SimpleNamespace(session_id=parent.session_id, session_key="agent:main:discord:group:synthetic", origin=None)
         store = SimpleNamespace(load_transcript=lambda sid: parent._session_messages)
         runner = SimpleNamespace(session_store=store,
@@ -153,9 +155,29 @@ def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scena
             print(json.dumps({"scenario": scenario, "trace": trace, "status": status, "sentinel": sentinel, "final": final}))
             assert status == "completed", final
             assert sentinel in final
-            assert [row["lane"] for row in trace] == ["primary", "second", "cross-vendor"]
-            assert [row["model"] for row in trace] == ["parent-pin", "second-model", "cross-model"]
+            expected_lanes = ["second", "cross-vendor"] if scenario == "active-fallback" else ["primary", "second", "cross-vendor"]
+            expected_models = ["second-model", "cross-model"] if scenario == "active-fallback" else ["parent-pin", "second-model", "cross-model"]
+            assert [row["lane"] for row in trace] == expected_lanes
+            assert [row["model"] for row in trace] == expected_models
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous_handler)
             parent.close()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mutation", ["drop-chain", "restore-defaults"])
+def test_route_mutants_cannot_return_sentinel(monkeypatch, tmp_path, mutation):
+    original = dt._build_child_agent
+
+    def mutated(**kw):
+        if mutation == "restore-defaults":
+            kw["inherit_parent_route"] = False
+        child = original(**kw)
+        if mutation == "drop-chain":
+            child._fallback_chain = []
+        return child
+
+    monkeypatch.setattr(dt, "_build_child_agent", mutated)
+    with pytest.raises(AssertionError):
+        test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, "downgrade")

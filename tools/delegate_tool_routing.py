@@ -11,9 +11,12 @@ def persist_route(agent):
     route = copy.deepcopy(captured) if isinstance(captured, dict) else {"source": "parent", "model": agent.model,
              "provider": getattr(agent, "requested_provider", None) or agent.provider,
              "api_mode": agent.api_mode,
-             "fallback_chain": persistable_fallback_chain(agent._fallback_chain) or [],
+             "fallback_chain": copy.deepcopy(agent._fallback_chain),
              "request_overrides": copy.deepcopy(getattr(agent, "request_overrides", {}) or {})}
-    route["fallback_chain"] = persistable_fallback_chain(route["fallback_chain"]) or []
+    original_chain = route["fallback_chain"] or []
+    route["fallback_chain"] = persistable_fallback_chain(original_chain) or []
+    if len(route["fallback_chain"]) != len(original_chain):
+        raise ValueError("boomerang routing-unavailable: fallback credentials need symbolic references")
     # Headers may contain opaque secrets whose spelling no generic scrubber can recognize.
     overrides = route["request_overrides"]
     if overrides.get("extra_headers"):

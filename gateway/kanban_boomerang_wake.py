@@ -1351,6 +1351,20 @@ async def _note_child_session(entry: dict, state: BoomerangWakeState) -> None:
 
 
 async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None:
+    """Bind the owner's profile for all background resolution and execution."""
+    from gateway import kanban_home_route as _hr
+    from gateway import kanban_owner_wake as _ow
+
+    home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
+                                   entry.get("home_sid") or "", _hr.read_session_row)
+    if home is None:
+        await _fail(runner, entry, "home session not live here", state)
+        return
+    async with runner._async_profile_scope_for_source(home.origin):
+        await _run_entry_scoped(runner, entry, state)
+
+
+async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState) -> None:
     """The dispatched task: parent → child → verdict executor → one origin line."""
     key = entry["key"]
     try:

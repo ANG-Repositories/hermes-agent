@@ -4312,6 +4312,9 @@ def delegate_task(
             if _recovery_spec and t.get("route_source") in ("explicit-child", "delegation-default"):
                 _task_inherits_route = False
             _route_parent = parent_agent
+            if _recovery_spec and _task_inherits_route and "parent_route" not in t:
+                if "fallback_chain" not in recovery_execution:
+                    raise ValueError("boomerang routing-unavailable: legacy record has unresolved parent fallback policy")
             if _recovery_spec and t.get("parent_route") is not None:
                 from tools.delegate_tool_routing import recover_route_parent
                 _route_parent = recover_route_parent(parent_agent, t["parent_route"])

@@ -1192,14 +1192,19 @@ def test_db_parent_sends_the_configured_gateway_model(monkeypatch):
                         lambda: {"provider": "p", "base_url": "u", "api_key": "k", "capabilities": {}})
     monkeypatch.setattr(gr, "_resolve_gateway_model", lambda *a, **k: "cfg-model")
     monkeypatch.setattr(run_agent, "AIAgent", _Agent)
-    runner = SimpleNamespace(session_store=SimpleNamespace(load_transcript=lambda sid: []))
-    ah._db_parent(runner, SimpleNamespace(session_id="s1"))
+    from gateway.run import GatewayRunner
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.session_store = SimpleNamespace(load_transcript=lambda sid: [])
+    runner._session_model_overrides = {}
+    runner._refresh_fallback_model = lambda: None
+    home = SimpleNamespace(session_id="s1", session_key=None, origin=None)
+    ah._db_parent(runner, home)
     assert seen["model"] == "cfg-model"
 
     # a fallback route's own model wins over config (same precedence as a gateway turn, #112600)
     monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs",
                         lambda: {"provider": "p2", "model": "fallback-model", "_fallback_notice": "n"})
     seen.clear()
-    ah._db_parent(runner, SimpleNamespace(session_id="s1"))
+    ah._db_parent(runner, home)
     assert seen["model"] == "fallback-model" and "_fallback_notice" not in seen
 

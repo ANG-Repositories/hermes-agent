@@ -28,3 +28,42 @@ def test_cold_parent_uses_session_identity_and_effective_policy(monkeypatch):
     assert calls[0]["session_key"] == home.session_key
     assert calls[0]["source"] is home.origin
     assert runner._pre_agent_fallback_notice == "foreground-notice"
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_cold_session_pin_channel_precedence_and_fail_closed(monkeypatch, tmp_path, broken):
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionStore, SessionSource
+    from gateway.config import GatewayConfig, Platform, PlatformConfig, ChannelOverride
+
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(
+        enabled=True, channel_overrides={"7": ChannelOverride(model="channel-model", provider="channel-provider")})})
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="7", chat_type="group")
+    entry = store.get_or_create_session(source)
+    store.set_model_override(entry.session_key, {"provider": "pinned-provider", "model": "pinned-model"})
+    store2 = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config, runner.session_store = config, store2
+    runner._session_model_overrides = {}
+    runner._pre_agent_fallback_notice = "foreground"
+    runner._refresh_fallback_model = lambda: [{"provider": "backup", "model": "backup-model"}]
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *a, **kw: "global-model")
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {"provider": "global-provider", "api_key": "global-key"})
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda provider, **kw: {"provider": provider, "api_key": "channel-key"})
+    monkeypatch.setattr(runner, "_reresolve_model_override_credentials", lambda value: None if broken else {
+        "provider": "pinned-provider", "model": "pinned-model", "api_key": "pin-key", "base_url": "http://pin", "api_mode": "chat_completions"})
+    captured = []
+    monkeypatch.setattr("run_agent.AIAgent", lambda **kw: (captured.append(kw) or SimpleNamespace()))
+    if broken:
+        with pytest.raises(Exception, match="credentials could not be resolved"):
+            wake._db_parent(runner, entry)
+        assert not captured
+    else:
+        wake._db_parent(runner, entry)
+        assert (captured[-1]["model"], captured[-1]["provider"]) == ("pinned-model", "pinned-provider")
+        store2.set_model_override(entry.session_key, None)
+        runner._session_model_overrides.clear()
+        wake._db_parent(runner, entry)
+        assert (captured[-1]["model"], captured[-1]["provider"]) == ("channel-model", "channel-provider")
+    assert runner._pre_agent_fallback_notice == "foreground"

@@ -10,6 +10,7 @@ from contextlib import suppress
 from typing import Any, Optional
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
+from agent.route_snapshot import route_mutation
 from hermes_cli.timeouts import get_provider_request_timeout
 from utils import base_url_host_matches, env_float
 
@@ -951,6 +952,7 @@ class ClientLifecycleMixin:
         if merged:
             self._client_kwargs["default_headers"] = merged
 
+    @route_mutation
     def _swap_credential(self, entry):
         """Adopt *entry* as the live credential.
 
