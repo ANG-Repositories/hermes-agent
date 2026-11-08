@@ -1966,6 +1966,7 @@ def _build_child_agent(
     # ``boomerang.fork_ineligible`` line to its batch (fork-fan RC-8).
     delegation_id: Optional[str] = None,
     inherit_parent_route: bool = False,
+    explicit_child_route: bool = False,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -2067,9 +2068,11 @@ def _build_child_agent(
             override_acp_command=None, override_acp_args=None, routing_cfg=routing_cfg,
         ), route_parent if inherit_parent_route else parent_agent)
         _ok, _reason = _fork.fork_eligible(parent_agent, _fork_rt, delegation_cfg)
-        if _ok and (inherit_parent_route or not any((model, override_provider, override_base_url))):
+        if _ok and not explicit_child_route:
             rt = _fork_rt
         else:
+            if explicit_child_route:
+                _reason = "explicit_child_route"
             _fork.log_ineligible(_reason, parent_agent, delegation_id=delegation_id, task_index=task_index)
             mode = "summary"
     # ── Boomerang context inheritance (spec v0.8 D-4 / P0.3) ────────────
@@ -2144,7 +2147,23 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._boomerang_route_source = ("live-parent" if inherit_parent_route else
+                                     "explicit-child" if explicit_child_route else "delegation-default")
+    if inherit_parent_route:
+        child._boomerang_parent_route = {
+            "source": "parent", "model": rt["model"],
+            "provider": rt.get("requested_provider") or rt["provider"], "api_mode": rt["api_mode"],
+            "fallback_chain": copy.deepcopy(rt["fallback_model"]),
+            "request_overrides": copy.deepcopy(override_request_overrides),
+        }
     child._context_inherited = context_inherited
+    logger.info(
+        "boomerang.route delegation=%s owner=%s child=%s requested=%s effective=%s source=%s provider=%s model=%s fallbacks=%d disabled=%s",
+        delegation_id or "-", parent_sid or "-", getattr(child, "session_id", "-"),
+        inherit_mode or ("summary" if inherit_context else "none"), mode or "none",
+        child._boomerang_route_source, rt.get("requested_provider") or rt.get("provider"),
+        rt.get("model"), len(rt.get("fallback_model") or []), not bool(rt.get("fallback_model")),
+    )
     if mode == "fork":
         # _apply_child_cache_ttl and _regate_inherited_child_tier are SKIPPED: both rewrite request bytes.
         _fork.apply_fork_overlay(child, parent_agent)
@@ -3619,6 +3638,12 @@ def _build_durable_background_spec(
             children and index < len(children)) else None
         if children and index < len(children) and (_mode is not None or _built_prefill is not None):
             persisted["materialized_prefill_messages"] = copy.deepcopy(_built_prefill)
+        if children and index < len(children):
+            built = children[index]
+            persisted["route_source"] = getattr(built, "_boomerang_route_source", "delegation-default")
+            if getattr(built, "_boomerang_route_source", None) == "live-parent":
+                from tools.delegate_tool_routing import persist_route
+                persisted["parent_route"] = persist_route(built)
         if task_images and index < len(task_images) and task_images[index]:
             persisted["images"] = list(task_images[index])
         if task_schemas and index < len(task_schemas) and task_schemas[index] is not None:
@@ -3711,6 +3736,14 @@ def _build_durable_background_spec(
         # Symbolic lookup data only. Credential bytes are re-resolved on resume.
         "credential_ref": credential_ref,
     }
+    if children and getattr(children[0], "_boomerang_route_source", None) == "live-parent":
+        from tools.delegate_tool_routing import persist_route
+        selected_route = persist_route(children[0])
+        execution.update(model=selected_route["model"], provider=selected_route["provider"],
+                         api_mode=selected_route["api_mode"],
+                         fallback_chain=copy.deepcopy(selected_route["fallback_chain"]))
+        execution["credential_ref"] = {"source": "provider", "provider": selected_route["provider"],
+                                       "inherited_route": True, "model_pinned": False}
     return {
         "profile": profile,
         "source": {
@@ -4087,7 +4120,13 @@ def delegate_task(
     # (upstream c47bf78d68): ``routing_cfg`` rides into _build_child_agent.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        from tools.delegate_tool_fork import resolve_inherit_mode
+        _routing_tasks = tasks if isinstance(tasks, list) and tasks else [
+            {"inherit_context": inherit_context, "inherit_mode": inherit_mode}]
+        _only_parent_routes = not (model or provider or credentials_cfg is not None) and all(
+            resolve_inherit_mode(t.get("inherit_context", inherit_context), t.get("inherit_mode", inherit_mode))
+            for t in _routing_tasks if isinstance(t, dict))
+        creds = _resolve_delegation_credentials({} if _only_parent_routes else routing_cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
     if _recovery_spec and not model and _inherited_route and _model_pinned:
@@ -4270,6 +4309,13 @@ def delegate_task(
             _task_inherits_route = bool(resolve_inherit_mode(
                 t.get("inherit_context", inherit_context), t.get("inherit_mode", inherit_mode),
             )) and not (model or provider or credentials_cfg is not None)
+            if _recovery_spec and t.get("route_source") in ("explicit-child", "delegation-default"):
+                _task_inherits_route = False
+            _route_parent = parent_agent
+            if _recovery_spec and t.get("parent_route") is not None:
+                from tools.delegate_tool_routing import recover_route_parent
+                _route_parent = recover_route_parent(parent_agent, t["parent_route"])
+                _task_inherits_route = True
             child = _build_child_preserving_parent_tools(
                 task_index=i,
                 goal=t["goal"],
@@ -4280,7 +4326,7 @@ def delegate_task(
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
-                parent_agent=parent_agent,
+                parent_agent=_route_parent,
                 override_provider=creds["provider"],
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
@@ -4308,6 +4354,7 @@ def delegate_task(
                 skills=(t.get("skills") if "skills" in t else skills),
                 delegation_id=live_deleg_id,
                 inherit_parent_route=_task_inherits_route,
+                explicit_child_route=bool(model or provider or credentials_cfg is not None),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command

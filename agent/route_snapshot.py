@@ -37,5 +37,6 @@ def snapshot_parent(parent):
             if name in fields:
                 fields[name] = copy.deepcopy(fields[name])
         view = copy.copy(parent)
-        view.__dict__ = fields
+        vars(view).clear()
+        vars(view).update(fields)
         return view
