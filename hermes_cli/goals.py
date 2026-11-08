@@ -860,17 +860,44 @@ def _truncate(text: str, limit: int) -> str:
 _PROCESS_INSTANCE = uuid4().hex[:12]
 
 
+def _process_start_time(pid: int) -> Optional[int]:
+    try:
+        from gateway.status import get_process_start_time
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _new_retry_claim() -> str:
+    pid = os.getpid()
+    start = _process_start_time(pid)
+    fingerprint = str(start) if start is not None else "unknown"
+    return f"retry:{pid}:{fingerprint}:{_PROCESS_INSTANCE}:{uuid4().hex}"
+
+
 def _orphaned_retry_claim(token: Optional[str]) -> bool:
-    """A ``retry:<pid>:<instance>:<id>`` claim whose claiming process is gone (it died between
-    claim and settlement, so nothing will dispatch or refund it). A live claimant fences it."""
+    """Recover proven-dead/replaced claimants; unknown identity stays fenced."""
     parts = (token or "").split(":")
-    if len(parts) != 4 or parts[0] != "retry" or parts[2] == _PROCESS_INSTANCE:
+    if len(parts) not in (4, 5) or parts[0] != "retry":
+        return False
+    instance = parts[-2]
+    if instance == _PROCESS_INSTANCE:
         return False
     try:
         pid = int(parts[1])
     except ValueError:
         return False
-    return pid == os.getpid() or not _pid_alive(pid)
+    if pid == os.getpid() or not _pid_alive(pid):
+        return True
+    if len(parts) == 5:
+        current = _process_start_time(pid)
+        if current is not None and parts[2] != "unknown":
+            try:
+                recorded = int(parts[2])
+                return recorded > 0 and int(current) > 0 and recorded != int(current)
+            except (ValueError, TypeError):
+                return False
+    return False
 
 
 def _pid_alive(pid: int) -> bool:
@@ -2145,13 +2172,28 @@ class GoalManager:
             counted = True
         if not prompt:
             return None
-        if counted:
-            s.idle_wakes += 1
-        s.last_idle_wake_at = now
-        s.idle_wake_attempt = (
-            f"retry:{os.getpid()}:{_PROCESS_INSTANCE}:{uuid4().hex}" if retry_wake else "idle:" + uuid4().hex)
+        if not orphan:
+            if counted:
+                s.idle_wakes += 1
+            s.last_idle_wake_at = now
+            s.idle_wake_attempt = (
+                _new_retry_claim() if retry_wake else "idle:" + uuid4().hex)
         if orphan:
-            # Compare-and-set: of two processes recovering the same orphan, exactly one dispatches.
+            # The dead claimant may have executed before dying. Charge once and
+            # back off, never immediately replay a potentially crashing turn.
+            s.turns_used += 1
+            s.consecutive_incomplete_turns += 1
+            s.idle_wake_attempt = None
+            s.last_turn_at = now
+            s.waiting_since = now
+            s.waiting_reason = "retry claimant exited before settlement"
+            s.incomplete_retry_wait = s.turns_used < s.max_turns
+            s.waiting_until = (now + min(1800, 60 * 2 ** min(max(
+                s.consecutive_incomplete_turns - 1, 0), 5))) if s.incomplete_retry_wait else 0.0
+            if not s.incomplete_retry_wait:
+                s.status = "paused"
+            prompt = None
+            # Compare-and-set: overlapping reclaimers charge the dead claim once.
             db = _get_session_db() if self.session_id else None
             if db is not None:
                 s.revision += 1

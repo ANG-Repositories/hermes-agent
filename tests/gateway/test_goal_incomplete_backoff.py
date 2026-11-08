@@ -436,8 +436,16 @@ def test_retry_claim_survives_claimant_death(tmp_path, monkeypatch):
         holder.communicate("", timeout=60)  # the claimant exits without dispatching
     racer = goals.GoalManager("orphan")
     mgr = goals.GoalManager("orphan")
-    assert mgr.idle_wake_prompt(deadline + 2, checkin_minutes=0)
+    before = mgr.state.turns_used
+    assert mgr.idle_wake_prompt(deadline + 2, checkin_minutes=0) is None
     assert racer.idle_wake_prompt(deadline + 2, checkin_minutes=0) is None  # lost the reclaim
+    recovered = goals.GoalManager("orphan")
+    assert recovered.state.turns_used == before + 1
+    assert recovered.state.idle_wake_attempt is None
+    assert recovered.state.incomplete_retry_wait
+    retry_at = recovered.state.waiting_until
+    assert retry_at > deadline + 2
+    assert recovered.idle_wake_prompt(retry_at - 1, checkin_minutes=0) is None
+    assert recovered.idle_wake_prompt(retry_at, checkin_minutes=0)
     owner = goals.GoalManager("orphan").state.idle_wake_attempt
-    assert owner == mgr.state.idle_wake_attempt and owner.startswith("retry:")
-    assert goals.GoalManager("orphan").idle_wake_prompt(deadline + 3, checkin_minutes=0) is None
+    assert owner == recovered.state.idle_wake_attempt and owner.startswith("retry:")
