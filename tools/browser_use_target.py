@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import subprocess
 import threading
@@ -42,6 +42,25 @@ def record_route(task_id, env, local=False, ready=True):
     with _lock:
         _routes[(hermes_home_key(), task_id or "default")] = route
     return route
+
+
+@contextmanager
+def selection_execution(task_id, env, *, local=False):
+    # The named daemon is shared across tasks. Use the dispatch authority itself
+    # to exclude selection changes through ACK/cancellation, not a later IPC sample.
+    from tools.browser_tool_cdp import _resolve_cdp_override
+    endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+    route = BrowserUseRoute(env, _resolve_cdp_override(endpoint) if endpoint else "", local, False)
+    key = (hermes_home_key(), task_id or "default")
+    with _lock:
+        for peer_key, peer in list(_routes.items()):
+            if (peer_key[0] == key[0] and peer.cdp_url == route.cdp_url
+                    and peer.env.get("BU_NAME") == route.env.get("BU_NAME")):
+                _routes[peer_key] = replace(peer, ready=False)
+        _routes[key] = route
+        def complete(ready):
+            _routes[key] = replace(route, ready=ready)
+        yield complete
 
 
 # This separate, fixed program queries the daemon's private IPC. Agent code/stdout cannot

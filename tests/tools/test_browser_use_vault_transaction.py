@@ -62,6 +62,11 @@ def test_daemon_selection_follows_backend_browser_across_tasks(monkeypatch, sess
     assert daemons[route_b.env['BU_NAME']] == ('T2' if session else 'T1')
     assert (route_a.env['BU_NAME'] == route_b.env['BU_NAME']) == bool(session)
     monkeypatch.setattr(t, 'selected_target', lambda r: (123, daemons[r.env['BU_NAME']]))
+    if session:
+        with pytest.raises(RuntimeError, match='route changed'):
+            t.begin('taskA', expected_route=route_a)
+        cli.browser_exec('inspect', session=session, task_id='taskA')
+        route_a = t.route_for_task('taskA')
     token = t.begin('taskA', expected_route=route_a)
     try:
         with pytest.raises(RuntimeError, match='not pinned'):
@@ -72,6 +77,38 @@ def test_daemon_selection_follows_backend_browser_across_tasks(monkeypatch, sess
         t.end(token)
     with pytest.raises(RuntimeError, match='route changed'):
         t.begin('taskB', expected_route=route_a)
+
+
+def test_selection_change_waits_for_dispatch_ack(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(t, '_routes', {})
+    monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
+    env = {'BU_NAME': 'shared', 'BU_CDP_WS': 'ws://synthetic'}
+    route = t.record_route('taskA', env)
+    monkeypatch.setattr(t, 'selected_target', lambda _: (1, 'login'))
+    token = t.begin('taskA', expected_route=route)
+    tx = t._pin.get()
+    attempted, changed = threading.Event(), threading.Event()
+    def select():
+        attempted.set()
+        with t.selection_execution('taskB', env) as complete:
+            changed.set()
+            complete(True)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with tx.dispatch():
+                future = pool.submit(select)
+                assert attempted.wait(5)
+                assert not future.done()
+                assert not changed.is_set()
+                assert not t._lock.acquire(blocking=False)
+            future.result(5)
+            assert changed.is_set()
+        with pytest.raises(RuntimeError, match='route changed'):
+            with tx.dispatch():
+                pytest.fail('stale transaction authorized')
+    finally:
+        t.end(token)
 
 
 def test_probe_cannot_import_cwd_or_inherited_pythonpath(monkeypatch, tmp_path):
@@ -108,7 +145,7 @@ def test_route_replaced_in_final_probe_cannot_dispatch(monkeypatch):
         t.end(token)
 
 
-@pytest.mark.parametrize('change', ['route', 'lease', 'deadline'])
+@pytest.mark.parametrize('change', ['route', 'lease', 'deadline', 'shared_selection'])
 def test_supervisor_dispatch_rechecks_transaction_after_setup(monkeypatch, change):
     import time
     from dataclasses import replace
@@ -117,8 +154,29 @@ def test_supervisor_dispatch_rechecks_transaction_after_setup(monkeypatch, chang
     monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
     epoch = [7]
     monkeypatch.setattr(lease, 'assert_agent_may_act', lambda profile=None: SimpleNamespace(epoch=epoch[0]))
-    route = t.record_route('task', {'BU_CDP_WS': 'ws://synthetic'}, local=True)
-    monkeypatch.setattr(t, 'selected_target', lambda _: (1, 'login'))
+    env = {'BU_CDP_WS': 'ws://synthetic', 'BU_NAME': 'shared-research'}
+    route = t.record_route('task', env, local=True)
+    selected = ['login']
+    monkeypatch.setattr(t, 'selected_target', lambda _: (1, selected[0]))
+    if change == 'shared_selection':
+        import subprocess
+        monkeypatch.setattr(cli, '_find_cli', lambda: ['synthetic-cli'])
+        monkeypatch.setattr(cli, '_base_subprocess_env', lambda: {})
+        monkeypatch.setattr(cli, '_read_browser_cfg', lambda: {})
+        monkeypatch.setattr(cli, '_workspace_dir', lambda _: None)
+        monkeypatch.setattr(cli, '_attach_vault_supervisor', lambda *a: None)
+        def route_backend(child_env, *args):
+            child_env['BU_CDP_WS'] = env['BU_CDP_WS']
+            child_env[cli._PRIVATE_BROWSER_SENTINEL] = '1'
+        monkeypatch.setattr(cli, '_route_backend', route_backend)
+        def execute(cmd, code, child_env, timeout):
+            selected[0] = 'other-tab'
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        monkeypatch.setattr(cli, '_run_cli_killing_process_group', execute)
+        cli.browser_exec('inspect', session='research', task_id='taskB')
+        env = dict(t.route_for_task('taskB').env)
+        route = t.record_route('task', env, local=True)
+        selected[0] = 'login'
     token = t.begin('task', expected_route=route)
     tx = t._pin.get()
     if change == 'deadline':
@@ -136,6 +194,10 @@ def test_supervisor_dispatch_rechecks_transaction_after_setup(monkeypatch, chang
                 t.record_route('task', {'BU_CDP_WS': 'ws://replacement'})
             elif change == 'lease':
                 epoch[0] += 1
+            elif change == 'shared_selection':
+                cli.browser_exec('select other-tab', session='research', task_id='taskB')
+                assert selected[0] == 'other-tab'
+                assert t.route_for_task('task') is not route
             return {'result': {'sessionId': 'pinned'}}
         return {'result': {}}
     sup._cdp = cdp

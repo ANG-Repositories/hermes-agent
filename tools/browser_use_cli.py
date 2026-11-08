@@ -646,23 +646,21 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> Dict[str, Any]:
-        from tools.browser_use_target import record_route
-        # Invalidate the old selection before executing (including failed/timed-out calls).
-        # Vault queries this exact daemon's selection, not the supervisor's first page.
-        record_route(task_id, env, local=bot_desktop_browser, ready=False)
-        _attach_vault_supervisor(env, task_id)
-        try:
-            proc = _run_cli_killing_process_group(cmd, code, env, timeout)
-            record_route(task_id, env, local=bot_desktop_browser, ready=proc.returncode == 0)
-            return {"proc": proc}
-        except subprocess.TimeoutExpired:
-            return {"error_result": tool_error(
-                f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
-                f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
-                "append to workspace files — anything already written to the workspace is preserved."
-            )}
-        except OSError as e:
-            return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
+        from tools.browser_use_target import selection_execution
+        with selection_execution(task_id, env, local=bot_desktop_browser) as complete:
+            _attach_vault_supervisor(env, task_id)
+            try:
+                proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+                complete(proc.returncode == 0)
+                return {"proc": proc}
+            except subprocess.TimeoutExpired:
+                return {"error_result": tool_error(
+                    f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
+                    f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
+                    "append to workspace files — anything already written to the workspace is preserved."
+                )}
+            except OSError as e:
+                return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
 
     if bot_desktop_browser:
         from tools.browser_tool_session import run_fenced
