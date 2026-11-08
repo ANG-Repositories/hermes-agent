@@ -754,6 +754,7 @@ gateway:
     reject_model: "エージェントが実行中です — 完了を待つか、先に /stop してからモデルを切り替えてください。"
     reject_codex_runtime: "エージェントが実行中です — 完了を待つか、先に /stop してからランタイムを変更してください。"
     reject_moa: "エージェントが実行中です — 完了を待つか、先に /stop してから /moa を実行してください。"
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ ゲートウェイは{action}です — 復帰後の次のターンにキューしました。"
     drain_rejected: "⏳ ゲートウェイは{action}のため、現在は次のターンを受け付けていません。"
     drain_rejected_new_work: "⏳ ゲートウェイは{action}のため、現在は新しい作業を受け付けていません。"
