@@ -183,3 +183,82 @@ def test_pause_cancels_chain_without_failure_increment(tmp_path, monkeypatch):
     assert persisted.status == 'paused'
     assert persisted.consecutive_transport_failures == 0
     assert persisted.turns_used == 0
+
+
+@pytest.mark.parametrize('failure', ['spawn', 'json', 'shape', 'exit', 'pipe'])
+def test_worker_failure_advances_without_false_completion(tmp_path, monkeypatch, failure):
+    import subprocess
+    from hermes_cli import goal_judge_chain as chain
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    class Worker:
+        pid = 123
+        returncode = 1 if failure == 'exit' else 0
+        def communicate(self, *args, **kwargs):
+            if failure == 'pipe':
+                raise BrokenPipeError()
+            return ('[]' if failure == 'shape' else 'not json'), None
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            assert timeout is not None
+            return self.returncode
+    def spawn(*args, **kwargs):
+        if failure == 'spawn':
+            raise OSError('private error must not escape')
+        return Worker()
+    monkeypatch.setattr(chain.subprocess, 'Popen', spawn)
+    original = chain.run_attempt
+    calls = []
+    def attempt(route, *args, **kwargs):
+        calls.append(route['model'])
+        if route['model'] == 'primary':
+            return original(route, *args, **kwargs)
+        return dict(category='ok', content='{"verdict":"blocked","reason":"missing input"}')
+    monkeypatch.setattr(chain, 'run_attempt', attempt)
+    routes = [dict(provider='custom', model=m, timeout=2) for m in ('primary', 'second')]
+    result = chain.judge_chain((routes, 4), 'system', 'prompt', 10, goals._parse_judge_response)
+    assert calls == ['primary', 'second']
+    assert result[0] == 'blocked' and not result[2] and not result[4]
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_stuck_cleanup_retains_owner_and_inhibits_retry(tmp_path, monkeypatch, cancel):
+    from hermes_cli import goal_judge_chain as chain
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+    import agent.deadline
+    release = threading.Event()
+    cleanup_started = threading.Event()
+    spawned = []
+    class Worker:
+        pid = 123
+        returncode = None
+        def communicate(self, *args, **kwargs):
+            raise __import__('subprocess').TimeoutExpired('worker', 0)
+        def poll(self):
+            return None if not release.is_set() else -9
+        def wait(self, timeout=None):
+            assert timeout is not None
+            return -9
+    def kill(pid):
+        cleanup_started.set()
+        release.wait(5)
+        raise OSError('kill failed')
+    monkeypatch.setattr(agent.deadline, 'kill_process_tree', kill)
+    monkeypatch.setattr(chain.subprocess, 'Popen', lambda *a, **kw: spawned.append(Worker()) or spawned[-1])
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    route = dict(provider='custom', model='primary', timeout=0.3)
+    started = time.monotonic()
+    try:
+        if cancel:
+            with pytest.raises(AuxiliaryExplicitCancellation):
+                chain.run_attempt(route, [], 10, started + 0.3, cancel_check=lambda: True)
+        else:
+            result = chain.judge_chain(([route, route], 0.3), 's', 'p', 10, goals._parse_judge_response)
+            assert result[4] and 'cleanup_pending' in result[1]
+        assert time.monotonic() - started < 2
+        assert cleanup_started.wait(1)
+        assert chain.run_attempt(route, [], 10, time.monotonic() + 1)['category'] == 'cleanup_pending'
+        assert len(spawned) == 1
+    finally:
+        release.set()
+        assert chain._cleanup_finished(str(tmp_path), timeout=2)

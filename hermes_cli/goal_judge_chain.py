@@ -11,11 +11,14 @@ import math
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 _LABEL = re.compile(r'[^a-zA-Z0-9_.:/-]')
+_CLEANUP_LOCK = threading.Lock()
+_CLEANUPS = {}
 
 
 def _label(value):
@@ -56,11 +59,33 @@ def chain_config(timeout):
     return routes, total
 
 
-def _stop(proc):
-    if proc.poll() is None:
+def _cleanup_finished(home, timeout=0):
+    with _CLEANUP_LOCK:
+        pending = _CLEANUPS.get(home)
+    return pending is None or pending.wait(timeout)
+
+
+def _stop(proc, home, deadline, finished):
+    """Retain ownership until reaped; a stuck kill must not hold the judge caller."""
+    def reap():
         from agent.deadline import kill_process_tree
-        kill_process_tree(proc.pid)
-    proc.wait()
+        while True:
+            try:
+                if proc.poll() is None:
+                    kill_process_tree(proc.pid)
+                proc.wait(timeout=0.05)
+            except Exception:
+                # Keep the process handle (not just a reusable PID) and inhibit
+                # further requests for this profile until termination is observed.
+                time.sleep(0.05)
+                continue
+            break
+        with _CLEANUP_LOCK:
+            _CLEANUPS.pop(home, None)
+            finished.set()
+
+    threading.Thread(target=reap, name='goal-judge-reaper', daemon=True).start()
+    return finished.wait(max(0, min(0.05, deadline - time.monotonic())))
 
 
 def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
@@ -68,14 +93,28 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
     from hermes_constants import get_hermes_home
     from tools.environments.local import served_profile_child_env
 
-    env = served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
-    payload = json.dumps(dict(route=route, messages=messages, max_tokens=max_tokens))
-    # -m uses THIS source checkout, not the installed runtime's editable root.
-    proc = subprocess.Popen(
-        [sys.executable, '-m', 'hermes_cli.goal_judge_chain'],
-        cwd=str(Path(__file__).resolve().parent.parent), env=env,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-    )
+    home = str(get_hermes_home())
+    raise_if_aux_cancel_requested()
+    finished = threading.Event()
+    with _CLEANUP_LOCK:
+        if home in _CLEANUPS:
+            return dict(category='cleanup_pending')
+        _CLEANUPS[home] = finished
+    try:
+        env = served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
+        payload = json.dumps(dict(route=route, messages=messages, max_tokens=max_tokens))
+        # -m uses THIS source checkout, not the installed runtime's editable root.
+        proc = subprocess.Popen(
+            [sys.executable, '-m', 'hermes_cli.goal_judge_chain'],
+            cwd=str(Path(__file__).resolve().parent.parent), env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except (OSError, ValueError, TypeError):
+        with _CLEANUP_LOCK:
+            _CLEANUPS.pop(home, None)
+            finished.set()
+        return dict(category='worker_error')
+    outcome = dict(category='timeout')
     try:
         pending = payload
         next_state_check = 0.0
@@ -86,9 +125,10 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
                 if cancel_check():
                     from agent.auxiliary_client import AuxiliaryExplicitCancellation
                     raise AuxiliaryExplicitCancellation()
-            remaining = deadline - time.monotonic()
+            # Reserve a small part of the attempt's own budget for normal reaping.
+            remaining = deadline - time.monotonic() - 0.05
             if remaining <= 0:
-                return dict(category='timeout')
+                break
             try:
                 out, _ = proc.communicate(pending, timeout=min(0.05, remaining))
                 raise_if_aux_cancel_requested()
@@ -96,12 +136,21 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
                     from agent.auxiliary_client import AuxiliaryExplicitCancellation
                     raise AuxiliaryExplicitCancellation()
                 if proc.returncode:
-                    return dict(category='worker_error')
-                return json.loads(out)
+                    outcome = dict(category='worker_error')
+                else:
+                    outcome = json.loads(out)
+                    if not isinstance(outcome, dict) or outcome.get('category') not in {
+                        'ok', 'unavailable', 'timeout', 'invalid_output', 'configuration', 'request_error',
+                    } or (outcome.get('category') == 'ok' and not isinstance(outcome.get('content'), str)):
+                        outcome = dict(category='worker_error')
+                break
             except subprocess.TimeoutExpired:
                 pending = None
+    except (OSError, ValueError, UnicodeError):
+        outcome = dict(category='worker_error')
     finally:
-        _stop(proc)
+        stopped = _stop(proc, home, deadline, finished)
+    return outcome if stopped else dict(category='cleanup_pending')
 
 
 def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=None):
@@ -130,7 +179,7 @@ def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=N
         logger.info('goal judge attempt failed: rung=%d provider=%s model=%s category=%s',
                     index, provider, model, category)
         last_category = category
-        if category not in {'unavailable', 'timeout', 'invalid_output', 'configuration'}:
+        if category not in {'unavailable', 'timeout', 'invalid_output', 'configuration', 'worker_error'}:
             break
     return 'continue', f'goal judge chain failed: {last_category}', last_category == 'invalid_output', None, last_category != 'invalid_output'
 

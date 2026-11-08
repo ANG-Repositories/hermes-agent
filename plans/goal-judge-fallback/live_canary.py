@@ -1,13 +1,17 @@
-"""Manual, non-mutating live fallback canary. Uses the caller's configured Sol alias."""
+"""Manual, non-mutating live fallback canary using the caller's own family alias."""
 # SCHEDULE: manual (operator/worker acceptance only)
 import json
 import logging
+import argparse
 
 
 def main():
     from hermes_cli.config import load_config
     from hermes_cli import goal_judge_chain, goals
-    alias = load_config()['model']['aliases']['sol']
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--family', choices=('sol', 'grok', 'kimi'), default='sol')
+    family = parser.parse_args().family
+    alias = load_config()['model']['aliases'][family]
     provider, model = alias.split('/', 1)
     logging.basicConfig(level=logging.INFO)
     routes = [
