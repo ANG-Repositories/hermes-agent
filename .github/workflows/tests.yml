@@ -125,6 +125,8 @@ jobs:
           CI_BLACKSMITH_SLICES: ${{ vars.CI_BLACKSMITH_SLICES }}
           EVENT_NAME: ${{ github.event_name }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          # last-N is placeable only on push:main (group 15 serves tests.yml@refs/heads/main alone)
+          GH_REF: ${{ github.ref }}
           # pull_request pre-filter (t_e8c5045e): run only the test files that
           # can observe the diff (scripts/ci/test_impact.py), on a matrix
           # scaled to their share of the suite. merge_group and push:main are
@@ -161,7 +163,8 @@ jobs:
             --x64-hosted-min="$CI_X64_HOSTED_MIN" \
             --blacksmith-slices="$CI_BLACKSMITH_SLICES" \
             --event="$EVENT_NAME" \
-            --same-repo="$SAME_REPO")
+            --same-repo="$SAME_REPO" \
+            --ref="$GH_REF")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           # A full matrix (~350 KB) exceeds Linux's 128 KB per-env-string limit
           # (E2BIG), so overflow tooling reads it from a file, never env/argv.
