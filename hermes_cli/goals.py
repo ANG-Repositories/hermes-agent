@@ -2145,7 +2145,10 @@ class GoalManager:
         if s.waiting_until:
             if now < s.waiting_until:
                 return None
-            self.stop_waiting()
+            if retry_wake:
+                s.clear_wait()  # persist timer consumption only with the claim CAS below
+            else:
+                self.stop_waiting()
             prompt = self.next_continuation_prompt()
             counted = False
         elif orphan:  # the claimant died before settling: re-offer the same retry
@@ -2193,7 +2196,8 @@ class GoalManager:
             if not s.incomplete_retry_wait:
                 s.status = "paused"
             prompt = None
-            # Compare-and-set: overlapping reclaimers charge the dead claim once.
+        if retry_wake:
+            # Both recovery settlement and eventual timer dispatch require ownership CAS.
             db = _get_session_db() if self.session_id else None
             if db is not None:
                 s.revision += 1

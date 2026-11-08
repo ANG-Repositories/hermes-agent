@@ -446,6 +446,8 @@ def test_retry_claim_survives_claimant_death(tmp_path, monkeypatch):
     retry_at = recovered.state.waiting_until
     assert retry_at > deadline + 2
     assert recovered.idle_wake_prompt(retry_at - 1, checkin_minutes=0) is None
+    timer_racer = goals.GoalManager("orphan")
     assert recovered.idle_wake_prompt(retry_at, checkin_minutes=0)
+    assert timer_racer.idle_wake_prompt(retry_at, checkin_minutes=0) is None
     owner = goals.GoalManager("orphan").state.idle_wake_attempt
     assert owner == recovered.state.idle_wake_attempt and owner.startswith("retry:")
