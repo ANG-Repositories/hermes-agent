@@ -38,3 +38,10 @@ def test_human_ready_is_operator_todo_and_cannot_promote(conn):
     assert kb.assign_task(conn, tid, "builder")
     kb.recompute_ready(conn)
     assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_untyped_block_requires_a_recovery_predicate(conn):
+    tid = kb.create_task(conn, title="Missing recovery", assignee="builder")
+    with pytest.raises(kb.BlockRefused, match="kind|unblock_when"):
+        kb.block_task(conn, tid, reason="stuck")
+    assert kb.get_task(conn, tid).status == "ready"

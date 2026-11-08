@@ -29,3 +29,12 @@ def test_raw_writer_cannot_create_or_clear_scheduled_wake(tmp_path: Path):
         assert kb.schedule_task(conn, tid, wake_at=2_000_000_000)
         with pytest.raises(sqlite3.IntegrityError, match="wake"):
             conn.execute("UPDATE tasks SET next_eligible_at=NULL WHERE id=?", (tid,))
+
+
+def test_named_event_is_an_explicit_schedule_exit(tmp_path: Path):
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        tid = kb.create_task(conn, title="Parts arrival", assignee="builder",
+                             body="unblock_when: event:parts-arrived")
+        assert kb.schedule_task(conn, tid)
+        assert kb.get_task(conn, tid).next_eligible_at is None
+        assert kb.wake_due_scheduled(conn, now=2_000_000_000) == []

@@ -14017,6 +14017,8 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if kind is None and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or ""):
+        raise BlockRefused("block needs a kind or an explicit unblock_when predicate")
     if until is not None and kind != "deferred":
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
@@ -17911,11 +17913,13 @@ def schedule_task(
     wake_at: Optional[int] = None,
 ) -> bool:
     """Park until a validated wake time, atomically with ending the run."""
-    if wake_at is None:
-        raise ValueError("scheduled needs a wake time (--at or --now)")
-    wake_at = validate_wake_at(wake_at)
+    if wake_at is not None:
+        wake_at = validate_wake_at(wake_at)
     with write_txn(conn):
-        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT status, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        from hermes_cli.kanban_lifecycle_guards import has_event_gate
+        if wake_at is None and not (row and has_event_gate(row["body"])):
+            raise ValueError("scheduled needs a wake time (--at or --now) or unblock_when: event:<name>")
         parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
         params: list[Any] = [wake_at, task_id]
         sql = """

@@ -3816,9 +3816,10 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 current is not None and current.status == "scheduled"
                 and wake_at is not None
             )
-            if wake_at is None:
+            from hermes_cli.kanban_lifecycle_guards import has_event_gate
+            if wake_at is None and not (current and has_event_gate(current.body)):
                 failed.append(tid)
-                print(f"cannot schedule {tid}: needs --at or --now", file=sys.stderr)
+                print(f"cannot schedule {tid}: needs --at, --now or unblock_when: event:<name>", file=sys.stderr)
                 continue
             # Provenance before the transition: scheduling ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
