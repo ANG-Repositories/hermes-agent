@@ -1149,6 +1149,17 @@ class GatewayBusySessionMixin:
         k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
     }
 
+    def _busy_slash_would_reject(self, cmd_def) -> bool:
+        """True when ``_dispatch_busy_slash_command`` would answer ``cmd_def`` with reject text rather
+        than running it mid-turn (no special busy handler, no dispatch policy)."""
+        if getattr(cmd_def, "busy_handler", None) in self._BUSY_SPECIAL_HANDLERS:
+            return False
+        return getattr(cmd_def, "busy_policy", "reject") not in ("dispatch", "interrupt_then_dispatch")
+
+    def _busy_turn_is_stopping(self, quick_key: str) -> bool:
+        state = self._peek_session_state(quick_key)
+        return bool(state is not None and getattr(state.turn, "stopping", False))
+
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):
         """Dispatch a recognized slash command while an agent is running.
 
@@ -1170,6 +1181,11 @@ class GatewayBusySessionMixin:
             special = self._BUSY_SPECIAL_HANDLERS.get(handler_key)
             if special is not None:
                 return await getattr(self, special)(event, quick_key, source)
+        if self._busy_turn_is_stopping(quick_key) and self._busy_slash_would_reject(cmd_def):
+            # The user already stopped this turn; "wait or /stop first" would be false. Reached only
+            # when the stop outlived _hm_wait_for_stop_to_settle's bound.
+            return t("gateway.busy.stop_settling", command=name)
+        if handler_key:
             reject_key = self._BUSY_REJECT_TEXT.get(handler_key)
             if reject_key is not None:
                 return t(reject_key)

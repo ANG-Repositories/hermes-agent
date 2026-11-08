@@ -764,6 +764,7 @@ gateway:
     reject_model: "Az ügynök fut — várj, vagy előbb /stop, aztán válts modellt."
     reject_codex_runtime: "Az ügynök fut — várj, vagy előbb /stop, aztán válts futtatókörnyezetet."
     reject_moa: "Az ügynök fut — várj, vagy előbb /stop, aztán futtasd a /moa parancsot."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ Az átjáró {action} — az üzenet a visszatérés utáni következő körre került sorba."
     drain_rejected: "⏳ Az átjáró {action}, és jelenleg nem fogad újabb kört."
     drain_rejected_new_work: "⏳ Az átjáró {action}, és jelenleg nem fogad új munkát."

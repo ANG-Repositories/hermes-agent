@@ -637,6 +637,10 @@ class GatewayAgentCacheMixin:
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
         _reason = str(invalidation_reason or "")
+        if release_running_state and state is not None and state.turn.agent is not None:
+            # Synchronous, right after the bump: the slot stays held through the awaits below, and
+            # a command sent in that window waits for the release instead of being rejected.
+            state.turn.stopping = True
         if _reason.startswith("stop_command"):
             self._session_state(session_key).conversation.automatic_turns_paused = True
         if _reason.startswith("stop_command") or _reason == "queue_run":
