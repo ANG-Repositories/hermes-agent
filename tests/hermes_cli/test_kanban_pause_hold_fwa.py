@@ -84,7 +84,7 @@ def test_fork_predicate_matches_every_golden_fixture(home, name):
             p.write_text(json.dumps(h), encoding="utf-8")
         mt = now - float(h.get("age_s", 0))   # mtime is case data: the unreadable bound is mtime + 24 h
         os.utime(p, (mt, mt))
-    entries = kph.fwa_entries(host, {("fwa", "table"): {}})
+    entries = kph.fwa_entries(host, {(kph._K_REGISTRY, str(kph.registry_path())): {}})
     for lane, want in case["expect"].items():
         got = kph.fwa_verdict(entries, lane, now)
         if want is True:
@@ -323,10 +323,10 @@ def test_profile_home_fwa_hold_is_never_read(home):
 def test_alias_directory_holds_the_canonical_host(home):
     """§5.2: ``ci``, ``ci.ace``, ``ci-box`` name one host."""
     _hold(home, host="ci")
-    cache = {("fwa", "table"): {"ci-box": {"ci-box", "ci", "ci.ace"}}}
-    v = kph.decide("ci-box", "t_any", cache)
+    _registry(home, {"ci-box": {"aliases": ["ci", "ci.ace"]}})
+    v = kph.decide("ci-box", "t_any", {})
     assert v is not None and v[0] == "wait" and HID in v[1]
-    assert kph.decide("ace-ai", "t_any", {("fwa", "table"): {"ci-box": {"ci-box", "ci"}}}) is None
+    assert kph.decide("ace-ai", "t_any", {}) is None
 
 
 # -- AC4: never cached across ticks ---------------------------------------------------------------------------------
@@ -430,3 +430,133 @@ def test_placement_holds_lists_fwa_holds(home):
     assert rows[HID]["holds_kanban"] is True
     assert rows["20261107T150000Z-ci-box-fwa00002"]["holds_kanban"] is False
     assert rep["source"] == "fwa"
+
+
+# -- round 3 (operator 11-08 05:50; Prism d6a2cb37de48 / abd3aba4b5be / 616898796fc2) --------------------------------
+
+def _registry(root, hosts):
+    """A ``config/fleet-hosts.json`` under ``root`` (the kanban home, or a decoy)."""
+    p = root / "config" / "fleet-hosts.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"hosts": hosts}), encoding="utf-8")
+    return p
+
+
+@pytest.fixture
+def decoy_placement(tmp_path, monkeypatch):
+    """placement.fleet_root() (PLACEMENT_HOME / the checkout) carries a DIFFERENT registry with no aliases: the hold
+    reader must resolve aliases from the kanban home's registry, never from the placement root (abd3aba4b5be)."""
+    d = tmp_path / "placement-root"
+    _registry(d, {"ci-box": {"aliases": []}})
+    monkeypatch.setenv("PLACEMENT_HOME", str(d))
+    return d
+
+
+@pytest.mark.parametrize("order", [("table", "ci-box"), ("ci-box", "table")], ids=["table-first", "ci-box-first"])
+def test_host_named_table_shares_no_cache_slot_with_the_alias_registry(home, order):
+    """d6a2cb37de48: a host literally named ``table`` must not collide with the alias-registry memo in either order."""
+    _registry(home, {"ci-box": {"aliases": ["ci"]}, "table": {"aliases": []}})
+    _hold(home)
+    cache: dict = {}
+    got = {h: kph.decide(h, "t_any", cache) for h in order}
+    assert got["table"] is None, got
+    assert got["ci-box"] is not None and got["ci-box"][1].startswith(f"pause_hold (ci-box:fwa:pause:{HID} "), got
+
+
+def test_dispatcher_tick_with_a_host_named_table_holds_only_the_held_host(home):
+    """d6a2cb37de48 through the real tick: one shared per-tick cache for every row of both lanes."""
+    _registry(home, {"ci-box": {"aliases": ["ci"]}, "table": {"aliases": []}})
+    with kb.connect_closing() as conn:
+        g = kb.create_task(conn, title="card G", assignee="alpha", body="do the thing")   # routed FIRST
+        _set(conn, g, status="ready", origin_host="table", priority=500)
+        ids = _cards(conn)
+        _hold(home)
+        res, _spawned = _tick(conn, _plan())
+        routes = _routes(res)
+        assert routes[ids["A"]]["outcome"] == "held", routes[ids["A"]]
+        assert routes[ids["A"]]["detail"].startswith(f"ci-box:fwa:pause:{HID} "), routes[ids["A"]]
+        assert routes.get(g, {}).get("code") != "pause_hold", routes.get(g)
+        assert g not in res.placement_waits or not str(res.placement_waits[g]).startswith("pause_hold"), res
+        kb.claim_task(conn, g)                               # layer 2: the direct claim of the unheld card opens
+        assert _runs(conn, g) == 1
+
+
+@pytest.mark.parametrize("origin", ["ci", "CI.ACE", "cibox"])
+def test_alias_origin_is_held_via_the_kanban_home_registry_both_layers(home, decoy_placement, origin):
+    """abd3aba4b5be: the alias table is the OWNING kanban home's ``config/fleet-hosts.json`` (aliases + ssh_alias,
+    as home ``fwa.resolve``), not placement's checkout table. Dispatcher tick AND direct claim refuse."""
+    _registry(home, {"ci-box": {"aliases": ["ci", "ci.ace"], "net": {"ssh_alias": "cibox"}}})
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _set(conn, ids["A"], origin_host=origin)
+        _hold(home)
+        res, spawned = _tick(conn, _plan())
+        r = _routes(res)[ids["A"]]
+        assert r["outcome"] == "held" and r["detail"].startswith(f"{origin}:fwa:pause:{HID} "), r
+        assert ids["A"] not in {t for t, _ in spawned}
+        with pytest.raises(kph.PauseHeld):
+            kb.claim_task(conn, ids["A"])
+        assert _runs(conn, ids["A"]) == 0
+
+
+def test_hold_under_an_alias_dir_holds_the_canonical_origin_via_the_kanban_home_registry(home, decoy_placement):
+    _registry(home, {"ci-box": {"aliases": ["ci"]}})
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _hold(home, host="ci")
+        _res, spawned = _tick(conn, _plan())
+        assert ids["A"] not in {t for t, _ in spawned}
+        with pytest.raises(kph.PauseHeld):
+            kb.claim_task(conn, ids["A"])
+
+
+def test_profile_home_registry_is_never_the_alias_table(home, decoy_placement):
+    """§5.1 root rule for the registry too: aliases declared only under the PROFILE home do not bind."""
+    _registry(home / "profiles" / "alpha", {"ci-box": {"aliases": ["ci"]}})
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _set(conn, ids["A"], origin_host="ci")
+        _hold(home)
+        _res, spawned = _tick(conn, _plan())
+        assert ids["A"] in {t for t, _ in spawned}
+
+
+_ROOT_LEVELS = {
+    "fwa-dir-no-access": (("state", "fwa"), 0o000),
+    "holds-dir-no-search": (("state", "fwa", "holds"), 0o600),
+    "holds-dir-no-access": (("state", "fwa", "holds"), 0o000),
+    "host-dir-no-access": (("state", "fwa", "holds", "ci-box"), 0o000),
+}
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root bypasses mode bits")
+@pytest.mark.parametrize("level", sorted(_ROOT_LEVELS))
+def test_inaccessible_hold_tree_fails_closed_both_layers(home, level):
+    """616898796fc2: an ABSENT hold root is no hold; a root (or host dir) that exists but cannot be stat'ed/listed is
+    an IO/access failure and fails closed (unreadable). Path.is_dir() reads EACCES as "absent"; never use it here."""
+    rel, mode = _ROOT_LEVELS[level]
+    _hold(home)
+    target = home.joinpath(*rel)
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        os.chmod(target, mode)
+        try:
+            res, spawned = _tick(conn, _plan())
+            r = _routes(res)[ids["A"]]
+            assert r["outcome"] == "held" and r["detail"].startswith("ci-box:fwa:unreadable:"), (level, r)
+            assert ids["A"] not in {t for t, _ in spawned}
+            with pytest.raises(kph.PauseHeld):
+                kb.claim_task(conn, ids["A"])
+            assert _runs(conn, ids["A"]) == 0
+        finally:
+            os.chmod(target, 0o755)
+
+
+def test_absent_hold_root_is_no_hold(home):
+    """The other half of 616898796fc2: no ``state/fwa`` at all = accepting (both layers)."""
+    assert not (home / "state" / "fwa").exists()
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        assert kph.decide("ci-box", ids["A"], {}) is None
+        kb.claim_task(conn, ids["A"])
+        assert _runs(conn, ids["A"]) == 1

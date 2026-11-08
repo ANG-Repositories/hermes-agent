@@ -243,52 +243,110 @@ def fwa_verdict(entries, lane: str, now: float):
     return None
 
 
+#: per-tick memo keys of the fwa arm. The legacy manifest memo keys are host STRINGS (``cache[host]``); every fwa key
+#: is a tuple whose first item names its namespace, so no host name (``table``, ``fwa``, ...) can alias another slot
+#: (Prism d6a2cb37de48).
+_K_REGISTRY = "fwa:registry"
+_K_ROOT = "fwa:root"
+_K_ENTRIES = "fwa:entries"
+
+
+def registry_path() -> Path:
+    """The alias registry of the OWNING kanban home: ``<kanban_home()>/config/fleet-hosts.json``, the same file
+    hermes-home ``fwa._host_table`` reads (Prism abd3aba4b5be). Never ``placement.fleet_root()`` (the checkout or
+    PLACEMENT_HOME) and never a profile home."""
+    from hermes_cli import kanban_db as _kb
+    return _kb.kanban_home() / "config" / "fleet-hosts.json"
+
+
+def _registry(cache: dict) -> dict:
+    """``{canonical_id: {id, aliases..., ssh_alias}}`` lower-cased, as home ``fwa.resolve`` matches names. Read once
+    per tick per kanban home; a missing or unreadable registry resolves no aliases (home ``_host_table`` returns {})."""
+    path = registry_path()
+    key = (_K_REGISTRY, str(path))
+    if key in cache:
+        return cache[key]
+    table: dict = {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+        hosts = doc.get("hosts") if isinstance(doc, dict) else None
+        for hid, row in (hosts if isinstance(hosts, dict) else {}).items():
+            row = row if isinstance(row, dict) else {}
+            names = {str(hid).lower(), *(str(a).lower() for a in row.get("aliases") or () if isinstance(a, str))}
+            ssh = (row.get("net") or {}).get("ssh_alias") if isinstance(row.get("net"), dict) else None
+            if isinstance(ssh, str) and ssh:
+                names.add(ssh.lower())
+            table[str(hid).lower()] = names
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RecursionError, AttributeError):
+        _log.warning("kanban pause_hold: %s unreadable; fwa hold aliases unresolved", path)
+    cache[key] = table
+    return table
+
+
 def _host_names(host: str, cache: dict) -> set:
-    """``host`` plus its canonical id and aliases from ``config/fleet-hosts.json`` (SPEC §5.2), lower-cased. The
-    table is read once per tick (memo in ``cache``); an unreadable table leaves the name itself."""
-    table = cache.get(("fwa", "table"))
-    if table is None:
-        table = {}
-        try:
-            from hermes_cli.fleet_placement import placement as _pl
-            t = _pl.load_hosts()
-            for hid, (_src, aliases) in dict(t.declared).items():
-                table[hid.lower()] = {hid.lower(), *(str(a).lower() for a in aliases)}
-            for hid, h in t.hosts.items():
-                table.setdefault(hid.lower(), set()).update({hid.lower(), *(str(a).lower() for a in h.aliases)})
-        except Exception:
-            table = {}
-        cache[("fwa", "table")] = table
+    """``host`` plus every name of the registry group(s) that contain it, lower-cased (SPEC §5.2)."""
     low = host.strip().lower()
     names = {low}
-    for group in table.values():
+    for group in _registry(cache).values():
         if low in group:
             names |= group
     return names
 
 
+def _root_listing(cache: dict):
+    """``(base, names, error)`` for ``fwa_root()``, memoised per tick. ABSENT (FileNotFoundError: no ``state``, no
+    ``state/fwa`` or no ``holds``) is ``([], None)`` = no hold; any other OSError (EACCES on the root or a parent, a
+    file where a directory belongs, EIO) is ``([], exc)`` = fail closed (Prism 616898796fc2: ``Path.is_dir()`` folds
+    EACCES into "absent", so it is never used on this path)."""
+    base = fwa_root()
+    key = (_K_ROOT, str(base))
+    if key not in cache:
+        try:
+            cache[key] = (base, sorted(n for n in os.listdir(base) if not n.startswith(".")), None)
+        except FileNotFoundError:
+            cache[key] = (base, [], None)
+        except OSError as exc:
+            cache[key] = (base, [], exc)
+    return cache[key]
+
+
+def _host_files(d: Path):
+    """``(files, error)`` of one host directory. ``None`` files = not a directory or gone (not a hold); an error =
+    the directory exists but cannot be listed (fail closed)."""
+    try:
+        return sorted(n for n in os.listdir(d) if n.endswith(".json") and not n.startswith(".")), None
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
+    except OSError as exc:
+        return None, exc
+
+
 def fwa_entries(host: str, cache: dict) -> list:
     """Every hold file of ``host`` (any alias's directory), parsed: a valid dict or an :class:`_Unreadable`. Per-tick
-    memo in ``cache`` (I4: never persisted across ticks). Lock, dot and tmp files are not holds."""
-    key = ("fwa", host)
+    memo in ``cache`` (I4: never persisted across ticks). Lock, dot and tmp files are not holds. A hold root or host
+    directory that exists but cannot be read is ONE unreadable entry with no mtime: it holds until it reads again."""
+    base, listing, err = _root_listing(cache)
+    key = (_K_ENTRIES, str(base), host)
     if key in cache:
         return cache[key]
     out: list = []
-    base = fwa_root()
-    names = _host_names(host, cache)
-    try:
-        dirs = [d for d in base.iterdir() if d.is_dir() and d.name.lower() in names] if base.is_dir() else []
-    except OSError:
-        _log.warning("kanban pause_hold: %s unlistable; every %s card is HELD", base, host)
-        dirs = []
+    if err is not None:
+        _log.warning("kanban pause_hold: %s unlistable (%s); every %s card is HELD", base, err, host)
         out.append(_Unreadable(str(base), None))
-    for d in sorted(dirs):
-        try:
-            files = sorted(p for p in d.iterdir() if p.suffix == ".json" and not p.name.startswith("."))
-        except OSError:
-            out.append(_Unreadable(d.name, None))
+    names = _host_names(host, cache)
+    for name in listing:
+        if name.lower() not in names:
             continue
-        for p in files:
+        d = base / name
+        files, ferr = _host_files(d)
+        if ferr is not None:
+            _log.warning("kanban pause_hold: %s unlistable (%s); every %s card is HELD", d, ferr, host)
+            out.append(_Unreadable(name, None))
+            continue
+        for fname in files or ():
+            p = d / fname
             mtime = None
             try:
                 mtime = p.stat().st_mtime
@@ -743,10 +801,17 @@ def holds(conn=None, *, now: Optional[float] = None) -> dict:
         }
     fwa: dict = {}
     if source() == SOURCE_FWA:
-        base = fwa_root()
-        for d in sorted(p for p in base.iterdir() if p.is_dir()) if base.is_dir() else []:
+        memo: dict = {(_K_REGISTRY, str(registry_path())): {}}   # one row per directory: no alias fan-in here
+        base, listing, err = _root_listing(memo)
+        if err is not None:
+            fwa[str(base)] = [{"file": str(base), "unreadable": True, "holds_kanban": True}]
+        for name in listing:
+            if _host_files(base / name) == (None, None):
+                continue                                    # a stray file at the root, not a host directory
             rows = []
-            for e in fwa_entries(d.name, {("fwa", "table"): {}}):
+            for e in fwa_entries(name, memo):
+                if isinstance(e, _Unreadable) and e.name == str(base):
+                    continue                                # the root itself: reported once above
                 if isinstance(e, _Unreadable):
                     rows.append({"file": e.name, "unreadable": True,
                                  "holds_kanban": fwa_verdict([e], FWA_LANE, t) is not None})
@@ -754,7 +819,7 @@ def holds(conn=None, *, now: Optional[float] = None) -> dict:
                 rows.append({"id": e["id"], "kind": e.get("kind"), "lanes": e["lanes"], "by": e.get("by"),
                              "owner": e.get("owner"), "reason": e.get("reason"), "since": e["since"],
                              "until": e["until"], "holds_kanban": fwa_verdict([e], FWA_LANE, t) is not None})
-            fwa[d.name] = rows
+            fwa[name] = rows
     cards = []
     if conn is not None:
         cache: dict = {}
