@@ -20,6 +20,8 @@ def main():
     parser.add_argument('--processes', type=int, default=32)
     parser.add_argument('--all-boundaries', action='store_true')
     args = parser.parse_args()
+    if os.name != 'posix':
+        parser.error('SIGKILL/process-group acceptance requires POSIX')
     root = args.scratch.expanduser().resolve()
     repo = Path(__file__).resolve().parents[1]
     # An explicit empty/new scratch root is required; no DB path override exists.
@@ -45,19 +47,19 @@ def main():
         try:
             rc = child.wait(timeout=180)
         except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
+            os.killpg(child.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only acceptance arm
             child.wait()
             rc = 124
         finally:
             # Reap multiprocessing grandchildren even after interrupted pytest.
             try:
-                os.killpg(child.pid, signal.SIGKILL)
+                os.killpg(child.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only acceptance arm
             except ProcessLookupError:
                 pass
     summary = dict(arm=args.arm, pid=child.pid, exit_code=rc,
                    elapsed_seconds=time.monotonic()-started, command=command,
                    log=str(root / 'output.log'))
-    (root / 'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
+    (root / 'summary.json').write_text(json.dumps(summary, indent=2)+'\n', encoding='utf-8')
     print(json.dumps(summary))
     return rc
 

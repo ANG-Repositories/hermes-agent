@@ -15,6 +15,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_failure_ownership as fo
 
+pytestmark = pytest.mark.platforms('posix')
+
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
