@@ -128,6 +128,16 @@ def test_automatic_wake_dispatch_to_executor(monkeypatch, tmp_path, scenario):
                 assert "route activation is still in progress" in claim["reason"]
                 assert claim["resurfaced"] and claim["resurface_delivered"] is False
                 assert turns == ["original owner obligation"]
+                assert state.handbacks()[claim["delegation_id"]]["parts"] == [wake.PART_TURN]
+                async def accept_turn(*a, **kw):
+                    turns.append(a[2])
+                    return True
+                monkeypatch.setattr("gateway.kanban_owner_wake.deliver_turn", accept_turn)
+                for _ in range(2):
+                    asyncio.run(wake.reconcile(runner, state=state))
+                assert turns == ["original owner obligation"] * 2
+                assert state.handbacks() == {}
+                assert state.get_claim(claim["key"])["resurface_delivered"] is True
             else:
                 assert claim["outcome"] == "complete", claim
                 assert [r["lane"] for r in trace] == ["primary", "second", "cross-vendor"], trace

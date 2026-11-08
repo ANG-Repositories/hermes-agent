@@ -100,6 +100,20 @@ def hermetic_http_runtime(monkeypatch):
     monkeypatch.setattr(api_error, "interruptible_backoff_sleep", short_sleep)
 
 
+@contextmanager
+def bounded_alarm():
+    def expired(*_):
+        raise TimeoutError("boomerang HTTP case exceeded 30 seconds")
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 30)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("scenario", ["summary", "downgrade", "busy", "cold", "detached", "active-fallback", "disabled", "auto-wake"])
 def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scenario):
@@ -114,12 +128,9 @@ def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scena
     monkeypatch.setattr(model_tools, "check_toolset_requirements", lambda **kw: {})
     monkeypatch.setattr(dt, "_load_config", lambda: {"model": "wrong-worker-default", "fallback_providers": [], "max_iterations": 8})
     monkeypatch.setenv("SYNTHETIC_FALLBACK_KEY", "synthetic-key")
-    def expired(*_):
-        raise TimeoutError("boomerang HTTP case exceeded 30 seconds")
-    previous_handler = signal.signal(signal.SIGALRM, expired)
-    signal.alarm(30)
+    parent = None
     sentinel = "BOOMERANG-WIRE-" + uuid.uuid4().hex
-    with endpoints(sentinel) as (base, trace):
+    with bounded_alarm(), endpoints(sentinel) as (base, trace):
         chain = [{"provider": "openrouter", "model": "second-model", "base_url": base + "/second/v1"},
                  {"provider": "openai", "model": "cross-model", "base_url": base + "/cross-vendor/v1"}]
         if scenario == "disabled":
@@ -226,9 +237,25 @@ def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scena
             assert [row["lane"] for row in trace] == expected_lanes, "routing contract: lanes"
             assert [row["model"] for row in trace] == expected_models, "routing contract: models"
         finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous_handler)
-            parent.close()
+            if parent is not None:
+                parent.close()
+
+
+@pytest.mark.platforms("posix")
+def test_http_setup_exception_restores_alarm(monkeypatch, tmp_path):
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    @contextmanager
+    def broken_endpoints(*a, **kw):
+        raise RuntimeError("endpoint setup failed")
+        yield
+    monkeypatch.setattr(__name__ + ".endpoints", broken_endpoints)
+    with pytest.raises(RuntimeError, match="endpoint setup failed"):
+        test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, "summary")
+    assert signal.getsignal(signal.SIGALRM) == previous_handler
+    restored = signal.getitimer(signal.ITIMER_REAL)
+    assert restored[1] == previous_timer[1]
+    assert 0 <= previous_timer[0] - restored[0] < 2
 
 
 @pytest.mark.platforms("posix")

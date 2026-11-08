@@ -69,3 +69,37 @@ def test_cold_session_pin_channel_precedence_and_fail_closed(monkeypatch, tmp_pa
         wake._db_parent(runner, entry)
         assert (captured[-1]["model"], captured[-1]["provider"]) == ("channel-model", "channel-provider")
     assert runner._pre_agent_fallback_notice == "foreground"
+
+
+@pytest.mark.parametrize("failure", ["owner", "scope"])
+def test_owner_or_scope_failure_preserves_pending_wake(monkeypatch, tmp_path, failure):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from gateway import kanban_owner_wake as owner
+
+    entry = {"key": "claim", "delegation_id": "failed-routing", "task_id": "fixture-task",
+             "home_sid": "fixture-home", "wake_text": "original obligation"}
+    state = wake.BoomerangWakeState(tmp_path / "claims.json")
+    state.claim(entry["key"], entry)
+    def resolve(*a):
+        if failure == "owner":
+            raise RuntimeError("owner lookup failed")
+        return SimpleNamespace(origin=object())
+    @asynccontextmanager
+    async def scope(*a):
+        raise RuntimeError("scope entry failed")
+        yield
+    runner = SimpleNamespace(session_store=None, _async_profile_scope_for_source=scope)
+    monkeypatch.setattr(owner, "resolve_owner", resolve)
+    async def refuse(*a, **kw):
+        return False
+    monkeypatch.setattr(wake, "post_line", refuse)
+    monkeypatch.setattr(wake, "resurface", refuse)
+    monkeypatch.setattr(wake, "_board_delivered", lambda *a: set())
+    asyncio.run(wake.run_entry(runner, entry, state))
+    claim = state.get_claim(entry["key"])
+    assert claim["outcome"] == "failed"
+    assert failure in claim["reason"]
+    assert not claim["resurface_delivered"]
+    row = state.handbacks()[entry["delegation_id"]]
+    assert row["turn"] == "original obligation" and wake.PART_TURN in row["parts"]

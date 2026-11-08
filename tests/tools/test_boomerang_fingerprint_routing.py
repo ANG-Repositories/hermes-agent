@@ -64,7 +64,7 @@ def test_fingerprint_downgrade_does_not_resnapshot_switched_parent(monkeypatch):
         parent.close()
 
 
-def test_pin_refused_rebuild_uses_original_snapshot(monkeypatch):
+def test_pin_refused_fails_without_unowned_replacement(monkeypatch):
     import httpx
     import anthropic
     from tests.tools.test_delegate_tool_fork_mode import _anthropic_response
@@ -99,13 +99,12 @@ def test_pin_refused_rebuild_uses_original_snapshot(monkeypatch):
             child = dt._build_child_agent(task_index=0, goal="verify", context=None, toolsets=None, model=None,
                 max_iterations=4, task_count=1, parent_agent=parent, inherit_mode="fork", inherit_parent_route=True)
             result = dt._run_single_child(0, "verify", child, parent)
-        assert result["status"] == "completed", result
-        assert result["summary"] == "PIN-REFUSED-SNAPSHOT-SENTINEL"
-        assert len(captured) == 2 and len(requests) == 2
-        folded = captured[1]
-        assert (folded.model, folded.provider, folded.base_url, folded.api_key) == before
-        assert folded._fallback_chain == [{"provider": "openai", "model": "permitted-backup"}]
-        assert folded._context_inherited == "summary"
+        assert result["status"] == "failed", result
+        assert len(captured) == 1 and len(requests) == 1
+        from tools import delegate_tool_registry as registry
+        with registry._active_subagents_lock:
+            assert child._subagent_id not in registry._active_subagents
+        assert child not in parent._active_children
     finally:
         for child in captured:
             child.close()

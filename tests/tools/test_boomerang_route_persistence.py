@@ -14,17 +14,42 @@ def parent():
                           "base_url": "http://127.0.0.1:9002/backup/v1"}])
 
 
-def test_selected_endpoint_beats_provider_default(monkeypatch):
+@pytest.mark.parametrize("matching", [False, True])
+def test_recovery_credentials_are_bound_to_selected_endpoint(monkeypatch, matching):
     p = parent()
     route = persist_route(p)
     monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda *a, **kw: {
-        "provider": "openai", "api_key": "FRESH-KEY", "base_url": "http://provider-default/v1",
+        "provider": "openai", "api_key": "FRESH-KEY", "base_url": p.base_url if matching else "http://provider-default/v1",
         "api_mode": "chat_completions"})
+    requests = []
+    monkeypatch.setattr("httpx.Client.send", lambda *a, **kw: requests.append(kw))
+    if not matching:
+        with pytest.raises(ValueError, match="endpoint") as error:
+            recover_route_parent(p, route)
+        assert requests == []
+        assert "FRESH-KEY" not in str(error.value)
+        assert "SECRET-PRIMARY" not in str(error.value)
+        return
     restored = recover_route_parent(p, route)
     assert restored.base_url == p.base_url, "selected endpoint lost to provider default"
     assert restored._client_kwargs == {"api_key": "FRESH-KEY", "base_url": p.base_url}
     assert restored._fallback_chain == p._fallback_chain
     assert "SECRET-PRIMARY" not in str(route)
+
+
+@pytest.mark.parametrize("provider,endpoint", [("copilot-acp", "acp://copilot"), ("moa", "moa://local")])
+def test_virtual_provider_route_roundtrip(monkeypatch, provider, endpoint):
+    p = parent()
+    p.provider = p.requested_provider = provider
+    p.base_url = endpoint
+    p._fallback_chain = []
+    route = persist_route(p)
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda *a, **kw: {
+        "provider": provider, "api_key": "virtual-credential", "base_url": endpoint,
+        "api_mode": "chat_completions"})
+    restored = recover_route_parent(p, route)
+    assert restored.base_url == endpoint
+    assert restored.requested_provider == provider
 
 
 @pytest.mark.parametrize("chain", [None, "auto", {"provider": "openai"}, [None], ["openai"],
