@@ -886,34 +886,44 @@ class GatewayGoalsMixin:
             # The goal lock is held through admission, so a gateway /goal pause|clear cannot complete
             # while the adapter prepares the event (Discord awaits get_chat_info before claiming).
             async with self._goal_session_lock(session_id):
-                mgr, prompt, before, after = await self._run_in_executor_with_context(_wake)
+                def _give_back(result):
+                    _mgr, _prompt, _before, _after = result
+                    if _prompt:
+                        undo_idle_wake(session_id, _before, _after)
+
+                mgr, prompt, before, after = await self._claim_off_loop(_wake, _give_back)
                 if not prompt:
                     return
-                # Writers outside this lock (CLI/TUI on the same session) may have ended the goal since
-                # the wake's save, or the re-read failed: give the wake back either way.
-                if not await self._run_in_executor_with_context(_still_active):
-                    await self._run_in_executor_with_context(_refund)
-                    return
-                if _ineligible(quick_key):
-                    await self._run_in_executor_with_context(_refund)
-                    return
-                logger.info(
-                    "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
-                    quick_key, session_id, prompt.splitlines()[0][:80],
-                )
-                event = self._synthetic_prompt_event(source, prompt, internal=True)
-                event.metadata["gateway_session_key"] = quick_key
-                refused = []
+                event = None
+                delivered = False
+                try:
+                    # Writers outside this lock (CLI/TUI on the same session) may have ended the goal since
+                    # the wake's save, or the re-read failed: give the wake back either way.
+                    if not await self._run_in_executor_with_context(_still_active):
+                        return
+                    if _ineligible(quick_key):
+                        return
+                    logger.info(
+                        "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
+                        quick_key, session_id, prompt.splitlines()[0][:80],
+                    )
+                    event = self._synthetic_prompt_event(source, prompt, internal=True)
+                    event.metadata["gateway_session_key"] = quick_key
+                    refused = []
 
-                def _admit(key: str) -> bool:
-                    # Final eligibility check, run by the adapter at the claim itself (Prism
-                    # eb13daf988ed): no await separates it from the session claim or queue.
-                    if _ineligible(key):
-                        refused.append(key)
-                        return False
-                    return True
+                    def _admit(key: str) -> bool:
+                        # Final eligibility check, run by the adapter at the claim itself (Prism
+                        # eb13daf988ed): no await separates it from the session claim or queue.
+                        if _ineligible(key):
+                            refused.append(key)
+                            return False
+                        return True
 
-                event._admission_check = _admit
-                await adapter.handle_message(event)
-                if refused:  # the wake never ran: give it back
-                    await self._run_in_executor_with_context(_refund)
+                    event._admission_check = _admit
+                    await adapter.handle_message(event)
+                    delivered = not refused
+                finally:
+                    # Cancellation may occur during the post-claim reload or the adapter's
+                    # pre-admission channel lookup. Never consume a retry that did not start.
+                    if not delivered and not getattr(event, "_gateway_accepted", False):
+                        await asyncio.shield(self._run_in_executor_with_context(_refund))

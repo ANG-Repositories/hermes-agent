@@ -95,6 +95,23 @@ async def test_incomplete_limit_is_configurable(tmp_path, monkeypatch):
     assert decision["message"]
 
 
+def test_failed_real_event_rearms_idle_checkins(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mgr = goals.GoalManager("rearm")
+    mgr.set("ship it")
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    mgr.state.idle_wakes = 3
+    mgr._save()
+    mgr.evaluate_after_turn("failed user turn", real_event=True, turn_completed=False)
+    mgr = goals.GoalManager("rearm")
+    assert mgr.state.idle_wakes == 0
+    with patch.object(goals, "judge_goal", return_value=("continue", "more", False, None, False)):
+        mgr.evaluate_after_turn("recovered", real_event=False)
+    clock += 1801
+    assert mgr.idle_wake_prompt(clock, checkin_minutes=30, max_checkins=3)
+
+
 def test_loop_observation_does_not_consume_due_retry(tmp_path, monkeypatch):
     from hermes_cli.loops import goal_blocks_loop_tick
 

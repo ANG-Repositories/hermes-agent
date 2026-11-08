@@ -84,6 +84,63 @@ async def test_timer_parked_goal_is_woken_when_the_deadline_passes(rig):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["claim", "recheck", "admission"])
+async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary):
+    runner, adapter, received, key = rig
+    mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    await asyncio.to_thread(mgr.set, "ship it")
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
+    clock = mgr.state.waiting_until
+    before = mgr.idle_wake_snapshot()
+    reached, release = asyncio.Event(), asyncio.Event()
+    real_hop = runner._run_in_executor_with_context
+    real_handle = adapter.handle_message
+
+    async def hop(fn, *args):
+        result = await real_hop(fn, *args)
+        if (boundary == "claim" and fn.__name__ == "_wake") or (
+                boundary == "recheck" and fn.__name__ == "_still_active"):
+            reached.set()
+            await release.wait()
+        return result
+
+    async def handle(event):
+        reached.set()  # Discord's awaited channel lookup before the base admission check
+        await release.wait()
+        return await real_handle(event)
+
+    runner._run_in_executor_with_context = hop
+    if boundary == "admission":
+        adapter.handle_message = handle
+    entry = runner.session_store.list_sessions()[0]
+    task = asyncio.create_task(runner._goal_idle_wake_one(entry, 0, 3))
+    try:
+        await asyncio.wait_for(reached.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+    # Drain a shielded off-loop claim/refund, if cancellation happened during the write.
+    for _ in range(100):
+        restored = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+        if restored.state.incomplete_retry_wait:
+            break
+        await asyncio.sleep(0.01)
+    assert restored.state.incomplete_retry_wait
+    assert restored.state.waiting_until == before["waiting_until"]
+    assert received == []
+    runner._run_in_executor_with_context = real_hop
+    adapter.handle_message = real_handle
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    await _drain(adapter)
+    assert len(received) == 1
+    assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+
+
+@pytest.mark.asyncio
 async def test_busy_session_is_never_woken(rig):
     runner, adapter, received, key = rig
     await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window

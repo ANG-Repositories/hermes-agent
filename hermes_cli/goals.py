@@ -1882,6 +1882,10 @@ class GoalManager:
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        # Real events re-arm check-ins even when the agent turn fails before judging.
+        if real_event and state.idle_wakes:
+            state.idle_wakes = 0
+            self._save()
         # Failed agent turns are not evidence for gates or the judge. Persist the streak so
         # reloading the manager (or restarting the gateway) cannot restart a rapid retry loop.
         if state.consecutive_incomplete_turns and (turn_completed or human_message):
@@ -1911,9 +1915,6 @@ class GoalManager:
             self._save()
             return _decision("active", True, self.next_continuation_prompt(), "incomplete",
                              "agent turn did not complete", "")
-        if real_event and state.idle_wakes:
-            state.idle_wakes = 0
-            self._save()
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
