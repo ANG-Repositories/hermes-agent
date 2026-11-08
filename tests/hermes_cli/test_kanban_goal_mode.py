@@ -616,7 +616,7 @@ def test_zombie_run_cannot_block_a_card_owned_by_a_live_successor(kanban_home):
 
     # POSITIVE CONTROL: the LIVE owner (run 2) can still block normally, so the
     # guard restricts only stale writers and does not break the real path.
-    blocked = kb.block_task(conn, tid, reason="real budget exhausted", expected_run_id=2)
+    blocked = kb.block_task(conn, tid, reason="real budget exhausted", kind="needs_input", expected_run_id=2)
     assert blocked is True
     row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
     assert row["status"] == "blocked"

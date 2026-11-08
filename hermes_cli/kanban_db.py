@@ -14017,8 +14017,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    if kind is None and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or ""):
-        raise BlockRefused("block needs a kind or an explicit unblock_when predicate")
+
     if until is not None and kind != "deferred":
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
@@ -14031,11 +14030,15 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, claim_lock FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, claim_lock, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        if expected_run_id is not None and cur_row["current_run_id"] != expected_run_id:
+            return False
+        if kind is None and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or ""):
+            raise BlockRefused("block needs a kind or an explicit unblock_when predicate")
         if require_unclaimed_ready and (cur_row["status"] != "ready" or cur_row["claim_lock"] is not None):
             return False
         # Refuse only where a block could have landed; a done/archived/
