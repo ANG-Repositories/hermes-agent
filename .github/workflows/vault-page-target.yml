@@ -19,8 +19,11 @@ jobs:
           node-version: '22'
       - run: npm install --global agent-browser@0.26.0
       - name: Real Chromium and real CLI tool-session regression
+        env:
+          VAULT_TEST_REQUIRE_CLI: '1'
         run: |
           uv run --no-sync pytest tests/tools/test_browser_vault.py tests/tools/test_browser_vault_cards.py tests/tools/test_browser_vault_target.py tests/tools/test_browser_vault_cli_target.py -q --tb=short --junitxml=vault-target.xml
+          uv run --no-sync python -c "import xml.etree.ElementTree as E; s=E.parse('vault-target.xml').getroot().find('testsuite'); assert int(s.attrib['tests']) >= 112 and s.attrib['skipped'] == '0', s.attrib"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

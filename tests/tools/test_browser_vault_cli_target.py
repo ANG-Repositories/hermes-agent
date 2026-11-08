@@ -24,6 +24,8 @@ def test_real_cli_tool_session(pages, monkeypatch, action):
                 created_at=time.time(), last_activity=time.time())
     binary = os.environ.get("VAULT_TEST_AGENT_BROWSER") or shutil.which("agent-browser")
     if not binary:
+        if os.environ.get("VAULT_TEST_REQUIRE_CLI") == "1":
+            pytest.fail("real agent-browser binary required by this CI lane")
         pytest.skip("real agent-browser binary required")
     # Isolate package discovery from fleet PM state; execution/transport is real.
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(__import__("pathlib").Path(os.environ["HERMES_HOME"]) / "tools"))
