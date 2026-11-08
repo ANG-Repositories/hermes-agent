@@ -7708,9 +7708,9 @@ def _dispatch_once_locked(
         if placed_host is None:
             # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
             # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
-            _dest_wait = _kph.local_destination_wait(_pause_cache)
-            if _dest_wait is not None:
-                result.placement_waits[row["id"]] = _dest_wait
+            _local_wait = _kph.local_destination_wait(_pause_cache)
+            if _local_wait is not None:
+                result.placement_waits[row["id"]] = _local_wait
                 continue
         if _take_refusal is not None and placed_host is None:
             result.take_refusals[row["id"]] = _take_refusal
