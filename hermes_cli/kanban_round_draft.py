@@ -77,14 +77,12 @@ def mark_records(conn, task_id: str) -> dict:
 
 
 def round_marked(mark, head: str, record, own_runs: Optional[Iterable] = None) -> bool:
-    """True iff the persisted ``mark`` was written by one of ``own_runs`` (this card's run ids), at ``head``,
-    after this card's last flip ``record``. No GitHub read: comments are display receipts, not provenance.
+    """An unconsumed mark from an own run, not older than the last flip.
+    The authenticated transition (checked separately) survives WIP head changes; timestamps alone prove nothing.
     Missing/malformed mark or record, or the kill switch -> False (the draft stays an operator hold)."""
     if not enabled() or not head or not isinstance(mark, dict) or not isinstance(record, dict):
         return False
-    if str(mark.get("head") or "") != head:
-        return False
-    if own_runs is not None and str(mark.get("run") or "") not in {str(r) for r in own_runs}:
+    if own_runs is None or str(mark.get("run") or "") not in {str(r) for r in own_runs}:
         return False
     try:
         return not mark.get("consumed") and float(mark.get("at") or 0) >= float(record.get("at") or 0)

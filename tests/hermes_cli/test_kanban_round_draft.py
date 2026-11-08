@@ -107,6 +107,7 @@ def test_second_run_adopts_marked_draft_and_handback_undrafts_once(rig):
     rig.log.clear()
     assert rig.start(102) == {"o/r#1": "skip: already draft"}
     assert rig.log == []                 # no second draft, no second mark
+    rig.state["pr"]["head"]["sha"] = "b" * 40  # WIP push preserves the draft transition
     report = rig.handback()
     assert report["draft_flipped"] == ["o/r#1"] and rig.log == [("ready", "o/r", 1)]
     rig.handback()                       # ready now: a second handback does not flip again
