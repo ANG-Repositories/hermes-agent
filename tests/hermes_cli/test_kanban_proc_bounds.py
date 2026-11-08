@@ -475,24 +475,59 @@ def _chrome_procs(profile: str, exclude: int | None = None) -> list[int]:
     return out
 
 
-def _chrome_tree(browser: int) -> dict[int, tuple[float, bool]]:
+def _chrome_tree(browser: int, browser_birth: float) -> dict[int, tuple[float, bool]]:
     """Browser + every descendant: pid -> (birth, is a ``--type=`` helper).
 
     macOS helpers do not repeat ``--user-data-dir`` in argv, so the profile
     path names only the browser there; the process tree names them all.
     """
     try:
-        procs = [kb.psutil.Process(browser)]
-        procs += procs[0].children(recursive=True)
+        root = kb.psutil.Process(browser)
+        if root.create_time() != browser_birth:
+            return {}
+        procs = [root, *root.children(recursive=True)]
+        if not root.is_running():
+            return {}
     except kb.psutil.Error:
         return {}
     tree = {}
     for p in procs:
-        born = kb._member_birth(p.pid)
-        if born is not None:
+        try:
+            born = p.create_time()
             helper = any(a.startswith("--type=") for a in kb._safe_cmdline(p))
-            tree[p.pid] = (born, helper)
+            if p.is_running():
+                tree[p.pid] = (born, helper)
+        except kb.psutil.Error:
+            continue
     return tree
+
+
+@pytest.mark.parametrize("recycled", [None, "root", "helper"])
+def test_chrome_snapshot_rejects_recycled_identities(monkeypatch, recycled):
+    from types import SimpleNamespace
+
+    births = {1234: 10.0, 5678: 20.0}
+    helper = SimpleNamespace(pid=5678, create_time=lambda: 20.0,
+                             is_running=lambda: births[5678] == 20.0)
+
+    def children(recursive):
+        assert recursive
+        if recycled == "helper":
+            births[5678] = 30.0
+        return [helper]
+
+    root = SimpleNamespace(pid=1234, create_time=lambda: births[1234],
+                           is_running=lambda: births[1234] == 10.0, children=children)
+    if recycled == "root":
+        births[1234] = 40.0
+    monkeypatch.setattr(kb.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(kb, "_member_birth", births.get)
+    monkeypatch.setattr(kb, "_safe_cmdline", lambda p: ["--type=gpu"] if p is helper else [])
+    tree = _chrome_tree(1234, 10.0)
+    expected = {} if recycled == "root" else {1234: (10.0, False)}
+    if recycled is None:
+        expected[5678] = (20.0, True)
+    assert tree == expected
 
 
 def _remember_chrome_tree(
@@ -571,14 +606,16 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     kb._register_worker_identity(worker.pid, tid, task.current_run_id, spawned_at)
     assert kbd._set_worker_pid(conn, tid, worker.pid)
     browser = int(worker.stdout.readline())
-    _track(browser)
+    browser_birth = kb._member_birth(browser)
+    assert browser_birth is not None
+    _STARTED.append((browser, browser_birth))
     deadline = time.monotonic() + 15
     # A real helper (renderer/gpu/utility) in the browser's tree, not argv
     # matches on the profile path (t_5dc9a37a).
-    tree = _chrome_tree(browser)
+    tree = _chrome_tree(browser, browser_birth)
     while time.monotonic() < deadline and not any(h for _, h in tree.values()):
         time.sleep(0.2)
-        tree = _chrome_tree(browser)
+        tree = _chrome_tree(browser, browser_birth)
     assert any(h for _, h in tree.values()), \
         f"Chrome did not start its helpers; drill proves nothing ({tree})"
     observed = tree
@@ -604,7 +641,7 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
         time.sleep(0.05)
     assert worker.pid in exited
     assert kb._pid_alive(browser), "Chrome died with its worker; drill proves nothing"
-    _remember_chrome_tree(tree, _chrome_tree(browser))
+    _remember_chrome_tree(tree, _chrome_tree(browser, browser_birth))
 
     assert kb.reap_exited_worker_leftovers(conn, exited, grace=5.0) == [tid]
     deadline = time.monotonic() + 15
