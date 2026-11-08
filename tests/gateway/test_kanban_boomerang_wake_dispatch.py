@@ -362,6 +362,40 @@ def test_block_nonchat_owner_preserves_notifier_wake(env, platform):
     assert not _claims()
 
 
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_block_assessed_text_changed_before_verdict(env, field):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    # Text updates need not append an event. Old evidence cannot authorize
+    # a different prerequisite, even without a restricted tag.
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute(f"UPDATE tasks SET {field} = 'different prerequisite' WHERE id = ?", (tid,))
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["old probe healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "old probe healthy"}))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert len(env["adapter"].handled) == 1
+
+
+def test_block_api_subscription_with_chat_home_keeps_native_wake(env):
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+        event = kb.list_events(conn, tid)[-1]
+        task = kb.get_task(conn, tid)
+    remaining = asyncio.run(ah.notifier_dispatch(
+        env["runner"], {"events": [event], "auto": {event.id: Disposition("auto", "fork", 0, "blocked_assess")}},
+        {"platform": "api_server", "chat_id": "api-session"}, None, task, {"blocked"}, "blocked"))
+    assert remaining == {"blocked"}
+    assert not _claims()
+    assert not env["dispatched"]
+
+
 def test_block_claim_concurrent_budget(env):
     state = ah.BoomerangWakeState()
     barrier = threading.Barrier(2)

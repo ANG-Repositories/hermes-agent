@@ -584,7 +584,8 @@ def card_snapshot(board: Optional[str], task_id: str) -> dict:
     finally:
         conn.close()
     return {"status": getattr(task, "status", None), "assignee": getattr(task, "assignee", None),
-            "top_event_id": int(top or 0), "pr": pr, "head": head}
+            "top_event_id": int(top or 0), "pr": pr, "head": head,
+            "card_text": [getattr(task, "title", None), getattr(task, "body", None)]}
 
 
 # --- delegation ledger (boomerang skill Step 0 shape) -------------------------------------
@@ -875,9 +876,12 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                 current = kb.get_task(conn, tid)
                 if card_tags(current) & SURFACE_TAGS:
                     raise RuntimeError("restricted card requires owner assessment")
-                # Pin exactly the policy-bearing text read above. The DB checks
-                # it under its writer lock, alongside the block-event CAS.
-                kwargs["expect_card_text"] = (current.title, current.body)
+                # Bind evidence to the dispatch snapshot, not freshly edited text.
+                # The DB checks it under its writer lock with the block-event CAS.
+                assessed_text = entry.get("assessed_card_text")
+                if not isinstance(assessed_text, list) or len(assessed_text) != 2:
+                    raise RuntimeError("assessed card text unavailable")
+                kwargs["expect_card_text"] = tuple(assessed_text)
             if not kb.unblock_task(conn, tid, **kwargs):
                 raise RuntimeError("unblock refused")
         elif status in ("ready", "todo"):
@@ -1496,6 +1500,7 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         "event_ts": event_ts, "row": disposition.row, "mode": disposition.mode or "fork",
         "status": snap["status"], "assignee": snap["assignee"], "pr": snap["pr"], "head": snap["head"],
         "cursor_event_id": max(int(event_id), snap["top_event_id"]),
+        "assessed_card_text": snap["card_text"],
         "home_sid": home_sid or "", "route": dict(route or {}), "path": path,
         "title": str(_field(task, "title") or "")[:160], "wake_text": wake_text,
         "verdict_nonce": secrets.token_hex(8), "delegation_id": mint_delegation_id(),
@@ -1529,6 +1534,9 @@ async def dispatch_or_warn(runner: Any, entry_route: dict, **kw: Any) -> bool:
         from gateway import kanban_home_route as _hr
         from gateway import kanban_owner_wake as _ow
 
+        if kw.get("path") == "notifier" and not _ow.is_chat_origin(
+                SimpleNamespace(origin=SimpleNamespace(**entry_route))):
+            return False  # a chat home does not own a non-chat subscription
         try:
             home = await asyncio.to_thread(
                 _ow.resolve_owner, getattr(runner, "session_store", None),
