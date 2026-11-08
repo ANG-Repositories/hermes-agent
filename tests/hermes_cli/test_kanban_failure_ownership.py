@@ -252,9 +252,10 @@ def test_pending_boundary_continuity(board, order, task_kind):
     assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='healed'").fetchone()[0] == 1
 
 
-def test_disabled_replay_after_enrollment(board):
+@pytest.mark.parametrize('disabled_producer', ['ci-red-owner', 'main-tip-red'])
+def test_disabled_replay_after_enrollment(board, disabled_producer):
     obs = observation()
-    assert admit(board, obs).action == 'DISABLED'
+    assert admit(board, obs, producer=disabled_producer).action == 'DISABLED'
     enroll(board)
     result = admit(board, obs)
     assert result.action == 'REPAIR'
