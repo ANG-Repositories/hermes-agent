@@ -22,6 +22,15 @@ def test_review_entry_binds_implementer_before_any_exit(conn):
     ).fetchone()
     assert event is not None
     assert json.loads(event[0])["implementer"] == "builder"
+    kb._append_event(conn, tid, "review_requested", {"implementer": "builder", "reviewer": "human:apollo", "summary": "verified"})
+    handoffs = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested'", (tid,)).fetchall()
+    assert len(handoffs) == 1
+    assert json.loads(handoffs[0][0])["summary"] == "verified"
+
+    # A new raw INSERT has no prior run/assignee to recover.
+    conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES('raw-review','Raw review','review',1)")
+    payload = conn.execute("SELECT payload FROM task_events WHERE task_id='raw-review' AND kind='review_requested'").fetchone()[0]
+    assert json.loads(payload)["implementer"] == "human:operator"
 
 
 def test_human_ready_is_operator_todo_and_cannot_promote(conn):

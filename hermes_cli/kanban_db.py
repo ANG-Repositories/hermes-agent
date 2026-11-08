@@ -9207,6 +9207,23 @@ def _append_event(
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
     boot = _boot_evidence() if kind in _BOOT_EVIDENCE_KINDS else None
+    if kind == "review_requested":
+        # A raw-entry trigger supplies provisional provenance before the normal
+        # handoff writer has finished. Finalize that row rather than publish two
+        # handoffs (and two notifications) for the same entry.
+        provisional = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='review_requested' "
+            "AND json_valid(payload) AND json_extract(payload,'$.source')='lifecycle_entry_repair' "
+            "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested')",
+            (task_id, task_id),
+        ).fetchone()
+        if provisional is not None:
+            conn.execute(
+                "UPDATE task_events SET run_id=?,payload=?,actor_profile=?,actor_session_id=? WHERE id=?",
+                (run_id, _json_or_null(payload), actor_profile, actor_session_id, provisional[0]),
+            )
+            _journal_append(conn, task_id, kind, payload, run_id=run_id)
+            return
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
         "actor_profile, actor_session_id, boottime, boot_id) "
@@ -14037,7 +14054,8 @@ def block_task(
             return False
         if expected_run_id is not None and cur_row["current_run_id"] != expected_run_id:
             return False
-        if kind is None and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or ""):
+        if (kind is None and cur_row["status"] in ('running', 'ready', 'review')
+                and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or "")):
             raise BlockRefused("block needs a kind or an explicit unblock_when predicate")
         if require_unclaimed_ready and (cur_row["status"] != "ready" or cur_row["claim_lock"] is not None):
             return False
