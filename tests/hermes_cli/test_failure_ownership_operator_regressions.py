@@ -98,6 +98,31 @@ def test_overlapping_later_passes_heal_delayed_failure(board, order):
     assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0] == 0
 
 
+def test_late_lineage_reconstruction_preserves_single_binding(board):
+    from dataclasses import replace
+    h.enroll(board)
+    a, b, x, d = (letter * 40 for letter in ('a', 'b', 'c', 'd'))
+    rows = (
+        replace(h.observation('failure-a'), sha=a, lineage=(a,)),
+        replace(h.observation('pass-b', result='pass'), sha=b, lineage=(a, b)),
+        replace(h.observation('failure-x'), sha=x, lineage=(x,)),
+        replace(h.observation('failure-d'), sha=d, lineage=(a, x, b, d)),
+    )
+    decisions = [h.admit(board, obs) for obs in rows]
+    original_owner = decisions[0].card_id
+    retained_owner = decisions[2].card_id
+    assert original_owner != retained_owner
+    bindings = board.execute("SELECT b.card_id FROM failure_bindings b JOIN failure_episodes e USING(episode_id) WHERE b.state='bound' AND e.state='active'").fetchall()
+    assert [row[0] for row in bindings] == [retained_owner]
+    with h.kb.write_txn(board):
+        assert h.fo.recheck_for_claim(board, original_owner).action == 'healed'
+        assert h.fo.recheck_for_claim(board, retained_owner).action == 'claim'
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 2
+    assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0] == 4
+    assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0] == 1
+    assert board.execute('PRAGMA foreign_key_check').fetchall() == []
+
+
 def test_new_detector_replacement_does_not_inherit_adoption_exemption(board):
     h.enroll(board)
     red = h.observation()

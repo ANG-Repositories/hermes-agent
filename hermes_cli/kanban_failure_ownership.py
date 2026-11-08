@@ -375,7 +375,7 @@ def _reduce(conn,key_id,obs_id,obs):
         predecessor = eid
     if active and transferable and transferable['episode_id'] != active['episode_id']:
         conn.execute("UPDATE failure_bindings SET state='detached',generation=generation+1,reason='late_boundary_transfer' WHERE binding_id=?",(transferable['binding_id'],))
-        conn.execute("UPDATE failure_bindings SET state='detached' WHERE episode_id=? AND state='pending'",(active['episode_id'],))
+        conn.execute("UPDATE failure_bindings SET state='detached',generation=generation+1,reason='late_boundary_superseded' WHERE episode_id=? AND state IN ('pending','bound')",(active['episode_id'],))
         conn.execute("INSERT INTO failure_bindings(episode_id,card_id,state,generation,provenance_json,task_kind,detector_only) VALUES(?,?,?,?,?,?,?)",
                      (active['episode_id'],transferable['card_id'],transferable['state'],transferable['generation']+1,transferable['provenance_json'],transferable['task_kind'],transferable['detector_only']))
     return active
