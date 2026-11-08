@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import subprocess
 import sys
@@ -79,7 +80,13 @@ def _stop(proc, home, deadline, finished):
         while True:
             try:
                 if proc.poll() is None:
-                    kill_process_tree(proc.pid)
+                    if os.name == 'posix':
+                        import signal
+                        # This worker owns a fresh session. Avoid a whole-host
+                        # psutil census before terminating its socket owner.
+                        os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only; worker owns this group
+                    else:
+                        kill_process_tree(proc.pid)
                 proc.wait(timeout=0.05)
             except Exception:
                 # Keep the process handle (not just a reusable PID) and inhibit
@@ -120,6 +127,7 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
             cwd=str(Path(__file__).resolve().parent.parent), env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8',
+            start_new_session=os.name == 'posix',
         )
     except (OSError, ValueError, TypeError):
         with _CLEANUP_LOCK:

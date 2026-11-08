@@ -41,6 +41,20 @@ def pytest_sessionstart(session):
     original_popen = subprocess.Popen
     original_stop = chain._stop
     original_attempt = chain.run_attempt
+    import agent.deadline
+    original_kill = agent.deadline.kill_process_tree
+
+    def kill(pid, **kwargs):
+        _event('kill_begin', child=pid)
+        try:
+            result = original_kill(pid, **kwargs)
+            _event('kill_return', child=pid, signalled=result)
+            return result
+        except Exception as exc:
+            _event('kill_error', child=pid, error_type=type(exc).__name__, error=str(exc)[:300])
+            raise
+
+    agent.deadline.kill_process_tree = kill
 
     class TracedPopen(original_popen):
         def __init__(self, argv, *args, **kwargs):
@@ -57,6 +71,11 @@ def pytest_sessionstart(session):
         _event('terminate_begin', child=proc.pid, returncode=proc.returncode)
         result = original_stop(proc, home, deadline, finished)
         _event('reap_return', child=proc.pid, stopped=result, returncode=proc.returncode)
+        if not result:
+            import sys
+            import traceback
+            for tid, frame in sys._current_frames().items():
+                _event('cleanup_stack', thread=tid, stack=[f'{f.filename}:{f.lineno}:{f.name}' for f in traceback.extract_stack(frame)])
         return result
 
     def attempt(route, *args, **kwargs):

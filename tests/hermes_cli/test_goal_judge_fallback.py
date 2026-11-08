@@ -166,6 +166,8 @@ def test_deadline_and_cancel_reap_request_owner(tmp_path, monkeypatch):
     children = []
     def spawn(*args, **kwargs):
         # An uncooperative provider/socket owner: deadline must terminate, not abandon it.
+        import os
+        assert kwargs['start_new_session'] == (os.name == 'posix')
         proc = actual_popen([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs)
         children.append(proc)
         return proc
@@ -302,6 +304,8 @@ def test_stuck_cleanup_retains_owner_and_inhibits_retry(tmp_path, monkeypatch, c
         release.wait(5)
         raise OSError('kill failed')
     monkeypatch.setattr(agent.deadline, 'kill_process_tree', kill)
+    if chain.os.name == 'posix':
+        monkeypatch.setattr(chain.os, 'killpg', lambda pid, sig: kill(pid))
     monkeypatch.setattr(chain.subprocess, 'Popen', lambda *a, **kw: spawned.append(Worker()) or spawned[-1])
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     route = dict(provider='custom', model='primary', timeout=0.3)
