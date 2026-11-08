@@ -480,8 +480,8 @@ def _placement_host() -> str | None:
 
     A spilled worker carries ``KANBAN_WORKER_PLACEMENT`` (its pool host); the
     boot record wins over the env, which the config bridge may have touched. A
-    dispatcher-owned worker with no placement runs on the Studio itself and is
-    ``studio-local``. Anything else (gateway, interactive CLI, a child process
+    dispatcher-owned worker with no placement is ``studio-local`` only when
+    its resolved terminal backend is local. Anything else (gateway, interactive CLI, a child process
     that merely inherited a worker's env) is None.
     """
     import os

@@ -6,7 +6,8 @@ A historical turn needs positive provenance: the session prefix of its turn_id
 must match ``worker_session_id`` in the covering task_runs.metadata. Time overlap alone
 does not prove worker ownership. Exactly one run of this profile may overlap
 the turn, including runs whose host is unknown; the turn must start in that
-run and have a known host (``studio`` -> ``studio-local``). A final turn can end
+closed run and have a known host (``studio`` -> ``studio-local``). Open runs
+only count for overlap detection. A final turn can end
 after its own completion tool closes the run. Missing provenance, placement
 reapplication failures, overlapping runs, gateway turns and already stamped rows
 are left unchanged.
