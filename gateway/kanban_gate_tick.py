@@ -304,6 +304,9 @@ class GateTickBuilder:
         it waits. Off under KANBAN_UNIFIED_ADMIT=0. Returns the count published, or None (off, or the write failed:
         logged, and the next tick publishes again; Prism 8397e82995e1). A board that is quarantined as corrupt, or
         failed to open earlier this tick, counts as zero demand and is not re-opened (corrupt-board guard)."""
+        from hermes_cli.kanban_priority_door import enabled as door_enabled
+        if door_enabled():
+            return None  # per-board routed publisher owns demand in door modes
         if not klg.unified_admit():
             return None
         n, read = 0, 0

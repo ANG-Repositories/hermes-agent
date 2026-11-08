@@ -1492,6 +1492,35 @@ class GoalManager:
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
 
+    def pause_if_unchanged(self, reason: str, *, baseline: Any = _UNPINNED) -> bool:
+        """Pause the goal a failed turn ran under, compare-and-set against a fresh read: a pause, clear,
+        done or replacement written since the turn ended (or while this write lands) wins; a nonterminal
+        edit of the same activation (/subgoal) is kept and still paused. True if this call paused it.
+        ``baseline`` omitted: pinned once to the row this manager already holds, so a replacement
+        landing before the first read or during a CAS retry is never paused."""
+        if baseline is _UNPINNED:
+            baseline = self._stored
+        db = _get_session_db() if self.session_id else None
+        for _attempt in range(_STALE_RETRIES + 1):
+            self._state, self._stored = _load_goal_raw(self.session_id, strict=True)
+            state, raw = self._state, self._stored
+            if state is None or state.status != "active":
+                return False
+            if baseline != raw and not same_active_goal(_row_state(baseline), state):
+                return False
+            if db is None:
+                self.pause(reason)
+                return True
+            state.status, state.paused_reason = "paused", reason
+            state.clear_wait()
+            state.revision += 1
+            new = state.to_json()
+            if db.compare_and_set_meta(_meta_key(self.session_id), raw, new):
+                self._stored = new
+                return True
+        self._state, self._stored = _load_goal_raw(self.session_id)
+        return False
+
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None

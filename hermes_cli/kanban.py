@@ -2795,6 +2795,40 @@ def _cmd_placement(args: argparse.Namespace) -> int:
     return 0 if not rep["errors"] else 1
 
 
+def _cmd_placement_holds(args: argparse.Namespace) -> int:
+    """``placement-holds [--clear ID]`` (t_0c5a95ab): host manifests + pause_hold-labelled cards, live or stale."""
+    from hermes_cli import kanban_pause_hold as kph
+    clear = getattr(args, "clear", None)
+    with kb.connect_closing() as conn:
+        if clear:
+            who = getattr(args, "operator", None) or os.environ.get("USER") or "operator"
+            if not kph.clear_card(conn, clear, who):
+                return _err(f"placement-holds: {clear} has no open pause_hold label")
+            print(f"cleared the pause_hold label on {clear} (a live hold comes back on the next tick)")
+            return 0
+        rep = kph.holds(conn)
+    if getattr(args, "json", False):
+        _print_json(rep)
+        return 0
+    if not rep["hosts"]:
+        print("hosts: no fleet-pause state")
+    for host, h in rep["hosts"].items():
+        state = "HOLDS" if h["holds"] else "no hold"
+        line = f"{host}: {state} {h.get('manifest') or '-'} {h['why']}"
+        if h.get("driver_pid") is not None:
+            line += f" driver pid {h['driver_pid']} {'alive' if h.get('driver_alive') else 'dead'}"
+        print(line)
+        if h.get("pins_owed"):
+            print(f"  resume pins owed: {' '.join(h['pins_owed'])}"
+                  + (" (conflicting pins released: past grace)" if h.get("pin_conflict_expired") else ""))
+    for c in rep["cards"]:
+        print(f"{c['task_id']}: {'LIVE' if c['live'] else 'STALE'} label {c['label']} "
+              f"(origin {c['origin_host'] or '-'}; now {c['now'] or 'not held'})")
+    if not rep["cards"]:
+        print("cards: none labelled pause_hold")
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -3571,13 +3605,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     add_skills = list(getattr(args, "skills", None) or [])
     clear_skills = bool(getattr(args, "clear_skills", False))
     do_skills = bool(add_skills) or clear_skills
+    asap_arg = getattr(args, "asap", None)
     boomerang_arg = getattr(args, "boomerang_wake", None)
 
     if result is None and (summary is not None or raw_meta is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     if (not do_result and not do_fields and not do_model and not do_session
             and no_worker is None and new_priority is None and page is None and not do_skills
-            and boomerang_arg is None):
+            and boomerang_arg is None and asap_arg is None):
         return _err(
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
             "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
@@ -3585,6 +3620,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
     rc = 0
     with kbc.connect_closing() as conn:
+        if asap_arg is not None:
+            from hermes_cli.kanban_priority import set_asap
+            try:
+                if not set_asap(conn, args.task_id, asap_arg):
+                    return _err(f"cannot edit {args.task_id} (unknown id)")
+            except PermissionError as exc:
+                return _err(str(exc))
+            print(f"{args.task_id}: ASAP {'on' if asap_arg else 'off'}")
         if new_priority is not None and not _set_priority(conn, args.task_id, new_priority):
             return 1
         if no_worker is not None:
@@ -5156,6 +5199,7 @@ _HANDLERS = {
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "placement": _cmd_placement,
+    "placement-holds": _cmd_placement_holds,
     "link": _cmd_link, "rehome": _cmd_rehome, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,

@@ -207,7 +207,8 @@ def test_unreadable_manifest_holds_every_card_of_the_host(home, mkplan, caplog):
         r = _routes(res)[ids["A"]]
         assert r["outcome"] == "held" and r["code"] == "pause_hold" and "unreadable" in r["detail"]
         assert ids["C"] in {t for t, _ in spawned}
-        assert sum("unreadable" in m for m in caplog.messages) == 1   # one line per tick (tick-local cache)
+        assert sum("unreadable" in r.getMessage() for r in caplog.records
+                   if r.name == "hermes_cli.kanban_pause_hold") == 1   # one line per tick (tick-local cache)
 
 
 # -- kill switch / arm (d) + AC20 dispatcher half / arm (e) --------------------
