@@ -1,5 +1,6 @@
 """Route snapshot survives a real constructor-time fingerprint downgrade."""
 import copy
+import threading
 from contextlib import ExitStack
 from unittest.mock import patch
 
@@ -38,9 +39,16 @@ def test_fingerprint_downgrade_does_not_resnapshot_switched_parent(monkeypatch):
         captured.append(copy.deepcopy({k: kw[k] for k in ("model", "provider", "base_url", "api_mode", "fallback_model", "request_overrides")}))
         child = real(**kw)
         if len(captured) == 1:
-            parent.model, parent.provider, parent.base_url, parent.api_key = "changed", "openai", "http://changed/v1", "CHANGED"
-            parent._fallback_chain = []
-            parent.request_overrides = {}
+            from agent.route_snapshot import route_lock
+            def switch():
+                with route_lock(parent):
+                    parent.model, parent.provider, parent.base_url, parent.api_key = "changed", "openai", "http://changed/v1", "CHANGED"
+                    parent._fallback_chain = []
+                    parent.request_overrides = {}
+            writer = threading.Thread(target=switch)
+            writer.start()
+            writer.join(5)
+            assert not writer.is_alive()
         return child
     monkeypatch.setattr(fork, "fork_eligible", lambda *a: (True, ""))
     monkeypatch.setattr(fork, "request_fingerprint", lambda agent: {"system": "parent" if agent is parent else "different"})

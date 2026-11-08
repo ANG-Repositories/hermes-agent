@@ -15,9 +15,9 @@ from tools import delegate_tool as dt
 
 @pytest.mark.parametrize("mode", ["summary", "fork", "branch", None])
 @pytest.mark.parametrize("explicit", [False, True])
-@pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.parametrize("disabled", [False, True, "auto"])
 def test_context_mode_does_not_select_route(monkeypatch, mode, explicit, disabled):
-    chain = [] if disabled else [{"provider": "openrouter", "model": "fallback-model"},
+    chain = [] if disabled is True else [{"provider": "openrouter", "model": "fallback-model"},
                                 {"provider": "openai", "model": "cross-vendor-model"}]
     parent = SimpleNamespace(
         model="parent-model", provider="openrouter", requested_provider="openrouter",
@@ -41,7 +41,7 @@ def test_context_mode_does_not_select_route(monkeypatch, mode, explicit, disable
         return child
 
     monkeypatch.setattr("run_agent.AIAgent", construct)
-    monkeypatch.setattr(dt, "_load_config", lambda: {"model": "worker-model", "fallback_providers": []})
+    monkeypatch.setattr(dt, "_load_config", lambda: {"model": "worker-model", "fallback_providers": "auto" if disabled == "auto" else []})
     result = json.loads(dt.delegate_task(
         goal="read parent context", parent_agent=parent, inherit_mode=mode,
         model="explicit-child-model" if explicit else None,
@@ -50,7 +50,13 @@ def test_context_mode_does_not_select_route(monkeypatch, mode, explicit, disable
     assert captured
     expected = "explicit-child-model" if explicit else ("parent-model" if mode else "worker-model")
     assert captured[0]["model"] == expected
-    assert (captured[0]["fallback_model"] or []) == (chain if mode and not explicit else [])
+    selected_chain = captured[0]["fallback_model"] or []
+    if disabled == "auto" and (explicit or not mode):
+        assert isinstance(selected_chain, list)
+        # Unknown-vendor names stay unchanged; auto must not invent a vendor mapping.
+        assert selected_chain == chain
+    else:
+        assert selected_chain == (chain if mode and not explicit else [])
     assert parent._fallback_chain == chain
     if mode and not explicit:
         captured[0]["request_overrides"]["extra_body"]["nonce"] = "child"
@@ -246,6 +252,17 @@ def test_direct_recovery_uses_endpoint_bound_delegation_key(monkeypatch, source,
     assert captured[0]["fallback_model"] == route["fallback_chain"]
     assert captured[0]["providers_allowed"] == ["selected-lane"]
     assert captured[0]["request_overrides"] == route["request_overrides"]
+    # A rotated endpoint or removed key must not expose the unrelated provider key.
+    captured.clear()
+    config["base_url"] = "http://rotated/v1"
+    refused = json.loads(dt.delegate_task(tasks=[task], parent_agent=parent, _recovery_spec=record))
+    assert "endpoint credentials" in refused["error"]
+    assert captured == [] and "WRONG-provider-key" not in json.dumps(refused)
+    config["base_url"] = route["base_url"]
+    config["api_key"] = ""
+    refused = json.loads(dt.delegate_task(tasks=[task], parent_agent=parent, _recovery_spec=record))
+    assert "credentials could not be resolved" in refused["error"]
+    assert captured == [] and "parent-key" not in json.dumps(refused)
 
 
 def test_persist_route_uses_constructed_fallback_chain():

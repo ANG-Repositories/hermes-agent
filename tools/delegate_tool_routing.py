@@ -94,10 +94,6 @@ def recover_route_parent(parent, route, *, credential_ref=None, delegation_cfg=N
                 or endpoint.rstrip("/") != route["base_url"].rstrip("/")):
             raise ValueError("boomerang routing-unavailable: selected endpoint credentials could not be resolved")
         runtime = _resolve_delegation_credentials({**cfg, "model": route["model"]}, parent)
-        if not runtime.get("api_key"):
-            bound_parent = snapshot_parent(parent)
-            if (bound_parent.base_url or "").rstrip("/") == endpoint.rstrip("/"):
-                runtime["api_key"] = bound_parent.api_key
         # The current config owns this key only for its configured endpoint. Do not
         # borrow an arbitrary provider key, even when that provider has the same URL.
     else:
