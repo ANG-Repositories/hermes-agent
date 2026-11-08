@@ -50,3 +50,38 @@ restart authorization belong to Apollo, not this implementation run.
 
 Rollback is a reviewed code revert through normal deployment; preserve all
 registry/session data. Existing foreground waits are not retroactively repaired.
+
+## Implementation receipts
+
+ci-box isolated checkout, `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh`:
+
+- `tests/tools/test_delegate_admission_rejection.py -q`: 14 passed, 0 failed
+  (runner wall 19.5s). Includes real loopback HTTP adapter/executor requests on
+  one parent, both admission and refusal, plus double delivery through the real
+  durable consumer producing one message. Inference alone is replaced by the
+  blocked sentinel; this is not a production-chat claim.
+- The same file with persistence and finite-outcome controls: 59 passed.
+- API delivery contract and capacity-interrupt controls: 21 passed.
+- Detached safety and cancellation controls: 60 passed, 1 skipped (169.9s).
+- `python evals/delegate_admission_mutation.py`: restored inline execution at the
+  shared refusal exit kills all five reason arms, 5 failed, harness exit 0;
+  original source restored in `finally`. Initial old-source test: 5 failed.
+
+Earlier development runs exposed a sentinel signature error, a too-short cold
+import allowance, and an incorrect completion-event field assertion; these are
+corrected, not counted as product regressions. Raw logs including those runs are
+attached to task t_11d072bf. PR: ANG-Ventures/hermes-agent#119.
+
+Cleanup follows the existing teardown door (its persistence close already catches
+resource-close errors), manifest best-effort writer and metrics publisher. A
+failure escaping one cleanup stage cannot prevent the remaining stages or replace
+the non-start result: `cleanup_pending` names it. Outbox acknowledgement failure
+leaves the existing durable obligation intact, rather than purging it; replay can
+therefore still surface the submission failure. No new retry thread or arbitrary
+I/O timeout is introduced. Injected exceptions at teardown, manifest, metrics and
+acknowledgement all return truthful rejection with the failed stage recorded.
+
+Exact-cap controls use a real retained terminal record from another session,
+both delivered and pending, and verify it is unchanged by refusal. Retention is
+unchanged by explicit operator direction. Apollo owns independent final review,
+CI/merge, live deployment and original-conversation acceptance.
