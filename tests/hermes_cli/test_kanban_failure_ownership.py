@@ -394,12 +394,14 @@ def _crash_writer(path, root, boundary):
             os.kill(os.getpid(),signal.SIGKILL)
     conn.set_trace_callback(trace)
     fo.observe_failure(conn,ref,producer='ci-red-owner',card_spec=card)
-    os.kill(os.getpid(),signal.SIGKILL)  # reply loss after commit
+    if boundary == 'REPLY_LOSS':
+        os.kill(os.getpid(),signal.SIGKILL)  # reply loss after commit
+    raise AssertionError('requested SQL crash boundary was never reached: ' + boundary)
 
 
 @pytest.mark.parametrize('boundary',[
     'INSERT OR IGNORE INTO FAILURE_KEYS', 'INSERT INTO FAILURE_OBSERVATIONS',
-    'INSERT INTO FAILURE_EPISODES', 'INSERT INTO FAILURE_MEMBERSHIPS',
+    'INSERT INTO FAILURE_EPISODES', 'INSERT OR IGNORE INTO FAILURE_MEMBERSHIPS',
     'INSERT INTO FAILURE_BINDINGS', 'INSERT INTO TASKS', 'INSERT INTO TASK_EVENTS',
     "UPDATE FAILURE_BINDINGS SET CARD_ID", 'INSERT INTO FAILURE_TRANSITIONS',
     'UPDATE FAILURE_OBSERVATIONS SET DISPOSITION', 'COMMIT', 'REPLY_LOSS',
