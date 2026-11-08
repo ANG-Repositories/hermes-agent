@@ -40,6 +40,7 @@ def rig(tmp_path, monkeypatch):
 
     async def handler(event):
         received.append(event)
+        event._goal_execution_started = True
         return None
 
     adapter.set_message_handler(handler)
@@ -180,6 +181,75 @@ async def test_retry_wake_rejected_before_admission_is_refunded(rig, monkeypatch
     await runner._goal_idle_wake_one(entry, 0, 3)
     await _drain(adapter)
     assert len(received) == 1  # accepted retries are not refunded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["cap", "cancel", "execute"])
+async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypatch, outcome):
+    from unittest.mock import AsyncMock
+
+    runner, adapter, received, key = rig
+    mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    await asyncio.to_thread(mgr.set, "ship it")
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
+    clock = mgr.state.waiting_until
+    before = mgr.idle_wake_snapshot()
+    entry = runner.session_store.list_sessions()[0]
+    runner.config = {"max_concurrent_sessions": 1}
+    runner.session_store.lookup_by_session_key = lambda key: None
+    runner._hm_admit_event = AsyncMock(side_effect=lambda e: (e, e.source, True))
+    runner._hm_estop_gate = lambda *a: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_evict_idle_stale_agent = lambda *a: None
+    runner._hm_queue_during_lease_flush = AsyncMock(return_value=None)
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    # Another session occupies the sole slot; exercise the real inbound cap rejection.
+    runner._running_agents["other-session"] = object()
+    runner._running_agent_count = lambda: len(runner._running_agents)
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def handler(event):
+        received.append(event)
+        if outcome == "cap":
+            return await runner._handle_message(event)
+        reached.set()
+        await release.wait()
+        event._goal_execution_started = True
+        return None
+
+    adapter.set_message_handler(handler)
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    processing = adapter._session_tasks[key]
+    if outcome != "cap":
+        await asyncio.wait_for(reached.wait(), 5)
+        # An accepted turn that has not settled must not be refunded prematurely.
+        assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+        if outcome == "cancel":
+            processing.cancel()
+        else:
+            release.set()
+    await asyncio.gather(processing, return_exceptions=True)
+    # Settlement may launch the persisted compare-and-refund as a tracked adapter task.
+    while adapter._background_tasks:
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+    assert received[0]._gateway_accepted is True
+    restored = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    assert restored.state.incomplete_retry_wait is (outcome != "execute")
+    if outcome != "execute":
+        assert restored.state.waiting_until == before["waiting_until"]
+        # Capacity recovers: the same persisted retry stays due with ordinary checkins off.
+        adapter.set_message_handler(lambda e: handler_recovered(e))
+
+        async def handler_recovered(event):
+            received.append(event)
+            event._goal_execution_started = True
+
+        await runner._goal_idle_wake_one(entry, 0, 3)
+        await _drain(adapter)
+        assert len(received) == 2
+        assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
 
 
 @pytest.mark.asyncio

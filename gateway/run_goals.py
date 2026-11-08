@@ -916,7 +916,22 @@ class GatewayGoalsMixin:
                     event._admission_check = _admit
                     await adapter.handle_message(event)
                 finally:
-                    # A normal return may reject routing before admission; cancellation may also
-                    # interrupt channel lookup. Only the concrete receipt transfers ownership.
-                    if not getattr(event, "_gateway_accepted", False):
-                        await asyncio.shield(self._run_in_executor_with_context(_refund))
+                    # Adapter admission only spawns work: cap/route/lease refusal or cancellation
+                    # can settle it without execution. Register even when handle_message itself
+                    # was cancelled after spawning, and never await the turn under the goal lock.
+                    processing = (
+                        adapter._session_tasks.get(quick_key)
+                        if getattr(event, "_gateway_accepted", False) else None
+                    )
+                    if processing is None:
+                        if not getattr(event, "_goal_execution_started", False):
+                            await asyncio.shield(self._run_in_executor_with_context(_refund))
+                    else:
+                        def _settled(_task):
+                            if getattr(event, "_goal_execution_started", False):
+                                return
+                            refund = asyncio.create_task(self._run_in_executor_with_context(_refund))
+                            adapter._background_tasks.add(refund)
+                            refund.add_done_callback(adapter._background_tasks.discard)
+
+                        processing.add_done_callback(_settled)
