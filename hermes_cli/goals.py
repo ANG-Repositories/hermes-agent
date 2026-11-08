@@ -952,6 +952,8 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if not (isinstance(data.get("verdict"), str) and data["verdict"].strip().lower() in {"done", "blocked", "continue", "wait"}):
         if "verdict" in data or not isinstance(data.get("done"), bool):
             return "continue", "judge reply did not match verdict schema", True, None
+    if "reason" in data and not isinstance(data["reason"], str):
+        return "continue", "judge reason did not match verdict schema", True, None
     reason = str(data.get("reason") or "").strip() or "no reason provided"
     verdict_raw = data.get("verdict")
     if isinstance(verdict_raw, str):
@@ -985,7 +987,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+    return "continue", "judge wait verdict had no valid target", True, None
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -1129,6 +1131,12 @@ def goal_judge_available() -> bool:
     """
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
+        from hermes_cli.goal_judge_chain import chain_config
+        policy = chain_config(_goal_judge_timeout())
+        if policy is not None:
+            # Explicit chain exists even when its primary cannot currently resolve. Let
+            # the bounded judge report exhaustion rather than silently bypassing it.
+            return True
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
         return False

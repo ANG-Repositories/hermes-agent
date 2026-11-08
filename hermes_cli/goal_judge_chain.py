@@ -32,13 +32,14 @@ def _positive(value, name):
 
 
 def chain_config(timeout):
-    from agent.auxiliary_client import _get_auxiliary_task_config
-    config = _get_auxiliary_task_config('goal_judge')
+    from hermes_cli.config import load_config
+    config = (load_config().get('auxiliary') or {}).get('goal_judge') or {}
     chain = config.get('fallback_chain')
     if chain is None or chain == []:
         return None
     if not isinstance(chain, list) or len(chain) > 7:
         raise ValueError('fallback_chain must contain at most seven routes')
+    timeout = _positive(timeout, 'timeout')
     total = _positive(config.get('total_timeout', timeout), 'total_timeout')
     routes = []
     # Do not inherit primary endpoint, credentials or vendor-specific body into other routes.
@@ -139,9 +140,14 @@ def _worker(payload):
     except AuxiliaryClientUnavailable:
         return dict(category='unavailable')
     except Exception as exc:
-        from agent.auxiliary_client import _is_transient_transport_error, _is_rate_limit_error, _is_auth_error
+        from agent.auxiliary_client import (
+            _is_transient_transport_error, _is_rate_limit_error, _is_auth_error,
+            _is_invalid_aux_response_error,
+        )
         if isinstance(exc, TimeoutError):
             category = 'timeout'
+        elif _is_invalid_aux_response_error(exc):
+            category = 'invalid_output'
         elif _is_transient_transport_error(exc) or _is_rate_limit_error(exc) or _is_auth_error(exc):
             category = 'unavailable'
         elif isinstance(exc, (ValueError, KeyError)) or getattr(exc, 'status_code', None) == 404:
