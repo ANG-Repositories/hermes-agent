@@ -305,7 +305,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 await self._install_dialog_bridge(sid)
                 with self._state_lock:
                     self._page_session_id = sid
-                return {"ok": True, "url": url}
+                return {"ok": True, "url": url, "target_id": target_id}
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
 
         try:

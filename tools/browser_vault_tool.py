@@ -32,13 +32,22 @@ import logging
 from contextvars import ContextVar
 from functools import wraps
 from inspect import signature
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
 
 # An operation-local document witness, never an origin-based tab selector.
 _PAGE_BINDING: ContextVar[Any] = ContextVar("vault_page_binding", default=None)
+
+
+class _Binding(NamedTuple):
+    task_id: str
+    key: Any        # agent-browser session key, or the Browser Use route dict
+    session: Any    # agent-browser session record (None on Browser Use)
+    witness: str
+    driver: str = "agent-browser"
+    target: Optional[tuple] = None  # Browser Use: (target_id, cdp session_id, daemon pid) at pin time
 
 
 def _pin_page(task_id):
@@ -48,9 +57,12 @@ def _pin_page(task_id):
     )
     from tools.browser_tool_session import _run_browser_command
 
-    # Never reuse a stale built-in session while another backend owns navigation.
-    if _is_camofox_mode() or _is_browser_use_cli_mode():
+    # Camofox has no CDP target API: fail closed. Never reuse a stale built-in session
+    # while another backend owns navigation.
+    if _is_camofox_mode():
         return None
+    if _is_browser_use_cli_mode():
+        return _pin_browser_use_page(task_id)
     key = _last_session_key(task_id)
     session = _active_sessions.get(key)
     if session is None or not _session_info_owned_by_task(session, task_id, key):
@@ -61,7 +73,24 @@ def _pin_page(task_id):
     ])
     if not result.get("success"):
         return None
-    return task_id, key, session, witness
+    return _Binding(task_id, key, session, witness)
+
+
+def _pin_browser_use_page(task_id):
+    """Pin the page browser_exec's harness daemon is attached to right now (its current target),
+    on the route navigation last drove. Requires that route's vault supervisor."""
+    from tools import browser_use_cli as bu
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    route = bu.last_route(task_id)
+    if not route or route.get("supervisor") is None or SUPERVISOR_REGISTRY.get(task_id) is not route["supervisor"]:
+        return None
+    witness = secrets.token_hex(24)
+    seen = bu.driver_eval(task_id, route, f"(window[{json.dumps(witness)}] = true, window.location.href)")
+    if not seen:
+        return None
+    return _Binding(task_id, route, None, witness, "browser-use",
+                    (seen["target_id"], seen["session_id"], seen.get("pid")))
 
 
 def _bound_page(fn):
@@ -93,9 +122,32 @@ def _binding_is_current(binding):
     from tools.browser_tool import (
         _active_sessions, _last_session_key, _is_camofox_mode, _is_browser_use_cli_mode,
     )
-    task_id, key, session, _ = binding
-    return (not _is_camofox_mode() and not _is_browser_use_cli_mode()
-            and _last_session_key(task_id) == key and _active_sessions.get(key) is session)
+    if _is_camofox_mode():
+        return False
+    if binding.driver == "browser-use":
+        from tools import browser_use_cli as bu
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        return (_is_browser_use_cli_mode() and bu.last_route(binding.task_id) == binding.key
+                and SUPERVISOR_REGISTRY.get(binding.task_id) is binding.key["supervisor"])
+    return (not _is_browser_use_cli_mode()
+            and _last_session_key(binding.task_id) == binding.key
+            and _active_sessions.get(binding.key) is binding.session)
+
+
+def _driver_eval_bound(binding, expression: str) -> Dict[str, Any]:
+    """Evaluate in the navigation driver's CURRENT page, only while it is still the pinned document."""
+    witness = json.dumps(binding.witness)
+    guarded = f"window[{witness}] === true ? ({expression}) : null"
+    if binding.driver == "browser-use":
+        from tools import browser_use_cli as bu
+        seen = bu.driver_eval(binding.task_id, binding.key, guarded)
+        if not seen or (seen["target_id"], seen["session_id"], seen.get("pid")) != binding.target:
+            return {"success": False, "error": "Current browser page changed"}
+        return {"success": True, "result": seen.get("value")}
+    from tools.browser_tool_session import _run_browser_command
+    result = _run_browser_command(binding.key, "eval", [guarded])
+    return {"success": bool(result.get("success")),
+            "result": (result.get("data") or {}).get("result")}
 
 
 # ---------------------------------------------------------------------------
@@ -128,15 +180,9 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     """
     binding = _PAGE_BINDING.get()
     if binding is not None:
-        from tools.browser_tool_session import _run_browser_command
         if not _binding_is_current(binding):
             return {"success": False, "error": "Browser session changed"}
-        witness = json.dumps(binding[3])
-        result = _run_browser_command(binding[1], "eval", [
-            f"window[{witness}] === true ? ({expression}) : null"
-        ])
-        return {"success": bool(result.get("success")),
-                "result": (result.get("data") or {}).get("result")}
+        return _driver_eval_bound(binding, expression)
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -202,8 +248,12 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
     When no supervisor session is available the caller gets a typed refusal
     (``error_type='supervisor_required'``) and nothing is written.
     """
+    binding = _PAGE_BINDING.get()
     try:
-        supervisor = _ensure_supervisor(task_id)
+        # Browser Use: only the supervisor browser_exec attached for this route; never start a
+        # built-in browser to find one.
+        supervisor = (binding.key["supervisor"] if binding is not None and binding.driver == "browser-use"
+                      else _ensure_supervisor(task_id))
     except Exception as exc:
         logger.debug("vault fill: supervisor unavailable (%s)", exc)
         supervisor = None
@@ -232,18 +282,20 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
-    binding = _PAGE_BINDING.get()
     if binding is not None:
-        if binding[0] != task_id or not _binding_is_current(binding):
+        if binding.task_id != task_id or not _binding_is_current(binding):
             return {"success": False, "error_type": "page_changed", "error": "Browser session changed"}
         # Verify the driver's current document again after any human prompt or
         # backend resolution. Never send secret-bearing JS through the driver.
         if not _eval_js(task_id, "true").get("result"):
             return {"success": False, "error_type": "page_changed", "error": "Current browser page changed"}
-        witness = json.dumps(binding[3])
+        witness = json.dumps(binding.witness)
         focused = supervisor.focus_page("", accept=f"window[{witness}] === true")
         if not focused.get("ok"):
             return {"success": False, "error_type": "page_changed", "error": "Bound document no longer exists"}
+        # Browser Use names its current target: the supervisor must have selected exactly that one.
+        if binding.target is not None and focused.get("target_id") != binding.target[0]:
+            return {"success": False, "error_type": "page_changed", "error": "Supervisor selected another tab"}
         if not _binding_is_current(binding) or not _eval_js(task_id, "true").get("result"):
             return {"success": False, "error_type": "page_changed", "error": "Browser page changed during target selection"}
         expression = (f"window[{witness}] === true ? ({expression}) : "
