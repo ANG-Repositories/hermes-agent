@@ -1,11 +1,10 @@
 """Shutdown notices describe intent and recovery policy, not a promised outcome."""
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent import i18n
-from gateway.config import HomeChannel, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import (
     RestartTestAdapter, make_restart_runner, make_restart_source,
@@ -41,7 +40,7 @@ async def test_active_shutdown_copy_is_conditional_and_policy_aware(notice_runne
 
     assert len(adapter.sent_calls) == 1
     _, text, metadata = adapter.sent_calls[0]
-    assert ("Hermes is restarting" if restart else "Hermes is stopping") in text
+    assert ("Hermes is restarting" if restart else "Hermes is shutting down") in text
     assert "may be interrupted" in text  # the drain may also finish the turn
     assert "If Hermes comes back online" in text
     assert "send any message" not in text.lower()
@@ -55,6 +54,8 @@ async def test_active_shutdown_copy_is_conditional_and_policy_aware(notice_runne
         assert "you can ask" not in text
     assert metadata["thread_id"] == "42"
     assert metadata["_interim_send"] is True
+    if restart:
+        assert metadata["telegram_reply_to_message_id"] == "command"
     assert runner._restart_requested is restart
 
 
@@ -71,7 +72,7 @@ async def test_idle_home_does_not_claim_a_current_task_or_relaunch(notice_runner
 
     assert len(adapter.sent_calls) == 1
     text = adapter.sent_calls[0][1]
-    assert ("Hermes is restarting" if restart else "Hermes is stopping") in text
+    assert ("Hermes is restarting" if restart else "Hermes is shutting down") in text
     assert "task" not in text and "work" not in text
     assert "online" not in text and "message" not in text
 
@@ -90,31 +91,75 @@ async def test_active_home_receives_one_active_notice_not_idle_broadcast(notice_
 
 
 @pytest.mark.asyncio
-async def test_secondary_policy_and_language_are_scoped_even_without_cached_source(notice_runner, tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["prompt", "auto", "always", None, "invalid"])
+@pytest.mark.parametrize("cached", [False, True])
+async def test_secondary_policy_and_language_are_scoped_even_without_cached_source(
+    notice_runner, tmp_path, monkeypatch, mode, cached,
+):
     runner, primary = notice_runner
     secondary = RestartTestAdapter()
     home = tmp_path / "secondary"
     home.mkdir()
-    (home / "config.yaml").write_text("agent:\n  resume_interrupted_turns: prompt\ndisplay:\n  language: fr\n")
+    policy = f"agent:\n  resume_interrupted_turns: {mode}\n" if mode else ""
+    (home / "config.yaml").write_text(policy + "display:\n  language: fr\n")
     runner._profile_adapters = {"secondary": {Platform.TELEGRAM: secondary}}
+    runner.config.multiplex_profiles = True
     runner._served_profile_homes = {"secondary": home}
     monkeypatch.delenv("HERMES_LANGUAGE")
-    monkeypatch.setenv("HERMES_RESUME_INTERRUPTED_TURNS", "always")
-    # Parsed-key fallback has no cached source; it must still bind the owning profile.
-    runner._running_agents["agent:secondary:telegram:dm:42"] = MagicMock()
+    monkeypatch.setenv("HERMES_RESUME_INTERRUPTED_TURNS", "prompt" if mode in {"auto", "always"} else "always")
+    if cached:
+        source = make_restart_source(chat_id="42")
+        source.profile = "secondary"
+        monkeypatch.setattr(runner, "_resolve_profile_home_for_source", lambda src: home if src.profile else tmp_path)
+        activate(runner, source)
+    else:
+        # Parsed-key fallback has no cached source; it must still bind the owning profile.
+        runner._running_agents["agent:secondary:telegram:dm:42"] = MagicMock()
 
     await runner._notify_active_sessions_of_shutdown()
 
     assert primary.sent == []
     assert len(secondary.sent) == 1
     assert "Hermes s’arrête" in secondary.sent[0]
-    assert "demander" in secondary.sent[0]
-    assert "automatiquement" not in secondary.sent[0]
+    if mode in {"auto", "always"}:
+        assert "peut reprendre automatiquement" in secondary.sent[0]
+        assert "contrôles de récupération" in secondary.sent[0]
+    else:
+        assert "demander" in secondary.sent[0]
+        assert "automatiquement" not in secondary.sent[0]
     # A -> B -> A: the scope must not leak into the following primary notice.
     runner._running_agents.clear()
     activate(runner, make_restart_source())
     await runner._notify_active_sessions_of_shutdown()
-    assert "may continue automatically" in primary.sent[0]
+    assert ("you can ask to continue" if mode in {"auto", "always"} else "may continue automatically") in primary.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_secondary_active_opt_out_does_not_borrow_primary_setting(notice_runner):
+    runner, primary = notice_runner
+    secondary = RestartTestAdapter()
+    runner._profile_adapters = {"secondary": {Platform.TELEGRAM: secondary}}
+    runner._profile_configs = {"secondary": GatewayConfig(platforms={
+        Platform.TELEGRAM: PlatformConfig(enabled=True, gateway_restart_notification=False),
+    })}
+    runner._running_agents["agent:secondary:telegram:dm:42"] = MagicMock()
+    await runner._notify_active_sessions_of_shutdown()
+    assert primary.sent == secondary.sent == []
+
+
+@pytest.mark.asyncio
+async def test_restart_requester_still_gets_answer_in_muted_route(notice_runner, monkeypatch):
+    runner, adapter = notice_runner
+    source = make_restart_source(thread_id="42")
+    activate(runner, source)
+    runner._restart_requested = True
+    runner._restart_command_source = source
+    monkeypatch.setattr("gateway.response_filters.lifecycle_notice_muted", lambda *a, **kw: True)
+    monkeypatch.setattr("gateway.warning_notifications.effective_user_config",
+                        lambda: {"display": {"suppress_warning_notifications": True}})
+    await runner._notify_active_sessions_of_shutdown()
+    assert len(adapter.sent) == 1
+    assert "Hermes is restarting" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
@@ -132,7 +177,7 @@ async def test_notice_suppression_preserved(notice_runner, monkeypatch, suppress
         monkeypatch.setattr("gateway.response_filters.lifecycle_notice_muted", lambda *a, **kw: True)
     else:
         monkeypatch.setattr("gateway.warning_notifications.effective_user_config",
-                            lambda: {"display": {"warning_notifications": False}})
+                            lambda: {"display": {"suppress_warning_notifications": True}})
     await runner._notify_active_sessions_of_shutdown()
     assert adapter.sent == []
 

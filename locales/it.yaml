@@ -917,8 +917,11 @@ gateway:
     action_shutting_down: "in arresto"
     action_restarting: "in riavvio"
     cron_interrupted: "⚠️ Il job pianificato '{job}' è stato interrotto perché Hermes è {action}; nessun risultato per questa esecuzione. Verrà eseguito di nuovo come pianificato, oppure eseguilo subito con `hermes cron run {job}` quando Hermes sarà tornato."
-    notice_shutdown: "⚠️ Hermes si sta arrestando — la tua attività corrente verrà interrotta. Quando sarà di nuovo online, invia un messaggio qualsiasi e proverò a riprendere da dove eravamo rimasti."
-    notice_restart: "⚠️ Hermes si sta riavviando — la tua attività corrente verrà interrotta. Invia un messaggio qualsiasi dopo il riavvio e proverò a riprendere da dove eri rimasto."
+    notice_shutdown: "⚠️ Hermes si sta arrestando."
+    notice_restart: "⚠️ Hermes si sta riavviando."
+    active_interruption: "La tua attività corrente potrebbe essere interrotta."
+    continue_prompt: "Se Hermes torna online, puoi chiedere di continuare il lavoro interrotto."
+    continue_auto: "Se Hermes torna online e i controlli di recupero lo consentono, il lavoro interrotto potrebbe continuare automaticamente."
   startup:
     handoff_thread_title: "Hermes — {title}"
     restarted: "♻ Gateway riavviato correttamente. La tua sessione continua."
