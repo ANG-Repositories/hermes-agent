@@ -85,7 +85,10 @@ def _stop(proc, home, deadline, finished):
             finished.set()
 
     threading.Thread(target=reap, name='goal-judge-reaper', daemon=True).start()
-    return finished.wait(max(0, min(0.05, deadline - time.monotonic())))
+    stopped = finished.wait(max(0, min(0.05, deadline - time.monotonic())))
+    if not stopped:
+        logger.warning('goal judge cleanup pending: pid=%d; profile retries inhibited', proc.pid)
+    return stopped
 
 
 def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):

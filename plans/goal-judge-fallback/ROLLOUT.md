@@ -20,8 +20,15 @@ A nonempty chain opts verdict judging into bounded explicit routing. No implicit
 main-model fallback or same-provider transport retry precedes the next route.
 Each route's deadline includes Python startup, plugin discovery and credential
 resolution. total_timeout bounds the chain; timeout is also the upper bound for
-any individual rung. Requests are killed and reaped on timeout/cancel, so no
-abandoned socket worker remains. Each failed chain is one GoalManager failure,
+any individual rung, including the foreground cleanup wait. Timeout/cancel starts
+owned background termination and bounded reaping; cancellation propagates without
+waiting for that worker. If termination is stuck or refused, `cleanup_pending`
+fails closed and inhibits all new judge requests for that home in this process
+until the retained process handle is reaped. This is not a claim of immediate
+termination when the OS refuses it. Other homes remain independent. Startup,
+pipe, malformed IPC and nonzero worker exits are sanitized `worker_error`
+availability failures and may advance only after ownership is released.
+Each failed chain is one GoalManager failure,
 not four failures. Parse/transport exhaustion never marks a goal done. The existing
 failure thresholds still pause repeatedly unjudgeable goals, preserving the goal.
 
@@ -47,7 +54,8 @@ Parent-owned model-rollout skill patch (replace its goal-judge seat section):
     Before cutover, run a fresh-client forced-primary-failure judge through the
     real judge/GoalManager seam. Require a schema-valid verdict, actual served
     model, ordered attempted-route receipt, and no leftover process after timeout
-    or cancellation. Test each rung and all-unavailable; a valid blocked/wait/
+    or cancellation (or explicit cleanup_pending ownership and retry inhibition
+    when termination fails). Test each rung and all-unavailable; a valid blocked/wait/
     continue verdict ends the chain and must not be shopped for a done answer.
     Keep total_timeout and per-route timeout finite. Report merged source and
     live loaded behavior separately; deployment/restart and config apply are

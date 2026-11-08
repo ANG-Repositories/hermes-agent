@@ -127,7 +127,8 @@ def test_deadline_and_cancel_reap_request_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(chain.subprocess, 'Popen', spawn)
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     route = dict(provider='custom', model='test', timeout=1)
-    assert chain.run_attempt(route, [], 10, time.monotonic() + 0.2)['category'] == 'timeout'
+    assert chain.run_attempt(route, [], 10, time.monotonic() + 0.2)['category'] in {'timeout', 'cleanup_pending'}
+    assert chain._cleanup_finished(str(tmp_path), timeout=2)
     assert children[-1].poll() is not None
     cancel = threading.Event()
     timer = threading.Timer(0.2, cancel.set)
@@ -139,6 +140,7 @@ def test_deadline_and_cancel_reap_request_owner(tmp_path, monkeypatch):
     finally:
         timer.cancel()
         timer.join()
+    assert chain._cleanup_finished(str(tmp_path), timeout=2)
     assert children[-1].poll() is not None
 
 
