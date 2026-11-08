@@ -1452,7 +1452,7 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
         " if sys.platform=='darwin' and path=='/var/lib/placement/host-pressure.json':\n"
         "  path=os.path.expanduser('~/.local/share/placement/host-pressure.json')\n"
         " try:\n"
-        "  with open(path, encoding='utf-8', errors='replace') as f: pressure=f.read()\n"
+        "  with open(path, encoding='utf-8-sig', errors='replace') as f: pressure=f.read()\n"
         " except OSError: pass\n"
         "print('@@hermes-probe-v1')\n"
         "print(json.dumps(dict(schema=1,load1=load[0],load5=load[1],"
