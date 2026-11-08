@@ -300,8 +300,15 @@ def _reduce(conn,key_id,obs_id,obs):
     values = [dict(json.loads(r['data']), obs_id=r['obs_id']) for r in rows]
     # Captures attest ancestry, not arrival order. A delayed prefix cannot erase
     # a retained extension; contradictory chains establish no ordering.
-    lineages = [v['lineage'] for v in values]
+    lineages = tuple(dict.fromkeys(tuple(v['lineage']) for v in values))
+    comparisons = {}
     def compare(a, b):
+        pair = (a['obs_id'], b['obs_id'])
+        if pair not in comparisons:
+            comparisons[pair] = compare_uncached(a, b)
+        return comparisons[pair]
+
+    def compare_uncached(a, b):
         orders = {_order(a, b, chain) for chain in lineages
                   if len(set(chain)) == len(chain) and a['sha'] in chain and b['sha'] in chain}
         orders.discard(None)

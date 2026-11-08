@@ -98,6 +98,22 @@ def test_overlapping_later_passes_heal_delayed_failure(board, order):
     assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0] == 0
 
 
+def test_repeated_lineage_is_not_recompared_per_observation(board, monkeypatch):
+    h.enroll(board)
+    for i in range(12):
+        h.admit(board, h.observation('repeat-%s' % i))
+    calls = []
+    original = h.fo._order
+    def counted(a, b, chain):
+        calls.append((a['source_key'], b['source_key'], tuple(chain)))
+        return original(a, b, chain)
+    monkeypatch.setattr(h.fo, '_order', counted)
+    h.admit(board, h.observation('repeat-final'))
+    # Each semantic pair/chain should be evaluated once, not once per capture.
+    assert len(calls) == len(set(calls))
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
+
+
 def test_disabled_evidence_can_be_reattested_after_policy_change(board):
     from dataclasses import replace
     obs = h.observation('disabled-before-enrollment')
