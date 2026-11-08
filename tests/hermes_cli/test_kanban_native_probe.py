@@ -56,3 +56,29 @@ def test_darwin_maps_only_default_linux_pressure_path(tmp_path):
     sample, error = pool._probe_once(host, runner, pressure_path="/var/lib/placement/host-pressure.json")
     assert not error
     assert json.loads(sample.pressure_text)["at"] == 123
+
+
+def test_corrupt_pressure_preserves_native_liveness_and_workspace(tmp_path):
+    pressure = tmp_path / "corrupt.json"
+    pressure.write_bytes(bytes([255]))
+    workspace = tmp_path / "default" / "task"
+    workspace.mkdir(parents=True)
+    host = pool.PoolHost("native", "unused", "kanbanw", None, .9, "required", (), "active", True, 0)
+    def runner(argv, **kwargs):
+        return subprocess.run(argv[-1], shell=True, **kwargs)
+    sample, error = pool._probe_once(host, runner, pressure_path=str(pressure),
+                                    workspaces_root=str(tmp_path), workspace_paths=[str(workspace)])
+    assert not error
+    assert sample.ncpu > 0
+    assert sample.workspace_states[str(workspace)] == "empty"
+    assert sample.pressure_text in ("", "\ufffd")
+
+
+def test_native_cpu_measurement_ignores_python_cpu_override(tmp_path):
+    import os
+    host = pool.PoolHost("native", "unused", "kanbanw", None, .9, "required", (), "active", True, 0)
+    def runner(argv, **kwargs):
+        return subprocess.run(argv[-1], shell=True, env={**os.environ, "PYTHON_CPU_COUNT": "123456"}, **kwargs)
+    sample, error = pool._probe_once(host, runner, pressure_path=str(tmp_path / "absent"))
+    assert not error
+    assert sample.ncpu == os.sysconf("SC_NPROCESSORS_ONLN")
