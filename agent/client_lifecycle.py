@@ -565,6 +565,7 @@ class ClientLifecycleMixin:
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
 
+    @route_mutation
     def _adopt_openai_credentials(self, api_key: str, base_url: str, *, reason: str) -> bool:
         """Apply a fresh key/base_url to the OpenAI-style kwargs and rebuild the shared client."""
         self.api_key, self.base_url = api_key.strip(), base_url.strip().rstrip("/")

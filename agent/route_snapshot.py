@@ -19,7 +19,7 @@ def route_mutation(fn):
     return synchronized
 
 
-def snapshot_parent(parent):
+def snapshot_parent(parent, *, timeout=2.0):
     """An execution view with copied configuration and no borrowed transport clients.
 
     Non-route parent facilities (callbacks, session store and ownership locks) remain
@@ -27,7 +27,10 @@ def snapshot_parent(parent):
     """
     from tools.delegate_tool_config import _inherit_parent_endpoint
 
-    with route_lock(parent):
+    lock = route_lock(parent)
+    if not lock.acquire(timeout=timeout):
+        raise RuntimeError("boomerang routing-unavailable: parent route activation is still in progress")
+    try:
         fields = dict(vars(parent))
         base_url, key = _inherit_parent_endpoint(parent, parent.base_url, getattr(parent, "api_key", None))
         fields.update(base_url=base_url, api_key=key, client=None, _anthropic_client=None)
@@ -40,3 +43,5 @@ def snapshot_parent(parent):
         vars(view).clear()
         vars(view).update(fields)
         return view
+    finally:
+        lock.release()

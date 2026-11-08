@@ -151,3 +151,57 @@ def test_real_credential_sync_cannot_publish_mixed_endpoint():
         writer.join(5)
         reader.join(5)
     assert (captured[0].base_url, captured[0].api_key) == ("http://new", "NEW")
+
+
+@pytest.mark.parametrize("sources", [("live-parent", "delegation-default"), ("delegation-default", "live-parent"), ("explicit-child",)])
+def test_recovery_replays_each_selected_task_route(monkeypatch, sources):
+    from tools.delegate_tool_routing import persist_route
+    parent = SimpleNamespace(model="parent", provider="openrouter", api_mode="chat_completions",
+        base_url="http://parent", api_key="test", client=None, _client_kwargs={},
+        _fallback_chain=[{"provider": "openai", "model": "parent-backup"}], request_overrides={},
+        _session_db=None, _delegate_depth=0, _active_children=[], _active_children_lock=threading.Lock(),
+        session_id="recovery-parent", platform="cli", enabled_toolsets=[], disabled_toolsets=[])
+    captured = []
+    def construct(**kw):
+        captured.append(kw)
+        child = MagicMock()
+        child.run_conversation.return_value = {"final_response": "done", "completed": True, "api_calls": 1}
+        child.get_activity_summary.return_value = {"api_call_count": 1}
+        return child
+    monkeypatch.setattr("run_agent.AIAgent", construct)
+    monkeypatch.setattr(dt, "_load_config", lambda: {"model": "changed-default", "fallback_providers": "auto"})
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda provider, **kw: {
+        "provider": provider, "api_key": "fresh-key", "base_url": "http://" + provider, "api_mode": "chat_completions"})
+    tasks = []
+    for index, source in enumerate(sources):
+        route = {"source": "parent", "provider": "openrouter", "model": source,
+                 "api_mode": "chat_completions", "fallback_chain": [] if source != "live-parent" else parent._fallback_chain,
+                 "request_overrides": {}}
+        tasks.append({"goal": "restore selected route " + str(index), "inherit_mode": "summary",
+                      "route_source": source, "parent_route": route, "materialized_prefill_messages": []})
+    record = {"execution": {"model": "parent", "provider": "openrouter", "fallback_chain": parent._fallback_chain,
+              "credential_ref": {"source": "provider", "provider": "openrouter", "inherited_route": True}},
+              "source": {"tasks": tasks}, "route": {}}
+    result = json.loads(dt.delegate_task(tasks=tasks, parent_agent=parent, _recovery_spec=record))
+    assert not result.get("error"), result
+    assert [kw["model"] for kw in captured] == list(sources)
+    assert [kw["fallback_model"] for kw in captured] == [parent._fallback_chain if s == "live-parent" else [] for s in sources]
+
+
+def test_route_snapshot_has_bounded_wait():
+    from agent.route_snapshot import route_lock, snapshot_parent
+    parent = SimpleNamespace(base_url="http://parent", api_key="synthetic", client=None)
+    entered, release = threading.Event(), threading.Event()
+    def hold():
+        with route_lock(parent):
+            entered.set()
+            release.wait(5)
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert entered.wait(5)
+    try:
+        with pytest.raises(RuntimeError, match="route activation is still in progress"):
+            snapshot_parent(parent, timeout=0.01)
+    finally:
+        release.set()
+        thread.join(5)

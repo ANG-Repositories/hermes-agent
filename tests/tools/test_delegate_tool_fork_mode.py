@@ -147,6 +147,7 @@ def test_fork_first_request_prefix_byte_identical_to_parent_next_request():
 def test_parent_route_policy_survives_eligible_fork_and_summary(mode):
     parent = _warm_parent()
     parent._fallback_chain = [{"provider": "openai", "model": "cross-vendor"}]
+    parent.request_overrides = {"extra_body": {"nonce": "parent"}}
     with ExitStack() as stack:
         _patches(stack)
         stack.enter_context(patch("tools.delegate_tool._load_config", return_value={
@@ -163,6 +164,8 @@ def test_parent_route_policy_survives_eligible_fork_and_summary(mode):
             assert child._inherit_mode == "fork"
         child._fallback_chain[0]["model"] = "child-only"
         assert parent._fallback_chain[0]["model"] == "cross-vendor"
+        child.request_overrides["extra_body"]["nonce"] = "child"
+        assert parent.request_overrides["extra_body"]["nonce"] == "parent"
     finally:
         child.close()
         parent.close()
