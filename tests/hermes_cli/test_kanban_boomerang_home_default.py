@@ -109,38 +109,40 @@ def test_tool_create_opt_out(script_env):
     assert all(mode == "notify" for _, mode, _ in subs)
 
 
-# (c) a home with no routable chat (CLI origin / unknown / operator) -> unchanged
+# (c) a home with no routable chat (CLI origin / unknown / operator): the card still gets the
+# level (t_c24b1cc7: every producer), but no recipient is invented.
 @pytest.mark.parametrize("sid", [CLI_SID, "20260101_000000_gone", "operator:apollo"])
-def test_cli_unroutable_home_unchanged(script_env, sid):
-    assert _state(_cli_create(f"--session {sid}")) == (None, [])
+def test_cli_unroutable_home_level_without_waker(script_env, sid):
+    assert _state(_cli_create(f"--session {sid}")) == (True, [])
 
 
-def test_cli_no_session_flag_unchanged(script_env):
-    assert _state(_cli_create("")) == (None, [])
+def test_cli_no_session_flag_level_without_waker(script_env):
+    assert _state(_cli_create("")) == (True, [])
 
 
-def test_tool_unroutable_home_unchanged(script_env):
+def test_tool_unroutable_home_level_without_waker(script_env):
     from tools import kanban_tools as kt
     created = json.loads(kt._handle_create(
         {"board": "default", "title": "tool card", "assignee": "peer", "session_id": CLI_SID}))
     assert created["ok"], created
-    assert _state(created["task_id"]) == (None, [])
+    assert _state(created["task_id"]) == (True, [])
 
 
-# (d) a dispatcher-owned worker caller keeps today's behaviour
-def test_cli_worker_caller_unchanged(script_env, monkeypatch):
+# (d) a dispatcher-owned worker caller: the card gets the level; the worker's create does not
+# subscribe the home (worker cards report through the parent lineage).
+def test_cli_worker_caller_level_no_home_row(script_env, monkeypatch):
     import agent.delegation_context as dc
     monkeypatch.setattr(dc, "is_dispatcher_owned_worker_context", lambda: True)
-    assert _state(_cli_create(f"--session {HOME_SID}")) == (None, [])
+    assert _state(_cli_create(f"--session {HOME_SID}")) == (True, [])
 
 
-def test_tool_worker_caller_unchanged(script_env, monkeypatch):
+def test_tool_worker_caller_level_no_home_row(script_env, monkeypatch):
     from tools import kanban_tools as kt
     monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
     created = json.loads(kt._handle_create(
         {"board": "default", "title": "tool card", "assignee": "peer", "session_id": HOME_SID}))
     assert created["ok"], created
-    assert _state(created["task_id"]) == (None, [])
+    assert _state(created["task_id"]) == (True, [])
 
 
 @pytest.fixture

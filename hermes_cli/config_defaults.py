@@ -2632,7 +2632,7 @@ DEFAULT_CONFIG = {
         # session: notify+wake (Ace 2026-10-03, t_74bf5296). One waker per
         # card is enforced in the store; false = notify-only.
         "auto_subscribe_wake": True,
-        "auto_subscribe_boomerang": True,  # operator auto-subscriptions use a child by default
+        "auto_subscribe_boomerang": True,  # every new card's boomerang_wake level unless set explicitly
         # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
         # host_axis cpu (default): downgrade at cpu_pause (0.90) busy. host_axis
         # load1 (kill switch): the pause_above / resume_below band set HERE.
