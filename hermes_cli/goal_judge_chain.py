@@ -62,8 +62,19 @@ def chain_config(timeout):
 
 def _cleanup_finished(home, timeout=0):
     with _CLEANUP_LOCK:
+        pending = tuple(_CLEANUPS.get(home, ()))
+    deadline = time.monotonic() + timeout
+    return all(event.wait(max(0, deadline - time.monotonic())) for event in pending)
+
+
+def _release_cleanup(home, finished):
+    with _CLEANUP_LOCK:
         pending = _CLEANUPS.get(home)
-    return pending is None or pending.wait(timeout)
+        if pending is not None:
+            pending.discard(finished)
+            if not pending:
+                _CLEANUPS.pop(home, None)
+        finished.set()
 
 
 def _stop(proc, home, deadline, finished):
@@ -71,10 +82,10 @@ def _stop(proc, home, deadline, finished):
     if proc.returncode is not None:
         # communicate() already reaped this worker; thread scheduling must not
         # turn a completed response into cleanup_pending on a busy host.
-        with _CLEANUP_LOCK:
-            _CLEANUPS.pop(home, None)
-            finished.set()
+        _release_cleanup(home, finished)
         return True
+    with _CLEANUP_LOCK:
+        _CLEANUPS.setdefault(home, set()).add(finished)
     def reap():
         from agent.deadline import kill_process_tree
         while True:
@@ -94,9 +105,7 @@ def _stop(proc, home, deadline, finished):
                 time.sleep(0.05)
                 continue
             break
-        with _CLEANUP_LOCK:
-            _CLEANUPS.pop(home, None)
-            finished.set()
+        _release_cleanup(home, finished)
 
     threading.Thread(target=reap, name='goal-judge-reaper', daemon=True).start()
     stopped = finished.wait(max(0, min(0.05, deadline - time.monotonic())))
@@ -116,11 +125,15 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
     with _CLEANUP_LOCK:
         if home in _CLEANUPS:
             return dict(category='cleanup_pending')
-        _CLEANUPS[home] = finished
     try:
+        from agent.auxiliary_client import _runtime_main_value
+        from agent.portal_tags import get_affinity_scope, get_conversation_context
         env = served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
         env['PYTHONIOENCODING'] = 'utf-8'
-        payload = json.dumps(dict(route=route, messages=messages, max_tokens=max_tokens))
+        payload = json.dumps(dict(route=route, messages=messages, max_tokens=max_tokens,
+                                  affinity_scope=get_affinity_scope(), conversation=get_conversation_context(),
+                                  session_id=_runtime_main_value('session_id'),
+                                  cache_scope=_runtime_main_value('cache_scope')))
         # -m uses THIS source checkout, not the installed runtime's editable root.
         proc = subprocess.Popen(
             [sys.executable, '-m', 'hermes_cli.goal_judge_chain'],
@@ -130,9 +143,6 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
             start_new_session=os.name == 'posix',
         )
     except (OSError, ValueError, TypeError):
-        with _CLEANUP_LOCK:
-            _CLEANUPS.pop(home, None)
-            finished.set()
         return dict(category='worker_error')
     outcome = dict(category='timeout')
     try:
@@ -151,10 +161,6 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
                 break
             try:
                 out, _ = proc.communicate(pending, timeout=min(0.05, remaining))
-                raise_if_aux_cancel_requested()
-                if cancel_check is not None and cancel_check():
-                    from agent.auxiliary_client import AuxiliaryExplicitCancellation
-                    raise AuxiliaryExplicitCancellation()
                 if proc.returncode:
                     outcome = dict(category='worker_error')
                 else:
@@ -165,6 +171,10 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
                         outcome = dict(category='worker_error')
                 from agent.aux_accounting import replay_aux_accounting
                 replay_aux_accounting(outcome.pop('accounting', []))
+                raise_if_aux_cancel_requested()
+                if cancel_check is not None and cancel_check():
+                    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+                    raise AuxiliaryExplicitCancellation()
                 break
             except subprocess.TimeoutExpired:
                 pending = None
@@ -208,8 +218,19 @@ def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=N
 
 def _worker(payload):
     from agent.aux_accounting import capture_aux_accounting
-    with capture_aux_accounting() as accounting:
-        result = _worker_result(payload)
+    from agent.auxiliary_client import scoped_runtime_main
+    from agent.portal_tags import (
+        set_affinity_scope, reset_affinity_scope, set_conversation_context, reset_conversation_context,
+    )
+    affinity = set_affinity_scope(payload.get('affinity_scope'))
+    conversation = set_conversation_context(payload.get('conversation'))
+    try:
+        with scoped_runtime_main({key: payload.get(key) for key in ('session_id', 'cache_scope')}):
+            with capture_aux_accounting() as accounting:
+                result = _worker_result(payload)
+    finally:
+        reset_conversation_context(conversation)
+        reset_affinity_scope(affinity)
     result['accounting'] = accounting
     return result
 
@@ -224,7 +245,7 @@ def _worker_result(payload):
             response = call_llm(task='goal_judge', messages=payload['messages'], temperature=0,
                                 max_tokens=payload['max_tokens'], timeout=route['timeout'])
         content = response.choices[0].message.content or ''
-        return dict(category='ok', content=content[:16000], served_model=getattr(response, 'model', '') or '')
+        return dict(category='ok', content=content, served_model=getattr(response, 'model', '') or '')
     except AuxiliaryClientUnavailable:
         return dict(category='unavailable')
     except Exception as exc:

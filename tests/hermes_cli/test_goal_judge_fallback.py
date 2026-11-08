@@ -21,6 +21,8 @@ def endpoint():
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             model = body['model']
             calls.append(model)
+            if '_headers' in replies:
+                replies['_headers'].append(self.headers.get('x-session-id'))
             value = replies.get(model, 503)
             if callable(value):
                 value = value()
@@ -275,7 +277,7 @@ def test_already_reaped_worker_does_not_wait_for_cleanup_thread(tmp_path, monkey
     from types import SimpleNamespace
     finished = threading.Event()
     home = str(tmp_path)
-    chain._CLEANUPS[home] = finished
+    chain._CLEANUPS[home] = {finished}
     monkeypatch.setattr(chain.threading, 'Thread', lambda **kw: pytest.fail('already reaped'))
     assert chain._stop(SimpleNamespace(returncode=0), home, time.monotonic(), finished)
     assert finished.is_set() and home not in chain._CLEANUPS
@@ -324,3 +326,78 @@ def test_stuck_cleanup_retains_owner_and_inhibits_retry(tmp_path, monkeypatch, c
     finally:
         release.set()
         assert chain._cleanup_finished(str(tmp_path), timeout=2)
+
+
+@pytest.mark.parametrize('case', ['long', 'accounting_cancel', 'concurrent', 'storage', 'affinity'])
+def test_review_boundary_contracts(tmp_path, monkeypatch, endpoint, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from agent import auxiliary_client as ac, aux_accounting, portal_tags
+    from hermes_cli import goal_judge_chain as chain
+    url, calls, replies = endpoint
+    configure(tmp_path, url)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    if case == 'long':
+        replies['primary'] = json.dumps(dict(verdict='done', reason='a' * 16000))
+        replies['sol'] = '{"verdict":"continue"}'
+        result = goals.judge_goal('deliver', 'evidence')
+        assert result[0] == 'done' and calls == ['primary']
+    elif case == 'accounting_cancel':
+        replayed = []
+        completed = threading.Event()
+        class Worker:
+            returncode = 0
+            def communicate(self, *args, **kwargs):
+                completed.set()
+                return json.dumps(dict(category='ok', content='{}', accounting=[{'billable': True}])), None
+        monkeypatch.setattr(chain.subprocess, 'Popen', lambda *a, **kw: Worker())
+        monkeypatch.setattr(aux_accounting, 'replay_aux_accounting', replayed.extend)
+        with pytest.raises(ac.AuxiliaryExplicitCancellation):
+            chain.run_attempt({}, [], 10, time.monotonic() + 10, cancel_check=completed.is_set)
+        assert replayed == [{'billable': True}]
+    elif case == 'concurrent':
+        both = threading.Barrier(2, timeout=2)
+        class Worker:
+            returncode = 0
+            def communicate(self, *args, **kwargs):
+                both.wait()
+                return json.dumps(dict(category='ok', content='{}')), None
+        monkeypatch.setattr(chain.subprocess, 'Popen', lambda *a, **kw: Worker())
+        def attempt():
+            return chain.run_attempt({}, [], 10, time.monotonic() + 5)
+        with ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(attempt) for _ in range(2)]
+            assert [f.result()['category'] for f in futures] == ['ok', 'ok']
+    elif case == 'storage':
+        manager = goals.GoalManager('storage-check')
+        manager.set('deliver')
+        def attempt(*args, cancel_check=None, **kwargs):
+            if cancel_check():
+                raise ac.AuxiliaryExplicitCancellation()
+            return dict(category='ok', content='{"verdict":"continue"}')
+        monkeypatch.setattr(chain, 'run_attempt', attempt)
+        # A missing DB and a failed committed read are not an explicit stop.
+        original_db = goals._get_session_db
+        monkeypatch.setattr(goals, '_get_session_db', lambda: None)
+        manager.evaluate_after_turn('evidence')
+        monkeypatch.setattr(goals, '_get_session_db', original_db)
+        db = original_db()
+        monkeypatch.setattr(db, 'get_meta_committed', lambda *a: (_ for _ in ()).throw(OSError('read failed')))
+        manager.evaluate_after_turn('evidence')
+    else:
+        config = json.loads((tmp_path / 'config.yaml').read_text())
+        config['custom_providers'] = [{'name': 'session-relay', 'base_url': url,
+                                      'api_key': 'test-only', 'session_affinity_header': 'x-session-id'}]
+        (tmp_path / 'config.yaml').write_text(json.dumps(config))
+        # Inspect the actual request at the HTTP server, not just the IPC payload.
+        endpoint_headers = replies['_headers'] = []
+        replies['primary'] = '{"verdict":"continue"}'
+        for mode, value in [('affinity', 'kanban:task-7'), ('conversation', 'root-7'), ('session', 'session-7')]:
+            tokens = (portal_tags.set_affinity_scope(value if mode == 'affinity' else None),
+                      portal_tags.set_conversation_context(value if mode == 'conversation' else None))
+            try:
+                with ac.scoped_runtime_main({'session_id': value if mode == 'session' else ''}):
+                    assert goals.judge_goal('deliver', 'evidence')[0] == 'continue'
+            finally:
+                portal_tags.reset_conversation_context(tokens[1])
+                portal_tags.reset_affinity_scope(tokens[0])
+        assert endpoint_headers == ['kanban:task-7', 'root-7', 'session-7']

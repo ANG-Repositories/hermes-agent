@@ -1913,10 +1913,19 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
+        def judge_cancelled():
+            # A failed read is not a user stop. The save CAS still fences stale verdicts.
+            if _get_session_db() is None:
+                return False
+            current, raw = _load_goal_raw(self.session_id, strict=True)
+            if raw and current is None:
+                raise ValueError('unreadable goal state')
+            return not same_active_goal(state, current)
+
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-            cancel_check=lambda: not same_active_goal(state, load_goal(self.session_id)),
+            cancel_check=judge_cancelled,
         )
         state.last_verdict = verdict
         state.last_reason = reason
