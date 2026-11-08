@@ -19,7 +19,10 @@ When the primary is capped, reuse `available_profile_fallback` with the same
 health probes, cache and eligibility threshold. Admit only if that selector
 finds a configured rung with headroom; otherwise preserve the downgrade and
 state that no configured fallback has headroom. The shared resolver expands
-configured/derived chains in the owning profile's context.
+configured/derived chains in the owning profile's home and secret scope, then
+restores both caller ContextVars even if source expansion raises. This matters
+for control-socket service threads that have no turn scope or carry another
+profile's scope; changing the home alone does not authorize derived sources.
 
 This is admission, NOT forced route installation. Do not stamp the selected
 health-check rung as a session override: the regular agent resolver still owns

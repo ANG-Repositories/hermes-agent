@@ -342,7 +342,22 @@ def _default_lane_probe(profile: str) -> Optional[str]:
     capped = _ph.capped_provider(task, probes, cache, **kwargs)
     if not capped:
         return None
-    fallback = _ph.available_profile_fallback(task, probes, cache, **kwargs)
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = resolve_profile_env(profile)
+    home_token = set_hermes_home_override(home)
+    try:
+        # Derived sources read scoped credentials as well as config. The control
+        # socket's service thread may carry no scope, or a different owner's.
+        secret_token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+        try:
+            fallback = _ph.available_profile_fallback(task, probes, cache, **kwargs)
+        finally:
+            reset_secret_scope(secret_token)
+    finally:
+        reset_hermes_home_override(home_token)
     if fallback is not None:
         _log.info("wake admission: primary %s capped; configured fallback %s/%s has headroom; "
                   "execution retains normal route resolution", capped.get("provider"),

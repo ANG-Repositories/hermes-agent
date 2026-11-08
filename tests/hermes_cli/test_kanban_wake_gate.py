@@ -248,6 +248,50 @@ def test_max_interval_below_sample_cadence_still_trips(tmp_path):
     assert any(r and r.startswith("host cpu 95%") for r in results)
 
 
+def test_fallback_admission_binds_owner_scope_and_restores_caller(tmp_path, monkeypatch):
+    """Derived sources must see the wake owner's secrets, never the caller's."""
+    from agent import secret_scope
+    from hermes_cli import fallback_config, kanban_provider_health as health, profiles
+    from hermes_cli.kanban_wake_gate import _default_lane_probe
+    from hermes_constants import get_hermes_home
+
+    homes = {}
+    for profile in ("owner-a", "owner-b"):
+        home = tmp_path / profile
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n  provider: zai\n  default: glm-5.1\n"
+            "fallback_providers:\n  - source: wake-scope-test\n")
+        (home / ".env").write_text(f"WAKE_TEST_SECRET={profile}\n")
+        homes[profile] = home
+    monkeypatch.setattr(profiles, "resolve_profile_env", homes.__getitem__)
+    monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
+    monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
+    monkeypatch.setattr(health, "configured_box_health", lambda: False)
+    monkeypatch.setattr(health, "_fetch", lambda *a: {"eligible_count": 0})
+    seen = []
+
+    def source(entry):
+        owner = secret_scope.get_secret("WAKE_TEST_SECRET")
+        seen.append((owner, get_hermes_home(), secret_scope.current_secret_scope_home()))
+        return [{"provider": "deepseek", "model": "deepseek-v4-flash"}] if owner else []
+
+    monkeypatch.setitem(fallback_config._CHAIN_SOURCES, "wake-scope-test", source)
+    multiplex = secret_scope.set_multiplex_context(True)
+    caller = secret_scope.set_secret_scope({"WAKE_TEST_SECRET": "foreign"}, profile_home="foreign")
+    original_home = get_hermes_home()
+    try:
+        for profile in ("owner-a", "owner-b", "owner-a"):
+            assert _default_lane_probe(profile) is None
+            assert secret_scope.get_secret("WAKE_TEST_SECRET") == "foreign"
+            assert secret_scope.current_secret_scope_home() == "foreign"
+            assert get_hermes_home() == original_home
+        assert seen == [(p, homes[p], str(homes[p])) for p in ("owner-a", "owner-b", "owner-a")]
+    finally:
+        secret_scope.reset_secret_scope(caller)
+        secret_scope.reset_multiplex_context(multiplex)
+
+
 def test_cpu_max_interval_is_configurable(tmp_path):
     cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90, "cpu_max_interval": 30}}}
     cpu = CpuDelta(0.95)
