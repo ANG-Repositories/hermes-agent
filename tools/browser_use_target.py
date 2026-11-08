@@ -105,7 +105,7 @@ def selected_target(route):
     env = {k: v for k, v in route.env.items() if not k.startswith("PYTHON")}
     proc = subprocess.run([sys.executable, "-I", "-c", _PROBE, json.dumps(sorted(roots))],
                           env=env, stdin=subprocess.DEVNULL,
-                          capture_output=True, text=True, timeout=15)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
     try:
         data = json.loads(proc.stdout) if proc.returncode == 0 else {}
         if type(data.get("pid")) is not int or not data.get("target"):
