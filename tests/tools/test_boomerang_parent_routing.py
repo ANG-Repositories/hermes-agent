@@ -207,3 +207,52 @@ def test_route_snapshot_has_bounded_wait():
     finally:
         release.set()
         thread.join(5)
+
+
+@pytest.mark.parametrize("source", ["delegation-default", "explicit-child"])
+@pytest.mark.parametrize("same_endpoint", [False, True])
+def test_direct_recovery_uses_endpoint_bound_delegation_key(monkeypatch, source, same_endpoint):
+    parent = SimpleNamespace(model="parent", provider="openrouter", api_mode="chat_completions",
+        base_url="http://parent", api_key="parent-key", client=None, _client_kwargs={},
+        _fallback_chain=[], request_overrides={}, _session_db=None, _delegate_depth=0,
+        _active_children=[], _active_children_lock=threading.Lock(), session_id="direct-parent",
+        platform="cli", enabled_toolsets=[], disabled_toolsets=[])
+    route = {"source": "parent", "model": "selected-child", "provider": "custom",
+        "base_url": "http://selected/v1", "api_mode": "chat_completions",
+        "fallback_chain": [{"provider": "openai", "model": "selected-backup"}],
+        "request_overrides": {"extra_body": {"nonce": "selected"}},
+        "routing_filters": {"providers_allowed": ["selected-lane"]}}
+    config = {"model": "changed-default", "base_url": route["base_url"], "api_key": "delegation-key"}
+    monkeypatch.setattr(dt, "_load_config", lambda: config)
+    captured = []
+    def construct(**kw):
+        captured.append(kw)
+        child = MagicMock()
+        child.run_conversation.return_value = {"final_response": "done", "completed": True, "api_calls": 1}
+        child.get_activity_summary.return_value = {"api_call_count": 1}
+        return child
+    monkeypatch.setattr("run_agent.AIAgent", construct)
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda *a, **kw: {
+        "provider": "custom", "api_key": "WRONG-provider-key", "api_mode": "chat_completions",
+        "base_url": route["base_url"] if same_endpoint else "http://different/v1"})
+    task = {"goal": "restore direct child", "route_source": source, "parent_route": route,
+            "credential_ref": {"source": "delegation_config"}, "materialized_prefill_messages": []}
+    record = {"execution": {"model": route["model"], "provider": "custom", "base_url": route["base_url"],
+              "fallback_chain": [], "credential_ref": {"source": "delegation_config"}}, "route": {}}
+    result = json.loads(dt.delegate_task(tasks=[task], parent_agent=parent, _recovery_spec=record))
+    assert not result.get("error"), result
+    assert captured[0]["api_key"] == "delegation-key"
+    assert captured[0]["model"] == route["model"]
+    assert captured[0]["fallback_model"] == route["fallback_chain"]
+    assert captured[0]["providers_allowed"] == ["selected-lane"]
+    assert captured[0]["request_overrides"] == route["request_overrides"]
+
+
+def test_persist_route_uses_constructed_fallback_chain():
+    from tools.delegate_tool_routing import persist_route
+    resolved = [{"provider": "openai", "model": "resolved-backup"}]
+    child = SimpleNamespace(_fallback_chain=resolved, _boomerang_parent_route={
+        "source": "parent", "model": "selected", "provider": "openrouter",
+        "base_url": "http://selected/v1", "api_mode": "chat_completions",
+        "fallback_chain": "auto", "request_overrides": {}})
+    assert persist_route(child)["fallback_chain"] == resolved

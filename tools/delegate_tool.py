@@ -3662,6 +3662,12 @@ def _build_durable_background_spec(
             if isinstance(getattr(built, "_boomerang_parent_route", None), dict):
                 from tools.delegate_tool_routing import persist_route
                 persisted["parent_route"] = persist_route(built)
+                task_routing_cfg = cfg if routing_cfg is None else routing_cfg
+                if (persisted["route_source"] != "live-parent" and task_routing_cfg.get("base_url")):
+                    persisted["credential_ref"] = {"source": "delegation_config"}
+                else:
+                    persisted["credential_ref"] = {"source": "provider",
+                        "provider": persisted["parent_route"]["provider"]}
         if task_images and index < len(task_images) and task_images[index]:
             persisted["images"] = list(task_images[index])
         if task_schemas and index < len(task_schemas) and task_schemas[index] is not None:
@@ -4058,6 +4064,7 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    current_delegation_cfg = cfg
     if _recovery_spec:
         # Recovery reuses this same live adapter but pins the effective,
         # non-secret settings captured before the original executor submit.
@@ -4336,7 +4343,11 @@ def delegate_task(
                     raise ValueError("boomerang routing-unavailable: legacy record has unresolved parent fallback policy")
             if _recovery_spec and t.get("parent_route") is not None:
                 from tools.delegate_tool_routing import recover_route_parent
-                _route_parent = recover_route_parent(parent_agent, t["parent_route"])
+                task_credential_ref = t.get("credential_ref")
+                if task_credential_ref is None and t.get("route_source") != "live-parent":
+                    task_credential_ref = recovery_execution.get("credential_ref")
+                _route_parent = recover_route_parent(parent_agent, t["parent_route"],
+                    credential_ref=task_credential_ref, delegation_cfg=current_delegation_cfg)
                 _task_inherits_route = True
             child = _build_child_preserving_parent_tools(
                 task_index=i,

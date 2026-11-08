@@ -59,7 +59,10 @@ def persist_route(agent):
              "base_url": agent.base_url,
              "fallback_chain": copy.deepcopy(agent._fallback_chain),
              "request_overrides": copy.deepcopy(getattr(agent, "request_overrides", {}) or {})}
-    original_chain = route["fallback_chain"] or []
+    # Constructor normalization resolves symbolic/legacy policy. Never persist its input
+    # (for example "auto") as though it were an already selected list of lanes.
+    effective_chain = getattr(agent, "_fallback_chain", None)
+    original_chain = effective_chain if isinstance(effective_chain, list) else route["fallback_chain"] or []
     route["fallback_chain"] = persistable_fallback_chain(original_chain) or []
     if len(route["fallback_chain"]) != len(original_chain):
         raise ValueError("boomerang routing-unavailable: fallback credentials need symbolic references")
@@ -74,7 +77,7 @@ def persist_route(agent):
     return route
 
 
-def recover_route_parent(parent, route):
+def recover_route_parent(parent, route, *, credential_ref=None, delegation_cfg=None):
     from agent.route_snapshot import snapshot_parent
     from gateway.run import _resolve_runtime_agent_kwargs_for_provider
 
@@ -83,7 +86,22 @@ def recover_route_parent(parent, route):
             or not isinstance(route.get("model"), str) or not route["model"].strip()):
         raise ValueError("boomerang routing-unavailable: incomplete persisted identity")
     _validate_policy(route)
-    runtime = _resolve_runtime_agent_kwargs_for_provider(route["provider"], target_model=route["model"])
+    if (credential_ref or {}).get("source") == "delegation_config":
+        from tools.delegate_tool_config import _resolve_delegation_credentials
+        cfg = delegation_cfg or {}
+        endpoint = cfg.get("base_url")
+        if (not isinstance(endpoint, str) or not route.get("base_url")
+                or endpoint.rstrip("/") != route["base_url"].rstrip("/")):
+            raise ValueError("boomerang routing-unavailable: selected endpoint credentials could not be resolved")
+        runtime = _resolve_delegation_credentials({**cfg, "model": route["model"]}, parent)
+        if not runtime.get("api_key"):
+            bound_parent = snapshot_parent(parent)
+            if (bound_parent.base_url or "").rstrip("/") == endpoint.rstrip("/"):
+                runtime["api_key"] = bound_parent.api_key
+        # The current config owns this key only for its configured endpoint. Do not
+        # borrow an arbitrary provider key, even when that provider has the same URL.
+    else:
+        runtime = _resolve_runtime_agent_kwargs_for_provider(route["provider"], target_model=route["model"])
     if not runtime.get("api_key") or not runtime.get("base_url"):
         raise ValueError("boomerang routing-unavailable: credentials could not be resolved")
     if route.get("base_url") and route["base_url"].rstrip("/") != runtime["base_url"].rstrip("/"):
