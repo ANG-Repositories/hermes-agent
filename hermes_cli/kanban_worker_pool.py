@@ -54,6 +54,8 @@ from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
 
+logger = logging.getLogger(__name__)
+
 ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 ROLES_FILE = "fleet-roles.json"
@@ -1203,6 +1205,15 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
             return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
             return False, _reasons.HOST_REACH, None
+    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals)
+    if need_hosts is not None:
+        if pin not in (None, PIN_ANY) and pin not in need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
+        # `host: any` returns below before soft_rule/studio_affinity, so it is checked here. An unpinned card
+        # is not: it must still reach soft_rule first (an identity-only capability wait, AC-5), and
+        # studio_affinity enforces its needs after that (Prism ed96eb421c9c).
+        if pin == PIN_ANY and not need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:
@@ -1437,11 +1448,15 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
             f"{tail}")
 
 
-def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
-               pressure_path: Optional[str] = None,
-               workspaces_root: Optional[str] = None,
-               workspace_paths: Sequence[str] = ()) -> Union[None, Tuple[float, int], HostSample]:
-    """``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
+def _probe_once(h: PoolHost, runner: Callable, *,
+                pressure_path: Optional[str] = None,
+                workspaces_root: Optional[str] = None,
+                workspace_paths: Sequence[str] = (),
+                direct: bool = False):
+    """One ssh round-trip: ``(result, error)``; ``error`` names why ``result``
+    is None. ``direct`` bypasses any ControlMaster mux (t_64342f07).
+
+    ``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
     With ``pressure_path`` the same call also returns the remote clock and
     the pressure file as a :class:`HostSample`. With ``workspaces_root`` it
     also lists the boards the host can host (``HostSample.boards``,
@@ -1449,27 +1464,36 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     With ``workspace_paths`` the same call reports each path's state
     (``HostSample.workspace_states``, t_8bfdcc07) and a changed host key
     raises :class:`HostKeyChanged` instead of reading as plain unreachable."""
+    argv = _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root, workspace_paths))
+    timeout = PROBE_TIMEOUT_SECONDS
+    if direct:
+        argv = argv[:1] + list(DIRECT_PROBE_SSH_OPTS) + argv[1:]
+        timeout = DIRECT_PROBE_TIMEOUT_SECONDS
     try:
         proc = runner(
-            _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root, workspace_paths)),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, stdin=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if getattr(proc, "returncode", 1) != 0:
-        err = (getattr(proc, "stderr", "") or "").lower()
-        if workspace_paths and getattr(proc, "returncode", 1) == 255 and (
+    except subprocess.TimeoutExpired:
+        return None, f"timeout after {timeout}s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:160]
+    rc = getattr(proc, "returncode", 1)
+    if rc != 0:
+        raw = (getattr(proc, "stderr", "") or "").strip()
+        err = raw.lower()
+        if workspace_paths and rc == 255 and (
                 "host key verification failed" in err
                 or "remote host identification has changed" in err):
             raise HostKeyChanged(h.name)
-        return None
+        last = raw.splitlines()[-1].strip() if raw else ""
+        return None, f"ssh rc={rc}" + (f": {last[:120]}" if last else "")
     out = proc.stdout or ""
     states: Optional[Dict[str, str]] = None
     if workspace_paths:
         out, sep, listed = out.partition(STATES_MARKER + "\n")
         if not sep:
-            return None  # the state list never printed: fail closed
+            return None, "probe output missing workspace states"  # fail closed
         states = {}
         try:
             got = json.loads(listed.strip().split("\n")[0] or "null")
@@ -1484,20 +1508,20 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     if workspaces_root:
         out, sep, listed = out.partition(BOARDS_MARKER + "\n")
         if not sep:
-            return None  # the board list never printed: fail closed
+            return None, "probe output missing board list"  # fail closed
         boards = frozenset(b.strip() for b in listed.split("\n") if b.strip())
     lines = out.split("\n")
     try:
         load1 = float(lines[0].split()[0])
         ncpu = int(lines[1].strip())
     except (IndexError, ValueError):
-        return None
+        return None, "unparseable probe output"
     if ncpu <= 0:
-        return None
+        return None, f"bad ncpu {ncpu}"
     if pressure_path is None:
         if boards is None and states is None:
-            return (load1, ncpu)
-        return HostSample(load1, ncpu, boards=boards, workspace_states=states)
+            return (load1, ncpu), ""
+        return HostSample(load1, ncpu, boards=boards, workspace_states=states), ""
     try:
         remote_now: Optional[float] = float(lines[2].strip())
     except (IndexError, ValueError):
@@ -1507,7 +1531,133 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     except (IndexError, ValueError):
         load5 = None
     return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards,
-                      load5=load5, workspace_states=states)
+                      load5=load5, workspace_states=states), ""
+
+
+
+# -- probe failure vs host down (t_64342f07) ----------------------------------
+# 2026-11-06: 31 ready cards waited ``pool_unavailable (ci-box: host
+# unreachable; ace-media: host unreachable)`` while both hosts answered ssh in
+# <2 s. The probe rides the ~/.ssh/config ControlMaster mux; a stale master
+# (ace-media, after a reboot) or a cold handshake on a loaded box (ci-box,
+# 39 s) failed every tick. So: a failed muxed probe is retried ONCE on a direct
+# connection (no mux, longer handshake budget), and a host that answered
+# recently keeps its last sample for PROBE_GRACE_FAILS ticks before it reads
+# unreachable. Nothing is sticky: every tick probes again, and the unreachable
+# reason names the probe, its error and when it was last tried / last answered.
+DIRECT_PROBE_SSH_OPTS = ("-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=10")
+DIRECT_PROBE_TIMEOUT_SECONDS = 15
+PROBE_GRACE_FAILS = 3
+PROBE_GRACE_SECONDS = 900
+_REAL_RUN = subprocess.run
+
+
+@dataclass
+class _ProbeRecord:
+    last_ok_at: Optional[float] = None
+    last_sample: Any = None
+    fails: int = 0
+    last_error: str = ""
+    last_tried_at: Optional[float] = None
+    reused: bool = False
+
+
+class ProbeMemory:
+    """Per-host probe outcomes, in-process (like ``_board_faults``): the
+    gateway is the one long-lived prober, and a restart re-probes."""
+
+    def __init__(self) -> None:
+        self._rows: Dict[str, _ProbeRecord] = {}
+
+    def row(self, h: PoolHost) -> _ProbeRecord:
+        return self._rows.setdefault(f"{h.target}:{h.ssh_port}", _ProbeRecord())
+
+    def get(self, h: PoolHost) -> Optional[_ProbeRecord]:
+        return self._rows.get(f"{h.target}:{h.ssh_port}")
+
+    def clear(self) -> None:
+        self._rows.clear()
+
+
+_PROBE_MEMORY = ProbeMemory()
+
+
+def _hhmmss(t: Optional[float]) -> str:
+    return "never" if t is None else time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def probe_note(h: PoolHost, memory: Optional[ProbeMemory] = None) -> str:
+    """One line for a placement_wait detail: which probe, which error, when
+    last tried and when the host last answered. "" when the last probe was
+    clean."""
+    rec = (memory or _PROBE_MEMORY).get(h)
+    if rec is None or rec.fails == 0:
+        return ""
+    head = (f"ssh probe {h.target} failed {rec.fails}x ({rec.last_error}), "
+            f"last tried {_hhmmss(rec.last_tried_at)}, last ok {_hhmmss(rec.last_ok_at)}")
+    return head + (", reusing last sample" if rec.reused else "")
+
+
+def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
+               pressure_path: Optional[str] = None,
+               workspaces_root: Optional[str] = None,
+               workspace_paths: Sequence[str] = (),
+               memory: Optional[ProbeMemory] = None,
+               now: Optional[float] = None) -> Union[None, Tuple[float, int], HostSample]:
+    """The sample from :func:`_probe_once`, or None (fail closed).
+
+    A failed probe is retried once on a direct (un-muxed) connection, so a
+    stale ControlMaster or a slow handshake is not read as a dead host. A
+    host whose last answer is under ``PROBE_GRACE_FAILS`` failures and
+    ``PROBE_GRACE_SECONDS`` old keeps that sample (load/pressure only: the
+    workspace states are dropped, so continuation reads ``unknown``).
+    ``memory`` defaults to the process-wide record only for the real
+    ``subprocess.run`` runner, so injected runners stay hermetic."""
+    if memory is None and runner is _REAL_RUN:
+        memory = _PROBE_MEMORY
+    kw = dict(pressure_path=pressure_path, workspaces_root=workspaces_root,
+              workspace_paths=workspace_paths)
+    got, err = _probe_once(h, runner, **kw)
+    if got is None:
+        direct, derr = _probe_once(h, runner, direct=True, **kw)
+        if direct is not None:
+            got, err = direct, ""
+            if runner is _REAL_RUN:
+                _drop_stale_master(h)
+        else:
+            err = f"mux: {err}; direct: {derr}"
+    if memory is None:
+        return got
+    rec = memory.row(h)
+    rec.last_tried_at = time.time() if now is None else now
+    if got is not None:
+        rec.last_ok_at, rec.last_sample = rec.last_tried_at, got
+        rec.fails, rec.last_error, rec.reused = 0, "", False
+        return got
+    rec.fails += 1
+    rec.last_error = err
+    rec.reused = (rec.last_sample is not None and rec.last_ok_at is not None
+                  and rec.fails <= PROBE_GRACE_FAILS
+                  and rec.last_tried_at - rec.last_ok_at <= PROBE_GRACE_SECONDS)
+    logger.warning("kanban pool: %s", probe_note(h, memory))
+    if not rec.reused:
+        return None
+    last = rec.last_sample
+    if isinstance(last, HostSample) and last.workspace_states is not None:
+        import dataclasses
+        last = dataclasses.replace(last, workspace_states=None)
+    return last
+
+
+def _drop_stale_master(h: PoolHost) -> None:
+    """The muxed probe failed and a direct one answered: the ControlMaster is
+    stale (ace-media 2026-11-06). Ask it to exit so the next tick re-masters;
+    best effort, bounded."""
+    argv = ["ssh", "-O", "exit"] + (["-p", str(h.ssh_port)] if h.ssh_port != 22 else []) + [h.target]
+    try:
+        subprocess.run(argv, capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 # -- per-(host, board) workspace faults (t_9fb4d477) --------------------------
@@ -2180,7 +2330,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             row["load1"], row["ncpu"] = sample
             row["band"], row["why"] = BAND_UNKNOWN, "pressure not probed"
         elif free > 0:
-            row["band"], row["why"] = BAND_UNKNOWN, "host unreachable"
+            note = probe_note(h)
+            row["band"], row["why"] = BAND_UNKNOWN, "host unreachable" + (f" ({note})" if note else "")
         probed[h.name] = row
 
     # t_5d7e7171 (FWA-G): no second verdict. Under the ONE rule a host is never closed here on its band (each take

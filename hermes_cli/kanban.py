@@ -1457,6 +1457,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = [pid for pid, _kind in parent_links]
         children = [cid for cid, _kind in child_links]
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        from hermes_cli.kanban_diagnostics import compute_task_diagnostics
+        diagnostics = compute_task_diagnostics(task, events, runs)
         # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived. Read AFTER the
         # live comments and runs, deduped by id, so a move committing in between cannot empty the history.
         from hermes_cli import kanban_archive_read as kar
@@ -1492,6 +1494,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "level": level,
             "latest_summary": latest_summary,
+            "diagnostics": [d.to_dict() for d in diagnostics],
             "workspace_refusal": refusal,
             "held_repo": held,
             "parents": parents, "children": children,
@@ -1519,6 +1522,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
+    for diagnostic in diagnostics:
+        field("integrity", f"{diagnostic.kind}: {diagnostic.detail}")
     field("status", task.status + (f"  [{_fmt_refusal(refusal)}]" if refusal else "")
           + (f"  [{kb.format_deferred_until(task.next_eligible_at)}]"
              if task.status == "scheduled" and task.block_kind == "deferred" else ""))
@@ -3613,13 +3618,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     add_skills = list(getattr(args, "skills", None) or [])
     clear_skills = bool(getattr(args, "clear_skills", False))
     do_skills = bool(add_skills) or clear_skills
+    asap_arg = getattr(args, "asap", None)
     boomerang_arg = getattr(args, "boomerang_wake", None)
 
     if result is None and (summary is not None or raw_meta is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     if (not do_result and not do_fields and not do_model and not do_session
             and no_worker is None and new_priority is None and page is None and not do_skills
-            and boomerang_arg is None):
+            and boomerang_arg is None and asap_arg is None):
         return _err(
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
             "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
@@ -3627,6 +3633,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
     rc = 0
     with kbc.connect_closing() as conn:
+        if asap_arg is not None:
+            from hermes_cli.kanban_priority import set_asap
+            try:
+                if not set_asap(conn, args.task_id, asap_arg):
+                    return _err(f"cannot edit {args.task_id} (unknown id)")
+            except PermissionError as exc:
+                return _err(str(exc))
+            print(f"{args.task_id}: ASAP {'on' if asap_arg else 'off'}")
         if new_priority is not None and not _set_priority(conn, args.task_id, new_priority):
             return 1
         if no_worker is not None:
