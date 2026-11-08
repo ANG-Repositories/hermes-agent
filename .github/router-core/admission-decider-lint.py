@@ -178,9 +178,11 @@ def _statements(lines, bares=None):
         # ASI-style assignments may start a new statement inside an enclosing
         # callback. Split only after a complete preceding segment; wrapped RHS
         # expressions still stay together.
-        assignment = re.match(r"\s*(?:(?:const|let|var)\s+)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*=(?!=|>)", bare)
-        call = re.match(r"\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\(", bare)
-        if seg and (_STMT_START.match(bare) or ((assignment or call) and not _continues(seg_bares))):
+        member = r"[A-Za-z_$][\w$]*(?:(?:\.[A-Za-z_$][\w$]*)|(?:\[[^\]]*\]))*"
+        assignment = re.match(r"\s*(?:(?:const|let|var)\s+)?" + member + r"\s*=(?!=|>)", bare)
+        call = re.match(r"\s*(?:await\s+)?" + member + r"\s*\(", bare)
+        shell_test = re.match(r"\s*command\s+test\b", bare)
+        if seg and (_STMT_START.match(bare) or shell_test or ((assignment or call) and not _continues(seg_bares))):
             out.append((seg, True))
             seg, seg_bares = [], []
         seg.append(ln)
