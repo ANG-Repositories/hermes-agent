@@ -90,9 +90,12 @@ def _bound_page(fn):
 
 
 def _binding_is_current(binding):
-    from tools.browser_tool import _active_sessions, _last_session_key
+    from tools.browser_tool import (
+        _active_sessions, _last_session_key, _is_camofox_mode, _is_browser_use_cli_mode,
+    )
     task_id, key, session, _ = binding
-    return _last_session_key(task_id) == key and _active_sessions.get(key) is session
+    return (not _is_camofox_mode() and not _is_browser_use_cli_mode()
+            and _last_session_key(task_id) == key and _active_sessions.get(key) is session)
 
 
 # ---------------------------------------------------------------------------

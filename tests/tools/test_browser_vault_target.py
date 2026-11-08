@@ -92,7 +92,7 @@ def test_bound_origin_mismatch_never_searches_another_tab(pages):
     assert current.locator("input").input_value() == ""
 
 
-@pytest.mark.parametrize("race", ["same_origin_navigation", "cross_origin_navigation", "tab_switch", "session_replaced"])
+@pytest.mark.parametrize("race", ["same_origin_navigation", "cross_origin_navigation", "tab_switch", "session_replaced", "camofox_switch", "browser_use_switch"])
 def test_page_change_during_resolution_fails_closed(pages, race, monkeypatch):
     current, wrong, driver, backend, *_ = pages
     def resolve(_):
@@ -102,6 +102,9 @@ def test_page_change_during_resolution_fails_closed(pages, race, monkeypatch):
             current.goto("https://accounts.example.test/replaced")
         elif race == "tab_switch":
             driver["page"] = wrong
+        elif race in {"camofox_switch", "browser_use_switch"}:
+            mode = "_is_camofox_mode" if race == "camofox_switch" else "_is_browser_use_cli_mode"
+            monkeypatch.setattr(bt, mode, lambda: True)
         else:
             key = bt._last_session_key("fixture-task")
             monkeypatch.setitem(bt._active_sessions, key, dict(bt._active_sessions[key]))
@@ -121,7 +124,7 @@ def test_foreign_task_cannot_use_supervisor_or_current_page(pages):
     assert current.locator("input").input_value() == wrong.locator("input").input_value() == ""
 
 
-@pytest.mark.parametrize("race", ["navigation", "tab_switch", "session_swap"])
+@pytest.mark.parametrize("race", ["navigation", "tab_switch", "session_swap", "camofox_switch", "browser_use_switch"])
 def test_navigation_after_target_selection_is_atomically_refused(pages, monkeypatch, race):
     current, wrong, driver, _, _, sup, _ = pages
     focus = sup.focus_page
@@ -132,6 +135,9 @@ def test_navigation_after_target_selection_is_atomically_refused(pages, monkeypa
             current.goto("https://site.example.test/new-document")
         elif race == "tab_switch":
             driver["page"] = wrong
+        elif race in {"camofox_switch", "browser_use_switch"}:
+            mode = "_is_camofox_mode" if race == "camofox_switch" else "_is_browser_use_cli_mode"
+            monkeypatch.setattr(bt, mode, lambda: True)
         else:
             key = bt._last_session_key("fixture-task")
             monkeypatch.setitem(bt._active_sessions, key, dict(bt._active_sessions[key]))
