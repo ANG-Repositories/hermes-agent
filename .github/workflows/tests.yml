@@ -50,7 +50,7 @@ jobs:
   generate:
     name: "Generate slices"
     # Local Python + GitHub cache only; start hosted overflow without the pool.
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       # The static split (CI_RUNNER_LABELS + CI_SELF_HOSTED_SLOTS). Every
@@ -102,11 +102,11 @@ jobs:
           # minutes are free on this public repo (20 concurrent jobs), so the
           # overflow tail costs nothing and the matrix starts in one wave.
           #
-          # Both vars are optional and fail SAFE: unset CI_SELF_HOSTED_SLOTS
-          # means no cap (every slice self-hosted, i.e. today's behaviour),
-          # and unset/garbage CI_RUNNER_LABELS falls back to ubuntu-latest —
-          # so the existing rollback (point CI_RUNNER_LABELS at ubuntu-latest
-          # to route everything hosted) still works unchanged.
+          # Hosted-first overflow: LAST_N overrides legacy labels/slots when
+          # nonempty. Zero disables all overflow; invalid/negative fails hosted.
+          # Empty preserves explicit legacy configuration; both unset is hosted.
+          # The planner and runs-on expressions independently reject fork PRs.
+          CI_SELF_HOSTED_LAST_N: ${{ vars.CI_SELF_HOSTED_LAST_N }}
           CI_SELF_HOSTED_SLOTS: ${{ vars.CI_SELF_HOSTED_SLOTS }}
           CI_RUNNER_LABELS: ${{ vars.CI_RUNNER_LABELS }}
           # Optional trial: overrides routing for the N lightest non-core slices.
@@ -154,6 +154,7 @@ jobs:
             --full-slices '${{ inputs.slice_count }}' \
             "${IMPACT_ARGS[@]}" \
             --test-scope '${{ inputs.test_scope }}' \
+            --self-hosted-last-n="$CI_SELF_HOSTED_LAST_N" \
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
             --self-hosted-labels "$CI_RUNNER_LABELS" \
             --arm-hosted-slices="$CI_ARM_HOSTED_SLICES" \
@@ -224,7 +225,7 @@ jobs:
     # Phase-2 static-routing switch: absent/invalid stays on the existing K/ARM
     # split until Apollo explicitly activates managed placement in Phase 4.
     if: github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     # A dead placement (checkout/runner failure, 5-min kill) must not fail the
     # required check: the static-split fallback still runs every slice. Only a
@@ -278,7 +279,7 @@ jobs:
     # semantics). Not `vars.CI_RUNNER_LABELS` directly: one label set for the
     # whole matrix cannot spill, and GitHub will not overflow a full
     # self-hosted pool onto hosted runners by itself.
-    runs-on: ${{ fromJSON(matrix.slice.runs_on) }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && (fromJSON(matrix.slice.runs_on)) || 'ubuntu-latest' }}
     timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     strategy:
       fail-fast: false
@@ -469,7 +470,7 @@ jobs:
     # (no readable slice files) must not add a red job to the run.
     continue-on-error: true
     # Artifact/cache plumbing needs no LAN or self-hosted test slot.
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Restore previous merged durations (merge base)
@@ -554,7 +555,7 @@ jobs:
   # (run_tests_parallel._noop_guard), so a missing PTB cannot read green.
   ptb-tests:
     name: Run tests (real PTB)
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -606,7 +607,7 @@ jobs:
     # Blacksmith: the class runs with seccomp/AppArmor unconfined on hosts we live on.
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","ace-e2e-vm"]' || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]')) }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && (fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","ace-e2e-vm"]' || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]'))) || 'ubuntu-latest' }}
     # 45, not 30: e2e measured 26 min on GitHub-hosted (#1624 rounds 4-7).
     timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     steps:
@@ -696,7 +697,7 @@ jobs:
     # The run step still accepts a bare directory name, so a hand-dispatched
     # "git" shard keeps working. Skipping this job skips every shard with it.
     if: inputs.e2e_upgrade
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
@@ -755,7 +756,7 @@ jobs:
     # Studio gate opens the route only while idle slots >= 1 + len(CI_E2E_VM_SHARDS).
     # ci-priv (t_df855b2a): with CI_PRIV_ENABLED + CI_PRIV_RUNNER (the private mirror only), those two
     # shards run in a ci-priv KVM guest instead: a real docker daemon, and no /.dockerenv.
-    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && contains(format(',{0},', vars.CI_E2E_VM_SHARDS), format(',{0},', matrix.shard)) && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_PRIV_ENABLED == 'true' && vars.CI_PRIV_RUNNER && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && (matrix.shard == 'hosts/test_libc_musl' || matrix.shard == 'core/test_fresh_process_entrypoints') && fromJSON(vars.CI_PRIV_RUNNER) || vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && (vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && contains(format(',{0},', vars.CI_E2E_VM_SHARDS), format(',{0},', matrix.shard)) && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_PRIV_ENABLED == 'true' && vars.CI_PRIV_RUNNER && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && (matrix.shard == 'hosts/test_libc_musl' || matrix.shard == 'core/test_fresh_process_entrypoints') && fromJSON(vars.CI_PRIV_RUNNER) || vars.CI_E2E_RUNNER || 'ubuntu-latest') || 'ubuntu-latest' }}
     timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     strategy:
       fail-fast: false
@@ -913,7 +914,7 @@ jobs:
     name: Tests complete
     needs: [generate, placement, test, ptb-tests, e2e, e2e-upgrade-plan, e2e-upgrade]
     if: always()
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read

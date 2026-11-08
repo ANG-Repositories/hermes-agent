@@ -848,6 +848,30 @@ def _route_blacksmith_slices(
     print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
 
 
+def _route_self_hosted_last_n(matrix: dict, raw: str | None, event: str | None, same_repo: str | None) -> None:
+    """Final routing boundary: untrusted code never leaves standard hosted.
+
+    An unset/empty last-N preserves the explicit legacy routing knobs. Explicit
+    zero, negative or malformed counts override them with all-hosted routing.
+    """
+    if not _blacksmith_trusted(event, same_repo):
+        for slice_ in matrix["slice"]:
+            slice_["runs_on"] = _HOSTED_RUNNER_LABELS
+        return
+    if raw is None or not raw.strip():
+        return
+    try:
+        count = max(0, min(int(raw), len(matrix["slice"])))
+    except ValueError:
+        count = 0
+    ordered = sorted(matrix["slice"], key=lambda slice_: slice_["index"])
+    for i, slice_ in enumerate(ordered):
+        slice_["runs_on"] = (
+            '["self-hosted","universal-ci"]'
+            if i >= len(ordered) - count else _HOSTED_RUNNER_LABELS
+        )
+
+
 def _scoped_plugin_matrix(
     scope: str,
     repo_root: Path,
@@ -2011,6 +2035,10 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--self-hosted-last-n", default=None, metavar="N",
+        help="Hosted first; last N trusted slices use universal-ci. Empty keeps legacy; 0 disables.",
+    )
+    parser.add_argument(
         "--arm-hosted-slices",
         metavar="N",
         default=None,
@@ -2156,7 +2184,7 @@ def main() -> int:
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--full-slices", "--files", "--files-from",
         "--changed-files-scope", "--test-scope",
-        "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
+        "--self-hosted-slots", "--self-hosted-labels", "--self-hosted-last-n", "--arm-hosted-slices",
         "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
         "--min-tests", "--strict-noop", "--no-strict-noop",
         "--junit-dir", "--result-file",
@@ -2345,6 +2373,9 @@ def main() -> int:
             _route_blacksmith_slices(
                 scoped_matrix, args.blacksmith_slices, args.event, args.same_repo
             )
+            _route_self_hosted_last_n(
+                scoped_matrix, args.self_hosted_last_n, args.event, args.same_repo
+            )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
                 f" ({len(scoped_matrix['slice'])} slices)",
@@ -2453,6 +2484,9 @@ def main() -> int:
         )
         _route_blacksmith_slices(
             matrix, args.blacksmith_slices, args.event, args.same_repo
+        )
+        _route_self_hosted_last_n(
+            matrix, args.self_hosted_last_n, args.event, args.same_repo
         )
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
