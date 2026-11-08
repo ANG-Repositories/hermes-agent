@@ -17906,22 +17906,23 @@ def set_task_priority(
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park until a validated wake time, atomically with ending the run."""
+    if wake_at is None:
+        raise ValueError("scheduled needs a wake time (--at or --now)")
+    wake_at = validate_wake_at(wake_at)
     with write_txn(conn):
         row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
-        params: list[Any] = [task_id]
+        params: list[Any] = [wake_at, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL,
-                   -- A leftover rate-limit cooldown would read as a timed wake
-                   -- to wake_due_scheduled; set_schedule_wake stamps a real one.
-                   next_eligible_at = NULL
+                   next_eligible_at = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
@@ -17934,7 +17935,7 @@ def schedule_task(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, "scheduled",
-                      {"reason": reason, "source_status": parked_from}, run_id=run_id)
+                      {"reason": reason, "source_status": parked_from, "until": wake_at}, run_id=run_id)
         return True
 
 # Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a
