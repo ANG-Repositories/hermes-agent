@@ -63,7 +63,7 @@ def _stop(proc):
     proc.wait()
 
 
-def run_attempt(route, messages, max_tokens, deadline):
+def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
     from agent.auxiliary_client import raise_if_aux_cancel_requested
     from hermes_constants import get_hermes_home
     from tools.environments.local import served_profile_child_env
@@ -78,8 +78,14 @@ def run_attempt(route, messages, max_tokens, deadline):
     )
     try:
         pending = payload
+        next_state_check = 0.0
         while True:
             raise_if_aux_cancel_requested()
+            if cancel_check is not None and time.monotonic() >= next_state_check:
+                next_state_check = time.monotonic() + 0.2
+                if cancel_check():
+                    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+                    raise AuxiliaryExplicitCancellation()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return dict(category='timeout')
@@ -95,7 +101,7 @@ def run_attempt(route, messages, max_tokens, deadline):
         _stop(proc)
 
 
-def judge_chain(policy, system_prompt, prompt, max_tokens, parse):
+def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=None):
     from agent.auxiliary_client import raise_if_aux_cancel_requested
     routes, total = policy
     deadline = time.monotonic() + total
@@ -109,7 +115,7 @@ def judge_chain(policy, system_prompt, prompt, max_tokens, parse):
         provider, model = _label(route['provider']), _label(route['model'])
         logger.info('goal judge attempt: rung=%d provider=%s model=%s', index, provider, model)
         outcome = run_attempt(route, messages, max_tokens,
-                              min(deadline, time.monotonic() + route['timeout']))
+                              min(deadline, time.monotonic() + route['timeout']), cancel_check=cancel_check)
         category = outcome.get('category', 'worker_error')
         if category == 'ok':
             verdict, reason, failed, directive = parse(outcome.get('content', ''))

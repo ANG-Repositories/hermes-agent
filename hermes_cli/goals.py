@@ -1046,6 +1046,7 @@ def judge_goal(
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
     completion_handoff: bool = False,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1103,7 +1104,8 @@ def judge_goal(
         from hermes_cli.goal_judge_chain import chain_config, judge_chain
         policy = chain_config(timeout)
         if policy is not None:
-            return judge_chain(policy, system_prompt, prompt, _goal_judge_max_tokens(), _parse_judge_response)
+            return judge_chain(policy, system_prompt, prompt, _goal_judge_max_tokens(), _parse_judge_response,
+                               cancel_check=cancel_check)
         raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
@@ -1911,6 +1913,7 @@ class GoalManager:
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
+            cancel_check=lambda: not same_active_goal(state, load_goal(self.session_id)),
         )
         state.last_verdict = verdict
         state.last_reason = reason

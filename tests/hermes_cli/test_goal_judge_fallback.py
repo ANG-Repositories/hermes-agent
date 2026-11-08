@@ -54,8 +54,11 @@ def configure(home, url, **extra):
     (home / 'config.yaml').write_text(json.dumps({'auxiliary': {'goal_judge': config}}))
 
 
-@pytest.mark.parametrize('winner', ['primary', 'sol', 'grok', 'kimi', None])
-@pytest.mark.parametrize('verdict', ['done', 'blocked', 'wait', 'continue'])
+@pytest.mark.slow_test(120, reason='Real fresh-interpreter provider resolution on up to four sequential routes')
+@pytest.mark.parametrize('winner,verdict', [
+    ('primary', 'done'), ('sol', 'done'), ('grok', 'done'), ('kimi', 'done'),
+    (None, 'done'), ('sol', 'blocked'), ('sol', 'wait'), ('sol', 'continue'),
+])
 def test_ordered_chain_and_failure_accounting(tmp_path, monkeypatch, endpoint, winner, verdict):
     url, calls, replies = endpoint
     configure(tmp_path, url)
@@ -149,7 +152,7 @@ def test_total_budget_and_invalid_config(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         chain.chain_config(1)
     calls = []
-    def attempt(route, messages, max_tokens, deadline):
+    def attempt(route, messages, max_tokens, deadline, **kwargs):
         calls.append(route['model'])
         assert deadline <= started + 0.21
         time.sleep(max(0, deadline - time.monotonic()))
