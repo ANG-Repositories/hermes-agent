@@ -515,8 +515,13 @@ def test_saved_chrome_tree_teardown_preserves_process_identity(tmp_path, monkeyp
         births = {1234: 10.0, 5678: 30.0}
         m.setattr(kb, "_member_birth", births.get)
         m.setattr(os, "getpgid", lambda pid: pid)
-        m.setattr(os, "killpg", lambda pid, sig: signals.append(pid))
-        m.setattr(os, "kill", lambda pid, sig: signals.append(pid))
+        def signal(pid, sig):
+            if sig == 0:
+                raise ProcessLookupError(pid)
+            signals.append(pid)
+
+        m.setattr(os, "killpg", signal)
+        m.setattr(os, "kill", signal)
         try:
             tree = {}
             _remember_chrome_tree(tree, {1234: (10.0, True)})
