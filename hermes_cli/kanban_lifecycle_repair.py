@@ -15,6 +15,8 @@ from hermes_cli.kanban_lifecycle_guards import has_event_gate
 
 
 def plan(conn: sqlite3.Connection) -> list[dict]:
+    from hermes_cli.kanban_db import is_human_reviewer
+
     changes = []
     for row in conn.execute("SELECT id,status,assignee,body,block_kind,next_eligible_at FROM tasks ORDER BY id"):
         tid, status, assignee, body, kind, wake = row
@@ -29,7 +31,7 @@ def plan(conn: sqlite3.Connection) -> list[dict]:
         if status == "blocked" and kind is None:
             changes.append({"id": tid, "class": "B", "block_kind": "needs_input",
                             "reason": "Legacy untyped block: operator must classify the recovery condition"})
-        if status == "ready" and (assignee == "human" or (assignee or "").startswith("human:")):
+        if status == "ready" and is_human_reviewer(assignee):
             changes.append({"id": tid, "class": "C", "status": "todo", "assignee": assignee})
         if status == "scheduled" and wake is None and not has_event_gate(body):
             if tid == "t_d394f63b":

@@ -9667,8 +9667,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if all(p["status"] in ("done", "archived") and p["kind"] != LINK_KIND_AFTER_MERGE
                    for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
-                if (resume_status == "ready" and
-                        (row["assignee"] == "human" or (row["assignee"] or "").startswith("human:"))):
+                if resume_status == "ready" and is_human_reviewer(row["assignee"]):
                     continue
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
