@@ -5856,7 +5856,8 @@ class NearDuplicateError(ValueError):
 # per rolling 24 h; the (N+1)th raises :class:`MintCapError`. ``force_reason`` (CLI ``--force``) overrides
 # it and is ledgered as a ``mint_cap_forced`` event on the new card. Kill switch:
 # ``HERMES_KANBAN_MINT_CAP=0`` (env; ``HERMES_KANBAN_MINT_CAP=<n>`` resizes). Idempotent re-mints that
-# return an existing card never count: the check runs after the idempotency lookup.
+# return an existing card never count: the check runs after the idempotency lookup. Every refusal, force and
+# kill-switch bypass is ledgered in ``<db>.mint-cap.jsonl`` (:func:`mint_cap_ledger_path`, t_f956f87f).
 MINT_CAP_PER_DAY = 24
 MINT_CAP_WINDOW_S = 24 * 3600
 MINT_CAP_HUMAN_PREFIXES = ("human:",)
@@ -5894,6 +5895,53 @@ def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int]
         (created_by, now - MINT_CAP_WINDOW_S),
     ).fetchone()
     return int(row[0] if row else 0)
+
+
+def mint_cap_ledger_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """``<board db>.mint-cap.jsonl`` beside the connection's own db file; None for an in-memory/unnamed db.
+
+    t_f956f87f: one append-only row per cap outcome a ``task_events`` row cannot carry (a refusal has no card)
+    or would scatter: ``refused``, ``forced``, ``bypassed`` (minted past the default cap under the kill switch).
+    The one-week readout counts these instead of recomputing from ``created_at``."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    file = row[2] if row else ""
+    return Path(file + ".mint-cap.jsonl") if file else None
+
+
+def _ledger_mint_cap(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Append one ledger row. Best effort: a write failure never changes the create outcome."""
+    try:
+        p = mint_cap_ledger_path(conn)
+        if p is None:
+            return
+        rec = dict(fields, outcome=outcome, at=int(time.time()))
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:  # noqa: BLE001 - the ledger is evidence, never a gate
+        _log.debug("mint-cap ledger write failed", exc_info=True)
+
+
+def _ledger_on_commit(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Queue a ledger row for the outer COMMIT of the enclosing write_txn (kanban_db_connect.on_commit)."""
+    from hermes_cli.kanban_db_connect import on_commit
+    on_commit(conn, lambda: _ledger_mint_cap(conn, outcome, **fields))
+
+
+def mint_cap_bypass(conn: sqlite3.Connection, created_by: Optional[str]) -> Optional[dict]:
+    """The kill switch is set and an automated ``created_by`` is at/over the DEFAULT cap: the mint that follows
+    would have been refused. -> {created_by, count, cap, env}, else None. Ledgered as ``bypassed`` and a
+    ``mint_cap_bypassed`` event so a kill-switch storm is visible on the board (11-06: 15 cards, no trace)."""
+    if mint_cap() > 0 or not mint_cap_applies(created_by):
+        return None
+    by = (created_by or "").strip()
+    n = mint_count_24h(conn, by)
+    if n < MINT_CAP_PER_DAY:
+        return None
+    return {"created_by": by, "count": n, "cap": MINT_CAP_PER_DAY,
+            "env": "HERMES_KANBAN_MINT_CAP=%s" % os.environ.get("HERMES_KANBAN_MINT_CAP", "").strip()}
 
 
 def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
@@ -6589,9 +6637,12 @@ def create_task(
         check_mint_cap(conn, created_by)
     except MintCapError as exc:
         if not force_reason:
+            _ledger_mint_cap(conn, "refused", created_by=exc.created_by, count=exc.count, cap=exc.cap,
+                             idempotency_key=idempotency_key)
             raise
         mint_cap_forced = {"created_by": exc.created_by, "count": exc.count, "cap": exc.cap,
                            "reason": force_reason}
+    mint_cap_bypassed = mint_cap_bypass(conn, created_by)
 
     now = int(time.time())
 
@@ -6972,6 +7023,15 @@ def create_task(
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 if mint_cap_forced:
                     _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
+                if mint_cap_bypassed:
+                    _append_event(conn, task_id, "mint_cap_bypassed", mint_cap_bypassed)
+                # Prism 31f2934ed515: a create nested in a caller's write_txn only releases a savepoint here, so the
+                # ledger row of a card is queued for the OUTER commit (dropped on any rollback); never a row for a
+                # card that does not exist. A refusal (no card) stays an immediate append.
+                if mint_cap_forced:
+                    _ledger_on_commit(conn, "forced", task_id=task_id, **mint_cap_forced)
+                if mint_cap_bypassed:
+                    _ledger_on_commit(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
                 if mint_breaker_forced:
                     _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
@@ -16087,6 +16147,20 @@ def reopen_task(
     # where the review-card closer completes it on REST merged=true.
     review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
+        if _task_status(conn, task_id) != "done":
+            return False, f"task {task_id} changed state concurrently; retry"
+        candidate_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
+            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if to_status == "review":
+            from hermes_cli.kanban_review_handoff import record_reopened_candidate
+            try:
+                record_reopened_candidate(conn, task_id, actor=actor, reviewer=review_assignee,
+                                          reason=reason, run_id=int(candidate_run["id"]) if candidate_run else None)
+            except ValueError as exc:
+                return False, str(exc)
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
@@ -16108,12 +16182,7 @@ def reopen_task(
                 "previous_path": dead_scratch,
                 "survivor_baseline": _reset_survivor_baseline(conn, task_id),
             })
-        run_id = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
-            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        voided_run = int(run_id["id"]) if run_id else None
+        voided_run = int(candidate_run["id"]) if candidate_run else None
         if voided_run is not None:
             conn.execute(
                 "UPDATE task_runs SET outcome = 'voided' WHERE id = ?",
