@@ -1,4 +1,5 @@
 """Offline rejection gates; real release/ELF smoke runs are documented in .github/runner."""
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -9,6 +10,71 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / ".github/scripts/install-ci-tool.sh"
+DOWNLOADER = ROOT / ".github/scripts/download-ci-asset.sh"
+
+
+def _download(tmp_path, mode):
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    # Fail the real shell transport boundary, not the verification gate.
+    (shim / "sleep").write_text('#!/bin/sh\nexit 0\n')
+    (shim / "curl").write_text(
+        '#!/bin/sh\n'
+        'printf "%s\\n" "$*" >> "$CALLS"\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        '  if [ "$1" = -o ]; then shift; output=$1; fi\n'
+        '  url=$1; shift\ndone\n'
+        'case "$MODE:$url" in\n'
+        '  primary:https://github.com/*) printf "verified payload" > "$output" ;;\n'
+        '  *:https://github.com/*|unavailable:*) printf "HTTP 504\\n" >&2; exit 22 ;;\n'
+        '  fallback:*) printf "verified payload" > "$output" ;;\n'
+        '  json:*) printf \'{"id":123,"name":"asset"}\' > "$output" ;;\n'
+        '  *) printf "wrong bytes" > "$output" ;;\n'
+        'esac\n'
+    )
+    for executable in shim.iterdir():
+        executable.chmod(0o755)
+    output, calls = tmp_path / "asset", tmp_path / "calls"
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
+           "MODE": mode, "CALLS": str(calls)}
+    result = subprocess.run(
+        ["bash", str(DOWNLOADER), "https://github.com/owner/repo/releases/download/v1/asset",
+         "https://api.github.com/repos/owner/repo/releases/assets/123",
+         hashlib.sha256(b"verified payload").hexdigest(), str(output)],
+        env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+    )
+    return result, output, calls.read_text().splitlines()
+
+
+@pytest.mark.skipif(not shutil.which("bash") or not shutil.which("sha256sum"), reason="installer tools required")
+@pytest.mark.parametrize("mode,requests", [("primary", 1), ("fallback", 2)])
+def test_verified_download_transport(tmp_path, mode, requests):
+    result, output, calls = _download(tmp_path, mode)
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == b"verified payload"
+    assert len(calls) == requests
+    if mode == "fallback":
+        assert "https://api.github.com/repos/owner/repo/releases/assets/123" in calls[-1]
+        assert "Accept: application/octet-stream" in calls[-1]
+    for call in calls:
+        assert call.startswith("-q ")  # ignore ambient curlrc, including credentials
+        assert "--proto =https" in call and "--proto-redir =https" in call
+        assert "--connect-timeout 20 --max-time 120" in call
+        assert "--max-redirs 5" in call
+        assert "Authorization" not in call and "--location-trusted" not in call
+
+
+@pytest.mark.skipif(not shutil.which("bash") or not shutil.which("sha256sum"), reason="installer tools required")
+@pytest.mark.parametrize("mode,requests", [("wrong", 2), ("json", 2), ("unavailable", 6)])
+def test_fallback_download_fails_closed(tmp_path, mode, requests):
+    result, output, calls = _download(tmp_path, mode)
+    assert result.returncode != 0
+    assert len(calls) == requests
+    if mode == "unavailable":
+        assert "download failed after 6 attempts" in result.stderr
+    else:
+        assert "FAILED" in result.stdout
+    assert not output.exists()  # no failed candidate survives to an install step
 
 
 @pytest.mark.skipif(not shutil.which("bash") or not shutil.which("sha256sum"), reason="Linux installer tools required")
