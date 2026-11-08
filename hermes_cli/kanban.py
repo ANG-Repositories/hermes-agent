@@ -4091,7 +4091,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         ) + str(kb.redact_review_value(reason))
         if worker_run is None:
             # Before any write: the human-lane mirror comment lands after the transition (t_ebc8eb87).
-            check_close_on_comment(_profile_author(), sendback_body)
+            kb._validate_comment_args(_profile_author(), sendback_body, conn=conn)
         if operator is not None and worker_run is not None:
             # A dispatched reviewer run always carries full coverage.
             print(

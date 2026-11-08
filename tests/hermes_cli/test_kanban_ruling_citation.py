@@ -129,6 +129,52 @@ def test_create_audit_reasons_refuse_without_journal(board, monkeypatch, reason_
     assert journal == []
 
 
+@pytest.mark.parametrize("claimed", [False, True])
+@pytest.mark.parametrize("operator", [None, "apollo: rebase first"])
+@pytest.mark.parametrize("cited", [False, True])
+def test_cli_sendback_preflights_mirror_without_side_effects(
+        board, monkeypatch, claimed, operator, cited):
+    import argparse
+    from hermes_cli import kanban
+
+    session = "20261107_200000_citation_review"
+    monkeypatch.setenv("HERMES_SESSION_ID", session)
+    tid = kb.create_task(board, title="sendback scratch", assignee="builder", session_id=session)
+    impl = kb.claim_task(board, tid)
+    assert impl
+    assert kb.request_review(board, tid, summary="ready", reviewer="human",
+                             expected_run_id=impl.current_run_id)
+    if claimed:
+        assert "Claimed" in kanban.run_slash(f"claim {tid} --review")
+    reason = "Ace said ship it" + (" (Discord msg 1568681380928295105)" if cited else "")
+    import json
+    coverage = json.dumps({
+        "lenses": {k: "done" for k in ("contract", "execution", "cross-vendor", "mutation")},
+        "findings": 1, "items": ["Missing preflight"], "review_minutes": 1,
+        "batch_id": "n/a: regression", "head_sha": "n/a: fixture card",
+    })
+    args = argparse.Namespace(task_id=tid, reason=[reason], coverage=coverage, operator=operator,
+                              why=False)
+    before_task = kb.get_task(board, tid)
+    before_runs = [tuple(row) for row in board.execute("SELECT * FROM task_runs ORDER BY id")]
+    before_events = kb.list_events(board, tid)
+    before_comments = kb.list_comments(board, tid)
+    journal = []
+    monkeypatch.setattr(kb, "_journal_append", lambda *a, **kw: journal.append(a))
+    if cited:
+        assert kanban._cmd_request_changes(args) == 0
+        assert kb.get_task(board, tid).status == "ready"
+        assert any(reason in c.body for c in kb.list_comments(board, tid))
+    else:
+        with pytest.raises(ValueError, match="ruling-citation"):
+            kanban._cmd_request_changes(args)
+        assert kb.get_task(board, tid) == before_task
+        assert [tuple(row) for row in board.execute("SELECT * FROM task_runs ORDER BY id")] == before_runs
+        assert kb.list_events(board, tid) == before_events
+        assert kb.list_comments(board, tid) == before_comments
+        assert journal == []
+
+
 def test_comment_reference_uses_target_board(board):
     tid = kb.create_task(board, title="citation refs", assignee="human", require_home=False)
     good = kb.add_comment(board, tid, "operator", "source: 1568681380928295105")
