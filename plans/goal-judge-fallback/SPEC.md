@@ -12,6 +12,15 @@ Design:
 - Cleanup refinement after review: reserve up to 50ms of the attempt budget for foreground reap. A background owner retains the process handle until bounded waits observe termination. Stuck/failed termination returns cleanup_pending, inhibits further judge requests for that profile in this process, and does not delay cancellation. Never claim immediate termination if the OS refuses it. Child startup/pipe/invalid IPC/nonzero exits are sanitized availability failures; fallback requires released ownership.
 - Parent applies fleet config/deployment separately. Registry aliases observed read-only: opus = claude-alr/claude-opus-5-5; sol = cpa/gpt-6.1-sol; grok = xai-oauth/grok-4.7; kimi = cpa/kimi-k3.1-pro. These are proposed sample bindings, not served-identity evidence.
 
+Worker-boundary refinements: active independent judges in one home may overlap; only
+unreaped cleanup owners fence new requests. Each owner removes only its own event.
+Completed IPC accounting is replayed before a late cancellation discards the verdict.
+Verdicts are parsed in full, never truncated at the IPC boundary. Workers inherit
+only the caller's conversation/affinity/session/cache identifiers, not its main
+provider credentials or routing. Failed committed goal reads terminate judging as
+a storage/transport failure, not as explicit cancellation; no-DB operation remains
+supported, and confirmed pause/clear/replacement still cancels immediately.
+
 Acceptance: narrow runner tests against real judge/GoalManager and real HTTP transports in isolated homes; sequential success, primary short-circuit, exhaustion, malformed/schema failures, blocked termination, deadline/cancellation cleanup, counter reset and A-B-A profile separation. Live fallback canary requires served response identity and must not mutate fleet config. Do not equate source tests with deployment.
 
 Rollback: remove fallback_chain/total_timeout to use legacy routing; revert this PR to remove implementation. No live files are changed by this task.
