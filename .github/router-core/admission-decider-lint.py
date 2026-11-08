@@ -52,7 +52,9 @@ LIBRARY = frozenset({"scripts/lib/admission.py", "scripts/lib/admission_demand.p
 METRIC = (r"\b(?:cpu_busy|load1|load5|procs_running|runnable_ewma|occupancy|psi_cpu_some10|psi_cpu_some60|"
           r"load_ratio|loadavg|getloadavg)\b")
 OP = r"(?:>=|<=|(?<![-=])>(?!>)|(?<!<)<(?![<=])|\s-(?:gt|ge|lt|le)\s)"
-OPERAND = r"[^\n=;<>]{0,40}?"
+# Prism 56a668146742: a shift inside the operand (`(procs_running >> 1) > 8`) is not a comparison; only a lone
+# `<` / `>` ends the operand, a `>>` / `<<` pair is part of it.
+OPERAND = r"(?:[^\n=;<>]|>>|<<){0,40}?"
 RX = re.compile(METRIC + OPERAND + OP + r"|" + OP + OPERAND + METRIC +
                 r"|\bncpu\s*//\s*\d|\bos\.getloadavg\(")
 SKIP = re.compile(r"(^|/)(tests?|fixtures|\.venv)/|(^|/)test_[^/]*$|_test\.py$|selftest"
@@ -113,16 +115,228 @@ def walk(root: Path, scan_dirs=SCAN):
     return sorted(out)
 
 
-def hits_in(text: str) -> int:
-    # Physical-line ratchet, not a lexer: preserve shell expansions and quoted hashes.
+def hits_in(text: str, lang: str = "py") -> int:
+    """Count comparison lines, joining continued expressions first (Prism 6acce03c3edb: black/ruff wrap long
+    conditions across lines, and shell `test ... \\` continues; a wrapped decider must still count). Not a lexer:
+    no `#` stripping (a shell `"$x" -lt 90 # note` or a quoted hash is kept whole), paren/bracket depth and a
+    trailing backslash decide where a logical line ends; each logical line counts at most once."""
+    # Prism 9be94a192b07: delimiters inside string literals or trailing comments must not drive the join (an
+    # unmatched `(` in prose joined the rest of the file into one logical line, counted once). Depth is read on
+    # the line with quotes and a trailing `#`/`//` comment blanked, and a join is bounded to JOIN_MAX physical
+    # lines: a wrapped condition is a handful of lines, so anything longer flushes and the lines count singly.
+    # Prism 053e4801af29 / e02aba55d4a0: this is deliberately NOT a lexer, so a join can be opened by something
+    # it cannot see (a `(` in a triple-quoted string body, a JS regex literal). Two defences: (a) Python
+    # triple-quote state is carried ACROSS lines so string bodies never count delimiters; (b) a join that never
+    # closes is UNWOUND: the buffered physical lines are counted singly (the pre-join behaviour), never once.
+    # Undercounting is the failure the ratchet exists to prevent, so the fallback errs toward counting.
     n = 0
+    buffered: list[str] = []
+    bares: list[str] = []
+    depth = 0
+    in_triple = None            # the open triple-quote delimiter while inside a Python multi-line string
     for line in text.splitlines():
         s = line.lstrip()
-        if s.startswith("#") or s.startswith("//") or WAIVER in line:
+        if in_triple is None and (s.startswith("#") or s.startswith("//")):
             continue
-        if RX.search(line):
-            n += 1
+        if WAIVER in line and in_triple is None:
+            # Prism 83b42c6be461: the waiver covers ITS statement only. Statements already completed inside the
+            # open join (an IIFE body before a waived telemetry line) still count; the open one is the waived one.
+            n += _count_completed(buffered, bares)
+            buffered, bares, depth = [], [], 0
+            continue
+        code = line.rstrip()
+        bare, in_triple = _blank_line(code, lang, in_triple)
+        buffered.append(code.removesuffix("\\"))
+        bares.append(bare)
+        depth += bare.count("(") + bare.count("[") - bare.count(")") - bare.count("]")
+        if depth <= 0 and not bare.endswith("\\"):
+            n += _count_joined(buffered, bares)
+            buffered, bares, depth = [], [], 0
+        # Do not chunk a pending expression at an arbitrary physical-line boundary: its metric and
+        # operator may straddle that boundary. Input is already resident in memory; retain context
+        # until the join closes (or EOF unwinds it), splitting independent statements below.
+    if buffered:
+        n += _count_unwound(buffered, bares) if depth > 0 else _count_joined(buffered, bares)
     return n
+
+
+def _count_singly(lines) -> int:
+    return sum(bool(RX.search(ln)) for ln in lines)
+
+
+_STMT_START = re.compile(r"^\s*(?:if|elif|else\s+if|while|for|return|assert|until|const|let|var|test)\b|^\s*(?:\[\[?\s|\(\()")
+
+
+def _statements(lines, bares=None):
+    """[(statement lines, closed)] for one buffered join. Prism bf35b2bc1492: an enclosing paren (a JS IIFE, a call
+    wrapping a block) can hold several independent decisions, so the join is split into statements: a physical line
+    whose bare text ends in `;`, `{` or `}` closes one, and a line opening `if`/`elif`/`while`/`for`/`return`/`assert`
+    starts one (closing the one before it). The last statement is open unless its line closed it."""
+    bares = bares if bares is not None else lines
+    out, seg, seg_bares = [], [], []
+    for ln, bare in zip(lines, bares):
+        # ASI-style assignments may start a new statement inside an enclosing
+        # callback. Split only after a complete preceding segment; wrapped RHS
+        # expressions still stay together.
+        assignment = re.match(r"\s*(?:(?:const|let|var)\s+)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*=(?!=|>)", bare)
+        if seg and (_STMT_START.match(bare) or (assignment and not _continues(seg_bares))):
+            out.append((seg, True))
+            seg, seg_bares = [], []
+        seg.append(ln)
+        seg_bares.append(bare)
+        if bare.rstrip().endswith((";", "{", "}")):
+            out.append((seg, True))
+            seg, seg_bares = [], []
+    if seg:
+        out.append((seg, False))
+    return out
+
+
+def _count_joined(lines, bares=None) -> int:
+    """One closed logical line, counted once PER STATEMENT inside it (_statements). Each statement still joins its
+    own wrapped lines, so a compound condition wrapped over lines (`if (load1 > x and` / `load5 > 3):`) is one
+    decision, counted once."""
+    return sum(bool(RX.search(" ".join(seg))) for seg, _closed in _statements(lines, bares))
+
+
+_CONTINUES = re.compile(r"(?:\\|,|&&|\|\||[-+*/%=<>?!(\[{]|\b(?:and|or|not|in|is))\s*$")
+
+
+def _continues(bares) -> bool:
+    """True when a buffered statement visibly runs on into the next physical line: an unclosed bracket inside the
+    statement, or its last line ending in a continuation token (backslash, comma, boolean/arithmetic operator)."""
+    depth = sum(b.count("(") + b.count("[") + b.count("{") - b.count(")") - b.count("]") - b.count("}")
+                for b in bares)
+    return depth > 0 or bool(_CONTINUES.search(bares[-1].rstrip())) if bares else False
+
+
+def _count_completed(lines, bares=None) -> int:
+    """The statements of an open join that a waived line does NOT cover (Prism 83b42c6be461, 81a0d5670704,
+    491a76480688). The waiver covers only the statement it sits on: the trailing open statement is that one only
+    when it visibly continues onto the waived line (_continues). A trailing statement that already reads complete
+    (semicolon-free JS by ASI, a shell `if ...; fi`, any language's terminator) counts, so the choke point never
+    depends on one language's statement terminator. Undercount is the failure the ratchet exists to prevent."""
+    bares = bares if bares is not None else lines
+    segs = _statements(lines, bares)
+    n = 0
+    k = 0
+    for seg, closed in segs:
+        seg_bares = bares[k:k + len(seg)]
+        k += len(seg)
+        if closed or not _continues(seg_bares):
+            n += bool(RX.search(" ".join(seg)))
+    return n
+
+
+def _count_unwound(lines, bares=None) -> int:
+    """A join that never closed (or hit JOIN_MAX). Prism 6b398a445eca: per statement, the larger of its physical-line
+    hits and its joined hit, so a comparison split across lines (`load1` / `> 4`) still counts and the unwind never
+    counts below the physical lines (the pre-join behaviour, Prism 053e4801af29)."""
+    return sum(max(_count_singly(seg), int(bool(RX.search(" ".join(seg))))) for seg, _closed in _statements(lines, bares))
+
+
+def _blank_line(code: str, lang: str, in_triple):
+    """(bare, in_triple') for one physical line: blanks quoted spans and the trailing comment for delimiter
+    counting, carrying Python triple-quote state across lines (053e4801af29).
+
+    Prism a21209b97e0e: one left-to-right scan of the whole line, so a triple quote opens wherever it sits
+    (after indentation, after `x = `, after a closed single-line string), never only at column zero."""
+    if lang != "py":
+        return _blank_quotes_and_comment(code, lang), None
+    out = []
+    q = None                     # open single-line quote char
+    i, n = 0, len(code)
+    while i < n:
+        if in_triple:
+            if code[i] == "\\":
+                i += 2
+                continue
+            if code.startswith(in_triple, i):
+                i, in_triple = i + 3, None
+                continue
+            i += 1
+            continue
+        c = code[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if code.startswith(("'''", '"""'), i):
+            in_triple = code[i:i + 3]
+            i += 3
+            continue
+        if c in ("'", '"'):
+            q = c
+            i += 1
+            continue
+        if c == "#":
+            break
+        out.append(c)
+        i += 1
+    return "".join(out), in_triple
+
+
+JOIN_MAX = 8   # physical lines one logical comparison may span (black wraps a condition in 2-4)
+
+
+def _blank_quotes_and_comment(code: str, lang: str = "py") -> str:
+    """The line with every quoted span blanked and a trailing comment removed, for delimiter counting only (the
+    comparison regex still reads the real text). Quotes are matched per line: a quote that does not close on its
+    line blanks to EOL, which keeps a multi-line string from opening a join either.
+
+    Prism fba51c46ef6f / 7cfa74e7831e: the comment marker is per language. Python: `#` only (`//` is floor
+    division). Shell: `#` only when it starts a word (preceded by start/space/`;`/`(`), never inside `$#`,
+    `${#arr[@]}` or `foo#bar`. JS/TS/Go-style: `//`. A wrong marker ate the closing delimiter and opened a join."""
+    out = []
+    q = None
+    i = 0
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            q = c
+            i += 1
+            continue
+        if lang == "py" and c == "#":
+            break
+        if lang == "sh" and c == "#" and (i == 0 or code[i - 1] in " \t;(") :
+            break
+        if lang == "c" and code.startswith("//", i):
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+_LANG_BY_SUFFIX = {".py": "py", ".sh": "sh", ".bash": "sh", ".zsh": "sh", ".js": "c", ".ts": "c", ".go": "c",
+                   ".mjs": "c", ".cjs": "c"}
+
+
+def _lang_of_text(rel, raw: bytes) -> str:
+    """py / sh / c from the suffix, else from the shebang, else py (the conservative marker set: `#` only)."""
+    import os
+    suf = os.path.splitext(str(rel))[1].lower()
+    if suf in _LANG_BY_SUFFIX:
+        return _LANG_BY_SUFFIX[suf]
+    first = raw.split(b"\n", 1)[0].decode("utf-8", "replace")
+    if first.startswith("#!") and ("sh" in first.rsplit("/", 1)[-1] or "bash" in first):
+        return "sh"
+    return "py"
+    if first.startswith("#!") and ("sh" in first.split("/")[-1] or "bash" in first):
+        return "sh"
+    return "py"
 
 
 def index_blob(root: Path, rel: str) -> bytes:
@@ -156,7 +370,7 @@ def scan(root: Path, scan_dirs=SCAN, library=LIBRARY, require_git=False) -> dict
             raise ScanError(f"{rel}: unreadable ({exc})") from exc
         if b"\0" in raw[:2048]:
             continue
-        n = hits_in(raw.decode("utf-8", errors="replace"))
+        n = hits_in(raw.decode("utf-8", errors="replace"), _lang_of_text(rel, raw))
         if n:
             out[rel] = n
     return out
@@ -229,7 +443,7 @@ def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
         if was is not None and n <= was:
             continue
         text = _show(root, ref, rel)
-        on_base = hits_in(text) if text is not None else 0
+        on_base = hits_in(text, _lang_of_text(rel, text.encode("utf-8", "replace"))) if text is not None else 0
         if n <= on_base:
             continue                  # code already on main, now recorded
         bad.append(f"{rel}: baseline row added ({n})" if was is None else f"{rel}: baseline raised {was} -> {n}")
