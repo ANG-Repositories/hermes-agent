@@ -821,12 +821,12 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
                _active_sessions.get(_last_session_key(tid)) or {})
 
     def pinned_op():
+        token = None
         try:
             if route_for_task(tid) is not route:
                 raise RuntimeError("Browser Use route changed after takeover fence selection")
-            if route is None and not is_browser_use_cli_mode():
-                return {"raw": fn()}
-            token = begin(tid, expected_route=route)
+            if route is not None or is_browser_use_cli_mode():
+                token = begin(tid, expected_route=route)
         except Exception:
             return {"raw": json.dumps({"success": False, "error_type": "selected_target_unavailable",
                     "outcome": "not_dispatched",
@@ -839,7 +839,8 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
             return {"raw": json.dumps({"success": False, "error_type": "operation_outcome_unknown",
                     "outcome": "unknown", "error": "Vault operation outcome unknown; inspect the page and saved item before retrying."})}
         finally:
-            end(token)
+            if token is not None:
+                end(token)
 
     res = run_fenced(session, pinned_op)
     return res["raw"] if "raw" in res else json.dumps(res)

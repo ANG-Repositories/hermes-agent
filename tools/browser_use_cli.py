@@ -616,12 +616,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     route_err = _route_backend(env, session, task_id, bool(local))
     if route_err:
         return tool_error(route_err)
-    # Daemon IPC must have the same task/profile scope as the trusted vault route.
+    # Match the provider browser's lifetime: explicit names persist across tasks,
+    # unnamed browsers remain task-scoped. Vault transaction authorization stays per-task.
     import hashlib
     from hermes_constants import hermes_home_key
     from tools.browser_tool_cdp import _resolve_cdp_override
     endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
-    daemon_scope = json.dumps([hermes_home_key(), task_id or "default", env.get("BU_NAME", "default"),
+    daemon_scope = json.dumps([hermes_home_key(), _backend_cache_key(task_id, session), env.get("BU_NAME", "default"),
                               _resolve_cdp_override(endpoint) if endpoint else ""])
     env["BU_NAME"] = "hermes-" + hashlib.sha256(daemon_scope.encode()).hexdigest()[:40]
     bot_desktop_browser = bool(env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None))

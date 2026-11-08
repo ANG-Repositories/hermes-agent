@@ -11,8 +11,11 @@ from tools import browser_supervisor as s, browser_use_cli as cli
 from tools import browser_use_target as t, browser_vault_tool as v
 
 
-def test_callback_failure_must_not_claim_nothing_written(monkeypatch):
-    route = t.BrowserUseRoute({}, 'ws://synthetic', False)
+@pytest.mark.parametrize('browser_use', [True, False])
+def test_callback_failure_must_not_claim_nothing_written(monkeypatch, browser_use):
+    route = t.BrowserUseRoute({}, 'ws://synthetic', False) if browser_use else None
+    monkeypatch.setattr(cli, 'is_browser_use_cli_mode', lambda: browser_use)
+    monkeypatch.setattr('tools.browser_tool._active_sessions', {})
     monkeypatch.setattr(t, 'route_for_task', lambda _: route)
     monkeypatch.setattr(t, 'begin', lambda *a, **kw: object())
     monkeypatch.setattr(t, 'end', lambda _: None)
@@ -25,6 +28,50 @@ def test_callback_failure_must_not_claim_nothing_written(monkeypatch):
     assert writes
     assert 'Nothing was written' not in result['error']
     assert result['outcome'] == 'unknown'
+
+
+@pytest.mark.parametrize('session', ['research', ''])
+def test_daemon_selection_follows_backend_browser_across_tasks(monkeypatch, session):
+    import subprocess
+    monkeypatch.setattr(t, '_routes', {})
+    monkeypatch.setattr(cli, '_find_cli', lambda: ['synthetic-cli'])
+    monkeypatch.setattr(cli, '_base_subprocess_env', lambda: {})
+    monkeypatch.setattr(cli, '_read_browser_cfg', lambda: {})
+    monkeypatch.setattr(cli, '_workspace_dir', lambda _: None)
+    monkeypatch.setattr(cli, '_attach_vault_supervisor', lambda *a: None)
+    monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
+    browsers, daemons = {}, {}
+    def route(env, name, task, local):
+        key = cli._backend_cache_key(task, name)
+        env['BU_CDP_WS'] = browsers.setdefault(key, 'ws://synthetic/' + key)
+        env[cli._PRIVATE_BROWSER_SENTINEL] = '1'
+    monkeypatch.setattr(cli, '_route_backend', route)
+    def execute(cmd, code, env, timeout):
+        # Harness startup selects T1; later calls retain that daemon's selection.
+        selected = daemons.setdefault(env['BU_NAME'], 'T1')
+        if code == 'select T2':
+            daemons[env['BU_NAME']] = 'T2'
+            selected = 'T2'
+        return subprocess.CompletedProcess(cmd, 0, selected, '')
+    monkeypatch.setattr(cli, '_run_cli_killing_process_group', execute)
+    cli.browser_exec('select T2', session=session, task_id='taskA')
+    route_a = t.route_for_task('taskA')
+    cli.browser_exec('inspect', session=session, task_id='taskB')
+    route_b = t.route_for_task('taskB')
+    assert (route_a.cdp_url == route_b.cdp_url) == bool(session)
+    assert daemons[route_b.env['BU_NAME']] == ('T2' if session else 'T1')
+    assert (route_a.env['BU_NAME'] == route_b.env['BU_NAME']) == bool(session)
+    monkeypatch.setattr(t, 'selected_target', lambda r: (123, daemons[r.env['BU_NAME']]))
+    token = t.begin('taskA', expected_route=route_a)
+    try:
+        with pytest.raises(RuntimeError, match='not pinned'):
+            t.supervisor_for_task('taskB')
+        with t._pin.get().dispatch():
+            pass
+    finally:
+        t.end(token)
+    with pytest.raises(RuntimeError, match='route changed'):
+        t.begin('taskB', expected_route=route_a)
 
 
 def test_probe_cannot_import_cwd_or_inherited_pythonpath(monkeypatch, tmp_path):
