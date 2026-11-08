@@ -52,3 +52,14 @@ Parent-owned model-rollout skill patch (replace its goal-judge seat section):
     Keep total_timeout and per-route timeout finite. Report merged source and
     live loaded behavior separately; deployment/restart and config apply are
     operator-owned gates.
+
+Fleet scope expansion: apply the same shared runtime to Apollo/default, Aegis,
+Agora (ACE-AI default home), and every active profile. Profiles are independent
+islands: they inherit built-in defaults, NOT the root profile's live chain.
+studio-manifest.json and ace-ai-manifest.json enumerate effective overrides and
+per-profile proposed migrations from each home's own aliases. Preserve declared
+exceptions explicitly; do not assume shared plugin code means shared credentials.
+The operator must migrate each listed goal_judge block or record its exception.
+An absent override (ACE-AI Clanker currently auto) is not an inherited fleet chain.
+Rollout guidance must inventory both fleet policy intent and per-profile effective
+configuration, and re-prove forced-primary-failure under each host/identity.
