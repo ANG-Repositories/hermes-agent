@@ -329,6 +329,7 @@ def test_mint_cap_durable_pending(board,monkeypatch):
     assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==0
 
 
+@pytest.mark.slow_test(200, reason='bounded 180-second SIGKILL/32-process acceptance subprocess')
 @pytest.mark.parametrize('arm',['atomic','crash'])
 def test_proof_entrypoint_real_execution(tmp_path,arm):
     root=tmp_path/'proof'
