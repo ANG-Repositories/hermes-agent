@@ -9620,7 +9620,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND COALESCE(assignee, '') != 'human' "
+            "AND COALESCE(assignee, '') NOT LIKE 'human:%'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
