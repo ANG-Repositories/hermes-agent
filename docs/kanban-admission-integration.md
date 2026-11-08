@@ -28,7 +28,8 @@ No candidate bytes are installed or checked into the vendored package here.
 The isolated candidate-package experiment copies the full five-module closure
 from exact canonical `e65e27833ef171a37582507ed72bd9ac8bcd3fd1`, using the real
 package adapter. It proves unprovisioned refusal, offline provision, protected
-marker write, reservation/release, and replaced-root refusal in a fresh process.
+marker write, reservation/release, pending receipt and wrong-env rejection, and
+replaced-root refusal in a fresh process.
 Run with `ADMISSION_SOURCE_REPO=/isolated/hermes-home` and optionally
 `ADMISSION_CANDIDATE_REF=<final-ref>` under test-gate. Missing source skips this
 candidate-only experiment in ordinary agent CI; that is NOT release acceptance.

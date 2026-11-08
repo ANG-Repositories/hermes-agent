@@ -83,6 +83,26 @@ assert alloc_client._protected("kanban")
 rid = placement.reserve("studio", "kanban", placement.Footprint(1, 1), ttl_s=60)
 assert rid
 assert placement.release(rid)
+import json
+ready = receipt.read_text()
+doc = json.loads(ready)
+doc["state"] = "pending"
+receipt.write_text(json.dumps(doc))
+try:
+    alloc_client.mark_protected("kanban")
+except (OSError, ValueError, RuntimeError):
+    pass
+else:
+    raise AssertionError("pending receipt accepted")
+receipt.write_text(ready)
+os.environ["PLACEMENT_ROOT_RECEIPT"] = str(receipt.with_name("missing-receipt"))
+try:
+    alloc_client.mark_protected("kanban")
+except (OSError, ValueError, RuntimeError):
+    pass
+else:
+    raise AssertionError("wrong receipt env accepted")
+os.environ["PLACEMENT_ROOT_RECEIPT"] = str(receipt)
 root.rename(root.with_name("old-fleet"))
 root.mkdir()
 try:
