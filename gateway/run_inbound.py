@@ -1586,8 +1586,6 @@ class GatewayInboundMixin:
                 _checkout_ticket.release()
             return _limit_message
 
-        event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
-
         _claim_state = self._session_state(_quick_key)
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
@@ -1614,6 +1612,9 @@ class GatewayInboundMixin:
             if _limit_message is not None:
                 return _limit_message
             _claim_state.turn.lease = _active_session_lease
+            # Registry refusal must leave the orphan FIFO untouched.
+            event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+            _claim_state.turn.event = event
             from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
             start_reply_clock(source, internal=is_internal)
             self._persist_active_agents()

@@ -477,7 +477,15 @@ class GatewayBusySessionMixin:
         existing = getattr(lease, "_gateway_release_task", None)
         if isinstance(existing, asyncio.Task):
             return existing
-        task = loop.create_task(asyncio.to_thread(lease.release))
+        async def release():
+            try:
+                await asyncio.to_thread(lease.release)
+            except Exception:
+                # Cleanup must not replace a completed reply, the turn's error,
+                # or cancellation. Keep the durable failure visible in the log.
+                logger.error("Failed to release active session slot", exc_info=True)
+
+        task = loop.create_task(release())
         lease._gateway_release_task = task
         tasks.add(task)
 
@@ -499,6 +507,21 @@ class GatewayBusySessionMixin:
         task.result()
         if cancelled:
             raise asyncio.CancelledError
+
+    async def _preserve_pending_session_claims(self):
+        """Stop unstarted turns and spool their input before waiting for registry I/O."""
+        snapshots = []
+        for task, key in tuple(getattr(self, "_active_session_claim_tasks", {}).items()):
+            state = self._peek_session_state(key)
+            if getattr(self, "_running_agent_tasks", {}).get(key) is task and state is not None:
+                snapshots.append((task, key, state.turn.event))
+            task.cancel()
+        for task, key, event in snapshots:
+            if event is not None and not getattr(task, "_claim_input_spooled", False):
+                if await self._preserve_followup_across_restart(key, event, None):
+                    task._claim_input_spooled = True
+                else:
+                    logger.error("Failed to preserve pending active-session input for %s", key)
 
     async def _drain_active_session_releases(self):
         """Do not cancel lease cleanup with ordinary background work at shutdown."""

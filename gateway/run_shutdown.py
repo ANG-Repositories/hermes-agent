@@ -2052,6 +2052,9 @@ class GatewayShutdownMixin:
         self._clear_plugin_message_injector()
         self._draining = True
         self._mark_api_runs_shutdown_requested()
+        # Pending registry claims have no transcript to resume. Preserve their
+        # original input before a stuck claim can consume the shutdown leash.
+        await self._preserve_pending_session_claims()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):
@@ -2338,6 +2341,7 @@ class GatewayShutdownMixin:
         self._background_tasks.clear()
         # Acquisitions own their worker until it returns, even when cancelled.
         # Join them before draining the durable releases they may enqueue.
+        await self._preserve_pending_session_claims()
         _claims = tuple(getattr(self, "_active_session_claim_tasks", ()))
         for _claim in _claims:
             _claim.cancel()

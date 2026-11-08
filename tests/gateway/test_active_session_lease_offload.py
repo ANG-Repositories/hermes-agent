@@ -264,6 +264,142 @@ async def test_shutdown_joins_pending_acquisition_and_cleanup(rig, monkeypatch):
     assert not runner._active_session_release_tasks
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_error", [False, True])
+async def test_release_error_does_not_replace_turn_result(rig, monkeypatch, caplog, turn_error):
+    runner, path = rig
+    def fail_release(lease):
+        raise OSError("release disk failure")
+    monkeypatch.setattr(active_sessions.ActiveSessionLease, "release", fail_release)
+    if turn_error:
+        runner._handle_message_with_agent.side_effect = ValueError("original turn failure")
+        with pytest.raises(ValueError, match="original turn failure"):
+            await runner._handle_message(_make_event())
+    else:
+        assert await runner._handle_message(_make_event()) == "ok"
+    await runner._drain_active_session_releases()
+    assert "Failed to release active session slot" in caplog.text
+    # Failed durable cleanup is observable, not falsely reported as removed.
+    assert len(active_sessions._read_entries(path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_release_failure_does_not_abort_remaining_cleanup(rig, monkeypatch):
+    from types import SimpleNamespace
+    runner, _ = rig
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    loop = asyncio.get_running_loop()
+    lease, _ = await runner._claim_active_session_slot_off_loop("a", _make_event().source)
+    def fail():
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(5)
+        raise OSError("release disk failure")
+    monkeypatch.setattr(lease, "release", fail)
+    runner._release_active_session_lease(lease)
+    await asyncio.wait_for(entered.wait(), 2)
+    class AfterDrain(Exception):
+        pass
+    def after_drain():
+        raise AfterDrain
+    runner._active_api_run_count = after_drain
+    runner._restart_task = None
+    stop = asyncio.create_task(runner._stop_release_runtime_state(SimpleNamespace()))
+    await asyncio.sleep(0)
+    proceed.set()
+    with pytest.raises(AfterDrain):
+        await stop
+
+
+@pytest.mark.asyncio
+async def test_registry_refusal_does_not_remove_orphan_fifo_head(rig):
+    from gateway.session import build_session_key
+    runner, _ = rig
+    event = _make_event(text="new")
+    key = build_session_key(event.source)
+    old = _make_event(text="old")
+    runner._session_state(key).conversation.queued_events = [old]
+    runner._claim_active_session_slot = MagicMock(return_value=(None, "registry full"))
+    assert await runner._handle_message(event) == "registry full"
+    assert runner._overflow_queue(key) == [old]
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_spools_pending_claim_before_cancelling_cleanup(rig, monkeypatch):
+    from types import SimpleNamespace
+    from gateway.fork_ext.restart_followups import take_followups
+    runner, path = rig
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    loop = asyncio.get_running_loop()
+    acquire = runner._claim_active_session_slot
+    def delayed(*args):
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(5)
+        return acquire(*args)
+    monkeypatch.setattr(runner, "_claim_active_session_slot", delayed)
+    runner._restart_task = None
+    runner._status_action_label = lambda: "restart"
+    class AfterDrain(Exception):
+        pass
+    def after_drain():
+        raise AfterDrain
+    runner._active_api_run_count = after_drain
+    turn = asyncio.create_task(runner._handle_message(_make_event(text="pending input")))
+    stop = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        stop = asyncio.create_task(runner._stop_release_runtime_state(SimpleNamespace()))
+        # Spool must happen without requiring the registry worker to return.
+        for _ in range(200):
+            rows, _ = await asyncio.to_thread(take_followups)
+            if rows:
+                break
+            await asyncio.sleep(0.01)
+        assert rows, "pending acquisition input was not spooled"
+        assert rows[0]["text"] == "pending input"
+    finally:
+        proceed.set()
+        await asyncio.gather(turn, *( [stop] if stop else []), return_exceptions=True)
+    runner._handle_message_with_agent.assert_not_awaited()
+    assert not active_sessions._read_entries(path)
+
+
+@pytest.mark.asyncio
+async def test_registry_waiters_leave_default_executor_available(rig, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    runner, path = rig
+    loop = asyncio.get_running_loop()
+    previous = loop._default_executor
+    pool = ThreadPoolExecutor(max_workers=2)
+    loop.set_default_executor(pool)
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    real_write = active_sessions._write_entries
+    def held_write(*args):
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(5)
+        return real_write(*args)
+    monkeypatch.setattr(active_sessions, "_write_entries", held_write)
+    tasks = [asyncio.create_task(runner._claim_active_session_slot_off_loop(str(i), _make_event().source))
+             for i in range(3)]
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        # Registry operations serialize at flock; waiting there must not occupy
+        # every shared executor thread needed by shutdown persistence.
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "heartbeat"), 1) == "heartbeat"
+    finally:
+        proceed.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, tuple) and result[0] is not None:
+                await runner._release_active_session_lease(result[0])
+        loop._default_executor = previous
+        pool.shutdown(wait=True)
+    assert not active_sessions._read_entries(path)
+
+
 def _held_io_shutdown_child(home, mode, negative):
     """Disposable process only: the registry barrier is NEVER released."""
     import os
