@@ -1134,7 +1134,10 @@ def goal_judge_available() -> bool:
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
         from hermes_cli.goal_judge_chain import chain_config
-        policy = chain_config(_goal_judge_timeout())
+        try:
+            policy = chain_config(_goal_judge_timeout())
+        except (ValueError, TypeError):
+            return True  # configured but invalid: judge must report failure, never bypass the gate
         if policy is not None:
             # Explicit chain exists even when its primary cannot currently resolve. Let
             # the bounded judge report exhaustion rather than silently bypassing it.

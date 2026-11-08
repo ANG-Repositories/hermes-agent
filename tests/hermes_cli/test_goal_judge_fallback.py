@@ -163,3 +163,23 @@ def test_total_budget_and_invalid_config(tmp_path, monkeypatch):
     result = chain.judge_chain((routes, 0.2), 'system', 'prompt', 10, goals._parse_judge_response)
     assert calls == ['primary']
     assert result[0] == 'continue' and result[4]
+
+
+def test_pause_cancels_chain_without_failure_increment(tmp_path, monkeypatch):
+    from hermes_cli import goal_judge_chain as chain
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    configure(tmp_path, 'http://127.0.0.1:9/v1')
+    manager = goals.GoalManager('cancel-chain')
+    manager.set('deliver')
+    def attempt(route, messages, max_tokens, deadline, cancel_check=None):
+        goals.GoalManager('cancel-chain').pause('user stop')
+        assert cancel_check()
+        raise AuxiliaryExplicitCancellation()
+    monkeypatch.setattr(chain, 'run_attempt', attempt)
+    with pytest.raises(AuxiliaryExplicitCancellation):
+        manager.evaluate_after_turn('working')
+    persisted = goals.load_goal('cancel-chain')
+    assert persisted.status == 'paused'
+    assert persisted.consecutive_transport_failures == 0
+    assert persisted.turns_used == 0

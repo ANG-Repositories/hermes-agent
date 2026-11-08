@@ -92,6 +92,9 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
             try:
                 out, _ = proc.communicate(pending, timeout=min(0.05, remaining))
                 raise_if_aux_cancel_requested()
+                if cancel_check is not None and cancel_check():
+                    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+                    raise AuxiliaryExplicitCancellation()
                 if proc.returncode:
                     return dict(category='worker_error')
                 return json.loads(out)
