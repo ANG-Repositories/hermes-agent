@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS failure_memberships (
  id INTEGER PRIMARY KEY, obs_id INTEGER NOT NULL REFERENCES failure_observations,
  episode_id INTEGER NOT NULL REFERENCES failure_episodes, revision INTEGER NOT NULL,
  UNIQUE(obs_id,episode_id,revision));
-CREATE TRIGGER IF NOT EXISTS failure_owner_terminal AFTER UPDATE OF status ON tasks
+DROP TRIGGER IF EXISTS failure_owner_terminal;
+CREATE TRIGGER failure_owner_terminal AFTER UPDATE OF status ON tasks
 WHEN NEW.status IN ('done','archived') AND OLD.status NOT IN ('done','archived')
 BEGIN
  INSERT INTO failure_transitions(episode_id,revision,reason,detail)
@@ -82,6 +83,7 @@ BEGIN
  SELECT e.episode_id,'pending',b.provenance_json,b.task_kind,b.detector_only,'owner_terminal'
  FROM failure_episodes e JOIN failure_bindings b USING(episode_id)
  WHERE b.card_id=NEW.id AND b.reason='owner_terminal' AND e.state='active'
+ AND b.binding_id=(SELECT MAX(y.binding_id) FROM failure_bindings y WHERE y.episode_id=e.episode_id AND y.card_id=NEW.id AND y.reason='owner_terminal')
  AND NOT EXISTS(SELECT 1 FROM failure_bindings x WHERE x.episode_id=e.episode_id AND x.state IN ('pending','bound'));
 END;
 CREATE TRIGGER IF NOT EXISTS failure_legacy_insert BEFORE INSERT ON tasks
@@ -281,24 +283,38 @@ def _order(a,b,lineage):
 def _reduce(conn,key_id,obs_id,obs):
     rows = conn.execute("SELECT obs_id,data FROM failure_observations WHERE key_id=? AND result IN ('failure','pass') AND disposition NOT IN ('DISABLED','NO_ACTION')", (key_id,)).fetchall()
     values = [dict(json.loads(r['data']), obs_id=r['obs_id']) for r in rows]
-    lineage = obs.lineage
-    ambiguous = len(set(lineage)) != len(lineage) or any(
-        _order(a,b,lineage) is None or
-        (_order(a,b,lineage) == 0 and a['result'] != b['result'])
-        for i,a in enumerate(values) for b in values[i+1:])
-    if any(v['sha'] not in lineage for v in values):
-        ambiguous = True
+    # Captures attest ancestry, not arrival order. A delayed prefix cannot erase
+    # a retained extension; contradictory chains establish no ordering.
+    lineages = [v['lineage'] for v in values]
+    def compare(a, b):
+        orders = {_order(a, b, chain) for chain in lineages
+                  if len(set(chain)) == len(chain) and a['sha'] in chain and b['sha'] in chain}
+        orders.discard(None)
+        order = orders.pop() if len(orders) == 1 else None
+        # A pass must itself attest the failed history it claims to heal.
+        passing, failing = (a, b) if a['result'] == 'pass' else (b, a)
+        if a['result'] != b['result'] and passing['result'] == 'pass':
+            heals = order == (1 if passing is a else -1)
+            if heals and failing['sha'] not in passing['lineage']:
+                return None
+        return order
+    failures = [v for v in values if v['result'] == 'failure']
+    # Incomparable passes add uncertainty, not a new red or revoked boundary.
+    values = [v for v in values if v['result'] == 'failure' or
+              all(compare(v, f) is not None for f in failures)]
+    ambiguous = any(compare(a, b) is None or
+                    (compare(a, b) == 0 and a['result'] != b['result'])
+                    for i, a in enumerate(values) for b in values[i+1:])
     old = conn.execute("SELECT * FROM failure_episodes WHERE key_id=? AND state='active'", (key_id,)).fetchone()
     if ambiguous:
         # Incomparable/force-pushed history cannot certify healing or stale red.
         if old:
             return old
-        failures = [v for v in values if v['result']=='failure']
-        if not failures:
-            return None
-        values = failures
+        healed = {r[0] for r in conn.execute(
+            'SELECT m.obs_id FROM failure_memberships m JOIN failure_episodes e USING(episode_id) WHERE e.key_id=? AND e.healed_obs IS NOT NULL', (key_id,))}
+        values = [v for v in failures if v['obs_id'] not in healed]
     else:
-        values.sort(key=cmp_to_key(lambda a,b: _order(a,b,lineage)))
+        values.sort(key=cmp_to_key(compare))
     segments, current = [], None
     for value in values:
         if value['result']=='failure':
@@ -313,7 +329,7 @@ def _reduce(conn,key_id,obs_id,obs):
         return None
     # Preserve an active card through late-boundary reconstruction; terminal
     # cards are never recycled. Historical detached bindings remain tombstones.
-    transferable = conn.execute("SELECT b.* FROM failure_bindings b JOIN failure_episodes e USING(episode_id) JOIN tasks t ON t.id=b.card_id WHERE e.key_id=? AND e.state='active' AND b.state='bound' AND t.status NOT IN ('done','archived') ORDER BY b.binding_id DESC LIMIT 1", (key_id,)).fetchone()
+    transferable = conn.execute("SELECT b.* FROM failure_bindings b JOIN failure_episodes e USING(episode_id) LEFT JOIN tasks t ON t.id=b.card_id WHERE e.key_id=? AND e.state='active' AND (b.state='pending' OR (b.state='bound' AND t.status NOT IN ('done','archived'))) ORDER BY b.binding_id DESC LIMIT 1", (key_id,)).fetchone()
     conn.execute("UPDATE failure_episodes SET state='healed' WHERE key_id=?", (key_id,))
     predecessor, active = None, None
     for segment in segments:
@@ -337,8 +353,8 @@ def _reduce(conn,key_id,obs_id,obs):
     if active and transferable and transferable['episode_id'] != active['episode_id']:
         conn.execute("UPDATE failure_bindings SET state='detached',generation=generation+1,reason='late_boundary_transfer' WHERE binding_id=?",(transferable['binding_id'],))
         conn.execute("UPDATE failure_bindings SET state='detached' WHERE episode_id=? AND state='pending'",(active['episode_id'],))
-        conn.execute("INSERT INTO failure_bindings(episode_id,card_id,state,generation,provenance_json,task_kind,detector_only) VALUES(?,?,'bound',?,?,?,?)",
-                     (active['episode_id'],transferable['card_id'],transferable['generation']+1,transferable['provenance_json'],transferable['task_kind'],transferable['detector_only']))
+        conn.execute("INSERT INTO failure_bindings(episode_id,card_id,state,generation,provenance_json,task_kind,detector_only) VALUES(?,?,?,?,?,?,?)",
+                     (active['episode_id'],transferable['card_id'],transferable['state'],transferable['generation']+1,transferable['provenance_json'],transferable['task_kind'],transferable['detector_only']))
     return active
 
 
@@ -392,21 +408,26 @@ def observe_failure(conn, ref, *, producer, card_spec=None):
         policy = conn.execute('SELECT * FROM failure_authority WHERE singleton=1').fetchone()
         if obs.policy_generation != policy['policy_generation']:
             raise ValueError('stale evidence policy; retry verification')
-        prior = conn.execute('SELECT * FROM failure_observations WHERE source_key=?',(obs.source_key,)).fetchone()
-        if prior:
-            if prior['data'] != _json(asdict(obs)):
-                raise ValueError('source replay changed payload')
-            return Decision('REPLAY',prior['key_id'],prior['episode_id'],prior['card_id'],reason=prior['disposition'])
         enrollment = conn.execute('SELECT * FROM failure_producers WHERE producer=?',(producer,)).fetchone()
         if not enrollment:
             raise ValueError('unsupported producer; compatibility capture required')
         enabled = enrollment['enabled'] and enrollment['enrolled']
+        prior = conn.execute('SELECT * FROM failure_observations WHERE source_key=?',(obs.source_key,)).fetchone()
+        if prior:
+            if prior['data'] != _json(asdict(obs)):
+                raise ValueError('source replay changed payload')
+            if prior['disposition'] != 'DISABLED' or not enabled:
+                return Decision('REPLAY',prior['key_id'],prior['episode_id'],prior['card_id'],reason=prior['disposition'])
         key_id = None
         if obs.key is not None:
             conn.execute('INSERT OR IGNORE INTO failure_keys(canonical) VALUES(?)',(obs.key,))
             key_id = conn.execute('SELECT key_id FROM failure_keys WHERE canonical=?',(obs.key,)).fetchone()[0]
-        oid = conn.execute('INSERT INTO failure_observations(source_key,key_id,result,receipt,data,disposition,reason) VALUES(?,?,?,?,?,?,?)',
-                           (obs.source_key,key_id,obs.result,ref.token,_json(asdict(obs)),'EVIDENCE_PENDING',obs.reason)).lastrowid
+        if prior:
+            oid = prior['obs_id']
+            conn.execute("UPDATE failure_observations SET disposition='EVIDENCE_PENDING' WHERE obs_id=?", (oid,))
+        else:
+            oid = conn.execute('INSERT INTO failure_observations(source_key,key_id,result,receipt,data,disposition,reason) VALUES(?,?,?,?,?,?,?)',
+                               (obs.source_key,key_id,obs.result,ref.token,_json(asdict(obs)),'EVIDENCE_PENDING',obs.reason)).lastrowid
         if not enabled:
             decision = Decision('DISABLED',key_id)
         elif obs.result in ('unknown','waived'):
@@ -417,12 +438,13 @@ def observe_failure(conn, ref, *, producer, card_spec=None):
                 decision = Decision('NO_ACTION',key_id,reason='preserve mode; healing disabled')
             else:
                 episode = _reduce(conn,key_id,oid,obs)
-                if obs.result=='pass':
-                    decision = Decision('HEALED' if episode is None else 'ATTACHED',key_id,
-                                        episode['episode_id'] if episode else None,
-                                        revision=episode['revision'] if episode else None)
-                elif episode:
-                    decision = _bind(conn,episode,obs,card_spec,producer)
+                if episode:
+                    failure = conn.execute('SELECT data FROM failure_observations WHERE obs_id=?', (episode['latest_failure_obs'],)).fetchone()
+                    data = json.loads(failure['data'])
+                    data['lineage'] = tuple(data['lineage'])
+                    decision = _bind(conn,episode,Observation(**data),card_spec,producer)
+                elif obs.result=='pass':
+                    decision = Decision('HEALED',key_id)
                 else:
                     decision = Decision('HISTORICAL',key_id)
         conn.execute('UPDATE failure_observations SET disposition=?,episode_id=?,card_id=?,reason=? WHERE obs_id=?',
@@ -494,8 +516,13 @@ def adopt_owner(conn,episode_id,card_id,*,expected_revision,provenance_ref):
             return Decision('retry')
         if obs.key != e['canonical'] or obs.result != 'failure' or not task or task['status'] in ('done','archived'):
             raise ValueError('exact failure-linked live adoption required')
+        binding = conn.execute("SELECT * FROM failure_bindings WHERE episode_id=? AND state IN ('pending','bound')", (episode_id,)).fetchone()
+        if not binding:
+            return Decision('retry', reason='active responsibility missing')
+        provenance = json.loads(binding['provenance_json'])
+        provenance['receipt'] = provenance_ref.token
         conn.execute("UPDATE failure_bindings SET state='detached',generation=generation+1 WHERE episode_id=? AND state IN ('pending','bound')",(episode_id,))
-        conn.execute("INSERT INTO failure_bindings(episode_id,card_id,state,provenance_json,task_kind,detector_only) VALUES(?,?,'bound',?,?,0)",(episode_id,card_id,_json({'receipt':provenance_ref.token}),obs.task_kind))
+        conn.execute("INSERT INTO failure_bindings(episode_id,card_id,state,provenance_json,task_kind,detector_only) VALUES(?,?,'bound',?,?,0)",(episode_id,card_id,_json(provenance),binding['task_kind']))
         conn.execute('UPDATE failure_episodes SET revision=revision+1 WHERE episode_id=?',(episode_id,))
         _transition(conn,e,None,'owner_adopted',{'card_id':card_id})
         return Decision('ATTACHED',e['key_id'],episode_id,card_id,expected_revision+1)

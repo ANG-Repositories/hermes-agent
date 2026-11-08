@@ -276,6 +276,22 @@ def test_delayed_prefix_keeps_verified_boundary(board, order):
     assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0] == 1
 
 
+def test_repeated_adoption_terminal_has_one_replacement(board):
+    enroll(board)
+    obs = observation()
+    result = admit(board, obs)
+    for _ in range(2):
+        result = fo.adopt_owner(board, result.episode_id, result.card_id,
+                                expected_revision=result.revision, provenance_ref=publish(board, obs))
+        with kb.write_txn(board):
+            board.execute("UPDATE tasks SET status='done' WHERE id=?", (result.card_id,))
+        assert_responsibility(board)
+        with kb.write_txn(board):
+            board.execute("UPDATE tasks SET status='ready' WHERE id=?", (result.card_id,))
+        revision = board.execute('SELECT revision FROM failure_episodes WHERE episode_id=?', (result.episode_id,)).fetchone()[0]
+        result = replace(result, revision=revision)
+
+
 def test_incomparable_pass_does_not_resurrect_healed_red(board):
     enroll(board)
     admit(board, observation())
