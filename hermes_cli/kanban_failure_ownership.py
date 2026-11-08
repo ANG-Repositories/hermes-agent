@@ -177,19 +177,40 @@ def _validate_observation(obs):
         if (not isinstance(fields, list) or len(fields) != 13 or type(fields[0]) is not int
                 or fields[0] != 1 or _json(fields) != obs.key):
             raise ValueError('exact canonical v1 key required')
+        if not isinstance(fields[3],str) or fields[3] != fields[3].lower() or any(c in fields[3] for c in '/: '):
+            raise ValueError('provider hostname required')
+        if not isinstance(fields[2],str) or fields[9] not in ('suite','step','job'):
+            raise ValueError('tenant and unit kind required')
+        if (not isinstance(fields[6],str) or not fields[6].startswith('.github/workflows/')
+                or '..' in fields[6].split('/')):
+            raise ValueError('repository-relative workflow required')
+        if fields[11] == 'pytest-node':
+            if fields[9]=='job' or not isinstance(fields[12],str) or '::' not in fields[12]:
+                raise ValueError('exact pytest node required')
+        elif fields[11] == 'unlocalized-job':
+            if fields[9]!='job' or fields[12]!='':
+                raise ValueError('unlocalized job discriminator required')
+        else:
+            raise ValueError('unsupported failure parser')
         if any(not isinstance(fields[i], str) or not fields[i] for i in (1,3,6,9,10,11)):
             raise ValueError('missing identity axis')
         if any(type(fields[i]) is not int or fields[i] <= 0 for i in (4,5)):
             raise ValueError('numeric repository/workflow required')
         if not isinstance(fields[7], list) or not isinstance(fields[8], list):
             raise ValueError('explicit chain and matrix required')
+        for entry in fields[7]:
+            if (not isinstance(entry,list) or len(entry)!=3 or not isinstance(entry[0],str)
+                    or not entry[0] or type(entry[1]) is not int or entry[1]<=0
+                    or not isinstance(entry[2],str) or not entry[2]):
+                raise ValueError('verified reusable call chain required')
         axes = fields[8]
-        if (any(not isinstance(a,list) or len(a)!=2 or not isinstance(a[0],str) for a in axes)
+        if (any(not isinstance(a,list) or len(a)!=2 or not isinstance(a[0],str) or not a[0]
+                or (a[1] is not None and type(a[1]) not in (str,int,float,bool)) for a in axes)
                 or axes != sorted(axes, key=lambda a:a[0]) or len({a[0] for a in axes}) != len(axes)):
             raise ValueError('canonical matrix required')
     if obs.result in ('failure','pass') and (obs.key is None or not obs.sha or obs.attempt < 1):
         raise ValueError('qualified execution required')
-    if obs.result == 'pass' and not obs.complete:
+    if obs.result == 'pass' and (not obs.complete or obs.sha not in obs.lineage):
         raise ValueError('incomplete evidence cannot attest pass')
 
 
@@ -328,6 +349,9 @@ def _create_owner(conn,card,producer):
         raise ValueError('prepared card required')
     tid = kb._new_task_id()
     now = int(time.time())
+    # Uncommitted guard row is visible only to this connection; SQLite's write
+    # lock prevents a second writer until it is removed before commit. Unlike a
+    # UDF trigger this remains evaluable by unupgraded SQLite connections.
     conn.execute('INSERT INTO failure_write_context VALUES(1,?)',(PROTOCOL,))
     try:
         kb._insert_task_row(conn, {

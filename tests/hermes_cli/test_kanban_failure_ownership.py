@@ -168,6 +168,17 @@ def test_pending_validation_never_claims_owned(board):
     assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==0
 
 
+def test_publication_failure_no_receipt_or_owner(board,monkeypatch):
+    def fail(*args):
+        raise OSError('injected durable publication failure')
+    monkeypatch.setattr(fo.os,'replace',fail)
+    with pytest.raises(OSError,match='durable publication'):
+        publish(board,observation())
+    assert board.execute('SELECT count(*) FROM failure_receipts').fetchone()[0]==0
+    assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0]==0
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==0
+
+
 def test_legacy_writer_floor(board):
     # Old ordinary semantics remain unchanged until a producer is enrolled.
     with kb.write_txn(board):
@@ -296,6 +307,7 @@ def test_public_claim_after_healing_no_allocation(board):
     enroll(board)
     red=admit(board,observation())
     admit(board,observation('pass','pass','b',run_id=2))
+    assert red.card_id is not None
     assert kb.claim_task(board,red.card_id,claimer='scratch:1') is None
     assert board.execute('SELECT count(*) FROM task_runs').fetchone()[0]==0
 
