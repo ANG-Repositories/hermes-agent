@@ -519,18 +519,28 @@ class GatewayBusySessionMixin:
 
     async def _preserve_pending_session_claims(self):
         """Stop unstarted turns and spool their input before waiting for registry I/O."""
-        snapshots = []
+        snapshots = getattr(self, "_pending_session_claim_inputs", None)
+        if snapshots is None:
+            snapshots = self._pending_session_claim_inputs = {}
         for task, key in tuple(getattr(self, "_active_session_claim_tasks", {}).items()):
             state = self._peek_session_state(key)
-            if getattr(self, "_running_agent_tasks", {}).get(key) is task and state is not None:
-                snapshots.append((task, key, state.turn.event))
+            if (getattr(self, "_running_agent_tasks", {}).get(key) is task
+                    and state is not None and state.turn.event is not None
+                    and not getattr(task, "_claim_input_spooled", False)):
+                # Retain independently of the owner's finally, which clears turn
+                # state even when the first spool attempt fails or is cancelled.
+                snapshots.setdefault(task, (key, state.turn.event))
             task.cancel()
-        for task, key, event in snapshots:
-            if event is not None and not getattr(task, "_claim_input_spooled", False):
-                if await self._preserve_followup_across_restart(key, event, None):
-                    task._claim_input_spooled = True
-                else:
-                    logger.error("Failed to preserve pending active-session input for %s", key)
+        for task, (key, event) in tuple(snapshots.items()):
+            if await self._preserve_followup_across_restart(key, event, None):
+                task._claim_input_spooled = True
+                snapshots.pop(task, None)
+            elif not getattr(task, "_claim_input_spool_warned", False):
+                task._claim_input_spool_warned = True
+                logger.error(
+                    "Pending active-session input for %s retained for shutdown retry; "
+                    "not durable and may be lost if storage remains unavailable", key,
+                )
 
     async def _drain_active_session_releases(self):
         """Do not cancel lease cleanup with ordinary background work at shutdown."""

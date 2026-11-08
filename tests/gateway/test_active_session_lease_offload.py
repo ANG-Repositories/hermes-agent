@@ -187,6 +187,7 @@ async def test_superseded_acquisition_never_clears_successor(rig, monkeypatch):
         await turn
     assert runner._session_state(key).turn.agent is successor
     runner._handle_message_with_agent.assert_not_awaited()
+    await runner._drain_active_session_releases()
     assert not active_sessions._read_entries(path)
 
 
@@ -364,6 +365,106 @@ async def test_shutdown_spools_pending_claim_before_cancelling_cleanup(rig, monk
         await asyncio.gather(turn, *( [stop] if stop else []), return_exceptions=True)
     runner._handle_message_with_agent.assert_not_awaited()
     assert not active_sessions._read_entries(path)
+
+
+@pytest.mark.asyncio
+async def test_completed_reply_handoff_precedes_held_release_and_shutdown(rig, monkeypatch):
+    from types import SimpleNamespace
+    runner, path = rig
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    delivered = asyncio.Event()
+    replies = []
+    loop = asyncio.get_running_loop()
+    real_release = active_sessions.ActiveSessionLease.release
+
+    def held_release(lease):
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(10)
+        real_release(lease)
+
+    async def adapter_handoff():
+        replies.append(await runner._handle_message(_make_event()))
+        delivered.set()
+
+    monkeypatch.setattr(active_sessions.ActiveSessionLease, "release", held_release)
+    turn = asyncio.create_task(adapter_handoff())
+    runner._background_tasks.add(turn)
+    runner._restart_task = None
+    runner._active_api_run_count = lambda: 0
+    stop = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        # Shutdown cancels ordinary background work while durable release is held.
+        stop = asyncio.create_task(runner._stop_release_runtime_state(SimpleNamespace()))
+        await asyncio.wait_for(delivered.wait(), 2)
+        assert replies == ["ok"]
+        assert not turn.cancelled()
+        assert len(active_sessions._read_entries(path)) == 1
+        assert runner._active_session_release_tasks
+    finally:
+        proceed.set()
+        await asyncio.gather(turn, *([stop] if stop else []), return_exceptions=True)
+        await runner._drain_active_session_releases()
+    assert not active_sessions._read_entries(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [True, False])
+async def test_failed_pending_spool_retains_original_after_owner_cleanup(rig, monkeypatch, recover):
+    from gateway.session import build_session_key
+    from gateway.fork_ext.restart_followups import take_followups
+    runner, path = rig
+    entered = asyncio.Event()
+    proceed = threading.Event()
+    loop = asyncio.get_running_loop()
+    acquire = runner._claim_active_session_slot
+    event = _make_event(text="retry original input")
+    key = build_session_key(event.source)
+    real_preserve = runner._preserve_followup_across_restart
+    runner._status_action_label = lambda: "restart"
+
+    def delayed(*args):
+        loop.call_soon_threadsafe(entered.set)
+        assert proceed.wait(10)
+        return acquire(*args)
+
+    monkeypatch.setattr(runner, "_claim_active_session_slot", delayed)
+    runner._preserve_followup_across_restart = AsyncMock(return_value=False)
+    turn = asyncio.create_task(runner._handle_message(event))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await runner._preserve_pending_session_claims()
+    finally:
+        proceed.set()
+        await asyncio.gather(turn, return_exceptions=True)
+    assert not runner._active_session_claim_tasks
+    assert not runner._running_agents
+    assert not active_sessions._read_entries(path)
+    retained = getattr(runner, "_pending_session_claim_inputs", {})
+    assert retained.get(turn) == (key, event), "cancelled input lost with owner state"
+    if recover:
+        runner._preserve_followup_across_restart = real_preserve
+    from types import SimpleNamespace
+    class AfterDrain(Exception):
+        pass
+    def after_drain():
+        raise AfterDrain
+    runner._restart_task = None
+    runner._active_api_run_count = after_drain
+    with pytest.raises(AfterDrain):
+        await runner._stop_release_runtime_state(SimpleNamespace())
+    rows, _ = await asyncio.to_thread(take_followups)
+    if recover:
+        assert [row["text"] for row in rows] == [event.text]
+        assert not retained
+        await runner._preserve_pending_session_claims()
+        assert (await asyncio.to_thread(take_followups))[0] == rows
+    else:
+        assert rows == []
+        assert retained.get(turn) == (key, event)
+        assert not getattr(turn, "_claim_input_spooled", False)
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

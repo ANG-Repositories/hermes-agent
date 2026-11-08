@@ -1665,9 +1665,10 @@ class GatewayInboundMixin:
                     if _checkout_ticket is not None:
                         _checkout_ticket.release()
                     if _active_session_lease is not None:
-                        _release = self._release_active_session_lease(_active_session_lease)
-                        if _release is not None:
-                            await self._wait_active_session_release(_release)
+                        # Runner-owned cleanup is joined at shutdown, not here:
+                        # delayed registry I/O must not hold the completed reply
+                        # outside the adapter's delivery/recovery lifecycle.
+                        self._release_active_session_lease(_active_session_lease)
 
     def _hm_lease_rejection_reply(self, event: "MessageEvent", source: SessionSource, _quick_key: str) -> str:
         """The fail-closed turn-lease rejection reply (``gateway.busy.another_turn_running``), after
