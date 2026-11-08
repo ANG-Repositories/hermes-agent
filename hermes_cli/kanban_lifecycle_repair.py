@@ -69,12 +69,16 @@ def repair(conn: sqlite3.Connection, *, apply: bool = False) -> dict:
                     conn.row_factory = sqlite3.Row
                     try:
                         source_status = kb._resume_status_from_events(conn, tid)
+                        block_source = kb._latest_block_source(conn, tid)
                     finally:
                         conn.row_factory = prior_factory
+                    payload = {"kind": "needs_input", "reason": change["reason"],
+                               "source_status": source_status}
+                    if block_source == "initial_status":
+                        payload["source"] = block_source
                     conn.execute("UPDATE tasks SET status='blocked',block_kind='needs_input' WHERE id=?", (tid,))
                     conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
-                                 (tid, "blocked", json.dumps({"kind": "needs_input", "reason": change["reason"],
-                                                             "source_status": source_status}), now))
+                                 (tid, "blocked", json.dumps(payload), now))
                 conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
                              (tid, "lifecycle_repaired", json.dumps(change), now))
             remaining = plan(conn)

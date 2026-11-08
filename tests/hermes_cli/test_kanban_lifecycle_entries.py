@@ -86,3 +86,28 @@ def test_legacy_repair_is_dry_run_first_and_idempotent(conn):
     conn.commit()
     repair(conn, apply=True)
     assert kb._resume_status_from_events(conn, held) == "review"
+
+
+@pytest.mark.parametrize("legacy_source", [False, True])
+def test_legacy_repair_preserves_creation_dependency_release(conn, legacy_source):
+    from hermes_cli.kanban_lifecycle_repair import repair
+
+    parent = kb.create_task(conn, title="Prerequisite", assignee="builder")
+    child = kb.create_task(conn, title="Creation hold", assignee="builder",
+                           parents=[parent], initial_status="blocked")
+    if legacy_source:
+        conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='blocked'",
+                     (json.dumps({"reason": "created with initial_status=blocked"}), child))
+    explicit = kb.create_task(conn, title="Explicit hold", assignee="builder", parents=[parent])
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (explicit,))
+    kb._append_event(conn, explicit, "blocked", {"reason": "operator decision"})
+    conn.commit()
+    repair(conn, apply=True)
+    assert kb._latest_block_source(conn, child) == "initial_status"
+    assert kb._latest_block_source(conn, explicit) == "explicit"
+    assert kb.get_task(conn, child).status == "blocked"
+    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    kb.recompute_ready(conn)
+    assert kb.get_task(conn, child).status == "ready"
+    assert kb.get_task(conn, explicit).status == "blocked"
+    assert repair(conn, apply=True)["before"] == 0

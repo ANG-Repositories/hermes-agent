@@ -33,7 +33,9 @@ explicit unblock_when predicate is required. Existing dashboard human actions us
 needs_input; old test fixtures now explicitly name that same human hold. Automatic
 breaker blocks remain untyped by design (existing supervisor classification path).
 The one-shot classifies legacy NULL-kind rows as needs_input, preserving the prior
-review resume phase. The separate sweep owns durable predicate recovery.
+review resume phase and creation-hold dependency-release provenance (including
+legacy reason-only creation events). Explicit blocks remain explicit and sticky.
+The separate sweep owns durable predicate recovery.
 
 C — human-ready contract
 Persistent INSERT/status/assignee triggers move ready+human to todo and emit one
