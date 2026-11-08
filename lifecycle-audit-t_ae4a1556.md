@@ -1,65 +1,88 @@
 Kanban lifecycle audit — t_ae4a1556
 
-Base: c1524a12afa6c9ae6997931c6f44c9a52ba9469e
-Live board read-only observations on 2026-11-08:
-A review without review_requested: 16.
-B blocked with null block_kind: 30.
-C ready with human/human:* assignee: 216 (changed since original 215-card census).
-D scheduled with null next_eligible_at: 1.
-No live repair or schema change has been performed by this run.
+Runtime PR: ANG-Ventures/hermes-agent#126. Predicate consumption is the independent
+hermes-home sibling t_df047ff5, per operator ruling. No live board writes by worker.
 
-Acceptance conflicts found:
-E's two cards both have after-merge edges, not ordinary blocks edges. Existing
-kanban_after_merge.py explicitly preserves those gates even for done/archived
-parents with recorded PRs. REST: ANG-Ventures/hermes-home#5971 closed/unmerged;
-#8993 closed/merged. t_a75816c1 therefore cannot safely be promoted on parent
-closure; its prerequisite was never merged. t_88ae92c4 can use the normal merged
-edge reconciler. Do not weaken _parents_satisfied to ignore after-merge.
-D t_d394f63b is intentionally waiting on Ace saying parts arrived. Its scheduled
-event explicitly says PARKED, waiting on parts arrival. Repair to a human input
-hold, not an invented timestamp.
-B unblock_when is not a column in this runtime. The predicate reader and grammar
-live in hermes-home scripts/kanban-unblock-when-sweep.py and hooks/unblock_when.py.
-This repo has durable obligations but cannot determine that a placement rule has
-cleared without coupling to the separate placement/predicate implementation.
-The task explicitly forbids widening into placement/admission.
-A #124 is OPEN, not landed on the base. Its named kanban_review_handoff.py file
-does not exist on current fork/main. Avoid assuming that writer was already fixed.
+A — review provenance
+Persistent SQLite INSERT and status-UPDATE triggers repair otherwise missing
+review_requested implementer data before the statement returns, including raw
+SQL clients after installation. Current run identity precedes historical successful
+runs, prior nonhuman assignee, then human:operator. The normal _append_event writer
+finalizes a provisional trigger event in place in the same transaction, preserving
+recovered fields omitted by the final payload. This prevents double notifications.
 
-Partial implementation, NOT review-ready:
-D wake_at on schedule_task; CLI passes it in the same transaction as scheduling;
-dashboard payload exposes it. Persistent INSERT/UPDATE trigger rejects scheduled
-without a wake. Narrow new invariant tests red 2/2 before, green 2/2 after.
-A persistent review-entry repair trigger synthesizes missing implementer
-provenance from last successful run / prior assignee / human:operator. Needs
-more coverage (especially initial INSERT and coexistence with normal handoff).
-C human ready entries route to todo with one needs_operator event; recompute_ready
-skips human assignments until reassigned. Needs operator visibility/notification
-validation and complete migration.
-A/C tests red 2/2 before, green 2/2 after.
+Writer inventory (direct SQL and dynamic resume targets):
+- kanban_db._request_review_txn: canonical handoff, finalizes provisional event.
+- kanban_superseded_open.park: canonical handoff, same _append_event seam.
+- kanban_db.reopen_task: recovered provenance before terminal run voiding.
+- kanban_db.release_unbound_review_claim: returns a claimed reviewer to its lane.
+- kanban_db.recompute_ready / unblock_task / promote / requeue / schedule wake:
+  resume prior review provenance rather than invent an implementation handoff.
+- kanban_db_dispatch recovery/reclaim/failure retry targets: preserve prior handoff;
+  persistent trigger fills missing legacy provenance when restoring review.
+- kanban_continuation, kanban_priority_door, kanban_handback_new_head,
+  kanban_quota_repair: dynamic review retry destinations covered by the same trigger.
+- dashboard: review goes through request_review, not a raw status write.
+External closer/merge-pass paths writing raw SQL are protected by the persistent
+trigger; no changes to the external hermes-home repo in this card.
 
-Verification actually executed on ACE-AI:
-cd /srv/ci/scratch/t_ae4a1556 && scripts/run_tests.sh tests/hermes_cli/test_kanban_schedule_atomic.py -q
-Before: 2 failed in 0.63s. After: 2 passed (runner wall 2.3s).
-cd /srv/ci/scratch/t_ae4a1556 && scripts/run_tests.sh tests/hermes_cli/test_kanban_lifecycle_entries.py -q
-Before: 2 failed in 1.18s.
-Combined current run:
-scripts/run_tests.sh tests/hermes_cli/test_kanban_lifecycle_entries.py tests/hermes_cli/test_kanban_schedule_atomic.py tests/hermes_cli/test_kanban_schedule_wake.py -q
-6 passed, 11 failed. The 11 failures are existing schedule-wake tests calling
-schedule_task without wake_at. These require intentional fixture/contract updates,
-not a relaxation of the new scheduling invariant. Other existing schedule callers
-were inventoried using search_files but not migrated yet.
-Local scripts/run_tests.sh was refused by local-suite-guard; did not bypass it.
-Remote runner used its own scrubbed temp HERMES_HOME. No live deviations.
+B — block contract
+block_task rejects a bare block only when a transition could enter blocked;
+missing/terminal/already-blocked/stale-run no-op behavior stays intact. A kind or
+explicit unblock_when predicate is required. Existing dashboard human actions use
+needs_input; old test fixtures now explicitly name that same human hold. Automatic
+breaker blocks remain untyped by design (existing supervisor classification path).
+The one-shot classifies legacy NULL-kind rows as needs_input, preserving the prior
+review resume phase. The separate sweep owns durable predicate recovery.
 
-Remaining work:
-B kind/predicate policy and red-first implementation; E resolution decision;
-A full writer audit and repair; C one-shot per-card map and operator visibility;
-D old fixture/caller migration, documentation, safe event-hold repair;
-one-shot dry-run/apply with reviewed manifests and before/after live counts;
-per-class commits, PR and exact-head CI.
+C — human-ready contract
+Persistent INSERT/status/assignee triggers move ready+human to todo and emit one
+needs_operator event. recompute_ready does not promote human implementation work,
+but does resume a dependency-gated human review back to review. Assigning a real
+worker makes the todo row promotable. Dry-run per-card manifest names every move.
+The prior census was C218, not the original task's 215; counts are not constants.
 
-Durability:
-Task-owned branch wt/t_ae4a1556 pushed to ANG-Ventures/hermes-agent (fork).
-No PR opened: incomplete implementation with known test failures.
-Remote test slice retained at /srv/ci/scratch/t_ae4a1556 for continuation.
+D — scheduling contract
+scheduled requires next_eligible_at or an explicit unblock_when: event:<name> line.
+The create-until INSERT carries its validated wake in the initial statement.
+schedule_task writes deadline atomically with the status/run close; CLI and API
+pass wake_at; dashboard single/bulk moves collect a deadline before sending.
+Raw SQL cannot clear a schedule's only exit. Repair adds event:parts-arrived to
+named card t_d394f63b; other legacy schedule defects become needs_input holds.
+
+E — root cause correction
+Both named children have after-merge edges, not ordinary blocks. Done or archived
+parent status deliberately does not release a recorded-PR prerequisite.
+Read-only _fleet_refs on production shows t_a9544cd6 (parent of t_88ae92c4) records
+BOTH hermes-home#8851 and #8993. REST: #8851 CLOSED/unmerged/draft, #8993 MERGED.
+#8851 was described as superseded only in prose; no routed_pr_superseded event
+replaced it. The all-recorded-PR gate therefore correctly never released this row.
+Its owner must explicitly replace #8851 with #8993 or waive; worker did neither.
+The other child's parent t_bbe87605 records #5971 CLOSED/unmerged.
+
+F — terminal prerequisite escalation
+Closed-unmerged recorded prerequisites triage todo/ready children with an explicit
+replacement-or-waiver reason and one after_merge_prerequisite_closed event. Edges
+remain after-merge. Open/unreadable prerequisites still wait; all merged refs still
+release to derived-from and normal recompute promotes. Both named live E rows
+currently meet F, not only t_a75816c1. This correction was posted to the operator.
+
+Repair operations (operator AFTER guard deployment)
+python -m hermes_cli.kanban_lifecycle_repair --db <board-path>
+Inspect the JSON per-card changes; default is dry-run with no schema changes.
+Repeat with --apply only after approval. Plans are regenerated inside a write lock;
+apply logs lifecycle_repaired per card and reports before/after. Idempotence and
+review-resume preservation tested on isolated SQLite. No worker live apply.
+
+Observed verification
+- Original D red: 2 failed; A/C red: 2 failed (prior run receipt on card).
+- F red: todo instead of triage; B red: DID NOT RAISE (prior run on card).
+- Fresh remote canonical runner: lifecycle/atomic schedule/after-merge 29 passed.
+- Normal-review double-event regression: offbox head ca2e589f notifier 2 failed,
+  home-route 1 failed; after fix those complete files 56 passed, 0 failed.
+- Lifecycle including current-run recovery + timed mint: 30 passed, 0 failed.
+- Tool/API/lifecycle group at b49b970e: 116 passed, 0 failed.
+- Exact-head full offbox receipts and any base attribution are posted on PR #126;
+  a running receipt is not a green result. No CI success claimed here.
+
+Deviations: none. Runtime deploy and live repair are operator-owned.
