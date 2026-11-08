@@ -7705,6 +7705,13 @@ def _dispatch_once_locked(
                         _kb._append_event(conn, row["id"], "placement_gate_refused",
                                           {"layer": "0b", "host": placed_host.name, "cap": _gap})
                 continue
+        if placed_host is None:
+            # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
+            # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
+            _dest_wait = _kph.local_destination_wait(_pause_cache)
+            if _dest_wait is not None:
+                result.placement_waits[row["id"]] = _dest_wait
+                continue
         if _take_refusal is not None and placed_host is None:
             result.take_refusals[row["id"]] = _take_refusal
         if dry_run:
@@ -8144,6 +8151,11 @@ def _dispatch_once_locked(
         if _kb._card_skills_refused(conn, row["id"], row["assignee"], result, dry_run=dry_run):
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
+            continue
+        _dest_wait = (_kph.destination_wait(_review_origin_host.name, _pause_cache) if _review_origin_host is not None
+                      else _kph.local_destination_wait(_pause_cache))
+        if _dest_wait is not None:                         # FWA destination fence, review lane (fe6a1ad69c44)
+            result.placement_waits[row['id']] = _dest_wait
             continue
         if _review_origin_host is not None:
             _review_origin_host = spillover.take(row['assignee'], pin=_review_origin_host.name)

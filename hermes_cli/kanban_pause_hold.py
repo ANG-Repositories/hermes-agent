@@ -412,6 +412,24 @@ def destination_wait(host: Optional[str], cache: dict) -> Optional[str]:
     return None if hit is None else f"{hit[1][:-1]} stage=destination)"
 
 
+def local_host() -> str:
+    """The dispatcher's own host as an fwa directory name: ``socket.gethostname()`` short form, lower-cased. Its
+    registry aliases (``<kanban_home()>/config/fleet-hosts.json``) are resolved by :func:`_host_names`, so a hold
+    written under the canonical id (``mac-studio``, ``ci-box``) closes a local start too."""
+    import socket
+    try:
+        return socket.gethostname().split(".", 1)[0].strip().lower()
+    except OSError:
+        return ""
+
+
+def local_destination_wait(cache: dict) -> Optional[str]:
+    """:func:`destination_wait` for a LOCAL start (no pool host chosen: a local route or the last-resort fallback,
+    Prism fe6a1ad69c44). An unknown hostname is no destination check (the origin fence still applies)."""
+    host = local_host()
+    return destination_wait(host, cache) if host else None
+
+
 def held_destinations(names, cache: dict) -> dict:
     """``{host: reason}`` for every candidate pool host a live fwa hold closes to new kanban work this tick."""
     out = {}

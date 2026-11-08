@@ -23,6 +23,14 @@ from tests.hermes_cli.test_kanban_pause_hold import (  # noqa: F401  (fixtures +
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "fwa"
+
+
+@pytest.fixture(autouse=True)
+def _neutral_local_host(monkeypatch):
+    """The local destination fence reads socket.gethostname(): pin it to a name no fixture holds, so the suite does
+    not depend on which runner it lands on (a runner named ``ci`` is a ci-box alias in these fixtures)."""
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: "fwa-test-runner.lan")
 HID = "20261107T150000Z-ci-box-fwa00001"
 
 
@@ -624,3 +632,65 @@ def test_unheld_destination_pin_spawns(home):
         _hold(home, host="ace-ai")
         _res, spawned = _tick(conn, _plan())
         assert (tid, "ci-box") in spawned, spawned
+
+
+# -- round 3c (Prism round 2 @ 5ed8f821: fe6a1ad69c44) -----------------------------------------------------------------
+
+def _local_is(monkeypatch, name):
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: f"{name}.lan")
+
+
+@pytest.mark.parametrize("mkplan", PLANS)
+def test_held_local_host_refuses_a_local_start(home, monkeypatch, mkplan):
+    """fe6a1ad69c44: the dispatcher runs on ci-box, which carries a live fwa kanban hold; a portable card with no
+    origin must not start locally (local route, or last-resort fallback once the pool refuses)."""
+    _local_is(monkeypatch, "ci-box")
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "do the thing")
+        _hold(home)
+        res, spawned = _tick(conn, mkplan())
+        assert tid not in {t for t, _ in spawned}, spawned
+        why = res.placement_waits.get(tid, "")
+        assert why.startswith(f"pause_hold (ci-box:fwa:pause:{HID} ") and "stage=destination" in why, why
+        assert _runs(conn, tid) == 0
+
+
+def test_held_local_host_by_registry_alias_refuses_a_local_start(home, monkeypatch):
+    _registry(home, {"ci-box": {"aliases": ["ci"]}})
+    _local_is(monkeypatch, "ci")
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "do the thing")
+        _hold(home)
+        _res, spawned = _tick(conn, _plan())
+        assert tid not in {t for t, _ in spawned}, spawned
+
+
+def test_held_local_host_refuses_a_review_start(home, monkeypatch):
+    _local_is(monkeypatch, "ci-box")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="review", assignee="alpha", body="do the thing")
+        _set(conn, tid, status="review", origin_host=None)
+        _hold(home)
+        res, spawned = _tick(conn, _plan())
+        assert tid not in {t for t, _ in spawned}, spawned
+        assert "stage=destination" in res.placement_waits.get(tid, ""), res.placement_waits.get(tid)
+
+
+def test_unheld_local_host_starts_locally(home, monkeypatch):
+    _local_is(monkeypatch, "ace-media")
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "do the thing")
+        _hold(home)
+        _res, spawned = _tick(conn, _plan())
+        assert tid in {t for t, _ in spawned}, spawned
+
+
+def test_local_fence_is_off_under_the_kill_switch(home, monkeypatch):
+    _source(monkeypatch, "manifest")
+    _local_is(monkeypatch, "ci-box")
+    with kb.connect_closing() as conn:
+        tid = _unorigined(conn, "do the thing")
+        _hold(home)
+        _res, spawned = _tick(conn, _plan())
+        assert tid in {t for t, _ in spawned}, spawned
