@@ -53,6 +53,17 @@ def test_default_and_legacy_compatibility(tmp_path):
     assert generate(tmp_path, *legacy, '--self-hosted-last-n=0') == [HOSTED] * 6
 
 
+@pytest.mark.parametrize('event,same', [('push', 'false'), ('pull_request', 'false')])
+def test_plugin_scoped_matrix_obeys_last_n_and_trust(tmp_path, event, same):
+    plugin = next(p.name for p in sorted((ROOT / 'tests/plugins').iterdir())
+                  if p.is_dir() and any(p.glob('test_*.py')))
+    labels = generate(tmp_path, '--test-scope', f'plugin:{plugin}',
+                      '--self-hosted-last-n=1', '--self-hosted-labels', LOCAL,
+                      '--event', event, '--same-repo', same)
+    assert labels == ([HOSTED] * (len(labels) - 1) + [LOCAL]
+                      if event == 'push' else [HOSTED] * len(labels))
+
+
 def test_workflow_plumbing_and_matrix_have_independent_fork_guard():
     for filename in ('tests.yml', 'ci.yaml', 'ci-placement-probe.yml'):
         jobs = yaml.safe_load((ROOT / '.github/workflows' / filename).read_text())['jobs']
