@@ -90,23 +90,28 @@ def test_actual_pid_event_correlates_authorization(board, monkeypatch, route, en
     original = door.start
     monkeypatch.setattr(door, "start", lambda *a, **kw: original(*a, **kw, client=client))
     monkeypatch.setattr(dispatch, "_book_local_start", lambda *a: None)
-    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"]) as proc:
-        try:
-            state = dispatch._LaunchState()
-            assert dispatch._launch_claimed(board, task, "/scratch", board=None,
-                spawn=lambda *a: proc.pid, spawn_kwargs={}, host="ace-ai", pool=None,
-                placement_record=lambda: {"route_class": route, "entry": entry}, state=state) == dispatch._LAUNCH_OK
-            grant = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
-                                            (tid, door.EVENT)).fetchone()[0])
-            event = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='spawned'",
-                                            (tid,)).fetchone()[0])
-            assert event["unit_id"] == uid == grant["unit_id"]
-            assert event["reservation_id"] == grant["reservation_id"]
-            assert event["host"] == "ace-ai" and event["consumer"] == "kanban"
-            assert event["process_id"] == proc.pid and event["boundary"] == expected
-            assert grant["at"] <= event["at"] <= time.time() < grant["until"]
-            assert event["source_ref"].startswith("sha256:")
-        finally:
+    processes = []
+    def spawn(*args):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
+        processes.append(proc)
+        return proc.pid
+    try:
+        state = dispatch._LaunchState()
+        assert dispatch._launch_claimed(board, task, "/scratch", board=None,
+            spawn=spawn, spawn_kwargs={}, host="ace-ai", pool=None,
+            placement_record=lambda: {"route_class": route, "entry": entry}, state=state) == dispatch._LAUNCH_OK
+        grant = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                                        (tid, door.EVENT)).fetchone()[0])
+        event = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='spawned'",
+                                        (tid,)).fetchone()[0])
+        assert event["unit_id"] == uid == grant["unit_id"]
+        assert event["reservation_id"] == grant["reservation_id"]
+        assert event["host"] == "ace-ai" and event["consumer"] == "kanban"
+        assert event["process_id"] == processes[0].pid and event["boundary"] == expected
+        assert grant["at"] <= event["at"] <= time.time() < grant["until"]
+        assert event["source_ref"].startswith("sha256:")
+    finally:
+        for proc in processes:
             proc.terminate()
             proc.wait(timeout=5)
 
