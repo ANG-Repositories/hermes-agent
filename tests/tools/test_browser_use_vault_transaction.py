@@ -150,17 +150,31 @@ def test_supervisor_dispatch_rechecks_transaction_after_setup(monkeypatch, chang
 
 
 @pytest.mark.platforms('posix')
-def test_isolated_probe_real_installed_harness_ipc(monkeypatch, tmp_path):
+@pytest.mark.parametrize('layout', ['interpreter', 'pm-generation'])
+def test_isolated_probe_real_installed_harness_ipc(monkeypatch, tmp_path, layout):
     import socket
     import zipfile
     import tempfile
     from pathlib import Path
     wheel = Path(__file__).resolve().parents[2] / 'deps/browser_harness-0.1.13-py3-none-any.whl'
+    from pm import environments
+    monkeypatch.setattr(environments, 'dependency_home_root', lambda: tmp_path / 'home')
+    project = Path(t.__file__).resolve().parents[1]
     site = tmp_path / 'site'
+    if layout == 'pm-generation':
+        generation = environments.install_state_dir(project) / 'environments' / 'synthetic' / 'venv'
+        generation.mkdir(parents=True)
+        (generation / 'pyvenv.cfg').write_text(
+            f'version = {sys.version_info.major}.{sys.version_info.minor}.0\n')
+        site = environments.site_packages(generation)
+        environments.runtime_facts_path(project).write_text(json.dumps(
+            {'packages': {'venv': {'environment': str(generation)}}}))
     if wheel.exists():
         with zipfile.ZipFile(wheel) as archive:
             archive.extractall(site)
     else:
+        if layout == 'pm-generation':
+            pytest.skip('PM generation fixture requires optional browser-harness wheel')
         from importlib.metadata import distribution, PackageNotFoundError
         try:
             site = Path(distribution('browser-harness').locate_file(''))
@@ -183,11 +197,24 @@ def test_isolated_probe_real_installed_harness_ipc(monkeypatch, tmp_path):
                 conn.sendall(json.dumps(reply).encode() + b'\n')
     thread = threading.Thread(target=serve)
     thread.start()
-    monkeypatch.setattr('sysconfig.get_path', lambda _: str(site))
+    if layout == 'pm-generation':
+        assert environments.committed_venv(project) == generation
+        marker = tmp_path / 'executed'
+        spoof = tmp_path / 'untrusted'
+        spoof.mkdir()
+        (spoof / 'browser_harness.py').write_text(
+            f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+        monkeypatch.chdir(spoof)
+        monkeypatch.setenv('PYTHONPATH', str(spoof))
+        monkeypatch.setattr('sysconfig.get_path', lambda _: str(tmp_path / 'empty-store-site'))
+    else:
+        monkeypatch.setattr('sysconfig.get_path', lambda _: str(site))
     route = t.BrowserUseRoute({'BU_NAME': 'scoped', 'BH_RUNTIME_DIR': str(runtime),
-        'BH_TMP_DIR': str(runtime)}, 'ws://synthetic', False)
+        'BH_TMP_DIR': str(runtime), 'PYTHONPATH': str(tmp_path / 'untrusted')}, 'ws://synthetic', False)
     try:
         assert t.selected_target(route) == (123, 'login')
+        if layout == 'pm-generation':
+            assert not marker.exists()
         thread.join(5)
         assert requests == ['ping', 'current_tab']
     finally:

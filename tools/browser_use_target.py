@@ -98,10 +98,18 @@ def selected_target(route):
     import sysconfig
     if not route.cdp_url or not route.ready:
         raise RuntimeError("Browser Use target unavailable; run browser_exec on a CDP-routed browser first")
-    roots = {sysconfig.get_path(key) for key in ("purelib", "platlib")}
-    bundle = Path(__file__).resolve().parents[2] / "venv"
-    roots.update(str(p) for p in (bundle / "Lib" / "site-packages",
-        bundle / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages") if p.is_dir())
+    from pm.environments import committed_venv, site_packages
+
+    environment = committed_venv(Path(__file__).resolve().parents[1])
+    if environment is not None:
+        # PM store Python keeps sys.prefix unchanged. Trust the install's committed
+        # dependency record, never inherited PYTHONPATH or a cwd-discovered package.
+        roots = {str(site_packages(environment))}
+    else:
+        roots = {sysconfig.get_path(key) for key in ("purelib", "platlib")}
+        bundle = Path(__file__).resolve().parents[2] / "venv"
+        roots.update(str(p) for p in (bundle / "Lib" / "site-packages",
+            bundle / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages") if p.is_dir())
     env = {k: v for k, v in route.env.items() if not k.startswith("PYTHON")}
     proc = subprocess.run([sys.executable, "-I", "-c", _PROBE, json.dumps(sorted(roots))],
                           env=env, stdin=subprocess.DEVNULL,
