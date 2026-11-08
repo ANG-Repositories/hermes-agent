@@ -45,3 +45,18 @@ def test_untyped_block_requires_a_recovery_predicate(conn):
     with pytest.raises(kb.BlockRefused, match="kind|unblock_when"):
         kb.block_task(conn, tid, reason="stuck")
     assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_legacy_repair_is_dry_run_first_and_idempotent(conn):
+    from hermes_cli.kanban_lifecycle_repair import repair
+
+    conn.execute("DROP TRIGGER tasks_human_ready_insert")
+    conn.execute("DROP TRIGGER tasks_human_ready_update")
+    tid = kb.create_task(conn, title="Legacy operator", assignee="human:apollo")
+    conn.commit()
+    assert repair(conn)["before"] == 1
+    assert kb.get_task(conn, tid).status == "ready"
+    report = repair(conn, apply=True)
+    assert (report["before"], report["after"]) == (1, 0)
+    assert kb.get_task(conn, tid).status == "todo"
+    assert repair(conn, apply=True)["before"] == 0

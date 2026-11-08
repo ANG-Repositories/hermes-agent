@@ -36,6 +36,18 @@ def install(conn: sqlite3.Connection) -> None:
             END
         """)
     conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS tasks_review_handoff_insert
+        AFTER INSERT ON tasks
+        WHEN NEW.status = 'review'
+        BEGIN
+            INSERT INTO task_events(task_id, kind, payload, created_at)
+            VALUES(NEW.id, 'review_requested', json_object(
+                'implementer', COALESCE(NEW.assignee, 'human:operator'),
+                'reviewer', NEW.assignee, 'source', 'lifecycle_entry_repair'),
+                CAST(strftime('%s','now') AS INTEGER));
+        END
+    """)
+    conn.execute("""
         CREATE TRIGGER IF NOT EXISTS tasks_review_handoff
         AFTER UPDATE OF status ON tasks
         WHEN NEW.status = 'review' AND OLD.status != 'review'
