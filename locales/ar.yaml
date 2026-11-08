@@ -917,8 +917,11 @@ gateway:
     action_shutting_down: "قيد إيقاف التشغيل"
     action_restarting: "قيد إعادة التشغيل"
     cron_interrupted: "⚠️ قُطعت المهمة المجدولة '{job}' لأن Hermes {action}؛ لا نتيجة لهذا التشغيل. ستعمل مجددًا في موعدها، أو شغّلها الآن بـ `hermes cron run {job}` بعد عودة Hermes."
-    notice_shutdown: "⚠️ Hermes قيد إيقاف التشغيل — ستُقطع مهمتك الحالية. عند عودته إلى الاتصال، أرسل أي رسالة وسأحاول المتابعة من حيث توقفنا."
-    notice_restart: "⚠️ Hermes قيد إعادة التشغيل — ستُقطع مهمتك الحالية. أرسل أي رسالة بعد إعادة التشغيل وسأحاول الاستئناف من حيث توقفت."
+    notice_shutdown: "⚠️ يجري إيقاف Hermes."
+    notice_restart: "⚠️ تجري إعادة تشغيل Hermes."
+    active_interruption: "قد تنقطع مهمتك الحالية."
+    continue_prompt: "إذا عاد Hermes إلى الاتصال، يمكنك طلب متابعة العمل الذي انقطع."
+    continue_auto: "إذا عاد Hermes إلى الاتصال وسمحت فحوص الاستعادة بذلك، فقد يستمر العمل الذي انقطع تلقائيًا."
   startup:
     handoff_thread_title: "Hermes — {title}"
     restarted: "♻ أُعيد تشغيل البوّابة بنجاح. جلستك مستمرة."

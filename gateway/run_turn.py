@@ -224,6 +224,7 @@ class GatewayTurnMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
         persisted_route_lookup: Optional["PersistedSessionRouteLookup"] = None,
+        background: bool = False,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -244,7 +245,8 @@ class GatewayTurnMixin:
         # Every exit path starts clean: the /model-override fast path returns before the pop below,
         # and hygiene/inbound callers resolve without a turn runner consuming the stash — a stale
         # notice must never attach to another session's next turn (#74349).
-        self._pre_agent_fallback_notice = None
+        if not background:
+            self._pre_agent_fallback_notice = None
 
         persisted_identity = None
         route_lookup = None
@@ -338,15 +340,17 @@ class GatewayTurnMixin:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
         # runner surfaces it through the agent's one-shot fallback notice (#74349).
-        self._pre_agent_fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+        fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
             model = runtime_model
-        if unavailable_override and not self._pre_agent_fallback_notice:
+        if unavailable_override and not fallback_notice:
             from hermes_cli.fallback_config import pre_agent_fallback_notice
-            self._pre_agent_fallback_notice = pre_agent_fallback_notice(
+            fallback_notice = pre_agent_fallback_notice(
                 unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
+        if not background:
+            self._pre_agent_fallback_notice = fallback_notice
 
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
         if cfg and source is not None:

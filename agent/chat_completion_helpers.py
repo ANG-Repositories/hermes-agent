@@ -3753,6 +3753,10 @@ def _same_provider_entry(agent, fb: Dict[str, Any]) -> bool:
     return bool(cur_provider) and fb_provider == cur_provider
 
 
+from agent.route_snapshot import route_mutation
+
+
+@route_mutation
 def try_activate_fallback(
     agent,
     reason: "FailoverReason | None" = None,

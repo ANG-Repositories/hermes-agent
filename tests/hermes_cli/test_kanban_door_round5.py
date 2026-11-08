@@ -378,7 +378,8 @@ def test_a_stale_record_entry_on_an_unreachable_host_is_dropped_never_latched(do
             assert priority.publish_waiting(conn, {}) == {}
             assert faults.latched() is None, faults.latched()
         assert door.load_published(conn) == set()
-    dropped = [r for r in caplog.records if "dropped published unit" in r.getMessage()]
+    message = "dropped published unit" if lost == "host_left_table" else "pending withdrawal of published unit"
+    dropped = [r for r in caplog.records if message in r.getMessage()]
     assert len(dropped) == 1 and uid in dropped[0].getMessage()
 
 

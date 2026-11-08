@@ -121,14 +121,24 @@ def load_published(conn) -> set:
         return set()
 
 
-def save_published(conn, units) -> None:
+def load_pending_withdrawals(conn) -> list:
+    try:
+        return json.loads(_published_path(conn).read_text(encoding="utf-8-sig")).get("pending_withdrawals", [])
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def save_published(conn, units, *, pending_withdrawals=None) -> None:
     import os
     import tempfile
+    if pending_withdrawals is None:
+        pending_withdrawals = load_pending_withdrawals(conn)
     path = _published_path(conn)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".published.")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"units": sorted([h, u] for h, u in units)}, fh)
+        json.dump({"units": sorted([h, u] for h, u in units),
+                   "pending_withdrawals": pending_withdrawals}, fh)
     os.replace(tmp, path)
 
 
@@ -166,7 +176,9 @@ def enqueue_here(client, conn, hid, uid):
             raise
         receipt = client.enqueue("kanban", hid, uid, *need())
     units.add((hid, uid))
-    save_published(conn, units)
+    # This pair is wanted again; an old auth-refused withdrawal must not remove the renewed unit next tick.
+    pending = [p for p in load_pending_withdrawals(conn) if (p["host"], p["unit_id"]) != (hid, uid)]
+    save_published(conn, units, pending_withdrawals=pending)
     return receipt
 
 
