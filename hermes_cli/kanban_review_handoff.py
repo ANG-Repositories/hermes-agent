@@ -12,7 +12,6 @@ def record_reopened_candidate(conn, task_id, *, actor, reviewer, reason, run_id)
         (task_id, run_id),
     ).fetchone() if run_id is not None else None
     row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    reviewer = reviewer or kb._nonblank_str(row["assignee"])
     implementer = kb._nonblank_str(run["profile"]) if run is not None else None
     if implementer is None or kb.is_human_reviewer(implementer) or implementer == reviewer:
         implementer = kb._nonblank_str(payload.get("implementer"))
@@ -22,6 +21,9 @@ def record_reopened_candidate(conn, task_id, *, actor, reviewer, reason, run_id)
         implementer = kb._nonblank_str(row["assignee"])
     if implementer is None or kb.is_human_reviewer(implementer) or implementer == reviewer:
         raise ValueError("review reopen requires a non-reviewer implementer binding")
+    # Retaining the implementer as assignee is not a new reviewer assignment.
+    # Record the effective lane owner without rejecting that existing binding.
+    reviewer = reviewer or kb._nonblank_str(row["assignee"])
     metadata = kb._json_dict(run["metadata"]) if run is not None else {}
     # Candidate identity is indivisible: a partial new identity must never pick
     # up the other half from an older review.
