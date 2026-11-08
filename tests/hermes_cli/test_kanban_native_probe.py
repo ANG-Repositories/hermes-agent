@@ -40,3 +40,19 @@ def test_missing_pressure_does_not_shift_native_header(tmp_path):
     assert not error
     assert sample.remote_now is not None
     assert sample.pressure_text == ""
+
+
+def test_darwin_maps_only_default_linux_pressure_path(tmp_path):
+    import sys
+    if sys.platform != "darwin":
+        pytest.skip("Darwin path projection")
+    target = tmp_path / ".local/share/placement/host-pressure.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"at": 123}')
+    host = pool.PoolHost(name="native", ssh_host="unused", slots=None, ssh_user="kanbanw", capacity_pct=.9, absence="required", profiles=(), state="active", enabled=True, priority=0)
+    def runner(argv, **kwargs):
+        import os
+        return subprocess.run(argv[-1], shell=True, env={**os.environ, "HOME": str(tmp_path)}, **kwargs)
+    sample, error = pool._probe_once(host, runner, pressure_path="/var/lib/placement/host-pressure.json")
+    assert not error
+    assert json.loads(sample.pressure_text)["at"] == 123
