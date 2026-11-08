@@ -29,6 +29,14 @@ may carry `scan` (dirs, "." = whole tree); `library` is required (repo paths of 
 Absent scan uses hermes-home's defaults below. scripts/admission-decider-census.py sums the four baselines into one line.
 
   admission-decider-lint.py [--root DIR] [--update] [--base-ref SHA]
+
+Standalone setup (CI uses the same pinned manifest):
+  python3 -m venv .venv-admission
+  .venv-admission/bin/python -m pip install -r scripts/admission-decider-requirements.txt
+  .venv-admission/bin/python scripts/admission-decider-lint.py
+Vendored callers use .github/router-core/ for both paths. JS/TS/TSX require the
+MIT-licensed tree-sitter dependencies; missing parsers and invalid syntax abort.
+Go retains the conservative historical line scanner, not the JavaScript grammar.
 """
 from __future__ import annotations
 
@@ -58,7 +66,7 @@ OPERAND = r"(?:[^\n=;<>]|>>|<<){0,40}?"
 RX = re.compile(METRIC + OPERAND + OP + r"|" + OP + OPERAND + METRIC +
                 r"|\bncpu\s*//\s*\d|\bos\.getloadavg\(")
 SKIP = re.compile(r"(^|/)(tests?|fixtures|\.venv)/|(^|/)test_[^/]*$|_test\.py$|selftest"
-                  r"|\.(md|json|ya?ml|txt|golden|plist|service|timer|conf|nft|env)$")
+                  r"|\.(?:test|spec)\.[cm]?[jt]sx?$|\.(md|json|ya?ml|txt|golden|plist|service|timer|conf|nft|env)$")
 WAIVER = "admission-lint: not-a-decider"
 # the lint and its census, wherever a repo keeps them (their regex/doc text matches RX)
 SELF = frozenset({"scripts/admission-decider-lint.py", "scripts/admission-decider-census.py",
@@ -129,6 +137,8 @@ def hits_in(text: str, lang: str = "py") -> int:
     # triple-quote state is carried ACROSS lines so string bodies never count delimiters; (b) a join that never
     # closes is UNWOUND: the buffered physical lines are counted singly (the pre-join behaviour), never once.
     # Undercounting is the failure the ratchet exists to prevent, so the fallback errs toward counting.
+    if lang in ("c", "js", "ts", "tsx"):
+        return _js_hits(text, lang)
     n = 0
     buffered: list[str] = []
     bares: list[str] = []
@@ -158,6 +168,70 @@ def hits_in(text: str, lang: str = "py") -> int:
     if buffered:
         n += _count_unwound(buffered, bares) if depth > 0 else _count_joined(buffered, bares)
     return n
+
+
+def _js_hits(text: str, lang: str) -> int:
+    """Parse JS/TS statements; never guess ASI, template, or shift-token boundaries.
+
+    One hit per statement (control conditions own their hit, not their bodies).
+    Comments and literal text are not executable metric operands. Go deliberately
+    retains the pre-parser conservative scanner via its separate language tag.
+    """
+    try:
+        from tree_sitter import Language, Parser
+        if lang in ("ts", "tsx"):
+            import tree_sitter_typescript as grammar
+            capsule = grammar.language_tsx() if lang == "tsx" else grammar.language_typescript()
+        else:
+            import tree_sitter_javascript as grammar
+            capsule = grammar.language()
+        parser = Parser(Language(capsule))
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        raise ScanError("unsupported JS/TS parser; install admission-decider-requirements.txt "
+                        f"in an isolated environment ({exc})") from exc
+    source = text.encode("utf-8")
+    root = parser.parse(source).root_node
+    if root.has_error:
+        raise ScanError(f"unreadable {lang} syntax: tree-sitter rejected source")
+    lines = text.splitlines()
+    owners = set()
+    statements = {"expression_statement", "lexical_declaration", "variable_declaration",
+                  "return_statement", "throw_statement", "if_statement", "while_statement",
+                  "do_statement", "for_statement", "switch_statement"}
+    literals = {"string", "string_fragment", "comment", "regex"}
+
+    def metric(node):
+        stack = [node]
+        while stack:
+            item = stack.pop()
+            if item.type in literals:
+                continue
+            if item.type in ("identifier", "property_identifier") and re.fullmatch(METRIC, item.text.decode()):
+                return True
+            stack.extend(item.named_children)
+        return False
+
+    stack = [(root, root)]
+    while stack:
+        node, owner = stack.pop()
+        if node.type in literals:
+            continue
+        if node.type in statements:
+            owner = node
+        if node.type == "binary_expression":
+            op = node.child_by_field_name("operator")
+            if op is not None and op.text in (b">", b"<", b">=", b"<=") and metric(node):
+                # A waiver belongs only to the owning statement, including its
+                # trailing comment, never a sibling inside an enclosing callback.
+                end = owner.end_point.row
+                if owner.type in ("if_statement", "while_statement", "do_statement", "for_statement", "switch_statement"):
+                    condition = owner.child_by_field_name("condition")
+                    if condition is not None:
+                        end = condition.end_point.row
+                if not any(WAIVER in line for line in lines[owner.start_point.row:end + 1]):
+                    owners.add((owner.start_byte, owner.end_byte))
+        stack.extend((child, owner) for child in node.named_children)
+    return len(owners)
 
 
 def _count_singly(lines) -> int:
@@ -316,15 +390,15 @@ def _blank_quotes_and_comment(code: str, lang: str = "py") -> str:
             break
         if lang == "sh" and c == "#" and (i == 0 or code[i - 1] in " \t;(") :
             break
-        if lang == "c" and code.startswith("//", i):
+        if lang in ("c", "go") and code.startswith("//", i):
             break
         out.append(c)
         i += 1
     return "".join(out)
 
 
-_LANG_BY_SUFFIX = {".py": "py", ".sh": "sh", ".bash": "sh", ".zsh": "sh", ".js": "c", ".ts": "c", ".go": "c",
-                   ".mjs": "c", ".cjs": "c"}
+_LANG_BY_SUFFIX = {".py": "py", ".sh": "sh", ".bash": "sh", ".zsh": "sh", ".js": "js", ".ts": "ts", ".go": "go",
+                   ".mjs": "js", ".cjs": "js", ".jsx": "js", ".tsx": "tsx"}
 
 
 def _lang_of_text(rel, raw: bytes) -> str:
@@ -373,7 +447,10 @@ def scan(root: Path, scan_dirs=SCAN, library=LIBRARY, require_git=False) -> dict
             raise ScanError(f"{rel}: unreadable ({exc})") from exc
         if b"\0" in raw[:2048]:
             continue
-        n = hits_in(raw.decode("utf-8", errors="replace"), _lang_of_text(rel, raw))
+        try:
+            n = hits_in(raw.decode("utf-8", errors="replace"), _lang_of_text(rel, raw))
+        except ScanError as exc:
+            raise ScanError(f"{rel}: {exc}") from exc
         if n:
             out[rel] = n
     return out

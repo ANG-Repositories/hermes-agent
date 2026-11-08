@@ -1106,7 +1106,7 @@ export function GroupDialog({ bot, onClose }: GroupDialogProps) {
             value={name}
           />
           <Button disabled={!name.trim()} size="sm" type="submit">
-            Create & join
+            Create &amp; join
           </Button>
         </form>
         {current.length ? (

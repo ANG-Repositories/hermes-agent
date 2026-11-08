@@ -39,7 +39,7 @@ jobs:
       - name: admission-decider ratchet (no new host-load decider outside the ONE admission library; baseline only goes DOWN, t_22955b73)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PYTHON: uv run --no-project --python 3.11 python
+          PYTHON: uv run --no-project --python 3.11 --with-requirements .github/router-core/admission-decider-requirements.txt python
         run: |
           set -euo pipefail
           read -ra PY <<< "${PYTHON:-python3}"
