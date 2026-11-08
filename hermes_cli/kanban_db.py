@@ -10368,6 +10368,9 @@ def _open_review_run(
     if spawns and not operator_claim:
         from hermes_cli.kanban_pause_hold import refuse_if_held
         refuse_if_held(conn, task_id)
+        from hermes_cli.kanban_failure_ownership import recheck_for_claim
+        if recheck_for_claim(conn, task_id).action != 'claim':
+            return None
     cur = conn.execute(
         """
         UPDATE tasks

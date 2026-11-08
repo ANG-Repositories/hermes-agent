@@ -216,3 +216,96 @@ def test_real_32_process_four_producer_race(board):
         for child in children:
             if child.is_alive(): child.kill()
             child.join(timeout=5)
+
+
+def _crash_writer(path, root, boundary):
+    assert Path(path).resolve().is_relative_to(Path(root).resolve())
+    conn=kb.connect(Path(path))
+    obs=observation('crash')
+    ref=publish(conn,obs)
+    card=fo.prepare_card(conn,title='repair',body='action and acceptance',assignee=None,session_id='operator')
+    def trace(sql):
+        normalized=' '.join(sql.upper().split())
+        if boundary in normalized:
+            os.kill(os.getpid(),signal.SIGKILL)
+    conn.set_trace_callback(trace)
+    fo.observe_failure(conn,ref,producer='ci-red-owner',card_spec=card)
+    os.kill(os.getpid(),signal.SIGKILL)  # reply loss after commit
+
+
+@pytest.mark.parametrize('boundary',[
+    'INSERT OR IGNORE INTO FAILURE_KEYS', 'INSERT INTO FAILURE_OBSERVATIONS',
+    'INSERT INTO FAILURE_EPISODES', 'INSERT INTO FAILURE_MEMBERSHIPS',
+    'INSERT INTO FAILURE_BINDINGS', 'INSERT INTO TASKS', 'INSERT INTO TASK_EVENTS',
+    "UPDATE FAILURE_BINDINGS SET CARD_ID", 'INSERT INTO FAILURE_TRANSITIONS',
+    'UPDATE FAILURE_OBSERVATIONS SET DISPOSITION', 'COMMIT', 'REPLY_LOSS',
+])
+def test_sigkill_transaction_boundary_retry(board,boundary):
+    enroll(board)
+    path=board.execute('PRAGMA database_list').fetchone()[2]
+    ctx=multiprocessing.get_context('spawn')
+    child=ctx.Process(target=_crash_writer,args=(path,str(Path(path).parent),boundary))
+    try:
+        child.start()
+        child.join(timeout=90)
+        assert child.exitcode==-signal.SIGKILL
+        result=admit(board,observation('crash'))
+        assert result.action in ('REPAIR','REPLAY')
+        assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==1
+        assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0]==1
+        assert board.execute("SELECT count(*) FROM failure_bindings WHERE state='bound'").fetchone()[0]==1
+        assert board.execute('PRAGMA foreign_key_check').fetchall()==[]
+    finally:
+        if child.is_alive(): child.kill()
+        child.join(timeout=5)
+
+
+def test_diagnostic_separate_key_and_known_red_with_partial_read(board):
+    enroll(board)
+    red=admit(board,observation())
+    diagnostic=admit(board,replace(observation('infra'),key=key('tests/test_infra.py::runner_loss'),task_kind='diagnostic'))
+    assert diagnostic.action=='DIAGNOSTIC' and diagnostic.card_id!=red.card_id
+    admit(board,replace(observation('partial'),result='unknown',reason='HTTP 502'))
+    assert board.execute("SELECT count(*) FROM failure_episodes WHERE state='active'").fetchone()[0]==2
+    assert board.execute("SELECT task_kind FROM failure_bindings WHERE card_id=?",(diagnostic.card_id,)).fetchone()[0]=='diagnostic'
+
+
+def test_legacy_create_semantics_unchanged(board):
+    card=kb.create_task(board,title='human project',session_id='operator',session_explicit=True)
+    task = kb.get_task(board,card)
+    assert task is not None and task.title=='human project'
+    assert board.execute('SELECT count(*) FROM failure_bindings').fetchone()[0]==0
+
+
+def test_raw_unupgraded_writer_inert_and_floor(board):
+    path=board.execute('PRAGMA database_list').fetchone()[2]
+    old=sqlite3.connect(path)
+    try:
+        old.execute("INSERT INTO tasks(id,title,status,created_at) VALUES('manual','manual','ready',1)")
+        old.commit()
+        enroll(board)
+        with pytest.raises(sqlite3.IntegrityError,match='incompatible writer'):
+            old.execute("INSERT INTO tasks(id,title,status,created_at,created_by) VALUES('old-ci','old','ready',1,'ci-red-owner')")
+        old.rollback()
+        assert board.execute('SELECT count(*) FROM failure_write_context').fetchone()[0]==0
+    finally:
+        old.close()
+
+
+def test_public_claim_after_healing_no_allocation(board):
+    enroll(board)
+    red=admit(board,observation())
+    admit(board,observation('pass','pass','b',run_id=2))
+    assert kb.claim_task(board,red.card_id,claimer='scratch:1') is None
+    assert board.execute('SELECT count(*) FROM task_runs').fetchone()[0]==0
+
+
+def test_mint_cap_durable_pending(board,monkeypatch):
+    enroll(board)
+    def cap(conn,producer):
+        raise kb.MintCapError('test cap',producer,100,1)
+    monkeypatch.setattr(kb,'check_mint_cap',cap)
+    result=admit(board,observation())
+    assert result.action=='EVIDENCE_PENDING' and result.card_id is None
+    assert board.execute("SELECT reason FROM failure_bindings WHERE state='pending'").fetchone()[0]
+    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==0

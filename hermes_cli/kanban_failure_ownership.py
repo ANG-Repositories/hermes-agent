@@ -29,6 +29,8 @@ INSERT OR IGNORE INTO failure_authority VALUES(1,1,1,1,'preserve');
 CREATE TABLE IF NOT EXISTS failure_producers (
  producer TEXT PRIMARY KEY COLLATE BINARY, enabled INTEGER NOT NULL DEFAULT 0,
  enrolled INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS failure_write_context (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), protocol INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS failure_receipts (
  token TEXT PRIMARY KEY, digest TEXT NOT NULL, observation_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS failure_keys (
@@ -87,14 +89,9 @@ WHEN EXISTS(SELECT 1 FROM failure_producers WHERE enrolled=1)
  AND (NEW.created_by IN ('main-green-streak','ci-red-owner','main-tip-red','main_tip_red','landing-advisory','gate-C')
  OR NEW.signature GLOB 'main-tip-red:*' OR NEW.idempotency_key GLOB 'ci-red-owner:*'
  OR NEW.idempotency_key GLOB 'main-green-streak:*')
- AND failure_writer_protocol() < 1
+ AND NOT EXISTS(SELECT 1 FROM failure_write_context WHERE singleton=1 AND protocol>=1)
 BEGIN SELECT RAISE(ABORT,'failure_authority: incompatible writer; retain source retry'); END;
 """
-
-
-def install_marker(conn):
-    # Default deny on every board connection, including steady-state cached opens.
-    conn.create_function('failure_writer_protocol', 0, lambda: 0)
 
 
 def migrate(conn):
@@ -261,7 +258,7 @@ def _order(a,b,lineage):
 
 
 def _reduce(conn,key_id,obs_id,obs):
-    rows = conn.execute("SELECT obs_id,data FROM failure_observations WHERE key_id=? AND result IN ('failure','pass')", (key_id,)).fetchall()
+    rows = conn.execute("SELECT obs_id,data FROM failure_observations WHERE key_id=? AND result IN ('failure','pass') AND disposition NOT IN ('DISABLED','NO_ACTION')", (key_id,)).fetchall()
     values = [dict(json.loads(r['data']), obs_id=r['obs_id']) for r in rows]
     lineage = obs.lineage
     ambiguous = len(set(lineage)) != len(lineage) or any(
@@ -295,7 +292,7 @@ def _reduce(conn,key_id,obs_id,obs):
         return None
     # Preserve an active card through late-boundary reconstruction; terminal
     # cards are never recycled. Historical detached bindings remain tombstones.
-    transferable = conn.execute("SELECT b.* FROM failure_bindings b JOIN failure_episodes e USING(episode_id) JOIN tasks t ON t.id=b.card_id WHERE e.key_id=? AND b.state='bound' AND t.status NOT IN ('done','archived') ORDER BY b.binding_id DESC LIMIT 1", (key_id,)).fetchone()
+    transferable = conn.execute("SELECT b.* FROM failure_bindings b JOIN failure_episodes e USING(episode_id) JOIN tasks t ON t.id=b.card_id WHERE e.key_id=? AND e.state='active' AND b.state='bound' AND t.status NOT IN ('done','archived') ORDER BY b.binding_id DESC LIMIT 1", (key_id,)).fetchone()
     conn.execute("UPDATE failure_episodes SET state='healed' WHERE key_id=?", (key_id,))
     predecessor, active = None, None
     for segment in segments:
@@ -331,7 +328,7 @@ def _create_owner(conn,card,producer):
         raise ValueError('prepared card required')
     tid = kb._new_task_id()
     now = int(time.time())
-    conn.create_function('failure_writer_protocol',0,lambda:PROTOCOL)
+    conn.execute('INSERT INTO failure_write_context VALUES(1,?)',(PROTOCOL,))
     try:
         kb._insert_task_row(conn, {
             'id':tid,'title':card.title,'body':card.body,'assignee':card.assignee,
@@ -340,7 +337,7 @@ def _create_owner(conn,card,producer):
             'completion_contract':'local-only',
         })
     finally:
-        install_marker(conn)
+        conn.execute('DELETE FROM failure_write_context WHERE singleton=1')
     kb._append_event(conn,tid,'created',{'assignee':card.assignee,'status':'ready','failure_authority':PROTOCOL})
     return tid
 
@@ -424,7 +421,8 @@ def recheck_for_claim(conn,task_id,expected_revision=None):
     revision = max(r['revision'] for r in rows)
     if expected_revision is not None and expected_revision != revision:
         return Decision('retry',revision=revision,reason='episode revision changed')
-    if active or any(not r['detector_only'] for r in rows):
+    preserve = conn.execute("SELECT mode FROM failure_authority WHERE singleton=1").fetchone()[0] == 'preserve'
+    if active or preserve or any(not r['detector_only'] for r in rows):
         return Decision('claim',revision=revision)
     return Decision('healed',revision=revision,reason='all detector bindings healed or detached')
 
