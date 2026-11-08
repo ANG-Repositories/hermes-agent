@@ -54,6 +54,22 @@ def test_sendback_releases_no_worker(board, sendback):
     assert kb.claim_task(board, tid) is not None
 
 
+@pytest.mark.parametrize("target", ["human", None])
+def test_composed_sendback_preserves_nonworker_hold(board, target):
+    tid = kb.create_task(board, title="operator rework", assignee="builder")
+    run = kb.claim_task(board, tid)
+    assert kb.request_review(board, tid, summary="ready", reviewer="human",
+                             expected_run_id=run.current_run_id)
+    assert kb.set_no_worker(board, tid, True)
+    with kb.event_actor("apollo"):
+        assert kb.assign_task(board, tid, target, operator="apollo",
+                              request_changes_reason="operator will handle it")
+    task = kb.get_task(board, tid)
+    assert task.assignee == target
+    assert task.no_worker
+    assert not [e for e in kb.list_events(board, tid) if e.kind == "no_worker_cleared"]
+
+
 def test_stranded_flag_is_stale_and_once_per_episode(board):
     tid = kb.create_task(board, title="stranded", assignee="builder")
     assert kb.set_no_worker(board, tid, True)
