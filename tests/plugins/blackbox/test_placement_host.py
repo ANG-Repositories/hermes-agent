@@ -111,6 +111,25 @@ def test_spilled_worker_turn_carries_pool_host(db, no_worker_env, monkeypatch):
     assert _host(db, "turn_w") == "ci-box"
 
 
+def test_failed_placement_reapply_suppresses_live_host(db, no_worker_env, monkeypatch):
+    _worker(monkeypatch, placement_host="ci-box")
+    monkeypatch.setattr(kwh, "_reapply", {"failed": 0, "warned": False})
+    # Exercise the real failure path without writing to a live kanban board.
+    monkeypatch.setattr(kwh, "_record_reapply_failure", lambda count: None)
+    assert _build().placement_host == "ci-box"
+    assert kwh.reapply_or_record("terminal", environ={}) is None
+    assert kwh.reapply_failures() == 1
+    store.insert_turn(_build(turn_id="failed_reapply"))
+    assert _host(db, "failed_reapply") is None
+    # Recovery cannot make this mixed-host run safe to attribute retroactively.
+    assert kwh.reapply_or_record("terminal", environ={
+        kwh.PLACEMENT_ENV: json.dumps({
+            "host": "ci-box", "env": {"TERMINAL_ENV": "ssh"},
+        }),
+    }) == "ci-box"
+    assert _build().placement_host is None
+
+
 def test_boot_record_wins_over_mutated_env(no_worker_env, monkeypatch):
     _worker(monkeypatch, placement_host="ace-media")
     monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", "ci-box")

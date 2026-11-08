@@ -495,6 +495,10 @@ def _placement_host() -> str | None:
             return None
         from hermes_cli import kanban_worker_hosts as kwh
 
+        # A failed bridge reapply can run tools locally despite a remote boot
+        # placement. Mixed-host runs cannot truthfully carry a single host.
+        if kwh.reapply_failures():
+            return None
         return kwh.BOOT_PLACED_HOST or kwh.LOCAL_HOST_NAME
     except Exception:
         logger.debug("blackbox placement_host resolve failed", exc_info=True)
