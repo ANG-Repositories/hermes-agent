@@ -96,6 +96,8 @@ def gh_snapshot(path: str):
     argv = ["gh", "api", "--hostname", "github.com"]
     if timeline:
         argv += ["--paginate", "--slurp"]
+    if path == "graphql":
+        argv += ["-f", "query=query { viewer { databaseId } }"]
     try:
         proc = subprocess.run(argv + [path], stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=60,
@@ -198,9 +200,10 @@ def draft_at_round_start(task_id: str, run_id, records: dict, *, gh=None, draft:
         if pr.get("draft") is True:
             report[key] = "skip: already draft"   # a dead run's marked draft (adopted) or someone else's hold
             continue
-        actor = gh("user")
+        identity = gh("graphql")
+        actor_id = (((identity or {}).get("data") or {}).get("viewer") or {}).get("databaseId") if isinstance(identity, dict) else None
         before = latest_transition(gh, ref.repo, ref.number)
-        if not isinstance(actor, dict) or not actor.get("id"):
+        if not actor_id:
             report[key] = "skip: authenticated actor unavailable; operator handback required"
             continue
         if not draft(ref.repo, ref.number):
@@ -209,14 +212,14 @@ def draft_at_round_start(task_id: str, run_id, records: dict, *, gh=None, draft:
         transition = latest_transition(gh, ref.repo, ref.number)
         if (not transition or transition.get("event") != "convert_to_draft" or not transition.get("id")
                 or (before and transition.get("id") == before.get("id"))
-                or (transition.get("actor") or {}).get("id") != actor["id"]):
+                or (transition.get("actor") or {}).get("id") != actor_id):
             report[key] = "drafted; transition ownership unproved; operator handback required"
             _log.warning("round draft: %s %s", key, report[key])
             continue
         if persist is not None:
             try:
                 persist(key, {"run": str(run_id), "head": head, "at": time.time(),
-                              "transition_id": transition["id"], "actor_id": actor["id"]})
+                              "transition_id": transition["id"], "actor_id": actor_id})
             except Exception:  # noqa: BLE001 -- unpersisted mark = the handback treats the draft as a hold
                 _log.warning("round draft: persisting mark for %s failed", key, exc_info=True)
         posted = comment(ref.repo, ref.number, mark_line(run_id, head))

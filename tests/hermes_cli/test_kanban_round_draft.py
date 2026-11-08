@@ -27,7 +27,9 @@ def rig(monkeypatch):
 
     def gh(*args):
         if args[0] == "user":
-            return {"id": 7}
+            return None  # Installation token: GET /user returns 403.
+        if args[0] == "graphql":
+            return rd.gh_snapshot("graphql") if state.get("real_identity") else {"data": {"viewer": {"databaseId": 7}}}
         if args[0] == "repos/o/r/issues/1/timeline?per_page=100":
             return {"pages": [json.loads(json.dumps(state["events"]))]}
         if args[0] == "repos/o/r/pulls/1":
@@ -70,6 +72,29 @@ def test_round_start_drafts_own_ready_pr_and_marks_it(rig):
     assert rig.log == [("draft", "o/r", 1), ("comment", "o/r", 1, rd.mark_line(101, SHA))]
     assert rig.state["pr"]["draft"] is True
     assert rig.marks["o/r#1"]["run"] == "101" and rig.marks["o/r#1"]["head"] == SHA
+
+
+@pytest.mark.parametrize("viewer", [{"databaseId": 7}, {}, None])
+def test_installation_token_identity_uses_viewer_not_rest_user(rig, monkeypatch, viewer):
+    rig.state["real_identity"] = True
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[-1] == "user":
+            return SimpleNamespace(returncode=1, stdout="", stderr="Resource not accessible by integration (HTTP 403)")
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"data": {"viewer": viewer}}))
+
+    monkeypatch.setattr(rd.subprocess, "run", run)
+    assert rd.gh_snapshot("user") is None
+    report = rig.start(101)
+    if viewer and viewer.get("databaseId"):
+        assert report == {"o/r#1": "drafted + marked"}
+        assert rig.marks["o/r#1"]["actor_id"] == viewer["databaseId"]
+    else:
+        assert "operator handback required" in report["o/r#1"]
+        assert rig.log == [] and not rig.marks
+    assert calls[-1][-1] == "graphql"
 
 
 def test_forged_mark_comment_does_not_clear_an_operator_hold(rig):
@@ -214,7 +239,9 @@ def test_new_host_operations_are_pinned(monkeypatch):
                         SimpleNamespace(returncode=0, stdout='{"id":7}'))
     rd.gh_draft("o/r", 1)
     rd.gh_comment("o/r", 1, "receipt")
-    rd.gh_snapshot("user")
+    rd.gh_snapshot("graphql")
+    assert "query=query { viewer { databaseId } }" in calls[-1][0]
+    assert "--hostname" in calls[-1][0]
     assert all(kw["env"]["GH_HOST"] == "github.com" for _, kw in calls)
     assert calls[0][0][calls[0][0].index("--repo") + 1] == "https://github.com/o/r"
 
