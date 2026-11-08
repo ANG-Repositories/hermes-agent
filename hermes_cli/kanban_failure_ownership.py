@@ -436,15 +436,13 @@ def reconcile_pending(conn, *, producer, card_spec):
         enrollment = conn.execute('SELECT * FROM failure_producers WHERE producer=?',(producer,)).fetchone()
         if not enrollment or not enrollment['enabled'] or not enrollment['enrolled']:
             return ()
-        rows = conn.execute("SELECT e.*,o.data FROM failure_bindings b JOIN failure_episodes e USING(episode_id) JOIN failure_observations o ON o.obs_id=e.latest_failure_obs WHERE b.state='pending' AND e.state='active' ORDER BY b.binding_id LIMIT 32").fetchall()
+        rows = conn.execute("SELECT e.*,o.data,b.task_kind FROM failure_bindings b JOIN failure_episodes e USING(episode_id) JOIN failure_observations o ON o.obs_id=e.latest_failure_obs WHERE b.state='pending' AND e.state='active' AND json_extract(b.provenance_json,'$.producer')=? ORDER BY b.binding_id LIMIT 32", (producer,)).fetchall()
         results = []
         for row in rows:
             data = json.loads(row['data'])
             data['lineage'] = tuple(data['lineage'])
+            data['task_kind'] = row['task_kind']
             obs = Observation(**data)
-            provenance = conn.execute("SELECT provenance_json FROM failure_bindings WHERE episode_id=? AND state='pending'",(row['episode_id'],)).fetchone()
-            if json.loads(provenance[0]).get('producer') != producer:
-                continue
             results.append(_bind(conn,row,obs,card_spec,producer))
         return tuple(results)
 
@@ -475,10 +473,14 @@ def detach_owner(conn,episode_id,*,expected_revision,reason):
         e = conn.execute('SELECT * FROM failure_episodes WHERE episode_id=?',(episode_id,)).fetchone()
         if not e or e['revision'] != expected_revision:
             return Decision('retry')
+        binding = conn.execute("SELECT * FROM failure_bindings WHERE episode_id=? AND state IN ('pending','bound')", (episode_id,)).fetchone()
+        if e['state']=='active' and binding is None:
+            return Decision('retry', reason='active responsibility missing')
         conn.execute("UPDATE failure_bindings SET state='detached',generation=generation+1,reason=? WHERE episode_id=? AND state IN ('pending','bound')",(reason,episode_id))
         conn.execute('UPDATE failure_episodes SET revision=revision+1 WHERE episode_id=?',(episode_id,))
         if e['state']=='active':
-            conn.execute("INSERT INTO failure_bindings(episode_id,state,provenance_json,task_kind,reason) VALUES(?,'pending','{}','repair',?)",(episode_id,reason))
+            conn.execute("INSERT INTO failure_bindings(episode_id,state,provenance_json,task_kind,detector_only,reason) VALUES(?,'pending',?,?,?,?)",
+                         (episode_id,binding['provenance_json'],binding['task_kind'],binding['detector_only'],reason))
         _transition(conn,e,None,'owner_detached',{'reason':reason})
         return Decision('EVIDENCE_PENDING',e['key_id'],episode_id,revision=expected_revision+1,reason=reason)
 

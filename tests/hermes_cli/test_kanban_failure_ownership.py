@@ -176,6 +176,57 @@ def test_pending_validation_never_claims_owned(board):
     assert fo.reconcile_pending(board,producer='ci-red-owner',card_spec=card)==()
 
 
+@pytest.mark.parametrize('task_kind', ['repair', 'diagnostic'])
+def test_detach_reconciles_without_new_observation(board, task_kind):
+    enroll(board)
+    obs = observation(task_kind=task_kind)
+    original = admit(board, obs)
+    binding = dict(board.execute("SELECT * FROM failure_bindings WHERE state='bound'").fetchone())
+    detached = fo.detach_owner(board, original.episode_id,
+                               expected_revision=original.revision, reason='replace owner')
+    assert detached.action == 'EVIDENCE_PENDING' and detached.card_id is None
+    pending = board.execute("SELECT * FROM failure_bindings WHERE state='pending'").fetchone()
+    assert pending['provenance_json'] == binding['provenance_json']
+    assert pending['task_kind'] == task_kind
+    assert pending['detector_only'] == binding['detector_only']
+    with kb.write_txn(board):
+        board.execute("UPDATE failure_producers SET enabled=0 WHERE producer='ci-red-owner'")
+    card = fo.prepare_card(board, title='replacement', body='action and acceptance',
+                           assignee=None, session_id='operator')
+    assert fo.reconcile_pending(board, producer='ci-red-owner', card_spec=card) == ()
+    with kb.write_txn(board):
+        board.execute("UPDATE failure_producers SET enabled=1 WHERE producer='ci-red-owner'")
+    assert admit(board, obs).action == 'REPLAY'
+    replacement, = fo.reconcile_pending(board, producer='ci-red-owner', card_spec=card)
+    assert replacement.action == task_kind.upper()
+    assert replacement.episode_id == original.episode_id
+    assert replacement.card_id != original.card_id
+    assert board.execute('SELECT count(*) FROM failure_observations').fetchone()[0] == 1
+    assert fo.reconcile_pending(board, producer='ci-red-owner', card_spec=card) == ()
+
+
+def test_pending_limit_is_per_producer(board, monkeypatch):
+    # Isolate the batch bound from the independent per-day mint cap.
+    monkeypatch.setenv('HERMES_KANBAN_MINT_CAP', '100')
+    enroll(board)
+    for index in range(33):
+        obs = replace(observation('backlog-' + str(index)), key=key('tests/test_backlog.py::test_' + str(index)))
+        result = fo.observe_failure(board, publish(board, obs), producer='ci-red-owner')
+        assert result.action == 'EVIDENCE_PENDING'
+    target = replace(observation('target'), key=key('tests/test_target.py::test_target'))
+    pending = fo.observe_failure(board, publish(board, target), producer='main-tip-red')
+    card = fo.prepare_card(board, title='repair', body='action and acceptance',
+                           assignee=None, session_id='operator')
+    result, = fo.reconcile_pending(board, producer='main-tip-red', card_spec=card)
+    assert result.episode_id == pending.episode_id and result.action == 'REPAIR'
+    first = fo.reconcile_pending(board, producer='ci-red-owner', card_spec=card)
+    assert len(first) == 32 and all(r.action == 'REPAIR' for r in first)
+    second, = fo.reconcile_pending(board, producer='ci-red-owner', card_spec=card)
+    assert second.action == 'REPAIR'
+    assert second.episode_id not in {r.episode_id for r in first}
+    assert board.execute("SELECT count(*) FROM failure_bindings WHERE state='pending'").fetchone()[0] == 0
+
+
 def test_publication_failure_no_receipt_or_owner(board,monkeypatch):
     def fail(*args):
         raise OSError('injected durable publication failure')
