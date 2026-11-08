@@ -263,3 +263,138 @@ async def test_shutdown_joins_pending_acquisition_and_cleanup(rig, monkeypatch):
         await stop
     assert not runner._active_session_release_tasks
 
+
+def _held_io_shutdown_child(home, mode, negative):
+    """Disposable process only: the registry barrier is NEVER released."""
+    import os
+    from pathlib import Path
+    from gateway import run_shutdown
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionStore, build_session_key
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    os.environ["HERMES_HOME"] = home
+    os.environ.pop("PYTEST_CURRENT_TEST", None)  # enable the real thread watchdog
+
+    async def exercise():
+        runner, adapter = make_restart_runner()
+        runner._restart_task = None
+        runner._restart_drain_timeout = 0
+        runner._active_session_leases = {}
+        runner.session_store = SessionStore(sessions_dir=Path(home) / "sessions", config=runner.config)
+        event = _make_event(text="held queue survives")
+        key = build_session_key(event.source)
+        runner.session_store.get_or_create_session(event.source)
+        runner._running_agents[key] = MagicMock()  # real active turn, not pending sentinel
+        runner._held_queues = {key: [event]}
+        adapter._pending_messages[key] = _make_event(text="adapter queue survives")
+        runner._clear_plugin_message_injector = lambda: None
+        runner._mark_api_runs_shutdown_requested = lambda: None
+        runner._notify_active_sessions_of_shutdown = AsyncMock()
+        runner._cancel_pending_boot_resumes_for_shutdown = AsyncMock()
+        runner._drain_active_agents = AsyncMock(return_value=([], False))
+        runner._active_cron_job_count = lambda: 0
+        runner._active_api_run_count = lambda: 0
+        runner._finalize_shutdown_agents = AsyncMock()
+        runner._cancel_process_completion_batch_tasks = AsyncMock()
+        # Only accelerate the leash in this child. Keep stop(), phase ordering,
+        # resume persistence, adapter teardown and watchdog hard-exit real.
+        run_shutdown._armed_watchdog_delay = lambda *a, **kw: 2.0
+        GatewayRunner._rearm_shutdown_watchdog = lambda *a, **kw: None
+        if negative == "no-watchdog":
+            os.environ["PYTEST_CURRENT_TEST"] = "negative control"
+        elif negative == "no-mark":
+            GatewayRunner._mark_running_sessions_resume_pending = AsyncMock(return_value=[])
+        elif negative == "no-spool":
+            runner._preserve_followup_across_restart = AsyncMock(return_value=False)
+        release_phase = GatewayRunner._stop_release_runtime_state
+        async def observed_release(self, ctx):
+            print("RELEASE_PHASE", flush=True)
+            await release_phase(self, ctx)
+        GatewayRunner._stop_release_runtime_state = observed_release
+
+        entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        def held_write(*args):
+            loop.call_soon_threadsafe(entered.set)
+            threading.Event().wait()  # deliberately infinite; parent kills on failure
+
+        if mode == "release":
+            lease, _ = await runner._claim_active_session_slot_off_loop(key, event.source)
+            assert lease is not None
+            active_sessions._write_entries = held_write
+            runner._release_active_session_lease(lease)
+        else:
+            active_sessions._write_entries = held_write
+            async def claim_owner():
+                await runner._claim_active_session_slot_off_loop(key, event.source)
+            owner = asyncio.create_task(claim_owner())
+            runner._background_tasks.add(owner)
+        await asyncio.wait_for(entered.wait(), 5)
+        print("IO_HELD", os.getpid(), flush=True)
+        await runner.stop(restart=True)
+        raise AssertionError("stop unexpectedly returned with registry I/O held")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("mode", ["acquire", "release"])
+@pytest.mark.parametrize("negative", ["", "no-watchdog", "no-mark", "no-spool"])
+def test_shutdown_watchdog_preserves_resume_and_spool(tmp_path, mode, negative):
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore, build_session_key
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    code = (
+        "from tests.gateway.test_active_session_lease_offload import _held_io_shutdown_child; "
+        "import sys; _held_io_shutdown_child(*sys.argv[1:])"
+    )
+    with subprocess.Popen(
+        [sys.executable, "-c", code, str(tmp_path), mode, negative],
+        cwd=Path(__file__).resolve().parents[2], env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as child:
+        # Import/setup time is not shutdown time, especially on loaded CI.
+        import selectors
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            if not selector.select(timeout=90):
+                child.kill()
+                out, err = child.communicate()
+                pytest.fail(f"child did not reach registry barrier: {out} {err}")
+            ready = child.stdout.readline()
+        try:
+            out, err = child.communicate(timeout=12)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            child.kill()
+            out, err = child.communicate()
+            timed_out = True
+    assert "IO_HELD" in ready, (ready, out, err)
+    assert "RELEASE_PHASE" in out, (out, err)
+    assert timed_out == (negative == "no-watchdog"), (out, err)
+    if timed_out:
+        print(f"pid={child.pid} mode={mode} negative=no-watchdog parent-killed-after=12s")
+        return
+    assert child.returncode == 1, (out, err)
+    dump = (tmp_path / "logs/gateway-shutdown-watchdog.log").read_text()
+    header = json.loads(dump.splitlines()[0])
+    assert header["event"] == "shutdown_watchdog_fired"
+    assert header["pid"] == child.pid
+    assert header["delay_s"] == 2.0
+    assert "_stop_impl" in dump
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.lookup_by_session_key(build_session_key(_make_event().source))
+    assert entry.resume_pending == (negative != "no-mark")
+    payloads = [p.read_text() for p in tmp_path.rglob("*.json")]
+    held = any("held queue survives" in p and "queue_held" in p for p in payloads)
+    adapter = any("adapter queue survives" in p for p in payloads)
+    assert held == adapter == (negative != "no-spool")
+    print(f"pid={child.pid} mode={mode} negative={negative or 'none'} exit=1 watchdog=2s resume={entry.resume_pending} held={held} adapter={adapter}")
+
