@@ -430,6 +430,25 @@ def observe_failure(conn, ref, *, producer, card_spec=None):
         return decision
 
 
+def reconcile_pending(conn, *, producer, card_spec):
+    """Bounded tick primitive; wiring to dispatcher is S4, not a new daemon."""
+    with write_txn(conn):
+        enrollment = conn.execute('SELECT * FROM failure_producers WHERE producer=?',(producer,)).fetchone()
+        if not enrollment or not enrollment['enabled'] or not enrollment['enrolled']:
+            return ()
+        rows = conn.execute("SELECT e.*,o.data FROM failure_bindings b JOIN failure_episodes e USING(episode_id) JOIN failure_observations o ON o.obs_id=e.latest_failure_obs WHERE b.state='pending' AND e.state='active' ORDER BY b.binding_id LIMIT 32").fetchall()
+        results = []
+        for row in rows:
+            data = json.loads(row['data'])
+            data['lineage'] = tuple(data['lineage'])
+            obs = Observation(**data)
+            provenance = conn.execute("SELECT provenance_json FROM failure_bindings WHERE episode_id=? AND state='pending'",(row['episode_id'],)).fetchone()
+            if json.loads(provenance[0]).get('producer') != producer:
+                continue
+            results.append(_bind(conn,row,obs,card_spec,producer))
+        return tuple(results)
+
+
 def record_verification(conn,ref,*,producer):
     return observe_failure(conn,ref,producer=producer)
 

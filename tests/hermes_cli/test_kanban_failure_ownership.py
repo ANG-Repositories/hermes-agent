@@ -4,6 +4,8 @@ import itertools
 import multiprocessing
 import os
 import signal
+import subprocess
+import sys
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -166,6 +168,10 @@ def test_pending_validation_never_claims_owned(board):
     assert result.action=='EVIDENCE_PENDING' and result.card_id is None
     assert board.execute("SELECT count(*) FROM failure_bindings WHERE state='pending'").fetchone()[0]==1
     assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==0
+    card=fo.prepare_card(board,title='repair',body='action and acceptance',assignee=None,session_id='operator')
+    results=fo.reconcile_pending(board,producer='ci-red-owner',card_spec=card)
+    assert len(results)==1 and results[0].action=='REPAIR'
+    assert fo.reconcile_pending(board,producer='ci-red-owner',card_spec=card)==()
 
 
 def test_publication_failure_no_receipt_or_owner(board,monkeypatch):
@@ -321,3 +327,15 @@ def test_mint_cap_durable_pending(board,monkeypatch):
     assert result.action=='EVIDENCE_PENDING' and result.card_id is None
     assert board.execute("SELECT reason FROM failure_bindings WHERE state='pending'").fetchone()[0]
     assert board.execute('SELECT count(*) FROM tasks').fetchone()[0]==0
+
+
+@pytest.mark.parametrize('arm',['atomic','crash'])
+def test_proof_entrypoint_real_execution(tmp_path,arm):
+    root=tmp_path/'proof'
+    script=Path(__file__).resolve().parents[2]/'scripts'/'failure-ownership-proof.py'
+    proc=subprocess.run([sys.executable,str(script),'--arm',arm,'--scratch',str(root)],
+                         stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=190)
+    assert proc.returncode==0,proc.stdout+proc.stderr+(root/'output.log').read_text()
+    summary=json.loads((root/'summary.json').read_text())
+    assert summary['exit_code']==0 and summary['pid']>0
+    print(json.dumps(summary))
