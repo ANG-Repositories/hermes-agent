@@ -99,7 +99,7 @@ def test_pin_refused_fails_without_unowned_replacement(monkeypatch):
             child = dt._build_child_agent(task_index=0, goal="verify", context=None, toolsets=None, model=None,
                 max_iterations=4, task_count=1, parent_agent=parent, inherit_mode="fork", inherit_parent_route=True)
             result = dt._run_single_child(0, "verify", child, parent)
-        assert result["status"] == "failed", result
+        assert result["status"] == "error", result
         assert len(captured) == 1 and len(requests) == 1
         from tools import delegate_tool_registry as registry
         with registry._active_subagents_lock:

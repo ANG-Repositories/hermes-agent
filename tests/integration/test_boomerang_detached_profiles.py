@@ -24,7 +24,8 @@ def test_detached_two_profile_process_isolation(tmp_path):
             home.mkdir()
             key = "SYNTHETIC-SECRET-" + name
             (home / ".env").write_text("OPENAI_API_KEY=" + key + "\n")
-            (home / "config.yaml").write_text("model:\n  provider: openai\n  default: wrong-current-default\n  base_url: " + base + "/wrong-default/v1\ndelegation:\n  model: wrong-worker-default\n  fallback_providers: []\n")
+            # Recovery may change model defaults, never the endpoint bound to this key.
+            (home / "config.yaml").write_text("model:\n  provider: openai\n  default: wrong-current-default\n  base_url: " + base + "/cross-vendor/v1\ndelegation:\n  model: wrong-worker-default\n  fallback_providers: []\n")
             p = SimpleNamespace(model="selected-" + name, provider="openai", requested_provider="openai",
                 api_mode="chat_completions", base_url=base + "/cross-vendor/v1", api_key=key,
                 request_overrides={}, _fallback_chain=[])

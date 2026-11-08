@@ -1205,11 +1205,13 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
 
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
                 text: Optional[str] = None) -> None:
-    """INV-6: one warning line + the original wake re-delivered, then terminal."""
-    await post_line(runner, entry, f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}")
-    ok = await resurface(runner, entry, text)
+    """Commit the original wake obligation before any best-effort delivery."""
+    handback = handback_row(entry, {"summary": reason},
+                            turn_text=text if text is not None else str(entry.get("wake_text") or ""))
+    handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="failed",
-                            reason=reason, resurfaced=True, resurface_delivered=ok)
+                            reason=reason, resurfaced=True, resurface_delivered=False, handback=handback)
+    await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
 
 
 # --- parent source (pass-1 R2) + the child ------------------------------------------------
@@ -1356,13 +1358,19 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
     from gateway import kanban_home_route as _hr
     from gateway import kanban_owner_wake as _ow
 
-    home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
-                                   entry.get("home_sid") or "", _hr.read_session_row)
-    if home is None:
-        await _fail(runner, entry, "home session not live here", state)
-        return
-    async with runner._async_profile_scope_for_source(home.origin):
-        await _run_entry_scoped(runner, entry, state)
+    try:
+        home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
+                                       entry.get("home_sid") or "", _hr.read_session_row)
+        if home is None:
+            raise RuntimeError("home session not live here")
+        async with runner._async_profile_scope_for_source(home.origin):
+            await _run_entry_scoped(runner, entry, state)
+    except Exception as exc:
+        live = await asyncio.to_thread(state.get_claim, entry["key"]) or entry
+        if live.get("state") not in (STATE_CANCELLED, STATE_TERMINAL):
+            await _fail(runner, live, f"dispatch failed: {exc}", state)
+        else:
+            await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
 
 
 async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState) -> None:

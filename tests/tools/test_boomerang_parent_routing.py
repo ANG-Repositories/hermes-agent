@@ -94,6 +94,7 @@ def test_recovered_routes_are_secret_free_and_session_isolated(monkeypatch):
     records = []
     for name in ("a", "b"):
         parent.requested_provider = name
+        parent.base_url = "http://" + name
         records.append(json.loads(json.dumps(persist_route(parent))))
     assert "SECRET-SENTINEL" not in json.dumps(records)
     calls = []

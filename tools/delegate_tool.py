@@ -2795,16 +2795,8 @@ def _run_single_child(
             if isinstance(_timeout_exc, ForkPinRefused):
                 log_ineligible("pin_refused", parent_agent, task_index=task_index,
                                delegation_id=getattr(child, "_delegation_id", None))
-                rebuild = child._fork_rebuild_args
-                _teardown(child, "fork pin refused")
-                folded = _build_child_preserving_parent_tools(**rebuild)
-                for attr in ("_delegation_id", "_delegate_output_schema", "_delegate_origin_ui_session_id",
-                             "_delegate_saved_tool_names"):
-                    if attr in vars(child):
-                        setattr(folded, attr, copy.deepcopy(vars(child)[attr]))
-                return _run_single_child(task_index, goal, folded, parent_agent,
-                    owner_session_id=owner_session_id, owner_transport=owner_transport,
-                    owner_session_record=owner_session_record, **_kwargs)
+                # Fail through normal teardown: replacing this child here would leave
+                # the dispatcher's stop closures and child list owning the old agent.
             # Timed out ≠ dead. A child still working (it made API calls or
             # has live descendants) keeps running; report TIMED_OUT_RUNNING
             # with live handles so the caller waits/steers instead of

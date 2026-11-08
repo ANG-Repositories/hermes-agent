@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
+from openai import OpenAI
 
 from gateway import kanban_boomerang_wake as wake
 from run_agent import AIAgent
@@ -117,7 +118,6 @@ def bounded_alarm():
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("scenario", ["summary", "downgrade", "busy", "cold", "detached", "active-fallback", "disabled", "auto-wake"])
 def test_real_boomerang_fails_over_to_wire_sentinel(monkeypatch, tmp_path, scenario):
-    from openai import OpenAI
     import model_tools
     import agent.auxiliary_client as auxiliary
     from gateway.config import GatewayConfig, Platform

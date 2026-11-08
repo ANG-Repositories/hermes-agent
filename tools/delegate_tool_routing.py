@@ -9,6 +9,20 @@ _ROUTING_FILTERS = frozenset({"providers_allowed", "providers_ignored", "provide
                              "provider_require_parameters", "provider_data_collection"})
 
 
+def _virtual_endpoint(provider, endpoint):
+    if provider == "moa":
+        return endpoint == "moa://local"
+    from providers import get_provider_profile
+    profile = get_provider_profile(provider)
+    if profile is None or profile.auth_type != "external_process":
+        return False
+    from urllib.parse import urlsplit
+    own = urlsplit(profile.base_url)
+    selected = urlsplit(endpoint)
+    return (own.scheme in ("acp", "acp+tcp") and selected.scheme == own.scheme
+            and bool(selected.hostname) and not selected.query and not selected.fragment)
+
+
 def _validate_policy(route):
     """Validate before credential lookup; empty is resolved-disabled, None is not."""
     chain = route.get("fallback_chain")
@@ -28,7 +42,8 @@ def _validate_policy(route):
             from urllib.parse import urlsplit
             try:
                 parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
-                valid = parsed and parsed.scheme in ("http", "https") and parsed.hostname and not parsed.fragment
+                valid = parsed and parsed.hostname and not parsed.fragment and (
+                    parsed.scheme in ("http", "https") or _virtual_endpoint(item.get("provider"), endpoint))
             except ValueError:
                 valid = False
             if not valid:
@@ -71,6 +86,8 @@ def recover_route_parent(parent, route):
     runtime = _resolve_runtime_agent_kwargs_for_provider(route["provider"], target_model=route["model"])
     if not runtime.get("api_key") or not runtime.get("base_url"):
         raise ValueError("boomerang routing-unavailable: credentials could not be resolved")
+    if route.get("base_url") and route["base_url"].rstrip("/") != runtime["base_url"].rstrip("/"):
+        raise ValueError("boomerang routing-unavailable: selected endpoint credentials could not be resolved")
     view = snapshot_parent(parent)
     view.model = route["model"]
     view.provider = runtime["provider"]
