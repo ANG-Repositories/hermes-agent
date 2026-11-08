@@ -1965,6 +1965,7 @@ def _build_child_agent(
     # The batch's live delegation id, when known at build time: only attributes the
     # ``boomerang.fork_ineligible`` line to its batch (fork-fan RC-8).
     delegation_id: Optional[str] = None,
+    inherit_parent_route: bool = False,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -2038,6 +2039,16 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
+    if inherit_parent_route:
+        from agent.route_snapshot import snapshot_parent
+        route_parent = snapshot_parent(parent_agent)
+        rt = _resolve_child_runtime(
+            route_parent, delegation_cfg, route_parent.api_key, model=None, override_provider=None,
+            override_base_url=None, override_api_key=None, override_api_mode=None,
+            override_acp_command=None, override_acp_args=None, routing_cfg={},
+        )
+        rt["fallback_model"] = copy.deepcopy(getattr(route_parent, "_fallback_chain", []))
+        override_request_overrides = copy.deepcopy(getattr(route_parent, "request_overrides", {}) or {})
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -2050,13 +2061,13 @@ def _build_child_agent(
     mode = None if materialized_prefill_messages is not None else _fork.resolve_inherit_mode(inherit_context, inherit_mode)
     if mode == "fork":
         # A fork FORCES the parent's lane/model/thinking/overrides, ignoring delegation.model/provider.
-        _fork_rt = _fork.build_fork_runtime(_resolve_child_runtime(
+        _fork_rt = _fork.build_fork_runtime(rt if inherit_parent_route else _resolve_child_runtime(
             parent_agent, delegation_cfg, parent_api_key, model=None, override_provider=None,
             override_base_url=None, override_api_key=None, override_api_mode=None,
             override_acp_command=None, override_acp_args=None, routing_cfg=routing_cfg,
-        ), parent_agent)
+        ), route_parent if inherit_parent_route else parent_agent)
         _ok, _reason = _fork.fork_eligible(parent_agent, _fork_rt, delegation_cfg)
-        if _ok:
+        if _ok and (inherit_parent_route or not any((model, override_provider, override_base_url))):
             rt = _fork_rt
         else:
             _fork.log_ineligible(_reason, parent_agent, delegation_id=delegation_id, task_index=task_index)
@@ -4255,6 +4266,10 @@ def delegate_task(
 
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
+            from tools.delegate_tool_fork import resolve_inherit_mode
+            _task_inherits_route = bool(resolve_inherit_mode(
+                t.get("inherit_context", inherit_context), t.get("inherit_mode", inherit_mode),
+            )) and not (model or provider or credentials_cfg is not None)
             child = _build_child_preserving_parent_tools(
                 task_index=i,
                 goal=t["goal"],
@@ -4292,6 +4307,7 @@ def delegate_task(
                 ),
                 skills=(t.get("skills") if "skills" in t else skills),
                 delegation_id=live_deleg_id,
+                inherit_parent_route=_task_inherits_route,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command

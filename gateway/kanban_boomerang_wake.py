@@ -1240,15 +1240,17 @@ def _live_agent(runner: Any, session_key: str) -> tuple:
 def _db_parent(runner: Any, home: Any) -> Any:
     """Summary-mode parent when no idle live agent exists: an AIAgent on the gateway's runtime
     whose transcript is the session DB's (the v1 fold reads ``_session_messages``)."""
-    from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
     from run_agent import AIAgent
 
-    kw = dict(_resolve_runtime_agent_kwargs())
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=home.origin, session_key=home.session_key, background=True,
+    )
+    kw = dict(runtime)
     kw.pop("_fallback_notice", None)
-    kw.pop("capabilities", None)
     # The runtime kwargs carry no model unless a fallback route chose one; without it the child's
     # every turn sent model="" (400, puppet lane 2026-10-24). Same precedence as a gateway turn.
-    kw["model"] = kw.get("model") or _resolve_gateway_model()
+    kw["model"] = model
+    kw["fallback_model"] = runner._refresh_fallback_model()
     agent = AIAgent(**kw, session_id=getattr(home, "session_id", None), quiet_mode=True,
                     skip_memory=True, skip_context_files=True)
     agent._session_messages = runner.session_store.load_transcript(home.session_id)
@@ -1268,8 +1270,11 @@ async def resolve_parent(runner: Any, entry: dict, *, wait_s: float = PARENT_BUS
         raise RuntimeError("home session not live here")
     deadline = _time.monotonic() + wait_s
     waited_busy = False
+    live_parent = None
     while True:
         agent, busy = _live_agent(runner, home.session_key)
+        if agent is not None:
+            live_parent = agent
         if agent is not None and not busy:
             return agent, entry.get("mode") or "fork"
         if not busy or _time.monotonic() >= deadline:
@@ -1284,6 +1289,12 @@ async def resolve_parent(runner: Any, entry: dict, *, wait_s: float = PARENT_BUS
 
         log_ineligible("parent_busy" if (busy or waited_busy) else "no_live_parent",
                        SimpleNamespace(session_id=getattr(home, "session_id", None) or entry.get("home_sid")))
+    if live_parent is not None:
+        from agent.route_snapshot import snapshot_parent
+
+        parent = await asyncio.to_thread(snapshot_parent, live_parent)
+        parent._session_messages = await asyncio.to_thread(runner.session_store.load_transcript, home.session_id)
+        return parent, "summary"
     return await asyncio.to_thread(_db_parent, runner, home), "summary"
 
 
