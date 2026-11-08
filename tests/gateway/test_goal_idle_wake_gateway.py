@@ -213,7 +213,11 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
     async def handler(event):
         received.append(event)
         if outcome == "cap":
-            return await runner._handle_message(event)
+            reply = await runner._handle_message(event)
+            assert reply == runner._active_session_limit_message(key)
+            assert reply is not None
+            reached.set()
+            return reply
         reached.set()
         await release.wait()
         runner.hooks = SimpleNamespace(emit=AsyncMock())
@@ -243,6 +247,7 @@ async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypat
         else:
             release.set()
     await asyncio.gather(processing, return_exceptions=True)
+    assert reached.is_set()  # cap path reached the real rejection, not an earlier fixture error
     # Settlement may launch the persisted compare-and-refund as a tracked adapter task.
     while adapter._background_tasks:
         await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
