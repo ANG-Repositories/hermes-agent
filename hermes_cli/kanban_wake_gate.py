@@ -344,14 +344,19 @@ def _default_lane_probe(profile: str) -> Optional[str]:
         return None
     from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
     from hermes_cli.profiles import resolve_profile_env
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from tui_gateway.launch_profile_policy import launch_secret_scope
 
     home = resolve_profile_env(profile)
     home_token = set_hermes_home_override(home)
     try:
-        # Derived sources read scoped credentials as well as config. The control
-        # socket's service thread may carry no scope, or a different owner's.
-        secret_token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+        # Derived sources need the owner's credentials. Only the launch home
+        # may inherit its frozen env-only injection; secondary homes stay isolated.
+        if home.resolve() == get_process_hermes_home().resolve():
+            secrets = launch_secret_scope(home)
+        else:
+            secrets = build_profile_secret_scope(home)
+        secret_token = set_secret_scope(secrets, profile_home=str(home))
         try:
             fallback = _ph.available_profile_fallback(task, probes, cache, **kwargs)
         finally:

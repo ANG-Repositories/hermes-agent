@@ -292,6 +292,45 @@ def test_fallback_admission_binds_owner_scope_and_restores_caller(tmp_path, monk
         secret_scope.reset_multiplex_context(multiplex)
 
 
+def test_fallback_admission_preserves_frozen_launch_credentials(tmp_path, monkeypatch):
+    from agent import secret_scope
+    from hermes_cli import fallback_config, kanban_provider_health as health, profiles
+    from hermes_cli.kanban_wake_gate import _default_lane_probe
+    from tui_gateway import launch_profile_policy
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "config.yaml").write_text(
+        "model:\n  provider: zai\n  default: glm-5.1\n"
+        "fallback_providers:\n  - source: wake-launch-test\n")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("WAKE_LAUNCH_SECRET", "injected-at-launch")
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: launch)
+    monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
+    monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
+    monkeypatch.setattr(health, "configured_box_health", lambda: False)
+    monkeypatch.setattr(health, "_fetch", lambda *a: {"eligible_count": 0})
+    launch_profile_policy.capture_launch_env()
+    monkeypatch.setenv("WAKE_LAUNCH_SECRET", "poisoned-after-launch")
+    seen = []
+
+    def source(entry):
+        seen.append(secret_scope.get_secret("WAKE_LAUNCH_SECRET"))
+        return [{"provider": "deepseek", "model": "deepseek-v4-flash"}] if seen[-1] else []
+
+    monkeypatch.setitem(fallback_config._CHAIN_SOURCES, "wake-launch-test", source)
+    multiplex = secret_scope.set_multiplex_context(True)
+    caller = secret_scope.set_secret_scope(None)
+    try:
+        assert _default_lane_probe("default") is None
+        assert seen == ["injected-at-launch"]
+        assert secret_scope.current_secret_scope() is None
+    finally:
+        secret_scope.reset_secret_scope(caller)
+        secret_scope.reset_multiplex_context(multiplex)
+
+
 def test_cpu_max_interval_is_configurable(tmp_path):
     cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90, "cpu_max_interval": 30}}}
     cpu = CpuDelta(0.95)

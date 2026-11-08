@@ -23,6 +23,9 @@ configured/derived chains in the owning profile's home and secret scope, then
 restores both caller ContextVars even if source expansion raises. This matters
 for control-socket service threads that have no turn scope or carry another
 profile's scope; changing the home alone does not authorize derived sources.
+The launch home reuses `launch_secret_scope` so frozen env-only credentials
+survive multi-profile activation; secondary homes receive only their own files
+and external sources, never the launch environment.
 
 This is admission, NOT forced route installation. Do not stamp the selected
 health-check rung as a session override: the regular agent resolver still owns
