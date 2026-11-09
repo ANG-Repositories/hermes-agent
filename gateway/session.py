@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 _NEVER_PERSISTED_STUB_GRACE = timedelta(hours=24)
 
 
+def _write_all(fd: int, payload: bytes) -> None:
+    """``os.write`` until all of ``payload`` is written; a write that makes no progress raises."""
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if not written:
+            raise OSError(f"short write: {len(view)} of {len(payload)} bytes not written")
+        view = view[written:]
+
+
+def _fsync_dir(directory) -> None:
+    """fsync a directory so the entries created, renamed or removed in it are durable."""
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _hash_id(value: str) -> str:
     """Deterministic 12-char hex hash of an identifier."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
@@ -2447,6 +2466,15 @@ class SessionStore(
         (Prism r2 0cb938c88f46); the caller then waits for the full marker write instead.
         """
         directory = self._user_stop_intent_dir()
+        # Directories this call creates: each new entry is durable only once its PARENT is
+        # fsync'd (Prism r3 c-8ff907760b0b3857).
+        created = []
+        probe = directory
+        while not probe.exists():
+            created.append(probe)
+            if probe.parent == probe:
+                break
+            probe = probe.parent
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{self._user_stop_intent_prefix(session_key)}.{uuid.uuid4().hex[:12]}.json"
         tmp = path.with_suffix(".tmp")
@@ -2457,17 +2485,19 @@ class SessionStore(
         }).encode("utf-8")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            try:
+                _write_all(fd, payload)  # Prism r3 c-2dc0ab551bad124b: no silent short write
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
         os.replace(tmp, path)
         try:
-            dir_fd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            _fsync_dir(directory)
+            for made in created:
+                _fsync_dir(made.parent)
         except OSError:
             # The rename is not confirmed durable: do not claim it. Drop the file so a later
             # boot never applies an intent the caller was told failed, and let the caller fall
@@ -2478,11 +2508,18 @@ class SessionStore(
 
     @staticmethod
     def retire_user_stop_intent(path) -> None:
-        """Delete one intent once its marker write landed (best effort)."""
+        """Delete one intent once its marker write landed (best effort).
+
+        The directory is fsync'd after the unlink (Prism r3 c-1efe0292ac7e504a): a retirement
+        a crash can undo brings the intent back, and the next boot re-stops a session the user
+        resumed. Blocking I/O: callers on the event loop run this in an executor.
+        """
         try:
             Path(path).unlink(missing_ok=True)
+            _fsync_dir(Path(path).parent)
         except OSError:
-            logger.debug("user_stop intent retire failed for %s", path, exc_info=True)
+            logger.warning("user_stop intent retire not confirmed durable for %s", path,
+                           exc_info=True)
 
     def _retire_user_stop_intents_for_key(
         self, session_key: str, *, generation: Optional[int] = None,
@@ -2517,6 +2554,12 @@ class SessionStore(
                 removed += 1
             except OSError:
                 logger.debug("user_stop intent retire failed for %s", path, exc_info=True)
+        if removed:
+            try:
+                _fsync_dir(directory)  # Prism r3 c-1efe0292ac7e504a: durable retirement
+            except OSError:
+                logger.warning("user_stop intent retire not confirmed durable in %s", directory,
+                               exc_info=True)
         return removed
 
     def _apply_user_stop_intents_locked(self) -> None:
@@ -2553,7 +2596,7 @@ class SessionStore(
                 self.retire_user_stop_intent(path)
                 continue
             entry = self._entries.get(key)
-            if entry is None or (session_id and entry.session_id != session_id):
+            if entry is None or (session_id and not self._stop_applies_to_entry_locked(entry, session_id)):
                 if authoritative:
                     self.retire_user_stop_intent(path)
                 else:
@@ -2613,6 +2656,10 @@ class SessionStore(
         ``_save_lock``, held by whole-index rewrites), ``upsert_s`` (the SQLite UPSERT) and
         ``fallback_s`` (full rewrite after a failed upsert).
         """
+        def _outcome(value: str) -> None:
+            if timings is not None:
+                timings["outcome"] = value
+
         _t_lock = time.monotonic()
         with self._lock:
             if timings is not None:
@@ -2620,15 +2667,24 @@ class SessionStore(
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
+                _outcome("skipped_missing")
                 return False
-            if expected_session_id is not None and entry.session_id != expected_session_id:
+            if (expected_session_id is not None
+                    and not self._stop_applies_to_entry_locked(entry, expected_session_id)):
                 logger.info(
                     "Skipping user_stopped write for %s: key now routes to session %s, /stop "
                     "was for %s", session_key, entry.session_id, expected_session_id)
+                _outcome("skipped_route")
                 return False
+            if expected_session_id is not None and entry.session_id != expected_session_id:
+                # Compression continuation: the rowid was read from the pre-compression session,
+                # and the continuation's rows all sit above it, so it would read as "the user
+                # spoke after the stop". Stamp None, which the boot gate treats as fail-closed.
+                last_message_id = None
             fence = self._user_stop_fence_locked(session_key)
             if generation is not None:
                 if generation <= fence[1]:
+                    _outcome("fenced")  # the user resumed at this generation or later
                     return False
                 if generation < fence[0]:
                     # Writes land out of order: a newer stop already marked. Lowering the fence
@@ -2637,6 +2693,7 @@ class SessionStore(
                     # acknowledges /stop, so persist the newer marker first: that write may be
                     # deferred behind the save lock or may have failed.
                     self._save_entry(session_key, lock_held=True, timings=timings)
+                    _outcome("written_newer")
                     return True
                 fence[0] = int(generation)
             # An untracked stop (no generation) leaves the fence as is: never lowered.
@@ -2656,7 +2713,21 @@ class SessionStore(
             # back to the full rewrite. Live
             # 2026-11-08: the full _save made /stop wait 0.6-5.5 s behind other sessions' saves.
             self._save_entry(session_key, lock_held=True, timings=timings)
+        # ``_save_entry``'s deferred write ran at the ``with`` exit and raised on failure.
+        _outcome("written")
         return True
+
+    def _stop_applies_to_entry_locked(self, entry: "SessionEntry", stopped_session_id: str) -> bool:
+        """True when ``entry`` is the conversation a /stop for ``stopped_session_id`` ended.
+
+        Compression rotates the session id (``advance_compression_session`` / compression-tip
+        healing), so the compression tip of the stopped id is the same conversation (Prism r3
+        c-d9f504b2a0758b66). ``/new`` or ``/resume`` routes to an unrelated id: not the same.
+        """
+        if entry.session_id == stopped_session_id:
+            return True
+        tip = self._compression_tip_for_session_id(stopped_session_id)
+        return bool(tip) and tip != stopped_session_id and tip == entry.session_id
 
     def clear_stale_resume_pending(self, max_age_seconds: float) -> int:
         """Clear stale recovery markers without dropping session entries.

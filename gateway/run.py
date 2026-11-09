@@ -2355,6 +2355,10 @@ from gateway.run_turn_runner import TurnRunner
 
 logger = logging.getLogger(__name__)
 
+# ``SessionStore.mark_user_stopped`` outcomes after which a /stop's durable intent is spent: the
+# marker is durable, or the user resumed past the stop. Skips keep the intent (t_41843f70).
+_USER_STOP_SPENT_OUTCOMES = frozenset({"written", "written_newer", "fenced"})
+
 
 def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
     """Call ``fn``; return None on any Exception (debug-logged via ``debug_msg`` ``%s`` if given)."""
@@ -7861,20 +7865,7 @@ class GatewayRunner(
             session_id = None
         intent_path = None
         from agent.interrupt_compat import _accepts_keyword
-        _t_intent = time.monotonic()
-        writer = getattr(store, "write_user_stop_intent", None)
-        if callable(writer) and session_id:
-            try:
-                try:
-                    boot_id = self._current_boot_id()
-                except Exception:
-                    boot_id = None
-                _gen_kw = {"generation": generation} if _accepts_keyword(writer, "generation") else {}
-                intent_path = writer(session_key, session_id, boot_id=boot_id, **_gen_kw)
-            except Exception:
-                logger.warning("user_stop intent write failed for %s; /stop waits for the marker "
-                               "write instead", session_key, exc_info=True)
-        intent_frag = f"intent={1 if intent_path else 0} intent_s={time.monotonic() - _t_intent:.3f}"
+        _t_intent = time.monotonic()  # also the start of the _STOP_MARKER_WAIT_S budget
         note = getattr(store, "note_user_stop_pending", None)
         noted = False
         # The pending receipt is scoped to the session and generation this stop saw (Prism r2
@@ -7888,6 +7879,27 @@ class GatewayRunner(
                 noted = True
             except Exception:
                 logger.debug("user_stop pending note failed for %s", session_key, exc_info=True)
+        # The intent's mkdir/write/fsync/rename run in the executor, not on the event loop
+        # (Prism r3 c-8f4218c9f5df3ee0); its time counts against the same 0.5 s budget.
+        writer = getattr(store, "write_user_stop_intent", None)
+        if callable(writer) and session_id:
+            try:
+                boot_id = self._current_boot_id()
+            except Exception:
+                boot_id = None
+            _gen_kw = {"generation": generation} if _accepts_keyword(writer, "generation") else {}
+            try:
+                intent_path = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: writer(session_key, session_id, boot_id=boot_id, **_gen_kw))
+            except asyncio.CancelledError:
+                if noted:
+                    store.release_user_stop_pending(*_receipt)
+                raise
+            except Exception:
+                logger.warning("user_stop intent write failed for %s; /stop waits for the marker "
+                               "write instead", session_key, exc_info=True)
+        intent_s = time.monotonic() - _t_intent
+        intent_frag = f"intent={1 if intent_path else 0} intent_s={intent_s:.3f}"
         timings: dict = {}
         _mark = self._mark_user_stopped
         _kwargs: dict = {}
@@ -7895,7 +7907,22 @@ class GatewayRunner(
             _kwargs.update(generation=generation, timings=timings)
         if session_id and _accepts_keyword(_mark, "expected_session_id"):
             _kwargs["expected_session_id"] = session_id
-        task = asyncio.ensure_future(_mark(session_key, **_kwargs))
+        async def _mark_then_retire():
+            marked = await _mark(session_key, **_kwargs)
+            # Retire the intent only when the marker is durable (written, or a newer stop's
+            # marker persisted) or the user resumed past this stop (fenced). A skipped write
+            # (route moved, key gone) proves nothing durable about the replacement, so the intent
+            # stays; the next boot or the user's next message retires it (Prism r3
+            # c-fef208c96fa65cce). The retire (unlink + directory fsync) runs in the executor.
+            if intent_path is not None and timings.get("outcome") in _USER_STOP_SPENT_OUTCOMES:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, store.retire_user_stop_intent, intent_path)
+                except Exception:
+                    logger.debug("user_stop intent retire failed for %s", session_key, exc_info=True)
+            return marked
+
+        task = asyncio.ensure_future(_mark_then_retire())
         pending = self.__dict__.setdefault("_pending_user_stop_writes", set())
         pending.add(task)
 
@@ -7906,18 +7933,10 @@ class GatewayRunner(
                     store.release_user_stop_pending(*_receipt)
                 except Exception:
                     logger.debug("user_stop pending release failed for %s", session_key, exc_info=True)
-            if t.cancelled() or t.exception() is not None:
-                if not t.cancelled():
-                    logger.warning("Failed to persist user_stopped marker for stopped session %s; "
-                                   "its durable intent stays for the next boot", session_key,
-                                   exc_info=t.exception())
-                return
-            # The write landed (or was fenced out by a newer resume/session): the intent is spent.
-            if intent_path is not None:
-                try:
-                    store.retire_user_stop_intent(intent_path)
-                except Exception:
-                    logger.debug("user_stop intent retire failed for %s", session_key, exc_info=True)
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning("Failed to persist user_stopped marker for stopped session %s; "
+                               "its durable intent stays for the next boot", session_key,
+                               exc_info=t.exception())
 
         task.add_done_callback(_done)
         if intent_path is None:
@@ -7928,7 +7947,9 @@ class GatewayRunner(
                 return f"{intent_frag} marker_deferred=0 marker_err=1"  # logged by _done
             return f"{intent_frag} marker_deferred=0 " + self._render_user_stop_timings(timings)
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=self._STOP_MARKER_WAIT_S)
+            # The intent write already spent part of the budget.
+            await asyncio.wait_for(asyncio.shield(task),
+                                   timeout=max(0.0, self._STOP_MARKER_WAIT_S - intent_s))
         except asyncio.TimeoutError:
             logger.info("PHASE=user_stopped_deferred key=%s waited=%.2f: marker write still in flight; "
                         "durable intent written, resume marks refuse the session until it lands",
