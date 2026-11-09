@@ -484,6 +484,68 @@ async def test_cached_agent_billing_write_runs_after_confirmation(tmp_path, monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_phase", ["sqlite", "fallback"])
+async def test_cached_agent_real_sqlite_has_no_write_before_confirmation(tmp_path, monkeypatch, blocked_phase):
+    from hermes_state import SessionDB, AsyncSessionDB
+    from tests.agent.test_switch_model_pool_reload import _make_agent, _make_pool
+    from run_agent import AIAgent
+    from types import MethodType
+
+    # Capture the real constructor BEFORE the legacy harness disables SQLite.
+    real_db = SessionDB
+    h = _Harness(tmp_path, monkeypatch)
+    monkeypatch.setattr("hermes_state.SessionDB", real_db)
+    db = real_db(db_path=tmp_path / "state.db")
+    h.runner.session_store._db = db
+    h.runner._session_db = AsyncSessionDB(db)
+    entry = h.runner.session_store.get_or_create_session(_source())
+    resident = _make_agent("openrouter", "old-model", _make_pool("openrouter"))
+    resident.switch_model = MethodType(AIAgent.switch_model, resident)
+    resident.session_id = entry.session_id
+    resident._session_db = db
+    resident._provider_fallback_active = True
+    h.runner._agent_cache_lock = threading.Lock()
+    h.runner._agent_cache = {h.key(): (resident, time.monotonic())}
+    entered, release = threading.Event(), threading.Event()
+    writes = []
+    execute = db._execute_write
+
+    def gated_write(*args, **kwargs):
+        writes.append(bool(h.sent_with(_switched("model-A"))))
+        if blocked_phase == "sqlite":
+            entered.set()
+            assert release.wait(10), "SQLite write never released"
+        return execute(*args, **kwargs)
+
+    def close_fallback(root):
+        assert root == entry.session_id
+        if blocked_phase == "fallback":
+            entered.set()
+            assert release.wait(10), "fallback write never released"
+        assert h.sent_with(_switched("model-A")), "sticky closure preceded confirmation"
+        return 1
+
+    monkeypatch.setattr(db, "_execute_write", gated_write)
+    monkeypatch.setattr("agent.fallback_wiring.close_episodes_for_user_route", close_fallback)
+    started = time.monotonic()
+    try:
+        await h.adapter.handle_message(_ev("/model model-A"))
+        await _wait_for(lambda: h.sent_with(_switched("model-A")), "real-store confirmation", 3)
+        reply_s = time.monotonic() - started
+        assert resident.model == "model-A"
+        assert h.runner._resolve_session_agent_runtime(source=_source())[0] == "model-A"
+        await _wait_for(entered.is_set, "post-delivery durable phase", 3)
+        assert all(writes), "SessionDB._execute_write ran before the confirmation"
+        print(f"real_sqlite phase={blocked_phase} reply_s={reply_s:.3f}")
+    finally:
+        release.set()
+        await _drained(h, 10)
+        db.close()
+    assert writes, "real SQLite mutation seam was not exercised"
+    assert not h.sent_with(FOLLOWUP)
+
+
+@pytest.mark.asyncio
 async def test_superseding_clear_fences_worker_credential_resolution(tmp_path, monkeypatch):
     h = _Harness(tmp_path, monkeypatch)
     entry = h.runner.session_store.get_or_create_session(_source())

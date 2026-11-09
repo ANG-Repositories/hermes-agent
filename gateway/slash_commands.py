@@ -3907,10 +3907,12 @@ class GatewaySlashCommandsMixin(
                     cached_entry = _cache.get(session_key)
             # Explicit route beats an automatic one: read + close the fallback
             # episode BEFORE the in-place swap resets the live flags.
+            _fallback_closures = [] if _defer is not None else None
             _fb_cleared = await asyncio.to_thread(
                 self._clear_fallback_for_user_route,
                 session_key,
                 cached_entry[0] if cached_entry else None,
+                deferred_closures=_fallback_closures,
             )
 
             if cached_entry and cached_entry[0] is not None:
@@ -3938,7 +3940,8 @@ class GatewaySlashCommandsMixin(
                         api_mode=result.api_mode,
                         # Gateway owns the deferred durable phase; the resident swap must not
                         # write its billing route before the confirmation.
-                        **({"persist_billing_route": False} if _defer is not None else {}),
+                        **({"persist_billing_route": False, "persist_fallback": False}
+                           if _defer is not None else {}),
                         # Keep the session's /reasoning override across the
                         # route change (#467 contract) — see the picker path.
                         **self._switch_reasoning_kwargs(
@@ -4101,6 +4104,12 @@ class GatewaySlashCommandsMixin(
                 _job_done: set = set()  # completed phases survive a cancelled drain
 
                 async def _deferred_writes() -> Optional[str]:
+                    if "fallback" not in _job_done:
+                        from agent import fallback_wiring as _fw
+
+                        for root in _fallback_closures:
+                            await asyncio.to_thread(_fw.close_episodes_for_user_route, root)
+                        _job_done.add("fallback")
                     if cached_entry and "billing" not in _job_done:
                         db = getattr(cached_entry[0], "_session_db", None)
                         sid = getattr(cached_entry[0], "session_id", None)
@@ -4508,7 +4517,7 @@ class GatewaySlashCommandsMixin(
             logger.warning("merge: could not build summarizer: %s", exc)
             return None
 
-    def _clear_fallback_for_user_route(self, session_key: str, agent=None) -> bool:
+    def _clear_fallback_for_user_route(self, session_key: str, agent=None, *, deferred_closures=None) -> bool:
         """``/model`` is an explicit route and beats an automatic fallback
         (t_b2e9bb23): close every active sticky episode on the session's
         lineage so the rebuilt agent cannot resume it. Sync (sqlite); call via
@@ -4526,6 +4535,12 @@ class GatewaySlashCommandsMixin(
                 store = getattr(self, "session_store", None)
                 entry = store.entry_for(session_key) if store is not None else None
                 root = str(getattr(entry, "session_id", "") or "")
+            if deferred_closures is not None:
+                # Capture lineage before switch_model resets the resident flags. The
+                # adapter-owned post-delivery job closes it before the next turn runs.
+                if root:
+                    deferred_closures.append(root)
+                return was_live
             closed = _fw.close_episodes_for_user_route(root)
             return bool(was_live or closed)
         except Exception:

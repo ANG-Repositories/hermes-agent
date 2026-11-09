@@ -2605,7 +2605,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
     return rt
 
 
-def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
+def _finish_switch(agent, new_provider, old_norm, new_norm, *, persist_fallback=True) -> None:
     """Post-switch bookkeeping: fallback reset/prune, request_overrides, billing route."""
     agent._fallback_activated = False
     agent._provider_fallback_active = False
@@ -2619,7 +2619,8 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     try:
         from agent import fallback_sticky_store as _fss
         from agent import fallback_wiring as _fw
-        _fw.close_episodes_for_user_route(_fss.lineage_root_for_agent(agent))
+        if persist_fallback:
+            _fw.close_episodes_for_user_route(_fss.lineage_root_for_agent(agent))
     except Exception:  # noqa: BLE001 — best-effort, never blocks a switch
         logger.debug("sticky close on switch_model failed", exc_info=True)
     # On a deliberate provider swap, prune fallback entries targeting the OLD or NEW primary;
@@ -2659,6 +2660,7 @@ def _persist_switch_billing_route(agent) -> None:
 def switch_model(
     agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None,
     session_reasoning_config=_SESSION_REASONING_UNSET, persist_billing_route=True,
+    persist_fallback=True,
 ):
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
@@ -2757,7 +2759,7 @@ def switch_model(
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
-    _finish_switch(agent, new_provider, old_norm, new_norm)
+    _finish_switch(agent, new_provider, old_norm, new_norm, persist_fallback=persist_fallback)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
