@@ -68,9 +68,11 @@ def _interruptible_parent():
 
 
 def _runner():
-    from gateway.run import GatewayRunner
+    from gateway.run import GatewayRunner, _SESSION_DB_UNPINNED
 
     runner = object.__new__(GatewayRunner)
+    # object.__new__ skips __init__: seed every field the /stop path reads (same as test_session_db_recovery).
+    runner._session_db_pinned = _SESSION_DB_UNPINNED
     runner._running_agents = {}
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
