@@ -103,6 +103,7 @@ def _pool_table(fleet):
     d.mkdir(parents=True, exist_ok=True)
     for name in doc["hosts"]:
         (d / f"kanban@{name}").write_text("pair-token\n", encoding="utf-8")
+    (d / "kanban").write_text("capacity-owner-token\n", encoding="utf-8")
 
 
 def _plan(*, remote=True):
@@ -304,6 +305,7 @@ def test_repairing_the_owner_reservation_token_clears_the_latch(door_fleet):
     """Prism d5a47f67cca8: the reservation upgrade authenticates with the token named exactly ``kanban``. RED on
     1f9b456d: the fingerprint read only kanban@* files, so repairing ``kanban`` never cleared the latch."""
     alloc_client.mark_protected("kanban")                    # a protected consumer whose token is missing
+    (door_fleet.root / alloc_client.TOKENS_REL / "kanban").unlink()
     tid = _card()
     with kbc.connect_closing() as conn:
         task = kb.claim_task(conn, tid)
@@ -413,3 +415,30 @@ def test_an_idle_publish_does_not_clear_a_publish_outage(door_fleet):
     with faults._state() as doc:
         assert "publish" in faults._transport(doc)
     assert not any("reachable again" in p for p in door_fleet.pages)
+
+
+def test_real_review_spawn_does_not_retry_after_post_launch_typeerror(door_fleet):
+    from hermes_cli import kanban_db_dispatch as dispatch
+    tid=_card('review me')
+    with kbc.connect_closing() as conn,kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?",(tid,))
+    import subprocess
+    import sys
+    starts=[]
+    def spawn(task,workspace,*,board=None):
+        process=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'])
+        starts.append(process)
+        if len(starts)==1:
+            raise TypeError('after external process creation')
+        return process.pid
+    try:
+        with kbc.connect_closing() as conn:
+            dispatch.dispatch_once(conn,spawn_fn=spawn,dry_run=False,default_assignee='default',
+                                   max_spawn=64,reconcile_orphans=False)
+        auth=[b for p,b in door_fleet.allocd.calls if p=='/demand/authorize']
+        assert len(auth)==1
+        assert len(starts)==1, f'one shared authorization started two real children: {[p.pid for p in starts]}'
+    finally:
+        for process in starts:
+            process.terminate()
+            process.wait(timeout=5)

@@ -6,7 +6,7 @@
     "  If the live run aborts at set_boomerang_wake, fix the argv here, not run.py.",
     "inject_failure: the AC-7 live fault (t_480d08ce), run AFTER the failure card's child is dispatched. A comment by",
     "  another session moves the card past the claim cursor, so the verdict executor refuses it ('state moved', _moved)",
-    "  and run_entry -> _fail posts the warning AND re-surfaces the wake into the still-live home. null = SKIP (live).",
+    "  and run_entry -> _fail logs the superseded line (no chat warning, t_ce8bd439) AND re-surfaces the wake into the still-live home. null = SKIP (live).",
     "  Never rehome the card (edit --session <bogus>): that proves only the warning half ('no live home').",
     "s1_fault_hold (optional): a --body that keeps the failure card's child busy so the fault lands first.",
     "wirelog_sync: run after the step-3 canary when a remote seat served it ({sub} = the bare seat number).",
@@ -34,7 +34,6 @@
     "resurface_log_regex": "kanban boomerang-wake: {card} lost reason=gateway restart, retry spent resurfaced delivered=(?P<delivered>\\w+)",
     "redispatch_log_regex": "kanban boomerang-wake: {card} redispatched after gateway restart \\(retry \\d+/\\d+\\) delegation=(?P<delegation>\\S+)",
     "handled_log_regex": "kanban boomerang-wake: {card} handled action=\\S+ delegation=(?P<delegation>\\S+)",
-    "fault_reason_regex": "state moved",
     "resurface_wake_log_regex": "inbound message: .*msg=.\\[kanban\\] Task {card}\\b"
   },
   "canary_url": "http://127.0.0.1:18810/v1/messages",

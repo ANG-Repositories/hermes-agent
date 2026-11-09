@@ -11,6 +11,8 @@ kanban adapter needs (Phase 1b, t_1e4b9684):
 * ``consumers.<c>`` ``cpu_est_prior`` / ``ramp_s`` / ``ttl_s`` (I-8, RC5);
 * ``hosts.<h>`` ``class`` and ``max_slots.<c>`` (I-7 clamp);
 * ``hosts.<h>.targets`` (I-1: ``false`` = never a placement target).
+* ``host_preference.last_resort`` / ``consumers.kanban`` (t_c2fce87e: the Studio is
+  the last resort; canonical reader hermes-home ``scripts/lib/host_preference.py``).
 
 Until the file is promoted to schema 1 (Phase 1a), ``_FALLBACK`` carries the
 PRD §5.3 numbers (each one lifted from the code named in the Phase 0 draft).
@@ -22,12 +24,16 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 POLICY_FILE = "placement-policy.json"
 CONSUMER = "kanban"
+HOST_PREFERENCE = "host_preference"        # t_c2fce87e: the fleet's "Studio last" setting
+LAST_RESORT_ENV = "FLEET_LAST_RESORT_HOSTS"
 
 _log = logging.getLogger(__name__)
 
@@ -128,6 +134,25 @@ class PlacementPolicy:
     def max_slots(self, host: str, consumer: str) -> int:
         v = self._pick_num(("hosts", host, "max_slots", consumer))
         return int(v) if v is not None and v >= 0 else UNSTATED_MAX_SLOTS
+
+    def is_last_resort(self, host: str, consumer: str = CONSUMER) -> bool:
+        """``host_preference`` (t_c2fce87e): ``host`` gets ``consumer``'s work only as a last resort.
+
+        Mirrors hermes-home ``scripts/lib/host_preference.is_last_resort(host, consumer=...)``
+        and holds no host list: the file's ``last_resort`` (env ``FLEET_LAST_RESORT_HOSTS``
+        replaces it; empty = off) and ``consumers.<consumer> == "on"``. No key, an off switch
+        or the PRD fallback doc = False, i.e. today's behaviour. No ``_FALLBACK`` entry.
+        """
+        blk = _get(self.doc, HOST_PREFERENCE)
+        if not isinstance(blk, Mapping) or _get(blk, "consumers", consumer) != "on":
+            return False
+        env = os.environ.get(LAST_RESORT_ENV)
+        if env is not None:
+            names = [n for n in re.split(r"[,\s]+", env.lower()) if n]
+        else:
+            raw = blk.get("last_resort")
+            names = [n.strip().lower() for n in raw if isinstance(n, str)] if isinstance(raw, list) else []
+        return isinstance(host, str) and host.strip().lower() in names
 
 
 def load(fleet_dir: Path) -> PlacementPolicy:

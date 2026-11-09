@@ -59,6 +59,8 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
                                                     "psi_io_some10": 0.0})
     monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
+    monkeypatch.setattr(klg.os, "cpu_count", lambda: 32)
+    monkeypatch.setattr(ad, "read_slice_memory", lambda **kw: None)
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
     return home
 

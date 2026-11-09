@@ -120,6 +120,9 @@ def _paths(turns) -> list:
 
 
 def _card(env, home="group", **kw) -> str:
+    # These rows pin the PLAIN wake contract; a boomerang-level card hands its mechanical
+    # wakes to a child instead, so opt out of the creation default (t_c24b1cc7).
+    kw.setdefault("boomerang_wake", False)
     with kb.connect_closing() as conn:
         return kb.create_task(conn, title=kw.pop("title", "card"), assignee="worker",
                               session_id=env[home].session_id, **kw)

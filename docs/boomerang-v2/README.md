@@ -23,6 +23,47 @@ A boomerang child inherits the parent conversation in one of two modes (D-14):
 `summary` instead and the gateway logs `boomerang.fork_ineligible reason=<reason>` (INV-2).
 A forked child never ships a near-fork that silently writes cold.
 
+### Routing is independent of context mode
+
+The [parent-routing contract](parent-routing-inheritance-spec.md) applies to fork,
+branch, explicit summary and automatic summary downgrade. Without an explicit
+call-level child model/provider/credential override, a boomerang takes its parent's
+active route and effective fallback chain, not `delegation.model/provider` defaults.
+An explicit empty parent chain remains disabled. Ordinary delegations retain their
+existing configuration precedence. A deliberately different child route uses summary
+context rather than claiming a byte-identical fork.
+
+A busy parent's route is snapshotted separately from its database transcript; it is
+not reset to its configured primary. With no live parent, the gateway restores the
+resolved owner's session `/model` preference, then channel overrides, then defaults,
+using the normal gateway fallback policy. Unreadable persisted preferences or missing
+credentials fail closed. No historical transient fallback is guessed after restart.
+
+Existing durable delegation records carry per-task non-secret routing provenance,
+identity, selected safe endpoint, protocol and fallback policy. An explicit selected
+endpoint wins over a provider's current default during recovery. Userinfo/credential
+query URLs are refused, never persisted. Malformed persisted chains (including null,
+strings and non-route rungs) fail before credential lookup; `[]` remains disabled.
+Execution resolves credentials again within the owning
+profile. Credential-bearing request headers or non-symbolic fallback secrets cannot
+be serialized: durable launch refuses that policy rather than silently widening or
+erasing it. Legacy records without a resolved fallback policy report routing-unavailable.
+`boomerang.route` logs requested/effective mode, owner/child sessions, route source,
+provider/model and fallback count; it excludes endpoints, headers and credentials.
+
+The synthetic-provider HTTP acceptance suites are
+`tests/integration/test_boomerang_parent_routing_http.py`,
+`tests/integration/test_boomerang_auto_routing.py` and
+`tests/integration/test_boomerang_detached_profiles.py`. They drive real
+notifier/owner-wake dispatch, scratch claim/board executor receipts, busy/cold
+session reconstruction, child retry/fallback and two separate profile subprocesses.
+The auto-wake primary/same-vendor lanes speak Anthropic Messages and the permitted
+cross-vendor lane speaks CPA-shaped OpenAI chat/SSE; each uses synthetic credentials.
+Plugin/MCP startup and model probes are suppressed; retry timing alone is shortened.
+External platform delivery is an in-memory adapter. Socket tripwires reject non-loopback
+connections. This proves routing integration, not real vendor availability or deployed activation.
+See [build receipts and remaining limits](build-review-status.md) before landing.
+
 ## 1. Which mode each entry point uses (spec §5.6)
 
 | Entry point | `inherit_context` | Mode you get |
@@ -135,16 +176,25 @@ session `/autohandle` toggle and no board default (Ace 2026-10-22, t_7be18632).
 | `wake` | `notify+wake` / `wake` | Passive line + a turn in the subscribed session. |
 | `boomerang wake` | `notify+wake` / `wake` (+ `tasks.boomerang_wake = 1`) | Mechanical events go to a background boomerang child (§3 `auto`); everything else wakes as `wake`. |
 
-`kanban.auto_subscribe_boomerang` defaults to `true`: new operator-created cards with an
-originating gateway auto-subscription use boomerang wake. The tool's `boomerang_wake: false`
-or `kanban create --no-boomerang-wake` opts out for one card. Set the config knob to `false`
-to restore plain notify+wake for future cards; existing cards are unchanged. Worker-created
-cards do not inherit this default. A CLI create (`hermes kanban create`, which scripts and
-cron also drive) inherits it only when `kanban.cli_auto_subscribe` (default `false`) would
-subscribe it, or when it names an explicit home (`--session <sid>`; tool `session_id`) whose
-session has a routable origin chat: then the card gets the level AND that home chat's
-`notify+wake` row even with no gateway identity in env (Ace 2026-11-06; scripts and cron mint
-most cards this way). Operator pseudo-homes and CLI/unknown sessions stay unsubscribed.
+`kanban.auto_subscribe_boomerang` defaults to `true`. The LEVEL and the SUBSCRIPTION are
+decided separately:
+
+- Level (`tasks.boomerang_wake`): every new card gets the knob's value at birth, whoever mints
+  it: CLI, tool, cron/script, worker child, swarm, dashboard API, triage decomposition (children
+  take the root's stored value). `kanban_db.create_task` applies it
+  (`hermes_cli/kanban_boomerang_default.py`, t_c24b1cc7). An explicit
+  `--no-boomerang-wake` / tool `boomerang_wake: false` is stored as given, and a retried create
+  (same idempotency key) returns that card unchanged. The `created` event records
+  `boomerang_wake_source` (`explicit` | `default` | `inherited`).
+- Subscription (who is woken): unchanged. A gateway create subscribes its chat; a CLI create
+  subscribes only when `kanban.cli_auto_subscribe` (default `false`) would, or when it names an
+  explicit home (`--session <sid>`; tool `session_id`) with a routable origin chat (Ace
+  2026-11-06). Worker creates, operator pseudo-homes and CLI/unknown sessions get no row.
+
+The level never invents a recipient. A card at boomerang level with no waker row wakes nobody;
+`kanban create --json` and the `kanban_create` tool return `wake_route` (`level`, `waker`, and a
+`note` when nothing holds the wake), and a plain CLI create prints that note on stderr. Set the
+knob to `false` to restore plain notify+wake for future cards; existing cards are unchanged.
 `--boomerang-wake` still sets it explicitly. The knob is read on create;
 once this code is loaded, flipping it needs no restart. Loading this code into a running
 gateway does require a restart.

@@ -1533,3 +1533,29 @@ def test_heartbeat_clear_removes_only_its_own(standby, tmp_path, monkeypatch):
     assert json.loads(standby.read_text()) == {"pid": os.getpid(), "host": akb._hostname(), "interval_s": 5.0}
     akb.clear_dispatcher_heartbeat()
     assert not standby.exists()
+
+
+def test_pause_hold_refusal_never_falls_back_in_process(monkeypatch, tmp_path, spawner):
+    """Prism 0f110d29ad76: a live FWA kanban hold on the dispatcher's host refuses spawn_now's local start. That
+    refusal is policy, not an infrastructure failure: the unit must NOT then run in-process (or detached) on the
+    same held host. Nothing starts; the delegation ends with the hold named, and the container card is archived."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_pause_hold as kph
+
+    why = "pause_hold (ci-box:fwa:pause:20261107T150000Z-ci-box-fwa00001 by apollo until 2026-11-08T23:00Z " \
+          "stage=destination)"
+    monkeypatch.setattr(kph, "local_destination_wait", lambda cache: why)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert calls == [], "no in-process fallback under a pause hold"
+    assert spawner.procs == [], "no worker spawned"
+    assert rec["attempt"]["generation"] == 0, "the attempt was not superseded"
+    assert rec["state"] == "failed"
+    terminal = [e for e in rec["outbox"] if e.get("type") == "async_delegation"]
+    assert len(terminal) == 1 and "pause_hold (ci-box:fwa:" in json.dumps(terminal[0])
+    runtime = ad.kanban_launch_runtime(did, timeout=0)
+    assert runtime.startswith("none (kanban pause hold"), runtime
+    with kb.connect_closing(board="delegations") as conn:
+        statuses = [r["status"] for r in conn.execute("SELECT status FROM tasks")]
+    assert statuses == ["archived"]

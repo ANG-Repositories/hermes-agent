@@ -79,6 +79,12 @@ def re_failed_line(card: str) -> re.Pattern:
     return re.compile(_WARN + r"boomerang-wake failed\s+(?:for\s+)?" + re.escape(card) + r":\s*(?P<reason>\S.*)")
 
 
+def re_superseded_line(card: str) -> re.Pattern:
+    """The #logs/INFO line of a freshness refusal (t_ce8bd439): a supersede, never a chat warning."""
+    return re.compile(r"boomerang-wake superseded " + re.escape(card)
+                      + r": card moved to (?P<status>\S+) before the wake ran")
+
+
 def re_lost_line(card: str) -> re.Pattern:
     return re.compile(_WARN + r"boomerang-wake lost\s+(?:for\s+)?" + re.escape(card) + r"\b(?P<rest>.*)")
 
@@ -597,28 +603,29 @@ def step1(ctx: Ctx) -> StepReport:
               FAIL if ni_disp == "auto" else PASS, ni_log or "no boomerang-wake log line (surfaced as today)")
 
     if not arm_failure:
-        rep.check(f"failure card {fail_card}: `warning boomerang-wake failed {fail_card}: <reason>`", SKIP,
+        rep.check(f"failure card {fail_card}: `boomerang-wake superseded {fail_card}` log line", SKIP,
                   "plan.commands.inject_failure is null: no fault-injection hook configured (README)")
     else:
-        warn = ctx.poll(lambda: find_chat(chat, re_failed_line(fail_card)), win)
-        rep.check(f"origin chat: `warning boomerang-wake failed {fail_card}: <reason>`", PASS if warn else FAIL,
-                  warn.content if warn else f"absent after {win:.0f}s")
-        if warn:
-            rep.raw.append(f"--- chat match\n{warn.content}")
+        # The injected fault is a freshness refusal: a supersede (t_ce8bd439). One INFO/#logs line,
+        # NO warning in the origin chat, the wake still re-surfaced.
+        sup = ctx.poll(lambda: find_log(log, re_superseded_line(fail_card)), win)
+        rep.check(f"gateway log: `boomerang-wake superseded {fail_card}: card moved to <status> ...`",
+                  PASS if sup else FAIL, sup or f"absent after {win:.0f}s")
+        if sup:
+            rep.raw.append(f"--- log match\n{sup}")
+        warn = ctx.poll(lambda: find_chat(chat, re_failed_line(fail_card)), ctx.tick_window)
+        rep.check(f"origin chat: no `warning boomerang-wake failed {fail_card}` line (supersede)",
+                  FAIL if warn else PASS, warn.content if warn else f"none ({ctx.window_label()})")
         if inject:
-            _check_live_resurface(ctx, rep, log, chat, fail_card, warn, fail_dispatch)
+            _check_live_resurface(ctx, rep, log, chat, fail_card, fail_dispatch)
     return rep
 
 
 def _check_live_resurface(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, card: str,
-                          warn: "ChatMessage | None", dispatched: str | None) -> None:
+                          dispatched: str | None) -> None:
     """INV-6 second half, live: the injected fault left the home live, so the original wake
     must come back into the home session as a turn (not `no live home ...`)."""
     expect = ctx.plan.get("expect", {})
-    reason_re = re.compile(expect.get("fault_reason_regex", r"state moved"))
-    reason = re_failed_line(card).search(warn.content).group("reason") if warn else None
-    rep.check(f"failure card {card}: warning reason is the injected fault (/{reason_re.pattern}/)",
-              PASS if reason and reason_re.search(reason) else FAIL, reason or "no warning line")
     early = find_chat(chat, re_boomerang_wake_line(card))
     if early:
         rep.check(f"failure card {card}: fault landed before the verdict", INCOMPLETE,

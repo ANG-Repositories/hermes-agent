@@ -759,12 +759,16 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
                 state.row_failures.pop(fkey, None)
                 if item is not None:
                     item["queued_at"] = now
-                    key = f"{slug}|{r['task_id']}"
+                    rkey = routed_recipient(item)
+                    key = f"{slug}|{r['task_id']}" + (f"|to:{rkey}" if rkey else "")
                     card = state.pending.setdefault(key, {
-                        "board": slug, "task_id": r["task_id"], "home_sid": r["home_sid"] or "",
+                        "board": slug, "task_id": r["task_id"], "home_sid": rkey or r["home_sid"] or "",
                         "title": r["title"] or "", "items": [],
                     })
-                    card["home_sid"] = r["home_sid"] or card.get("home_sid") or ""
+                    if rkey:
+                        card["recipient"] = rkey  # t_3151f3fd: woken in place of the home, never re-homed
+                    else:
+                        card["home_sid"] = r["home_sid"] or card.get("home_sid") or ""
                     card["items"].append(item)
                     queued += 1
                 state.cursors[slug] = max(state.cursors[slug], int(r["id"]))
@@ -774,6 +778,22 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
         finally:
             conn.close()
     return queued
+
+
+def routed_recipient(item: dict) -> str:
+    """t_3151f3fd: the session KEY a review_deadman event names as its recipient, else "".
+
+    hermes-home's review deadman resolves the recipient itself (recipient(): a card whose
+    home lives in #alerts, or whose home has no live gateway, pages the newest live operator
+    wake sub). On a boomerang card it now emits the event on those routes too, carrying
+    ``recipient_session_key``; the owner-wake then wakes THAT session (or hands it to a
+    boomerang child routed there), never the #alerts home. Any other kind: ""."""
+    if item.get("kind") != TRIGGER_REVIEW_DEADMAN:
+        return ""
+    p = item.get("payload") or {}
+    if p.get("recipient_route") not in ("alerts-home", "fallback"):
+        return ""
+    return str(p.get("recipient_session_key") or "").strip()
 
 
 def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
@@ -1097,7 +1117,8 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             state.pending.pop(key, None)
             continue
         card["items"] = live
-        card["home_sid"] = str(current.get("session_id") or "")
+        # t_3151f3fd: a routed review_deadman keeps the recipient the producer resolved
+        card["home_sid"] = card.get("recipient") or str(current.get("session_id") or "")
         card["title"] = current.get("title") or card.get("title") or ""
         try:
             entry = await asyncio.to_thread(resolve_owner, store, card["home_sid"],

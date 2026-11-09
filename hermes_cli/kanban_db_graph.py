@@ -117,14 +117,21 @@ def decompose_triage_task(
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
     _validate_children_graph(children)
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    for child in children:
+        validate_fields(conn, [("title", child["title"]), ("body", child.get("body"))])
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
     # (create_task, link_tasks, add_comment) must not be called in here.
     now = int(time.time())
+    from hermes_cli import kanban_boomerang_default as _kbd
+    from hermes_cli.kanban_db_connect import write_card_boomerang_wake
+
+    policy_boomerang = _kbd.policy_default()
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path, "
-            "session_id, body FROM tasks WHERE id = ?",
+            "session_id, body, boomerang_wake FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
@@ -139,6 +146,12 @@ def decompose_triage_task(
         tenant = root_row["tenant"]
         root_home = (root_row["session_id"] or "").strip() or None
         root_origin = _kb._origin_line(root_row["body"])
+        # Children carry the root's boomerang choice (an opt-out included); a root
+        # that predates the creation default gets the policy default.
+        if root_row["boomerang_wake"] is None:
+            child_boomerang, boomerang_source = policy_boomerang, _kbd.SOURCE_DEFAULT
+        else:
+            child_boomerang, boomerang_source = bool(root_row["boomerang_wake"]), _kbd.SOURCE_INHERITED
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -208,8 +221,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by, session_id) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, session_id, boomerang_wake) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -221,11 +234,14 @@ def decompose_triage_task(
                     now,
                     (author or "decomposer"),
                     root_home,
+                    1 if child_boomerang else 0,
                 ),
             )
+            write_card_boomerang_wake(conn, new_id, 1 if child_boomerang else 0)
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {"by": author or "decomposer", "from_decompose_of": task_id,
+                 "boomerang_wake": child_boomerang, "boomerang_wake_source": boomerang_source},
             )
             _kb._inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)

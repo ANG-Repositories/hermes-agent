@@ -756,7 +756,11 @@ def _compact(registry: dict[str, Any], now: float, path: Path) -> int:
     return changed
 
 
-def _prune(registry: dict[str, Any], now: float, path: Path) -> None:
+def _prune(registry: dict[str, Any], now: float, path: Path, *, limit: int | None = None) -> None:
+    """Drop expired terminal records, then evict the oldest settled terminal records down to
+    ``limit`` (default ``MAX_REGISTRY_RECORDS``). Live (running/pending-outbox) records are never
+    evicted — the cap is enforced against them by the caller, not here."""
+    cap = MAX_REGISTRY_RECORDS if limit is None else max(0, limit)
     _expire_admitted_unserved(registry, path, now)
     _compact(registry, now, path)
     records = registry["records"]
@@ -776,7 +780,7 @@ def _prune(registry: dict[str, Any], now: float, path: Path) -> None:
             removable.append((updated, delegation_id))
     for _, delegation_id in sorted(removable):
         records.pop(delegation_id, None)
-    if len(records) <= MAX_REGISTRY_RECORDS:
+    if len(records) <= cap:
         return
     eligible = sorted(
         (float(r.get("updated_at") or 0.0), rid)
@@ -787,7 +791,7 @@ def _prune(registry: dict[str, Any], now: float, path: Path) -> None:
         and not _terminal_pending(r)
     )
     for _, delegation_id in eligible:
-        if len(records) <= MAX_REGISTRY_RECORDS:
+        if len(records) <= cap:
             break
         records.pop(delegation_id, None)
 
@@ -981,6 +985,27 @@ def redact_url(url: Any) -> str:
     return urlunsplit((parsed.scheme, host, parsed.path, query, ""))
 
 
+def admission_refusal(*, profile_home: Path | None = None, max_records: int | None = None) -> str | None:
+    """Would ``persist_dispatch`` refuse a new record right now? ``registry_cap`` / ``registry_error`` / None.
+
+    A preflight, not a reservation: delegate_task asks before it builds any child, so a full or unreadable
+    registry refuses the call with zero child sessions. ``persist_dispatch`` stays the binding check."""
+    record_limit = MAX_REGISTRY_RECORDS if max_records is None else max_records
+    path = registry_path(profile_home)
+    try:
+        with locked_registry(path=path) as registry:
+            # Same eviction as persist_dispatch (cap-1, settled terminal records only), so the preflight
+            # never refuses a full-but-evictable registry the binding check would accept (Prism
+            # c-e0bb5594880eff70: that would bring the 2026-11-08 registry_cap degradation back).
+            _prune(registry, time.time(), path, limit=record_limit - 1)
+            if len(registry["records"]) >= record_limit:
+                return "registry_cap"
+    except Exception as exc:
+        logger.error("async_delegation_admission_preflight_failed path=%s reason=%s", path, exc)
+        return "registry_error"
+    return None
+
+
 def persist_dispatch(
     *,
     delegation_id: str,
@@ -997,7 +1022,10 @@ def persist_dispatch(
     try:
         _assert_nonsecret_settings(durable_spec)
         with locked_registry(path=path) as registry:
-            _prune(registry, now, path)
+            # Make room for THIS record: settle down to cap-1 so a registry full of finished,
+            # delivered records never rejects a new dispatch (2026-11-08: 256 done/failed records,
+            # zero pending, and every delegate_task fell back to sync for a week).
+            _prune(registry, now, path, limit=record_limit - 1)
             if len(registry["records"]) >= record_limit:
                 logger.error(
                     "async_delegation_sync_fallback reason=registry_cap cap=%d path=%s",

@@ -117,6 +117,9 @@ def fleet(tmp_path, monkeypatch):
         d = root / alloc_client.TOKENS_REL
         d.mkdir(parents=True, exist_ok=True)
         (d / "kanban@mac-studio").write_text("pair-token\n", encoding="utf-8")
+        # Local capacity accounting is upgraded in place; authorization authenticates
+        # the existing row's owner as well as the host/workload pair.
+        (d / "kanban").write_text("capacity-owner-token\n", encoding="utf-8")
 
     ns.registry, ns.table, ns.token = registry, table, token
     return ns

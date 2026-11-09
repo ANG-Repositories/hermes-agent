@@ -129,7 +129,7 @@ def _tool_call(tool: str, args: dict) -> tuple[bool, str]:
 
 
 def _block(reason: str) -> bool:
-    ok, detail = _tool_call("kanban_block", {"reason": reason[:1000]})
+    ok, detail = _tool_call("kanban_block", {"reason": reason[:1000], "kind": "needs_input"})
     _log(f"board kanban_block ok={ok}: {detail}")
     return ok
 
@@ -149,6 +149,8 @@ def handback(receipt: Optional[dict], rc: Optional[int], stderr_tail: str) -> bo
         return _block(f"native worker: receipt handback not allowed (tool={tool!r}); "
                       f"only {', '.join(HANDBACK_TOOLS)} are")
     args = {k: v for k, v in args.items() if k != "task_id"}  # always this worker's own card
+    if tool == "kanban_block":
+        args.setdefault("kind", "needs_input")
     ok, detail = _tool_call(tool, args)
     _log(f"board {tool} ok={ok}: {detail}")
     if ok:
