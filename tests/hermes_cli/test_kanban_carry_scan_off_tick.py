@@ -123,6 +123,19 @@ def test_stale_verdict_is_answered_and_requeued(tmp_path):
     assert kwh._carry_pending
 
 
+def test_too_big_verdict_is_not_rewalked_every_ttl(tmp_path):
+    d = tmp_path / "big"
+    d.mkdir()
+    for i in range(5):
+        (d / f"f{i}").write_text("x")
+    assert kwh.carry_size_known(str(d), max_entries=2, now=0.0) is None
+    kwh.carry_scan_refresh(now=0.0)
+    assert kwh.carry_size_known(str(d), max_entries=2, now=kwh.CARRY_SCAN_TTL_SECONDS + 1.0) is False
+    assert not kwh._carry_pending  # still fresh: not re-queued at 300 s
+    assert kwh.carry_size_known(str(d), max_entries=2, now=kwh.CARRY_SCAN_NEGATIVE_TTL_SECONDS + 1.0) is False
+    assert kwh._carry_pending  # answered False, re-queued after the negative TTL
+
+
 def test_placement_parity_with_the_synchronous_scan(kanban_home, monkeypatch):
     """Once the cache is warm, every fixture row routes exactly as the old in-tick scan routed it."""
     with kb.connect_closing() as conn:

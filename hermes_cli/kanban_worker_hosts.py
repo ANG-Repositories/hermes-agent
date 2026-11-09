@@ -453,6 +453,11 @@ _carry_lock = threading.Lock()
 # is ~330 lstat/s, whatever the number of carry candidates; measured before (t_3489445d) on 85 real workspaces,
 # 72 of them repo-sized: ~1.53M lstat per 300 s TTL cycle, ~5,100 lstat/s.
 CARRY_WALK_BUDGET_ENTRIES = CARRY_MAX_ENTRIES
+# Re-scan age of a "too big" verdict in the routing pass. A capped walk spends the whole tick budget, and a
+# repo-sized dir rarely shrinks under the cap: re-walking those every 300 s kept ~80 paths queued and starved new
+# cards on nas-fleet (measured t_3489445d). A "small enough" verdict keeps the 300 s TTL, so a dir that grew is
+# re-checked as fast as before.
+CARRY_SCAN_NEGATIVE_TTL_SECONDS = 3600
 
 
 def _stat(key: str, n: float = 1) -> None:
@@ -479,7 +484,7 @@ def carry_size_known(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
             _stat("misses")
             _carry_pending.setdefault(root, (max_bytes, max_entries, True))
             return None
-        if t - hit[0] < CARRY_SCAN_TTL_SECONDS:
+        if t - hit[0] < (CARRY_SCAN_TTL_SECONDS if hit[1] else CARRY_SCAN_NEGATIVE_TTL_SECONDS):
             _stat("hits")
         else:
             _stat("stale")
