@@ -2826,6 +2826,14 @@ def _cmd_placement_holds(args: argparse.Namespace) -> int:
         if h.get("pins_owed"):
             print(f"  resume pins owed: {' '.join(h['pins_owed'])}"
                   + (" (conflicting pins released: past grace)" if h.get("pin_conflict_expired") else ""))
+    for host, rows in (rep.get("fwa") or {}).items():
+        for f in rows:
+            state = "HOLDS kanban" if f["holds_kanban"] else "no kanban hold"
+            if f.get("unreadable"):
+                print(f"{host}: fwa {state} unreadable hold file {f['file']}")
+                continue
+            print(f"{host}: fwa {state} {f['kind'] or 'pause'}:{f['id']} lanes {','.join(f['lanes'])} by "
+                  f"{f.get('by') or f.get('owner') or '?'} until {f['until']}: {f.get('reason') or ''}")
     for c in rep["cards"]:
         print(f"{c['task_id']}: {'LIVE' if c['live'] else 'STALE'} label {c['label']} "
               f"(origin {c['origin_host'] or '-'}; now {c['now'] or 'not held'})")

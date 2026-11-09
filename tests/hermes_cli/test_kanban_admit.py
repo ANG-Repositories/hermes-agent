@@ -56,6 +56,7 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # hostname, so on a pool host (ace-ai) `local` would otherwise BE that host.
     import socket
     monkeypatch.setattr(socket, "gethostname", lambda: LOCAL_NAME)
+    monkeypatch.setattr(socket, "getfqdn", lambda name="": name)   # the local fence's FQDN read: no resolver
     kb.init_db()
     # The placement table (mem_reserve_gb, threads) is this test's, never the host's:
     # fleet_root() honours PLACEMENT_HOME first, and test-gate exports the live root (t_2105a835).
@@ -903,6 +904,42 @@ def _site_triggers():
         ctx["measure_remote_fn"] = _remote()
         return "ace-ai", "admit", "requires:gpu\\+layer0b:ace-ai"
 
+    def _fwa_hold(host):
+        """A live fwa hold record on lane kanban for ``host`` (FWA SPEC §5.1, §5.4a time end), under the kanban home."""
+        import time as _time
+        now = int(_time.time())
+        d = kb.kanban_home() / "state" / "fwa" / "holds" / host
+        d.mkdir(parents=True, exist_ok=True)
+        hid = f"20261108T000000Z-{host}-admit001"
+        (d / f"{hid}.json").write_text(json.dumps({
+            "schema": 1, "id": hid, "host": host, "kind": "pause", "lanes": ["kanban"], "owner": "card:t_x",
+            "drive": True, "by": "apollo", "card": "t_x", "reason": "admit site", "since": now - 60,
+            "until": now + 3600, "end": {"kind": "time", "until": now + 3600}}))
+
+    def fwa_pin_held(m, ctx):
+        # A `host:` pin to a host a live fwa kanban hold closes: the destination fence waits it before take().
+        upd("UPDATE tasks SET body='host: ace-ai' WHERE id=?", ctx)
+        _fwa_hold("ace-ai")
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "twin", "pause_hold \\(ace-ai:fwa:.*stage=destination\\)"
+
+    def fwa_dest_belt(m, ctx):
+        # The pre-take fence misses (held_destinations sees nothing), take() returns the held host anyway:
+        # the post-take belt re-checks the CHOSEN host and waits the card, releasing the reservation. Kind `admit`
+        # like layer0b: only admit's forced take places on ace-ai here (the tick's take has no remote pressure).
+        _fwa_hold("ace-ai")
+        m.setattr(kph, "held_destinations", lambda names, cache: {})
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "admit", "pause_hold \\(ace-ai:fwa:.*stage=destination\\)"
+
+    def fwa_local_held(m, ctx):
+        # A local start on a dispatcher host a live fwa kanban hold closes (Prism fe6a1ad69c44). The tick's own
+        # local gate is left open so its twin also routes local and meets the same fence.
+        _hot_local(m, load1=1.0, cpu_busy=0.05)
+        _fwa_hold(LOCAL_NAME)
+        ctx["plan"] = None
+        return "studio", "twin", f"pause_hold \\({LOCAL_NAME}:fwa:.*stage=destination\\)"
+
     def claim(m, ctx):
         m.setattr(kb, "claim_task", lambda conn, task_id, **k: None)
         return "studio", "twin", "did not spawn"
@@ -1074,6 +1111,9 @@ def _site_triggers():
         "fail: except Exception (try: admit_floor)": floor_error,
         "continue: _only is not None and force_host.lower() not in {h.lower() for h in _only}": reach,
         "continue: _forced_remote": forced_take,
+        "continue: _pin_held is not None": fwa_pin_held,
+        "continue: _dest_wait is not None": fwa_dest_belt,
+        "continue: _local_wait is not None": fwa_local_held,
         "continue: _gap is not None": layer0b,
         "continue: claimed is None": claim,
         "fail: except _kph.PauseHeld (try: _kb.claim_task)": claim_pause,
