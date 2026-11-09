@@ -26,20 +26,47 @@ Only an ANCHOR worktree ports (``workspace_path`` unset, or naming a repo
 root): a concrete target path is a place on the Studio someone chose. A card
 whose ``.worktrees/<id>`` already exists on the Studio keeps it (that tree
 may hold a prior run's work).
+
+DERIVED mode (t_1d2c5939, default; ``KANBAN_MIRROR_DERIVED=0`` or a file
+``"derived": false`` restores the hand list above): every GitHub repo a card
+anchors on ports to EVERY pool host; there is no per-repo allowlist. The
+file is only an override: schema 2 ``{"schema": 2, "exclude": [slug],
+"mirror_paths": {slug: path | {"*": path, host: path}}}`` (schema 1 rows are
+still read as mirror paths; their ``hosts`` are ignored). A repo with no
+mirror path uses ``~/.hermes/mirrors/<owner>/<repo>.git`` on the host; the
+clone is ``--reference-if-able``, so an absent mirror is a slower clone,
+never a refusal. A card branch with commits origin lacks is PUSHED at spawn
+(``--force-with-lease``) and then ported (:func:`push_card_branch`); only a
+card whose own Studio tree has uncommitted or untracked work stays local,
+named ``unpushed_dirty_tree``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 MIRRORS_FILE = "kanban-worktree-mirrors.json"
+DERIVED_ENV = "KANBAN_MIRROR_DERIVED"
+# Per-host default mirror of a derived repo; "~/" expands on the host (clone_script).
+DERIVED_MIRROR_ROOT = "~/.hermes/mirrors"
+PUSH_TIMEOUT_S = 120
+# Named local-only reasons (``why`` of :func:`assess`), the tail of not_portable:workspace_kind:<why>.
+WHY_DIRTY = "unpushed_dirty_tree"
+WHY_OFF_BRANCH = "own_tree_off_branch"
+WHY_CONCRETE = "concrete_target_path"
+WHY_NOT_REPO = "not_a_repo"
+WHY_NOT_GITHUB = "origin_not_github"
+WHY_EXCLUDED = "excluded"
+WHY_NO_POOL = "no_pool_host"
+WHY_BAD_OVERRIDES = "overrides_file_malformed"
 PORTED_EVENT = "worktree_ported"
 # portable() bind rule of a ported card: it runs where its clone is.
 PORT_BIND_RULE = "worktree_port"
@@ -80,6 +107,88 @@ def read_mirrors(fleet_dir: Path) -> Dict[str, Tuple[str, Tuple[str, ...], Dict[
         if hs:
             out[slug.lower()] = (mirror, hs, {h.lower(): p for h, p in per_host.items()})
     return out
+
+
+def _read_doc(fleet_dir: Path):
+    """The parsed override file; ``None`` when absent, ``False`` when unreadable/malformed."""
+    path = Path(fleet_dir) / MIRRORS_FILE
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return False
+    return doc if isinstance(doc, dict) else False
+
+
+def derived_enabled(fleet_dir: Path) -> bool:
+    """Derived mode (t_1d2c5939) unless ``KANBAN_MIRROR_DERIVED=0`` or the file says ``"derived": false``."""
+    if os.environ.get(DERIVED_ENV, "").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    doc = _read_doc(fleet_dir)
+    return not (isinstance(doc, dict) and doc.get("derived") is False)
+
+
+def read_overrides(fleet_dir: Path) -> Optional[Tuple[frozenset, Dict[str, Tuple[Optional[str], Dict[str, str]]]]]:
+    """Derived-mode overrides: ``(excluded slugs (lower), {slug (lower): (default mirror | None, {host: mirror})})``.
+
+    Absent file = no overrides. A file that exists but cannot be read, or a malformed schema 2 entry, is None
+    (fail closed: nothing ports, the same as a broken hand list). Schema 1 rows count as mirror paths only."""
+    doc = _read_doc(fleet_dir)
+    if doc is None:
+        return frozenset(), {}
+    if doc is False:
+        return None
+    if doc.get("schema") == 1:
+        return frozenset(), {s: (row[0], row[2]) for s, row in read_mirrors(fleet_dir).items()}
+    if doc.get("schema") != 2:
+        return None
+    exclude, paths = doc.get("exclude", []), doc.get("mirror_paths", {})
+    if not isinstance(exclude, list) or not all(isinstance(s, str) and "/" in s for s in exclude):
+        return None
+    if not isinstance(paths, dict):
+        return None
+    out: Dict[str, Tuple[Optional[str], Dict[str, str]]] = {}
+    for slug, val in paths.items():
+        if not isinstance(slug, str) or "/" not in slug:
+            return None
+        if isinstance(val, str):
+            val = {"*": val}
+        if not isinstance(val, dict) or not val or not all(
+                isinstance(h, str) and h and isinstance(p, str) and (p.startswith("/") or p.startswith("~/"))
+                for h, p in val.items()):
+            return None
+        out[slug.lower()] = (val.get("*"), {h.lower(): p for h, p in val.items() if h != "*"})
+    return frozenset(s.lower() for s in exclude), out
+
+
+def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str]] = None
+                  ) -> Optional[Tuple[str, Tuple[str, ...], Dict[str, str]]]:
+    """``(mirror, hosts, {host: mirror})`` for ``slug`` in derived mode: every pool host, the override path or
+    ``~/.hermes/mirrors/<slug>.git``. None (reason appended to ``why``) when excluded / no pool / bad file."""
+    ov = read_overrides(fleet_dir)
+    if ov is None:
+        _why(why, WHY_BAD_OVERRIDES)
+        return None
+    exclude, paths = ov
+    if slug.lower() in exclude:
+        _why(why, WHY_EXCLUDED)
+        return None
+    hosts = tuple(dict.fromkeys(str(h).lower() for h in (pool_hosts or ()) if h))
+    if not hosts:
+        _why(why, WHY_NO_POOL)
+        return None
+    default, per_host = paths.get(slug.lower(), (None, {}))
+    return (default or f"{DERIVED_MIRROR_ROOT}/{slug}.git"), hosts, dict(per_host)
+
+
+def _why(why: Optional[List[str]], reason: str) -> None:
+    if why is not None and not why:
+        why.append(reason)
 
 
 def mirror_for(port: tuple, host: str) -> str:
@@ -156,11 +265,29 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     card's OWN ``<repo>/.worktrees/<id>`` (persisted path or found under the
     anchor) no longer pins it to the Studio when that tree is on the card's
     branch, clean, and the branch is fully on origin (the check below). Any
-    other concrete path still keeps the card local."""
+    other concrete path still keeps the card local.
+
+    The hand-list semantics: committed-but-unpushed work keeps the card local.
+    :func:`assess` with ``push_ok=True`` is the derived mode's push-then-port."""
+    top, _push = assess(task_id, workspace_path, board_default, branch, runner,
+                        allow_studio_tree=allow_studio_tree, push_ok=False)
+    return top
+
+
+def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[str],
+           branch: Optional[str] = None, runner: Callable = subprocess.run, *,
+           allow_studio_tree: bool = False, push_ok: bool = False,
+           why: Optional[List[str]] = None) -> Tuple[Optional[Path], Optional[Tuple[str, str, str]]]:
+    """``(anchor repo | None, push)``: :func:`anchor_repo`'s checks, with the reason a card stays local
+    appended to ``why``. ``push_ok`` (derived mode, t_1d2c5939): a card branch whose commits origin lacks is
+    no longer a refusal; ``push`` = ``(repo, branch, expected origin sha or "")`` and the spawn pushes it
+    (:func:`push_card_branch`) before the clone. Still local: an own tree with uncommitted/untracked work
+    (``unpushed_dirty_tree``), and a branch that diverged from origin (a push would drop origin's commits)."""
     from hermes_cli.kanban_db_workspace import _git_toplevel, _is_linked_worktree_checkout
     raw = (workspace_path or "").strip() or (board_default or "").strip()
     if not raw:
-        return None
+        _why(why, WHY_NOT_REPO)
+        return None, None
     p = Path(raw).expanduser()
     # <repo>/.worktrees/<id> not made yet: the repo is the anchor (t_e604c0f9). Only under the same switch as
     # the own-tree port: with host_preference off a concrete target keeps today's Studio pin (Prism 7eba47409a75).
@@ -168,10 +295,12 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     if target is not None:
         p = target
     if not p.is_absolute() or not p.is_dir():
-        return None
+        _why(why, WHY_NOT_REPO)
+        return None, None
     top = _git_toplevel(p)
     if top is None:
-        return None
+        _why(why, WHY_NOT_REPO)
+        return None, None
     b = (branch or "").strip() or f"wt/{task_id}"
     own_tree = None
     if top != p.resolve() or _is_linked_worktree_checkout(top):
@@ -179,27 +308,22 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
         # card's own pushed .worktrees/<id> and the knob allows the port.
         if not (allow_studio_tree and top == p.resolve() and top.name == task_id
                 and top.parent.name == ".worktrees" and _is_linked_worktree_checkout(top)):
-            return None
+            _why(why, WHY_CONCRETE)
+            return None, None
         own_tree, top = top, top.parent.parent.resolve()
         if _git_toplevel(top) != top or _is_linked_worktree_checkout(top):
-            return None
+            _why(why, WHY_CONCRETE)
+            return None, None
     elif (top / ".worktrees" / task_id).exists():
         own_tree = top / ".worktrees" / task_id
         if not (allow_studio_tree and _is_linked_worktree_checkout(own_tree)
                 and _git_toplevel(own_tree) == own_tree.resolve()):
-            return None  # a prior run's local worktree: its work stays where it is
+            _why(why, WHY_CONCRETE)
+            return None, None  # a prior run's local worktree: its work stays where it is
     if own_tree is not None and not _clean_on_branch(own_tree, b, runner):
-        return None  # uncommitted or untracked work only the Studio has
-    if own_tree is not None:
-        # The tree's commits must be on origin: no origin ref = local only.
-        try:
-            ref = runner(["git", "-C", str(top), "rev-parse", "-q", "--verify", f"refs/remotes/origin/{b}"],
-                         capture_output=True, text=True, encoding="utf-8", timeout=10,
-                         stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if getattr(ref, "returncode", 1) != 0:
-            return None
+        # uncommitted or untracked work only the Studio has
+        _why(why, WHY_DIRTY if _on_branch(own_tree, b, runner) else WHY_OFF_BRANCH)
+        return None, None
 
     def _git(*args):
         try:
@@ -207,22 +331,86 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
                           timeout=10, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             return None
-    local = _git("rev-parse", "-q", "--verify", f"refs/heads/{b}")
-    if local is None:
-        return None
-    if getattr(local, "returncode", 1) == 0:
-        ahead = _git("rev-list", "--count", f"refs/remotes/origin/{b}..refs/heads/{b}")
-        if ahead is None or getattr(ahead, "returncode", 1) != 0 or (ahead.stdout or "").strip() != "0":
-            return None  # local commits (or no origin ref): only the Studio has the baseline
-    return top
+
+    def _sha(ref):
+        proc = _git("rev-parse", "-q", "--verify", ref)
+        if proc is None:
+            return None
+        return (proc.stdout or "").strip() if getattr(proc, "returncode", 1) == 0 else ""
+
+    remote = _sha(f"refs/remotes/origin/{b}")
+    local = _sha(f"refs/heads/{b}")
+    if remote is None or local is None:
+        _why(why, WHY_NOT_REPO)
+        return None, None
+    if own_tree is not None and not remote and not push_ok:
+        _why(why, "unpushed_commits")
+        return None, None  # the tree's commits must be on origin: no origin ref = local only
+    if not local:
+        return top, None  # no local branch at all: the clone makes it
+    ahead = _git("rev-list", "--count", f"refs/remotes/origin/{b}..refs/heads/{b}") if remote else None
+    if remote and (ahead is None or getattr(ahead, "returncode", 1) != 0):
+        _why(why, WHY_NOT_REPO)
+        return None, None
+    if remote and (ahead.stdout or "").strip() == "0":
+        return top, None  # in step with origin
+    if not push_ok:
+        _why(why, "unpushed_commits")
+        return None, None  # local commits (or no origin ref): only the Studio has the baseline
+    if remote:
+        anc = _git("merge-base", "--is-ancestor", f"refs/remotes/origin/{b}", f"refs/heads/{b}")
+        if anc is None or getattr(anc, "returncode", 1) != 0:
+            _why(why, "diverged_from_origin")
+            return None, None  # origin has commits the Studio lacks: a push would drop them
+    return top, (str(top), b, remote)
+
+
+def _on_branch(tree: Path, branch: str, runner: Callable) -> bool:
+    try:
+        proc = runner(["git", "-C", str(tree), "branch", "--show-current"], capture_output=True, text=True,
+                      encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return getattr(proc, "returncode", 1) == 0 and (proc.stdout or "").strip() == branch
+
+
+def push_card_branch(push: Tuple[str, str, str], runner: Callable = subprocess.run) -> None:
+    """Push the card branch to origin before the port (t_1d2c5939): ``--force-with-lease`` pinned to the
+    origin sha the routing saw ("" = the branch must not exist on origin), so a branch someone moved since
+    is refused, never overwritten. Raises on failure (a spawn failure; the card stays where it is)."""
+    repo, branch, expected = push
+    proc = runner(["git", "-C", repo, "push", "--porcelain",
+                   f"--force-with-lease=refs/heads/{branch}:{expected}",
+                   "origin", f"refs/heads/{branch}:refs/heads/{branch}"],
+                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  timeout=PUSH_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    rc = getattr(proc, "returncode", 1)
+    if rc != 0:
+        raise RuntimeError(f"push of {branch} from {repo} before the port failed rc={rc}: "
+                           f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
 
 
 def port_for(task_id: str, workspace_path: Optional[str], board_default: Optional[str],
              fleet_dir: Path, runner: Callable = subprocess.run, *,
              branch: Optional[str] = None,
-             allow_studio_tree: bool = False) -> Optional[Tuple[str, str, Tuple[str, ...], Dict[str, str]]]:
-    """``(owner/repo, mirror, hosts, {host: mirror})`` when this worktree card
-    may run on a pool host, else None (:func:`mirror_for` picks the path)."""
+             allow_studio_tree: bool = False,
+             pool_hosts=None, why: Optional[List[str]] = None) -> Optional[tuple]:
+    """``(owner/repo, mirror, hosts, {host: mirror}, push)`` when this worktree card
+    may run on a pool host, else None (:func:`mirror_for` picks the path).
+
+    Derived mode (:func:`derived_enabled`): any GitHub repo, every host in ``pool_hosts``, ``push`` set when
+    the card branch must be pushed first. Hand-list mode: the file's rows only, ``push`` always None."""
+    if pool_hosts is not None and derived_enabled(fleet_dir):
+        repo, push = assess(task_id, workspace_path, board_default, branch, runner,
+                            allow_studio_tree=allow_studio_tree, push_ok=True, why=why)
+        if repo is None:
+            return None
+        slug = origin_slug(repo, runner)
+        if not slug:
+            _why(why, WHY_NOT_GITHUB)
+            return None
+        route = derived_route(slug, fleet_dir, pool_hosts, why)
+        return (slug, route[0], route[1], route[2], push) if route else None
     mirrors = read_mirrors(fleet_dir)
     if not mirrors:
         return None
@@ -230,7 +418,7 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
                        allow_studio_tree=allow_studio_tree)
     slug = origin_slug(repo, runner) if repo is not None else None
     row = mirrors.get(slug.lower()) if slug else None
-    return (slug, row[0], row[1], row[2]) if row else None
+    return (slug, row[0], row[1], row[2], None) if row else None
 
 
 def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], fleet_dir: Path,
@@ -256,7 +444,14 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
     repo = target if target is not None else p
     top = _git_toplevel(repo) if repo.is_dir() else None
     slug = origin_slug(top, runner) if top is not None else None
-    row = read_mirrors(fleet_dir).get(slug.lower()) if slug else None
+    if slug and derived_enabled(fleet_dir):
+        # t_1d2c5939: every GitHub repo ports to every pool host (minus the file's exclusions).
+        excl: List[str] = []
+        row = derived_route(slug, fleet_dir, ("every pool host",), excl)
+        if row is None:
+            return workspace_path, f"worktree card stays Studio-local: {slug} {excl[0] if excl else 'not portable'}"
+    else:
+        row = read_mirrors(fleet_dir).get(slug.lower()) if slug else None
     if row is None:
         why = (f"{slug} has no row in fleet/{MIRRORS_FILE}" if slug
                else f"{workspace_path} is not a GitHub repo checkout")
@@ -284,6 +479,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     the checkout instead of returning early (Prism f43e48b43fc3). rc 3 = the
     workspace holds something else (never overwritten)."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
+    if mirror.startswith("~/"):
+        # A derived per-host default (t_1d2c5939): the host's own $HOME, whatever user/OS it runs.
+        m = '"$HOME"/' + shlex.quote(mirror[2:])
     url = shlex.quote(url or f"https://github.com/{slug}.git")
     from hermes_cli.kanban_worker_hosts import WORKSPACE_MODE  # t_69e47673: pool workspace, never world-searchable
     return (

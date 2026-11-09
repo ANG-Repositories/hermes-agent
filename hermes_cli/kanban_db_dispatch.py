@@ -5335,12 +5335,16 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None
+    wt_why: list = []
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
+        # t_1d2c5939: derived mode ports any GitHub repo to every pool host (no hand list), pushing an
+        # unpushed card branch first; wt_why names why a card still stays local.
         port = _kwt.port_for(row["id"], row["workspace_path"],
                              _kwt.board_default_workdir(board), _fleet_dir,
                              branch=_kb._row_get(row, "branch_name"),
-                             allow_studio_tree=last_resort)
+                             allow_studio_tree=last_resort,
+                             pool_hosts=tuple(plan.config.hosts or ()), why=wt_why)
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -5500,6 +5504,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     if rule == "workspace_kind" and (row["workspace_kind"] or "scratch") == "worktree":
         # Linked worktrees reference the Studio's git common dir. Only the
         # mirror-backed clone route above can safely move their baseline.
+        if wt_why:
+            # Derived mode (t_1d2c5939): the one named reason, e.g. unpushed_dirty_tree.
+            return "local", f"not_portable:workspace_kind:{wt_why[0]}"
         return "local", ("not_portable:workspace_kind:worktree is Studio-only without a safe mirror-backed "
                          "clone; fleet/kanban-worktree-mirrors.json must list the repo and destination "
                          "host, and the source must be an eligible anchor or clean pushed card worktree")
@@ -7997,6 +8004,9 @@ def _dispatch_once_locked(
                 claimed.workspace_kind, claimed.workspace_path = "scratch", None
                 workspace = _kbw.resolve_workspace(claimed, board=board)
                 _wt_mirror = _kwt.mirror_for(_wt_port, placed_host.name)
+                if len(_wt_port) > 4 and _wt_port[4] is not None:
+                    # Push-then-port (t_1d2c5939): committed work only the Studio has goes to origin first.
+                    _kwt.push_card_branch(_wt_port[4])
                 _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_mirror,
                                    resolved_branch_name)
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
