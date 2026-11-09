@@ -1081,19 +1081,29 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     return p
 
 
-def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str) -> None:
+def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str,
+                     run_id: Optional[int] = None) -> None:
+    """``run_id``: write only while that run still owns the card (same transaction), else raise ClaimLost."""
     with _kb.write_txn(conn):
-        conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
+        if run_id is None:
+            conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
+            return
+        cur = conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ? AND status = 'running' "
+                           "AND current_run_id = ?", (value, task_id, int(run_id)))
+        if cur.rowcount == 0:
+            raise _kb.ClaimLost(f"{task_id}: run {run_id} no longer owns the card")
 
 
-def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
-    _set_task_column(conn, task_id, "workspace_path", str(path))
+def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str, *,
+                       run_id: Optional[int] = None) -> None:
+    _set_task_column(conn, task_id, "workspace_path", str(path), run_id)
     from hermes_cli.kanban_survivor import record_baseline
     record_baseline(conn, task_id, path)
 
 
-def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
-    _set_task_column(conn, task_id, "branch_name", str(branch_name))
+def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str, *,
+                    run_id: Optional[int] = None) -> None:
+    _set_task_column(conn, task_id, "branch_name", str(branch_name), run_id)
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.

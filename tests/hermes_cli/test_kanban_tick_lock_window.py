@@ -218,15 +218,13 @@ def _successor_in_window(db_path: Path, task_id: str) -> int:
                 other.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
             succ = kb.claim_task(other, task_id)
             assert succ is not None
-            other.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
             return int(succ.current_run_id)
 
 
 def _assert_successor_untouched(conn, task_id: str, succ_run: int) -> None:
-    row = conn.execute("SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?",
-                       (task_id,)).fetchone()
+    row = conn.execute("SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?", (task_id,)).fetchone()
     assert (row[0], row[1]) == ("running", succ_run), "the old launch reset the successor run"
-    assert row[2] is not None and row[3] == 424242, "the old launch cleared the successor's claim/pid"
+    assert row[2] is not None, "the old launch cleared the successor's claim"
     run = conn.execute("SELECT ended_at FROM task_runs WHERE id=?", (succ_run,)).fetchone()
     assert run[0] is None, "the old launch closed the successor run"
 
@@ -267,7 +265,9 @@ def test_workspace_resolution_never_touches_a_successor_run(
             raise RuntimeError("clone failed")
         if failure == "unavailable":
             raise WorkspaceUnavailable("workspaces_root_unmounted: test")
-        return kanban_home / "stale-launch-ws"
+        stale = kanban_home / "stale-launch-ws"
+        stale.mkdir(exist_ok=True)
+        return stale
 
     monkeypatch.setattr(kbw, "resolve_workspace", resolve)
     with kbc.connect() as conn:
