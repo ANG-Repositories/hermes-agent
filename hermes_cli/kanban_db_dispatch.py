@@ -4695,9 +4695,14 @@ def _reroute_placement_blocks(conn, result) -> None:
     that has the capability (t_a32116ec). Never breaks a tick."""
     try:
         from hermes_cli import kanban_placement_block as _kpb
+        from hermes_cli import kanban_host_capabilities as _khc
         from hermes_cli import kanban_worker_pool as _kwp
-        pool = _kwp.read_pool(_kb.kanban_home() / "fleet")
-        result.placement_rerouted, result.placement_unroutable = _kpb.reroute_placement_blocks(conn, pool)
+        fleet = _kb.kanban_home() / "fleet"
+        pool = _kwp.read_pool(fleet)
+        # t_388c4ab2: the Studio pin it writes must carry a requires: word this map's Studio row serves.
+        reasons = _kwp.studio_map_reasons(_khc.load_map(fleet))
+        result.placement_rerouted, result.placement_unroutable = _kpb.reroute_placement_blocks(
+            conn, pool, studio_reasons=reasons)
     except Exception:
         _kb._log.warning("kanban dispatch: placement-block re-route failed", exc_info=True)
 

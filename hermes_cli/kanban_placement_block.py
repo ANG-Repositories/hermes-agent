@@ -137,6 +137,57 @@ def _latest_blocks(conn) -> list:
     ).fetchall()
 
 
+# t_388c4ab2: a bare ``host: studio`` is DROPPED at dispatch (kanban_worker_pool.effective_pin, #138) unless a
+# ``requires:`` word names a reason the Studio serves, so the re-route writes one. Block-reason wording -> map
+# word, first match wins; a word the map's Studio row does not list is skipped.
+DEFAULT_STUDIO_REQUIRES = "studio-state"
+_REQUIRES_HINTS = (
+    ("fleet-ssh", re.compile(r"\bssh\b", re.IGNORECASE)),
+    ("docker", re.compile(r"\bdocker\b", re.IGNORECASE)),
+    ("browser-session", re.compile(r"\bbrowser\b", re.IGNORECASE)),
+    ("studio-state", re.compile(r"\b(?:launchd|relay|logs?)\b", re.IGNORECASE)),
+)
+_REQUIRES_HEAD_RE = re.compile(r"^([ \t]*requires:[ \t]*)", re.IGNORECASE | re.MULTILINE)
+
+
+def studio_requires_word(reason: str, studio_reasons: Optional[frozenset]) -> str:
+    """The ``requires:`` word for a re-route to the Studio: the first hint the block reason names that the map's
+    Studio row serves, else ``studio-state``. ``studio_reasons`` None (no map this tick) = ``studio-state``."""
+    if studio_reasons is None:
+        return DEFAULT_STUDIO_REQUIRES
+    for word, rx in _REQUIRES_HINTS:
+        if word in studio_reasons and rx.search(reason or ""):
+            return word
+    if DEFAULT_STUDIO_REQUIRES in studio_reasons:
+        return DEFAULT_STUDIO_REQUIRES
+    rest = sorted(studio_reasons - {_pr.ACCESS_CONTROL_PLANE_READ})
+    return rest[0] if rest else _pr.ACCESS_CONTROL_PLANE_READ
+
+
+def pin_body(body: Optional[str], host: str, *, reason: str, studio_reasons: Optional[frozenset],
+             pool) -> str:
+    """THE body a re-route writes: ``host: <host>`` unless the body already resolves to that pin, and for the
+    Studio a ``requires:`` word :func:`kanban_worker_pool.studio_pin_justified` accepts (the same predicate
+    dispatch drops a bare pin with) unless one is already there. An existing ``requires:`` line that names no
+    Studio reason gets the word on that line, never a second line. ``studio_reasons`` None = judged against
+    ``studio-state`` alone."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    text = body or ""
+    head = []
+    pin, _ign = _kwp.resolve_pin(text, getattr(pool, "hosts", ()) or (), getattr(pool, "pin_aliases", None))
+    if pin != host:
+        head.append(f"host: {host}")
+    if host == _kwp.PIN_STUDIO:
+        vocab = studio_reasons if studio_reasons is not None else frozenset({DEFAULT_STUDIO_REQUIRES})
+        if not _kwp.studio_pin_justified(text, vocab):
+            word = studio_requires_word(reason, studio_reasons)
+            if _REQUIRES_HEAD_RE.search(text):
+                text = _REQUIRES_HEAD_RE.sub(lambda m: f"{m.group(1)}{word}, ", text, count=1)
+            else:
+                head.append(f"requires: {word}")
+    return "\n".join(head + [text]) if head else text
+
+
 def _json(raw) -> dict:
     try:
         v = json.loads(raw) if raw else {}
@@ -145,8 +196,11 @@ def _json(raw) -> dict:
     return v if isinstance(v, dict) else {}
 
 
-def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """One pass over the board: ``([(task_id, host)] re-routed, [task_id] newly unroutable)``."""
+def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None,
+                             studio_reasons: Optional[frozenset] = None) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """One pass over the board: ``([(task_id, host)] re-routed, [task_id] newly unroutable)``.
+    ``studio_reasons``: :func:`kanban_worker_pool.studio_map_reasons` this tick (None = no map), for
+    :func:`pin_body`."""
     from hermes_cli import kanban_db as _kb
     now = int(time.time()) if now is None else int(now)
     rerouted: List[Tuple[str, str]] = []
@@ -190,12 +244,16 @@ def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None) -> Tuple[
                                   {"placed_host": placed_host, "why": arg, "run_id": row["run_id"]})
             unroutable.append(tid)
             continue
-        pin_line = f"host: {arg}"
-        new_body = f"{pin_line}\n{row['body'] or ''}"
+        reason = str(blk.get("reason") or "")
+        new_body = pin_body(row["body"], arg, reason=reason, studio_reasons=studio_reasons, pool=pool)
+        from hermes_cli import kanban_host_capabilities as _khc
+        words = _khc.declared_words(new_body)
+        carries = f"`host: {arg}`" + (f" and `requires: {', '.join(words)}` (a bare Studio pin is dropped at "
+                                      f"dispatch)" if arg == "studio" and words else "")
         note = (f"placement re-route: run {row['run_id']} ran on {placed_host or 'a host'} and blocked "
-                f"kind=capability, so this card now carries `{pin_line}` (line 1) and is back in the queue. "
+                f"kind=capability, so this card now carries {carries} and is back in the queue. "
                 f"Once only: a second capability block pages #alerts instead. Reason was: "
-                f"{str(blk.get('reason') or '')[:300]}")
+                f"{reason[:300]}")
         # Order is the atomicity (unblock_task owns its own write txn and cannot nest): the pin goes in with a
         # compare-and-swap on the body read above (a concurrent edit is never overwritten), then the unblock,
         # and the placement_rerouted marker ONLY after the unblock landed. A failed unblock reverts the pin
