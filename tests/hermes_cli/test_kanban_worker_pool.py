@@ -29,6 +29,9 @@ def _no_real_spawn(monkeypatch: pytest.MonkeyPatch):
     def boom(*a, **kw):
         raise RuntimeError("real spawn in gate test")
     monkeypatch.setattr(kbd, "_default_spawn", boom)
+    # t_e604c0f9: the local_files carry runs ssh + rsync to the pool host; never from a test.
+    from hermes_cli import kanban_worker_hosts as _kwh
+    monkeypatch.setattr(_kwh, "carry_workspace", boom)
 
 
 @pytest.fixture
@@ -883,6 +886,13 @@ def test_cards_no_host_serves_are_never_claimed(kanban_home):
 
 
 def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
+    """Kill switch (hosts.mac-studio.consumers.kanban.last_resort: false): the pre-t_e604c0f9 contract."""
+    import json as _json
+    cfg = kanban_home / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / kwp.FLEET_HOSTS_FILE).write_text(_json.dumps({"hosts": {"mac-studio": {
+        "consumers": {"kanban": {"last_resort": False}}}}}))
+    kwp._last_resort_cache.clear()
     ws = tmp_path / "legacy-ws"
     ws.mkdir()
     (ws / "handoff.md").write_text("x", encoding="utf-8")
@@ -892,6 +902,23 @@ def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
     assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files"
+
+
+def test_prefilled_local_workspace_is_carried_when_the_studio_is_full(kanban_home, tmp_path, monkeypatch):
+    """t_e604c0f9: local_files is continuity; with the local gate paused the files go with the card."""
+    from hermes_cli import kanban_worker_hosts as kwh
+    calls = []
+    monkeypatch.setattr(kwh, "carry_workspace", lambda host, w, runner=None: calls.append((host.name, w)))
+    kwh._carry_scan_cache.clear()
+    ws = tmp_path / "legacy-ws"
+    ws.mkdir()
+    (ws / "handoff.md").write_text("x", encoding="utf-8")
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host:any")
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), tid))
+        conn.commit()
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert spawned == [(tid, "ace-ai")] and calls == [("ace-ai", str(ws))]
 
 
 # -- Prism round 1 (PR #1730) -----------------------------------------------
