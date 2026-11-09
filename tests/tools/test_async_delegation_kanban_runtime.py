@@ -1559,3 +1559,37 @@ def test_pause_hold_refusal_never_falls_back_in_process(monkeypatch, tmp_path, s
     with kb.connect_closing(board="delegations") as conn:
         statuses = [r["status"] for r in conn.execute("SELECT status FROM tasks")]
     assert statuses == ["archived"]
+
+
+def test_pause_hold_refusal_keeps_the_fence_on_a_card_it_could_not_archive(monkeypatch, tmp_path, spawner):
+    """Prism c-c6546d2332b994d5: spawn_now refused by a pause hold, and the container card could not be archived
+    (launch_unit says fenced=False). The refusal branch must not release the launch fence then: the card stays
+    ready and is dispatched once the hold clears. The fence stays held, the failure names the unarchived card,
+    and the card's runner, dispatched after the hold clears, finds nothing to run."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_pause_hold as kph
+    from tools import delegation_unit_worker as duw
+
+    why = "pause_hold (ci-box:fwa:pause:20261107T150000Z-ci-box-fwa00001 by apollo stage=destination)"
+    monkeypatch.setattr(kph, "local_destination_wait", lambda cache: why)
+    monkeypatch.setattr(akb, "_archive_quietly", lambda task_id: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    rec = _record(did)
+    task_id = rec["kanban"]["task_id"]
+    assert calls == [] and spawner.procs == [], "nothing ran under the hold"
+    assert rec["state"] == "failed" and rec["attempt"]["generation"] == 0
+    assert akb._fenced_launch(task_id), "an unarchived card keeps its launch fence"
+    terminal = json.dumps([e for e in rec["outbox"] if e.get("type") == "async_delegation"])
+    assert f"card {task_id} could not be archived and stays fenced" in terminal, terminal
+    card, _ = _card(task_id)
+    assert card.status == "ready", "the archive failed: the card is still dispatchable"
+    # The hold clears and dispatch processes the card: its runner must not run the failed delegation.
+    monkeypatch.setattr(kph, "local_destination_wait", lambda cache: None)
+    with kb.connect_closing(board="delegations") as conn:
+        assert kbd.spawn_now(conn, task_id, board="delegations", spawn_fn=spawner)
+    assert len(spawner.procs) == 1
+    _, current = duw.read_unit(task_id)
+    assert current is None, "the delegation reported failed is not run by the late card"
+    assert _record(did)["state"] == "failed" and calls == []
