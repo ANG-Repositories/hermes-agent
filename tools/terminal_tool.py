@@ -1718,8 +1718,8 @@ def terminal_tool(
             acting_for_tid.reset(_acting_token)
         if bounded_guard.timed_out:
             raise _Rejected(_error_json(
-                f"Terminal pre-execution guard did not finish within {guard_timeout}s "
-                "(process-identity probe wedged); the command was not run. Retry the call.",
+                f"Terminal pre-execution safety checks did not finish within {guard_timeout}s; "
+                "the command was not run. Retry the call.",
                 status="error",
             ))
         # Pre-exec security checks (tirith + dangerous command detection);
