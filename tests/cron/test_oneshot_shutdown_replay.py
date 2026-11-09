@@ -296,6 +296,12 @@ def test_stale_marker_retires_job_so_catchup_scan_cannot_fire_it(home, monkeypat
     assert job["fire_claim"] is None and job.get("run_claim") is None
     assert _fire_if_due() == []
     _shift_clock(monkeypatch, 60)  # one more scheduler tick
+    from unittest.mock import patch
+    from cron.scheduler import tick
+
+    with patch("cron.scheduler.run_job") as run:
+        tick(verbose=False, sync=True)
+    run.assert_not_called()
     assert _fire_if_due() == []
     assert [k for k, _ in home.pages] == [f"stale-{JOB_ID}"]
     assert f"hermes cron resume {JOB_ID} --run-now" in home.pages[0][1]
@@ -378,8 +384,8 @@ def test_ownership_lost_row_from_before_marking_is_terminal(home):
     assert _job()["state"] == "completed"
 
 
-@pytest.mark.parametrize("ledger", ["missing", "running", "wedged"])
-def test_marker_whose_run_cannot_be_proven_cut_off_is_retired_and_paged(home, ledger):
+@pytest.mark.parametrize("ledger", ["missing", "running", "wedged", "unreadable"])
+def test_marker_whose_run_cannot_be_proven_cut_off_is_retired_and_paged(home, ledger, monkeypatch):
     """P1 39cb8aa0809e: replay only on positive evidence the run was cut off by this stop.
     A missing row, a row still open, or a wedged-owner unknown proves nothing: page, retire."""
     from cron import executions
@@ -395,6 +401,11 @@ def test_marker_whose_run_cannot_be_proven_cut_off_is_retired_and_paged(home, le
             conn.execute(
                 "UPDATE executions SET process_id=?, pid=?, process_started_at=NULL WHERE id=?",
                 (executions._PROCESS_ID, os.getpid(), owner.run_id))
+        elif ledger == "unreadable":
+            def unreadable(_run_id):
+                raise OSError("ledger unavailable")
+
+            monkeypatch.setattr(executions, "get_execution", unreadable)
         else:
             conn.execute(
                 "UPDATE executions SET status='unknown', error=?, finished_at=? WHERE id=?",
