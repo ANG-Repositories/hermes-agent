@@ -902,6 +902,76 @@ def _verify_land_inherited(entry: dict, verdict: dict, kb: Any, conn: Any) -> Op
     return None
 
 
+def stale_surface_reason(entry: dict) -> Optional[str]:
+    """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
+
+    Keep the original event cursor across retries/restarts: a deadman event's timestamp
+    is NOT the timestamp of the review handback it is summarizing.
+    """
+    if os.environ.get("BOOMERANG_STALE_GUARD") == "0":
+        return None
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_open_pr as _op
+
+    conn = _readonly(kb, entry.get("board"))
+    try:
+        task = kb.get_task(conn, entry["task_id"])
+        event_id = entry.get("event_id")
+        handback = conn.execute(
+            "SELECT id, created_at, payload, run_id FROM task_events WHERE task_id = ? "
+            "AND kind IN ('review_requested', 'completed') AND (? IS NULL OR id <= ?) "
+            "ORDER BY id DESC LIMIT 1", (entry["task_id"], event_id, event_id)).fetchone()
+        owner = str(entry.get("assignee") or _field(task, "assignee") or "")
+        owners = {name.removeprefix("human:") for name in
+                  (owner, str(_field(task, "assignee") or "")) if name}
+        owners |= {f"human:{name}" for name in owners}
+        comments = [c for c in kb.list_comments(conn, entry["task_id"])
+                    if str(c.author) not in {"boomerang-wake", "kanban-dispatcher"}
+                    and not str(c.author).startswith("unverified:")
+                    and c.author in owners]
+        if comments:
+            newest = max(comments, key=lambda c: (c.created_at, c.id))
+            if re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M):
+                return "owner release/hold line"
+            if handback and newest.created_at > handback["created_at"]:
+                return "owner comment newer than handback"
+        refs = []
+        if handback:
+            payload = json.loads(handback["payload"] or "{}")
+            refs = _handback_refs(kb, conn, None, payload, handback["run_id"])
+        # Preserve the claim's PR even if a newer handback now names another one.
+        refs = list(refs) + list(_op.extract_pr_refs(entry.get("pr")))
+    finally:
+        conn.close()
+    health_fn = _health_fn()
+    if health_fn is not None:
+        seen = set()
+        for ref in refs:
+            key = (ref.repo.lower(), int(ref.number))
+            if key in seen:
+                continue
+            seen.add(key)
+            health = health_fn(ref.repo, int(ref.number)) or {}
+            if health.get("state") == "merged" or health.get("merged") or health.get("merged_at"):
+                return f"summarized PR merged: {ref.repo}#{ref.number}"
+    return None
+
+
+def _stale_refusal(entry: dict, stage: str) -> Optional[str]:
+    try:
+        reason = stale_surface_reason(entry)
+    except Exception as exc:
+        # An unavailable read is not evidence that a card is stale. Keep the existing
+        # visible failure path, rather than silently losing an actionable wake.
+        logger.warning("kanban boomerang-wake: stale guard read failed task=%s stage=%s: %s",
+                       entry.get("task_id"), stage, exc)
+        return None
+    if reason:
+        logger.info("kanban boomerang-wake: stale surface refused task=%s stage=%s reason=%s delegation=%s",
+                    entry.get("task_id"), stage, reason, entry.get("delegation_id"))
+    return reason
+
+
 def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[BoomerangWakeState] = None,
                     handback: bool = False) -> dict:
     """Validate the child's verdict and do at most ONE allowlisted board write (§5.8, D-19).
@@ -931,6 +1001,9 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
         return {"ok": False, "action": action, "reason": f"action not allowed for {live.get('row')}",
                 "summary": summary, "refused": True, **finding}
     if action == "surface":
+        why = _stale_refusal(live, "execute_verdict")
+        if why:
+            return {"ok": False, "action": action, "reason": why, "summary": summary, "stale": True}
         return {"ok": False, "action": action, "reason": "child surfaced it", "summary": summary, "surface": True,
                 **finding}
     conn = kb.connect(board=live.get("board"))
@@ -1011,7 +1084,9 @@ def handback_row(entry: dict, result: dict, *, turn_text: Optional[str] = None) 
     return entry["delegation_id"], {
         "task_id": entry["task_id"], "board": entry.get("board"), "route": dict(entry.get("route") or {}),
         "home_sid": entry.get("home_sid") or "", "title": entry.get("title"), "kind": entry.get("kind"),
-        "event_ts": entry.get("event_ts"), "claim_key": entry.get("key"), "parts": parts,
+        "event_ts": entry.get("event_ts"), "event_id": entry.get("event_id"),
+        "assignee": entry.get("assignee"), "pr": entry.get("pr"),
+        "claim_key": entry.get("key"), "parts": parts, "action": result.get("action"),
         "line": f"boomerang handled {entry['task_id']} ({row}): {summary}", "turn": turn_text,
         "attempts": 0, "created_at": _time.time()}
 
@@ -1080,7 +1155,22 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
         done = set()
     left = [p for p in row.get("parts") or [] if p not in done]
     sent = 0
+    # Prism 0c2f7d571cd9: only a surface goes stale; a write receipt (land/complete/...) always delivers.
+    # A legacy row has no action: a turn part marks it as a surface (handback_row sets turn for surfaces only).
+    action = row.get("action")
+    guarded = action == "surface" or (action is None and row.get("turn") is not None)
     for part in list(left):
+        if guarded:
+            # Recover original cursors for rows persisted before the guard was introduced.
+            claim = await asyncio.to_thread(state.get_claim, row.get("claim_key") or "") or {}
+            guard_entry = {**claim, **entry}
+            for field in ("event_id", "assignee", "pr"):
+                if guard_entry.get(field) is None:
+                    guard_entry[field] = claim.get(field)
+            why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one")
+            if why:
+                await asyncio.to_thread(state.drop_handback, delegation_id)
+                return sent
         if part == PART_TURN:
             ok = await resurface(runner, entry, row.get("turn"))
         else:
@@ -1401,6 +1491,8 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
         await _fail(runner, live, f"child {status}: {_first_line(final, 200)}", state)
         return
     if await asyncio.to_thread(deadman_owner_acted, live):
+        logger.info("kanban boomerang-wake: stale surface refused task=%s stage=run_entry "
+                    "reason=operator already acted delegation=%s", live["task_id"], live.get("delegation_id"))
         await asyncio.to_thread(enqueue_handback, live, {"summary": "operator already acted; stale wake ignored"},
                                 state=state, stale=True)
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale")
@@ -1408,6 +1500,10 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
     # handback=True: the pending row commits with the terminal claim (one state write), then the
     # best-effort breadcrumb, then the send (ruling t_e98f651e-handback-first-then-everything).
     result = await asyncio.to_thread(execute_verdict, live, final, state=state, handback=True)
+    if result.get("stale"):
+        await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale",
+                                reason=result["reason"])
+        return
     if result.get("noop"):
         if result.get("action"):   # receipt already on the board: its handback is still owed
             await asyncio.to_thread(enqueue_handback, live, result, state=state)
