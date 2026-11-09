@@ -156,7 +156,7 @@ def _classify_run(run_id: Optional[str], marked_at: datetime) -> Tuple[str, Any]
     """What the marked run's ledger row says, read after execution recovery.
 
     ``("replay", None)``: the row proves the run was cut off by this stop before it delivered:
-    ``unknown`` written by recovery because the owner is gone (``_OWNER_GONE_REASON``), ``failed``
+    ``failed``
     with ``INTERRUPTED_ERROR`` (only ever written for a run the stop sweep flagged), or ``failed``
     with an ``OWNERSHIP_LOST_BY_STOP_ERRORS`` error finished at or after ``marked_at``.
     ``("terminal", (success, error))``: the run reached its own outcome.
@@ -165,7 +165,7 @@ def _classify_run(run_id: Optional[str], marked_at: datetime) -> Tuple[str, Any]
     """
     if not run_id:
         return "uncertain", "the marker carries no execution id"
-    from cron.executions import _OWNER_GONE_REASON, get_execution
+    from cron.executions import get_execution
 
     try:
         row = get_execution(run_id)
@@ -179,8 +179,6 @@ def _classify_run(run_id: Optional[str], marked_at: datetime) -> Tuple[str, Any]
     if status == "completed":
         return "terminal", (True, None)
     if status == "unknown":
-        if error == _OWNER_GONE_REASON:
-            return "replay", None
         return "uncertain", f"execution {run_id} is unknown ({error or 'no reason'})"
     if status == "failed":
         finished = _parse(row.get("finished_at"))
@@ -287,6 +285,8 @@ def consume_replay_markers() -> Dict[str, List[str]]:
             changed = True
             job.pop(REPLAY_PENDING_KEY, None)
             job_id = str(job.get("id") or "")
+            if not _is_once(job) or _is_script_lane(job):
+                continue  # definition changed since the stop; do not retire the new job
             name = job.get("name") or job_id
             run_id = marker.get("run_id") if isinstance(marker, dict) else None
             marked_at = _parse(marker.get("marked_at")) if isinstance(marker, dict) else None
@@ -297,6 +297,9 @@ def consume_replay_markers() -> Dict[str, List[str]]:
             stamp = now.isoformat()
             if verdict == "terminal":
                 success, error = detail
+                repeat = job.get("repeat")
+                if isinstance(repeat, dict) and isinstance(repeat.get("times"), int) and repeat["times"] > 0:
+                    repeat["completed"] = min(repeat["times"], int(repeat.get("completed") or 0) + 1)
                 J._record_run_outcome(job, success, error, None, None, stamp)
                 J._advance_after_run(job, stamp)
                 out["terminal"].append(job_id)

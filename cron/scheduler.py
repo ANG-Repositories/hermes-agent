@@ -4838,7 +4838,9 @@ def _run_one_job_body(
                     _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
                 return True
 
-        if _consume_interrupted_flag(job["id"], execution_token):
+        # A flag alone is advisory: the sweep may have timed out without persisting.
+        # After delivery, the owner-fenced terminal write is authoritative.
+        if _consume_interrupted_flag(job["id"], execution_token) and fire_owner is None:
             _finish_interrupted_run(
                 job, execution_id, delivery_error,
                 delivered=bool(d.delivery_attempted and not d.delivery_error))
@@ -4876,10 +4878,11 @@ def _run_one_job_body(
             delivery_error, delivery_outcome = _deliver_crash_failure(
                 job, _err_text, adapters=adapters, loop=loop)
         interrupted = False
+        marked = False
         try:
             interrupted = _consume_interrupted_flag(job["id"], execution_token)
             if (
-                not interrupted
+                (not interrupted or fire_owner is not None)
                 and not self_removal_delivery_allowed(job["id"])  # no record left to mark
             ):
                 mark_kwargs = {}
@@ -4887,11 +4890,11 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
-                mark_job_run(job["id"], False, _err_text, **mark_kwargs)
+                marked = mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
-        if interrupted:
+        if interrupted and not marked:
             # The stop's cancel surfaced as this exception: record the interruption, which a
             # one-shot replay marker reads as "not an outcome" (t_b5c315bb).
             from cron.shutdown_replay import INTERRUPTED_AFTER_DELIVERY_ERROR, INTERRUPTED_ERROR

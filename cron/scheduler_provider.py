@@ -199,8 +199,12 @@ class CronScheduler(ABC):
         report it as scheduled). Built-in: no-op."""
         return None
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self, *, replay_pass: bool = True) -> int:
         """Run profile-local attempt recovery for every provider lifecycle.
+
+        ``replay_pass`` runs cron/shutdown_replay.py's boot pass around recovery, so every
+        provider (builtin or Chronos) consumes stop-drain markers. The script-runner lane
+        passes False: it never owns agent-lane markers (t_b5c315bb).
 
         Two stores must be reconciled, not one:
 
@@ -232,6 +236,8 @@ class CronScheduler(ABC):
         """
         from cron.executions import recover_interrupted_executions
 
+        if replay_pass:
+            _shutdown_replay_pass("pre")
         recovered = recover_interrupted_executions()
         if recovered:
             try:
@@ -243,6 +249,8 @@ class CronScheduler(ABC):
                     exc_info=True,
                 )
         _settle_script_outcomes()
+        if replay_pass:
+            _shutdown_replay_pass("post")
         return recovered
 
     @staticmethod
@@ -617,15 +625,11 @@ class InProcessCronScheduler(CronScheduler):
         # store here must not take the whole ticker thread down (#111010) — the loop's own
         # per-tick handling logs, persists the reason and keeps the thread alive.
         try:
-            if lane != "script":
-                _shutdown_replay_pass("pre")
-            recovered = self.recover_interrupted()
+            recovered = self.recover_interrupted(replay_pass=lane != "script")
             if recovered:
                 logger.warning(
                     "Marked %d interrupted cron execution(s) unknown after restart", recovered
                 )
-            if lane != "script":
-                _shutdown_replay_pass("post")
             # Heartbeat before the first sleep so `hermes cron status` sees a live ticker
             # immediately.
             record_ticker_heartbeat()
@@ -740,16 +744,12 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 with _profile_cron_scope(home):
                     if startup_recovery:
-                        if lane != "script":
-                            _shutdown_replay_pass("pre")
-                        recovered = self.recover_interrupted()
+                        recovered = self.recover_interrupted(replay_pass=lane != "script")
                         if recovered:
                             logger.warning(
                                 "Marked %d interrupted cron execution(s) for profile at %s",
                                 recovered, home,
                             )
-                        if lane != "script":
-                            _shutdown_replay_pass("post")
                     if heartbeat:
                         record_ticker_heartbeat()
             except BaseException as e:

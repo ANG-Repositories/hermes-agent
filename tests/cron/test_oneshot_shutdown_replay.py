@@ -56,6 +56,8 @@ _OWNER = textwrap.dedent(
     def on_term(*_):
         from gateway.run_shutdown import GatewayShutdownMixin
         marked = GatewayShutdownMixin._stop_kill_tool_subprocesses("post-interrupt")
+        if mode != "ambiguous":
+            S._finish_interrupted_run({{"id": {JOB_ID!r}}}, row["id"], None)
         print("SWEPT", ",".join(marked), flush=True)
         os._exit(0)
 
@@ -187,7 +189,7 @@ def test_sigterm_mid_run_with_drain_expiring_fires_exactly_once_after_restart(ho
     _restart()
     assert "replay_pending" not in _job()
     # The interrupted attempt is recorded honestly (startup recovery: owner gone).
-    assert get_execution(owner.run_id)["status"] == "unknown"
+    assert get_execution(owner.run_id)["status"] == "failed"
     assert _fire_if_due() == [JOB_ID]
     assert _fire_if_due() == []  # a second tick while the replay runs
     _finish_fired()
@@ -225,6 +227,7 @@ def test_marker_whose_run_has_terminal_execution_row_is_not_replayed(home):
     job = _job()
     assert "replay_pending" not in job
     assert job["last_status"] == "ok" and job["last_run_at"] is not None
+    assert job["repeat"]["completed"] == 1
     assert job["state"] == "completed" and job["enabled"] is False
     assert _fire_if_due() == []
     assert home.pages == []
@@ -399,7 +402,7 @@ def test_marker_whose_run_cannot_be_proven_cut_off_is_retired_and_paged(home, le
         elif ledger == "running":
             # A live owner still holds it (e.g. a worker that outlived the gateway).
             conn.execute(
-                "UPDATE executions SET process_id=?, pid=?, process_started_at=NULL WHERE id=?",
+                "UPDATE executions SET status='running', error=NULL, process_id=?, pid=?, process_started_at=NULL WHERE id=?",
                 (executions._PROCESS_ID, os.getpid(), owner.run_id))
         elif ledger == "unreadable":
             def unreadable(_run_id):
@@ -511,3 +514,64 @@ def test_gateway_stop_sweep_requests_replay_markers(monkeypatch):
     monkeypatch.setattr(sched, "mark_running_jobs_interrupted", fake)
     GatewayShutdownMixin._stop_kill_tool_subprocesses("post-interrupt")
     assert seen.get("replay_marker") is True
+
+
+def test_owner_gone_after_possible_delivery_is_uncertain(home):
+    _seed()
+    _owner(home.path, "ambiguous", signal.SIGTERM)
+    _restart()
+    assert _fire_if_due() == []
+    assert [key for key, _ in home.pages] == [f"uncertain-{JOB_ID}"]
+
+
+@pytest.mark.parametrize("change", ["recurring", "script"])
+def test_obsolete_marker_does_not_retire_current_definition(home, change, monkeypatch):
+    from cron import jobs as J
+
+    _seed()
+    _owner(home.path, "run", signal.SIGTERM)
+    jobs = J.load_jobs()
+    if change == "recurring":
+        jobs[0]["schedule"] = {"kind": "cron", "expr": "0 * * * *"}
+    else:
+        jobs[0].update(no_agent=True, script="oneshot/x.sh")
+    J.save_jobs(jobs)
+    _shift_clock(monkeypatch, 7 * 3600)
+    _restart()
+    job = _job()
+    assert "replay_pending" not in job
+    assert job["enabled"] is True
+    assert job["state"] == "scheduled"
+    assert job["last_run_at"] is None
+
+
+def test_external_provider_recovery_consumes_markers(home):
+    from cron.scheduler_provider import CronScheduler
+
+    _seed()
+    _owner(home.path, "run", signal.SIGTERM)
+    # Chronos calls the inherited recovery hook, not the builtin ticker start.
+    CronScheduler.recover_interrupted(object())
+    assert "replay_pending" not in _job()
+    assert _fire_if_due() == [JOB_ID]
+
+
+def test_interrupt_flag_without_persisted_mark_preserves_owner_outcome(home):
+    from unittest.mock import patch
+    from cron import jobs as J, scheduler as S
+    from cron.executions import get_execution
+
+    _seed()
+    assert J.claim_job_for_fire(JOB_ID)
+    job = _job()
+
+    def deliver(*a, **kw):
+        # Drain mark times out while delivery owns the fence: only the flag lands.
+        with S._running_lock:
+            S._interrupted_job_ids.add(S._inflight_key(JOB_ID))
+
+    with patch("cron.scheduler.run_job", return_value=(True, "output", "response", None)), \
+         patch("cron.scheduler._deliver_result", side_effect=deliver):
+        assert S.run_one_job(job)
+    assert _job()["last_status"] == "ok"
+    assert get_execution(job["execution_id"])["status"] == "completed"
