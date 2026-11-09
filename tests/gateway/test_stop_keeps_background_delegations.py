@@ -11,6 +11,7 @@ and a session reset remain the ways to end it.
 import asyncio
 import json
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -68,11 +69,12 @@ def _interruptible_parent():
 
 
 def _runner():
-    from gateway.run import GatewayRunner, _SESSION_DB_UNPINNED
+    from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
-    # object.__new__ skips __init__: seed every field the /stop path reads (same as test_session_db_recovery).
-    runner._session_db_pinned = _SESSION_DB_UNPINNED
+    # object.__new__ skips __init__: pin the session DB to None so the /stop path's user_stopped marker
+    # write is a clean no-op instead of opening a store this bare runner has no handles for.
+    runner._session_db_pinned = None
     runner._running_agents = {}
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
@@ -140,9 +142,14 @@ def test_gateway_stop_leaves_background_child_running_and_delivering(monkeypatch
 
     # 3. Released after the stop, the child completes and its result reaches the outbox.
     release.set()
-    evt = process_registry.completion_queue.get(timeout=10)
+    # The completion queue is process-global: a background unit from an earlier test can finish late and
+    # land first. Take THIS delegation's event; any other id is someone else's late delivery.
+    deadline = time.monotonic() + 10
+    while True:
+        evt = process_registry.completion_queue.get(timeout=max(0.1, deadline - time.monotonic()))
+        if evt.get("delegation_id") == out["delegation_id"]:
+            break
     assert evt["type"] == "async_delegation"
-    assert evt["delegation_id"] == out["delegation_id"]
     assert evt["status"] == "completed", evt
     assert evt["results"][0]["summary"] == "done: long review"
 

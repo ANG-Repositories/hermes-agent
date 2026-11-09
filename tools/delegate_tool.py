@@ -3589,7 +3589,11 @@ def _regate_inherited_child_tier(child, parent_agent, explicit_tier_overrides) -
 # ── fork: durable background spec + restart recovery (t_1191e078 #1104; gateway/run.py caller) ──
 def _durable_intent_expected(cfg: Dict[str, Any]) -> bool:
     """True when a background unit dispatched now would carry restart-durable intent (a routable
-    gateway session with resume_on_restart on), so its admission also needs a durable registry slot."""
+    gateway session with resume_on_restart on), so its admission also needs a durable registry slot.
+
+    Fails CLOSED: when the session context cannot be read, durability is assumed required, so the
+    spec build re-reads it, fails, and the unit is refused rather than started process-local
+    (Prism 3f3a2c174875: a lookup error must not downgrade a restart-safe unit to a losable one)."""
     if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
         return False
     try:
@@ -3598,7 +3602,8 @@ def _durable_intent_expected(cfg: Dict[str, Any]) -> bool:
         source_name = get_session_env("HERMES_SESSION_SOURCE", "")
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
     except Exception:
-        return False
+        logger.warning("delegate_task: session context unreadable; treating background unit as durable", exc_info=True)
+        return True
     return source_name != "tui" and bool(platform)
 
 
@@ -3663,8 +3668,12 @@ def _build_durable_background_spec(
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_name = get_session_env("HERMES_SESSION_USER_NAME", "") or None
-    except Exception:
-        return None, None
+    except Exception as exc:
+        # Durable intent was expected (above), so a context we cannot read is a refusal, never a
+        # silent downgrade to a process-local unit (Prism 3f3a2c174875).
+        raise RuntimeError("session context unreadable for durable intent") from exc
+    if not platform:
+        raise RuntimeError("session context has no platform for durable intent")
 
     from gateway.status import get_current_boot_id
     from tools.async_delegation_store import persistable_fallback_chain, persistable_fallback_policy

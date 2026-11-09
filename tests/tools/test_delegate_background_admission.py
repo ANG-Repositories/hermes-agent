@@ -142,6 +142,32 @@ def test_durable_registry_refusal_is_a_non_start(monkeypatch, failure):
     assert elapsed < 5
 
 
+def test_unreadable_session_context_fails_closed(monkeypatch):
+    """Prism 3f3a2c174875: a session-context lookup error during the durability decision must refuse
+    the background unit (durable_intent_error), never start it without a restart-safe spec."""
+    import sys
+    import gateway.session_context as sc
+
+    dt, seen = _seams(monkeypatch)
+    set_session_vars(platform="discord", chat_id="c", session_key="agent:main:discord:c",
+                     session_id="parent-sess", async_delivery=True)
+    real = sc.get_session_env
+
+    def flaky(name, default=""):
+        if sys._getframe(1).f_code.co_name in ("_durable_intent_expected", "_build_durable_background_spec"):
+            raise RuntimeError("context store unavailable")
+        return real(name, default)
+
+    monkeypatch.setattr(sc, "get_session_env", flaky)
+    out, elapsed = _delegate(dt, _parent())
+
+    assert out["status"] == "rejected", out
+    assert out["reason"] == "durable_intent_error"
+    assert seen["ran"] == [], "a refused unit must not run child work"
+    assert len(seen["closed"]) == len(seen["built"]), "every built child is closed unrun"
+    assert elapsed < 5
+
+
 def test_refusal_after_construction_closes_children_unrun(monkeypatch):
     """Preflight passed, then another dispatch took the slot: the built child is closed, never joined."""
     dt, seen = _seams(monkeypatch)
