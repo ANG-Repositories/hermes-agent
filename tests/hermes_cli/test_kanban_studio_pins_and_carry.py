@@ -813,4 +813,3 @@ def test_workspace_git_probes_do_not_execute_checkout_config(reproducible_worksp
         assert overrides.get("core.hooksPath") == os.devnull
         assert overrides.get("core.fsmonitor") == "false"
         assert env["GIT_OPTIONAL_LOCKS"] == "0"
-
