@@ -53,8 +53,8 @@ def main():
              patch.object(smt, '_maybe_debounced_sync_push'):
             # Load the same lazy imports for BOTH cases outside the measurement.
             for label in ('before', 'after'):
-                target.write_text(target.read_text(encoding='utf-8-sig').replace('new line', 'old line'),
-                                  encoding='utf-8')
+                text = target.read_text(encoding='utf-8-sig')
+                target.write_text(text.replace('new line', 'old line'), encoding='utf-8')
                 call = original_dispatch if label == 'before' else smt.skill_manage
                 # Baseline dispatch shares patched side-effect seams, but keeps its actual
                 # pre-index entrypoint (no extra eager lookup introduced by this PR).
