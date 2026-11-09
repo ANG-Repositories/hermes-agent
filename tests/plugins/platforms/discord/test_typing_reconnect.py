@@ -16,7 +16,7 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("replacement_state", ["missing", "uninitialized", "closed"])
+@pytest.mark.parametrize("replacement_state", ["missing", "uninitialized", "closed", "inflight"])
 async def test_typing_resumes_after_client_replacement(monkeypatch, replacement_state):
     """Drive real SDK lifecycle states between two ticks, with no network I/O."""
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
@@ -31,7 +31,7 @@ async def test_typing_resumes_after_client_replacement(monkeypatch, replacement_
 
     adapter._client = healthy(old_request)
     replacement = None
-    if replacement_state != "missing":
+    if replacement_state in ("uninitialized", "closed"):
         replacement = commands.Bot(command_prefix="!", intents=discord.Intents.none())
         if replacement_state == "closed":
             await replacement.close()
@@ -81,7 +81,14 @@ async def test_typing_resumes_after_client_replacement(monkeypatch, replacement_
     try:
         tick = await next_sleep()
         assert old_request.await_count == 1
-        adapter._client = replacement
+        if replacement_state == "inflight":
+            async def retire_during_request(*args, **kwargs):
+                adapter._client = healthy(new_request)
+                raise RuntimeError("retired HTTP session")
+
+            old_request.side_effect = retire_during_request
+        else:
+            adapter._client = replacement
         tick.set()
         tick = await next_sleep()
         # A reconnect gap must retain the same owner, not arm duplicate loops.
@@ -91,7 +98,7 @@ async def test_typing_resumes_after_client_replacement(monkeypatch, replacement_
         tick.set()
         await next_sleep()
         assert new_request.await_count == 1
-        assert old_request.await_count == 1
+        assert old_request.await_count == (2 if replacement_state == "inflight" else 1)
         assert not errors
     finally:
         await asyncio.wait_for(adapter.stop_typing(chat, token=token), timeout=2.0)
