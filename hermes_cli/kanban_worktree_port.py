@@ -92,8 +92,19 @@ def read_mirrors(fleet_dir: Path) -> Dict[str, Tuple[str, Tuple[str, ...], Dict[
     except (OSError, ValueError):
         return {}
     repos = doc.get("repos") if isinstance(doc, dict) and doc.get("schema") == 1 else None
+    if isinstance(doc, dict) and doc.get("schema") == 2 and "repos" not in doc:
+        # Frozen rollback snapshot, not an editable allowlist.
+        repos = {
+            slug: {"mirror": mirror, "hosts": ["ci-box", "ace-ai", "ace-media", "nas-fleet"]}
+            for slug, mirror in (
+                ("ANG-Ventures/hermes-home", "/srv/ci/git-mirrors/hermes-home-mirror.git"),
+                ("ANG-Ventures/hermes-agent", "/srv/ci/git-mirrors/hermes-mirror.git"),
+                ("ANG-Ventures/prism-router", "/home/kanbanw/.hermes/mirrors/ANG-Ventures/prism-router.git"),
+                ("ANG-Ventures/fleetreview-router", "/home/kanbanw/.hermes/mirrors/ANG-Ventures/prism-router.git"))}
     out: Dict[str, Tuple[str, Tuple[str, ...], Dict[str, str]]] = {}
-    for slug, row in (repos.items() if isinstance(repos, dict) else ()):
+    if not isinstance(repos, dict):
+        return {}
+    for slug, row in repos.items():
         if not isinstance(slug, str) or "/" not in slug or not isinstance(row, dict):
             continue
         mirror, hosts, per_host = row.get("mirror"), row.get("hosts"), row.get("mirrors", {})
@@ -384,9 +395,15 @@ def push_card_branch(push: Tuple[str, str, str, str], runner: Callable = subproc
                   text=True, timeout=10, stdin=subprocess.DEVNULL)
     if dest.returncode != 0 or not dest.stdout.strip():
         raise RuntimeError("cannot resolve clone source before push")
-    proc = runner(["git", "-C", repo, "push", "--porcelain",
+    # An explicit remote pushurl suppresses pushInsteadOf; passing the URL
+    # directly does not. Command-local configuration leaves the checkout intact.
+    destination = dest.stdout.strip()
+    proc = runner(["git", "-C", repo,
+                   "-c", f"remote.kanban-port-destination.url={destination}",
+                   "-c", f"remote.kanban-port-destination.pushurl={destination}",
+                   "push", "--porcelain",
                    f"--force-with-lease=refs/heads/{branch}:{expected}",
-                   dest.stdout.strip(), f"{source}:refs/heads/{branch}"],
+                   "kanban-port-destination", f"{source}:refs/heads/{branch}"],
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=PUSH_TIMEOUT_S, stdin=subprocess.DEVNULL)
     rc = getattr(proc, "returncode", 1)

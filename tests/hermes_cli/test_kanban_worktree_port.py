@@ -404,7 +404,7 @@ def test_kill_switch_file_or_env_restores_the_hand_list(kanban_home, anchor, mon
     assert not kwt.derived_enabled(fleet)
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
-        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2))[0] == "local"
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2))[0] == "portable"
     (fleet / kwt.MIRRORS_FILE).unlink()
     monkeypatch.setenv(kwt.DERIVED_ENV, "0")
     assert not kwt.derived_enabled(fleet)
@@ -506,6 +506,7 @@ def test_push_uses_assessed_sha_despite_branch_reset_and_ignores_pushurl(anchor,
     other = tmp_path / "wrong.git"
     _git("init", "-q", "--bare", str(other), cwd=tmp_path)
     _git("remote", "set-url", "--push", "origin", str(other), cwd=anchor)
+    _git("config", f"url.{other}.pushInsteadOf", str(bare), cwd=anchor)
     _git("checkout", "-q", "main", cwd=anchor)
     _git("branch", "-f", "feature", parent, cwd=anchor)
     kwt.push_card_branch(push)
