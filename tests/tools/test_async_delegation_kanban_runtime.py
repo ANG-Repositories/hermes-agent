@@ -1769,7 +1769,7 @@ def test_default_fallback_runs_a_failed_spawn_as_a_detached_child(monkeypatch, t
     assert seen["fallback"] is ad._refuse_in_process
     assert seen["record"]["execution"]["detached"] is True, "the next boot adopts the child"
     assert seen["record"]["attempt"]["generation"] == 1 and seen["attempt_id"] == seen["record"]["attempt"]["attempt_id"]
-    assert ad.kanban_launch_runtime(did, timeout=0) == "detached (kanban spawn failed: OSError)"
+    assert ad.kanban_launch_runtime(did, timeout=0) == "detached (kanban spawn failed: SpawnNowError)"
     assert _record(did)["state"] == "done"
 
 
@@ -1787,7 +1787,7 @@ def test_host_that_cannot_detach_errors_instead_of_running_in_process(monkeypatc
     assert calls == [] and detached_fallback == []
     rec = _record(did)
     assert rec["state"] == "failed" and rec["attempt"]["generation"] == 0
-    assert ad.kanban_launch_runtime(did, timeout=0) == "none (kanban spawn failed: OSError; not run)"
+    assert ad.kanban_launch_runtime(did, timeout=0) == "none (kanban spawn failed: SpawnNowError; not run)"
 
 
 def test_transient_launch_error_is_retried_before_leaving_kanban(monkeypatch, tmp_path, spawner, detached_fallback):
