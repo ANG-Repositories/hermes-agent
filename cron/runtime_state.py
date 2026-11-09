@@ -84,6 +84,7 @@ DEFAULT_MIRROR_INTERVAL_S = 30.0
 #   cron/quota_hold.py plan_hold / clear_state                   quota_hold_until, quota_hold_cron_expr
 #   request_restart_requeue / _apply_restart_requeue             restart_requeue, restart_requeue_count
 #   trigger_job                                                  manual_run_at, manual_run_prompt
+#   _arm_dead_owner_replay (t_b5c315bb)                          dead_owner_replay_of
 #   cron/scheduler_delivery.py (update_job per delivery)         last_delivery_unverified,
 #                                                                last_delivery_queued
 #   cron/monitor.py check_monitor                                monitor_state
@@ -98,6 +99,7 @@ RUNTIME_FIELDS = frozenset({
     "failure_streak", "error_repeat_streak", "manual_run_at", "manual_run_prompt",
     "preflight_alerted", "restart_requeue", "restart_requeue_count", "interval_fire_at",
     "unreachable_retry", "quota_hold_until", "quota_hold_cron_expr", "monitor_state",
+    "dead_owner_replay_of",
 })
 REPEAT_COMPLETED = "repeat.completed"
 

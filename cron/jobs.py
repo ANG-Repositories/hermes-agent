@@ -4999,6 +4999,10 @@ def _dead_owner_replay_refusal(job: Dict[str, Any]) -> Optional[str]:
     jid = str(job.get("id") or "")
     if not jid or _job_running_in_this_process(jid):
         return "running in this process"
+    if _previous_script_unsettled(jid):
+        # A no_agent script runs in its own session and outlives a dead owner: until settle
+        # grades its exit status (or proves it killed), a replay could run a second copy.
+        return "previous script unsettled"
     count = int(job.get(RESTART_REQUEUE_COUNT_KEY) or 0)
     if count >= RESTART_REQUEUE_MAX:
         logger.warning(
@@ -5007,6 +5011,23 @@ def _dead_owner_replay_refusal(job: Dict[str, Any]) -> Optional[str]:
             job.get("name", jid), jid, count)
         return "replay budget spent"
     return None
+
+
+def _previous_script_unsettled(job_id: str) -> bool:
+    """The job's previous script attempt still has an outcome record (running orphan or awaiting
+    settle). An unreadable records dir counts as unsettled: never replay on missing evidence."""
+    try:
+        from cron.script_outcome_records import unsettled_for_job
+
+        return unsettled_for_job(job_id)
+    except Exception:
+        logger.debug("script outcome record probe failed for %s", job_id, exc_info=True)
+        return True
+
+
+# Runtime field naming the execution an armed dead-owner replay stands in for (t_b5c315bb), so a
+# repeated recovery reconciliation of that same ``unknown`` row keeps the pending replay.
+DEAD_OWNER_REPLAY_OF_KEY = "dead_owner_replay_of"
 
 
 def _ledger_refuses_replay(latest: Optional[Dict[str, Any]]) -> bool:
@@ -5022,23 +5043,36 @@ def _ledger_refuses_replay(latest: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
-def _arm_dead_owner_replay(job: Dict[str, Any], now: datetime, ledger: Any) -> Dict[str, Any]:
+def _arm_dead_owner_replay(
+    job: Dict[str, Any], now: datetime, ledger: Any, execution_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Release the dead claims, give back the consumed dispatch, spend the once-only budget and
-    re-arm as a run-now. Mutates ``job`` and returns the changed fields."""
+    re-arm as a run-now. Mutates ``job`` and returns the changed fields.
+
+    An explicitly future ``next_run_at`` (the one-shot was rescheduled after its owner died) is
+    kept: the replay then fires at that instant, never now (Prism 86a33629e76f). The replaced
+    execution is recorded in ``DEAD_OWNER_REPLAY_OF_KEY`` so a later recovery pass over the same
+    ``unknown`` row keeps this replay instead of retiring the job (Prism c140f4b963a7)."""
     jid = str(job.get("id") or "")
     repeat = dict(job.get("repeat") or {})
     if isinstance(repeat.get("completed"), int) and repeat["completed"] > 0:
         repeat["completed"] -= 1  # give back the dispatch the killed run consumed
-    stamp = now.isoformat()
-    fields = {
+    fields: Dict[str, Any] = {
         "run_claim": None, "fire_claim": None, "repeat": repeat,
-        "next_run_at": stamp, "manual_run_at": stamp,
         RESTART_REQUEUE_COUNT_KEY: int(job.get(RESTART_REQUEUE_COUNT_KEY) or 0) + 1,
+        DEAD_OWNER_REPLAY_OF_KEY: str(execution_id or ""),
     }
+    stored = job.get("next_run_at")
+    stored_dt = _parse_aware(stored) if stored else None
+    if not (stored_dt is not None and stored_dt > now):
+        stamp = now.isoformat()
+        fields["next_run_at"] = stamp
+        fields["manual_run_at"] = stamp
     logger.warning(
         "cron.oneshot.dead_owner_replay job='%s' id=%s run_claim=%s fire_claim=%s ledger=%s: "
-        "previous run's owner is gone; claims released, replaying once now",
-        job.get("name", jid), jid, job.get("run_claim"), job.get("fire_claim"), ledger)
+        "previous run's owner is gone; claims released, replaying once at %s",
+        job.get("name", jid), jid, job.get("run_claim"), job.get("fire_claim"), ledger,
+        fields.get("next_run_at", stored))
     job.update(fields)
     return fields
 
@@ -5071,7 +5105,7 @@ def _replay_dead_owner_oneshot(job: Dict[str, Any], scan: "_DueScan", run_claim_
         logger.warning("cron.oneshot.dead_owner_replay.ledger_unavailable job='%s' id=%s",
                        job.get("name", jid), jid, exc_info=True)
         return False
-    fields = _arm_dead_owner_replay(job, scan.now, status)
+    fields = _arm_dead_owner_replay(job, scan.now, status, (latest or {}).get("id"))
     scan.persist(jid, **fields)
     return True
 
@@ -5080,17 +5114,28 @@ def replay_interrupted_oneshot(job_id: str, execution: Dict[str, Any]) -> bool:
     """Startup-recovery hook (t_b5c315bb): ``recover_interrupted()`` runs before the first due
     scan and has just swept ``execution`` (the job's newest attempt) to ``unknown``. For a
     never-run one-shot whose owner provably died, arm the once-only replay here instead of letting
-    ``mark_job_run`` record the interruption and retire the job. Returns True when re-armed; the
-    caller then must not record the run."""
+    ``mark_job_run`` record the interruption and retire the job. Returns True when the caller must
+    not record the run: the replay was armed now, was already armed for this same execution by an
+    earlier recovery pass (Prism c140f4b963a7 / 928f8b0f4e8d), or the previous script is still
+    unsettled and ``settle`` (or the due scan, once it is) decides the outcome
+    (Prism b0a1982205e6)."""
     from cron.executions import _OWNER_GONE_REASON
 
     if (execution or {}).get("status") != "unknown" or execution.get("error") != _OWNER_GONE_REASON:
         return False
+    exec_id = str(execution.get("id") or "")
 
     def apply(jobs, _i, job):
-        if _dead_owner_replay_refusal(job) is not None:
+        never_run_once = ((job.get("schedule") or {}).get("kind") == "once"
+                          and not job.get("last_run_at"))
+        if never_run_once and exec_id and job.get(DEAD_OWNER_REPLAY_OF_KEY) == exec_id:
+            return True  # replay already armed for this execution: keep it pending
+        refusal = _dead_owner_replay_refusal(job)
+        if refusal == "previous script unsettled":
+            return True  # dead claims stay; the due scan re-checks after settle
+        if refusal is not None:
             return False
-        _arm_dead_owner_replay(job, _hermes_now(), "unknown (startup recovery)")
+        _arm_dead_owner_replay(job, _hermes_now(), "unknown (startup recovery)", exec_id)
         save_jobs(jobs)
         return True
 
@@ -6669,7 +6714,9 @@ def _warn_overdue_oneshots_not_due(
             overdue = (now - _ensure_aware(datetime.fromisoformat(run_at))).total_seconds()
             if overdue <= ONESHOT_GRACE_SECONDS:
                 continue
-            if _oneshot_claims_dead(job, now, ttl):
+            # An orphan script still running (or awaiting settle) is not a wedge: settle grades
+            # it, or the next scan replays once its record is gone.
+            if _oneshot_claims_dead(job, now, ttl) and not _previous_script_unsettled(jid):
                 key = "%s:%s" % (scope, jid)
                 wedged_now.add(key)
                 _track_dead_owner_wedge(job, key, True, overdue)

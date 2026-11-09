@@ -192,6 +192,31 @@ def discard_execution(execution_id: Optional[str]) -> None:
         logger.debug("could not discard outcome record of %s", execution_id, exc_info=True)
 
 
+def unsettled_for_job(job_id: str) -> bool:
+    """True when ``job_id`` still has an outcome record: its script may still be running as an
+    orphan, or its exit status is waiting for ``settle``. Owners discard a record once they record
+    the run and ``settle`` removes it once graded or proven killed, so any record left means the
+    previous attempt's outcome is not known yet (t_b5c315bb: a dead-owner replay must wait)."""
+    if not job_id or not supported():
+        return False
+    try:
+        names = os.listdir(_records_dir())
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    for name in names:
+        if not name.endswith(".json") or name.endswith(".json.tmp"):
+            continue
+        try:
+            meta = json.loads((_records_dir() / name).read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue  # unparseable: settle ages it out; it names no job
+        if str(meta.get("job_id") or "") == str(job_id):
+            return True
+    return False
+
+
 def _read_int(base: Path, suffix: str) -> Optional[int]:
     try:
         return int(Path(str(base) + suffix).read_text(encoding="utf-8-sig").strip())
