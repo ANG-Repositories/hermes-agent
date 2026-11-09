@@ -994,7 +994,10 @@ def admission_refusal(*, profile_home: Path | None = None, max_records: int | No
     path = registry_path(profile_home)
     try:
         with locked_registry(path=path) as registry:
-            _prune(registry, time.time(), path)
+            # Same eviction as persist_dispatch (cap-1, settled terminal records only), so the preflight
+            # never refuses a full-but-evictable registry the binding check would accept (Prism
+            # c-e0bb5594880eff70: that would bring the 2026-11-08 registry_cap degradation back).
+            _prune(registry, time.time(), path, limit=record_limit - 1)
             if len(registry["records"]) >= record_limit:
                 return "registry_cap"
     except Exception as exc:
