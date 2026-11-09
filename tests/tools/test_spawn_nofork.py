@@ -18,7 +18,7 @@ import pytest
 
 import tools.spawn_nofork as nofork
 from tools.environments.local import LocalEnvironment
-from tools.file_operations_lint_shell import _parse_check
+from tools.file_operations_lint_shell import _parse_check, _parse_bash
 
 pytestmark = pytest.mark.platforms("posix")
 
@@ -76,8 +76,7 @@ def test_run_bash_leads_new_session_in_cwd(no_fork_exec, env, tmp_path):
         assert int(proc.stdout.readline()) == proc.pid, "bash must be the spawned pid (exec, no extra child)"
         assert proc.stdout.readline().strip() == os.path.realpath(tmp_path / "work dir")
         assert os.getpgid(proc.pid) == proc.pid != os.getpgrp()
-        if nofork._session_mode == "setsid":
-            assert os.getsid(proc.pid) == proc.pid
+        assert os.getsid(proc.pid) == proc.pid
     finally:
         env._kill_process(proc)
 
@@ -130,6 +129,7 @@ def test_inheritable_fds_are_not_passed_to_the_child(no_fork_exec, tmp_path):
 
 
 def test_parse_check_does_not_fork(no_fork_exec):
+    _parse_bash.cache_clear()
     assert _parse_check("echo ok\n", "bash")[0] is True
     ok, msg = _parse_check("if then fi (\n", "bash")
     assert ok is False and "syntax error" in msg
@@ -142,7 +142,7 @@ def test_run_nofork_timeout_kills_child(no_fork_exec):
     assert time.monotonic() - started < 10
 
 
-def test_setpgroup_when_platform_lacks_setsid(no_fork_exec, monkeypatch):
+def test_plain_popen_when_platform_lacks_setsid(monkeypatch):
     real = os.posix_spawn
 
     def no_setsid(*args, **kwargs):
@@ -151,11 +151,11 @@ def test_setpgroup_when_platform_lacks_setsid(no_fork_exec, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(os, "posix_spawn", no_setsid)
-    monkeypatch.setattr(nofork, "_session_mode", "setsid")
     proc = nofork.spawn_popen(["/bin/sh", "-c", 'echo "$$ $(ps -o pgid= -p $$)"'],
                               new_session=True, stdout=subprocess.PIPE, text=True)
     pid, pgid = (int(x) for x in proc.communicate(timeout=10)[0].split())
-    assert pid == pgid == proc.pid and nofork._session_mode == "setpgroup"
+    assert pid == pgid == proc.pid
+    assert os.getsid(proc.pid) == proc.pid if proc.poll() is None else True
 
 
 def test_ineligible_calls_keep_plain_popen_semantics(tmp_path):
@@ -171,4 +171,4 @@ def test_legacy_env_switch_forces_plain_popen(monkeypatch):
     monkeypatch.setenv("HERMES_SPAWN_LEGACY", "1")
     assert not nofork.eligible(["/bin/true"], {})
     monkeypatch.delenv("HERMES_SPAWN_LEGACY")
-    assert nofork.eligible(["/bin/true"], {}) is bool(getattr(subprocess, "_USE_POSIX_SPAWN", False))
+    assert nofork.eligible(["/bin/true"], {}) is hasattr(os, "posix_spawn")

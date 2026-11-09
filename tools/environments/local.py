@@ -34,8 +34,8 @@ from tools.spawn_nofork import spawn_popen
 _IS_WINDOWS = platform.system() == "Windows"
 # POSIX spawn trampoline: $1 is the cwd, the rest is bash's argv. /bin/sh reads no startup
 # file when non-interactive (bash invoked as sh included), so nothing runs twice.
-_POSIX_SH = "/bin/sh"
-_CD_THEN_EXEC = 'cd -- "$1" || exit 126; shift; exec "$@"'
+_POSIX_SH = "/system/bin/sh" if hasattr(sys, "getandroidapilevel") else "/bin/sh"
+_CD_THEN_EXEC = 'cd -P -- "$1" || { printf "hermes: cannot enter working directory: %s\\n" "$1" >&2; exit 126; }; shift; exec "$@"'
 
 logger = logging.getLogger(__name__)
 

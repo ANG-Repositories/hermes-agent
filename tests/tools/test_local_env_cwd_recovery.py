@@ -51,7 +51,7 @@ def _make_fake_popen(captured: dict, fds: list):
     caller can clean up after the test.
     """
     def fake_popen(cmd, **kwargs):
-        captured["cwd"] = kwargs.get("cwd")
+        captured["cwd"] = kwargs.get("cwd") if os.name == "nt" else cmd[4]
         captured["env"] = kwargs.get("env", {})
         read_fd, write_fd = os.pipe()
         os.close(write_fd)
