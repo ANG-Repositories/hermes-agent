@@ -14,6 +14,7 @@ import hashlib
 import logging
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -135,6 +136,91 @@ def test_pruned_offloaded_record_removes_its_sidecar():
                            dispatched_at=time.time(), max_records=1)
     assert "big" not in _load()["records"]
     assert not (store.sidecar_dir(path) / "big.json").exists()
+
+
+def test_failed_registry_write_keeps_the_pruned_records_sidecar(monkeypatch):
+    """Prism de9f5c835503: prune unlinked the sidecar before the registry write committed. A write
+    that raises leaves the on-disk registry pointing at a sidecar that no longer exists."""
+    _seed({"big": _big_done_record("big")})
+    store.persist_dispatch(delegation_id="n0", durable_spec=_spec(), boot_id="100:1.0",
+                           dispatched_at=time.time())
+    path = store.registry_path()
+    sidecar = store.sidecar_dir(path) / "big.json"
+    assert sidecar.exists()
+    # Age the stub past retention so the next prune drops it.
+    with store.locked_registry() as registry:
+        registry["records"]["big"]["updated_at"] = time.time() - store.TERMINAL_RETENTION_SECONDS - 60
+
+    def boom(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    real_write = store._write
+    monkeypatch.setattr(store, "_write", boom)
+    _, why = store.persist_dispatch(delegation_id="n1", durable_spec=_spec(), boot_id="100:1.0",
+                                    dispatched_at=time.time())
+    assert why == "registry_error"
+    monkeypatch.setattr(store, "_write", real_write)
+    store._REGISTRY_CACHE.clear()
+    assert sidecar.exists(), "sidecar deleted although the registry write failed"
+    registry = store.read_registry()
+    assert "big" in registry["records"]
+    full = store.canonical_terminal(registry, "big", path=path)["execution_result"]
+    assert full["summary"] == "x" * (BIG_BYTES // 3)
+
+
+def test_pruned_sidecar_is_removed_once_the_write_commits():
+    _seed({"big": _big_done_record("big")})
+    store.persist_dispatch(delegation_id="n0", durable_spec=_spec(), boot_id="100:1.0",
+                           dispatched_at=time.time())
+    path = store.registry_path()
+    with store.locked_registry() as registry:
+        registry["records"]["big"]["updated_at"] = time.time() - store.TERMINAL_RETENTION_SECONDS - 60
+    store.persist_dispatch(delegation_id="n1", durable_spec=_spec(), boot_id="100:1.0",
+                           dispatched_at=time.time())
+    assert "big" not in _load()["records"]
+    assert not (store.sidecar_dir(path) / "big.json").exists()
+
+
+def test_offloaded_lone_surrogate_result_reads_back_in_full():
+    """Prism: the sidecar was encoded with surrogatepass (not UTF-8) and read back with a strict
+    decode, so a lone surrogate made the full body unreadable after the record was stubbed. The
+    registry write itself refuses a lone surrogate (strict checksum), so this drives the offload
+    pass directly on the in-memory registry it receives."""
+    _seed({})
+    path = store.registry_path()
+    record = _big_done_record("big", size=3000)
+    text = "\ud800" + "x" * 40000
+    record["terminal"]["result"]["summary"] = text
+    registry = {"schema_version": 1, "updated_at": time.time(), "records": {"big": record}}
+    assert store._offload_oversized(registry, path) == 1
+    stub = registry["records"]["big"]
+    raw = (path.parent / stub["offloaded"]["sidecar"]).read_bytes()
+    assert raw.isascii()
+    full = store.read_offloaded_record(path, stub)
+    assert full is not None, "sidecar unreadable"
+    assert full["terminal"]["result"]["summary"] == text
+
+
+def test_sidecar_dir_creation_not_durable_offloads_nothing(monkeypatch):
+    """Prism: the first mkdir of <registry>.sidecars/ must be durable in the registry's parent
+    before any stub replaces a full record."""
+    _seed({"big": _big_done_record("big")})
+    path = store.registry_path()
+    assert store._backup_before_first_compaction(path)  # the backup is not under test here
+    real = store._fsync_directory
+
+    def parent_fsync_fails_once_sidecars_exist(directory):
+        if Path(directory) == path.parent and store.sidecar_dir(path).exists():
+            return False
+        return real(directory)
+
+    monkeypatch.setattr(store, "_fsync_directory", parent_fsync_fails_once_sidecars_exist)
+    store.persist_dispatch(delegation_id="n0", durable_spec=_spec(), boot_id="100:1.0",
+                           dispatched_at=time.time())
+    monkeypatch.setattr(store, "_fsync_directory", real)
+    stub = _load()["records"]["big"]
+    assert "offloaded" not in stub, "record stubbed although the sidecar dir is not durable"
+    assert stub["terminal"]["result"]["summary"] == "x" * (BIG_BYTES // 3)
 
 
 def test_dispatch_survives_a_sibling_holding_the_lock_past_one_timeout(monkeypatch):

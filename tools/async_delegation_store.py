@@ -410,6 +410,7 @@ def _write(path: Path, registry: dict[str, Any]) -> None:
     registry["schema_version"] = SCHEMA_VERSION
     registry["updated_at"] = time.time()
     invalid_record_ids = set(registry.pop("_invalid_record_ids", []))
+    registry.pop(_SIDECAR_UNLINKS_KEY, None)
     written: dict[str, tuple[str, bytes]] = {}
     for delegation_id, record in registry.get("records", {}).items():
         if str(delegation_id) in invalid_record_ids:
@@ -527,8 +528,14 @@ def locked_registry(
         acquired_at = time.monotonic()
         registry = _load(path, allow_invalid_records=True, private=write, verify_content=write)
         yield registry
+        # Sidecars of records dropped in this transaction are unlinked only after the registry
+        # that no longer references them is durably on disk (Prism de9f5c835503).
+        unlinks = registry.pop(_SIDECAR_UNLINKS_KEY, [])
         if write:
             _write(path, registry)
+            for sidecar in unlinks:
+                with contextlib.suppress(OSError):
+                    Path(sidecar).unlink()
     finally:
         _log_lock_timing(path, write, started, acquired_at)
         if acquired:
@@ -871,19 +878,30 @@ def _offload_oversized(registry: dict[str, Any], path: Path) -> int:
                 or record.get("state") not in _TERMINAL_STATES or _terminal_pending(record)):
             continue
         try:
+            # ensure_ascii=True: pure ASCII escapes a lone surrogate too, so the strict UTF-8
+            # read in read_offloaded_record always decodes what was written (Prism).
             body = json.dumps(record, sort_keys=True, separators=(",", ":"),
-                              ensure_ascii=False).encode("utf-8", "surrogatepass")
+                              ensure_ascii=True).encode("ascii")
         except (TypeError, ValueError):
             continue
         if len(body) > OFFLOAD_RECORD_BYTES:
             big.append((str(delegation_id), record, body))
     if not big or not _backup_before_first_compaction(path):
         return 0
+    # The sidecar directory's own entry in the registry's parent must be durable before any stub
+    # replaces a full record; otherwise a crash can lose the directory and every body in it.
+    try:
+        sidecar_dir(path).mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        logger.warning("async_delegation_offload_failed sidecar_dir=%s", sidecar_dir(path),
+                       exc_info=True)
+        return 0
+    if not _fsync_directory(path.parent):
+        return 0
     changed = 0
     for delegation_id, record, body in big:
         target = _sidecar_path(path, delegation_id)
         try:
-            target.parent.mkdir(mode=0o700, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
             try:
                 with os.fdopen(fd, "wb") as out:
@@ -923,11 +941,16 @@ def _offload_oversized(registry: dict[str, Any], path: Path) -> int:
     return changed
 
 
-def _remove_sidecar(path: Path, record: Any) -> None:
+#: Transient registry key: sidecars to unlink once ``locked_registry`` has written the registry.
+_SIDECAR_UNLINKS_KEY = "_sidecar_unlinks"
+
+
+def _remove_sidecar(registry: dict[str, Any], path: Path, record: Any) -> None:
+    """Queue ``record``'s sidecar for deletion after the registry write commits; unlinking it now
+    would leave the on-disk registry pointing at a missing file if that write fails."""
     marker = record.get("offloaded") if isinstance(record, dict) else None
     if isinstance(marker, dict) and isinstance(marker.get("sidecar"), str):
-        with contextlib.suppress(OSError):
-            (path.parent / marker["sidecar"]).unlink()
+        registry.setdefault(_SIDECAR_UNLINKS_KEY, []).append(str(path.parent / marker["sidecar"]))
 
 
 def _compact(registry: dict[str, Any], now: float, path: Path) -> int:
@@ -982,7 +1005,7 @@ def _prune(registry: dict[str, Any], now: float, path: Path, *, limit: int | Non
         if (not _terminal_pending(record) and age >= TERMINAL_RETENTION_SECONDS) or age >= ABSOLUTE_RETENTION_SECONDS:
             removable.append((updated, delegation_id))
     for _, delegation_id in sorted(removable):
-        _remove_sidecar(path, records.pop(delegation_id, None))
+        _remove_sidecar(registry, path, records.pop(delegation_id, None))
     if len(records) <= cap:
         return
     eligible = sorted(
@@ -996,7 +1019,7 @@ def _prune(registry: dict[str, Any], now: float, path: Path, *, limit: int | Non
     for _, delegation_id in eligible:
         if len(records) <= cap:
             break
-        _remove_sidecar(path, records.pop(delegation_id, None))
+        _remove_sidecar(registry, path, records.pop(delegation_id, None))
 
 
 def _attempt_id(delegation_id: str, generation: int) -> str:
