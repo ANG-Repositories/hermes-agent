@@ -7592,7 +7592,11 @@ def _dispatch_once_locked(
                 result.placement_waits[row["id"]] = _pin_held
                 continue
             if _held_dest and route == "portable":
-                _only = [h for h in (_only if _only is not None else spillover.hosts) if h not in _held_dest]
+                # Case-insensitive, as take() matches (Prism 96dd675bda52): reach keys are lower-cased, pool names
+                # keep their configured case.
+                _held_low = {str(h).lower() for h in _held_dest}
+                _only = [h for h in (_only if _only is not None else spillover.hosts)
+                         if str(h).lower() not in _held_low]
             _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
             # Scorer-backed takes (pins included) book a reservation for this card.
             _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
