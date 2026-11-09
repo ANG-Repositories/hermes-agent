@@ -7860,6 +7860,7 @@ class GatewayRunner(
         except Exception:
             session_id = None
         intent_path = None
+        from agent.interrupt_compat import _accepts_keyword
         _t_intent = time.monotonic()
         writer = getattr(store, "write_user_stop_intent", None)
         if callable(writer) and session_id:
@@ -7868,21 +7869,26 @@ class GatewayRunner(
                     boot_id = self._current_boot_id()
                 except Exception:
                     boot_id = None
-                intent_path = writer(session_key, session_id, boot_id=boot_id)
+                _gen_kw = {"generation": generation} if _accepts_keyword(writer, "generation") else {}
+                intent_path = writer(session_key, session_id, boot_id=boot_id, **_gen_kw)
             except Exception:
                 logger.warning("user_stop intent write failed for %s; /stop waits for the marker "
                                "write instead", session_key, exc_info=True)
         intent_frag = f"intent={1 if intent_path else 0} intent_s={time.monotonic() - _t_intent:.3f}"
         note = getattr(store, "note_user_stop_pending", None)
         noted = False
+        # The pending receipt is scoped to the session and generation this stop saw (Prism r2
+        # ed0ce609a190), so a /new session or a later resumed turn is not blocked by it.
+        _receipt: tuple = (session_key,)
         if callable(note):
             try:
-                note(session_key)
+                if _accepts_keyword(note, "generation"):
+                    _receipt = (session_key, session_id, generation)
+                note(*_receipt)
                 noted = True
             except Exception:
                 logger.debug("user_stop pending note failed for %s", session_key, exc_info=True)
         timings: dict = {}
-        from agent.interrupt_compat import _accepts_keyword
         _mark = self._mark_user_stopped
         _kwargs: dict = {}
         if _accepts_keyword(_mark, "timings"):
@@ -7897,7 +7903,7 @@ class GatewayRunner(
             pending.discard(t)
             if noted:
                 try:
-                    store.release_user_stop_pending(session_key)
+                    store.release_user_stop_pending(*_receipt)
                 except Exception:
                     logger.debug("user_stop pending release failed for %s", session_key, exc_info=True)
             if t.cancelled() or t.exception() is not None:

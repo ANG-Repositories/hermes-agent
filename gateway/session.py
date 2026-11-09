@@ -2238,7 +2238,7 @@ class SessionStore(
         # retired by the next real user message (``clear_user_stopped``), so a
         # stopped session that the user resumes by hand marks normally again.
         # A /stop whose durable write is still in flight counts too (user_stop_pending).
-        if entry.user_stopped_at is not None or self.user_stop_pending(entry.session_key):
+        if entry.user_stopped_at is not None or self._user_stop_pending_for_entry_locked(entry):
             logger.info(
                 "Refusing resume mark for /stop'd session %s (reason=%s)",
                 session_key,
@@ -2347,7 +2347,9 @@ class SessionStore(
             state = self.__dict__.setdefault("_user_stop_pending_state", (threading.Lock(), {}))
         return state
 
-    def note_user_stop_pending(self, session_key: str) -> None:
+    def note_user_stop_pending(
+        self, session_key: str, session_id: Optional[str] = None, generation: Optional[int] = None,
+    ) -> None:
         """Record, without ``_lock``, that a /stop marker write for ``session_key`` is in flight.
 
         /stop acknowledges and releases the slot before its durable write lands (t_41843f70:
@@ -2355,26 +2357,59 @@ class SessionStore(
         ``release_user_stop_pending``, every resume mark refuses the session exactly as if the
         marker were already set, so no in-process path can re-arm a turn the user just stopped.
         Safe from the event loop: a dict update under a private mutex no I/O ever holds.
+
+        The receipt is scoped to the ``session_id`` and run ``generation`` /stop saw (Prism r2
+        ed0ce609a190): a ``/new`` session on the same key, or a turn the user resumed at a newer
+        generation, is not blocked by an older stop whose write is still in flight.
         """
         guard, pending = self._user_stop_pending_map()
+        receipt = (session_key, session_id, generation)
         with guard:
-            pending[session_key] = pending.get(session_key, 0) + 1
+            pending[receipt] = pending.get(receipt, 0) + 1
 
-    def release_user_stop_pending(self, session_key: str) -> None:
+    def release_user_stop_pending(
+        self, session_key: str, session_id: Optional[str] = None, generation: Optional[int] = None,
+    ) -> None:
         guard, pending = self._user_stop_pending_map()
+        receipt = (session_key, session_id, generation)
         with guard:
-            count = pending.get(session_key, 0) - 1
+            count = pending.get(receipt, 0) - 1
             if count > 0:
-                pending[session_key] = count
+                pending[receipt] = count
             else:
-                pending.pop(session_key, None)
+                pending.pop(receipt, None)
 
-    def user_stop_pending(self, session_key: Optional[str]) -> bool:
+    def user_stop_pending(
+        self, session_key: Optional[str], session_id: Optional[str] = None, *,
+        resume_generation: Optional[int] = None,
+    ) -> bool:
+        """True when a /stop write for this key is in flight and still applies.
+
+        ``session_id`` (when given) ignores receipts for another session; a receipt with no
+        session_id applies to any. ``resume_generation`` ignores receipts at or below it: that
+        stop is fenced out (``mark_user_stopped`` skips it), the user resumed after it.
+        """
         if not session_key:
             return False
         guard, pending = self._user_stop_pending_map()
         with guard:
-            return pending.get(session_key, 0) > 0
+            for (key, sid, gen), count in pending.items():
+                if key != session_key or count <= 0:
+                    continue
+                if session_id is not None and sid is not None and sid != session_id:
+                    continue
+                if resume_generation is not None and gen is not None and gen <= resume_generation:
+                    continue
+                return True
+            return False
+
+    def _user_stop_pending_for_entry_locked(self, entry: "SessionEntry") -> bool:
+        """``user_stop_pending`` scoped to ``entry``'s session and this process's resume fence."""
+        fences = self.__dict__.get("_user_stop_fences") or {}
+        fence = fences.get(entry.session_key)
+        resume_generation = fence[1] if fence is not None and fence[1] >= 0 else None
+        return self.user_stop_pending(
+            entry.session_key, entry.session_id, resume_generation=resume_generation)
 
     # Durable stop intent (t_41843f70, Prism r1): /stop writes one tiny fsync'd file BEFORE it acks,
     # outside ``_lock`` and the executor, so a SIGKILL before the deferred marker write lands still
@@ -2385,18 +2420,31 @@ class SessionStore(
     def _user_stop_intent_dir(self) -> Path:
         return Path(self.sessions_dir) / self._USER_STOP_INTENT_DIR
 
+    def _user_stop_intent_owner(self) -> str:
+        """Per-store nonce. Run generations are process-local, so a generation in an intent is
+        comparable only for intents this store wrote; a previous process's intent is retired by
+        any clear."""
+        owner = self.__dict__.get("_user_stop_intent_owner_id")
+        if owner is None:
+            owner = self.__dict__.setdefault("_user_stop_intent_owner_id", uuid.uuid4().hex)
+        return owner
+
     @staticmethod
     def _user_stop_intent_prefix(session_key: str) -> str:
         return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24]
 
     def write_user_stop_intent(
         self, session_key: str, session_id: str, *, boot_id: Optional[str] = None,
+        generation: Optional[int] = None,
     ) -> Path:
         """Durably record a /stop for ``session_key``/``session_id``; returns the intent path.
 
         No ``_lock``, no DB: a ~200-byte file, fsync'd, renamed into place, directory fsync'd.
         One file per stop (a unique suffix), so a landed write retires only its own intent.
-        Raises on I/O failure; the caller then waits for the full marker write instead.
+        ``generation`` is the run generation the stop claimed: a clear at an older generation
+        leaves this intent alone (Prism r2 2839625d4dbd).
+        Raises on any I/O failure, including the directory fsync that makes the rename durable
+        (Prism r2 0cb938c88f46); the caller then waits for the full marker write instead.
         """
         directory = self._user_stop_intent_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -2404,7 +2452,8 @@ class SessionStore(
         tmp = path.with_suffix(".tmp")
         payload = json.dumps({
             "session_key": session_key, "session_id": session_id,
-            "stopped_at": _iso(_now()), "boot_id": boot_id,
+            "stopped_at": _iso(_now()), "boot_id": boot_id, "generation": generation,
+            "owner": self._user_stop_intent_owner(),
         }).encode("utf-8")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -2420,7 +2469,11 @@ class SessionStore(
             finally:
                 os.close(dir_fd)
         except OSError:
-            logger.debug("user_stop intent dir fsync failed for %s", directory, exc_info=True)
+            # The rename is not confirmed durable: do not claim it. Drop the file so a later
+            # boot never applies an intent the caller was told failed, and let the caller fall
+            # back to waiting for the marker write.
+            self.retire_user_stop_intent(path)
+            raise
         return path
 
     @staticmethod
@@ -2431,13 +2484,34 @@ class SessionStore(
         except OSError:
             logger.debug("user_stop intent retire failed for %s", path, exc_info=True)
 
-    def _retire_user_stop_intents_for_key(self, session_key: str) -> int:
-        """Delete every intent for ``session_key`` (the user spoke again); returns the count."""
+    def _retire_user_stop_intents_for_key(
+        self, session_key: str, *, generation: Optional[int] = None,
+    ) -> int:
+        """Delete the intents the user superseded by speaking again; returns the count.
+
+        With ``generation`` (the run generation the clearing message observed), an intent from a
+        NEWER stop is kept: an older clear can run after a newer /stop wrote its intent but before
+        that stop's marker raised the fence, and the intent is then its only durable record
+        (Prism r2 2839625d4dbd). Without ``generation`` every intent for the key goes.
+        """
         directory = self._user_stop_intent_dir()
         if not directory.is_dir():
             return 0
         removed = 0
         for path in directory.glob(f"{self._user_stop_intent_prefix(session_key)}.*.json"):
+            if generation is not None:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if data.get("session_key") != session_key:
+                        continue  # prefix collision: another key's intent
+                    stop_generation = (data.get("generation")
+                                       if data.get("owner") == self._user_stop_intent_owner()
+                                       else None)
+                except Exception:
+                    stop_generation = None  # unreadable: the load drops it too
+                if (isinstance(stop_generation, int) and not isinstance(stop_generation, bool)
+                        and stop_generation > int(generation)):
+                    continue
             try:
                 path.unlink(missing_ok=True)
                 removed += 1
@@ -2454,11 +2528,22 @@ class SessionStore(
         The file stays until the user speaks again (``clear_user_stopped``), so a second crash
         before any save re-applies it. An intent whose key is gone or now routes to another
         session_id, or whose entry already carries a marker on disk, is deleted.
+
+        Only an authoritative routing load may delete an unmatched intent (Prism r2
+        f8d11269d797). After a fallback-only load (state.db routing unreadable, sessions.json
+        used) an absent or different entry is not evidence: the intent is kept, and
+        ``_reconcile_recovered_routing_locked`` calls this again once state.db's rows are merged.
+        An intent this process already applied is never deleted here: its marker is only in
+        memory until the next save.
         """
         directory = self._user_stop_intent_dir()
         if not directory.is_dir():
             return
+        authoritative = bool(getattr(self, "_routing_db_loaded", True))
+        applied = self.__dict__.setdefault("_applied_user_stop_intents", set())
         for path in sorted(directory.glob("*.json")):
+            if str(path) in applied:
+                continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 key = data["session_key"]
@@ -2469,11 +2554,17 @@ class SessionStore(
                 continue
             entry = self._entries.get(key)
             if entry is None or (session_id and entry.session_id != session_id):
-                self.retire_user_stop_intent(path)
+                if authoritative:
+                    self.retire_user_stop_intent(path)
+                else:
+                    logger.info("Keeping user_stop intent %s for %s until state.db routing "
+                                "loads (fallback routing has no matching entry)", path.name, key)
                 continue
             if entry.user_stopped_at is not None:
-                self.retire_user_stop_intent(path)
+                if authoritative:
+                    self.retire_user_stop_intent(path)
                 continue
+            applied.add(str(path))
             entry.user_stopped_at = _parse_iso(data.get("stopped_at")) or _now()
             entry.user_stopped_boot_id = data.get("boot_id")
             entry.user_stopped_message_id = None
@@ -3035,7 +3126,7 @@ class SessionStore(
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
-                if entry.user_stopped_at is not None or self.user_stop_pending(entry.session_key):
+                if entry.user_stopped_at is not None or self._user_stop_pending_for_entry_locked(entry):
                     # A /stop'd turn is never auto-resumed (ruling 2026-09-21).
                     # This wholesale post-crash re-mark is precisely the path
                     # that made a stopped session indistinguishable from an
@@ -3080,7 +3171,8 @@ class SessionStore(
                     return False
             # The user spoke after the stop: retire its durable intent too (an in-flight write
             # for it is fenced out by fence[1] above, or lands and is cleared by the next message).
-            self._retire_user_stop_intents_for_key(session_key)
+            # An intent from a newer stop is kept: its marker may not have raised fence[0] yet.
+            self._retire_user_stop_intents_for_key(session_key, generation=generation)
             if entry is None or entry.user_stopped_at is None:
                 return False
             entry.user_stopped_at = None

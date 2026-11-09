@@ -520,6 +520,15 @@ class SessionPersistenceMixin:
                 self._entries[key] = durable_entry  # unchanged fallback data yields to the DB copy
         self._routing_db_loaded = True
         self._routing_fallback_baseline = None
+        # Stop intents the fallback load could not match were kept for this moment (t_41843f70,
+        # Prism r2 f8d11269d797): apply them to the authoritative rows before any recovery runs.
+        _apply_stop_intents = getattr(self, "_apply_user_stop_intents_locked", None)
+        if callable(_apply_stop_intents):
+            try:
+                _apply_stop_intents()
+            except Exception:
+                logger.warning("Applying user_stop intents after routing reconcile failed",
+                               exc_info=True)
 
     def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
