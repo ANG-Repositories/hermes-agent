@@ -122,6 +122,74 @@ def test_broken_history_never_fails_the_write(db, monkeypatch, tmp_path):
     assert db.get_meta("k") == "v"
 
 
+def _fake_hold(ledger, seq, op):
+    return {"ledger": str(ledger), "pid": 4242, "seq": seq, "who": "PID 4242 (peer)", "op": op, "since": time.time()}
+
+
+def test_concurrent_rotation_never_clobbers_the_archived_generation(tmp_path, monkeypatch):
+    """Prism 8e1b5c4107a7: writers A and B both find history.jsonl full. Without a cross-process lock,
+    B rotates the full file to .1 and appends, and then A rotates B's new file over .1, which destroys the
+    archived generation. flock belongs to the open file description, so two threads with separate opens
+    conflict exactly like two processes."""
+    ledger = tmp_path / "state.db.lockholders"
+    ledger.mkdir(mode=0o700)
+    monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 200)
+    monkeypatch.setattr(lockowners, "_HISTORY_LOCK_WAIT_S", 5.0)
+    full = b"".join(b'{"since": 1.0, "op": "archived", "n": %d}\n' % i for i in range(5))
+    assert len(full) > 150
+    (ledger / "history.jsonl").write_bytes(full)
+
+    real_replace = os.replace
+    a_rotating = threading.Event()
+    a_ident = []
+
+    def _slow_first_rotation(*args, **kwargs):  # A has stat'ed the full file; park it before it rotates
+        if threading.get_ident() in a_ident and not a_rotating.is_set():
+            a_rotating.set()
+            time.sleep(0.4)
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(lockowners.os, "replace", _slow_first_rotation)
+
+    def _writer_a():
+        a_ident.append(threading.get_ident())
+        lockowners._append_history(_fake_hold(ledger, 1, "writer_a"), {"held_s": 3.0, "state": "released"})
+
+    a = threading.Thread(target=_writer_a)
+    a.start()
+    assert a_rotating.wait(5.0)
+    lockowners._append_history(_fake_hold(ledger, 2, "writer_b"), {"held_s": 3.0, "state": "released"})
+    a.join(timeout=10.0)
+
+    assert (ledger / "history.jsonl.1").read_bytes() == full, "the archived generation was overwritten"
+    current = (ledger / "history.jsonl").read_text(encoding="utf-8")
+    assert '"writer_a"' in current and '"writer_b"' in current, current
+
+
+def test_busy_history_lock_appends_without_rotating(tmp_path, monkeypatch):
+    """When another writer holds history.lock past the bounded wait, the record is still appended and the
+    file is NOT rotated, so nothing archived can be lost and the write path never waits long."""
+    import fcntl
+
+    ledger = tmp_path / "state.db.lockholders"
+    ledger.mkdir(mode=0o700)
+    monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 100)
+    monkeypatch.setattr(lockowners, "_HISTORY_LOCK_WAIT_S", 0.05)
+    full = b"x" * 150 + b"\n"
+    (ledger / "history.jsonl").write_bytes(full)
+    peer = os.open(str(ledger / "history.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(peer, fcntl.LOCK_EX)
+        t0 = time.monotonic()
+        lockowners._append_history(_fake_hold(ledger, 1, "contended"), {"held_s": 3.0, "state": "released"})
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        os.close(peer)
+    assert not (ledger / "history.jsonl.1").exists()
+    data = (ledger / "history.jsonl").read_bytes()
+    assert data.startswith(full) and b'"contended"' in data
+
+
 def _waiter_lines(caplog):
     return [r.getMessage() for r in caplog.records if "state.db write waiting" in r.getMessage()]
 

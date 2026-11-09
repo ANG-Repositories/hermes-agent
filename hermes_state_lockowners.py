@@ -137,6 +137,13 @@ _WATCHDOG_TICK_S = 0.5
 # stall window can be rebuilt after the per-pid file was overwritten (t_7fe48f0b). Bounded: rotated to
 # history.jsonl.1 at _HISTORY_MAX_BYTES, one backup kept (<= 2x the cap on disk).
 _HISTORY_NAME = "history.jsonl"
+# Cross-process guard for rotate+append (Prism 8e1b5c4107a7): _publish_lock serializes threads of ONE
+# process only, so two processes could both see a full file and the second rotation would clobber the
+# generation the first just archived. Bounded wait; on contention the record is appended WITHOUT
+# rotating (a single O_APPEND write is already safe across processes), so a writer never blocks long
+# and an archived generation is never overwritten. Never matches _LEDGER_NAME_RE, so never pruned.
+_HISTORY_LOCK_NAME = "history.lock"
+_HISTORY_LOCK_WAIT_S = 0.2
 _HISTORY_MAX_BYTES = 4 * 1024 * 1024
 # A writer that has waited this long for the write lock logs the holder on its own side.
 WAITER_ATTRIBUTION_S = 10.0
@@ -394,9 +401,42 @@ def hold_ended(token: Optional[int]) -> None:
                                        released_at=time.time()))
 
 
+def _try_lock_fd(lock_fd: int) -> bool:
+    """Non-blocking exclusive lock on *lock_fd* (flock on POSIX, a 1-byte msvcrt lock on Windows)."""
+    try:
+        import fcntl
+
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except ImportError:
+        import msvcrt  # windows-footgun: ok — Windows-only branch, fcntl is absent there
+
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_history_lock(lock_fd: int) -> bool:
+    """True once the cross-process history lock is held; False after _HISTORY_LOCK_WAIT_S."""
+    deadline = time.monotonic() + _HISTORY_LOCK_WAIT_S
+    while True:
+        try:
+            if _try_lock_fd(lock_fd):
+                return True
+        except OSError:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
 def _append_history(hold: dict, fields: dict) -> None:
     """Append one released hold to <ledger>/history.jsonl, rotating at _HISTORY_MAX_BYTES.
-    Callers hold _publish_lock; never raises. Runs after _write_record, which resolved the ledger."""
+    Callers hold _publish_lock (threads of this process); rotate+append also holds the cross-process
+    history.lock, and rotation is skipped when that lock is busy. Never raises. Runs after
+    _write_record, which resolved the ledger."""
     try:
         ledger = hold.get("ledger")
         if ledger is None:
@@ -406,25 +446,37 @@ def _append_history(hold: dict, fields: dict) -> None:
             if os.path.islink(ledger) or not os.path.isdir(ledger):
                 return
             path = os.path.join(ledger, _HISTORY_NAME)
-            with contextlib.suppress(OSError):
-                if os.path.getsize(path) + len(line) > _HISTORY_MAX_BYTES:
-                    os.replace(path, path + ".1")
-            with open(path, "ab") as handle:
-                handle.write(line)
+            lock_fd = os.open(os.path.join(ledger, _HISTORY_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                if _acquire_history_lock(lock_fd):  # released by the close below
+                    with contextlib.suppress(OSError):
+                        if os.path.getsize(path) + len(line) > _HISTORY_MAX_BYTES:
+                            os.replace(path, path + ".1")
+                with open(path, "ab") as handle:
+                    handle.write(line)
+            finally:
+                os.close(lock_fd)
             return
         fd = _open_ledger(ledger, create=False)
         if fd is None:
             return
         try:
-            with contextlib.suppress(FileNotFoundError):
-                st = os.stat(_HISTORY_NAME, dir_fd=fd, follow_symlinks=False)
-                if stat.S_ISREG(st.st_mode) and st.st_size + len(line) > _HISTORY_MAX_BYTES:
-                    os.replace(_HISTORY_NAME, _HISTORY_NAME + ".1", src_dir_fd=fd, dst_dir_fd=fd)
-            out = os.open(_HISTORY_NAME, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            lock_fd = os.open(_HISTORY_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=fd)
             try:
-                os.write(out, line)  # one O_APPEND write per record: concurrent writers never interleave lines
+                if _acquire_history_lock(lock_fd):  # released by the close below
+                    # Size check under the lock: a peer that rotated first left a small file here.
+                    with contextlib.suppress(FileNotFoundError):
+                        st = os.stat(_HISTORY_NAME, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISREG(st.st_mode) and st.st_size + len(line) > _HISTORY_MAX_BYTES:
+                            os.replace(_HISTORY_NAME, _HISTORY_NAME + ".1", src_dir_fd=fd, dst_dir_fd=fd)
+                out = os.open(_HISTORY_NAME, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600,
+                              dir_fd=fd)
+                try:
+                    os.write(out, line)  # one O_APPEND write per record: concurrent writers never interleave lines
+                finally:
+                    os.close(out)
             finally:
-                os.close(out)
+                os.close(lock_fd)
         finally:
             os.close(fd)
     except Exception:
