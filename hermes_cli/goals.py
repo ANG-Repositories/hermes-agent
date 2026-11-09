@@ -848,6 +848,124 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
 
 
+# ── Orphan GC (t_92fc3ff0) ────────────────────────────────────────────
+# A goal row is keyed by session id. When the gateway replaces a routed conversation (/new, /reset,
+# an auto-reset) the old id stops being routed, and an ACTIVE row left on it never wakes anyone but
+# is loaded by every 15 s idle-wake scan. Rotations retire it (``superseded``); the hourly reaper
+# retires what any other path leaves behind (``orphaned``). Retire, never delete: ``/goal resume``
+# (or ``save_goal``) restores the row.
+
+DEFAULT_ORPHAN_GC_DAYS = 7   # goals.orphan_gc_days; 0 disables the reaper
+_ORPHAN_GC_SCAN_CHUNK = 500  # bound on one sessions IN (...) read
+
+
+def retire_goal(session_id: str, status: str, reason: str, *, db: Any = None) -> bool:
+    """Flip an ACTIVE goal row to *status* (``superseded`` / ``orphaned``) with ``paused_reason``
+    *reason*. Compare-and-set against the row read here, so a concurrent edit wins. Never touches a
+    non-active row: a done, paused or /stop-latched goal is never turned back on (Ace 2026-10-19).
+    *db*: the store holding the row (gateway rotations pass the routing key's profile store).
+    Best-effort, never raises; True when this call retired it."""
+    if not session_id:
+        return False
+    db = db if db is not None else _get_session_db()
+    if db is None:
+        return False
+    key = _meta_key(session_id)
+    try:
+        raw = db.get_meta_committed(key)
+        state = GoalState.from_json(raw) if raw else None
+        if state is None or state.status != "active":
+            return False
+        state.status, state.paused_reason = status, reason
+        state.clear_wait()
+        state.revision += 1
+        return bool(db.compare_and_set_meta(key, raw, state.to_json()))
+    except Exception as exc:
+        logger.debug("GoalManager: retiring goal %s failed: %s", session_id, exc)
+        return False
+
+
+def orphaned_goal_and_loop_ids(
+    now: float, routing: Any, session_activity: Dict[str, float], *, gc_days: int = DEFAULT_ORPHAN_GC_DAYS,
+) -> List[str]:
+    """Pure: the session ids in *session_activity* (``{sid: last activity epoch}`` for every session
+    with an active goal or loop) that are NOT routed (*routing*: current session ids of every routed
+    key, all served profiles) AND idle for >= *gc_days*. CLI/TUI sessions are never routed, so the
+    idle test alone protects them. ``gc_days <= 0`` returns nothing."""
+    if gc_days <= 0:
+        return []
+    routed = set(routing or ())
+    cutoff = now - gc_days * 86400
+    return sorted(sid for sid, last in session_activity.items() if sid not in routed and (last or 0.0) <= cutoff)
+
+
+def _goal_loop_session_activity(db: Any) -> Tuple[Dict[str, float], set, set]:
+    """``(activity, goal_sids, loop_sids)`` for sessions with an ACTIVE goal or loop row in *db*.
+    Activity is the latest of the row's own clocks (set/resume, last turn, last idle wake, last loop
+    tick) and the session store's (start, last message, ``effective_last_active``). A failed read
+    raises: an unreadable store must not look idle."""
+    activity: Dict[str, float] = {}
+    goal_sids, loop_sids = set(), set()
+    for prefix, sids, clocks in (
+        ("goal:", goal_sids, ("created_at", "resumed_at", "last_turn_at", "last_idle_wake_at", "waiting_since")),
+        ("loop:", loop_sids, ("created_at", "last_fired_at")),
+    ):
+        for key, raw in db.list_meta_prefix(prefix):
+            try:
+                data = json.loads(raw) if raw else None
+            except Exception:
+                continue
+            sid = key[len(prefix):]
+            if not sid or not isinstance(data, dict) or data.get("status") != "active":
+                continue
+            sids.add(sid)
+            last = max(float(data.get(c) or 0.0) for c in clocks)
+            activity[sid] = max(activity.get(sid, 0.0), last)
+    ids = sorted(activity)
+    for i in range(0, len(ids), _ORPHAN_GC_SCAN_CHUNK):
+        chunk = ids[i:i + _ORPHAN_GC_SCAN_CHUNK]
+        rows = db._read_all(
+            "SELECT s.id, MAX(COALESCE(s.started_at, 0), COALESCE(s.effective_last_active, 0), "
+            "COALESCE((SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id), 0)) "
+            f"FROM sessions s WHERE s.id IN ({','.join('?' * len(chunk))})",
+            tuple(chunk),
+        )
+        for sid, last in rows:
+            activity[sid] = max(activity[sid], float(last or 0.0))
+    return activity, goal_sids, loop_sids
+
+
+def reap_orphaned_goals_and_loops(
+    routed_session_ids: Any, *, gc_days: int = DEFAULT_ORPHAN_GC_DAYS, now: Optional[float] = None, db: Any = None,
+) -> Dict[str, int]:
+    """Retire (status ``orphaned``) every active goal and loop in this profile's store that
+    :func:`orphaned_goal_and_loop_ids` selects. Returns ``{"scanned", "orphaned", "loops"}``
+    (scanned = sessions holding an active goal or loop). Any read failure reaps nothing."""
+    counts = {"scanned": 0, "orphaned": 0, "loops": 0}
+    if gc_days <= 0:
+        return counts
+    db = db if db is not None else _get_session_db()
+    if db is None:
+        return counts
+    now = time.time() if now is None else now
+    try:
+        activity, goal_sids, loop_sids = _goal_loop_session_activity(db)
+    except Exception as exc:
+        logger.debug("goal-gc: activity read failed, nothing reaped: %s", exc)
+        return counts
+    counts["scanned"] = len(activity)
+    stamp = time.strftime("%Y-%m-%d", time.localtime(now))
+    reason = f"orphan-gc: unrouted and idle >= {gc_days}d (retired {stamp})"
+    from hermes_cli.loops import retire_loop
+
+    for sid in orphaned_goal_and_loop_ids(now, routed_session_ids, activity, gc_days=gc_days):
+        if sid in goal_sids and retire_goal(sid, "orphaned", f"{reason}; /goal resume restores", db=db):
+            counts["orphaned"] += 1
+        if sid in loop_sids and retire_loop(sid, "orphaned", f"{reason}; /loop resume restores", db=db):
+            counts["loops"] += 1
+    return counts
+
+
 # ── Judge ─────────────────────────────────────────────────────────────
 
 def _truncate(text: str, limit: int) -> str:
