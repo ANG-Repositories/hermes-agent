@@ -41,6 +41,14 @@ def _switched(model):
     return t("gateway.model.switched", model=model)
 
 
+async def _drained(h, timeout=5.0):
+    """Wait until the session's deferred jobs are committed and the session task is done; read the
+    store only after that (a concurrent read races the store creating its tables)."""
+    await _wait_for(lambda: not h.runner._model_switch_write_pending(h.key())
+                    and not any(not t.done() for t in list(h.adapter._session_tasks.values())),
+                    "deferred writes to settle", timeout)
+
+
 class _GatedDB:
     """state.db stand-in: ``update_session_model`` blocks until ``release`` is set."""
 
@@ -110,7 +118,7 @@ async def test_reply_is_sent_before_a_blocked_state_db_write(tmp_path, monkeypat
     assert h.db.models == []
     h.db.release.set()
     await _wait_for(lambda: h.db.models == ["gpt-5.5"], "deferred state.db write to land")
-    await _wait_for(lambda: h.runner.session_store.get_model_override(h.key()) is not None, "store write-through")
+    await _drained(h)
     assert h.runner.session_store.get_model_override(h.key())["model"] == "gpt-5.5"
     assert not h.sent_with(FOLLOWUP)
 
@@ -160,9 +168,10 @@ async def test_same_session_switches_commit_in_issue_order(tmp_path, monkeypatch
     await _wait_for(lambda: h.sent_with(_switched("model-B")), "second confirmation while the first write is blocked")
     assert h.runner._session_model_override(h.key())["model"] == "model-B"
     h.db.release.set()
-    await _wait_for(lambda: h.db.models == ["model-A", "model-B"], "both deferred writes, in issue order")
-    await _wait_for(lambda: (h.runner.session_store.get_model_override(h.key()) or {}).get("model") == "model-B",
-                    "store on the later pick")
+    await _drained(h)
+    # model-A's state.db write was already in flight when model-B was issued; it lands first.
+    assert h.db.models == ["model-A", "model-B"]
+    assert h.runner.session_store.get_model_override(h.key())["model"] == "model-B"
     assert h.runner._session_model_override(h.key())["model"] == "model-B"
     assert not h.sent_with(FOLLOWUP)
 
@@ -212,7 +221,7 @@ async def test_deferred_global_write_failure_posts_a_followup_line(tmp_path, mon
     # #100314 semantics: the switch truthfully stays a session override (memory + store).
     assert yaml.safe_load(h.cfg_path.read_text(encoding="utf-8"))["model"]["default"] == "old-model"
     assert h.runner._session_model_override(h.key())["model"] == "gpt-5.5"
-    await _wait_for(lambda: h.runner.session_store.get_model_override(h.key()) is not None, "store write-through")
+    await _drained(h)
     assert h.runner.session_store.get_model_override(h.key())["model"] == "gpt-5.5"
 
 
@@ -229,3 +238,126 @@ async def test_stop_during_the_deferred_write_keeps_the_queued_message(tmp_path,
     # The interrupted write stays queued for the next drain instead of being dropped.
     assert len(h.runner.__dict__["_model_switch_pending"][h.key()]) == 1
     assert h.db.models == []
+
+
+# --------------------------------------------------------------------------- Prism round 1 (#169)
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_lands_after_a_queued_typed_switch(tmp_path, monkeypatch):
+    """Prism f05146212848 / ea8bef1a2f75: a picker tap while a typed /model's deferred write is still
+    blocked commits after it; the older typed switch never overwrites the tap (db, store, config)."""
+    from tests.gateway.test_model_picker_persist import _FakePickerAdapter
+
+    h = _Harness(tmp_path, monkeypatch)
+    monkeypatch.setattr("hermes_cli.model_switch_providers.list_picker_providers",
+                        lambda **kw: [{"slug": "openrouter", "name": "OpenRouter", "models": ["model-B"]}])
+    monkeypatch.setattr(type(h.adapter), "send_model_picker", _FakePickerAdapter.send_model_picker, raising=False)
+    h.adapter.captured_callback = None
+    await h.adapter.handle_message(_ev("/model model-A --global"))
+    await _wait_for(lambda: h.sent_with(_switched("model-A")), "typed confirmation")
+    await asyncio.wait_for(h.db.entered.wait(), 5)
+    assert await h.runner._handle_model_command(_ev("/model --global")) is None
+    tap = asyncio.ensure_future(h.adapter.captured_callback("12345", "model-B", "openrouter"))
+    await asyncio.sleep(0.2)
+    assert not tap.done(), "the tap committed before the queued typed switch"
+    h.db.release.set()
+    assert _switched("model-B") in await asyncio.wait_for(tap, 10)
+    await _drained(h)
+    assert h.db.models[-1] == "model-B"
+    assert yaml.safe_load(h.cfg_path.read_text(encoding="utf-8"))["model"]["default"] == "model-B"
+
+
+@pytest.mark.asyncio
+async def test_pending_switch_survives_persisted_route_reconciliation(tmp_path, monkeypatch):
+    """Prism 396516742752: with model-A persisted and the switch to model-B not yet written, the
+    runtime resolver must not reconcile the in-memory B back to the persisted A."""
+    from gateway.session import PersistedSessionRouteLookup
+
+    h = _Harness(tmp_path, monkeypatch)
+    persisted = {"model": "model-A", "provider": "openrouter", "api_mode": "chat_completions"}
+    monkeypatch.setattr(h.runner, "_persisted_session_route_identity",
+                        lambda _key: PersistedSessionRouteLookup("valid", persisted))
+    await h.adapter.handle_message(_ev("/model model-B"))
+    await _wait_for(lambda: h.sent_with(_switched("model-B")), "confirmation")
+    await asyncio.wait_for(h.db.entered.wait(), 5)
+    model, _runtime = h.runner._resolve_session_agent_runtime(source=_source())
+    assert model == "model-B"
+    h.db.release.set()
+    await _drained(h)
+
+
+@pytest.mark.asyncio
+async def test_superseded_global_switch_does_not_clear_a_newer_override(tmp_path, monkeypatch):
+    """Prism 9ea56997a2df: a newer override installed while a deferred --global switch waits on its
+    config write is not cleared from memory or the store by the older switch."""
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    gate, entered = asyncio.Event(), asyncio.Event()
+    from hermes_cli.model_switch import persist_model_selection
+
+    async def _slow_write(result, config_path):
+        entered.set()
+        await gate.wait()
+        await asyncio.to_thread(persist_model_selection, result, config_path)
+
+    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", _slow_write)
+    await h.adapter.handle_message(_ev("/model model-A --global"))
+    await asyncio.wait_for(entered.wait(), 5)
+    newer = {"model": "model-B", "provider": "openrouter", "api_mode": "chat_completions"}
+    await h.runner._persist_session_model_override(h.key(), newer)
+    gate.set()
+    await _drained(h)
+    assert h.runner._session_model_override(h.key())["model"] == "model-B"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_drain_does_not_replay_a_completed_config_write(tmp_path, monkeypatch):
+    """Prism fce37d9b26ea: a drain cancelled after its config.yaml write resumes after that phase."""
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    writes = []
+    from hermes_cli.model_switch import persist_model_selection
+
+    async def _write(result, config_path):
+        await asyncio.to_thread(persist_model_selection, result, config_path)
+        writes.append(result.new_model)
+
+    store_gate = asyncio.Event()
+    real_persist = h.runner._persist_session_model_override
+
+    async def _held_persist(key, override, **kw):
+        if kw.get("persist_only"):
+            await store_gate.wait()
+        return await real_persist(key, override, **kw)
+
+    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", _write)
+    h.runner._persist_session_model_override = _held_persist
+    await h.adapter.handle_message(_ev("/model model-A --global"))
+    await _wait_for(lambda: writes == ["model-A"], "config write")
+    await h.adapter.cancel_session_processing(h.key())  # /stop mid store phase
+    assert h.runner._model_switch_write_pending(h.key())
+    store_gate.set()
+    await _drained(h)
+    assert writes == ["model-A"], "the completed config.yaml write was replayed"
+
+
+@pytest.mark.asyncio
+async def test_writes_still_land_when_the_post_delivery_callback_is_skipped(tmp_path, monkeypatch):
+    """Prism 49cf8836d4b4: if the adapter never fires the callback, the session task's end drains."""
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    h.adapter._fire_post_delivery_callback = lambda *_a, **_k: asyncio.sleep(0)
+    await h.adapter.handle_message(_ev("/model gpt-5.5"))
+    await _wait_for(lambda: h.db.models == ["gpt-5.5"], "orphaned deferred write drained")
+    await _drained(h)
+    assert h.runner.session_store.get_model_override(h.key())["model"] == "gpt-5.5"
+
+
+def test_telegram_dm_commands_share_one_switch_lock(tmp_path, monkeypatch):
+    """Prism da07a87006ed: a lobby-shaped and a threaded Telegram DM /model normalize to the same
+    session, so they must take the same lock (the key is known only after topic recovery)."""
+    h = _Harness(tmp_path, monkeypatch)
+    lobby = _source()
+    threaded = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", thread_id="42")
+    assert h.runner._model_switch_lock_key(lobby) == h.runner._model_switch_lock_key(threaded)

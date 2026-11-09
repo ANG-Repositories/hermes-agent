@@ -246,6 +246,7 @@ class GatewayModelCommandsMixin:
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
+        self._bump_model_override_seq(ctx.session_key)  # supersedes any queued reply-first write
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
             # command's snapshot is the first temporary model, not the user's standing override.
@@ -358,7 +359,7 @@ class GatewayModelCommandsMixin:
 
         Entry for the picker / cost-confirm callbacks, which fire outside ``_handle_model_command``
         and take the switch lock themselves; the typed path already holds it."""
-        async with self._model_switch_lock(ctx.session_key):
+        async with self._model_switch_lock(self._model_switch_lock_key(ctx.source)):
             return await self._commit_model_switch_locked(result, ctx, source=source, picker=picker)
 
     def _channel_override_for(self, source):
@@ -396,17 +397,32 @@ class GatewayModelCommandsMixin:
 
     def _model_switch_lock_key(self, source) -> str:
         """Lock key for a /model from ``source``. Sync (no await before the lock is taken, so
-        same-session commands commit in issue order); the raw key, before the off-loop topic
-        normalization the handler runs."""
+        same-session commands commit in issue order). A Telegram DM's session key is only known
+        after the off-loop topic recovery, so every command in that DM shares one chat-level key:
+        a lobby-shaped and a threaded command that normalize to the same session must share a lock
+        (Prism da07a87006ed). Elsewhere the raw source already is the session."""
         try:
+            platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+            if str(platform) == "telegram" and getattr(source, "chat_type", "") == "dm":
+                return f"telegram-dm:{source.chat_id}"
             return self._session_key_for_source(source) or ""
         except Exception:
             return ""
 
     def _model_override_seq(self, session_key: str) -> int:
-        """Bumped by every in-memory /model override change (``_apply_session_model_override_in_memory``);
-        a deferred write whose seq is no longer current was superseded by a later switch."""
+        """Bumped by every in-memory /model override change (``_bump_model_override_seq``); a
+        deferred write whose seq is no longer current was superseded by a later switch."""
         return int((self.__dict__.get("_model_override_seqs") or {}).get(session_key, 0))
+
+    def _bump_model_override_seq(self, session_key: str) -> int:
+        seqs = self.__dict__.setdefault("_model_override_seqs", {})
+        seqs[session_key] = seqs.get(session_key, 0) + 1
+        return seqs[session_key]
+
+    def _model_switch_write_pending(self, session_key: str) -> bool:
+        """A reply-first /model for this session has durable writes not yet committed; its
+        in-memory override is authoritative until then (persisted-route reconciliation keeps it)."""
+        return bool(session_key and (self.__dict__.get("_model_switch_pending") or {}).get(session_key))
 
     # Reply-first /model (t_2ab07928): the confirmation is sent once the switch is applied in memory;
     # the durable writes (state.db column, session-store identity, --global config.yaml) run after the
@@ -460,7 +476,34 @@ class GatewayModelCommandsMixin:
         # Unbounded, as the inline await was: the store/config writes carry no generic short timeout.
         _after_delivery.post_delivery_timeout = None
         adapter.register_post_delivery_callback(adapter_key, _after_delivery, generation=generation)
+        # Fallback (Prism 49cf8836d4b4): the callback can be skipped (an exception before it, a
+        # generation mismatch, a /stop cancelling it mid-job). When the session task ends with this
+        # session's jobs still queued and no drain running, drain them then, in the captured context.
+        # Serialized by the write lock and resumed from each job's recorded progress, and every inline
+        # /model commit drains first, so it cannot reorder writes; the in-memory override already
+        # decides every turn.
+        task = asyncio.current_task()
+        if task is not None:
+            task.add_done_callback(lambda _t: self._drain_orphaned_model_switch_writes(session_key, source, ctx))
         return True
+
+    def _drain_orphaned_model_switch_writes(self, session_key: str, source, ctx) -> None:
+        if not self._model_switch_write_pending(session_key):
+            return
+        lock = (self.__dict__.get("_model_switch_write_locks") or {}).get(session_key)
+        if lock is not None and lock.locked():
+            return  # the running drain takes every queued job
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("deferred /model writes for %s left queued: no running loop", session_key)
+            return
+        logger.info("deferred /model writes for %s: post-delivery callback did not run them; draining now",
+                    session_key)
+        tasks = self.__dict__.setdefault("_model_switch_orphan_drains", set())
+        task = loop.create_task(self._drain_model_switch_writes(session_key, source), context=ctx)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _drain_model_switch_writes(self, session_key: str, source) -> None:
         """Run every queued deferred /model write for ``session_key`` in issue order. A failure is
@@ -479,6 +522,8 @@ class GatewayModelCommandsMixin:
                 try:
                     failure = await job()
                 except asyncio.CancelledError:
+                    # Completed phases are recorded on the job; the next drain resumes after them
+                    # (an already-written config.yaml is never written again, Prism fce37d9b26ea).
                     logger.warning("deferred /model writes for %s interrupted; left queued for the next drain",
                                    session_key)
                     raise
@@ -530,6 +575,9 @@ class GatewayModelCommandsMixin:
 
     async def _commit_model_switch_locked(self, result, ctx: _ModelSwitchContext, *, source, picker: bool) -> str:
         one_turn = False if picker else ctx.one_turn
+        # An inline commit lands after any reply-first write still queued for this session, so the
+        # older switch can never overwrite this one (Prism ea8bef1a2f75 / af86b8cbef02).
+        await self._drain_model_switch_writes(ctx.session_key, source)
         error = self._switch_cached_agent_model(result, ctx, picker)
         if error is not None:
             return error

@@ -8021,6 +8021,8 @@ class GatewayRunner(
             self._override_target_just_changed = {}
         self._override_target_just_changed[session_key] = True
         if override is None:
+            # NOTE(P3b/RC-2): the in-memory half of the single door (_set_session_model_override),
+            # split out so the reply-first /model path can run it on the loop (t_2ab07928).
             self._session_model_overrides.pop(session_key, None)
         else:
             self._session_model_overrides[session_key] = dict(override)
@@ -8028,8 +8030,7 @@ class GatewayRunner(
         if unavailable is not None:
             unavailable.discard(session_key)
         # Supersedes any reply-first /model write still queued for this session (t_2ab07928).
-        seqs = self.__dict__.setdefault("_model_override_seqs", {})
-        seqs[session_key] = seqs.get(session_key, 0) + 1
+        self._bump_model_override_seq(session_key)
 
     def _sweep_restart_initiated_breadcrumbs(self) -> int:
         """Prune breadcrumb files from a prior boot or past the TTL (D-8).
