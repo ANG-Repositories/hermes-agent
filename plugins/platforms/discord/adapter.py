@@ -534,6 +534,9 @@ _NON_REPO_PATH_MARKERS = (
 
 # Set once the mirror handler is attached to the ``discord.gateway`` logger.
 _HEARTBEAT_BLOCKED_MIRROR_INSTALLED = False
+# Monotonic count of PHASE=event_loop_blocked lines the mirror wrote. The liveness probe diffs it across an
+# unhealthy streak so its forced-reconnect line can say whether a blocked-site line exists to grep for.
+_HEARTBEAT_BLOCKED_EMITTED = 0
 
 
 def _discord_repo_root() -> str:
@@ -597,6 +600,8 @@ class _DiscordHeartbeatBlockedMirror(logging.Handler):
             seconds_match = _HEARTBEAT_BLOCKED_SECONDS_RE.search(message)
             seconds = seconds_match.group(1) if seconds_match else "unknown"
             site = _innermost_repo_frame(message)
+            global _HEARTBEAT_BLOCKED_EMITTED
+            _HEARTBEAT_BLOCKED_EMITTED += 1
             logger.error(
                 "PHASE=event_loop_blocked platform=discord seconds=%s site=%s",
                 seconds,
@@ -2446,6 +2451,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         interval = self._liveness_interval_seconds
         threshold = self._liveness_failure_threshold
         failures = 0
+        blocked_at_streak_start = _HEARTBEAT_BLOCKED_EMITTED
         while self._running:
             try:
                 await asyncio.sleep(interval)
@@ -2476,6 +2482,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         self.name, failures,
                     )
                 failures = 0
+                # Window for the reconnect line's blocked-site count: since the last HEALTHY sample, so a
+                # block that caused the first unhealthy sample is inside it.
+                blocked_at_streak_start = _HEARTBEAT_BLOCKED_EMITTED
                 # Piggyback the hourly slash-command registry drift check on
                 # the existing healthy-sample tick — no extra task, and it only
                 # runs when the Gateway is actually up. Fail-soft.
@@ -2504,14 +2513,29 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "transport closed" if terminal else "remained unhealthy",
                 reason, failures, threshold,
             )
-            # A stalled event loop is the common cause of latency_exceeded /
-            # ack_stale here — grep this log for PHASE=event_loop_blocked to see
-            # whether discord.py's keep-alive thread named a blocking call site.
-            logger.error(
-                "[%s] If this repeats, grep gateway.log for PHASE=event_loop_blocked "
-                "— it names the synchronous call blocking the event loop",
-                self.name,
-            )
+            # A stalled event loop is the common cause of latency_exceeded / ack_stale. Say whether the
+            # heartbeat-blocked mirror actually wrote a PHASE=event_loop_blocked line during this streak:
+            # discord.py only reports a block when ONE heartbeat send waits >= 10 s, so a loop starved by
+            # host load (many short stalls) reconnects with no such line, and the old unconditional "grep
+            # for it" hint sent the 2026-11-09 04:56:45 triage looking for a line that never existed
+            # (t_8783804a).
+            blocked_lines = _HEARTBEAT_BLOCKED_EMITTED - blocked_at_streak_start
+            if blocked_lines:
+                logger.error(
+                    "[%s] %d PHASE=event_loop_blocked line(s) logged during this unhealthy streak — they "
+                    "name the synchronous call blocking the event loop",
+                    self.name, blocked_lines,
+                )
+            else:
+                load = None
+                with suppress(Exception):
+                    load = round(os.getloadavg()[0], 1)  # admission-lint: not-a-decider log context only, gates nothing
+                logger.error(
+                    "[%s] No PHASE=event_loop_blocked during this unhealthy streak (no single call held the "
+                    "loop >= 10 s); load1=%s ncpu=%s — suspect host CPU starvation or a slow Gateway ACK, "
+                    "not one blocking call",
+                    self.name, load, os.cpu_count(),
+                )
             self._set_fatal_error(
                 "discord_websocket_health_stale",
                 f"Discord Gateway WebSocket health check failed: {reason}", retryable=True,
