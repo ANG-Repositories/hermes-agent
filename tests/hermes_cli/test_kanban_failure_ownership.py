@@ -206,8 +206,6 @@ def test_detach_reconciles_without_new_observation(board, task_kind):
 
 
 def test_pending_limit_is_per_producer(board, monkeypatch):
-    # Isolate the batch bound from the independent per-day mint cap.
-    monkeypatch.setenv('HERMES_KANBAN_MINT_CAP', '100')
     enroll(board)
     for index in range(33):
         obs = replace(observation('backlog-' + str(index)), key=key('tests/test_backlog.py::test_' + str(index)))
@@ -467,11 +465,11 @@ def test_public_claim_after_healing_no_allocation(board):
     assert board.execute('SELECT count(*) FROM task_runs').fetchone()[0]==0
 
 
-def test_mint_cap_durable_pending(board,monkeypatch):
+def test_owner_create_refusal_is_durable_pending(board,monkeypatch):
     enroll(board)
-    def cap(conn,producer):
-        raise kb.MintCapError('test cap',producer,100,1)
-    monkeypatch.setattr(kb,'check_mint_cap',cap)
+    def refuse(conn,row):
+        raise ValueError('test refusal')
+    monkeypatch.setattr(kb,'_insert_task_row',refuse)
     result=admit(board,observation())
     assert result.action=='EVIDENCE_PENDING' and result.card_id is None
     assert board.execute("SELECT reason FROM failure_bindings WHERE state='pending'").fetchone()[0]

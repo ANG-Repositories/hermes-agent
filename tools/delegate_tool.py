@@ -5049,7 +5049,8 @@ def delegate_task(
                 # back in-process (t_7e0f9dab).
                 _runtime = kanban_launch_runtime(dispatch["delegation_id"], _KANBAN_LAUNCH_WAIT_SECONDS)
                 payload["runtime"] = _runtime or "kanban (spawn pending)"
-            if _kanban is not None and _runtime in (None, KANBAN_SPAWNED_RUNTIME):
+            if _kanban is not None and (_runtime in (None, KANBAN_SPAWNED_RUNTIME)
+                                        or str(_runtime).startswith("detached")):
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
                     "steer/list are not available for it; /stop does not cancel it (delegate_task action='stop' does).")

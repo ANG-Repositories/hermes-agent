@@ -5847,25 +5847,20 @@ class NearDuplicateError(ValueError):
         self.duplicates = duplicates
 
 
-# Per-creator mint cap (Ace 2026-11-05 12:59 PT, "do this immediately"): measured 2026-11-05, 710 cards
-# minted in 24 h on the default board, 477 of them by automation (main-tip-red 177, pager-owner-card 120,
-# landing-queue 93, ci-red-owner 38, live-edit-card 32, prism-page-card 17) feeding ~1,640 worker runs and
-# ~2,500 CI runs on hermes-home alone; CI runners then starved the Prism review pool to 0 placeable hosts.
-# Every minter passes through ``create_task``, so the cap lives here, not per script. A creator that is
-# not a human (``created_by`` empty / ``user`` / ``human:*``) may mint at most ``MINT_CAP_PER_DAY`` cards
-# per rolling 24 h; the (N+1)th raises :class:`MintCapError`. ``force_reason`` (CLI ``--force``) overrides
-# it and is ledgered as a ``mint_cap_forced`` event on the new card. Kill switch:
-# ``HERMES_KANBAN_MINT_CAP=0`` (env; ``HERMES_KANBAN_MINT_CAP=<n>`` resizes). Idempotent re-mints that
-# return an existing card never count: the check runs after the idempotency lookup. Every refusal, force and
-# kill-switch bypass is ledgered in ``<db>.mint-cap.jsonl`` (:func:`mint_cap_ledger_path`, t_f956f87f).
-MINT_CAP_PER_DAY = 24
-MINT_CAP_WINDOW_S = 24 * 3600
-MINT_CAP_HUMAN_PREFIXES = ("human:",)
-MINT_CAP_HUMAN_NAMES = frozenset({"", "user", "operator", "apollo", "aegis"})
+# Automated-creator classification. The per-creator rolling-24 h mint cap that used to live here (PR #65/#85,
+# ``MINT_CAP_PER_DAY`` = 24, ``HERMES_KANBAN_MINT_CAP``) was REMOVED on Ace's ruling 2026-11-09 (Discord
+# msg 1569346219715592214, "kill it, get rid of it"): no creator is refused for minting volume. Volume is held by
+# the signature resolver / flap breaker (one card per failure signature), idempotency keys, near-duplicate
+# refusal, and the explicit mint moratorium below. :func:`mint_cap_applies` survives as the "is this an
+# automated creator" predicate those controls share (humans, the operator CLI default, apollo/aegis are exempt).
+AUTOMATED_CREATOR_HUMAN_PREFIXES = ("human:",)
+AUTOMATED_CREATOR_HUMAN_NAMES = frozenset({"", "user", "operator", "apollo", "aegis"})
 
 
 class MintCapError(ValueError):
-    """``create_task`` refused: ``created_by`` is over its rolling-24 h mint cap."""
+    """Retired: the per-creator mint cap was removed (2026-11-09) and nothing raises this any more.
+
+    Kept so callers that still ``except MintCapError`` keep importing; it is never raised."""
 
     def __init__(self, message: str, created_by: str, count: int, cap: int):
         super().__init__(message)
@@ -5874,17 +5869,18 @@ class MintCapError(ValueError):
         self.cap = cap
 
 
-def mint_cap() -> int:
-    """The live cap (``HERMES_KANBAN_MINT_CAP`` env, else :data:`MINT_CAP_PER_DAY`); 0 = off."""
-    return _env_int("HERMES_KANBAN_MINT_CAP", MINT_CAP_PER_DAY, minimum=0)
-
-
 def mint_cap_applies(created_by: Optional[str]) -> bool:
-    """True for an automated creator; humans and the operator CLI default are never capped."""
+    """True for an automated creator; humans and the operator CLI default are exempt from the shared mint
+    controls (signature dedup, mint moratorium). Historical name; there is no volume cap."""
     by = (created_by or "").strip()
-    if by.lower() in MINT_CAP_HUMAN_NAMES:
+    if by.lower() in AUTOMATED_CREATOR_HUMAN_NAMES:
         return False
-    return not any(by.lower().startswith(p) for p in MINT_CAP_HUMAN_PREFIXES)
+    return not any(by.lower().startswith(p) for p in AUTOMATED_CREATOR_HUMAN_PREFIXES)
+
+
+def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
+    """Retired no-op (the per-creator mint cap was removed 2026-11-09). Kept for API compatibility only."""
+    return None
 
 
 # Mint moratorium (Ace 2026-11-08 22:5x, t_fb98bedc): while ``<kanban root>/state/kanban-mint-moratorium`` exists,
@@ -5923,22 +5919,13 @@ def check_mint_moratorium(created_by: Optional[str], creator_task_id: Optional[s
         "\"<why this card must exist now>\"." % (flag, by), by, flag)
 
 
-def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int] = None) -> int:
-    """Cards this creator minted in the trailing window, archived ones included (a reaped card still cost a run)."""
-    now = int(time.time()) if now is None else int(now)
-    row = conn.execute(
-        "SELECT COUNT(*) FROM tasks WHERE created_by = ? AND created_at > ?",
-        (created_by, now - MINT_CAP_WINDOW_S),
-    ).fetchone()
-    return int(row[0] if row else 0)
-
-
 def mint_cap_ledger_path(conn: sqlite3.Connection) -> Optional[Path]:
     """``<board db>.mint-cap.jsonl`` beside the connection's own db file; None for an in-memory/unnamed db.
 
-    t_f956f87f: one append-only row per cap outcome a ``task_events`` row cannot carry (a refusal has no card)
-    or would scatter: ``refused``, ``forced``, ``bypassed`` (minted past the default cap under the kill switch).
-    The one-week readout counts these instead of recomputing from ``created_at``."""
+    t_f956f87f: one append-only row per mint-control outcome a ``task_events`` row cannot carry (a refusal has no
+    card): today ``moratorium_refused`` / ``moratorium_forced``. The file name predates the cap's removal and is
+    kept so existing readers keep working; historical ``refused``/``forced``/``bypassed`` rows came from the
+    removed per-creator cap."""
     try:
         row = conn.execute("PRAGMA database_list").fetchone()
     except sqlite3.Error:
@@ -5964,35 +5951,6 @@ def _ledger_on_commit(conn: sqlite3.Connection, outcome: str, **fields: Any) -> 
     """Queue a ledger row for the outer COMMIT of the enclosing write_txn (kanban_db_connect.on_commit)."""
     from hermes_cli.kanban_db_connect import on_commit
     on_commit(conn, lambda: _ledger_mint_cap(conn, outcome, **fields))
-
-
-def mint_cap_bypass(conn: sqlite3.Connection, created_by: Optional[str]) -> Optional[dict]:
-    """The kill switch is set and an automated ``created_by`` is at/over the DEFAULT cap: the mint that follows
-    would have been refused. -> {created_by, count, cap, env}, else None. Ledgered as ``bypassed`` and a
-    ``mint_cap_bypassed`` event so a kill-switch storm is visible on the board (11-06: 15 cards, no trace)."""
-    if mint_cap() > 0 or not mint_cap_applies(created_by):
-        return None
-    by = (created_by or "").strip()
-    n = mint_count_24h(conn, by)
-    if n < MINT_CAP_PER_DAY:
-        return None
-    return {"created_by": by, "count": n, "cap": MINT_CAP_PER_DAY,
-            "env": "HERMES_KANBAN_MINT_CAP=%s" % os.environ.get("HERMES_KANBAN_MINT_CAP", "").strip()}
-
-
-def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
-    """Raise :class:`MintCapError` when ``created_by`` is an automated creator at or over the cap."""
-    cap = mint_cap()
-    if cap <= 0 or not mint_cap_applies(created_by):
-        return
-    by = (created_by or "").strip()
-    n = mint_count_24h(conn, by, now)
-    if n >= cap:
-        raise MintCapError(
-            "mint cap: created_by=%r has minted %d cards in the last 24 h (cap %d). One card per distinct "
-            "failing signature, not one per occurrence: reuse the open card (idempotency_key) or wait for "
-            "the window. Override: --force \"<why this card must exist now>\"; kill switch "
-            "HERMES_KANBAN_MINT_CAP=0." % (by, n, cap), by, n, cap)
 
 
 # Signature resolver + flap breaker (PRD plans/2026-11-05_machine-minted-cards-signature-dedup-prd.md, Ace
@@ -6499,8 +6457,12 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
-    from hermes_cli.kanban_ruling_citation import validate_fields
-    validate_fields(conn, [("title", title), ("body", body)])
+    # A delegations-board card contains an already-admitted delegate_task call, not a new work item.
+    # Its goal-derived title may quote a ruling without minting a ruling-bearing task.
+    container_card = _kdb.conn_is_delegations(conn)
+    if not container_card:
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("title", title), ("body", body)])
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -6671,9 +6633,6 @@ def create_task(
             pr_owner_forced = {"owner": exc.owner["task_id"], "pr": exc.owner["pr"],
                                "reason": force_reason}
 
-    # Per-creator mint cap (see MINT_CAP_PER_DAY): after the idempotency lookup, so a re-mint that returns the
-    # existing card never counts; before the write txn, so a refusal holds no lock.
-    mint_cap_forced: Optional[dict] = None
     mint_breaker_forced: Optional[dict] = None
     # Signature resolver (see SIGNATURE_QUIET_S): an open or recently closed card for the same failure signature
     # is returned instead of minting; a flapping signature raises unless forced.
@@ -6699,16 +6658,6 @@ def create_task(
                              idempotency_key=idempotency_key)
             raise
         moratorium_forced = {"created_by": exc.created_by, "reason": force_reason}
-    try:
-        check_mint_cap(conn, created_by)
-    except MintCapError as exc:
-        if not force_reason:
-            _ledger_mint_cap(conn, "refused", created_by=exc.created_by, count=exc.count, cap=exc.cap,
-                             idempotency_key=idempotency_key)
-            raise
-        mint_cap_forced = {"created_by": exc.created_by, "count": exc.count, "cap": exc.cap,
-                           "reason": force_reason}
-    mint_cap_bypassed = mint_cap_bypass(conn, created_by)
 
     now = int(time.time())
 
@@ -7075,17 +7024,9 @@ def create_task(
                     })
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
-                if mint_cap_forced:
-                    _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
-                if mint_cap_bypassed:
-                    _append_event(conn, task_id, "mint_cap_bypassed", mint_cap_bypassed)
                 # Prism 31f2934ed515: a create nested in a caller's write_txn only releases a savepoint here, so the
                 # ledger row of a card is queued for the OUTER commit (dropped on any rollback); never a row for a
                 # card that does not exist. A refusal (no card) stays an immediate append.
-                if mint_cap_forced:
-                    _ledger_on_commit(conn, "forced", task_id=task_id, **mint_cap_forced)
-                if mint_cap_bypassed:
-                    _ledger_on_commit(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
                 if moratorium_forced:
                     _append_event(conn, task_id, "moratorium_forced", moratorium_forced)
                     _ledger_on_commit(conn, "moratorium_forced", task_id=task_id, title=(title or "")[:120],
