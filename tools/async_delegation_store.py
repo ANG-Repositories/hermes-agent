@@ -7,6 +7,7 @@ Live events continue to use ``process_registry.completion_queue``.
 from __future__ import annotations
 
 import copy
+import contextlib
 import errno
 import hashlib
 import json
@@ -14,7 +15,9 @@ import math
 import logging
 import marshal
 import os
+import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -429,11 +432,43 @@ def _write(path: Path, registry: dict[str, Any]) -> None:
         _invalidate_cache(path)
 
 
+#: Default wait for the registry lock. Every holder loads (and a writer rewrites + fsyncs) the
+#: WHOLE file, so the hold scales with registry bytes; record size is bounded by
+#: ``_offload_oversized`` rather than by raising this (t_86324a22).
+LOCK_TIMEOUT_SECONDS = 5.0
+#: An acquisition whose wait or hold reaches this is logged at WARNING (DEBUG otherwise).
+LOCK_SLOW_LOG_MS = 1000.0
+#: Total time ``mark_submitted`` keeps retrying a lock timeout before the unit is failed.
+MARK_SUBMITTED_BUDGET_SECONDS = 30.0
+
+
+def _log_lock_timing(path: Path, write: bool, started: float, acquired_at: float | None) -> None:
+    """One line per acquisition: wait/hold ms and registry bytes (WARNING when either is slow).
+
+    ``acquired_at`` None = the lock was never taken (timeout): wait is the whole attempt."""
+    try:
+        now = time.monotonic()
+        wait_ms = ((acquired_at if acquired_at is not None else now) - started) * 1000.0
+        hold_ms = (now - acquired_at) * 1000.0 if acquired_at is not None else 0.0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+        slow = acquired_at is None or wait_ms >= LOCK_SLOW_LOG_MS or hold_ms >= LOCK_SLOW_LOG_MS
+        (logger.warning if slow else logger.debug)(
+            "async_delegation_registry_lock acquired=%s write=%s wait_ms=%.0f hold_ms=%.0f "
+            "registry_bytes=%d path=%s",
+            acquired_at is not None, write, wait_ms, hold_ms, size, path,
+        )
+    except Exception:  # pragma: no cover - telemetry must never break the lock path
+        pass
+
+
 @contextmanager
 def locked_registry(
     profile_home: Path | None = None,
     *,
-    timeout: float = 5.0,
+    timeout: float | None = None,
     write: bool = True,
     path: Path | None = None,
 ) -> Iterator[dict[str, Any]]:
@@ -450,7 +485,11 @@ def locked_registry(
         raise ValueError("pass profile_home or path, not both")
     lpath = path.with_suffix(".lock")  # Same captured home, even if cwd/symlink changes.
     _prepare_directory(path)
-    deadline = time.monotonic() + max(0.0, timeout)
+    if timeout is None:
+        timeout = LOCK_TIMEOUT_SECONDS
+    started = time.monotonic()
+    acquired_at: float | None = None
+    deadline = started + max(0.0, timeout)
     handle = lpath.open("a+b")
     acquired = False
     try:
@@ -485,11 +524,13 @@ def locked_registry(
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"timed out acquiring {lpath}")
                     time.sleep(0.01)
+        acquired_at = time.monotonic()
         registry = _load(path, allow_invalid_records=True, private=write, verify_content=write)
         yield registry
         if write:
             _write(path, registry)
     finally:
+        _log_lock_timing(path, write, started, acquired_at)
         if acquired:
             try:
                 import fcntl  # type: ignore
@@ -728,10 +769,172 @@ def _backup_before_first_compaction(path: Path) -> bool:
                 pass
 
 
+#: A settled terminal record whose canonical JSON exceeds this is offloaded (t_86324a22): its full
+#: body goes to a sidecar file and the registry keeps identity + a bounded preview. Every lock
+#: holder loads, and every writer rewrites + fsyncs, the WHOLE registry, so one 6 MB record taxes
+#: every dispatch in every gateway sharing the profile.
+OFFLOAD_RECORD_BYTES = 32 * 1024
+#: Characters kept of each offloaded free-text field (summary, error, context).
+OFFLOAD_PREVIEW_CHARS = 2000
+_SIDECAR_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def sidecar_dir(path: Path) -> Path:
+    """Where offloaded record bodies live: ``<registry>.sidecars/`` next to the registry."""
+    return path.with_name(f"{path.name}.sidecars")
+
+
+def _sidecar_path(path: Path, delegation_id: str) -> Path:
+    safe = _SIDECAR_ID_UNSAFE.sub("_", str(delegation_id))[:200] or "_"
+    return sidecar_dir(path) / f"{safe}.json"
+
+
+def read_offloaded_record(path: Path, record: dict[str, Any]) -> dict[str, Any] | None:
+    """The full record an ``offloaded`` stub points at, or None (missing / hash mismatch)."""
+    marker = record.get("offloaded") if isinstance(record, dict) else None
+    if not isinstance(marker, dict) or not isinstance(marker.get("sidecar"), str):
+        return None
+    try:
+        raw = (path.parent / marker["sidecar"]).read_bytes()
+    except OSError:
+        return None
+    if hashlib.sha256(raw).hexdigest() != marker.get("sha256"):
+        return None
+    try:
+        full = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None
+    return full if isinstance(full, dict) else None
+
+
+def _preview(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > OFFLOAD_PREVIEW_CHARS:
+        return value[:OFFLOAD_PREVIEW_CHARS] + f"... [{len(value) - OFFLOAD_PREVIEW_CHARS} chars offloaded]"
+    return value
+
+
+_PREVIEW_CHILD_FIELDS = ("task_index", "status", "summary", "error", "model", "role", "goal",
+                         "exit_reason", "api_calls", "duration_seconds")
+_PREVIEW_RESULT_FIELDS = ("status", "summary", "error", "exit_reason", "api_calls",
+                          "duration_seconds", "total_duration_seconds", "model")
+
+
+def _preview_result(result: Any) -> Any:
+    """``terminal.result`` reduced to its scalar facts + per-child previews (still a dict, so
+    canonical_terminal accepts it)."""
+    if not isinstance(result, dict):
+        return result
+    out = {k: _preview(result[k]) for k in _PREVIEW_RESULT_FIELDS if k in result}
+    children = result.get("results")
+    if isinstance(children, list):
+        out["results"] = [
+            {k: _preview(child[k]) for k in _PREVIEW_CHILD_FIELDS if k in child}
+            if isinstance(child, dict) else None
+            for child in children
+        ]
+    out["preview"] = True
+    return out
+
+
+def _preview_source(source: Any) -> Any:
+    """``source`` without the materialized prefill (the inherited parent transcript) and with
+    bounded free text. Only a settled record is offloaded: nothing re-dispatches it."""
+    if not isinstance(source, dict):
+        return source
+    out = dict(source)
+    if "shared_context" in out:
+        out["shared_context"] = _preview(out["shared_context"])
+    tasks = out.get("tasks")
+    if isinstance(tasks, list):
+        slim = []
+        for task in tasks:
+            if isinstance(task, dict):
+                task = {k: v for k, v in task.items() if k != "materialized_prefill_messages"}
+                for key in ("context", "goal"):
+                    if key in task:
+                        task[key] = _preview(task[key])
+            slim.append(task)
+        out["tasks"] = slim
+    return out
+
+
+def _offload_oversized(registry: dict[str, Any], path: Path) -> int:
+    """Bound every settled terminal record to roughly ``OFFLOAD_RECORD_BYTES``; returns how many
+    were offloaded. Idempotent (an offloaded record is skipped) and doubles as the migration for
+    records written before the bound existed. Nothing is offloaded until the one-time
+    pre-compaction backup exists; a sidecar write failure leaves that record untouched."""
+    invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+    big: list[tuple[str, dict[str, Any], bytes]] = []
+    for delegation_id, record in registry["records"].items():
+        if (str(delegation_id) in invalid_record_ids or not isinstance(record, dict)
+                or "offloaded" in record
+                or record.get("state") not in _TERMINAL_STATES or _terminal_pending(record)):
+            continue
+        try:
+            body = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False).encode("utf-8", "surrogatepass")
+        except (TypeError, ValueError):
+            continue
+        if len(body) > OFFLOAD_RECORD_BYTES:
+            big.append((str(delegation_id), record, body))
+    if not big or not _backup_before_first_compaction(path):
+        return 0
+    changed = 0
+    for delegation_id, record, body in big:
+        target = _sidecar_path(path, delegation_id)
+        try:
+            target.parent.mkdir(mode=0o700, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    out.write(body)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(tmp, target)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+            if not _fsync_directory(target.parent):
+                continue
+        except OSError:
+            logger.warning("async_delegation_offload_failed delegation_id=%s sidecar=%s",
+                           delegation_id, target, exc_info=True)
+            continue
+        terminal = record.get("terminal")
+        if isinstance(terminal, dict):
+            if "result" in terminal:
+                terminal["result"] = _preview_result(terminal["result"])
+            if "error" in terminal:
+                terminal["error"] = _preview(terminal["error"])
+        record["source"] = _preview_source(record.get("source"))
+        for event in record.get("outbox") or []:
+            if (isinstance(event, dict) and event.get("state") == "delivered"
+                    and _compact_delivered_event(record, event, dry_run=True)):
+                _compact_delivered_event(record, event)
+        record["offloaded"] = {
+            "sidecar": str(target.relative_to(path.parent)),
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "bytes": len(body),
+        }
+        changed += 1
+        logger.info("async_delegation_record_offloaded delegation_id=%s bytes=%d sidecar=%s",
+                    delegation_id, len(body), target)
+    return changed
+
+
+def _remove_sidecar(path: Path, record: Any) -> None:
+    marker = record.get("offloaded") if isinstance(record, dict) else None
+    if isinstance(marker, dict) and isinstance(marker.get("sidecar"), str):
+        with contextlib.suppress(OSError):
+            (path.parent / marker["sidecar"]).unlink()
+
+
 def _compact(registry: dict[str, Any], now: float, path: Path) -> int:
     """D5 compaction of every valid record; returns how many records changed.
 
     Nothing is compacted until a complete pre-compaction backup exists on disk."""
+    _offload_oversized(registry, path)
     invalid_record_ids = set(registry.get("_invalid_record_ids", []))
     candidates: list[dict[str, Any]] = []
     for delegation_id, record in registry["records"].items():
@@ -779,7 +982,7 @@ def _prune(registry: dict[str, Any], now: float, path: Path, *, limit: int | Non
         if (not _terminal_pending(record) and age >= TERMINAL_RETENTION_SECONDS) or age >= ABSOLUTE_RETENTION_SECONDS:
             removable.append((updated, delegation_id))
     for _, delegation_id in sorted(removable):
-        records.pop(delegation_id, None)
+        _remove_sidecar(path, records.pop(delegation_id, None))
     if len(records) <= cap:
         return
     eligible = sorted(
@@ -793,7 +996,7 @@ def _prune(registry: dict[str, Any], now: float, path: Path, *, limit: int | Non
     for _, delegation_id in eligible:
         if len(records) <= cap:
             break
-        records.pop(delegation_id, None)
+        _remove_sidecar(path, records.pop(delegation_id, None))
 
 
 def _attempt_id(delegation_id: str, generation: int) -> str:
@@ -1085,8 +1288,42 @@ def mark_submitted(
     attempt_id: str,
     *,
     profile_home: Path | None = None,
+    budget_seconds: float | None = None,
 ) -> bool:
-    with locked_registry(profile_home) as registry:
+    """Stamp ``attempt.submitted_at``; True when this attempt is current and running.
+
+    A lock timeout is retried until ``budget_seconds`` (default ``MARK_SUBMITTED_BUDGET_SECONDS``)
+    is spent: the parent was already told the unit is running, so a transient queue of registry
+    holders must not turn into a never-started child (t_86324a22). Only the last timeout raises."""
+    budget = MARK_SUBMITTED_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    deadline = time.monotonic() + max(0.0, budget)
+    attempt = 0
+    while True:
+        attempt += 1
+        remaining = deadline - time.monotonic()
+        try:
+            return _mark_submitted_once(
+                delegation_id, attempt_id, profile_home=profile_home,
+                timeout=max(0.05, min(LOCK_TIMEOUT_SECONDS, remaining)))
+        except TimeoutError:
+            if time.monotonic() >= deadline:
+                logger.error(
+                    "async_delegation_submit_telemetry_timeout delegation_id=%s attempt_id=%s "
+                    "attempts=%d budget_s=%.1f", delegation_id, attempt_id, attempt, budget)
+                raise
+            logger.warning(
+                "async_delegation_submit_telemetry_retry delegation_id=%s attempt_id=%s attempt=%d",
+                delegation_id, attempt_id, attempt)
+
+
+def _mark_submitted_once(
+    delegation_id: str,
+    attempt_id: str,
+    *,
+    profile_home: Path | None,
+    timeout: float,
+) -> bool:
+    with locked_registry(profile_home, timeout=timeout) as registry:
         if delegation_id in set(registry.get("_invalid_record_ids", [])):
             return False
         record = registry["records"].get(delegation_id)
@@ -2358,11 +2595,12 @@ def exact_json_archive(result: Any) -> Any | None:
         return None
 
 
-def canonical_terminal(registry, delegation_id):
+def canonical_terminal(registry, delegation_id, path: Path | None = None):
     """Validate terminal identity for both canonical and mirror consumers.
 
     Caller holds the registry lock. Sparse historical outboxes and terminal
     work intentionally emitted without an envelope have no execution evidence.
+    ``path`` (the registry file) lets an offloaded record's full result be read from its sidecar.
     """
     if delegation_id in registry.get("_invalid_record_ids", []):
         raise RegistryError(f"record {delegation_id} failed integrity validation")
@@ -2412,6 +2650,15 @@ def canonical_terminal(registry, delegation_id):
     result = record["terminal"].get("result")
     if result is not None and not isinstance(result, dict):
         raise RegistryError(f"invalid terminal result for {delegation_id}")
+    if "offloaded" in record:
+        # terminal.result is a bounded preview; the full result lives in the sidecar. Without a
+        # readable sidecar, None keeps the SQLite mirror's existing result_json instead of
+        # overwriting it with the preview.
+        full = read_offloaded_record(path, record) if path is not None else None
+        terminal = full.get("terminal") if isinstance(full, dict) else None
+        result = terminal.get("result") if isinstance(terminal, dict) else None
+        if not isinstance(result, dict):
+            result = None
     return {**entry, "execution_result": result}
 
 
