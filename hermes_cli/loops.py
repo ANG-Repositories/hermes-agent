@@ -359,7 +359,9 @@ def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
 
 
-def retire_loop(session_id: str, status: str, reason: str, *, db: Any = None) -> bool:
+def retire_loop(
+    session_id: str, status: str, reason: str, *, db: Any = None, expected_raw: Optional[str] = None,
+) -> bool:
     """Flip an ACTIVE loop row to *status* (``superseded`` / ``orphaned``) with ``paused_reason``
     *reason*, compare-and-set against the row read here; never touches a non-active row. Same
     contract as ``goals.retire_goal`` (t_92fc3ff0): retire, never delete, so ``/loop resume``
@@ -372,6 +374,8 @@ def retire_loop(session_id: str, status: str, reason: str, *, db: Any = None) ->
     key = _meta_key(session_id)
     try:
         raw = db.get_meta_committed(key)
+        if expected_raw is not None and raw != expected_raw:  # changed since the caller's scan
+            return False
         state = _parse_state(raw, session_id) if raw else None
         if state is None or state.status != "active":
             return False

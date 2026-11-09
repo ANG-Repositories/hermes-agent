@@ -859,11 +859,15 @@ DEFAULT_ORPHAN_GC_DAYS = 7   # goals.orphan_gc_days; 0 disables the reaper
 _ORPHAN_GC_SCAN_CHUNK = 500  # bound on one sessions IN (...) read
 
 
-def retire_goal(session_id: str, status: str, reason: str, *, db: Any = None) -> bool:
+def retire_goal(
+    session_id: str, status: str, reason: str, *, db: Any = None, expected_raw: Optional[str] = None,
+) -> bool:
     """Flip an ACTIVE goal row to *status* (``superseded`` / ``orphaned``) with ``paused_reason``
     *reason*. Compare-and-set against the row read here, so a concurrent edit wins. Never touches a
     non-active row: a done, paused or /stop-latched goal is never turned back on (Ace 2026-10-19).
     *db*: the store holding the row (gateway rotations pass the routing key's profile store).
+    *expected_raw*: the row as the caller judged it (the reaper's scan); a row changed since then is
+    left alone, so work refreshed after the scan is never retired on stale eligibility.
     Best-effort, never raises; True when this call retired it."""
     if not session_id:
         return False
@@ -873,6 +877,8 @@ def retire_goal(session_id: str, status: str, reason: str, *, db: Any = None) ->
     key = _meta_key(session_id)
     try:
         raw = db.get_meta_committed(key)
+        if expected_raw is not None and raw != expected_raw:
+            return False
         state = GoalState.from_json(raw) if raw else None
         if state is None or state.status != "active":
             return False
@@ -899,16 +905,19 @@ def orphaned_goal_and_loop_ids(
     return sorted(sid for sid, last in session_activity.items() if sid not in routed and (last or 0.0) <= cutoff)
 
 
-def _goal_loop_session_activity(db: Any) -> Tuple[Dict[str, float], set, set]:
-    """``(activity, goal_sids, loop_sids)`` for sessions with an ACTIVE goal or loop row in *db*.
+def _goal_loop_session_activity(db: Any) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """``(activity, goal_rows, loop_rows)`` for sessions with an ACTIVE goal or loop row in *db*;
+    ``*_rows`` map session id -> the raw row as scanned (retirement CASes against it).
     Activity is the latest of the row's own clocks (set/resume, last turn, last idle wake, last loop
-    tick) and the session store's (start, last message, ``effective_last_active``). A failed read
-    raises: an unreadable store must not look idle."""
+    tick, the loop's ``next_due_at`` that ``resume()`` re-arms to now) and the session store's (start,
+    last message, ``effective_last_active``). A failed read raises: an unreadable store must not look
+    idle."""
     activity: Dict[str, float] = {}
-    goal_sids, loop_sids = set(), set()
+    goal_sids: Dict[str, str] = {}
+    loop_sids: Dict[str, str] = {}
     for prefix, sids, clocks in (
         ("goal:", goal_sids, ("created_at", "resumed_at", "last_turn_at", "last_idle_wake_at", "waiting_since")),
-        ("loop:", loop_sids, ("created_at", "last_fired_at")),
+        ("loop:", loop_sids, ("created_at", "last_fired_at", "next_due_at")),
     ):
         for key, raw in db.list_meta_prefix(prefix):
             try:
@@ -918,7 +927,7 @@ def _goal_loop_session_activity(db: Any) -> Tuple[Dict[str, float], set, set]:
             sid = key[len(prefix):]
             if not sid or not isinstance(data, dict) or data.get("status") != "active":
                 continue
-            sids.add(sid)
+            sids[sid] = raw
             last = max(float(data.get(c) or 0.0) for c in clocks)
             activity[sid] = max(activity.get(sid, 0.0), last)
     ids = sorted(activity)
@@ -959,9 +968,11 @@ def reap_orphaned_goals_and_loops(
     from hermes_cli.loops import retire_loop
 
     for sid in orphaned_goal_and_loop_ids(now, routed_session_ids, activity, gc_days=gc_days):
-        if sid in goal_sids and retire_goal(sid, "orphaned", f"{reason}; /goal resume restores", db=db):
+        if sid in goal_sids and retire_goal(sid, "orphaned", f"{reason}; /goal resume restores", db=db,
+                                            expected_raw=goal_sids[sid]):
             counts["orphaned"] += 1
-        if sid in loop_sids and retire_loop(sid, "orphaned", f"{reason}; /loop resume restores", db=db):
+        if sid in loop_sids and retire_loop(sid, "orphaned", f"{reason}; /loop resume restores", db=db,
+                                            expected_raw=loop_sids[sid]):
             counts["loops"] += 1
     return counts
 

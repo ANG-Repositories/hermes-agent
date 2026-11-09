@@ -817,26 +817,32 @@ class GatewayGoalsMixin:
 
     async def _goal_orphan_gc(self, scopes, scope_cm) -> dict:
         """Retire (``orphaned``) active goals/loops whose session id no routed key holds and that
-        were idle >= ``goals.orphan_gc_days`` (default 7; 0 = off). Routing is the gateway-wide
+        were idle >= ``goals.orphan_gc_days`` (default 7; 0 = off; read under each profile's scope). Routing is the gateway-wide
         store, so a goal routed under ANY served profile is kept; each profile's own store is
         reaped under its scope. One INFO line per run, never a page."""
         from hermes_cli.goals import DEFAULT_ORPHAN_GC_DAYS, reap_orphaned_goals_and_loops
 
         totals = {"scanned": 0, "orphaned": 0, "loops": 0}
-        gc_days = self._goal_int_setting("orphan_gc_days", DEFAULT_ORPHAN_GC_DAYS)
         store = getattr(self, "session_store", None)
-        if gc_days <= 0 or store is None:
+        if store is None:
             return totals
         entries = await self._run_in_executor_with_context(store.list_sessions)
         routed = {e.session_id for e in entries if getattr(e, "session_id", None)}
+        ran = False
         for _profile_name, profile_home in scopes:
             async with scope_cm(profile_home):
+                # Read per scope: each profile's own goals.orphan_gc_days governs its own store.
+                gc_days = self._goal_int_setting("orphan_gc_days", DEFAULT_ORPHAN_GC_DAYS)
+                if gc_days <= 0:
+                    continue
                 await self._warm_goals_session_db("goal orphan gc")
                 counts = await self._run_in_executor_with_context(
                     functools.partial(reap_orphaned_goals_and_loops, routed, gc_days=gc_days))
+            ran = True
             for k in totals:
                 totals[k] += counts.get(k, 0)
-        logger.info("goal-gc: scanned=%d orphaned=%d loops=%d", totals["scanned"], totals["orphaned"], totals["loops"])
+        if ran:
+            logger.info("goal-gc: scanned=%d orphaned=%d loops=%d", totals["scanned"], totals["orphaned"], totals["loops"])
         return totals
 
     async def _goal_idle_wake_scan(self) -> None:

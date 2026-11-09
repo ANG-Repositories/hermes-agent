@@ -135,7 +135,7 @@ def test_reset_never_touches_a_non_active_goal(store_rig, status):
     a = store.get_or_create_session(source)
     _put_goal(db, a.session_id, status=status)
     store.reset_session(a.session_key)
-    # RED-proof (M6): in hermes_cli/goals.py::retire_goal (~line 877) drop
+    # RED-proof (M6): in hermes_cli/goals.py::retire_goal (~line 883) drop
     # `or state.status != "active"` -> done/paused/cleared rows are re-stamped "superseded".
     assert _goal(db, a.session_id).status == status
 
@@ -147,7 +147,7 @@ def test_orphaned_ids_pure_contract():
     activity = {"old-unrouted": now - 8 * DAY, "fresh-unrouted": now - 1 * DAY, "old-routed": now - 30 * DAY,
                 "exactly-7d": now - 7 * DAY}
     # RED-proof (M2): drop `and (last or 0.0) <= cutoff` in
-    # hermes_cli/goals.py::orphaned_goal_and_loop_ids (~line 899) -> "fresh-unrouted" is returned.
+    # hermes_cli/goals.py::orphaned_goal_and_loop_ids (~line 905) -> "fresh-unrouted" is returned.
     assert goals.orphaned_goal_and_loop_ids(now, {"old-routed"}, activity, gc_days=7) == ["exactly-7d", "old-unrouted"]
     assert goals.orphaned_goal_and_loop_ids(now, set(), activity, gc_days=0) == []
 
@@ -173,7 +173,7 @@ def test_reaper_retires_only_unrouted_and_idle(tmp_path):
         assert g.status == "orphaned" and "orphan-gc" in g.paused_reason
         assert time.strftime("%Y-%m-%d", time.localtime(now)) in g.paused_reason
         assert _loop(db, "old-unrouted").status == "orphaned"
-        # RED-proof (M3): in hermes_cli/goals.py::_goal_loop_session_activity (~line 934) replace
+        # RED-proof (M3): in hermes_cli/goals.py::_goal_loop_session_activity (~line 943) replace
         # `activity[sid] = max(activity[sid], ...)` with `pass` -> "cli-recent" is reaped.
         assert _goal(db, "cli-recent").status == "active"
         assert _goal(db, "routed-idle").status == "active" and _loop(db, "routed-idle").status == "active"
@@ -192,6 +192,54 @@ def test_reaper_disabled_at_zero_days(tmp_path):
         db.close()
 
 
+class _RefreshAfterScanDB:
+    """Delegates to a real SessionDB; right after the reaper's ``goal:`` scan, another writer
+    commits a fresh ``last_turn_at`` (Prism 257ff1d18304's repro: refreshed between scan and retire)."""
+
+    def __init__(self, db, sid):
+        self._db, self._sid = db, sid
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def list_meta_prefix(self, prefix):
+        rows = list(self._db.list_meta_prefix(prefix))
+        if prefix == "goal:":
+            state = _goal(self._db, self._sid)
+            state.last_turn_at = time.time()
+            self._db.set_meta(f"goal:{self._sid}", state.to_json())
+        return rows
+
+
+def test_reaper_never_retires_a_row_refreshed_after_the_scan(tmp_path):
+    db = _db(tmp_path / "state.db")
+    try:
+        _put_goal(db, "s", age_days=8)
+        counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=_RefreshAfterScanDB(db, "s"))
+        # RED-proof (M10): in hermes_cli/goals.py::retire_goal (~line 880) delete
+        # `if expected_raw is not None and raw != expected_raw: return False` -> the refreshed goal is orphaned.
+        assert counts["orphaned"] == 0
+        assert _goal(db, "s").status == "active"
+    finally:
+        db.close()
+
+
+def test_resumed_loop_is_not_reaped_before_its_first_tick(tmp_path, monkeypatch):
+    """Prism 4ca29f7a0858: ``LoopManager.resume()`` moves neither ``created_at`` nor ``last_fired_at``."""
+    db = _db(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    try:
+        _put_loop(db, "s", age_days=9)
+        assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db)["loops"] == 1
+        assert loops.LoopManager("s").resume() is not None
+        # RED-proof (M11): in hermes_cli/goals.py::_goal_loop_session_activity (~line 920) drop
+        # "next_due_at" from the loop clocks -> the next hourly pass re-orphans the resumed loop.
+        assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db)["loops"] == 0
+        assert _loop(db, "s").status == "active"
+    finally:
+        db.close()
+
+
 # ── 4. Retire, never delete ───────────────────────────────────────────
 
 def test_orphaned_goal_and_loop_round_trip_through_resume(tmp_path, monkeypatch):
@@ -202,7 +250,7 @@ def test_orphaned_goal_and_loop_round_trip_through_resume(tmp_path, monkeypatch)
         _put_loop(db, "s", age_days=9)
         assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db)["orphaned"] == 1
 
-        # RED-proof (M9): in hermes_cli/goals.py::retire_goal (~line 882) replace the
+        # RED-proof (M9): in hermes_cli/goals.py::retire_goal (~line 888) replace the
         # compare_and_set_meta write with a DELETE of the row -> resume() has nothing to restore.
         mgr = goals.GoalManager("s")
         assert mgr.resume() is not None
@@ -275,8 +323,28 @@ async def test_config_zero_disables_the_gateway_pass(gw_rig):
     runner.config = {"goals": {"orphan_gc_days": 0}}
     _put_goal(dbs[None], "root-orphan", age_days=100)
     await runner._goal_orphan_gc([(None, None)], scope_cm)
-    # RED-proof (M7): in gateway/run_goals.py::_goal_orphan_gc (~line 828) default a 0 to 7 days.
+    # RED-proof (M7): in gateway/run_goals.py::_goal_orphan_gc (~line 836) default a 0 to 7 days.
     assert _goal(dbs[None], "root-orphan").status == "active"
+
+
+@pytest.mark.asyncio
+async def test_each_profile_reads_its_own_orphan_gc_days(gw_rig, monkeypatch):
+    """Prism d6291f28e729: under multiplex ``goals.*`` comes from ``load_config()`` inside the profile
+    scope; root has GC off, the secondary has it on."""
+    import hermes_cli.config as hcfg
+
+    runner, dbs, scope_cm = gw_rig
+    runner.config = SimpleNamespace()  # a GatewayConfig carries no goals block
+    per_profile = {None: {"goals": {"orphan_gc_days": 0}}, "sec": {"goals": {"orphan_gc_days": 7}}}
+    monkeypatch.setattr(hcfg, "load_config", lambda *a, **k: per_profile[_ACTIVE_STORE.get()])
+    _put_goal(dbs[None], "root-orphan", age_days=100)
+    _put_goal(dbs["sec"], "sec-orphan", age_days=10)
+
+    await runner._goal_orphan_gc([(None, None), ("sec", "/profiles/sec")], scope_cm)
+    # RED-proof (M12): in gateway/run_goals.py::_goal_orphan_gc (~line 835) hoist the
+    # `gc_days = self._goal_int_setting(...)` read above the scope loop -> root's 0 disables sec too.
+    assert _goal(dbs[None], "root-orphan").status == "active"
+    assert _goal(dbs["sec"], "sec-orphan").status == "orphaned"
 
 
 def test_gc_runs_at_most_once_per_hour(monkeypatch):
