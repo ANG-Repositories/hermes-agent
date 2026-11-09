@@ -2008,6 +2008,7 @@ class GatewayShutdownMixin:
             _interrupted = mark_running_jobs_interrupted(
                 f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished.",
                 lock_timeout=_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S,
+                replay_marker=True,
             )
             if _interrupted:
                 logger.warning(

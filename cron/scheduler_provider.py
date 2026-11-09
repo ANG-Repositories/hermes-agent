@@ -273,6 +273,9 @@ class CronScheduler(ABC):
             last_run = job.get("last_run_at") or ""
             if _stamp_not_before(last_run, claimed_at):
                 continue  # the job already recorded this run (or a newer one)
+            marker = job.get("replay_pending")
+            if isinstance(marker, dict) and marker.get("run_id") == row.get("id"):
+                continue  # the stop drain marked this run for replay (cron/shutdown_replay.py)
             mark_job_run(
                 job_id, False,
                 "Interrupted: the scheduler process exited before this run's "
@@ -619,6 +622,8 @@ class InProcessCronScheduler(CronScheduler):
                 logger.warning(
                     "Marked %d interrupted cron execution(s) unknown after restart", recovered
                 )
+            if lane != "script":
+                _consume_shutdown_replays()
             # Heartbeat before the first sleep so `hermes cron status` sees a live ticker
             # immediately.
             record_ticker_heartbeat()
@@ -739,6 +744,8 @@ class InProcessCronScheduler(CronScheduler):
                                 "Marked %d interrupted cron execution(s) for profile at %s",
                                 recovered, home,
                             )
+                        if lane != "script":
+                            _consume_shutdown_replays()
                     if heartbeat:
                         record_ticker_heartbeat()
             except BaseException as e:
@@ -880,6 +887,17 @@ class InProcessCronScheduler(CronScheduler):
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
             stop_event.wait(max(0.0, next_tick - now))
+
+
+def _consume_shutdown_replays() -> None:
+    """Boot pass over the current store's stop-drain replay markers and hard-kill claims.
+    Never lets that bookkeeping break scheduler startup."""
+    try:
+        from cron.shutdown_replay import consume_at_startup
+
+        consume_at_startup()
+    except Exception:
+        logger.warning("cron shutdown-replay startup pass failed", exc_info=True)
 
 
 def _stamp_not_before(last_run: str, claimed_at: str) -> bool:
