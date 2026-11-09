@@ -754,6 +754,7 @@ gateway:
     reject_model: "الوكيل قيد التشغيل — انتظر أو استخدم /stop أولًا، ثم بدّل النموذج."
     reject_codex_runtime: "الوكيل قيد التشغيل — انتظر أو استخدم /stop أولًا، ثم غيّر بيئة التشغيل."
     reject_moa: "الوكيل قيد التشغيل — انتظر أو استخدم /stop أولًا، ثم شغّل /moa."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ البوّابة {action} — رسالتك في قائمة الانتظار للدور التالي بعد عودتها."
     drain_rejected: "⏳ البوّابة {action} ولا تقبل دورًا آخر الآن."
     drain_rejected_new_work: "⏳ البوّابة {action} ولا تقبل عملًا جديدًا الآن."

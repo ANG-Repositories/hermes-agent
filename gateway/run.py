@@ -7859,11 +7859,16 @@ class GatewayRunner(
         except Exception:
             entry = None
         session_id = getattr(entry, "session_id", None)
+        _t0 = time.monotonic()
         if self._session_db is not None and session_id:
             try:
+                # Newest row only (same filter, ORDER BY id DESC LIMIT 1 on the session index): the
+                # full transcript load this replaced scaled with session size on the /stop path.
                 rows = await self._session_db.get_messages(
                     session_id,
                     preserve_unparseable_tool_calls=True,
+                    latest=True,
+                    limit=1,
                 )
                 for row in reversed(rows or []):
                     if not isinstance(row, dict):
@@ -7876,6 +7881,7 @@ class GatewayRunner(
                 logger.debug(
                     "user_stopped rowid lookup failed for %s", session_key, exc_info=True
                 )
+        _t1 = time.monotonic()
         boot_id = None
         try:
             boot_id = self._current_boot_id()
@@ -7888,11 +7894,13 @@ class GatewayRunner(
             generation=generation,
         )
         logger.info(
-            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s",
+            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s rowid_s=%.3f store_s=%.3f",
             session_key,
             boot_id,
             last_message_id,
             marked,
+            _t1 - _t0,
+            time.monotonic() - _t1,
         )
         return bool(marked)
 

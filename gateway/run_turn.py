@@ -2176,6 +2176,12 @@ class GatewayTurnMixin:
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         _entered = time.monotonic()
+        # Delivery returns text/None rather than the result dict; preserve completion for /goal.
+        from agent.turn_failure_copy import is_max_iteration_handoff
+
+        event._goal_turn_completed = (
+            agent_result.get("completed") is not False or is_max_iteration_handoff(agent_result)
+        )
         # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
         with suppress(Exception):
             event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
@@ -2601,6 +2607,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            event._goal_execution_started = True
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,

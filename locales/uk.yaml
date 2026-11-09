@@ -754,6 +754,7 @@ gateway:
     reject_model: "Агент працює — зачекайте або спочатку виконайте /stop, а потім змінюйте модель."
     reject_codex_runtime: "Агент працює — зачекайте або спочатку виконайте /stop, а потім змінюйте середовище виконання."
     reject_moa: "Агент працює — зачекайте або спочатку виконайте /stop, а потім запускайте /moa."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ Шлюз {action} — повідомлення поставлено в чергу на перший хід після його повернення."
     drain_rejected: "⏳ Шлюз {action} і зараз не приймає ще один хід."
     drain_rejected_new_work: "⏳ Шлюз {action} і зараз не приймає нову роботу."
