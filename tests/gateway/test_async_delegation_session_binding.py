@@ -211,6 +211,59 @@ class TestGatewayPinningFailsClosed:
 
 
 @pytest.mark.asyncio
+async def test_process_child_pin_cannot_take_over_human_route(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from gateway.config import GatewayConfig, Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from gateway.turn_lease import SessionTurnLeaseRegistry
+    from hermes_state import SessionDB, AsyncSessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    entry = runner.session_store.get_or_create_session(source)
+    db = SessionDB(db_path=tmp_path / "fixture.db")
+    db.create_session(entry.session_id, source="telegram")
+    db.create_session("child", source="telegram", parent_session_id=entry.session_id,
+                      model_config={"_delegate_from": entry.session_id})
+    runner._session_db = AsyncSessionDB(db)
+    runner._cache_session_source = lambda *a: None
+    runner._recover_telegram_topic_thread_id = lambda s: None
+    leases = SessionTurnLeaseRegistry()
+    held = await leases.acquire("child", owner_key="child", generation=1)
+    seen = []
+
+    async def receive(event):
+        resolved = await runner._hmwa_resolve_session(event, event.source)
+        if resolved is not None:
+            sid = resolved[1].session_id
+            token = await leases.acquire(sid, owner_key="human", generation=1, timeout=0.1)
+            seen.append(sid)
+            leases.release(token)
+        event._gateway_accepted = True
+
+    adapter = SimpleNamespace(handle_message=receive)
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = {"type": "completion", "session_id": "proc_child", "session_key": entry.session_key,
+             "parent_session_id": "child", "platform": "telegram", "chat_id": "123"}
+    try:
+        await runner._inject_watch_notification("child finished", event)
+        print("ROUTE", runner.session_store.lookup_by_session_key(entry.session_key).session_id, "seen", seen)
+        assert runner.session_store.lookup_by_session_key(entry.session_key).session_id == entry.session_id
+        await asyncio.wait_for(receive(MessageEvent(text="follow up", source=source)), 2)
+        assert seen == [entry.session_id]
+        assert await runner._classify_completion_target("child") == "retry"
+        assert await runner._classify_completion_target(entry.session_id) == "deliver"
+        assert await runner._classify_completion_target("missing") == "terminal"
+    finally:
+        leases.release(held)
+        db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["none", "revoke", "replace"])
 async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
     """A non-compression re-pin that resolved its row across an await must not move the route
@@ -257,3 +310,25 @@ async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
         assert result is not None and result.session_id == expected
     else:
         assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["new_session", "user_exit", "session_switch"])
+async def test_user_closed_delegated_completion_is_terminal(tmp_path, monkeypatch, reason):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from hermes_state import SessionDB, AsyncSessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig())
+    db = SessionDB(db_path=tmp_path / "fixture.db")
+    db.create_session("child", source="tool", model_config={"_delegate_from": "parent"})
+    db.end_session("child", reason)
+    runner._session_db = AsyncSessionDB(db)
+    try:
+        claim = await runner._preflight_completion_delivery(
+            {"type": "completion", "session_id": "proc_closed", "parent_session_id": "child"})
+        assert not claim.proceed
+        assert claim.early_result is not False, "terminal must stop the watcher, not ask it to retry"
+    finally:
+        db.close()

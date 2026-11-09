@@ -1,5 +1,25 @@
 [
   {
+    "feature": "delegated process completion preserves human route and execution ownership",
+    "tests": [
+      "tests/tools/test_subagent_process_handoff.py",
+      "tests/gateway/test_async_delegation_session_binding.py",
+      "tests/tools/test_terminal_watcher_arming.py"
+    ],
+    "paths": [
+      "tools/process_registry.py",
+      "tools/process_registry_*.py",
+      "tools/terminal_tool_background.py",
+      "gateway/run_notifications.py",
+      "agent/delegation_context.py"
+    ],
+    "why": "Child process notifications must not pin human chats to child sessions or leak child execution context through explicit parent handoff. Preserve actual watcher delivery, unread results, closure and compression boundaries.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": ["gateway", "tools"]
+  },
+  {
     "feature": "chat model pins and cross-session reply mismatch announcements",
     "tests": [
       "tests/gateway/test_discord_chat_identity.py",

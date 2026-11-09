@@ -26,6 +26,14 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 
+def _is_delegated_completion_target(row: dict) -> bool:
+    # Compression inherits provenance; a child continuation is still not a human owner.
+    config = row.get("model_config") or {}
+    if isinstance(config, str):
+        config = json.loads(config)
+    return row.get("source") == "tool" or bool(config.get("_delegate_from"))
+
+
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
@@ -301,6 +309,9 @@ class GatewayNotificationsMixin:
                 "Async-delegation completion has unknown spawning session %s; "
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
+            return None
+        if _is_delegated_completion_target(pinned_row):
+            logger.warning("Refusing completion route pin to delegated session %s", pinned_session_id)
             return None
         target_session_id = pinned_session_id
         follows_compression = False
@@ -1486,13 +1497,18 @@ class GatewayNotificationsMixin:
             return "retry"
         if parent is None:
             return "terminal"
+        end_reason = str(parent.get("end_reason") or "")
+        if parent.get("ended_at") and end_reason in _USER_BOUNDARY_END_REASONS:
+            return "terminal"
+        if _is_delegated_completion_target(parent):
+            logger.warning("Deferring completion for delegated origin %s; no human route ownership", parent_session_id)
+            return "retry"
         if not parent.get("ended_at"):
             return "deliver"
-        end_reason = str(parent.get("end_reason") or "")
         if end_reason != "compression":
             # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
             # ends stay routable and the resolver retargets. Boundary set shared with the resolver.
-            return "terminal" if end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
+            return "deliver"
         try:
             tip_session_id = await session_db.get_compression_tip(parent_session_id)
             if not tip_session_id or tip_session_id == parent_session_id:
