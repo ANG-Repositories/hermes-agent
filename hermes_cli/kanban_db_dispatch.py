@@ -433,6 +433,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    lock_held_s: Optional[float] = None
+    """Seconds this tick held the board's dispatch lock (t_f60f502f); None when it never held it."""
+    tick_phases_s: dict = field(default_factory=dict)
+    """Wall seconds per tick phase (``TickLockWindow.mark``); ``<phase>.unlocked`` = spent with the
+    lock handed back (``kanban.dispatch.narrow_lock``)."""
     budget_paused: bool = False
     """True when this board spawned nothing because its rolling-window worker
     spend has reached ``kanban.budget.usd_per_24h``. Reclaim / promotion /
@@ -4209,9 +4214,11 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    _prefetch_t0 = time.monotonic()
     pr_gate_prefetch = _kb._prefetch_pr_gates_for_tick(conn, dry_run=dry_run)
     if not dry_run:
         _release_after_merge_edges(conn)
+    _prefetch_s = time.monotonic() - _prefetch_t0
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
@@ -4249,6 +4256,8 @@ def dispatch_once(
             )
             _kb._log.warning("%s (board=%s)", _kb.format_dispatch_lock_skip(result.lock_holder), db_path)
         else:
+            window = _kbc.TickLockWindow(db_path, enabled=narrow_lock_enabled())
+            window.phases["pr_gate_prefetch.unlocked"] = _prefetch_s   # before the lock was taken
             result = _dispatch_once_locked(
                 conn,
                 spawn_fn=spawn_fn,
@@ -4270,11 +4279,15 @@ def dispatch_once(
                 spillover=spillover,
                 max_new=max_new,
                 entry=entry,
+                lock_window=window,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
+            window.hold()
             _kbc._maybe_checkpoint_wal(conn, db_path)
+            window.mark("checkpoint")
+            _note_tick_lock(result, window, board=board, entry=entry)
     # Outside the dispatch lock: stop resources (VM/container/unit) whose card finished
     # (t_2df204e5). Only the tick that held the lock sweeps; release_finished claims each resource in a
     # write txn before stopping it, so an overlapping sweep never stops the same one twice.
@@ -4286,6 +4299,23 @@ def dispatch_once(
     # the lock hold and stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def narrow_lock_enabled(kanban_cfg: Optional[dict] = None) -> bool:
+    """``kanban.dispatch.narrow_lock`` (default true, t_f60f502f): a tick hands the board lock back while it
+    resolves workspaces and spawns (:class:`TickLockWindow`). ``false`` = the tick holds it throughout, as
+    before. Read from the ROOT config, like the other board knobs."""
+    cfg = _root_kanban_cfg() if kanban_cfg is None else kanban_cfg
+    sec = cfg.get("dispatch") if isinstance(cfg, dict) else None
+    return not (isinstance(sec, dict) and sec.get("narrow_lock") is False)
+
+
+def _note_tick_lock(result: "DispatchResult", window, *, board: Optional[str], entry: str) -> None:
+    """Record and log how long this tick held the board lock, per phase (t_f60f502f)."""
+    result.lock_held_s = round(window.held_s(), 3)
+    result.tick_phases_s = {k: round(v, 3) for k, v in sorted(window.phases.items())}
+    _kb._log.info("kanban tick lock: board=%s entry=%s held=%.2fs windows=%d phases=%s",
+                  board or "default", entry, result.lock_held_s, window.windows, result.tick_phases_s)
 
 
 def _release_finished_resources(conn: sqlite3.Connection, board: Optional[str]) -> None:
@@ -6219,14 +6249,17 @@ def admit_once(
     while True:
         with _kbc._dispatch_tick_lock(db_path) as held:
             if held:
-                return _dispatch_once_locked(
+                window = _kbc.TickLockWindow(db_path, enabled=narrow_lock_enabled())
+                result = _dispatch_once_locked(
                     conn, spawn_fn=spawn_fn, board=board, max_spawn=max_spawn,
                     failure_limit=failure_limit, default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     spillover=spillover, entry="admit", only_task=task_id,
                     force_host=host, skip_host_admission=True, admission_event=admission_event,
-                    admit_floor=admit_floor,
+                    admit_floor=admit_floor, lock_window=window,
                 )
+                _note_tick_lock(result, window, board=board, entry="admit")
+                return result
         if time.monotonic() >= deadline:
             return DispatchResult(skipped_locked=True, lock_holder=_kb._read_dispatch_lock_holder(db_path))
         time.sleep(0.2)
@@ -6262,6 +6295,7 @@ def _dispatch_once_locked(
     skip_host_admission: bool = False,
     admission_event: Optional[dict] = None,
     admit_floor=None,
+    lock_window=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -6306,7 +6340,12 @@ def _dispatch_once_locked(
     brake, the pool host's band/slots). Every other gate below runs unchanged,
     so a gate added to this loop later binds admit too. The review lane and the
     post-loop wait bookkeeping are skipped.
+
+    ``lock_window`` (:class:`TickLockWindow`, t_f60f502f): the tick hands the board lock back between a
+    claim and the next decision (workspace resolve + spawn of that claimed run) and marks each phase.
+    None = a window that releases nothing (timing only).
     """
+    _lw = lock_window if lock_window is not None else _kbc.TickLockWindow(None, enabled=False)
     _admit = only_task is not None
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -6326,6 +6365,7 @@ def _dispatch_once_locked(
                 result.orphans_reaped = _kb.sweep_terminal_workspace_orphans(conn, board=board)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban orphan sweep failed: %s", exc)
+    _lw.mark("reap")
 
     # ---- lane-model overrides (board-level, time-boxed routing) ----
     # One clock read for the whole tick so every card in this pass sees the
@@ -6471,6 +6511,7 @@ def _dispatch_once_locked(
         result.stranded_by_triage = _kb.find_stranded_by_triage(conn)
         # Scheduled cards nothing will ever wake (no timed wake, parked > 24h).
         result.unwoken_scheduled = _kb.find_unwoken_scheduled(conn)
+    _lw.mark("reclaim_promote")
 
     # Fan-out brake: per-board rolling-window USD ceiling. Evaluated AFTER all
     # reclaim/promotion bookkeeping so a paused board stays accurate on the
@@ -7483,7 +7524,9 @@ def _dispatch_once_locked(
     # board (spec v0.3 I-0 per-board key, Momus pass 3 R1); capability-``only``
     # rows are excluded (they never take a local slot, §3.4).
     _portable_room: set = set()
+    _lw.mark("route")
     for row_index, row in enumerate(ready_rows):
+        _lw.hold()          # every decision below runs under the board lock (t_f60f502f)
         route, route_arg = row_route.get(row["id"], ("local", None))
         if record_only is not None:
             result.placement_waits[row["id"]] = (
@@ -7873,6 +7916,10 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        # Claimed and routed: what follows writes only this claimed run (workspace, clone, spawn), so
+        # the board lock goes back until the next row's decision (t_f60f502f, kanban.dispatch.narrow_lock).
+        _lw.mark("decide")
+        _lw.release()
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -7954,6 +8001,7 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        _lw.mark("workspace")
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
             if placed_host is not None:
@@ -8050,6 +8098,7 @@ def _dispatch_once_locked(
                     entry=entry, gate=tick_gate, take_refusal=_take_refusal,
                 ),
             )
+            _lw.mark("spawn")
             if outcome == _LAUNCH_NOT_OWNED:
                 # The run no longer owns the card: nothing launched, refund.
                 if _join is not None:
@@ -8123,6 +8172,9 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
 
+    _lw.mark("decide")
+    if not _admit:
+        _lw.hold()          # admit returns below: nothing after its one start needs the board lock
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete and not _admit)
     if _admit:
         return result
@@ -8199,7 +8251,9 @@ def _dispatch_once_locked(
     # review lane extra capacity. Same for the per-pool hold:
     # release it so reviewers are judged on the pool's real budget.
     review_pool_reserve.clear()
+    _lw.mark("post_loop")
     for row in review_rows:
+        _lw.hold()
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         _review_origin_host = None
@@ -8319,6 +8373,8 @@ def _dispatch_once_locked(
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = fallback_route_source(review_route_source, fallback_selection)
+        _lw.mark("review_decide")
+        _lw.release()       # same as the ready lane: only this claimed run is written until the next row
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -8380,6 +8436,7 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        _lw.mark("review_workspace")
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
             if _review_origin_host is not None:
@@ -8420,6 +8477,7 @@ def _dispatch_once_locked(
                                      spawn=_review_spawn, spawn_kwargs={}, state=_review_launch,
                                      reservation_id=_review_rid)
             _review_launch.launched = True
+            _lw.mark("review_spawn")
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
@@ -8475,6 +8533,8 @@ def _dispatch_once_locked(
             result.spawn_failed.append(claimed.id)
             if auto:
                 result.auto_blocked.append(claimed.id)
+    _lw.mark("review_decide")
+    _lw.hold()
     if not dry_run:
         try:
             starved = find_priority_starved(conn, now=_tick_now)
@@ -8485,6 +8545,7 @@ def _dispatch_once_locked(
                 _notify_priority_starved(conn, board, starved)
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban priority-starvation check failed: %s", exc)
+    _lw.mark("tail")
     return result
 
 

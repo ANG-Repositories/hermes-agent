@@ -2442,6 +2442,10 @@ DEFAULT_CONFIG = {
         # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
         # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).
         "admission": "legacy",
+        # A tick hands the board's dispatch lock back while it resolves workspaces and spawns, so
+        # `kanban admit` / a second dispatcher are not locked out for minutes (t_f60f502f). false =
+        # the tick holds the lock for its whole run, as before.
+        "dispatch": {"narrow_lock": True},
         "dispatch_load_gate": {
             "enabled": True,
             # A spawn younger than ramp_seconds is a lease candidate (admission settles it after
