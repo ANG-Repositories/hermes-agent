@@ -91,7 +91,8 @@ def pool_health(root, pool, last: Optional[bool] = None) -> Optional[bool]:
     try:
         result = subprocess.run([sys.executable, str(script), *args],
                                 stdin=subprocess.DEVNULL, capture_output=True,
-                                text=True, timeout=10)
+                                text=True, encoding="utf-8", errors="replace",
+                                timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         logger.warning("kanban pool health pager unavailable", exc_info=True)
         return None
