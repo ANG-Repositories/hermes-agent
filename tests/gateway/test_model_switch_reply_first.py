@@ -198,7 +198,9 @@ async def test_concurrent_global_switches_serialize_the_config_write(tmp_path, m
     await asyncio.gather(h.runner._handle_model_command(_ev("/model model-A --global", chat_id="111")),
                          h.runner._handle_model_command(_ev("/model model-B --global", chat_id="222")))
     assert peak[0] == 1, "two --global config.yaml writes overlapped"
-    assert sorted(order) == ["model-A", "model-B"]
+    # An older issue may be superseded before it reaches config; any writes
+    # that do run are serialized and the last committed issue wins.
+    assert order and set(order) <= {"model-A", "model-B"}
     assert yaml.safe_load(h.cfg_path.read_text(encoding="utf-8"))["model"]["default"] == order[-1]
 
 
@@ -479,4 +481,46 @@ async def test_cached_agent_billing_write_runs_after_confirmation(tmp_path, monk
     finally:
         release.set()
     await _drained(h)
+
+
+@pytest.mark.asyncio
+async def test_superseding_clear_fences_worker_credential_resolution(tmp_path, monkeypatch):
+    h = _Harness(tmp_path, monkeypatch)
+    entry = h.runner.session_store.get_or_create_session(_source())
+    override = {"model": "model-A", "provider": "openrouter"}
+    h.runner._apply_session_model_override_in_memory(h.key(), override)
+    entered, release = threading.Event(), threading.Event()
+
+    def resolve(value):
+        entered.set()
+        assert release.wait(10)
+        return dict(value)
+
+    h.runner._model_override_is_persistable = resolve
+    worker = asyncio.create_task(h.runner._persist_session_model_override(
+        h.key(), override, persist_only=True, require_persistence=True))
+    try:
+        await _wait_for(entered.is_set, "worker in credential resolution")
+        h.runner._set_session_model_override(h.key(), None)
+    finally:
+        release.set()
+    await worker
+    assert entry.model_override_identity is None
+    assert h.runner._session_model_override(h.key()) is None
+
+
+@pytest.mark.asyncio
+async def test_thirty_second_blocked_write_reply_timing(tmp_path, monkeypatch):
+    h = _Harness(tmp_path, monkeypatch)
+    started = time.monotonic()
+    await h.adapter.handle_message(_ev("/model model-A"))
+    await _wait_for(lambda: h.sent_with(_switched("model-A")), "confirmation", 5)
+    reply_s = time.monotonic() - started
+    await asyncio.wait_for(h.db.entered.wait(), 5)
+    await asyncio.sleep(30)
+    assert h.db.models == []
+    h.db.release.set()
+    await _drained(h)
+    print(f"blocked_write_s=30 reply_s={reply_s:.3f} settled_s={time.monotonic() - started:.3f}")
+    assert reply_s < 5
 

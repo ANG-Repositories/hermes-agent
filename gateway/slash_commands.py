@@ -3527,6 +3527,8 @@ class GatewaySlashCommandsMixin(
                         except Exception as exc:
                             logger.debug("preflight-compression switch warning failed: %s", exc)
 
+                        if persist_global:
+                            _self._claim_global_model_switch(result)
                         # Update cached agent in-place
                         _switch_announce_kwargs = {}
                         cached_entry = None
