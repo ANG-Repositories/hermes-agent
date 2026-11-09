@@ -375,6 +375,10 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     #     reach the live board through a pin or through a home nested under
     #     ~/.hermes. Tests of pin precedence opt out with ``kanban_pins``.
     monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    # fleet_placement resolves PLACEMENT_HOME before the kanban root; an inherited one
+    # (test-gate exported ~/.hermes) made tests rewrite the LIVE config/fleet-hosts.json
+    # (t_dbacd1f2). Tests of PLACEMENT_HOME precedence set it themselves.
+    monkeypatch.delenv("PLACEMENT_HOME", raising=False)
 
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
@@ -672,6 +676,23 @@ def _isolate_fallback_sticky_store():
     yield
     _fss._DEFAULT = None
     _fw._last_primary_note.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_relay_health_cache():
+    """Fresh process-global relay /health TTL cache per test (t_bde7653d): a body
+    cached in one test must not answer a reused loopback port in the next."""
+    try:
+        from hermes_cli import kanban_provider_health as _kph
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    caches = [getattr(_kph, n, {}) for n in ("_RELAY_HEALTH_CACHE", "_RELAY_UNREADABLE_LOGGED")]
+    for c in caches:
+        c.clear()
+    yield
+    for c in caches:
+        c.clear()
 
 
 @pytest.fixture(autouse=True)

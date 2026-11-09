@@ -1240,6 +1240,10 @@ class TurnRunner:
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
+                    # Fold can race setup from another thread. Publish first, then recheck:
+                    # either the folder sees this consumer or this check sees its promotion.
+                    if ctx.human_engaged:
+                        stream_consumer.on_human_engagement()
                     # #105341: a consumer created only for interim commentary (text streaming off)
                     # is never fed the final reply's deltas — mark it so the duplicate-risk
                     # diagnostic in ``_run_agent_mark_streamed_delivery`` stays silent.
@@ -1665,6 +1669,9 @@ class TurnRunner:
             agent.stream_delta_callback = None
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
+        # Bind policy synchronously before accepting steering; the async slot tracker
+        # may still hold the previous context when this cached agent is reused.
+        agent._gateway_receiving_turn_context = ctx
         ctx.agent_holder[0] = agent  # interrupt support
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)
@@ -2411,11 +2418,16 @@ class TurnRunner:
         # announces fire where the transitions happen: failover mid-turn, restore inline in
         # restore_primary_runtime, re-init at the pre-run site above). Without this call
         # ``last_served_identity`` is never written.
-        runner._announce_and_persist_served_route(
-            agent=agent, session_key=ctx.session_key, served_provider=resolved_provider,
-            served_model=resolved_model, was_reinit=not reused_cached_agent,
-        )
-        compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
+        from agent.turn_step_timing import StepTimer
+        _post_run = StepTimer()
+        with _post_run.step("persist_served_route"):
+            runner._announce_and_persist_served_route(
+                agent=agent, session_key=ctx.session_key, served_provider=resolved_provider,
+                served_model=resolved_model, was_reinit=not reused_cached_agent,
+            )
+        with _post_run.step("sync_session_after_run"):
+            compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
+        _post_run.log_if_slow(logger, "gateway_post_run", ctx.session_key)
         # failure_reason must survive the empty-response path too (TUI billing, transient-failure
         # persistence). compression_deferred (soft lock-contention defer) is distinct from
         # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
@@ -2424,6 +2436,8 @@ class TurnRunner:
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
+            # /goal reads this to tell a productive iteration-limit handoff from a failed turn.
+            "turn_exit_reason": result.get("turn_exit_reason"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),

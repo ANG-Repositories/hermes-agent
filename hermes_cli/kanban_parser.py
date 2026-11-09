@@ -108,6 +108,11 @@ def _base_check_setup(p: argparse.ArgumentParser) -> None:
     add_arguments(p)
 
 
+def _reclaim_setup(p: argparse.ArgumentParser) -> None:
+    from hermes_cli.kanban_reclaim import add_arguments
+    add_arguments(p)
+
+
 def _obligation_setup(p: argparse.ArgumentParser) -> None:
     from hermes_cli.kanban_work_obligations import setup_parser
     setup_parser(p)
@@ -365,6 +370,14 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--signature",
+             help="Automated minters: the failure's identity minus its per-occurrence sha/epoch. An open card "
+                  "for it, or one closed in the last 24 h, is returned instead of minting; after 3 no-code "
+                  "closes in a row the mint is refused (mint breaker). Humans are never affected."),
+        _arg("--no-signature-reuse", dest="signature_reuse", action="store_false",
+             help="With --signature: never hand back an existing card for it (the caller proved this occurrence "
+                  "needs a fresh owner, e.g. a regression after the card closed); the breaker still applies and the "
+                  "new card keeps the signature."),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
@@ -429,7 +442,8 @@ _SPECS = [
              help="Subscription level 'boomerang wake': mechanical wakes on this card are "
                   "handled by a background boomerang child (the calling chat subscribes "
                   "--boomerang-wake). Defaults to kanban.auto_subscribe_boomerang "
-                   "for operator creates with a gateway origin."),
+                   "for operator creates with a gateway origin or a --session whose home "
+                   "has a routable chat."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -588,7 +602,7 @@ _SPECS = [
         _arg("--fleet", action="store_true",
              help="With --placement: the fleet view (alias of `kanban placement --fleet`)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
-    ], aliases=["diag"], help="List active diagnostics on the current board"),
+    ], aliases=["diag"], help="List active diagnostics on the board named by --board or the DB pin"),
     _cmd("placement", [
         _arg("task_id", nargs="?", help="One card: its Placement block only"),
         _arg("--fleet", action="store_true",
@@ -598,6 +612,12 @@ _SPECS = [
              help="Read this load_gate.json instead of <root>/load_gate.json"),
         _json_flag(help="Emit the dict the text is printed from"),
     ], help="Where cards run and why they wait (read-only; no probe)"),
+    _cmd("placement-holds", [
+        _arg("--clear", metavar="TASK_ID",
+             help="End this card's open pause_hold label now (a live hold is re-derived next tick)"),
+        _arg("--operator", default=None, help="Who clears it (recorded on the event)"),
+        _json_flag(help="Emit the dict the text is printed from"),
+    ], help="Fleet-pause holds: every host manifest (live or stale) and every card labelled pause_hold"),
     # rehome (t_808bc8e6)
     _cmd("rehome", [
         _arg("task_id"),
@@ -733,6 +753,12 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, metavar="N",
              help="Set the dispatch priority (higher first); records priority_set."),
+        _group(
+            _arg("--asap", action="store_const", const=True, dest="asap", default=None,
+                 help="Operator-only: send this card to the front of the host door"),
+            _arg("--no-asap", action="store_const", const=False, dest="asap",
+                 help="Clear this card's explicit urgency"),
+        ),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
         _arg("--model", dest="model_override", metavar="MODEL",
@@ -916,7 +942,7 @@ _SPECS = [
              help="Running-count ceiling for this board: spawn nothing once N are running "
                   "(default: kanban.max_spawn)"),
         _arg("--ignore-load-gate", action="store_true",
-             help="Bypass kanban.dispatch_load_gate for this call. Prints load1/pause_above "
+             help="Bypass kanban.dispatch_load_gate for this call. Prints the admission verdict "
                   "and records a load_gate_override event on every card it spawns"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -1087,6 +1113,8 @@ _SPECS = [
         _arg("--dry-run", action="store_true",
              help="List the workspaces gc would try to remove; delete nothing"),
     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
+    _cmd("reclaim-workspaces", setup=_reclaim_setup,
+         help="Capture, verify and delete the held workspaces of done cards (dry run unless --apply)"),
     _cmd("clone", setup=_clone_setup,
          help="git clone that borrows objects from a shared fleet mirror",
          description=(

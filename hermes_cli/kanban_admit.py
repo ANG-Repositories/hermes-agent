@@ -200,14 +200,14 @@ def measure_local() -> Measure:
         allowance, paused = None, f"gate error: {exc}"
     return Measure(LOCAL, load1, threads, ctx.get("mem_available_gb"), reserve, extra={
         "band": gate.band, "gate_state": getattr(gate, "state", None), "spill_reason": gate.spill_reason,
-        "gate_allowance": allowance, "spawn_paused": paused, "admission": gate.admission,
+        "gate_allowance": allowance, "spawn_paused": paused, "admission": klg.ADMISSION,
     }, threshold_error=terr)
 
 
 def measure_remote(host, signal, workspaces_root: Optional[str] = None) -> Measure:
     """One fresh probe of pool host ``host``: load1/ncpu plus, with the target
     signal, its pressure file (memory, band); threads + mem_reserve_gb from its
-    placement-table row (ncpu / 0 GB without one); hot streak from the state file.
+    placement-table row (ncpu / 0 GB without one); hot = the published kanban band.
     With ``workspaces_root`` (the tick's ``kanban.workspaces_root``) the same
     round-trip lists the boards the host can host, so the dispatcher's own
     board_refusal sees them (Prism 9f96730083e6)."""
@@ -237,10 +237,8 @@ def measure_remote(host, signal, workspaces_root: Optional[str] = None) -> Measu
     # absent one; _host_row re-reads the file, so only an absent table is 0 GB.
     table = signal.placement_table if signal is not None else None
     threads, reserve, terr = _host_row(table, host.name, ncpu)
-    hot = None
-    if signal is not None:
-        st = kwp._load_state(signal.state_path).get(host.name)
-        hot = bool(st.get("hot")) if isinstance(st, dict) else None
+    # t_5d7e7171: no streak file; hot = the published band (admit_class's verdict) this probe
+    hot = (band == kwp.BAND_HOT) if signal is not None and band != kwp.BAND_UNKNOWN else None
     return Measure(host.name, load1, threads, mem, reserve, extra={
         "band": band, "hot": hot, "pressure": pressure or None, "ncpu": ncpu,
     }, threshold_error=terr, boards=boards)

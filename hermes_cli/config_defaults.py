@@ -6,32 +6,6 @@ docs of config.yaml.
 
 
 from hermes_cli.lazy_registry import LazyFilledDict
-from hermes_cli import load_lines as _load_lines
-
-
-def _kanban_cpu_lines() -> dict:
-    """The kanban dispatch_load_gate CPU keys from the fleet CPU-line registry (Ace 2026-10-26 04:40: "one central
-    registry that controls all of this for all the devices"): hermes-home ``fleet/placement-policy.json``
-    ``cpu_lines``, lane ``kanban``, this host, found via $HERMES_HOME and read by the vendored stdlib reader
-    ``hermes_cli/load_lines.py`` (byte-identical to hermes-home ``scripts/lib/load_lines.py``).
-    Registry present -> cpu_busy_pause + the four spill keys (a SET the gate validates). Registry absent (any
-    install without hermes-home) -> cpu_busy_pause 0.90 only (== the registry default), spill stays unarmed, and
-    nothing is printed (this module is imported by every CLI call). config.yaml
-    ``kanban.dispatch_load_gate.<key>`` stays an explicit override. The gateway builds its LoadGate at boot, so a
-    registry change is live at the next gateway restart."""
-    try:
-        block, _src = _load_lines.load()
-    except Exception:  # noqa: BLE001 -- a broken registry must never break config import
-        block = None
-    if block is None:
-        return {"cpu_busy_pause": 0.90}  # load-lines: fallback (== cpu_lines.default.admit)
-    h = _load_lines.host_id()
-    line = lambda kind: _load_lines.resolve(h, "kanban", kind)[0]  # noqa: E731
-    return {"cpu_busy_pause": line("admit"), "cpu_spill": line("spill"), "spill_fraction": line("spill"),
-            "cpu_spill_resume": line("resume"), "cpu_pause": line("hot")}
-
-
-_KANBAN_CPU = _kanban_cpu_lines()
 
 
 #: Image every container terminal backend (docker/modal/daytona/singularity) uses unless the
@@ -1029,7 +1003,7 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
-        "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
+        "goal_judge": _aux(60, fallback_chain=[], total_timeout=120),  # verdict chain; drafting uses ordinary aux routing
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
         "curator": _aux(600),
@@ -2394,18 +2368,10 @@ DEFAULT_CONFIG = {
         # Per-tick spawn cap for the dispatcher (gateway tick and
         # `kanban dispatch`; the CLI --max flag wins over it). None = no cap.
         "max_spawn": None,
-        # Pause dispatcher SPAWNS (reclaims still run) while the host's
-        # 1-minute load average is over `pause_above` (default: CPU count);
-        # resume once it drops below `resume_below` (default: 0.75 × CPU
-        # count). Hysteresis so a load that hovers at the bar doesn't flap
-        # spawns every tick. Set enabled: false to disable.
-        # Projected-load admission (a worker's load lands over 5-10 min):
-        # each worker spawned in the last `ramp_seconds` counts as the
-        # per-worker load cost x the share of the ramp not yet elapsed; a
-        # tick admits at most floor((pause_above - load1 - pending) / cost)
-        # and never
-        # more than `max_spawn_per_tick`. `load5_floor`: resuming from a
-        # pause also needs load5 < pause_above. See kanban_load_gate.py.
+        # dispatch_load_gate (below): the spawn gate. Every tick admits by
+        # admission.admit_class("kanban") over this host's measured sample
+        # (cpu_busy, memory, procs, PSI); load1 is never read (t_b20850d2).
+        # See kanban_load_gate.py.
         # Worker pool (KWLB v0.1): while the Studio gate is spilling/paused
         # (or a ready card pins host:<id>), portable cards spawn with their
         # terminal + file tools on a fleet host over ssh. Hosts come from
@@ -2435,10 +2401,9 @@ DEFAULT_CONFIG = {
         # (committed mode off), logged once per process as browser_registry_fallback.
         "browser_hosts_file": None,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
-        # also reads each host's host-pressure.json (same ssh round-trip), a
-        # host turns hot after 2 hot samples and clears after 3 (state in
-        # <root>/var/kanban-target-state.json), warm hosts are picked last by
-        # projected load, and kanban's placements are written to
+        # also reads each host's host-pressure.json (same ssh round-trip); its
+        # band.kanban is admit_class's verdict (t_5d7e7171, no streak), warm
+        # hosts are picked last by projected load, and kanban's placements are written to
         # <root>/var/placement/host-reservations.kanban.json. false = KWLB v0.1.
         # kanban.placement.capabilities (t_8c474c2e, Fleet Work Placement
         # Phase 1): off | warn | enforce, read per tick from the ROOT
@@ -2457,18 +2422,12 @@ DEFAULT_CONFIG = {
         # and every held row gets a placement_wait, including rows a total
         # gate or an exhausted budget holds; false restores the silent early
         # returns and the old one-shot gate line.
-        # admit_on_memory (t_31350981, Saturation spec 4.2; D1: off until
-        # Ace's yes): a pool host takes at most floor(mem_available_gb /
-        # worker_reservation_gb) new workers per tick and none while its
-        # sampler publishes band.kanban hot. false = computed and logged per
-        # tick ("kanban admission (dry ...): would-refuse N"), never applied.
         # default (Control-Plane Protection spec v0.3 §3.1, t_667f1f6a; read
         # per tick, no restart): remote = every portable card is offered to
         # the worker pool first and spawns on this host only as the last
         # resort after the pool refused it (no cap: the load gate is the only
         # local limit); local = today's local-first order. Kill switch: local.
         "placement": {"read_signal": True, "route_first": True, "default": "local",
-                      "admit_on_memory": False, "worker_reservation_gb": 6,
                       # allocd (Router Core Card B1, t_4187c8f1; read per tick): off | shadow | on.
                       # off = the in-process scorer, allocd never consulted. shadow = allocd also
                       # scores each unpinned pool take (nothing booked), the in-process pick acts,
@@ -2476,38 +2435,16 @@ DEFAULT_CONFIG = {
                       # (promotion gate: n >= 50 answered, 0 disagreements). on = alloc_client.admit
                       # picks and books; release/renew go through alloc_client.
                       "allocd": "off"},
-        # Admission predicate (t_da6f84f7, read per tick by the gateway gate, `kanban dispatch` and the shared
-        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/fleet_placement/admission.py admit() over the
-        # host's measured cpu_busy / memory / PSI / procs with one measured-estimate lease per recent spawn. In
-        # utilization the dispatch_load_gate load/CPU keys are inert (procs pause and max_spawn_per_tick still apply).
+        # Admission predicate of the shared placement scorer and unified_filter (t_da6f84f7): legacy = the
+        # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
+        # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).
         "admission": "legacy",
         "dispatch_load_gate": {
             "enabled": True,
-            "pause_above": None,
-            "resume_below": None,
-            "worker_load_cost": 2.0,
+            # A spawn younger than ramp_seconds is a lease candidate (admission settles it after
+            # DEFAULT_SETTLE_S); max_spawn_per_tick paces one tick, it is not capacity.
             "ramp_seconds": 600,
             "max_spawn_per_tick": 4,
-            "load5_floor": True,
-            # t_bf26e8f1: load-per-worker is measured (least squares of load1
-            # on running workers over slope_window_seconds), clamped to
-            # [worker_load_cost_min, worker_load_cost_max]; worker_load_cost
-            # is the prior. A load1 pause needs the CPU at least
-            # cpu_busy_pause busy (cpu_corroborate); below that the gate
-            # admits on CPU headroom at worker_cpu_cost cores per worker.
-            "worker_load_cost_min": 0.5,
-            "worker_load_cost_max": 4.0,
-            "slope_window_seconds": 600,
-            "cpu_corroborate": True,
-            # CPU lines: the fleet registry (cpu_lines lane kanban; _kanban_cpu_lines above). The four spill
-            # keys (present only when the registry is found) are validated as a SET by the gate.
-            **_KANBAN_CPU,
-            "worker_cpu_cost": 1.0,
-            # t_a7978f86: E-core band saturation (Apple silicon) at or above
-            # ecore_busy_pause is no local CPU headroom. off | report (log
-            # "would-refuse" only; D1: flips to on on Ace's yes) | on.
-            "ecore_gate": "report",
-            "ecore_busy_pause": 0.95,
             # t_b660edb6: pause spawns (state proc_paused, #alerts page) at
             # proc_pause_fraction of this uid's process limit (RLIMIT_NPROC,
             # or proc_limit when set); resume below proc_resume_fraction.
@@ -2697,8 +2634,9 @@ DEFAULT_CONFIG = {
         "auto_subscribe_wake": True,
         "auto_subscribe_boomerang": True,  # operator auto-subscriptions use a child by default
         # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
-        # Unset thresholds inherit dispatch_load_gate. lane_headroom: also
-        # downgrade while the waker profile's model lane is capped.
+        # host_axis cpu (default): downgrade at cpu_pause (0.90) busy. host_axis
+        # load1 (kill switch): the pause_above / resume_below band set HERE.
+        # lane_headroom: also downgrade while the waker profile's model lane is capped.
         "wake_load_gate": {
             "enabled": True,
             "pause_above": None,

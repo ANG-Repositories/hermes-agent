@@ -31,7 +31,7 @@ import pytest
 from tests.hermes_cli.test_kanban_headroom_placement import (  # noqa: F401  (fixture)
     FAKE_PID, TABLE, Fleet, _plan, home,
 )
-from hermes_cli import alloc_client
+from hermes_cli.fleet_placement import alloc_client
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
@@ -203,8 +203,7 @@ def _replay_plan(home, dec, table_doc, mode):
             detail[h] = {"slots": n, "running": 0, "load1": None,
                          "pressure": (v["reason"] or "closed").split(":", 1)[-1]}
     _pressure(home, measured, at=at)
-    sig = kwp.TargetSignal(policy=pp.PlacementPolicy(), state_path=home / "var" / kwp.TARGET_STATE_FILE,
-                           ledger_dir=home / "var" / "placement", clock=lambda: at, placement_table=table,
+    sig = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=home / "var" / "placement", clock=lambda: at, placement_table=table,
                            placement_reservations=rpath, allocd=mode)
     return kwp._finish_plan(hosts, slots, detail, (), at, None, sig)
 
@@ -648,30 +647,3 @@ def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
     assert kh.RESERVATION_KEY in payload and kh.RESERVATION_VIA_KEY not in payload
     assert loud.requests == []
 
-
-# -- the vendored client stays the canonical one -----------------------------------------------
-
-def test_vendored_alloc_client_matches_canonical():
-    """hermes_cli/alloc_client.py == hermes-home scripts/lib/alloc_client.py except the
-    vendoring header and the placement import. ALLOC_CLIENT_CANONICAL names the file (CI skips)."""
-    import os
-    env = os.environ.get("ALLOC_CLIENT_CANONICAL")
-    if not env:
-        pytest.skip("ALLOC_CLIENT_CANONICAL not set (no hermes-home checkout to cross-read)")
-    ours = Path(alloc_client.__file__).read_text(encoding="utf-8").splitlines()
-    theirs = Path(env).read_text(encoding="utf-8").splitlines()
-    ours = [x for x in ours if not x.startswith("# VENDORED") and not x.startswith("# sha256")
-            and not x.startswith("# local change") and not x.startswith("# the rest against")]
-    theirs_n = []
-    skip = 0
-    for x in theirs:
-        if x.startswith("sys.path.insert(0, str(Path(__file__).resolve().parent))"):
-            skip = 1
-            continue
-        if skip and x.startswith("import placement"):
-            theirs_n.append("from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy "
-                            "(hermes-home: sys.path + import placement)")
-            skip = 0
-            continue
-        theirs_n.append(x)
-    assert ours == theirs_n

@@ -946,6 +946,7 @@ _RENAMED_TASK_COLUMNS = (
 # NULL / 0 defaults below reproduce the behaviour existing rows had before the
 # column existed.
 _LATER_TASK_COLUMNS = (
+    ("asap", "asap INTEGER NOT NULL DEFAULT 0"),
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),
@@ -976,6 +977,10 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Failure signature an automated minter passes (t_mint-dedup, Ace 2026-11-05): the idempotency key minus its
+    # per-occurrence sha/epoch. The signature resolver in create_task reuses the open/recent card for it and trips
+    # the flap breaker after N no-code closes. NULL = not an automated mint (humans, legacy rows): resolver inert.
+    ("signature", "signature TEXT"),
 )
 _NOTIFY_SUB_COLUMNS = (
     ("last_ping_event_id", "last_ping_event_id INTEGER NOT NULL DEFAULT 0"),
@@ -1051,6 +1056,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # init on legacy boards before the ALTER TABLE pass runs. ``IF NOT EXISTS``
     # keeps re-running here cheap and correct on fresh DBs.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_signature_created ON tasks(signature, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
@@ -1070,6 +1076,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "task_events", "actor_session_id", "actor_session_id TEXT"
         )
+    # CLOCK_BOOTTIME + boot id of liveness evidence (claimed/spawned/heartbeat),
+    # so the session reap compares births without a wall conversion
+    # (kanban_db._boot_window). NULL for historical rows and non-Linux writers.
+    if ev_cols and "boottime" not in ev_cols:
+        _add_column_if_missing(conn, "task_events", "boottime", "boottime REAL")
+    if ev_cols and "boot_id" not in ev_cols:
+        _add_column_if_missing(conn, "task_events", "boot_id", "boot_id TEXT")
 
     # task_comments gained per-run / per-session provenance. Two concurrent
     # sessions on the SAME profile used to be indistinguishable on the board

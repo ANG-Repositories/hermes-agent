@@ -98,17 +98,38 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return default
 
 
-def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
-    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
+def _git_out(
+    cwd: Path, *args: str, timeout: int = 30, workspace_probe: bool = False,
+) -> Optional[str]:
+    """Return git stdout, preserving executable failures on workspace probes.
+
+    A failed executable is not evidence that the workspace is not a repository.
+    Other callers retain the historical best-effort (None on failure) behavior.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, check=False,
+            timeout=timeout, check=False, stdin=subprocess.DEVNULL,
         )
+    except OSError as exc:
+        if workspace_probe and exc.filename == "git":
+            raise RuntimeError(f"git executable unavailable: {exc}") from exc
+        return None
     except Exception:
         return None
     if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        executable_failure = result.returncode in (126, 127) or (
+            "no such file or directory" in stderr.lower()
+            and ("exec" in stderr.lower() or re.search(
+                r"/[^\s:]*[/]git(?:-[\w.-]+)?(?=['\"\s:]|$)", stderr,
+            ))
+        )
+        if workspace_probe and executable_failure:
+            raise RuntimeError(
+                f"git executable unavailable (exit {result.returncode}): {stderr}"
+            )
         return None
     return (result.stdout or "").strip() or None
 
@@ -2559,6 +2580,7 @@ class Task:
     # Boomerang wake level (Ace 2026-10-22): True/False = the card's subscription level is
     # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
     boomerang_wake: Optional[bool] = None
+    asap: bool = False  # Explicit operator edit only; never inherited at creation.
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2578,6 +2600,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            asap=bool(g("asap")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
             pin_sub_reason=g("pin_sub_reason") or None,
@@ -2902,7 +2925,9 @@ CREATE TABLE IF NOT EXISTS task_events (
     payload    TEXT,
     created_at INTEGER NOT NULL,
     actor_profile    TEXT,
-    actor_session_id TEXT
+    actor_session_id TEXT,
+    boottime   REAL,
+    boot_id    TEXT
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -5571,7 +5596,6 @@ def _origin_line(body: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 NEEDS_INPUT_PAGE_MIN_PRIORITY = 100
-NEEDS_INPUT_PAGE_ALERTS_PRIORITY = 200
 _NEEDS_INPUT_PAGE_OFF = "needs_input_page_off"
 _NEEDS_INPUT_PAGE_ON = "needs_input_page_on"
 # ``origin: discord <name> (<numeric channel id>) · session ...`` (see
@@ -5736,15 +5760,16 @@ def needs_input_page_candidates(
     comment newer than its latest block (answered, waiting on an unblock; see
     ``_ruled_since_block``), and has ``priority >= min_priority``
     OR an ``origin:`` line naming a numeric Discord channel. Each item carries
-    ``channel`` (origin channel id or None) and ``alerts`` (priority >= 200).
+    ``channel`` (origin channel id or None), ``session_id`` (the card's home
+    session, which the pager resolves to a chat when ``channel`` is None).
     """
     rows = list(conn.execute(
-        "SELECT id, title, body, priority, status, block_kind FROM tasks "
+        "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks "
         "WHERE status IN ('blocked', 'triage') AND block_kind = 'needs_input' ORDER BY id"
     ))
     if include_dependency:
         rows += list(conn.execute(
-            "SELECT id, title, body, priority, status, block_kind FROM tasks t "
+            "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks t "
             "WHERE status IN ('todo', 'blocked') AND block_kind = 'dependency' "
             "AND EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
             "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) IN (?, ?) "
@@ -5788,7 +5813,7 @@ def needs_input_page_candidates(
             "kind": row["block_kind"],
             "reason": reason or "(no reason given)",
             "channel": channel,
-            "alerts": priority >= NEEDS_INPUT_PAGE_ALERTS_PRIORITY,
+            "session_id": row["session_id"],
         })
     return out
 
@@ -5820,6 +5845,221 @@ class NearDuplicateError(ValueError):
     def __init__(self, message: str, duplicates: list[dict]):
         super().__init__(message)
         self.duplicates = duplicates
+
+
+# Per-creator mint cap (Ace 2026-11-05 12:59 PT, "do this immediately"): measured 2026-11-05, 710 cards
+# minted in 24 h on the default board, 477 of them by automation (main-tip-red 177, pager-owner-card 120,
+# landing-queue 93, ci-red-owner 38, live-edit-card 32, prism-page-card 17) feeding ~1,640 worker runs and
+# ~2,500 CI runs on hermes-home alone; CI runners then starved the Prism review pool to 0 placeable hosts.
+# Every minter passes through ``create_task``, so the cap lives here, not per script. A creator that is
+# not a human (``created_by`` empty / ``user`` / ``human:*``) may mint at most ``MINT_CAP_PER_DAY`` cards
+# per rolling 24 h; the (N+1)th raises :class:`MintCapError`. ``force_reason`` (CLI ``--force``) overrides
+# it and is ledgered as a ``mint_cap_forced`` event on the new card. Kill switch:
+# ``HERMES_KANBAN_MINT_CAP=0`` (env; ``HERMES_KANBAN_MINT_CAP=<n>`` resizes). Idempotent re-mints that
+# return an existing card never count: the check runs after the idempotency lookup. Every refusal, force and
+# kill-switch bypass is ledgered in ``<db>.mint-cap.jsonl`` (:func:`mint_cap_ledger_path`, t_f956f87f).
+MINT_CAP_PER_DAY = 24
+MINT_CAP_WINDOW_S = 24 * 3600
+MINT_CAP_HUMAN_PREFIXES = ("human:",)
+MINT_CAP_HUMAN_NAMES = frozenset({"", "user", "operator", "apollo", "aegis"})
+
+
+class MintCapError(ValueError):
+    """``create_task`` refused: ``created_by`` is over its rolling-24 h mint cap."""
+
+    def __init__(self, message: str, created_by: str, count: int, cap: int):
+        super().__init__(message)
+        self.created_by = created_by
+        self.count = count
+        self.cap = cap
+
+
+def mint_cap() -> int:
+    """The live cap (``HERMES_KANBAN_MINT_CAP`` env, else :data:`MINT_CAP_PER_DAY`); 0 = off."""
+    return _env_int("HERMES_KANBAN_MINT_CAP", MINT_CAP_PER_DAY, minimum=0)
+
+
+def mint_cap_applies(created_by: Optional[str]) -> bool:
+    """True for an automated creator; humans and the operator CLI default are never capped."""
+    by = (created_by or "").strip()
+    if by.lower() in MINT_CAP_HUMAN_NAMES:
+        return False
+    return not any(by.lower().startswith(p) for p in MINT_CAP_HUMAN_PREFIXES)
+
+
+def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int] = None) -> int:
+    """Cards this creator minted in the trailing window, archived ones included (a reaped card still cost a run)."""
+    now = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE created_by = ? AND created_at > ?",
+        (created_by, now - MINT_CAP_WINDOW_S),
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def mint_cap_ledger_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """``<board db>.mint-cap.jsonl`` beside the connection's own db file; None for an in-memory/unnamed db.
+
+    t_f956f87f: one append-only row per cap outcome a ``task_events`` row cannot carry (a refusal has no card)
+    or would scatter: ``refused``, ``forced``, ``bypassed`` (minted past the default cap under the kill switch).
+    The one-week readout counts these instead of recomputing from ``created_at``."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    file = row[2] if row else ""
+    return Path(file + ".mint-cap.jsonl") if file else None
+
+
+def _ledger_mint_cap(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Append one ledger row. Best effort: a write failure never changes the create outcome."""
+    try:
+        p = mint_cap_ledger_path(conn)
+        if p is None:
+            return
+        rec = dict(fields, outcome=outcome, at=int(time.time()))
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:  # noqa: BLE001 - the ledger is evidence, never a gate
+        _log.debug("mint-cap ledger write failed", exc_info=True)
+
+
+def _ledger_on_commit(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Queue a ledger row for the outer COMMIT of the enclosing write_txn (kanban_db_connect.on_commit)."""
+    from hermes_cli.kanban_db_connect import on_commit
+    on_commit(conn, lambda: _ledger_mint_cap(conn, outcome, **fields))
+
+
+def mint_cap_bypass(conn: sqlite3.Connection, created_by: Optional[str]) -> Optional[dict]:
+    """The kill switch is set and an automated ``created_by`` is at/over the DEFAULT cap: the mint that follows
+    would have been refused. -> {created_by, count, cap, env}, else None. Ledgered as ``bypassed`` and a
+    ``mint_cap_bypassed`` event so a kill-switch storm is visible on the board (11-06: 15 cards, no trace)."""
+    if mint_cap() > 0 or not mint_cap_applies(created_by):
+        return None
+    by = (created_by or "").strip()
+    n = mint_count_24h(conn, by)
+    if n < MINT_CAP_PER_DAY:
+        return None
+    return {"created_by": by, "count": n, "cap": MINT_CAP_PER_DAY,
+            "env": "HERMES_KANBAN_MINT_CAP=%s" % os.environ.get("HERMES_KANBAN_MINT_CAP", "").strip()}
+
+
+def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
+    """Raise :class:`MintCapError` when ``created_by`` is an automated creator at or over the cap."""
+    cap = mint_cap()
+    if cap <= 0 or not mint_cap_applies(created_by):
+        return
+    by = (created_by or "").strip()
+    n = mint_count_24h(conn, by, now)
+    if n >= cap:
+        raise MintCapError(
+            "mint cap: created_by=%r has minted %d cards in the last 24 h (cap %d). One card per distinct "
+            "failing signature, not one per occurrence: reuse the open card (idempotency_key) or wait for "
+            "the window. Override: --force \"<why this card must exist now>\"; kill switch "
+            "HERMES_KANBAN_MINT_CAP=0." % (by, n, cap), by, n, cap)
+
+
+# Signature resolver + flap breaker (PRD plans/2026-11-05_machine-minted-cards-signature-dedup-prd.md, Ace
+# 2026-11-05 15:36 "spec out the real fix ... you do it then build it"). Phase-0 replay over 7 days: main-tip-red
+# minted 523 cards for 184 failure signatures (336 would have reused an existing card; 20 signatures closed 3+
+# times in a row with no code change), pager-owner-card 827 for 180. The idempotency key carries a per-occurrence
+# sha/epoch, so the same failure minted a fresh card per baseline/episode and the worker's whole job was to find
+# "already fixed on main". A minter passes ``signature`` = the key minus that suffix; the resolver answers from
+# ``tasks.signature`` (indexed) regardless of who minted.
+SIGNATURE_QUIET_S = 24 * 3600      # a card that CLOSED this recently still owns the signature
+SIGNATURE_FLAP_N = 3               # consecutive no-code closes that trip the breaker
+SIGNATURE_PAGE_PRODUCER = "kanban-mint-breaker"
+
+
+class MintBreakerError(ValueError):
+    """``create_task`` refused: the signature's last N cards all closed with no code change (a flapping detector)."""
+
+    def __init__(self, message: str, signature: str, cards: list[str]):
+        super().__init__(message)
+        self.signature = signature
+        self.cards = cards
+
+
+def signature_dedup_on() -> bool:
+    return _env_int("HERMES_KANBAN_SIGNATURE_DEDUP", 1, minimum=0) > 0
+
+
+def mint_breaker_on() -> bool:
+    return _env_int("HERMES_KANBAN_MINT_BREAKER", 1, minimum=0) > 0
+
+
+def signature_quiet_s() -> int:
+    return _env_int("HERMES_KANBAN_SIGNATURE_QUIET_S", SIGNATURE_QUIET_S, minimum=0)
+
+
+def signature_flap_n() -> int:
+    return _env_int("HERMES_KANBAN_SIGNATURE_FLAP_N", SIGNATURE_FLAP_N, minimum=1)
+
+
+def _signature_history(conn: sqlite3.Connection, signature: str, limit: int) -> list[dict]:
+    """Newest-first cards for ``signature`` with their close time and whether the close carried code.
+
+    ``closed_at`` = the newest ``completed``/``archived`` event; ``no_code`` = that event's payload has no
+    ``survivor`` of kind patch/bundle/landed/artifact and no ``superseded_by`` naming a PR (I4: evidence, never
+    the summary's prose). An open card has ``closed_at`` None.
+    """
+    rows = conn.execute(
+        "SELECT id, status, created_at FROM tasks WHERE signature = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (signature, limit)).fetchall()
+    out = []
+    for r in rows:
+        ev = conn.execute(
+            "SELECT created_at, payload FROM task_events WHERE task_id = ? AND kind IN ('completed', 'archived') "
+            "ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        closed_at, no_code = None, False
+        if ev is not None and r["status"] in ("done", "archived"):
+            closed_at = int(ev["created_at"])
+            try:
+                payload = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else (ev["payload"] or {})
+            except (TypeError, ValueError):
+                payload = {}
+            surv = payload.get("survivor") if isinstance(payload, dict) else None
+            kind = surv.get("kind") if isinstance(surv, dict) else None
+            sup = str(payload.get("superseded_by") or "") if isinstance(payload, dict) else ""
+            no_code = kind not in ("patch", "bundle", "landed", "artifact") and "/pull/" not in sup and "#" not in sup
+        out.append({"id": r["id"], "status": r["status"], "created_at": int(r["created_at"]),
+                    "closed_at": closed_at, "no_code": no_code})
+    return out
+
+
+def resolve_signature(conn: sqlite3.Connection, signature: Optional[str], created_by: Optional[str], *,
+                      now: Optional[int] = None, reuse: bool = True) -> Optional[str]:
+    """The card that already owns ``signature`` (open, or closed within the quiet window), else None.
+
+    Raises :class:`MintBreakerError` when the last :func:`signature_flap_n` cards for it all closed with no code
+    change. Inert for humans (:func:`mint_cap_applies`), a NULL signature, or ``HERMES_KANBAN_SIGNATURE_DEDUP=0``.
+    ``reuse=False`` (``kanban create --no-signature-reuse``): the caller has proven it needs a FRESH card (a possible
+    regression after the signature's card closed), so the open/quiet-window reuse is skipped while the breaker still
+    applies and the new card still stores the signature, keeping it in the breaker's history.
+    """
+    sig = (signature or "").strip()
+    if not sig or not signature_dedup_on() or not mint_cap_applies(created_by):
+        return None
+    now = int(time.time()) if now is None else int(now)
+    n = signature_flap_n()
+    hist = _signature_history(conn, sig, n)
+    if not hist:
+        return None
+    newest = hist[0]
+    if reuse and newest["closed_at"] is None:
+        _append_event(conn, newest["id"], "signature_remint", {"signature": sig, "created_by": created_by, "at": now})
+        return newest["id"]
+    if reuse and newest["closed_at"] is not None and now - newest["closed_at"] < signature_quiet_s():
+        _append_event(conn, newest["id"], "signature_remint",
+                      {"signature": sig, "created_by": created_by, "at": now, "quiet_window": True})
+        return newest["id"]
+    if mint_breaker_on() and len(hist) >= n and all(h["no_code"] for h in hist[:n]):
+        ids = [h["id"] for h in hist[:n]]
+        raise MintBreakerError(
+            "mint breaker: signature %r minted and closed %d times in a row with no code change (%s); the detector "
+            "or its baseline is stale, not the tree. Fix the detector, or override with --force \"<why>\"; kill "
+            "switch HERMES_KANBAN_MINT_BREAKER=0." % (sig, n, ", ".join(ids)), sig, ids)
+    return None
 
 
 def _near_dup_body(body: Optional[str]) -> str:
@@ -6077,8 +6317,17 @@ def create_task(
     workspace_of: Optional[str] = None,
     boomerang_wake: Optional[bool] = None,
     no_worker: bool = False,
+    signature: Optional[str] = None,
+    signature_reuse: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
+
+    ``signature`` (automated minters only): the failure's identity minus its per-occurrence sha/epoch
+    (``main-tip-red:<repo>/<unit>/<test>``, ``pager:<host>:<producer>:<key>``). :func:`resolve_signature`
+    returns the OPEN card for it, or the card that closed within :data:`SIGNATURE_QUIET_S`, instead of
+    minting; after :data:`SIGNATURE_FLAP_N` consecutive closes with no code change it raises
+    :class:`MintBreakerError` (``force_reason`` overrides, ledgered ``mint_breaker_forced``).
+    ``signature_reuse=False`` skips the reuse but keeps the breaker and stores the signature (a caller-proven fresh card).
 
     ``no_worker=True`` mints the card operator-only (the ``no_worker`` flag,
     see :func:`set_no_worker`): it never reaches a worker, so the assignee
@@ -6365,6 +6614,34 @@ def create_task(
             pr_owner_forced = {"owner": exc.owner["task_id"], "pr": exc.owner["pr"],
                                "reason": force_reason}
 
+    # Per-creator mint cap (see MINT_CAP_PER_DAY): after the idempotency lookup, so a re-mint that returns the
+    # existing card never counts; before the write txn, so a refusal holds no lock.
+    mint_cap_forced: Optional[dict] = None
+    mint_breaker_forced: Optional[dict] = None
+    # Signature resolver (see SIGNATURE_QUIET_S): an open or recently closed card for the same failure signature
+    # is returned instead of minting; a flapping signature raises unless forced.
+    if signature:
+        try:
+            with write_txn(conn):
+                owner = resolve_signature(conn, signature, created_by, reuse=signature_reuse)
+        except MintBreakerError as exc:
+            if not force_reason:
+                raise
+            mint_breaker_forced = {"signature": exc.signature, "cards": exc.cards, "reason": force_reason}
+        else:
+            if owner:
+                return owner
+    try:
+        check_mint_cap(conn, created_by)
+    except MintCapError as exc:
+        if not force_reason:
+            _ledger_mint_cap(conn, "refused", created_by=exc.created_by, count=exc.count, cap=exc.cap,
+                             idempotency_key=idempotency_key)
+            raise
+        mint_cap_forced = {"created_by": exc.created_by, "count": exc.count, "cap": exc.cap,
+                           "reason": force_reason}
+    mint_cap_bypassed = mint_cap_bypass(conn, created_by)
+
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -6386,6 +6663,8 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+    from hermes_cli.kanban_db_workspace import refuse_runtime_tree_workspace
+    refuse_runtime_tree_workspace(workspace_kind, workspace_path)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -6601,8 +6880,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, boomerang_wake
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        workspace_of, boomerang_wake, signature
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6634,6 +6913,7 @@ def create_task(
                         brain,
                         workspace_of,
                         None if boomerang_wake is None else (1 if boomerang_wake else 0),
+                        signature,
                     ),
                 )
                 for pid in parents:
@@ -6731,6 +7011,19 @@ def create_task(
                     })
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
+                if mint_cap_forced:
+                    _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
+                if mint_cap_bypassed:
+                    _append_event(conn, task_id, "mint_cap_bypassed", mint_cap_bypassed)
+                # Prism 31f2934ed515: a create nested in a caller's write_txn only releases a savepoint here, so the
+                # ledger row of a card is queued for the OUTER commit (dropped on any rollback); never a row for a
+                # card that does not exist. A refusal (no card) stays an immediate append.
+                if mint_cap_forced:
+                    _ledger_on_commit(conn, "forced", task_id=task_id, **mint_cap_forced)
+                if mint_cap_bypassed:
+                    _ledger_on_commit(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
+                if mint_breaker_forced:
+                    _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
                 # K5: a background delegation unit is not an incident a session
                 # mints; the gate would only comment and hold it for 10 min.
@@ -8913,10 +9206,13 @@ def _append_event(
             "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
+    boot = _boot_evidence() if kind in _BOOT_EVIDENCE_KINDS else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
-        "actor_profile, actor_session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, _json_or_null(payload), int(time.time()), actor_profile, actor_session_id),
+        "actor_profile, actor_session_id, boottime, boot_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, run_id, kind, _json_or_null(payload), int(time.time()), actor_profile, actor_session_id,
+         boot[0] if boot else None, boot[1] if boot else None),
     )
     # Append-only mutation journal (card t_357330bf). This is the single choke
     # point every lifecycle mutation already flows through, so journaling here
@@ -9653,6 +9949,88 @@ def _boot_id() -> Optional[str]:
             return fh.read().strip() or None
     except OSError:
         return None
+
+
+# Liveness evidence the session reap orders member births against (t_29dee3c8).
+# On Linux each of these events also records CLOCK_BOOTTIME + the boot id, the
+# clock /proc/<pid>/stat starttime is on, so ownership compares the two
+# directly and a wall-clock step between evidence and reap moves nothing.
+_BOOT_EVIDENCE_KINDS = frozenset({"claimed", "spawned", "heartbeat"})
+# One starttime tick: /proc births are floored to it (and recorded with it).
+_BOOT_TICK_S = (
+    1.0 / os.sysconf("SC_CLK_TCK")
+    if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME") else 0.01
+)
+
+
+def _boot_evidence() -> Optional[tuple[float, str]]:
+    """``(CLOCK_BOOTTIME seconds, boot_id)`` now; None off Linux (macOS has no
+    BOOTTIME and keeps its microsecond p_starttime wall path)."""
+    if not _PRECISE_BIRTH:
+        return None
+    boot_id = _boot_id()
+    if not boot_id:
+        return None
+    return (time.clock_gettime(time.CLOCK_BOOTTIME), boot_id)
+
+
+def _boot_window(
+    after: Optional[tuple], before: Optional[tuple],
+) -> tuple[str, Optional[tuple[float, float]]]:
+    """How the reap orders births against a run's ``(boottime, boot_id)`` bounds.
+
+    ``("direct", (lo, hi))``: both bounds are from THIS boot; a /proc starttime
+    birth ``b`` (BOOTTIME, floored to a tick) is the run's iff ``lo <= b <= hi``,
+    i.e. one tick of slack each way and no epoch. ``("other_boot", None)``: a
+    bound was recorded under another boot id; nothing alive now can be that
+    run's (a worker does not survive a reboot), so NO ownership.
+    ``("wall", None)``: a bound has no BOOTTIME (old row, non-Linux writer) or
+    this host has none; the caller keeps the wall conversion.
+    """
+    current = _boot_id() if _PRECISE_BIRTH else None
+    if current is None:
+        return "wall", None
+    if any(ev is not None and ev[1] != current for ev in (after, before)):
+        return "other_boot", None
+    if after is None or before is None:
+        return "wall", None
+    return "direct", (float(after[0]) - _BOOT_TICK_S, float(before[0]) - _BOOT_TICK_S)
+
+
+def _event_boot(row) -> Optional[tuple[float, str]]:
+    """``(boottime, boot_id)`` of a task_events row, or None when unrecorded."""
+    if row is None or row["boottime"] is None or not row["boot_id"]:
+        return None
+    return (float(row["boottime"]), str(row["boot_id"]))
+
+
+def _run_boot_evidence(
+    conn: Optional[sqlite3.Connection], task_id: Optional[str],
+    run_id: Optional[int] = None,
+) -> tuple[Optional[tuple[float, str]], Optional[tuple[float, str]]]:
+    """BOOTTIME twins of the run's ownership bounds: the ``claimed`` event (as
+    :func:`_worker_owner_window`'s lower bound) and the newest ``heartbeat``/
+    ``spawned`` event (:func:`_run_last_evidence_at`). Newest by insertion id,
+    never by the wall ``created_at`` a backward step can reorder."""
+    if conn is None or task_id is None:
+        return None, None
+    if run_id is None:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = row[0] if row else None
+    if run_id is None:
+        return None, None
+    claim = conn.execute(
+        "SELECT boottime, boot_id FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'claimed' ORDER BY id ASC LIMIT 1", (task_id, int(run_id)),
+    ).fetchone()
+    last = conn.execute(
+        "SELECT boottime, boot_id FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind IN ('heartbeat', 'spawned') ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    return _event_boot(claim), _event_boot(last)
 
 
 def _spawn_start_token(payload: Any) -> Any:
@@ -11317,6 +11695,18 @@ def _enforce_superseded_content(
     try:
         return _content.verify(task_id, prs, shas)
     except _content.SupersededContentError as err:
+        # t_87e32ff7: an equivalent fix worded differently. Accepted when the PR's own trusted close record names
+        # the sha and that commit touched every file that differs; the PR must also have had no other failure.
+        if err.differs and not err.unverified and not err.off_default:
+            from hermes_cli import kanban_superseded_open as _sopen
+            covered = {pr: _sopen.sha_close_covers(pr, shas) for pr in err.differs}
+            if all(covered.values()):
+                with write_txn(conn):
+                    _append_event(conn, task_id, "routed_pr_superseded",
+                                  {"close_record_sha": covered, "differs": err.differs})
+                return [{"remote": f"https://github.com/{pr.rpartition('#')[0]}", "branch": "main", "sha": sha,
+                         "pr": pr, "external": True, "corroborated_by": "close-record+file-coverage"}
+                        for pr, sha in covered.items()]
         with write_txn(conn):
             _append_event(conn, task_id, "completion_blocked_superseded_content",
                           {"differs": err.differs, "unverified": err.unverified, "shas": shas})
@@ -11670,9 +12060,7 @@ def complete_task(
             # Arm only the card's OWN handoff PR(s), never a PR the prose
             # merely mentions (FleetReview #1234 finding).
             armable = {
-                f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
-                    metadata=metadata, survivor_pr=survivor_pr,
-                )
+                f"{r.repo}#{r.number}" for r in _fresh.handoff_refs(metadata, survivor_pr=survivor_pr)
             }
             may_arm = not is_milestone_card(conn, task_id)
             # Ready-flip evidence from earlier handoffs of this card (t_c1ee61ae, Prism
@@ -11717,6 +12105,8 @@ def complete_task(
                 # draft is a mention, not a route to review that would wait
                 # on a merge nobody intends.
                 override = {"prs": list(overridden), "reason": draft_ok}
+                if freshness.get("draft_held"):
+                    override["held"] = freshness["draft_held"]  # t_62389c4f: the hold stays visible
                 with write_txn(conn):
                     _append_event(conn, task_id, "completion_draft_override", override)
                 metadata = dict(metadata or {}, draft_override=override)
@@ -11759,6 +12149,10 @@ def complete_task(
             return ok
         if still_open:
             note = _open_pr.route_note(still_open)
+            # t_62389c4f: an operator-drafted PR the gate left as-is says so in the handback.
+            held = freshness.get("draft_held") or {}
+            if held:
+                note = "\n".join([note, *(f"{k}: {why}" for k, why in sorted(held.items()))])
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
@@ -11895,6 +12289,26 @@ def complete_task(
             card_cover=card_cover, card_covered_out=card_covers,
         )
     except _open_pr.ClosedUnmergedPrError as closed_err:
+        # t_ec8ceae2: an explicit close whose closed PR names an OPEN superseder (trusted `CLOSED: SUPERSEDED-BY #N`,
+        # #N names this card) parks the card on #N instead of refusing: it closes when #N merges.
+        if (superseded_by or str(abandon_routed_pr or "").strip()) and closed_err.closed and not closed_err.unverified:
+            from hermes_cli import kanban_superseded_open as _sopen
+            targets = _sopen.park_targets(
+                task_id, [r for r in _open_pr.extract_pr_refs(*closed_err.closed)],
+                superseded_by=superseded_by, query_fn=_pr_query or _open_pr.memo_query())
+            if targets:
+                park_meta, staged = _stage_routed_scratch_artifacts(
+                    conn, task_id, dict(metadata or {}), summary=summary, result=result)
+                ok = False
+                try:
+                    ok = _sopen.park(conn, task_id, targets, expected_run_id=expected_run_id, force=force,
+                                     summary=summary, result=result, metadata=park_meta,
+                                     own_prs=[f"{r.repo}#{r.number}" for r in _open_pr.split_fleet(
+                                         _open_pr.extract_pr_refs(*_card_recorded_pr_refs(conn, task_id),
+                                                                  metadata=metadata, survivor_pr=survivor_pr))[0]])
+                finally:
+                    _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+                return ok
         with write_txn(conn):
             _append_event(
                 conn, task_id, "completion_blocked_closed_unmerged_pr",
@@ -13322,8 +13736,12 @@ def safe_remove_workspace_dir(
     reason: str,
     conn: Optional[sqlite3.Connection] = None,
     remote_host=None,
+    reclaimed: Optional[dict] = None,
 ) -> bool:
     """THE choke point for removing a kanban-managed scratch workspace.
+
+    ``reclaimed`` is a verified capture from :mod:`hermes_cli.kanban_reclaim` (t_83c38f7b); it
+    replaces the survivor proof in the deleter and is accepted only with ``conn`` on a local tree.
 
     Every workspace deletion in Hermes goes through here. Three gates, in
     order, each of which independently refuses:
@@ -13487,7 +13905,10 @@ def safe_remove_workspace_dir(
     # does), so open one here rather than degrading into a hold -- the same
     # self-connect _task_has_live_run performs.
     try:
-        if conn is not None or not task_id:
+        if reclaimed is not None:
+            removed = conn is not None and bool(task_id) and bool(
+                remove_workspace_dir(conn, task_id, resolved, reclaimed=reclaimed))
+        elif conn is not None or not task_id:
             removed = bool(remove_workspace_dir(conn, task_id, resolved))
         else:
             with connect_closing() as own:
@@ -14747,6 +15168,15 @@ def _request_review_txn(
         staged = _cleaned_artifact_paths(metadata)
         if staged:
             payload["artifacts"] = staged
+        if negative_result is not None:
+            # t_5c6c67c5: the PR is left exactly as it is; tell the reviewer how to flip it on accept.
+            from hermes_cli import kanban_negative_result as _neg
+            cmds = _neg.draft_cmds(metadata)
+            if cmds:
+                payload["draft_cmds"] = cmds
+                payload["draft_note"] = _neg.draft_note_line(cmds)
+                if not _neg.draft_note_fits(cmds):
+                    _insert_comment(conn, task_id, "kanban", _neg.draft_note_comment(cmds), int(time.time()))
         _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
         if negative_result is not None:
             _append_event(
@@ -15700,6 +16130,20 @@ def reopen_task(
     # where the review-card closer completes it on REST merged=true.
     review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
+        if _task_status(conn, task_id) != "done":
+            return False, f"task {task_id} changed state concurrently; retry"
+        candidate_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
+            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if to_status == "review":
+            from hermes_cli.kanban_review_handoff import record_reopened_candidate
+            try:
+                record_reopened_candidate(conn, task_id, actor=actor, reviewer=review_assignee,
+                                          reason=reason, run_id=int(candidate_run["id"]) if candidate_run else None)
+            except ValueError as exc:
+                return False, str(exc)
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
@@ -15721,12 +16165,7 @@ def reopen_task(
                 "previous_path": dead_scratch,
                 "survivor_baseline": _reset_survivor_baseline(conn, task_id),
             })
-        run_id = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
-            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        voided_run = int(run_id["id"]) if run_id else None
+        voided_run = int(candidate_run["id"]) if candidate_run else None
         if voided_run is not None:
             conn.execute(
                 "UPDATE task_runs SET outcome = 'voided' WHERE id = ?",
@@ -16404,12 +16843,17 @@ def triage_resolve_task(
 def _card_recorded_pr_refs(conn: sqlite3.Connection, task_id: str, runs=None) -> list:
     """Every PR string any of the card's runs persisted (``kanban_open_pr.recorded_pr_refs``): pr_url /
     pr_urls / pr, auto_routed_open_prs and survivor PR evidence. The card's own PRs for the closed-unmerged
-    gates (FleetReview #1339), so neither done nor archive depends on which key carried the ref."""
+    gates (FleetReview #1339), so neither done nor archive depends on which key carried the ref.
+
+    A PR a superseded park replaced (its ``routed_pr_superseded`` event) is dropped per reference from every run,
+    ended ones included: the successor stands in for it, so ``release_merged_edges`` releases after-merge children
+    once the successor merges (Prism e9ba3e150e29)."""
     from hermes_cli import kanban_open_pr as _open_pr
+    from hermes_cli import kanban_superseded_open as _sopen
     out: list = []
     for run in (list_runs(conn, task_id) if runs is None else runs):
         out.extend(_open_pr.recorded_pr_refs(run.metadata))
-    return out
+    return _sopen.honour_successors(conn, task_id, out)
 
 
 def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=None) -> None:
@@ -17213,6 +17657,23 @@ def workspace_refusal_state(conn, task_ids) -> dict[str, dict]:
 _REFUSAL_PAGED_KIND = "workspace_refusal_paged"
 
 
+def _claim_was_refused(conn, payload) -> bool:
+    """True when the run a ``claimed`` event opened ended ``workspace_refused``.
+
+    A refusal raised after the claim (a dead worktree stub, a mount lost in
+    the claim/resolve window) claims the card on every tick; those claims must
+    not end the refusal episode, or the same hold pages every tick.
+    """
+    try:
+        run_id = (json.loads(payload) or {}).get("run_id")
+    except (TypeError, ValueError):
+        return False
+    row = run_id and conn.execute(
+        "SELECT outcome FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    return bool(row) and row[0] == "workspace_refused"
+
+
 def claim_workspace_refusal_pages(conn, refused, *, channel: str = "alerts"):
     """Claim the (card, reason) refusals that have not been paged yet.
 
@@ -17243,6 +17704,8 @@ def claim_workspace_refusal_pages(conn, refused, *, channel: str = "alerts"):
                 f"AND kind IN ({marks}) ORDER BY id DESC",
                 (task_id, *kinds),
             ):
+                if kind == "claimed" and _claim_was_refused(conn, payload):
+                    continue  # refused after the claim: never admitted, same episode
                 if kind != _REFUSAL_PAGED_KIND:
                     break  # episode boundary
                 try:
@@ -18401,11 +18864,12 @@ def _record_worker_returncode(pid: int, code: int) -> None:
     if not pid or pid <= 0:
         return
     now = time.time()
-    _recent_worker_exits[int(pid)] = (int(code), now)
+    # (code, wall, boot evidence): the reap's upper bound on both clocks.
+    _recent_worker_exits[int(pid)] = (int(code), now, _boot_evidence())
     # Age-based trim: drop entries older than the TTL.
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
         cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
-        for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
+        for _pid in [p for p, e in _recent_worker_exits.items() if e[1] < cutoff]:
             _recent_worker_exits.pop(_pid, None)
     # Size cap as a final guard.
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
@@ -18819,6 +19283,7 @@ def _reap_birth(pid: int) -> Optional[float]:
 
 def _owned_identities(
     members: list[tuple[int, int]], sid: int, born_after: float, born_before: float,
+    *, after_boot: Optional[tuple] = None, before_boot: Optional[tuple] = None,
 ) -> dict[tuple[int, float], int]:
     """``{(pid, birth): pgid}`` of the members created inside the recorded
     run, i.e. between its claim and its last liveness evidence.
@@ -18839,11 +19304,31 @@ def _owned_identities(
     a child the worker started after its last heartbeat is indistinguishable
     from a recycled session's child and is left alone. Paths that verified
     the worker alive before signalling it bound on that moment instead.
+
+    Clock (t_29dee3c8): when both bounds carry CLOCK_BOOTTIME from this boot
+    (``after_boot``/``before_boot``, see :func:`_boot_window`), the record's
+    own /proc starttime birth is compared with them directly: no epoch, so a
+    wall-clock step after the evidence cannot move a birth into the window.
+    A bound from another boot is no ownership. Otherwise (old row, macOS,
+    another writer) the wall conversion below decides, and says so.
     """
+    mode, window = _boot_window(after_boot, before_boot)
+    if mode == "other_boot":
+        _log.info("kanban: session %d: run evidence is from another boot; "
+                  "no member can be the run's, not reaped", sid)
+        return {}
+    if mode == "wall" and _PRECISE_BIRTH:
+        _log.info("kanban: session %d: run evidence has no CLOCK_BOOTTIME bound "
+                  "(old row or another writer); ownership uses the wall conversion", sid)
     owned: dict[tuple[int, float], int] = {}
     for pid, _ in members:
         first = _reap_record(pid, sid)
         if first is None:
+            continue
+        if window is not None:
+            # ONE record carries membership, group and the BOOTTIME birth.
+            if window[0] <= first[1] <= window[1]:
+                owned[(pid, first[1])] = first[0]
             continue
         created = _ownership_birth(pid)
         if _reap_record(pid, sid) != first:
@@ -18869,6 +19354,8 @@ def _reap_worker_session(
     born_after: Optional[float],
     born_before: Optional[float],
     grace: float = 3.0,
+    after_boot: Optional[tuple] = None,
+    before_boot: Optional[tuple] = None,
 ) -> int:
     """SIGTERM every process group left in worker session ``sid``, wait up to
     ``grace`` seconds, then SIGKILL the survivors. Returns the groups signalled.
@@ -18876,7 +19363,9 @@ def _reap_worker_session(
     Call only once the worker is gone. Signals nothing unless the session is
     proved to be the recorded run's (:func:`_owned_identities`, with
     ``born_after`` = claim time and ``born_before`` = the last moment the
-    worker was known alive); unknown bounds mean no reap. Every later scan
+    worker was known alive; ``after_boot``/``before_boot`` are the same two
+    moments as ``(CLOCK_BOOTTIME, boot_id)``, see :func:`_boot_window`);
+    unknown bounds mean no reap. Every later scan
     must hold a member born before a moment some earlier-proved member was
     seen alive (re-checked during each scan), so a session that empties and
     has its sid reused mid-reap is never signalled.
@@ -18902,7 +19391,8 @@ def _reap_worker_session(
     members = _worker_session_members(sid)
     if not members:
         return 0
-    known = _owned_identities(members, sid, float(born_after), float(born_before))
+    known = _owned_identities(members, sid, float(born_after), float(born_before),
+                              after_boot=after_boot, before_boot=before_boot)
     if not known:
         _log.info(
             "kanban: session %d has %d member(s) but none from the recorded run; not reaped",
@@ -19179,12 +19669,16 @@ def _reap_run_env_escapees(
     born_after: Optional[float],
     born_before: Optional[float],
     grace: float = 3.0,
+    after_boot: Optional[tuple] = None,
+    before_boot: Optional[tuple] = None,
 ) -> int:
     """Second sweep after :func:`_reap_worker_session`: SIGTERM (then SIGKILL)
     the process groups of run-identified processes that escaped the worker's
     session (see :func:`_run_env_escapees`). Same proof as the session reap:
     only members born inside ``[born_after, born_before]`` — the recorded
-    run's window — are signalled; unknown bounds mean no reap. Call only once
+    run's window — are signalled; unknown bounds mean no reap. With BOOTTIME
+    bounds from this boot the /proc birth is compared directly
+    (:func:`_boot_window`); another boot's bounds reap nothing. Call only once
     the worker is gone. POSIX only; a no-op elsewhere."""
     import signal
 
@@ -19192,10 +19686,16 @@ def _reap_run_env_escapees(
         return 0
     if not (hasattr(os, "getsid") and hasattr(os, "killpg")):
         return 0
+    mode, window = _boot_window(after_boot, before_boot)
+    if mode == "other_boot":
+        return 0
+    birth = _member_birth
     lo, hi = float(born_after) - _BIRTH_SLACK_SECONDS, float(born_before)
+    if window is not None:
+        birth, (lo, hi) = _reap_birth, window
     matched: list[tuple[int, int, bool]] = []
     for pid, pgid, by_env in _run_env_escapees_detailed(task_id, run_id):
-        born = _member_birth(pid)
+        born = birth(pid)
         if born is None or not (lo <= born <= hi):
             continue
         matched.append((pid, pgid, by_env))
@@ -19267,10 +19767,12 @@ _ORPHAN_SWEEP_CARD_RE = re.compile(r"t_[0-9a-f]+")
 
 def _register_worker_identity(
     pid: int, task_id: str, run_id: Optional[int], spawned_at: float,
+    spawned_boot: Optional[tuple[float, str]] = None,
 ) -> None:
-    """Remember which card/run a spawned worker pid belongs to."""
+    """Remember which card/run a spawned worker pid belongs to, and when it was
+    spawned on both clocks (``spawned_boot`` = :func:`_boot_evidence`)."""
     with _worker_processes_lock:
-        _worker_identities[int(pid)] = (str(task_id), run_id, float(spawned_at))
+        _worker_identities[int(pid)] = (str(task_id), run_id, float(spawned_at), spawned_boot)
 
 
 def reap_exited_worker_leftovers(
@@ -19300,15 +19802,21 @@ def reap_exited_worker_leftovers(
             ident = _worker_identities.pop(int(pid), None)
         if ident is None:
             continue
-        task_id, run_id, spawned_at = ident
+        task_id, run_id, spawned_at = ident[:3]
+        boot = {"after_boot": ident[3] if len(ident) > 3 else None}
         exit_entry = _recent_worker_exits.get(int(pid))
-        now = exit_entry[1] if exit_entry else time.time()
+        if exit_entry:
+            now = exit_entry[1]
+            boot["before_boot"] = exit_entry[2] if len(exit_entry) > 2 else None
+        else:
+            now = time.time()
+            boot["before_boot"] = _boot_evidence()
         try:
             groups = _reap_worker_session(
-                int(pid), born_after=spawned_at, born_before=now, grace=grace,
+                int(pid), born_after=spawned_at, born_before=now, grace=grace, **boot,
             )
             escaped = _reap_run_env_escapees(
-                task_id, run_id, born_after=spawned_at, born_before=now, grace=grace,
+                task_id, run_id, born_after=spawned_at, born_before=now, grace=grace, **boot,
             )
         except Exception as exc:  # never break a dispatcher tick
             _log.warning("kanban: leftover reap of worker %s failed: %s", pid, exc)
@@ -19545,6 +20053,7 @@ def _reap_terminated_worker_session(
     pid, info: dict, signal_fn, owner_window: tuple,
     verified_alive_at: Optional[float], conn, task_id,
     run_id: Optional[int] = None,
+    *, verified_alive_boot: Optional[tuple[float, str]] = None,
 ) -> None:
     """Reap the leftovers of a worker ``_terminate_reclaimed_worker`` just
     proved gone. Session members must date from the recorded run: claimed
@@ -19556,19 +20065,22 @@ def _reap_terminated_worker_session(
     use fake or borrowed pids)."""
     if signal_fn is not None:
         return
-    born_before = verified_alive_at
+    claim_boot, last_boot = _run_boot_evidence(conn, task_id, run_id) \
+        if run_id is not None else (None, None)
+    born_before, before_boot = verified_alive_at, verified_alive_boot
     if born_before is None and run_id is not None:
         born_before = _run_last_evidence_at(conn, task_id, run_id)
+        before_boot = last_boot
     reaped = _reap_worker_session(
         pid, born_after=owner_window[0] if owner_window else None,
-        born_before=born_before,
+        born_before=born_before, after_boot=claim_boot, before_boot=before_boot,
     )
     if reaped:
         info["session_groups_reaped"] = reaped
     escaped = _reap_run_env_escapees(
         task_id, run_id,
         born_after=owner_window[0] if owner_window else None,
-        born_before=born_before,
+        born_before=born_before, after_boot=claim_boot, before_boot=before_boot,
     )
     if escaped:
         info["env_escapees_reaped"] = escaped

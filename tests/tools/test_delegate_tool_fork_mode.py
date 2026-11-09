@@ -143,6 +143,34 @@ def test_fork_first_request_prefix_byte_identical_to_parent_next_request():
     assert child_req["extra_headers"][_PIN] == _SEAT
 
 
+@pytest.mark.parametrize("mode", ["fork", "summary"])
+def test_parent_route_policy_survives_eligible_fork_and_summary(mode):
+    parent = _warm_parent()
+    parent._fallback_chain = [{"provider": "openai", "model": "cross-vendor"}]
+    parent.request_overrides = {"extra_body": {"nonce": "parent"}}
+    with ExitStack() as stack:
+        _patches(stack)
+        stack.enter_context(patch("tools.delegate_tool._load_config", return_value={
+            "model": "worker-default", "fallback_providers": []}))
+        child = _build_child_agent(
+            task_index=0, goal="verify inherited route", context=None, toolsets=None,
+            model="worker-default", override_provider="wrong-default-provider", max_iterations=5,
+            task_count=1, parent_agent=parent, inherit_mode=mode, inherit_parent_route=True,
+        )
+    try:
+        assert (child.provider, child.model) == (parent.provider, parent.model)
+        assert child._fallback_chain == parent._fallback_chain
+        if mode == "fork":
+            assert child._inherit_mode == "fork"
+        child._fallback_chain[0]["model"] = "child-only"
+        assert parent._fallback_chain[0]["model"] == "cross-vendor"
+        child.request_overrides["extra_body"]["nonce"] = "child"
+        assert parent.request_overrides["extra_body"]["nonce"] == "parent"
+    finally:
+        child.close()
+        parent.close()
+
+
 def test_fork_prefix_stops_at_last_complete_assistant_turn():
     """D-8: a delegate_task issued mid-turn sees the in-flight user row (and possibly an
     unfinished tool round) after the last complete assistant turn; none of it is copied."""
@@ -406,3 +434,38 @@ def test_fork_child_has_no_clarify():
     child = _build(_warm_parent())
     assert child._inherit_mode == "fork"
     assert getattr(child, "clarify_callback", None) is None
+
+
+# ── fork-fan RC-8: per-child attribution on the ineligible line ────────────
+
+
+def test_log_ineligible_carries_delegation_and_task_after_existing_fields(caplog):
+    caplog.set_level(logging.INFO, logger="tools.delegate_tool")
+    fork.log_ineligible("warm", SimpleNamespace(session_id="20261107_000000_p"), delegation_id="deleg_ab12", task_index=3)
+    rec = [r.getMessage() for r in caplog.records if "fork_ineligible" in r.getMessage()][-1]
+    assert rec == ("boomerang.fork_ineligible reason=warm parent_session=20261107_000000_p "
+                   "delegation=deleg_ab12 task=3")
+
+
+def test_log_ineligible_without_ids_is_unchanged(caplog):
+    caplog.set_level(logging.INFO, logger="tools.delegate_tool")
+    fork.log_ineligible("no_live_parent", SimpleNamespace(session_id="s1"))
+    rec = [r.getMessage() for r in caplog.records if "fork_ineligible" in r.getMessage()][-1]
+    assert rec == "boomerang.fork_ineligible reason=no_live_parent parent_session=s1"
+
+
+def test_build_child_downgrade_line_names_its_delegation_and_task(caplog):
+    parent = _warm_parent()
+    child = _build(parent)
+    child._session_messages = parent._session_messages
+    child.last_served_by, child.last_served_at = _SEAT, time.time()
+    caplog.set_level(logging.INFO, logger="tools.delegate_tool")
+    with ExitStack() as stack:
+        _patches(stack)
+        stack.enter_context(patch("tools.delegate_tool._load_config", return_value={}))
+        _build_child_agent(
+            task_index=2, goal="verify the canary", context=None, toolsets=None, model=None,
+            max_iterations=5, task_count=3, parent_agent=child, inherit_mode="fork", delegation_id="deleg_feed",
+        )
+    assert "boomerang.fork_ineligible reason=fork_depth" in caplog.text
+    assert "delegation=deleg_feed task=2" in caplog.text

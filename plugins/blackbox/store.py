@@ -180,7 +180,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             served_subs_json TEXT,
             attribution TEXT,
             terminal_error TEXT,
-            reasoning_effort TEXT
+            reasoning_effort TEXT,
+            placement_host TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -255,6 +256,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             usage_invariant_violation TEXT,
             corrected_prompt_tokens INT,
             upstream_requests INT,
+            -- 1 = the relay deferred this call's usage to the next response
+            -- of the turn (claude-bpx#564 arrival publish): its zero token
+            -- columns are by design, the tokens are on that next row.
+            usage_deferred INT,
             -- Who minted route_id (S7 D1): relay | harness | cli, derived from
             -- the id's prefix by relay_headers.route_id_origin. NULL with it.
             route_id_origin TEXT,
@@ -447,7 +452,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                       ("vendor", "TEXT"), ("served_provider", "TEXT"),
                       ("usage_invariant_violation", "TEXT"),
                       ("corrected_prompt_tokens", "INT"),
-                      ("upstream_requests", "INT")):
+                      ("upstream_requests", "INT"), ("usage_deferred", "INT")):
         if col not in _api_existing:
             try:
                 conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
@@ -547,7 +552,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # `reasoning_effort` (t_09a1e42a): the resolved effort label the turn ran
     # at (`xhigh`, `none`, ...), distinct from the `reasoning` TOKEN count.
     # NULL on rows written before the column existed.
-    for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort"):
+    # `placement_host` (t_c9fc6c9f): the box that ran a kanban worker's tools
+    # (pool host name, or `studio-local`); NULL for non-worker turns and for
+    # rows written before the column existed.
+    for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort",
+                 "placement_host"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
@@ -916,6 +925,7 @@ _INSERT_TURN_COLUMNS = (
     "terminal_error",
     "lane_family", "vendor", "served_provider",
     "reasoning_effort",
+    "placement_host",
 )
 
 _INSERT_TURN_SQL = (
@@ -1135,6 +1145,9 @@ def insert_turn(
                     (str(record.reasoning_effort).strip() or None)
                     if record.reasoning_effort is not None
                     else None,
+                    (str(record.placement_host).strip() or None)
+                    if record.placement_host is not None
+                    else None,
                 ),
             )
             if provisional and cur.rowcount == 0:
@@ -1307,6 +1320,7 @@ def insert_api_call(
     usage_invariant_violation: str | None = None,
     corrected_prompt_tokens: int | None = None,
     upstream_requests: int | None = None,
+    usage_deferred: bool = False,
 ) -> None:
     """Append one call, including zero-usage failures, without changing turn totals.
 
@@ -1335,9 +1349,9 @@ def insert_api_call(
                 cache_write_1h, cache_ttl_requested, lane_family, call_id,
                 route_id_origin, vendor, served_provider,
                 usage_invariant_violation, corrected_prompt_tokens,
-                upstream_requests
+                upstream_requests, usage_deferred
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?)
+                      ?, ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model,
              _measured(usage, "input_tokens"), _measured(usage, "output_tokens"),
@@ -1348,7 +1362,7 @@ def insert_api_call(
              AUX_LANE_FAMILY if aux else lane_family(provider), call_id,
              _route_id_origin(route_id), *_route_columns(provider, model)[1:],
              usage_invariant_violation, _int_or_none(corrected_prompt_tokens),
-             _int_or_none(upstream_requests)),
+             _int_or_none(upstream_requests), 1 if usage_deferred else None),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():

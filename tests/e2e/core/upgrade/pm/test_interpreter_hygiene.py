@@ -174,12 +174,14 @@ def test_kanban_worker_spawned_after_update_boots(updated, provider):
     log = sb.root / "kanban-dispatch.log"
     # One sandbox for dispatcher + worker (the worker outlives `kanban dispatch`, as on a real host);
     # the sandbox stays up until the worker's first model call is observed, then is torn down.
-    script = (f'H="{sb.hermes}"\n"$H" kanban init >/dev/null\n'
+    # Fork: a kanban verb with no derivable board is refused (S7 D2, kanban_board_select), so each
+    # verb names the default board, as handoff/_scenario.create_card does.
+    script = (f'H="{sb.hermes}"\n"$H" kanban --board default init >/dev/null\n'
               # Fork: `kanban create` refuses an unhomed card (t_09fea045); the sandbox has no session,
               # so opt in through the suite-compat env (same as handoff/_scenario.create_card).
-              'HERMES_KANBAN_ALLOW_UNHOMED_CREATE=1 "$H" kanban create "pm hygiene kanban probe" '
+              'HERMES_KANBAN_ALLOW_UNHOMED_CREATE=1 "$H" kanban --board default create "pm hygiene kanban probe" '
               '--assignee default --json\n'
-              '"$H" kanban dispatch --json\nsleep 600\n')
+              '"$H" kanban --board default dispatch --json\nsleep 600\n')
     with log.open("w") as out:
         proc = subprocess.Popen(H.sandbox_argv(["/bin/sh", "-c", script], writable=[sb.root]), env=P.lazy_env(sb),
                                 cwd=str(sb.root), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,

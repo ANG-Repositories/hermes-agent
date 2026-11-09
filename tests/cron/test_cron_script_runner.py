@@ -1471,6 +1471,72 @@ def test_d_skew_kill_rechecks_first_pass_survivors_after_the_confirmed_pass(root
     assert sched._restart_killed_job_ids == {key_a}
 
 
+@pytest.mark.parametrize("last_status,bounded", [("error", True), ("ok", False), (None, False)])
+def test_d_bounded_drain_does_not_wait_on_a_refire_spent_failing_job(root, monkeypatch,
+                                                                       last_status, bounded):
+    """t_af461294 (P1-A): a re-fire-spent job (restart_requeue_count at the cap) whose last run
+    failed no longer holds the bounded skew drain: past RUNNER_SKEW_DRAIN_MAX_S the runner takes the
+    bounded path and withholds that job's re-fire. A spent job whose last run was ok (or never ran)
+    still makes the drain wait (Prism 05343ab9e749)."""
+    import types
+
+    import cron.scheduler as sched
+    from cron import lanes, script_runner
+    from cron.jobs import RESTART_REQUEUE_COUNT_KEY, RESTART_REQUEUE_MAX, update_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    j = _job(root, "spent", "spent.sh", due_now=False)
+    with _profile_cron_scope(root):
+        update_job(j["id"], {RESTART_REQUEUE_COUNT_KEY: RESTART_REQUEUE_MAX,
+                             "last_status": last_status})
+    key = sched._inflight_key(j["id"], root)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(script_runner, "time", types.SimpleNamespace(
+        monotonic=lambda: clock["t"], time=time.time, sleep=time.sleep))
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    stop = threading.Event()
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(stop)
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+    try:
+        r.enumerate_homes()
+        assert r.draining and not stop.is_set()
+        clock["t"] += float(lanes.RUNNER_SKEW_DRAIN_MAX_S) + 1
+        r.enumerate_homes()
+    finally:
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+    assert r._skew_bounded is bounded
+    assert stop.is_set() is bounded and r.sigterm is bounded
+    assert getattr(r, "_skew_withhold", set()) == ({key} if bounded else set())
+
+
+def test_d_bounded_drain_fires_from_the_stop_poll_not_the_next_cycle(root, monkeypatch):
+    """t_af461294 drill: the bound was only checked on a ticker cycle (60 s), which landed ms short
+    of RUNNER_SKEW_DRAIN_MAX_S and held the drain to 180 s. ``main``'s 0.5 s stop poll checks it."""
+    import types
+
+    from cron import lanes, script_runner
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(script_runner, "time", types.SimpleNamespace(
+        monotonic=lambda: clock["t"], time=time.time, sleep=time.sleep))
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    monkeypatch.setattr(script_runner, "_inflight_refire_status", lambda: ([], set()))
+    stop = threading.Event()
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(stop)
+    r.enumerate_homes()
+    clock["t"] += float(lanes.RUNNER_SKEW_DRAIN_MAX_S) - 1
+    r.poll_skew_bound()
+    assert not stop.is_set()
+    clock["t"] += 1
+    r.poll_skew_bound()
+    assert r._skew_bounded and stop.is_set() and r.sigterm
+
+
 @pytest.mark.slow_test(180, reason="real runner subprocess")
 def test_d_code_skew_drain_waits_on_a_jobs_final_repetition(root, tmp_path, procs):
     """Prism cd1ea5071578: a run on its job's last finite repetition (repeat times 1, completed 0)

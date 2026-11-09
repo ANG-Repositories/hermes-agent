@@ -28,11 +28,14 @@ board loop). A change that ticks boards concurrently must add a lock here.
 Placement Phase 1b (PRD ``plans/2026-10-04_fleet-resource-aware-placement-PRD.md``
 v0.4, I-3, I-8, F-5, F-6; card t_1e4b9684): with a ``TargetSignal`` (config
 ``kanban.placement.read_signal``, default true) the same ssh probe also reads
-the host's ``host-pressure.json`` and the remote clock. ``plan()`` advances a
-per-host hot/clear streak once per new remote ``at`` and persists it;
-``take()`` only reads it. Stale/unreadable pressure is UNKNOWN (refused,
-``reachable: false``, streak reset), never hot. Without a signal the planner
-is KWLB v0.1, byte for byte.
+the host's ``host-pressure.json`` and the remote clock. Stale/unreadable
+pressure is UNKNOWN (refused, ``reachable: false``), never hot. The published
+``band.kanban`` is admission.admit_class's own verdict (hermes-home
+host-pressure.py, t_5d7e7171), so the plan keeps no hot/clear streak of its
+own: under the ONE rule (KANBAN_UNIFIED_ADMIT) every take asks may_start and
+the plan never closes a host on the band; with that rule's kill switch a hot
+band closes the host for the tick. Without a signal the planner is KWLB v0.1,
+byte for byte.
 """
 
 from __future__ import annotations
@@ -47,10 +50,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from hermes_cli import kanban_admission as _admission
 from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
+
+logger = logging.getLogger(__name__)
 
 ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
@@ -60,13 +64,16 @@ SIDECAR_FILE = "kanban-pool.json"
 # until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
 # kanban-worker joined (t_c834e0d8, bug class A: admission is measured use, never
 # a count): ``{}`` parses to ``PoolHost.slots = None``; a legacy count stays a ceiling.  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
-COUNT_FREE_ROLES = frozenset({"ci-runner", ROLE})
+# review-worker joined (t_e85e77b7): hermes-home #9338 made every Prism member row
+# ``{}``; refusing it refused the whole pool (``refused:roles``) and nothing spilled.
+COUNT_FREE_ROLES = frozenset({"ci-runner", "review-worker", ROLE})
 # A count-free kanban host's free slots for ONE plan (t_c834e0d8). A per-tick  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # stand-in so ``plan.slots`` / ``budget`` / load_gate.json stay finite ints; it is  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # not a concurrency count (running workers are not subtracted). Measured
-# admission decides: allocd / the placement ledger per take, the band and the
-# memory cap per plan. Equal to the fleet-roles slots maximum (1..64).  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
-UNCOUNTED_TICK_FREE = 64
+# admission decides: allocd / the placement ledger per take, the band per plan.
+# 1000 = the fleet's runaway stop (t_b20850d2, FWA-H: a surviving count is 1000),
+# so it never binds in the working range and the plan budget is never a slot sum.
+UNCOUNTED_TICK_FREE = 1000
 
 
 def count_free(h: "PoolHost", running: int) -> int:
@@ -299,7 +306,8 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
             slots = spec["slots"]
             if isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64:
                 raise PoolError(f"fleet-roles.json: host {hid}: role {role} slots must be 1..64")
-            parsed[role] = slots
+            # t_b20850d2 (FWA-H): a legacy kanban-worker count is validated, never read as capacity
+            parsed[role] = None if role == ROLE else slots
         if row["state"] not in _STATES:
             raise PoolError(f"fleet-roles.json: host {hid}: state must be one of {_STATES}")
         out[hid] = (parsed, row["state"])
@@ -1197,6 +1205,15 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
             return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
             return False, _reasons.HOST_REACH, None
+    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals)
+    if need_hosts is not None:
+        if pin not in (None, PIN_ANY) and pin not in need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
+        # `host: any` returns below before soft_rule/studio_affinity, so it is checked here. An unpinned card
+        # is not: it must still reach soft_rule first (an identity-only capability wait, AC-5), and
+        # studio_affinity enforces its needs after that (Prism ed96eb421c9c).
+        if pin == PIN_ANY and not need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:
@@ -1431,11 +1448,15 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
             f"{tail}")
 
 
-def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
-               pressure_path: Optional[str] = None,
-               workspaces_root: Optional[str] = None,
-               workspace_paths: Sequence[str] = ()) -> Union[None, Tuple[float, int], HostSample]:
-    """``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
+def _probe_once(h: PoolHost, runner: Callable, *,
+                pressure_path: Optional[str] = None,
+                workspaces_root: Optional[str] = None,
+                workspace_paths: Sequence[str] = (),
+                direct: bool = False):
+    """One ssh round-trip: ``(result, error)``; ``error`` names why ``result``
+    is None. ``direct`` bypasses any ControlMaster mux (t_64342f07).
+
+    ``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
     With ``pressure_path`` the same call also returns the remote clock and
     the pressure file as a :class:`HostSample`. With ``workspaces_root`` it
     also lists the boards the host can host (``HostSample.boards``,
@@ -1443,27 +1464,36 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     With ``workspace_paths`` the same call reports each path's state
     (``HostSample.workspace_states``, t_8bfdcc07) and a changed host key
     raises :class:`HostKeyChanged` instead of reading as plain unreachable."""
+    argv = _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root, workspace_paths))
+    timeout = PROBE_TIMEOUT_SECONDS
+    if direct:
+        argv = argv[:1] + list(DIRECT_PROBE_SSH_OPTS) + argv[1:]
+        timeout = DIRECT_PROBE_TIMEOUT_SECONDS
     try:
         proc = runner(
-            _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root, workspace_paths)),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, stdin=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if getattr(proc, "returncode", 1) != 0:
-        err = (getattr(proc, "stderr", "") or "").lower()
-        if workspace_paths and getattr(proc, "returncode", 1) == 255 and (
+    except subprocess.TimeoutExpired:
+        return None, f"timeout after {timeout}s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:160]
+    rc = getattr(proc, "returncode", 1)
+    if rc != 0:
+        raw = (getattr(proc, "stderr", "") or "").strip()
+        err = raw.lower()
+        if workspace_paths and rc == 255 and (
                 "host key verification failed" in err
                 or "remote host identification has changed" in err):
             raise HostKeyChanged(h.name)
-        return None
+        last = raw.splitlines()[-1].strip() if raw else ""
+        return None, f"ssh rc={rc}" + (f": {last[:120]}" if last else "")
     out = proc.stdout or ""
     states: Optional[Dict[str, str]] = None
     if workspace_paths:
         out, sep, listed = out.partition(STATES_MARKER + "\n")
         if not sep:
-            return None  # the state list never printed: fail closed
+            return None, "probe output missing workspace states"  # fail closed
         states = {}
         try:
             got = json.loads(listed.strip().split("\n")[0] or "null")
@@ -1478,20 +1508,20 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     if workspaces_root:
         out, sep, listed = out.partition(BOARDS_MARKER + "\n")
         if not sep:
-            return None  # the board list never printed: fail closed
+            return None, "probe output missing board list"  # fail closed
         boards = frozenset(b.strip() for b in listed.split("\n") if b.strip())
     lines = out.split("\n")
     try:
         load1 = float(lines[0].split()[0])
         ncpu = int(lines[1].strip())
     except (IndexError, ValueError):
-        return None
+        return None, "unparseable probe output"
     if ncpu <= 0:
-        return None
+        return None, f"bad ncpu {ncpu}"
     if pressure_path is None:
         if boards is None and states is None:
-            return (load1, ncpu)
-        return HostSample(load1, ncpu, boards=boards, workspace_states=states)
+            return (load1, ncpu), ""
+        return HostSample(load1, ncpu, boards=boards, workspace_states=states), ""
     try:
         remote_now: Optional[float] = float(lines[2].strip())
     except (IndexError, ValueError):
@@ -1501,7 +1531,133 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     except (IndexError, ValueError):
         load5 = None
     return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards,
-                      load5=load5, workspace_states=states)
+                      load5=load5, workspace_states=states), ""
+
+
+
+# -- probe failure vs host down (t_64342f07) ----------------------------------
+# 2026-11-06: 31 ready cards waited ``pool_unavailable (ci-box: host
+# unreachable; ace-media: host unreachable)`` while both hosts answered ssh in
+# <2 s. The probe rides the ~/.ssh/config ControlMaster mux; a stale master
+# (ace-media, after a reboot) or a cold handshake on a loaded box (ci-box,
+# 39 s) failed every tick. So: a failed muxed probe is retried ONCE on a direct
+# connection (no mux, longer handshake budget), and a host that answered
+# recently keeps its last sample for PROBE_GRACE_FAILS ticks before it reads
+# unreachable. Nothing is sticky: every tick probes again, and the unreachable
+# reason names the probe, its error and when it was last tried / last answered.
+DIRECT_PROBE_SSH_OPTS = ("-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=10")
+DIRECT_PROBE_TIMEOUT_SECONDS = 15
+PROBE_GRACE_FAILS = 3
+PROBE_GRACE_SECONDS = 900
+_REAL_RUN = subprocess.run
+
+
+@dataclass
+class _ProbeRecord:
+    last_ok_at: Optional[float] = None
+    last_sample: Any = None
+    fails: int = 0
+    last_error: str = ""
+    last_tried_at: Optional[float] = None
+    reused: bool = False
+
+
+class ProbeMemory:
+    """Per-host probe outcomes, in-process (like ``_board_faults``): the
+    gateway is the one long-lived prober, and a restart re-probes."""
+
+    def __init__(self) -> None:
+        self._rows: Dict[str, _ProbeRecord] = {}
+
+    def row(self, h: PoolHost) -> _ProbeRecord:
+        return self._rows.setdefault(f"{h.target}:{h.ssh_port}", _ProbeRecord())
+
+    def get(self, h: PoolHost) -> Optional[_ProbeRecord]:
+        return self._rows.get(f"{h.target}:{h.ssh_port}")
+
+    def clear(self) -> None:
+        self._rows.clear()
+
+
+_PROBE_MEMORY = ProbeMemory()
+
+
+def _hhmmss(t: Optional[float]) -> str:
+    return "never" if t is None else time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def probe_note(h: PoolHost, memory: Optional[ProbeMemory] = None) -> str:
+    """One line for a placement_wait detail: which probe, which error, when
+    last tried and when the host last answered. "" when the last probe was
+    clean."""
+    rec = (memory or _PROBE_MEMORY).get(h)
+    if rec is None or rec.fails == 0:
+        return ""
+    head = (f"ssh probe {h.target} failed {rec.fails}x ({rec.last_error}), "
+            f"last tried {_hhmmss(rec.last_tried_at)}, last ok {_hhmmss(rec.last_ok_at)}")
+    return head + (", reusing last sample" if rec.reused else "")
+
+
+def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
+               pressure_path: Optional[str] = None,
+               workspaces_root: Optional[str] = None,
+               workspace_paths: Sequence[str] = (),
+               memory: Optional[ProbeMemory] = None,
+               now: Optional[float] = None) -> Union[None, Tuple[float, int], HostSample]:
+    """The sample from :func:`_probe_once`, or None (fail closed).
+
+    A failed probe is retried once on a direct (un-muxed) connection, so a
+    stale ControlMaster or a slow handshake is not read as a dead host. A
+    host whose last answer is under ``PROBE_GRACE_FAILS`` failures and
+    ``PROBE_GRACE_SECONDS`` old keeps that sample (load/pressure only: the
+    workspace states are dropped, so continuation reads ``unknown``).
+    ``memory`` defaults to the process-wide record only for the real
+    ``subprocess.run`` runner, so injected runners stay hermetic."""
+    if memory is None and runner is _REAL_RUN:
+        memory = _PROBE_MEMORY
+    kw = dict(pressure_path=pressure_path, workspaces_root=workspaces_root,
+              workspace_paths=workspace_paths)
+    got, err = _probe_once(h, runner, **kw)
+    if got is None:
+        direct, derr = _probe_once(h, runner, direct=True, **kw)
+        if direct is not None:
+            got, err = direct, ""
+            if runner is _REAL_RUN:
+                _drop_stale_master(h)
+        else:
+            err = f"mux: {err}; direct: {derr}"
+    if memory is None:
+        return got
+    rec = memory.row(h)
+    rec.last_tried_at = time.time() if now is None else now
+    if got is not None:
+        rec.last_ok_at, rec.last_sample = rec.last_tried_at, got
+        rec.fails, rec.last_error, rec.reused = 0, "", False
+        return got
+    rec.fails += 1
+    rec.last_error = err
+    rec.reused = (rec.last_sample is not None and rec.last_ok_at is not None
+                  and rec.fails <= PROBE_GRACE_FAILS
+                  and rec.last_tried_at - rec.last_ok_at <= PROBE_GRACE_SECONDS)
+    logger.warning("kanban pool: %s", probe_note(h, memory))
+    if not rec.reused:
+        return None
+    last = rec.last_sample
+    if isinstance(last, HostSample) and last.workspace_states is not None:
+        import dataclasses
+        last = dataclasses.replace(last, workspace_states=None)
+    return last
+
+
+def _drop_stale_master(h: PoolHost) -> None:
+    """The muxed probe failed and a direct one answered: the ControlMaster is
+    stale (ace-media 2026-11-06). Ask it to exit so the next tick re-masters;
+    best effort, bounded."""
+    argv = ["ssh", "-O", "exit"] + (["-p", str(h.ssh_port)] if h.ssh_port != 22 else []) + [h.target]
+    try:
+        subprocess.run(argv, capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 # -- per-(host, board) workspace faults (t_9fb4d477) --------------------------
@@ -1533,7 +1689,6 @@ def board_fault(host: str, board: str, *, now: Optional[float] = None) -> Option
 # -- target pressure + hysteresis (Placement PRD Phase 1b) -------------------
 
 BAND_OK, BAND_WARM, BAND_HOT, BAND_UNKNOWN = "ok", "warm", "hot", "unknown"
-TARGET_STATE_FILE = "kanban-target-state.json"
 
 
 def _kanban_unified_admit(signal: Any = None) -> bool:
@@ -1551,17 +1706,12 @@ class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
 
     policy: Any                       # placement_policy.PlacementPolicy
-    state_path: Path                  # <root>/var/kanban-target-state.json
     ledger_dir: Path                  # <root>/var/placement
     cpu_est: Optional[float] = None   # kanban's measured slope; None = policy prior
     clock: Callable[[], float] = time.time
     # A fixed ledger read for _warm_pick (diagnostics --placement keeps one
     # snapshot per report). None = read fresh per pick (RC7, the dispatcher).
     reservations: Optional[List[Any]] = None
-    # Saturation 4.2 (t_31350981): kanban.placement.admit_on_memory. False =
-    # the memory/band cap is computed and reported only (D1: Ace's yes flips it).
-    admit_on_memory: bool = False
-    reservation_gb: float = _admission.DEFAULT_RESERVATION_GB
     # The ONE placement scorer (t_d6ce856e): <root>/config/fleet-hosts.json and
     # the headroom reservation ledger. None = no table: the band pick below.
     placement_table: Any = None
@@ -1615,44 +1765,15 @@ def read_pressure(remote_now: Optional[float], text: str, *,
     return (float(at), band), ""
 
 
-def _load_state(path: Path) -> dict:
+def _band_reason(text: str) -> str:
+    """The sampler's ``band_reason.kanban`` (the admitter's reason for its verdict), or ""."""
     try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return {}
-    hosts = doc.get("hosts") if isinstance(doc, dict) else None
-    return hosts if isinstance(hosts, dict) else {}
-
-
-def advance_streak(prev: Optional[Mapping], at: Optional[float], band: str, *,
-                   hot_streak: int, clear_streak: int, now: float,
-                   discard_after_s: float) -> dict:
-    """One sample's step of the per-host hysteresis (F-5). A repeated ``at``
-    is a no-op; state older than ``discard_after_s`` is discarded first.
-
-    UNKNOWN neither builds nor erases a streak (I-3, F-5 addendum t_36840c8a):
-    the state is kept as-is, ``updated`` included, so an earned hot verdict
-    still needs ``clear_streak`` fresh non-hot samples and a host that stays
-    UNKNOWN past ``discard_after_s`` starts over. ``plan()`` refuses the
-    UNKNOWN tick itself."""
-    st = dict(prev) if isinstance(prev, Mapping) else {}
-    updated = st.get("updated")
-    if not isinstance(updated, (int, float)) or now - float(updated) > discard_after_s:
-        st = {}
-    if band == BAND_UNKNOWN or at is None:
-        return {"at": st.get("at"), "hot": bool(st.get("hot")), "hot_run": int(st.get("hot_run") or 0),
-                "clear_run": int(st.get("clear_run") or 0), "updated": st.get("updated")}
-    if st.get("at") == at:
-        return st
-    hot, hot_run, clear_run = bool(st.get("hot")), int(st.get("hot_run") or 0), int(st.get("clear_run") or 0)
-    if band == BAND_HOT:
-        hot_run, clear_run = hot_run + 1, 0
-        hot = hot or hot_run >= hot_streak
-    else:
-        hot_run, clear_run = 0, clear_run + 1
-        if hot and clear_run >= clear_streak:
-            hot = False
-    return {"at": at, "hot": hot, "hot_run": hot_run, "clear_run": clear_run, "updated": now}
+        doc = json.loads(text) if text else None
+    except ValueError:
+        return ""
+    why = doc.get("band_reason") if isinstance(doc, dict) else None
+    why = why.get("kanban") if isinstance(why, dict) else None
+    return why[:300] if isinstance(why, str) else ""
 
 
 def running_by_host(conn) -> Dict[str, int]:
@@ -1692,9 +1813,6 @@ class SpilloverPlan:
     default_remote: bool = False
     signal: Optional[TargetSignal] = None  # None = KWLB v0.1 (read_signal false)
     taken: Dict[str, int] = field(default_factory=dict)  # this tick's takes, per host
-    # host -> why the memory/band cap is below its free slots (t_31350981);
-    # filled with the flag off too, so the dry readback has its numbers.
-    admission: Dict[str, str] = field(default_factory=dict)
     last_pick: Optional[str] = None      # hysteresis for placement.choose()
     last_decision: Any = None            # the placement.Decision behind the last take()
     last_reservation: Optional[str] = None  # the headroom reservation the last take() wrote
@@ -2096,9 +2214,10 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
     enabled, under its slots and probed under ``capacity_pct x ncpu`` (I-3).
     A host with no free slot or not active is not probed.
 
-    With ``signal`` the load bar is the host's pressure band instead: the
-    per-host streak advances here, once per new remote ``at`` (F-5), and a
-    host is refused when its streak says hot or its pressure is UNKNOWN.
+    With ``signal`` the load bar is the host's published pressure band
+    instead (admit_class's verdict, t_5d7e7171): a host is refused when its
+    pressure is UNKNOWN, and when its band is hot only while the ONE rule's
+    kill switch is set; under the ONE rule each take asks may_start itself.
 
     ``workspace_paths`` (host -> paths, t_8bfdcc07) rides the same probe: a
     host holding continuation state is probed even with no free slot, and
@@ -2188,85 +2307,47 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     states = {} if states is None else states
     policy = signal.policy
     now = signal.clock()
-    discard_after = policy.stale_after_s * 3
     ordered = sorted(hosts, key=lambda x: x.priority)
-    # Pass 1: probe. samples[name] = (at, band) for every host probed this tick.
+    # Pass 1: probe every host eligible for work.
     probed: Dict[str, dict] = {}
-    samples: Dict[str, Tuple[Optional[float], str]] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
         free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "band_cap": "",
-               "boards": None}
+               "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
-            row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
-            row["band_cap"] = _admission.band_cap(sample.pressure_text)
             if signal.placement_table is not None:
                 from hermes_cli import kanban_headroom as _kh
                 row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
                                                      stale_after_s=policy.stale_after_s, local_now=now)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
                                             stale_after_s=policy.stale_after_s)
-            at, row["band"] = (None, BAND_UNKNOWN) if got is None else got
-            samples[h.name] = (at, row["band"])
+            row["band"] = BAND_UNKNOWN if got is None else got[1]
+            row["band_reason"] = _band_reason(sample.pressure_text) if got is not None else ""
         elif sample is not None:  # a v0.1-shape probe: no pressure read
             row["load1"], row["ncpu"] = sample
             row["band"], row["why"] = BAND_UNKNOWN, "pressure not probed"
-            samples[h.name] = (None, BAND_UNKNOWN)
         elif free > 0:
-            row["band"], row["why"] = BAND_UNKNOWN, "host unreachable"
-            samples[h.name] = (None, BAND_UNKNOWN)
+            note = probe_note(h)
+            row["band"], row["why"] = BAND_UNKNOWN, "host unreachable" + (f" ({note})" if note else "")
         probed[h.name] = row
 
-    # Pass 2: advance every streak against the COMMITTED state, under the
-    # state file's lock, so two planners on one root never lose a sample.
-    def advance(old: Mapping) -> Mapping:
-        hs = old.get("hosts") if isinstance(old.get("hosts"), dict) else {}
-        out = dict(hs)
-        for name, (at, band) in samples.items():
-            kb = policy.kanban_band(name)
-            out[name] = advance_streak(hs.get(name), at, band, hot_streak=kb.hot_streak,
-                                       clear_streak=kb.clear_streak, now=now,
-                                       discard_after_s=discard_after)
-        return {"hosts": out, "updated": now}
-
-    try:
-        committed = _ledger.update_json(signal.state_path, advance).get("hosts") or {}
-    except Exception as exc:  # unsaved state: decide on this tick's step from what is on disk
-        _log.warning("kanban pool: target state not saved: %s", exc)
-        committed = advance({"hosts": _load_state(signal.state_path)})["hosts"]
-
+    # t_5d7e7171 (FWA-G): no second verdict. Under the ONE rule a host is never closed here on its band (each take
+    # runs may_start, which IS the band's formula); otherwise a hot band closes it this tick, with no streak.
+    band_closes = not _kanban_unified_admit(signal)
     slots: Dict[str, int] = {}
     detail: Dict[str, dict] = {}
-    admission: Dict[str, str] = {}
     for h in ordered:
         r = probed[h.name]
         band, why, free = r["band"], r["why"], r["free"]
-        st = committed.get(h.name)
-        hot = bool(isinstance(st, Mapping) and st.get("hot")) and band not in (None, BAND_UNKNOWN)
+        hot = band == BAND_HOT and band_closes
         if band == BAND_UNKNOWN:
             free = 0
         elif hot:
             free = 0
-            why = f"band hot (streak {policy.kanban_band(h.name).hot_streak}, {band} now)"
-        else:
-            limit, cap_why = r["cap"]
-            if limit is not None and limit < free:
-                admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
-                # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the memory axis is admit_class's (measured estimate,
-                # not 6 GB per worker); the cap is still computed and reported, never enforced
-                if signal.admit_on_memory and not _kanban_unified_admit(signal):
-                    free = limit
-                    if free == 0:
-                        why = f"admission: {cap_why}"
-                elif signal.admit_on_memory and r["band_cap"]:
-                    # ...but only the memory axis: a PUBLISHED hot band.kanban still closes the host on every
-                    # path, pinned and unpinned (Prism ce581503f8d8, t_c466b7ee)
-                    free = 0
-                    why = f"admission: {r['band_cap']}"
+            why = f"band hot (admit_class: {r['band_reason'] or 'no reason published'})"
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],
@@ -2274,11 +2355,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             "reachable": (band not in (None, BAND_UNKNOWN)) if r["probed"] else None,
             "band": band, "hot": hot,
             **({"pressure": why} if why else {}),
-            **({"admission": admission[h.name]} if h.name in admission else {}),
             **({"boards": sorted(r["boards"])} if r["boards"] is not None else {}),
             **(r.get("placement") or ({"sample_status": "absent"} if signal.placement_table is not None
                                       and r["probed"] else {})),
         }
-    plan = _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
-    plan.admission = admission
-    return plan
+    return _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)

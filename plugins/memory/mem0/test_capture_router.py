@@ -397,8 +397,13 @@ def test_secret_cache_ttl_and_single_mint():
     ex._secret_cache["op://x"] = (tok, _ts - ex._secret_ttl_s - 1)
     assert ex._secret("op://x") == "tok-2"
     assert len(mints) == 2
-    # invalidate_secret -> re-mint on demand (rotation heal path)
-    ex.invalidate_secret("op://x")
+    # invalidate_secret right after a read is refused: re-reading returns the same value
+    assert ex.invalidate_secret("op://x") is False
+    assert ex._secret("op://x") == "tok-2" and len(mints) == 2
+    # invalidate_secret on a value older than the retry window -> re-mint (rotation heal path)
+    tok, _ts = ex._secret_cache["op://x"]
+    ex._secret_cache["op://x"] = (tok, _ts - ex._secret_retry_s - 1)
+    assert ex.invalidate_secret("op://x") is True
     assert ex._secret("op://x") == "tok-3"
 
 
@@ -419,12 +424,39 @@ def test_auth_shaped_error_refreshes_secret_and_retries():
         inner = json.dumps({"candidates": []})
         return json.dumps({"choices": [{"message": {"content": inner}}], "usage": {}})
 
+    import time as _time
     ex = BridgeExtractor(auth_fn=fake_auth, http_fn=fake_http)
+    # rotation case: the primary token was read (and cached) longer ago than the retry window
+    mints.append(ex._primary_ref)
+    ex._secret_cache[ex._primary_ref] = ("tok-1", _time.time() - ex._secret_retry_s - 1)
     res = ex.extract("sys", "u", "a")
     assert res["provider"] == "codex-bridge"      # healed on primary, no fallback needed
     assert res["candidates"] == []
     assert calls == ["Bearer tok-1", "Bearer tok-2"]
     assert len(mints) == 2
+
+
+@pytest.mark.parametrize("readable", [True, False], ids=["secret_rejected", "op_read_fails"])
+def test_n_captures_against_a_rejecting_bridge_read_each_secret_once(readable):
+    """t_8ca13fd0: with a bridge answering 401 on every call, the 401 refresh path re-ran `op read`
+    on every capture (GIL profile: 24/996 samples were that fork). N captures must cost one read per
+    ref plus at most one rotation re-read, and every capture must still FAIL (never skip)."""
+    import urllib.error as _ue
+    reads = []
+
+    def fake_auth(ref):
+        reads.append(ref)
+        return "stale-token" if readable else ""
+
+    def always_401(url, body, headers, timeout):
+        raise _ue.HTTPError(url, 401, "unauthorized", None, None)
+
+    ex = BridgeExtractor(auth_fn=fake_auth, http_fn=always_401)
+    results = [ex.extract("sys", "u", "a") for _ in range(10)]
+    assert all(r["provider"] == "none" and "401" in r["error"] for r in results)
+    per_ref = {ref: reads.count(ref) for ref in set(reads)}
+    assert set(per_ref) == {ex._primary_ref, ex._fallback_ref}
+    assert max(per_ref.values()) <= (2 if readable else 1), per_ref
 
 
 # ---------------------------------------------------------------------------
@@ -664,3 +696,61 @@ def test_default_write_same_target_reentrant_writers_do_not_collide(tmp_path, mo
     with open(target, encoding="utf-8-sig") as fh:
         assert fh.read() == "A-content"                 # last publish wins, whole (never truncated)
     assert sorted(os.listdir(os.path.dirname(target))) == ["turn.md"]   # no temp left behind
+
+
+# ---------------------------------------------------------------------------
+# 1Password read budget (t_f32095d5)
+# ---------------------------------------------------------------------------
+
+def _counting_exe(path, log, stdout):
+    """A fake executable that appends its argv to `log` and prints `stdout`."""
+    path.write_text("#!/bin/sh\n"
+                    f"echo \"$@\" >> {log}\n"
+                    f"echo {stdout}\n")
+    path.chmod(0o755)
+
+
+@pytest.fixture
+def op_env(tmp_path, monkeypatch):
+    """Isolated fleet root + a fake `op` that counts calls; the process secret cache starts empty."""
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    log = tmp_path / "op-calls.log"
+    log.write_text("", encoding="utf-8")
+    _counting_exe(tmp_path / "op", log, "tok")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("OP_BIN", str(tmp_path / "op"))
+    monkeypatch.setattr(cr, "_PROCESS_SECRET_CACHE", {}, raising=False)
+    monkeypatch.setattr(cr, "_PROCESS_SECRET_LOCKS", {}, raising=False)
+    return root, log
+
+
+def test_twenty_captures_on_fresh_routers_read_each_secret_once(op_env):
+    """Every mem0 provider builds its own router, so 20 captures can run on 20 extractors.
+    They must cost at most one 1Password read per ref per TTL, not one per extractor."""
+    _root, log = op_env
+    cfg = {"mem0_capture_router": {"enabled": True,
+                                   "primary_secret_ref": "op://V/p/secret",
+                                   "fallback_secret_ref": "op://V/f/secret"}}
+    for _ in range(20):
+        ex = build_router_from_config(cfg)._extractor
+        ex._http = lambda url, body, headers, timeout: _resp([])
+        assert ex.extract("sys", "u", "a")["provider"] == "codex-bridge"
+        ex._call(ex._fallback_url, ex._fallback_ref, "m", "sys", "u", "a")
+    calls = log.read_text(encoding="utf-8-sig").splitlines()
+    assert calls.count("read op://V/p/secret") == 1, calls
+    assert calls.count("read op://V/f/secret") == 1, calls
+
+
+def test_default_reader_goes_through_op_cached_read_when_present(op_env, tmp_path):
+    """With the fleet's op-cached-read installed, the router never execs raw `op`."""
+    root, op_log = op_env
+    cached_log = tmp_path / "cached-calls.log"
+    # run with the gateway's own interpreter, so the fake is Python, not sh
+    (root / "scripts" / "op-cached-read").write_text(
+        "import sys\n"
+        f"open({str(cached_log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "print('cached-tok')\n", encoding="utf-8")
+    assert BridgeExtractor._op_read("op://V/p/secret") == "cached-tok"
+    assert cached_log.read_text(encoding="utf-8-sig").split()[-1] == "op://V/p/secret"
+    assert op_log.read_text(encoding="utf-8-sig") == ""

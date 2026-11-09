@@ -14,6 +14,7 @@ import threading
 import time
 
 import pytest
+import run_agent  # Bootstrap recovery before the per-test home-I/O guard.
 from types import SimpleNamespace
 
 from gateway import kanban_boomerang_wake as ah
@@ -65,6 +66,7 @@ def _config(on: bool) -> None:
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_STATE_DELETED_WAL_CHECK", "registry")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     for var in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_SESSION_ID",
                 "HERMES_PROFILE_NAME", "HERMES_PROFILE"):
@@ -872,8 +874,7 @@ def _gate(env, tmp_path, *, load: float, lane=None, axis="load1", cpu=None):
 
     kw = {"cpu_sampler": (lambda prev: (cpu, object()))} if cpu is not None else {}
     env["runner"]._kanban_wake_gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                    "wake_load_gate": {"host_axis": axis}}},
+        {"kanban": {"wake_load_gate": {"pause_above": 64, "resume_below": 48, "host_axis": axis}}},
         ncpu=32, loadavg=lambda: (load, load, load), lane_probe=lambda p: lane,
         state_file=tmp_path / "wake_gate.json", **kw)
 
@@ -959,9 +960,14 @@ def _resolve(monkeypatch, runner, *, mode="fork", wait_s=0.0):
 
 
 def test_busy_parent_fold_logs_parent_busy(monkeypatch, caplog):
+    parent = SimpleNamespace(model="active", provider="active", base_url="http://active",
+                             api_key="synthetic", client=None, _client_kwargs={}, _fallback_chain=[])
+    runner = _Runner(running={"k1": parent})
+    runner.session_store = SimpleNamespace(load_transcript=lambda sid: [])
     with caplog.at_level("INFO", logger="tools.delegate_tool"):
-        out = _resolve(monkeypatch, _Runner(running={"k1": object()}))
-    assert out == ("db-parent", "summary")
+        out = _resolve(monkeypatch, runner)
+    assert out[1] == "summary" and out[0].model == parent.model
+    assert out[0] is not parent
     assert "boomerang.fork_ineligible reason=parent_busy parent_session=20261020_000000_parent" in caplog.text
 
 
@@ -1193,14 +1199,19 @@ def test_db_parent_sends_the_configured_gateway_model(monkeypatch):
                         lambda: {"provider": "p", "base_url": "u", "api_key": "k", "capabilities": {}})
     monkeypatch.setattr(gr, "_resolve_gateway_model", lambda *a, **k: "cfg-model")
     monkeypatch.setattr(run_agent, "AIAgent", _Agent)
-    runner = SimpleNamespace(session_store=SimpleNamespace(load_transcript=lambda sid: []))
-    ah._db_parent(runner, SimpleNamespace(session_id="s1"))
+    from gateway.run import GatewayRunner
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.session_store = SimpleNamespace(load_transcript=lambda sid: [])
+    runner._session_model_overrides = {}
+    runner._refresh_fallback_model = lambda: None
+    home = SimpleNamespace(session_id="s1", session_key=None, origin=None)
+    ah._db_parent(runner, home)
     assert seen["model"] == "cfg-model"
 
     # a fallback route's own model wins over config (same precedence as a gateway turn, #112600)
     monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs",
                         lambda: {"provider": "p2", "model": "fallback-model", "_fallback_notice": "n"})
     seen.clear()
-    ah._db_parent(runner, SimpleNamespace(session_id="s1"))
+    ah._db_parent(runner, home)
     assert seen["model"] == "fallback-model" and "_fallback_notice" not in seen
 

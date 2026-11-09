@@ -84,11 +84,19 @@ def _inflight_count() -> int:
 
 
 def _inflight_refire_spent() -> List[tuple]:
-    """``(job_id, elapsed_s)`` per in-flight run whose job could NOT be re-fired if killed now: the
-    same test ``request_restart_requeue`` applies (a cron/interval job under ``RESTART_REQUEUE_MAX``).
-    A run that is itself the re-fire, a job at the cap, a job on its final finite repetition, a
-    one-shot or an unreadable job counts as spent, so the bounded skew drain waits for it instead of
-    losing the run (Prism 05343ab9e749, cd1ea5071578)."""
+    """``(job_id, elapsed_s)`` per in-flight run that holds the bounded skew drain."""
+    return _inflight_refire_status()[0]
+
+
+def _inflight_refire_status() -> tuple:
+    """``(spent, failed_keys)``. ``spent``: ``(job_id, elapsed_s)`` per in-flight run whose job
+    could NOT be re-fired if killed now (the test ``request_restart_requeue`` applies) and whose last
+    run was ``ok`` or never recorded. A run that is itself the re-fire, a job at the cap, a job on
+    its final finite repetition, a one-shot or an unreadable job counts, so the bounded skew drain
+    waits for it instead of losing the run (Prism 05343ab9e749, cd1ea5071578).
+    ``failed_keys``: in-flight keys of re-fire-spent jobs whose last run failed. They do not hold
+    the drain (t_af461294): killing one more run of an already-red streak loses nothing, and their
+    wait held every deploy for up to the script timeout. The bounded kill withholds their re-fire."""
     import cron.scheduler as sched
     from cron.jobs import get_job, restart_refire_refusal
     from cron.scheduler_provider import _profile_cron_scope
@@ -97,9 +105,10 @@ def _inflight_refire_spent() -> List[tuple]:
         keys = sorted(sched._running_job_ids | sched._running_fire_owners.keys())
         since = {k: sched._running_since.get(k) for k in keys}
     now = time.time()
-    spent = []
+    spent, failed = [], set()
     for key in keys:
         home_key, job_id = key
+        job = None
         try:
             with _profile_cron_scope(sched._inflight_home_path(home_key)):
                 job = get_job(job_id)
@@ -108,10 +117,14 @@ def _inflight_refire_spent() -> List[tuple]:
         except Exception:
             logger.debug("re-fire lookup failed for %s", job_id, exc_info=True)
             available = False
-        if not available:
-            started = since.get(key)
-            spent.append((job_id, round(now - started) if started else None))
-    return spent
+        if available:
+            continue
+        if job is not None and job.get("last_status") not in ("ok", None):
+            failed.add(key)
+            continue
+        started = since.get(key)
+        spent.append((job_id, round(now - started) if started else None))
+    return spent, failed
 
 
 def _boot_code_sha() -> Optional[str]:
@@ -190,6 +203,8 @@ class ScriptRunner:
         self._draining_mono = float("-inf")
         self.sigterm = False
         self._skew_bounded = False
+        self._skew_withhold: set = set()
+        self._bound_polled = False
         self._reasons: Dict[str, Optional[str]] = {}
         self._last_ok: Dict[str, str] = {}
         self._tick_started: Dict[str, str] = {}
@@ -349,19 +364,37 @@ class ScriptRunner:
             self.exit_code = 0
             if self._stop is not None:
                 self._stop.set()
-        elif time.monotonic() - self._draining_mono >= float(lanes.RUNNER_SKEW_DRAIN_MAX_S):
+        else:
+            self._check_skew_bound()
+
+    def poll_skew_bound(self) -> None:
+        """Called from ``main``'s 0.5 s stop poll: evaluate the drain bound once, the moment it is
+        crossed. The ticker cycle (``RUNNER_CYCLE_S`` = 60) alone can land a few ms short of it and
+        hold the drain another whole cycle (t_af461294 drill: 180 s, not 120 s)."""
+        if (not self.draining or self._bound_polled or self.sigterm
+                or time.monotonic() - self._draining_mono < float(lanes.RUNNER_SKEW_DRAIN_MAX_S)):
+            return
+        self._bound_polled = True
+        if _inflight_count():
+            self._check_skew_bound()
+
+    def _check_skew_bound(self) -> None:
+        if time.monotonic() - self._draining_mono >= float(lanes.RUNNER_SKEW_DRAIN_MAX_S):
             # Bounded drain (t_c15baa4b), only while every in-flight job can still be re-fired:
             # killing a run that is itself the re-fire (or a job at RESTART_REQUEUE_MAX) would lose
             # it until its next schedule, so then the drain waits as before (Prism 05343ab9e749).
-            spent = _inflight_refire_spent()
+            spent, failed = _inflight_refire_status()
             if spent:
                 names = ", ".join(f"{job_id} {elapsed}s" for job_id, elapsed in spent)
                 self._warn_hourly("skew_wait", tuple(j for j, _ in spent),
                                   "script runner code-skew drain waiting: re-fire spent, %s", names)
                 return
             logger.warning("script runner code-skew drain bounded: re-fire available; %d script(s) "
-                           "in flight past %s s, terminating them (one re-fire each) and exiting 0",
-                           _inflight_count(), lanes.RUNNER_SKEW_DRAIN_MAX_S)
+                           "in flight past %s s, terminating them (one re-fire each) and exiting 0; "
+                           "re-fire withheld for re-fire-spent failing job(s): %s",
+                           _inflight_count(), lanes.RUNNER_SKEW_DRAIN_MAX_S,
+                           ", ".join(sorted(j for _h, j in failed)) or "-")
+            self._skew_withhold = failed
             self._skew_bounded = True
             self.request_shutdown()
 
@@ -721,6 +754,9 @@ class ScriptRunner:
 
         with sched._script_procs_lock:
             sched.signal_shutdown("cron script runner code-skew drain bound")
+            # Re-fire-spent jobs whose last run failed were not waited for (t_af461294): their cut
+            # run is recorded as a failure with no re-fire.
+            sched._refire_withheld_job_ids.update(self._skew_withhold)
             trees = [(key, proc, ss._script_tree_snapshot(proc))
                      for key, proc in sched._active_script_procs.items() if proc.returncode is None]
             # returncode stays None until the worker reaps its script, so an exited run reads as in
@@ -907,6 +943,7 @@ def main(argv: Optional[list] = None) -> int:
         if not thread.is_alive():
             logger.error("cron script runner ticker thread exited; exiting 1")
             return 1
+        runner.poll_skew_bound()
     if runner.sigterm:
         return runner.shutdown()
     thread.join(timeout=_SHUTDOWN_WAIT_S)
