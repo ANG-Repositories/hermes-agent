@@ -4971,6 +4971,70 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     return not _claim_owner_is_dead(claim)
 
 
+def _oneshot_claims_dead(job: Dict[str, Any], now: datetime, run_claim_ttl: float) -> bool:
+    """True when a one-shot holds a run/fire claim and NONE of them is live: every claim is past
+    its TTL or names a same-host pid that has exited (``_claim_is_live``). An unclaimed job is
+    False: there is no claim to release."""
+    claims = [(job.get("run_claim"), run_claim_ttl), (job.get("fire_claim"), FIRE_CLAIM_TTL_SECONDS)]
+    held = [(claim, ttl) for claim, ttl in claims if claim]
+    return bool(held) and not any(_claim_is_live(claim, now, ttl) for claim, ttl in held)
+
+
+def _replay_dead_owner_oneshot(job: Dict[str, Any], scan: "_DueScan", run_claim_ttl: float) -> bool:
+    """Release a dead owner's claims on an interrupted one-shot and arm ONE replay (t_b5c315bb).
+
+    A gateway SIGTERMed mid-run leaves ``run_claim``/``fire_claim`` owned by its dead pid,
+    ``repeat.completed`` already bumped by ``claim_dispatch`` and no ``last_run_at``. Every later
+    scan skipped the job on the claim and nothing reclaimed it (2026-11-08, 2a450ce62b25).
+    Replays only when the executions ledger shows the run never finished (no row, or
+    claimed/running/unknown; a claimed/running row is terminalized first, which refuses a live
+    owner) and the once-only budget (``RESTART_REQUEUE_COUNT_KEY``, shared with the recurring
+    restart re-fire) is unspent. Returns True when the job was re-armed as a run-now."""
+    if (job.get("schedule") or {}).get("kind") != "once" or job.get("last_run_at"):
+        return False
+    if not _oneshot_claims_dead(job, scan.now, run_claim_ttl):
+        return False
+    jid = str(job.get("id") or "")
+    if not jid or _job_running_in_this_process(jid):
+        return False
+    name = job.get("name", jid)
+    count = int(job.get(RESTART_REQUEUE_COUNT_KEY) or 0)
+    if count >= RESTART_REQUEUE_MAX:
+        logger.warning(
+            "cron.oneshot.dead_owner_replay.refused job='%s' id=%s: claim owner is gone but the "
+            "one-shot was already replayed %d time(s); not replaying again", name, jid, count)
+        return False
+    try:
+        from cron.executions import latest_execution, terminalize_dead_owner
+
+        latest = latest_execution(jid)
+        status = (latest or {}).get("status")
+        if status in ("completed", "failed"):
+            return False  # the run reached a recorded outcome: never replay it
+        if status in ("claimed", "running") and not terminalize_dead_owner(
+                latest["id"], reason="one-shot owner died mid-run (claim owner gone); replaying once"):
+            return False  # owner still live (or not provably dead): leave the run alone
+    except Exception:
+        logger.warning("cron.oneshot.dead_owner_replay.ledger_unavailable job='%s' id=%s",
+                       name, jid, exc_info=True)
+        return False
+    repeat = dict(job.get("repeat") or {})
+    if isinstance(repeat.get("completed"), int) and repeat["completed"] > 0:
+        repeat["completed"] -= 1  # give back the dispatch the killed run consumed
+    stamp = scan.now.isoformat()
+    fields = {
+        "run_claim": None, "fire_claim": None, "repeat": repeat,
+        "next_run_at": stamp, "manual_run_at": stamp, RESTART_REQUEUE_COUNT_KEY: count + 1,
+    }
+    logger.warning(
+        "cron.oneshot.dead_owner_replay job='%s' id=%s run_claim=%s fire_claim=%s ledger=%s: "
+        "previous run's owner is gone; claims released, replaying once now",
+        name, jid, job.get("run_claim"), job.get("fire_claim"), status)
+    job.update(fields)
+    scan.persist(jid, **fields)
+    return True
+
+
 def live_fire_claim_owner(job: Optional[Dict[str, Any]]) -> Optional[str]:
     """Owner of the job's fire_claim when it is a live run (fresh and owner not provably dead)."""
     claim = job.get("fire_claim") if isinstance(job, dict) else None
@@ -6276,6 +6340,9 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         and _claim_is_live(job.get("run_claim"), now, run_claim_ttl)
     ):
         return False
+    # A one-shot whose run's owner died mid-run (gateway SIGTERM) is re-armed ONCE (t_b5c315bb);
+    # otherwise its dead claim parks it in _retire_expired_oneshot's "in flight elsewhere" skip.
+    _replay_dead_owner_oneshot(job, scan, run_claim_ttl)
 
     next_run = _restore_unclaimed_slot(job, scan) or job.get("next_run_at") or _recover_missing_next_run(job, scan)
     if not next_run:
@@ -6418,7 +6485,7 @@ def _get_due_jobs_locked(lane: str = "all") -> List[Dict[str, Any]]:
                 "Skipping malformed cron job %r during due scan",
                 job.get("name") or job.get("id") or "?")
 
-    _warn_overdue_oneshots_not_due(jobs, due, scan.removed, scan.now)
+    _warn_overdue_oneshots_not_due(jobs, due, scan.removed, scan.now, run_claim_ttl)
     from cron.occurrences import REWOUND_BURST_MARKER, rewound_burst_payload
 
     rewound = scan.rewound
@@ -6443,6 +6510,46 @@ def _get_due_jobs_locked(lane: str = "all") -> List[Dict[str, Any]]:
 # Last-warned monotonic time per one-shot id for _warn_overdue_oneshots_not_due.
 _overdue_oneshot_warned: Dict[str, float] = {}
 _OVERDUE_ONESHOT_WARN_INTERVAL_SECONDS = 600.0
+# Consecutive scans per one-shot that were skipped while every claim on it was dead, and the
+# ids already paged this episode (t_b5c315bb). A wedge that outlives the replay (budget spent,
+# ledger unreadable) pages #alerts once after more than this many ticks.
+_dead_owner_wedge_ticks: Dict[str, int] = {}
+_dead_owner_wedge_paged: Set[str] = set()
+DEAD_OWNER_WEDGE_PAGE_TICKS = 2
+_DEAD_OWNER_PAGER_PRODUCER = "cron-oneshot-dead-owner"
+
+
+def _dispatch_dead_owner_page(argv: List[str]) -> None:
+    """Hand one page/clear to the fleet's #alerts pager (scripts/lib/episode_pager.py, detached)."""
+    from cron.script_runner_rearm import _detach
+
+    _detach(argv, "scripts/lib/episode_pager.py", "one-shot dead-owner wedge %s" % argv[0])
+
+
+def _track_dead_owner_wedge(job: Dict[str, Any], jid: str, wedged: bool, overdue: float) -> None:
+    """Count dead-owner skipped ticks for one one-shot; page once past the threshold, clear on exit."""
+    if not wedged:
+        _dead_owner_wedge_ticks.pop(jid, None)
+        if jid in _dead_owner_wedge_paged:
+            _dead_owner_wedge_paged.discard(jid)
+            _dispatch_dead_owner_page(["clear", "--producer", _DEAD_OWNER_PAGER_PRODUCER, "--key", jid])
+        return
+    ticks = _dead_owner_wedge_ticks.get(jid, 0) + 1
+    _dead_owner_wedge_ticks[jid] = ticks
+    if ticks <= DEAD_OWNER_WEDGE_PAGE_TICKS or jid in _dead_owner_wedge_paged:
+        return
+    _dead_owner_wedge_paged.add(jid)
+    text = (
+        "cron one-shot '%s' (%s) is %d min overdue and wedged for %d ticks on a claim whose owner "
+        "is dead (run_claim=%s fire_claim=%s, replays used=%s). It will not fire on its own: "
+        "inspect with `hermes cron list`, then re-run with `hermes cron resume %s --run-now`."
+        % (job.get("name", jid), jid, int(overdue // 60), ticks,
+           (job.get("run_claim") or {}).get("by"), (job.get("fire_claim") or {}).get("by"),
+           job.get(RESTART_REQUEUE_COUNT_KEY) or 0, job.get("name", jid)))
+    logger.error("cron.oneshot.dead_owner_wedge id=%s ticks=%d: paging #alerts", jid, ticks)
+    _dispatch_dead_owner_page([
+        "page", "--producer", _DEAD_OWNER_PAGER_PRODUCER, "--key", jid, "--text", text,
+        "--resolve-text", "✅ cron one-shot %s is no longer wedged on a dead-owner claim" % jid])
 
 
 def _warn_overdue_oneshots_not_due(
@@ -6450,6 +6557,7 @@ def _warn_overdue_oneshots_not_due(
     due: List[Dict[str, Any]],
     removed_ids: Set[str],
     now: datetime,
+    run_claim_ttl: Optional[float] = None,
 ) -> None:
     """Name the reason a past-due, never-run one-shot was left out of this scan.
 
@@ -6457,9 +6565,13 @@ def _warn_overdue_oneshots_not_due(
     state, a live run/fire claim, a ``next_run_at`` parked after ``run_at``) is
     silent. On 2026-09-30 a 09:45 one-shot (28a5a721bb20) was skipped by every
     tick until it was removed by hand at 09:51, and nothing in the logs said why.
-    This logs one WARNING per job per 10 min with the fields that decide it.
+    This logs one WARNING per job per 10 min with the fields that decide it, and pages #alerts once
+    per episode when the skip has held on dead-owner claims for more than
+    ``DEAD_OWNER_WEDGE_PAGE_TICKS`` scans (t_b5c315bb).
     """
     due_ids = {str(j.get("id")) for j in due}
+    ttl = float(run_claim_ttl if run_claim_ttl is not None else ONESHOT_RUN_CLAIM_TTL_SECONDS)
+    wedged_now: Set[str] = set()
     for job in jobs:
         try:
             schedule = job.get("schedule") or {}
@@ -6476,6 +6588,9 @@ def _warn_overdue_oneshots_not_due(
             overdue = (now - _ensure_aware(datetime.fromisoformat(run_at))).total_seconds()
             if overdue <= ONESHOT_GRACE_SECONDS:
                 continue
+            if _oneshot_claims_dead(job, now, ttl):
+                wedged_now.add(jid)
+                _track_dead_owner_wedge(job, jid, True, overdue)
             last = _overdue_oneshot_warned.get(jid)
             mono = time.monotonic()
             if last is not None and mono - last < _OVERDUE_ONESHOT_WARN_INTERVAL_SECONDS:
@@ -6499,6 +6614,15 @@ def _warn_overdue_oneshots_not_due(
             )
         except Exception:
             logger.debug("overdue one-shot diagnostic failed", exc_info=True)
+    # This scan's jobs that are no longer wedged (fired, replayed, removed, re-armed) end the
+    # episode. Ids outside this scan (the other lane's) are not this scan's to clear.
+    scanned = {str(j.get("id") or "") for j in jobs} | set(removed_ids)
+    for jid in [j for j in set(_dead_owner_wedge_ticks) | _dead_owner_wedge_paged
+                if j in scanned and j not in wedged_now]:
+        try:
+            _track_dead_owner_wedge({}, jid, False, 0.0)
+        except Exception:
+            logger.debug("dead-owner wedge clear failed", exc_info=True)
 
 
 # --- Run output ---
