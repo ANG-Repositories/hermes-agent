@@ -514,6 +514,26 @@ def test_push_uses_assessed_sha_despite_branch_reset_and_ignores_pushurl(anchor,
     assert not _ref(other, "refs/heads/feature")
 
 
+def test_assessment_checks_immutable_shas_when_branch_moves(anchor):
+    _commit(anchor, "base")
+    _git("branch", "feature", cwd=anchor)
+    _commit(anchor, "remote")
+    remote = _ref(anchor, "HEAD")
+    _git("update-ref", "refs/remotes/origin/feature", remote, cwd=anchor)
+    _git("checkout", "-q", "feature", cwd=anchor)
+    _commit(anchor, "divergent")
+    divergent = _ref(anchor, "HEAD")
+    def racing_runner(argv, **kwargs):
+        if "rev-list" in argv:
+            _git("update-ref", "refs/heads/feature", remote, cwd=anchor)
+        return subprocess.run(argv, **kwargs)
+    why = []
+    assert kwt.assess("t_x", str(anchor), None, "feature", runner=racing_runner,
+                      push_ok=True, why=why) == (None, None)
+    assert why == ["diverged_from_origin"]
+    assert divergent != remote
+
+
 def test_clone_script_expands_a_home_relative_mirror(tmp_path):
     origin, mirror = _origin_with_feature(tmp_path)
     home = tmp_path / "home"

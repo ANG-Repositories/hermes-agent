@@ -359,7 +359,7 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
         return None, None  # the tree's commits must be on origin: no origin ref = local only
     if not local:
         return top, None  # no local branch at all: the clone makes it
-    ahead = _git("rev-list", "--count", f"refs/remotes/origin/{b}..refs/heads/{b}") if remote else None
+    ahead = _git("rev-list", "--count", f"{remote}..{local}") if remote else None
     if remote and (ahead is None or getattr(ahead, "returncode", 1) != 0):
         _why(why, WHY_NOT_REPO)
         return None, None
@@ -369,7 +369,7 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
         _why(why, "unpushed_commits")
         return None, None  # local commits (or no origin ref): only the Studio has the baseline
     if remote:
-        anc = _git("merge-base", "--is-ancestor", f"refs/remotes/origin/{b}", f"refs/heads/{b}")
+        anc = _git("merge-base", "--is-ancestor", remote, local)
         if anc is None or getattr(anc, "returncode", 1) != 0:
             _why(why, "diverged_from_origin")
             return None, None  # origin has commits the Studio lacks: a push would drop them
