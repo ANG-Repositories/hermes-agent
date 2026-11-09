@@ -5196,7 +5196,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         from hermes_cli import kanban_worktree_port as _kwt
         port = _kwt.port_for(row["id"], row["workspace_path"],
                              _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet",
-                             branch=_kb._row_get(row, "branch_name"))
+                             branch=_kb._row_get(row, "branch_name"),
+                             allow_studio_tree=_kwt.studio_last_resort(_root_kanban_cfg()))
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:

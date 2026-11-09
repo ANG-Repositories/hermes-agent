@@ -93,16 +93,63 @@ def origin_slug(repo: Path, runner: Callable = subprocess.run) -> Optional[str]:
     return slug
 
 
+STUDIO_LAST_RESORT_ENV = "KANBAN_STUDIO_LAST_RESORT"
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def studio_last_resort(kanban_cfg=None) -> bool:
+    """``kanban.placement.studio_last_resort`` (default True), env
+    ``KANBAN_STUDIO_LAST_RESORT`` wins (t_c2fce87e). True lets a card's own
+    Studio ``.worktrees/<id>`` port to a pool host when it is clean and every
+    commit is on origin; False restores the old rule (that tree keeps the
+    card on the Studio). The pool-first ORDER for portable cards is not this
+    knob: ``placement_default`` is remote-only by ruling (t_82b4db80)."""
+    import os
+    env = (os.environ.get(STUDIO_LAST_RESORT_ENV) or "").strip().lower()
+    if env:
+        return env not in _FALSE_WORDS
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, dict) else None
+    val = pl.get("studio_last_resort") if isinstance(pl, dict) else None
+    if isinstance(val, str):
+        return val.strip().lower() not in _FALSE_WORDS
+    return True if val is None else bool(val)
+
+
+def _clean_on_branch(tree: Path, branch: str, runner: Callable) -> bool:
+    """``tree`` is checked out on ``branch`` with nothing uncommitted or
+    untracked (ignored files excepted): a clone of the pushed branch loses
+    nothing that only this tree holds."""
+    def _out(*args):
+        try:
+            proc = runner(["git", "-C", str(tree), *args], capture_output=True, text=True, encoding="utf-8",
+                          timeout=10, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout if getattr(proc, "returncode", 1) == 0 else None
+    cur = _out("branch", "--show-current")
+    if cur is None or cur.strip() != branch:
+        return False
+    status = _out("status", "--porcelain", "--untracked-files=all")
+    return status is not None and status.strip() == ""
+
+
 def anchor_repo(task_id: str, workspace_path: Optional[str],
                 board_default: Optional[str], branch: Optional[str] = None,
-                runner: Callable = subprocess.run) -> Optional[Path]:
+                runner: Callable = subprocess.run, *,
+                allow_studio_tree: bool = False) -> Optional[Path]:
     """The repo root a worktree card would anchor on, or None (not portable).
 
     None for: a concrete target path; a LINKED worktree (a prior Studio run
     persisted ``<repo>/.worktrees/<id>``, whose toplevel is itself, Prism
     4a24c6d61776); an existing ``<repo>/.worktrees/<id>``; and a card branch
     that exists locally with commits origin does not have (or no origin ref
-    at all), since the clone could not start from them (Prism 044612a3554e)."""
+    at all), since the clone could not start from them (Prism 044612a3554e).
+
+    ``allow_studio_tree`` (:func:`studio_last_resort`, t_c2fce87e): the
+    card's OWN ``<repo>/.worktrees/<id>`` (persisted path or found under the
+    anchor) no longer pins it to the Studio when that tree is on the card's
+    branch, clean, and the branch is fully on origin (the check below). Any
+    other concrete path still keeps the card local."""
     from hermes_cli.kanban_db_workspace import _git_toplevel, _is_linked_worktree_checkout
     raw = (workspace_path or "").strip() or (board_default or "").strip()
     if not raw:
@@ -111,11 +158,36 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     if not p.is_absolute() or not p.is_dir():
         return None
     top = _git_toplevel(p)
-    if top is None or top != p.resolve() or _is_linked_worktree_checkout(top):
-        return None  # a concrete target or a linked worktree: keep it local
-    if (top / ".worktrees" / task_id).exists():
-        return None  # a prior run's local worktree: its work stays where it is
+    if top is None:
+        return None
     b = (branch or "").strip() or f"wt/{task_id}"
+    own_tree = None
+    if top != p.resolve() or _is_linked_worktree_checkout(top):
+        # A concrete target or a linked worktree: local, unless it is this
+        # card's own pushed .worktrees/<id> and the knob allows the port.
+        if not (allow_studio_tree and top == p.resolve() and top.name == task_id
+                and top.parent.name == ".worktrees" and _is_linked_worktree_checkout(top)):
+            return None
+        own_tree, top = top, top.parent.parent.resolve()
+        if _git_toplevel(top) != top or _is_linked_worktree_checkout(top):
+            return None
+    elif (top / ".worktrees" / task_id).exists():
+        own_tree = top / ".worktrees" / task_id
+        if not (allow_studio_tree and _is_linked_worktree_checkout(own_tree)
+                and _git_toplevel(own_tree) == own_tree.resolve()):
+            return None  # a prior run's local worktree: its work stays where it is
+    if own_tree is not None and not _clean_on_branch(own_tree, b, runner):
+        return None  # uncommitted or untracked work only the Studio has
+    if own_tree is not None:
+        # The tree's commits must be on origin: no origin ref = local only.
+        try:
+            ref = runner(["git", "-C", str(top), "rev-parse", "-q", "--verify", f"refs/remotes/origin/{b}"],
+                         capture_output=True, text=True, encoding="utf-8", timeout=10,
+                         stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(ref, "returncode", 1) != 0:
+            return None
 
     def _git(*args):
         try:
@@ -135,13 +207,15 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
 
 def port_for(task_id: str, workspace_path: Optional[str], board_default: Optional[str],
              fleet_dir: Path, runner: Callable = subprocess.run, *,
-             branch: Optional[str] = None) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+             branch: Optional[str] = None,
+             allow_studio_tree: bool = False) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
     """``(owner/repo, mirror, hosts)`` when this worktree card may run on a
     pool host, else None."""
     mirrors = read_mirrors(fleet_dir)
     if not mirrors:
         return None
-    repo = anchor_repo(task_id, workspace_path, board_default, branch, runner)
+    repo = anchor_repo(task_id, workspace_path, board_default, branch, runner,
+                       allow_studio_tree=allow_studio_tree)
     slug = origin_slug(repo, runner) if repo is not None else None
     row = mirrors.get(slug.lower()) if slug else None
     return (slug, row[0], row[1]) if row else None
