@@ -8,6 +8,7 @@
     ],
     "paths": [
       "tools/process_registry.py",
+      "tools/process_registry_*.py",
       "tools/terminal_tool_background.py",
       "gateway/run_notifications.py",
       "agent/delegation_context.py"
