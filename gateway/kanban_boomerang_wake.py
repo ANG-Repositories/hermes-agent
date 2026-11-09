@@ -1332,6 +1332,7 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
     (the card moved under the claim) is a supersede, not a fault (t_ce8bd439): the handback keeps
     only the re-delivered wake, the origin chat gets no line, and one #logs line records it."""
     superseded = reason in _SUPERSEDE_REASONS
+    stopped = reason == "stopped by /stop"
     handback = handback_row(entry, {"summary": reason},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
     status = await asyncio.to_thread(_card_status, entry) if superseded else ""
@@ -1344,10 +1345,12 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
     elif superseded:
         handback[1]["line"] = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before "
                                f"the wake ran; no live home session, so the original wake was NOT re-delivered")
+    elif stopped:
+        handback[1]["line"] = f"boomerang-wake stopped {entry['task_id']}: stopped by /stop"
     else:
         handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
-                            outcome="superseded" if superseded else "failed",
+                            outcome="superseded" if superseded else "stopped" if stopped else "failed",
                             reason=reason, resurfaced=True, resurface_delivered=False, handback=handback)
     if quiet:
         line = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before the wake ran; "
@@ -1456,6 +1459,12 @@ def _run_child_delegate(parent: Any, goal: str, mode: str) -> tuple:
     if data.get("error"):
         return "failed", str(data["error"])
     res = (data.get("results") or [{}])[0]
+    from gateway.run import _INTERRUPT_REASON_STOP
+
+    # The gateway propagates this control message to owned children; never infer /stop
+    # from the placeholder final_response (also used by watchdogs and provider failures).
+    if res.get("status") == "interrupted" and res.get("interrupt_message") == _INTERRUPT_REASON_STOP:
+        return "stopped", "stopped by /stop"
     return str(res.get("status") or "failed"), str(res.get("summary") or res.get("error") or "")
 
 
@@ -1544,7 +1553,8 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
     except Exception as exc:
         logger.debug("kanban boomerang-wake: ledger close failed: %s", exc)
     if status != "completed":
-        await _fail(runner, live, f"child {status}: {_first_line(final, 200)}", state)
+        reason = "stopped by /stop" if status == "stopped" else f"child {status}: {_first_line(final, 200)}"
+        await _fail(runner, live, reason, state)
         return
     if await asyncio.to_thread(deadman_owner_acted, live):
         logger.info("kanban boomerang-wake: stale surface refused task=%s stage=run_entry "

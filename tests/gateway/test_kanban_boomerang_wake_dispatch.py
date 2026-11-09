@@ -463,6 +463,30 @@ def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "failed"
 
 
+@pytest.mark.parametrize("stop", [True, False])
+def test_child_stop_attribution_preserves_wake(env, stop):
+    """Exercise delegate-result decoding as well as the durable failure handback."""
+    from tools import delegate_tool
+    from gateway.run import _INTERRUPT_REASON_STOP
+
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    result = {"status": "interrupted", "summary": "Operation interrupted: waiting for model response (45.2s elapsed).",
+              "interrupt_message": _INTERRUPT_REASON_STOP if stop else "provider watchdog"}
+    env["monkeypatch"].setattr(delegate_tool, "delegate_task", lambda **_kw: json.dumps({"results": [result]}))
+    status, final = ah._run_child_delegate(object(), "goal", "fork")
+    _run(env, entry, status, final)
+    expected = (f"boomerang-wake stopped {tid}: stopped by /stop" if stop else
+                f"⚠️ boomerang-wake failed {tid}: child interrupted: {result['summary']}")
+    assert env["adapter"].sent == [expected]
+    assert [event.text for event in env["adapter"].handled] == [entry["wake_text"]]
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim is not None
+    assert claim["outcome"] == ("stopped" if stop else "failed")
+    assert claim["resurface_delivered"] is True
+
+
 def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):
     """t_ce8bd439: the card left the claim-time status before the verdict ran. No origin-chat
     line, one #logs line, the original wake still re-surfaces, outcome superseded."""
