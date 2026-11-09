@@ -44,7 +44,9 @@ from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
-from hermes_cli.kanban_parser import create_default_priority
+from hermes_cli.kanban_parser import (
+    HUMAN_CREATED_BY, _LIVE_BAND_OPERATORS, create_default_priority, live_band_default,
+)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
@@ -1013,20 +1015,32 @@ def _cmd_create(args: argparse.Namespace) -> int:
                                 and _auto_wake(None)
                                 and _resolve_notify_target(require_platform_identity=True))
                 or bool(_explicit_sid and routable_home_target(_explicit_sid) is not None))
+            _author = args.created_by or _profile_author()
+            _default_priority = None
+            if args.priority is None:  # live band for a person/operator create (t_febbdb61)
+                _priority_author = args.created_by or (
+                    _author if _author == "default" or _author in _LIVE_BAND_OPERATORS else HUMAN_CREATED_BY)
+                # argparse's historical default is "user"; preserve that persisted author,
+                # but retain the verified root alias for operator eligibility.
+                if _priority_author == HUMAN_CREATED_BY and _profile_author() == "default":
+                    _priority_author = "default"
+                _default_priority = live_band_default(conn, _priority_author)
+                if _default_priority is None:
+                    _default_priority = create_default_priority(args.created_by)
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
                 title=args.title,
                 body=args.body,
                 assignee=args.assignee,
-                created_by=args.created_by or _profile_author(),
+                created_by=_author,
                 workspace_kind=ws_kind,
                 workspace_path=ws_path,
                 branch_name=branch_name,
                 project_id=getattr(args, "project", None),
                 tenant=args.tenant,
                 priority=(args.priority if args.priority is not None
-                          else create_default_priority(args.created_by)),
+                          else _default_priority),
                 parents=tuple(args.parent or ()),
                 parents_kind=getattr(args, "parent_kind", None),
                 continues=getattr(args, "continues", None),
@@ -2826,6 +2840,14 @@ def _cmd_placement_holds(args: argparse.Namespace) -> int:
         if h.get("pins_owed"):
             print(f"  resume pins owed: {' '.join(h['pins_owed'])}"
                   + (" (conflicting pins released: past grace)" if h.get("pin_conflict_expired") else ""))
+    for host, rows in (rep.get("fwa") or {}).items():
+        for f in rows:
+            state = "HOLDS kanban" if f["holds_kanban"] else "no kanban hold"
+            if f.get("unreadable"):
+                print(f"{host}: fwa {state} unreadable hold file {f['file']}")
+                continue
+            print(f"{host}: fwa {state} {f['kind'] or 'pause'}:{f['id']} lanes {','.join(f['lanes'])} by "
+                  f"{f.get('by') or f.get('owner') or '?'} until {f['until']}: {f.get('reason') or ''}")
     for c in rep["cards"]:
         print(f"{c['task_id']}: {'LIVE' if c['live'] else 'STALE'} label {c['label']} "
               f"(origin {c['origin_host'] or '-'}; now {c['now'] or 'not held'})")
@@ -3738,6 +3760,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     failed: list[str] = []
     with kbc.connect_closing() as conn:
+        if reason:
+            kb._validate_comment_args(author, f"BLOCKED: {reason}", conn=conn)
         for tid in ids:
             # Provenance before the transition: blocking ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
@@ -3813,6 +3837,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        if reason:
+            kb._validate_comment_args(author, f"SCHEDULED: {reason}", conn=conn)
         for tid in ids:
             current = kb.get_task(conn, tid)
             # An already-scheduled card only gets its wake time (re)set; the
@@ -3821,6 +3847,11 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 current is not None and current.status == "scheduled"
                 and wake_at is not None
             )
+            from hermes_cli.kanban_lifecycle_guards import has_event_gate
+            if wake_at is None and not (current and has_event_gate(current.body)):
+                failed.append(tid)
+                print(f"cannot schedule {tid}: needs --at, --now or unblock_when: event:<name>", file=sys.stderr)
+                continue
             # Provenance before the transition: scheduling ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
 
@@ -3839,6 +3870,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                wake_at=wake_at,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
@@ -4092,7 +4124,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         ) + str(kb.redact_review_value(reason))
         if worker_run is None:
             # Before any write: the human-lane mirror comment lands after the transition (t_ebc8eb87).
-            check_close_on_comment(_profile_author(), sendback_body)
+            kb._validate_comment_args(_profile_author(), sendback_body, conn=conn)
         if operator is not None and worker_run is not None:
             # A dispatched reviewer run always carries full coverage.
             print(

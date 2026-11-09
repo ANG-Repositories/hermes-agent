@@ -165,7 +165,7 @@ def test_events_carry_bound_actor(kanban_home):
     with kb.connect_closing() as conn:
         tid = _card(conn, HOME)
         with kb.mutation_actor(session_ids=(HOME,), profile="apollo"):
-            assert kb.block_task(conn, tid, reason="needs input")
+            assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
         rows = [r for r in _events(conn, tid) if r["kind"] == "blocked"]
         assert rows and rows[-1]["actor_profile"] == "apollo"
         assert rows[-1]["actor_session_id"] == HOME

@@ -5168,19 +5168,19 @@ def _takeover_comment_body(
 
 
 def _validate_foreign_action_comments(
-    actor: MutationActor, action: str, prev_home: Optional[str],
+    conn: sqlite3.Connection, actor: MutationActor, action: str, prev_home: Optional[str],
 ) -> None:
     """:func:`add_comment`'s refusals (:func:`_validate_comment_args`) for every
-    comment :func:`record_foreign_action` will write, with no database access.
+    comment :func:`record_foreign_action` will write, before any mutation.
     Run where the override is ACCEPTED, so a reason those comments cannot carry
     is refused before any guarded write journals (t_705b1458, Prism 34b90ddab22b)."""
     author = actor.profile or "user"
     if not actor.operator:
         _validate_comment_args(author, _takeover_comment_body(
             actor, action, prev_home, _takeover_new_home(action, actor),
-        ))
+        ), conn=conn)
     if action in FOREIGN_CHANGE_ACTIONS:
-        _validate_comment_args(author, _foreign_change_comment_body(actor, action))
+        _validate_comment_args(author, _foreign_change_comment_body(actor, action), conn=conn)
 
 
 def check_home_session(
@@ -5258,11 +5258,11 @@ def check_home_session(
                 f"\"<who: why>\" (e.g. \"Ace via Aegis: ruled (a)\")."
             )
         _check_ruling_precedence(conn, task_id, action, home, actor.operator)
-        _validate_foreign_action_comments(actor, action, row["session_id"])
+        _validate_foreign_action_comments(conn, actor, action, row["session_id"])
         return actor
     if actor.foreign_ok:
         _check_ruling_precedence(conn, task_id, action, home, actor.foreign_ok)
-        _validate_foreign_action_comments(actor, action, row["session_id"])
+        _validate_foreign_action_comments(conn, actor, action, row["session_id"])
         return actor
     if home_guard_mode() == "warn":
         print(
@@ -5404,7 +5404,7 @@ def record_foreign_action(
     )
     # Every comment this writes, judged before its first event: a refusal
     # here leaves no takeover/operator_override line in the journal.
-    _validate_foreign_action_comments(actor, action, prev_home)
+    _validate_foreign_action_comments(conn, actor, action, prev_home)
     if actor.operator:
         last = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -6463,6 +6463,8 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("title", title), ("body", body)])
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -6820,7 +6822,15 @@ def create_task(
                     )
                 # The override comment is written after the card's first
                 # journaled event; judge it before the INSERT (Prism 8b7984d6e364 r14).
-                flagship_override_comment(flagship_override_author, flagship_override_reason)
+                flagship_override_comment(flagship_override_author, flagship_override_reason, conn=conn)
+                audit_author = flagship_override_author or created_by or "operator"
+                if pin_sub_reason:
+                    from hermes_cli.model_policy import sub_pin_comment
+                    _validate_comment_args(audit_author, sub_pin_comment(
+                        provider_override, pin_sub_reason, fallback=bool(pin_sub_fallback)), conn=conn)
+                if _model_verdict.reason == "forced":
+                    _validate_comment_args(audit_author, _model_force_comment(
+                        provider_override, model_override, _model_verdict.force_reason or ""), conn=conn)
 
                 if tenant is None and parents:
                     # Parent order breaks ties in this soft namespace; an
@@ -6916,6 +6926,7 @@ def create_task(
                     'workspace_of': workspace_of,
                     'boomerang_wake': None if boomerang_wake is None else (1 if boomerang_wake else 0),
                     'signature': signature,
+                    'next_eligible_at': int(until) if until is not None else None,
                 })
                 for pid in parents:
                     conn.execute(
@@ -7396,16 +7407,16 @@ def authorize_flagship(
     reads back. A caller that mutates before this call checks
     ``require_flagship_authority`` first.
     """
-    comment = flagship_override_comment(actor, reason)
+    comment = flagship_override_comment(actor, reason, conn=conn)
     if comment:
         add_comment(conn, task_id, *comment)
 
 
 def flagship_override_comment(
-    actor: Optional[str], reason: Optional[str],
+    actor: Optional[str], reason: Optional[str], *, conn=None,
 ) -> Optional[tuple[str, str]]:
     """The ``(author, body)`` :func:`authorize_flagship` would write, judged
-    with no database access: the authority (:func:`model_policy.require_flagship_authority`)
+    before any write: the authority (:func:`model_policy.require_flagship_authority`)
     and every refusal :func:`add_comment` applies to that author and body
     (:func:`_validate_comment_args`). ``None`` when no reason was given. Each
     caller that writes before ``authorize_flagship`` calls this first, so the
@@ -7417,7 +7428,7 @@ def flagship_override_comment(
     if not reason:
         return None
     body = override_comment(reason)
-    _validate_comment_args(actor, body)
+    _validate_comment_args(actor, body, conn=conn)
     return actor, body
 
 
@@ -7509,7 +7520,7 @@ def _route_flagship_reason(
         return None
     # The override comment this reason will be written as, judged with every
     # add_comment refusal before the caller's first write (Prism 8b7984d6e364 r14).
-    flagship_override_comment(actor, allowed)
+    flagship_override_comment(actor, allowed, conn=conn)
     return allowed
 
 
@@ -7844,7 +7855,7 @@ def set_model_override(
         pin_sub_author=pin_sub_author,
         force_model_reason=force_model_reason,
     ):
-        _validate_comment_args(author, body)
+        _validate_comment_args(author, body, conn=conn)
     # Only a flagship override may stand in for the clear-route check; any
     # other audit comment does not (Prism r9 aed001cfb920).
     validated_override = (audit_comment_body or "").lstrip().casefold().startswith(
@@ -8373,7 +8384,7 @@ def apply_batch_route_writes(
                     pin_sub_author=write.pin_sub_author or write.audit_comment_author,
                     force_model_reason=write.force_model_reason,
                 ):
-                    _validate_comment_args(author, body)
+                    _validate_comment_args(author, body, conn=conn)
             if write.touch_model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
                 FLAGSHIP_OVERRIDE_COMMENT_PREFIX
             ):
@@ -8709,8 +8720,8 @@ def _validate_comment_provenance(
     return run_id, session_ref
 
 
-def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = False) -> None:
-    """:func:`add_comment`'s author/body refusals, with no database access, so a
+def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = False, conn=None) -> None:
+    """:func:`add_comment`'s author/body refusals (read-only with ``conn``), so a
     batch can judge every comment it will insert before its first write
     (Prism d0b2bf482d38)."""
     if not body or not body.strip():
@@ -8724,6 +8735,9 @@ def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = Fal
     if not kernel_approve:
         check_approve_stamp(author, body)
     _check_flagship_override_body(author, body)
+    if conn is not None:
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("comment", body)])
 
 
 # Bound on an unhonoured ``--author`` label kept for forensics (see add_comment).
@@ -8773,7 +8787,7 @@ def add_comment(
     card, author, verb and session inside the insert's transaction; else
     :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
-    _validate_comment_args(author, body, kernel_approve=_kernel_approve)
+    _validate_comment_args(author, body, kernel_approve=_kernel_approve, conn=conn)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
@@ -9208,6 +9222,25 @@ def _append_event(
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
     boot = _boot_evidence() if kind in _BOOT_EVIDENCE_KINDS else None
+    if kind == "review_requested":
+        # A raw-entry trigger supplies provisional provenance before the normal
+        # handoff writer has finished. Finalize that row rather than publish two
+        # handoffs (and two notifications) for the same entry.
+        provisional = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_requested' "
+            "AND json_valid(payload) AND json_extract(payload,'$.source')='lifecycle_entry_repair' "
+            "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested')",
+            (task_id, task_id),
+        ).fetchone()
+        if provisional is not None:
+            payload = {**json.loads(provisional[1]), **(payload or {})}
+            payload.pop("source", None)
+            conn.execute(
+                "UPDATE task_events SET run_id=?,payload=?,actor_profile=?,actor_session_id=? WHERE id=?",
+                (run_id, _json_or_null(payload), actor_profile, actor_session_id, provisional[0]),
+            )
+            _journal_append(conn, task_id, kind, payload, run_id=run_id)
+            return
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
         "actor_profile, actor_session_id, boottime, boot_id) "
@@ -9620,7 +9653,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -9648,6 +9681,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if all(p["status"] in ("done", "archived") and p["kind"] != LINK_KIND_AFTER_MERGE
                    for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
+                if resume_status == "ready" and is_human_reviewer(row["assignee"]):
+                    continue
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
                     # recover -> respawn -> exhaust -> block forever). The
@@ -12082,11 +12117,24 @@ def complete_task(
                 except (TypeError, ValueError, AttributeError):
                     continue
 
+            from hermes_cli.kanban_round_draft import card_run_ids, mark_records
+            _round_runs = card_run_ids(conn, task_id)  # t_c418eebc: whose round-draft marks count as own
+            _round_marks = mark_records(conn, task_id)  # kernel-persisted marks only (Prism 852b8897186d)
+
             def _record_flips(flipped):
                 if flipped:
                     flip_records.update(flipped)
                     with write_txn(conn):
                         _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
+
+            def _consume_round_mark(key):
+                with write_txn(conn):
+                    current = mark_records(conn, task_id).get(key)
+                    if current != _round_marks.get(key) or not current or current.get("consumed"):
+                        raise ValueError("round draft mark already consumed or replaced")
+                    consumed = dict(current, consumed=True)
+                    _append_event(conn, task_id, "round_draft_marked", {"marked": {key: consumed}})
+                    _round_marks[key] = consumed
 
             # The card's Intent block into its own PR bodies before the ready flip (t_deee5435);
             # None when KANBAN_PR_INTENT/KANBAN_HANDOFF_PR_INTENT=0. Never raises.
@@ -12098,6 +12146,7 @@ def complete_task(
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
+                        round_runs=_round_runs, marked=_round_marks, consume=_consume_round_mark,
                         intent=intent_fn,
                     )
                 except _fresh.DraftPrError as draft_err:
@@ -13011,6 +13060,8 @@ def edit_task(
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("title", title), ("body", body)])
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -14028,6 +14079,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
     if until is not None and kind != "deferred":
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
@@ -14040,11 +14092,16 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, claim_lock FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, claim_lock, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        if expected_run_id is not None and cur_row["current_run_id"] != expected_run_id:
+            return False
+        if (kind is None and cur_row["status"] in ('running', 'ready', 'review')
+                and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or "")):
+            raise BlockRefused("block needs a kind or an explicit unblock_when predicate")
         if require_unclaimed_ready and (cur_row["status"] != "ready" or cur_row["claim_lock"] is not None):
             return False
         # Refuse only where a block could have landed; a done/archived/
@@ -14998,6 +15055,12 @@ def request_review(
         _enforce_branch_base(conn, _bb_task, metadata)
         if expected_run_id is not None:
             _enforce_handback_head(conn, task_id, summary=summary, metadata=metadata)
+            # Round end (t_c418eebc, Prism 1c13b5bb5159): this path skips complete_task's freshness gate, so
+            # flip the card's own round draft ready here; a negative-result handback stays draft.
+            from hermes_cli.kanban_negative_result import negative_result_match
+            if _neg_result is None and negative_result_match(summary, metadata) is None:
+                from hermes_cli.kanban_round_draft import finalize_on_review
+                finalize_on_review(conn, task_id, metadata)
 
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
@@ -15626,6 +15689,8 @@ def request_changes(
         # Inline INSERT below bypasses add_comment's release-line guard: check before any write (t_80c7e5b9).
         from hermes_cli.kanban_close_on_guard import refusal as _close_on_refusal
 
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("comment", coverage_body)])
         close_on_error = _close_on_refusal(comment_author, coverage_body)
         if close_on_error:
             return False, close_on_error
@@ -15754,6 +15819,10 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        # A composed reassignment owns its final route and worker_ok release;
+        # its intermediate implementer must not clear a non-worker hold.
+        if not nested and is_worker_assignee(implementer):
+            _set_no_worker_locked(conn, task_id, False, source="request-changes")
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
@@ -15961,6 +16030,10 @@ def request_sendback(
                     )
                     if cur.rowcount != 1:
                         return False, "task changed during sendback"
+                    # Only a sendback that hands the card back to its worker
+                    # releases an operator hold; an untouched assignee keeps it.
+                    if is_worker_assignee(implementer):
+                        _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": status,
@@ -15979,6 +16052,8 @@ def request_sendback(
             )
             if cur.rowcount != 1:
                 return False, "task changed during sendback"
+            if is_worker_assignee(implementer):
+                _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": new_status,
@@ -16660,6 +16735,8 @@ def specify_triage_task(
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("title", title), ("body", body)])
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
@@ -16767,6 +16844,8 @@ def triage_resolve_task(
         if close_on_error:
             return False, close_on_error
 
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("reason", reason)])
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
@@ -17928,22 +18007,25 @@ def set_task_priority(
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park until a validated wake time, atomically with ending the run."""
+    if wake_at is not None:
+        wake_at = validate_wake_at(wake_at)
     with write_txn(conn):
-        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT status, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        from hermes_cli.kanban_lifecycle_guards import has_event_gate
+        if wake_at is None and not (row and has_event_gate(row["body"])):
+            raise ValueError("scheduled needs a wake time (--at or --now) or unblock_when: event:<name>")
         parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
-        params: list[Any] = [task_id]
+        params: list[Any] = [wake_at, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL,
-                   -- A leftover rate-limit cooldown would read as a timed wake
-                   -- to wake_due_scheduled; set_schedule_wake stamps a real one.
-                   next_eligible_at = NULL
+                   next_eligible_at = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
@@ -17956,7 +18038,7 @@ def schedule_task(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, "scheduled",
-                      {"reason": reason, "source_status": parked_from}, run_id=run_id)
+                      {"reason": reason, "source_status": parked_from, "until": wake_at}, run_id=run_id)
         return True
 
 # Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a

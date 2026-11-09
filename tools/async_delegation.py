@@ -1658,6 +1658,13 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         return True
     logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
                    delegation_id, old_attempt, launched.get("error"))
+    if launched.get("paused"):
+        # A live FWA hold closed this host to new work (Prism 0f110d29ad76): running the unit in-process or
+        # detached here would start it on the held host anyway. Nothing runs; the delegation ends naming the hold.
+        _akb.release_launch_fence(launched.get("task_id"))
+        _note_kanban_launch(delegation_id, "none (kanban pause hold; not run)")
+        raise RuntimeError(f"background unit not started: {launched['paused']}; no in-process fallback "
+                           "while the host is held")
     error_class = str(launched.get("error") or "").split(":", 1)[0] or "unknown"
     try:
         on_card = _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home)

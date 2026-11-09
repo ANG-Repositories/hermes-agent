@@ -502,6 +502,15 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
     return int(value) if value is not None else default
 
 
+def _tool_default_priority(conn) -> int:
+    """No-priority create through the tool: the live band for a person/operator author (t_febbdb61), else 0."""
+    from hermes_cli.kanban_parser import live_band_default
+    try:
+        return live_band_default(conn, _persisted_identity()) or 0
+    except Exception:  # a band read must never fail the create
+        return 0
+
+
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
@@ -1550,7 +1559,8 @@ def _handle_create(args: dict, **kw) -> str:
             parents=tuple(parents), parents_kind=parents_kind, continues=args.get("continues"),
             workspace_of=args.get("workspace_of") or None,
             tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
-            priority=_opt_int(args.get("priority"), 0),
+            priority=(_opt_int(args.get("priority")) if args.get("priority") is not None
+                      else _tool_default_priority(conn)),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.

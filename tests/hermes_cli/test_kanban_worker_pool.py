@@ -651,10 +651,10 @@ def test_human_review_lane_rows_are_dropped_before_routing(kanban_home, monkeypa
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         kinds = [r[0] for r in conn.execute(
             "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (review,))]
-    assert review in res.skipped_nonspawnable
+    assert review not in res.skipped_nonspawnable
     assert review not in res.placement_waits
     assert all(e["task_id"] != review for e in res.routes)
-    assert kinds.count("skipped_nonspawnable") == 1
+    assert kinds.count("needs_operator") == 1
     assert (work, "ace-ai") in spawned
 
 

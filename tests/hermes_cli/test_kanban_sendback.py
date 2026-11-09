@@ -296,7 +296,7 @@ def test_sendback_resume_phase_survives_block_unblock(kanban_home: SimpleNamespa
         assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
         assert kb._resume_status_from_events(conn, tid) == "ready"
         _tick(kanban_home)
-        assert kb.block_task(conn, tid, reason="wait")
+        assert kb.block_task(conn, tid, reason="wait", kind="needs_input")
         _tick(kanban_home)
         assert kb.unblock_task(conn, tid)
         t = kb.get_task(conn, tid)

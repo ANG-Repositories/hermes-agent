@@ -837,6 +837,8 @@ def connect(
                 _kb._ensure_status_audit(conn)
                 from hermes_cli.kanban_failure_ownership import migrate
                 migrate(conn)
+                from hermes_cli.kanban_lifecycle_guards import install
+                install(conn)
                 _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 
