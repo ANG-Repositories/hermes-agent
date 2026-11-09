@@ -266,6 +266,60 @@ def test_sqlite_lock_waiter_logs_once_and_the_write_lands(db, monkeypatch, caplo
     assert len(lines) == 1 and "sqlite lock" in lines[0], caplog.text
 
 
+def test_writer_wait_timer_keeps_context_protocol_and_cancels(db, monkeypatch):
+    lock = db._lock
+    events = []
+
+    class ObservedLock:
+        def locked(self):
+            return True  # force the contended telemetry path without a wall-clock wait
+
+        def __enter__(self):
+            events.append("enter")
+            return lock.__enter__()
+
+        def __exit__(self, *args):
+            events.append("exit")
+            return lock.__exit__(*args)
+
+    class Timer:
+        def __init__(self, interval, callback):
+            assert interval == sessiondb_mod.WAITER_ATTRIBUTION_S
+
+        def start(self):
+            events.append("start")
+
+        def cancel(self):
+            events.append("cancel")
+
+    monkeypatch.setattr(db, "_lock", ObservedLock())
+    monkeypatch.setattr(sessiondb_mod.threading, "Timer", Timer)
+    db._execute_write(lambda conn: events.append("write"))
+    assert events == ["start", "enter", "cancel", "write", "exit"]
+
+
+def test_writer_wait_timer_start_failure_does_not_fail_write(db, monkeypatch):
+    lock = db._lock
+
+    class ObservedLock:
+        def locked(self):
+            return True
+
+        def __enter__(self):
+            return lock.__enter__()
+
+        def __exit__(self, *args):
+            return lock.__exit__(*args)
+
+    def broken_timer(*args, **kwargs):
+        raise RuntimeError("cannot start diagnostic thread")
+
+    monkeypatch.setattr(db, "_lock", ObservedLock())
+    monkeypatch.setattr(sessiondb_mod.threading, "Timer", broken_timer)
+    db.set_meta("timer-failure", "write survived")
+    assert db.get_meta("timer-failure") == "write survived"
+
+
 def test_waiter_attribution_fails_open(db, monkeypatch):
     def _broken(*_a, **_k):
         raise RuntimeError("ledger unreadable")
