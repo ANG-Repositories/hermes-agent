@@ -4,8 +4,8 @@ Regression for t_5e8801d8: every new CLI process ran a full ``PRAGMA
 integrity_check`` on the 740 MB board while holding the cross-process init
 lock (``_INITIALIZED_PATHS`` is per-process), so concurrent callers queued
 behind each other's scans and hit the 10 s init-lock timeout. A clean check now
-leaves a stamp bound to the DB file's ``(st_dev, st_ino)``; a later process
-within the TTL trusts it, anything else re-runs the full check.
+leaves a stamp bound to the DB file (inode, birth time, boot, size floor); a
+later process within the TTL trusts it, anything else re-runs the full check.
 
 Counts come from a ``_run_integrity_check`` shim in real subprocesses, never a
 wall-clock bound.
@@ -111,6 +111,41 @@ def test_inode_change_reruns_full_check(tmp_path):
     copy = tmp_path / "kanban.db.copy"
     shutil.copy2(db, copy)
     os.replace(copy, db)  # same bytes, new inode
+
+    assert _spawn_connects(db, 1, tmp_path) == 1
+
+
+def test_same_inode_restore_of_older_copy_reruns_full_check(tmp_path):
+    """Prism ed5edb9798ea: ``cp backup kanban.db`` keeps the inode."""
+    db = tmp_path / "kanban.db"
+    _seed(db)
+    backup = tmp_path / "backup.db"
+    shutil.copyfile(db, backup)
+    with kbc.connect_closing(db_path=db) as conn:
+        conn.execute("CREATE TABLE filler(x BLOB)")
+        conn.executemany("INSERT INTO filler VALUES (zeroblob(4096))", [()] * 256)
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    kb._INITIALIZED_PATHS.discard(str(db.resolve()))
+    assert _spawn_connects(db, 1, tmp_path) <= 1
+    assert _stamp(db).exists()
+    inode = db.stat().st_ino
+    for sidecar in ("-wal", "-shm"):
+        Path(str(db) + sidecar).unlink(missing_ok=True)
+    shutil.copyfile(backup, db)  # truncate + rewrite in place
+    assert db.stat().st_ino == inode
+
+    assert _spawn_connects(db, 1, tmp_path) == 1
+
+
+def test_stamp_from_another_boot_reruns_full_check(tmp_path):
+    """A torn page from a power loss keeps the inode; a reboot voids the stamp."""
+    db = tmp_path / "kanban.db"
+    _seed(db)
+    assert _spawn_connects(db, 1, tmp_path) <= 1
+    stamp = json.loads(_stamp(db).read_text())
+    stamp["boot"] = "a-previous-boot"
+    _stamp(db).write_text(json.dumps(stamp))
 
     assert _spawn_connects(db, 1, tmp_path) == 1
 

@@ -6,6 +6,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 """
 from __future__ import annotations
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -46,8 +48,8 @@ _INIT_LOCK_POLL_SECONDS = 0.05
 # Cross-process healthy verdict: ``_INITIALIZED_PATHS`` is per-process, so every
 # fresh CLI/worker process re-ran a full integrity_check (~2-3 s on a 740 MB
 # board) under the init lock and queued the rest behind it (t_5e8801d8). A clean
-# check leaves ``<db>.integrity-ok`` bound to the file's (st_dev, st_ino); it is
-# trusted for the TTL only. Env override (seconds, 0 disables), env-only like
+# check leaves ``<db>.integrity-ok`` bound to the file (see _db_fingerprint);
+# it is trusted for the TTL only. Env override (seconds, 0 disables), env-only like
 # the busy timeout so connect() never loads config.yaml.
 _INTEGRITY_STAMP_TTL_ENV = "HERMES_KANBAN_INTEGRITY_STAMP_TTL_SECONDS"
 _INTEGRITY_STAMP_TTL_SECONDS = 900
@@ -541,31 +543,78 @@ def _integrity_stamp_path(resolved: Path) -> Path:
     return resolved.with_name(resolved.name + ".integrity-ok")
 
 
-def _integrity_stamp_is_fresh(resolved: Path, identity: Optional[tuple[int, int]]) -> bool:
-    """True iff the stamp names this exact file and is younger than the TTL.
-    Missing/unreadable/malformed/foreign-inode/expired/future stamps are False."""
+@functools.lru_cache(maxsize=1)
+def _boot_id() -> str:
+    """Per-boot id (Linux ``boot_id``, macOS ``kern.bootsessionuuid``); ``""``
+    when unknown. Not a boot time: a clock step moves that."""
+    with contextlib.suppress(OSError):
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    if sys.platform == "darwin":
+        with contextlib.suppress(OSError, AttributeError):
+            import ctypes
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            buf, size = ctypes.create_string_buffer(64), ctypes.c_size_t(64)
+            if libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0:
+                return buf.value.decode("ascii", "ignore").strip()
+    return ""
+
+
+def _db_fingerprint(resolved: Path) -> Optional[dict]:
+    """What a stamp is bound to. ``stat`` only: opening the DB file outside
+    SQLite would drop this process's POSIX locks on it.
+
+    The inode alone trusts a same-inode rewrite (Prism ed5edb9798ea), and the
+    mtime cannot be used: checkpoints move it every few seconds on a live
+    board. So: ``boot`` invalidates across a power loss / panic (the torn-page
+    case), ``birth`` (where the OS has it) across delete-and-recreate inode
+    reuse, and ``size`` is a floor checked by the reader: SQLite only shrinks
+    the file on VACUUM, while a copy of an older backup over the same inode
+    usually does."""
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return None
+    return {
+        "dev": st.st_dev,
+        "ino": st.st_ino,
+        "birth": getattr(st, "st_birthtime", None),
+        "boot": _boot_id(),
+        "size": st.st_size,
+    }
+
+
+def _integrity_stamp_is_fresh(resolved: Path, fingerprint: Optional[dict]) -> bool:
+    """True iff the stamp names this exact file in this boot, the file has not
+    shrunk below the checked size, and the stamp is younger than the TTL.
+    Missing/unreadable/malformed/foreign/expired/future stamps are False."""
     ttl = _kb._env_int(_INTEGRITY_STAMP_TTL_ENV, _INTEGRITY_STAMP_TTL_SECONDS, minimum=0)
-    if ttl <= 0 or identity is None:
+    if ttl <= 0 or fingerprint is None:
         return False
     try:
         data = json.loads(_integrity_stamp_path(resolved).read_text())
-        stamped = (int(data["dev"]), int(data["ino"]))
+        same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth", "boot"))
+        not_shrunk = fingerprint["size"] >= int(data["size"])
         age = time.time() - float(data["checked_at"])
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return False
-    return stamped == identity and 0 <= age < ttl
+    return same_file and not_shrunk and 0 <= age < ttl
 
 
-def _write_integrity_stamp(resolved: Path, identity: Optional[tuple[int, int]], checked_at: float) -> None:
-    """Record a clean verdict for ``identity``; skipped if the file was swapped
-    during the check. Best effort: a failed write only costs the next process a
-    full check."""
-    if identity is None or _kb._path_identity(resolved) != identity:
+def _write_integrity_stamp(resolved: Path, fingerprint: Optional[dict], checked_at: float) -> None:
+    """Record a clean verdict for ``fingerprint`` (taken before the check);
+    skipped if the file was swapped during the check. Best effort: a failed
+    write only costs the next process a full check."""
+    if fingerprint is None:
+        return
+    after = _db_fingerprint(resolved)
+    if after is None or any(after[key] != fingerprint[key] for key in ("dev", "ino", "birth")):
         return
     stamp = _integrity_stamp_path(resolved)
     tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(json.dumps({"dev": identity[0], "ino": identity[1], "checked_at": checked_at}))
+        tmp.write_text(json.dumps({**fingerprint, "checked_at": checked_at}))
         os.replace(tmp, stamp)
     except OSError:
         with contextlib.suppress(OSError):
@@ -598,13 +647,13 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if _missing_or_empty(resolved) or str(resolved) in _INITIALIZED_PATHS:
         return
-    identity = _kb._path_identity(resolved)
-    if _integrity_stamp_is_fresh(resolved, identity):
+    fingerprint = _db_fingerprint(resolved)
+    if _integrity_stamp_is_fresh(resolved, fingerprint):
         return
     checked_at = time.time()
     messages, reason = _probe_for_corruption(resolved)
     if reason is None:
-        _write_integrity_stamp(resolved, identity, checked_at)
+        _write_integrity_stamp(resolved, fingerprint, checked_at)
         return
     _drop_integrity_stamp(resolved)
     # Quarantine FIRST — both the repair and fail-closed paths preserve the
