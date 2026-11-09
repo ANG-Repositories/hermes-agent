@@ -338,6 +338,22 @@ def test_replay_interrupted_again_is_not_marked_a_second_time(home):
     assert "replay_pending" not in _job()
 
 
+@pytest.mark.parametrize("delivered", [True, False])
+def test_interrupted_run_ledger_error_says_whether_it_delivered(home, delivered):
+    """The marker pass tells "already delivered" from "cut off" by this error text."""
+    import cron.scheduler as sched
+    from cron import shutdown_replay
+    from cron.executions import create_execution, get_execution, mark_execution_running
+
+    _seed()
+    row = create_execution(JOB_ID, source="tick")
+    mark_execution_running(row["id"])
+    sched._finish_interrupted_run(_job(), row["id"], None, delivered=delivered)
+    assert get_execution(row["id"])["error"] == (
+        shutdown_replay.INTERRUPTED_AFTER_DELIVERY_ERROR if delivered
+        else shutdown_replay.INTERRUPTED_ERROR)
+
+
 def test_gateway_stop_sweep_requests_replay_markers(monkeypatch):
     """The drain-expired sweep is the only caller that asks for replay markers."""
     import cron.scheduler as sched
