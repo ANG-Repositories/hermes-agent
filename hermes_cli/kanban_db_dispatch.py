@@ -5216,6 +5216,10 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     _fleet_dir = _kb.kanban_home() / "fleet"
     last_resort = _studio_last_resort(_fleet_dir)
     studio_reasons = _kwp.studio_pin_reasons(caps) if last_resort else None
+    if _kwp.skills_need_studio(skills, getattr(caps, "cmap", None), studio_reasons):
+        # An attached skill needs a capability the Studio serves (identity-only docker included): its
+        # `host: studio` pin is justified, in this check and in portable() alike (Prism f5bbe97bc028).
+        studio_reasons = None
     pin, ignored, pin_dropped = _kwp.effective_pin(row["body"], plan.config.hosts or (),
                                                    getattr(plan.config, "pin_aliases", None), studio_reasons)
     if pin_dropped:
@@ -5263,7 +5267,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                                if scan else False), **_portable_kw)
     carried = False
     if (not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None
-            and _kb._kwh.carry_size_ok(row["workspace_path"])):
+            and _kb._kwh.carry_size_ok(row["workspace_path"])
+            and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])):
         # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
         # while the Studio has room. Every OTHER rule is judged as if the directory were empty; a card that is
         # then portable runs locally when the local gate admits, else on a pool host with the directory carried
@@ -6677,6 +6682,13 @@ def _dispatch_once_locked(
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
+        # A carried card's workspace is on its carry host (Prism fd679a4c5702): with no plan it waits there,
+        # never runs on the Studio's stale copy, whatever the host_preference switch says.
+        for _rid in _kb._kwh.carried_ids(conn, [r["id"] for r in ready_rows]):
+            _r = next(r for r in ready_rows if r["id"] == _rid)
+            if (_r["workspace_kind"] or "scratch") == "scratch" \
+                    and _kb._kwh.carried_host(conn, _rid, _r["workspace_path"]):
+                row_route.setdefault(_rid, ("wait", "pool_unavailable"))
         # Identity-only capabilities (docker) hold with or without a plan:
         # no plan is the normal admitting band, and an unpinned docker card
         # must not spawn locally there either (Prism b83b86d68a65 on #1902).
@@ -7821,7 +7833,8 @@ def _dispatch_once_locked(
                     # failure (claim released, reservation refunded), never an empty-dir run.
                     _kb._kwh.carry_workspace(placed_host, str(workspace))
                     with _kbc.write_txn(conn):
-                        # "workspace" is the card's stored path, the key carried_host() binds on.
+                        # "workspace" = the stored path at carry time, "path" = the spelling persisted just
+                        # below; carried_host() binds on either (Prism 34bd0265a601).
                         _kb._append_event(conn, claimed.id, _kb._kwh.CARRIED_EVENT,
                                           {"host": placed_host.name, "workspace": claimed.workspace_path,
                                            "path": str(workspace)},

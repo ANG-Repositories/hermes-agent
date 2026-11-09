@@ -444,3 +444,72 @@ def test_replay_counts_studio_placements_before_and_after(kanban_home, monkeypat
     assert res["studio_after_pinned"] == 2
     assert res["moved"]["host_studio->fwa"] == [bare]
     assert "host_studio" in rp.render(res)
+
+
+# -- Prism round 3 (ea59f384dc) ------------------------------------------------------------------------------
+
+def test_a_studio_pin_a_skill_needs_is_kept(kanban_home, monkeypatch):
+    """Prism f5bbe97bc028: a bare `host: studio` on a card whose ATTACHED skill needs an identity-only Studio
+    capability (docker) is justified. Dropping it would make the card an unpinned docker card: wait forever."""
+    cmap = khc.CapabilityMap(capabilities=tuple(sorted(STUDIO_CAPS)),
+                             hosts={khc.STUDIO_ROW: STUDIO_CAPS, "ace-ai": frozenset()},
+                             index={"docker-ops": ("docker",)}, identity_only=frozenset({"docker"}))
+    caps = khc.CapabilityTick(cmap, khc.ENFORCE, ("docker",), ("ace-ai",))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="x", assignee="alpha", body="host: studio\nrun the compose stack",
+                             skills=["docker-ops"])
+        route, rule, _ = _route(conn, tid, caps)
+        bare = kb.create_task(conn, title="y", assignee="alpha", body="host: studio\nfix the lint")
+        assert _route(conn, bare, caps)[0] == ("portable", None)  # no such skill: still dropped
+    assert route[0] == "local" and rule == "host_studio", (route, rule)
+    monkeypatch.setattr(khc, "load_map", lambda fleet: cmap)
+    assert kwp.mint_studio_pin_note("host: studio", kanban_home / "fleet", ["docker-ops"]) is None
+    assert kwp.mint_studio_pin_note("host: studio", kanban_home / "fleet") is not None
+
+
+def test_carried_host_reads_the_persisted_spelling(kanban_home):
+    """Prism 34bd0265a601: custody holds when the row now carries the spelling the claim persisted ("path"),
+    not the one stored at carry time ("workspace")."""
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        kb._append_event(conn, tid, kwh.CARRIED_EVENT, {"host": "ace-ai", "workspace": "/old/spelling", "path": path})
+        conn.commit()
+        assert kwh.carried_host(conn, tid, path) == "ace-ai"
+        assert kwh.carried_host(conn, tid, "/old/spelling") == "ace-ai"
+        assert kwh.carried_host(conn, tid, None) is None
+
+
+def test_a_shared_workspace_is_never_carried(kanban_home, carried):
+    """Prism e25ae3385b2f: a carry copies onto the same path on the pool host, so a directory another card points
+    at (or already carried) is not carried; that card keeps the old local_files rule."""
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        other = kb.create_task(conn, title="o", assignee="alpha")
+        kbw.set_workspace_path(conn, other, path)
+        assert kwh.carry_path_shared(conn, tid, path)
+        assert _route(conn, tid, None) == (("local", None), "local_files", False)
+        _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="saturated:cpu")
+    assert carried == [] and all(t != tid for t, _h in spawned)
+
+
+def test_a_workspace_another_card_carried_is_not_carried_again(kanban_home, carried):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        other = kb.create_task(conn, title="o", assignee="alpha")
+        kb._append_event(conn, other, kwh.CARRIED_EVENT, {"host": "ace-ai", "workspace": "/x", "path": path})
+        conn.commit()
+        assert kwh.carry_path_shared(conn, tid, path)
+        assert not kwh.carry_path_shared(conn, other, "/somewhere/else")
+        assert _route(conn, tid, None)[1:] == ("local_files", False)
+
+
+def test_a_carried_card_waits_when_there_is_no_pool_plan(kanban_home, carried):
+    """Prism fd679a4c5702: with no plan this tick the bind is never computed; custody still holds, so the card
+    waits pool_unavailable instead of running on the Studio's stale copy."""
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        kb._append_event(conn, tid, kwh.CARRIED_EVENT, {"host": "ace-ai", "workspace": path, "path": path})
+        plain = kb.create_task(conn, title="p", assignee="alpha")
+        conn.commit()
+        _res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+    assert (tid, None) not in spawned and (plain, None) in spawned

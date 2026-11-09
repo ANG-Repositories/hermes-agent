@@ -1011,6 +1011,19 @@ def studio_pin_justified(body: Optional[str], reasons: Optional[frozenset]) -> b
     return any(w in reasons for w in _khc.declared_words(body))
 
 
+def skills_need_studio(skills: Optional[Iterable[Any]], cmap, reasons: Optional[frozenset]) -> bool:
+    """Does an ATTACHED skill need a capability the Studio row serves (Prism f5bbe97bc028)? The capability index
+    maps skill -> capabilities (identity-only docker included), and the verdict enforces those; a `host: studio`
+    pin such a card carries is justified even with no ``requires:`` line. False when the map or index is
+    unreadable (``reasons`` is then None anyway, or the index cannot say)."""
+    if not reasons or cmap is None or getattr(cmap, "index_error", None) is not None:
+        return False
+    from hermes_cli import kanban_host_capabilities as _khc
+    index = getattr(cmap, "index", None) or {}
+    return any(c in reasons for s in (skills or ()) if isinstance(s, str)
+               for c in index.get(_khc.skill_key(s), ()))
+
+
 def effective_pin(body: Optional[str], known_hosts: Iterable[str],
                   aliases: Optional[Mapping[str, str]] = None,
                   studio_reasons: Optional[frozenset] = None) -> Tuple[Optional[str], Optional[str], bool]:
@@ -1034,7 +1047,8 @@ def note_dropped_studio_pin(card_id: str) -> None:
                   "placed by FWA", card_id)
 
 
-def mint_studio_pin_note(body: Optional[str], fleet_dir: Path) -> Optional[str]:
+def mint_studio_pin_note(body: Optional[str], fleet_dir: Path,
+                         skills: Optional[Iterable[Any]] = None) -> Optional[str]:
     """``kanban create``'s line for a bare ``host: studio`` the dispatcher will drop (t_e604c0f9), else None. The
     same predicate as dispatch: the host_preference switch (t_c2fce87e), the capability map's Studio row, the
     card's ``requires:`` words."""
@@ -1046,7 +1060,10 @@ def mint_studio_pin_note(body: Optional[str], fleet_dir: Path) -> Optional[str]:
         if pin != PIN_STUDIO:
             return None
         from hermes_cli import kanban_host_capabilities as _khc
-        reasons = studio_map_reasons(_khc.load_map(fleet_dir))
+        cmap = _khc.load_map(fleet_dir)
+        reasons = studio_map_reasons(cmap)
+        if skills_need_studio(skills, cmap, reasons):
+            return None
     except Exception:
         return None
     if reasons is None or studio_pin_justified(body, reasons):

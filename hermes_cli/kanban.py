@@ -1157,7 +1157,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
         try:
             from hermes_cli import kanban_worker_pool as _kpool
-            _pin_note = _kpool.mint_studio_pin_note(task.body, kb.kanban_home() / "fleet")
+            _pin_note = _kpool.mint_studio_pin_note(task.body, kb.kanban_home() / "fleet",
+                                                    getattr(task, "skills", None))
         except Exception:
             _pin_note = None
         for _note in (*_placement_notes, *((_pin_note,) if _pin_note else ())):

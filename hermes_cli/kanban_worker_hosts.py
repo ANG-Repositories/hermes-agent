@@ -369,9 +369,43 @@ def carried_host(conn, task_id: str, workspace_path: Optional[str]) -> Optional[
     except (TypeError, ValueError):
         return None
     host = doc.get("host")
-    if not isinstance(host, str) or not host or doc.get("workspace") != workspace_path:
+    # Either spelling the carry recorded counts: the stored path at carry time and the path the claim then
+    # persisted (Prism 34bd0265a601: the persisted one is what the row holds on every later run).
+    if not isinstance(host, str) or not host or workspace_path is None \
+            or workspace_path not in (doc.get("workspace"), doc.get("path")):
         return None
     return host.lower()
+
+
+def carried_ids(conn, task_ids) -> set:
+    """The subset of ``task_ids`` with any carry event (one query; :func:`carried_host` decides custody)."""
+    ids = [t for t in task_ids if t]
+    if not ids:
+        return set()
+    marks = ",".join("?" * len(ids))
+    return {r[0] for r in conn.execute(f"SELECT DISTINCT task_id FROM task_events WHERE kind=? AND task_id IN ({marks})",
+                                       (CARRIED_EVENT, *ids))}
+
+
+def carry_path_shared(conn, task_id: str, workspace_path: Optional[str]) -> bool:
+    """True when another card points at ``workspace_path`` or already carried it (Prism e25ae3385b2f): a carry
+    copies onto the same path on the pool host, so a shared directory would overwrite that card's remote work.
+    Such a card is not carried (it keeps the old local_files rule). A missing path counts as shared."""
+    if not workspace_path:
+        return True
+    if conn.execute("SELECT 1 FROM tasks WHERE id<>? AND workspace_path=? LIMIT 1",
+                    (task_id, workspace_path)).fetchone():
+        return True
+    needle = json.dumps(workspace_path)
+    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE kind=? AND task_id<>? AND instr(payload, ?) > 0",
+                                   (CARRIED_EVENT, task_id, needle)):
+        try:
+            doc = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            return True
+        if workspace_path in (doc.get("workspace"), doc.get("path")):
+            return True
+    return False
 
 
 def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
