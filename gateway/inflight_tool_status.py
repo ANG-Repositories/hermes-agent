@@ -31,13 +31,9 @@ _DELEGATE_LOG_MAX = 256
 
 
 def format_duration(seconds: float) -> str:
-    """``45s`` / ``7m`` / ``2h05m``."""
+    """``45s`` / ``71m`` (plain minutes, matching the heartbeat's own ``N min``)."""
     s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s}s" if s < 60 else f"{s // 60}m"
 
 
 def child_key(child: Any) -> str:
