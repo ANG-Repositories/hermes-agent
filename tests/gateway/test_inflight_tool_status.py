@@ -232,3 +232,55 @@ async def test_bubble_short_call_or_knob_off_paints_nothing(monkeypatch, elapsed
     await tr._paint_inflight_notice(st)
     assert adapter.edits == [] and adapter.sent == []
     assert st.progress_lines == ['🔀 delegate_task: "3 tasks"']
+
+
+# ── the real heartbeat loop (gateway/run_turn.py::_run_agent_notify_long_running) ──────────────
+
+async def _one_heartbeat(monkeypatch, agent, activity):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tests.gateway.test_wake_progress_header import _bare_runner
+
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.01")
+    runner = _bare_runner()
+    sends = []
+
+    async def _send(chat_id, content, metadata=None):
+        sends.append(content)
+        runner._restart_requested = True  # one heartbeat, then stop
+        return SimpleNamespace(success=True, message_id="hb-1")
+
+    adapter = MagicMock()
+    adapter.send = _send
+    adapter.edit_message = AsyncMock()
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._agent_activity_summary = staticmethod(lambda a: activity)
+    runner._running_agents["sess"] = agent
+    disp = MagicMock()
+    disp._display_surface_mode.return_value = "on"
+    disp.resolve_display_setting.return_value = True
+    ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform="discord"), session_key="sess")
+    ctx.agent_holder[0] = agent
+    await asyncio.wait_for(runner._run_agent_notify_long_running(disp, ctx, [None]), 5)
+    assert len(sends) == 1
+    return sends[0]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_shows_inflight_delegate_children(monkeypatch):
+    now = time.time()
+    child = _child("20261108_154800_af3bcd", 78, tool="terminal", tool_started=now - 40)
+    agent = _parent("delegate_task", 71 * 60, active=[child], now=now)
+    record_delegate_child(agent, child, now=now - 70 * 60)
+    text = await _one_heartbeat(monkeypatch, agent, {"api_call_count": 79, "max_iterations": 300,
+                                                     "current_tool": "delegate_task"})
+    assert text.startswith("⏳ Working — 0 min — iteration 79/300, delegate_task 71m - 1 child: 0 done, 1 running ")
+    assert "(child af3bcd: API call #78, in terminal 4" in text
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_short_call_unchanged(monkeypatch):
+    agent = _parent("terminal", 20, now=time.time())
+    text = await _one_heartbeat(monkeypatch, agent, {"api_call_count": 5, "max_iterations": 300,
+                                                     "current_tool": "terminal"})
+    assert text == "⏳ Working — 0 min — iteration 5/300, terminal"
