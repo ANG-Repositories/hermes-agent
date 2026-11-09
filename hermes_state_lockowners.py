@@ -13,6 +13,7 @@ at the moment the deadline passes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -132,6 +133,13 @@ _LEDGER_SUFFIX = ".lockholders"
 _LEDGER_MAX_AGE_S = 86400.0
 _TIMEOUT_MEMORY_S = 600.0
 _WATCHDOG_TICK_S = 0.5
+# Every recorded hold (>= _HOLD_RECORD_MIN_S) is also appended to <ledger>/history.jsonl so a past
+# stall window can be rebuilt after the per-pid file was overwritten (t_7fe48f0b). Bounded: rotated to
+# history.jsonl.1 at _HISTORY_MAX_BYTES, one backup kept (<= 2x the cap on disk).
+_HISTORY_NAME = "history.jsonl"
+_HISTORY_MAX_BYTES = 4 * 1024 * 1024
+# A writer that has waited this long for the write lock logs the holder on its own side.
+WAITER_ATTRIBUTION_S = 10.0
 
 _holds_lock = threading.Lock()
 # Serializes ledger publication with hold completion: a watchdog "holding" write that lost the race
@@ -289,7 +297,8 @@ def hold_started(db_path, op: str) -> Optional[int]:
             token = _hold_seq
             _active_holds[token] = {"db_path": db_path, "op": op, "t0": time.monotonic(), "since": time.time(),
                                     "marked": False, "ended": False, "pid": os.getpid(), "who": None,
-                                    "ledger": None, "seq": token, "commit_t0": None}
+                                    "ledger": None, "seq": token, "commit_t0": None,
+                                    "tid": threading.get_ident(), "cpu0": _thread_cpu(), "callback_cpu_s": None}
             if not _watchdog_running or _watchdog_pid != os.getpid():
                 try:
                     _Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
@@ -314,6 +323,7 @@ def hold_committing(token: Optional[int]) -> None:
             if hold is None:
                 return
             hold["commit_t0"], hold["commit_since"] = time.monotonic(), time.time()
+            hold["callback_cpu_s"] = _callback_cpu(hold)  # this IS the writer thread: thread_time() is its CPU
             republish = hold["marked"]  # already published "holding" without the phase
         if republish:
             _publish_holding(hold)
@@ -321,11 +331,33 @@ def hold_committing(token: Optional[int]) -> None:
         logger.debug("state.db lock-holder commit mark failed", exc_info=True)  # never breaks the write
 
 
+def _thread_cpu() -> Optional[float]:
+    try:
+        return time.thread_time()
+    except Exception:  # never breaks the write
+        return None
+
+
+def _callback_cpu(hold: dict) -> Optional[float]:
+    """CPU the writer thread spent since BEGIN IMMEDIATE; None off the writer thread or when unknown."""
+    try:
+        if hold.get("cpu0") is None or hold.get("tid") != threading.get_ident():
+            return None
+        now = _thread_cpu()
+        return None if now is None else round(max(now - hold["cpu0"], 0.0), 3)
+    except Exception:
+        return None
+
+
 def _phase_fields(hold: dict, now: float) -> dict:
-    """``commit_since`` (wall) and ``commit_s`` (so far): absent while the callback still runs."""
+    """``commit_since`` (wall) and ``commit_s`` (so far): absent while the callback still runs.
+    Once commit() started, ``callback_s`` (wall from BEGIN to commit) and ``callback_cpu_s`` (writer
+    thread CPU over the same span): callback_s far above callback_cpu_s means the thread held the lock
+    without running (GIL / CPU starvation), not that its SQL was slow (t_7fe48f0b)."""
     if hold.get("commit_t0") is None:
         return {}
-    return {"commit_since": hold["commit_since"], "commit_s": round(now - hold["commit_t0"], 1)}
+    return {"commit_since": hold["commit_since"], "commit_s": round(now - hold["commit_t0"], 1),
+            "callback_s": round(hold["commit_t0"] - hold["t0"], 1), "callback_cpu_s": hold.get("callback_cpu_s")}
 
 
 def _phase_suffix(rec: dict, now: float, *, released: bool) -> str:
@@ -353,9 +385,75 @@ def hold_ended(token: Optional[int]) -> None:
     now = time.monotonic()
     held = now - hold["t0"]
     if held >= _HOLD_RECORD_MIN_S or hold["marked"]:
+        fields = _phase_fields(hold, now)
+        if hold.get("commit_t0") is None:  # rolled back / raised before commit(): all of it was callback
+            fields.update(callback_s=round(held, 1), callback_cpu_s=_callback_cpu(hold))
         with _publish_lock:
-            _write_record(hold, state="released", held_s=round(held, 1), released_at=time.time(),
-                          **_phase_fields(hold, now))
+            _write_record(hold, state="released", held_s=round(held, 1), released_at=time.time(), **fields)
+            _append_history(hold, dict(fields, state="released", held_s=round(held, 1),
+                                       released_at=time.time()))
+
+
+def _append_history(hold: dict, fields: dict) -> None:
+    """Append one released hold to <ledger>/history.jsonl, rotating at _HISTORY_MAX_BYTES.
+    Callers hold _publish_lock; never raises. Runs after _write_record, which resolved the ledger."""
+    try:
+        ledger = hold.get("ledger")
+        if ledger is None:
+            return
+        line = (json.dumps(_record(hold, fields), sort_keys=True) + "\n").encode("utf-8")
+        if not _DIR_FD_OK:
+            if os.path.islink(ledger) or not os.path.isdir(ledger):
+                return
+            path = os.path.join(ledger, _HISTORY_NAME)
+            with contextlib.suppress(OSError):
+                if os.path.getsize(path) + len(line) > _HISTORY_MAX_BYTES:
+                    os.replace(path, path + ".1")
+            with open(path, "ab") as handle:
+                handle.write(line)
+            return
+        fd = _open_ledger(ledger, create=False)
+        if fd is None:
+            return
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                st = os.stat(_HISTORY_NAME, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISREG(st.st_mode) and st.st_size + len(line) > _HISTORY_MAX_BYTES:
+                    os.replace(_HISTORY_NAME, _HISTORY_NAME + ".1", src_dir_fd=fd, dst_dir_fd=fd)
+            out = os.open(_HISTORY_NAME, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            try:
+                os.write(out, line)  # one O_APPEND write per record: concurrent writers never interleave lines
+            finally:
+                os.close(out)
+        finally:
+            os.close(fd)
+    except Exception:
+        logger.debug("state.db lock-holder history append failed", exc_info=True)
+
+
+def ledger_history(db_path, start: float, end: float) -> List[dict]:
+    """Recorded holds (any pid) that overlapped the wall-clock window [start, end], oldest first.
+    Reads history.jsonl.1 then history.jsonl; malformed lines are skipped. Never raises."""
+    ledger = _ledger_dir(db_path)
+    out: List[dict] = []
+    if os.path.islink(ledger):
+        return out
+    for name in (_HISTORY_NAME + ".1", _HISTORY_NAME):
+        try:
+            with open(os.path.join(ledger, name), encoding="utf-8") as handle:
+                for raw in handle:
+                    try:
+                        rec = json.loads(raw)
+                        since = float(rec["since"])
+                        released = float(rec.get("released_at") or since + float(rec.get("held_s") or 0.0))
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if since <= end and released >= start:
+                        out.append(rec)
+        except OSError:
+            continue
+    out.sort(key=lambda rec: float(rec["since"]))
+    return out
 
 
 def _pid_alive(pid: int) -> bool:
@@ -431,6 +529,20 @@ def describe_write_lock_holders(db_path, window_s: float) -> str:
                 f"{_HOLD_RECORD_MIN_S:.0f}s+ in the last {window_s:.0f}s (/proc/locks is Linux-only)")
     return ("holder unknown: no write-class lock held at the deadline and no Hermes process recorded a "
             f"write-lock hold of {_HOLD_RECORD_MIN_S:.0f}s+ in the last {window_s:.0f}s")
+
+
+def log_write_lock_waiter(db_path, waited_s: float, *, lock: str) -> str:
+    """Waiter-side attribution: one WARNING naming the current holder once a write has waited
+    WAITER_ATTRIBUTION_S for *lock* (``writer`` = this SessionDB's in-process writer lock, ``sqlite``
+    = the state.db write lock). Returns the detail; never raises (t_7fe48f0b)."""
+    try:
+        detail = describe_write_lock_holders(db_path, waited_s + 5.0)
+        logger.warning("state.db write waiting %.1fs for the %s lock (%s, pid %d): holder: %s",
+                       waited_s, lock, Path(db_path).name, os.getpid(), detail)
+        return detail
+    except Exception:
+        logger.debug("state.db waiter-side attribution failed", exc_info=True)
+        return ""
 
 
 def log_write_lock_holders(db_path, patience_s: float) -> str:

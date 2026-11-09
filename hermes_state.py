@@ -7,6 +7,7 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
+import contextlib
 import hashlib
 import json
 import logging
@@ -79,7 +80,8 @@ from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import (
-    describe_write_lock_holders, hold_committing, hold_ended, hold_started, log_write_lock_holders,
+    WAITER_ATTRIBUTION_S, describe_write_lock_holders, hold_committing, hold_ended, hold_started,
+    log_write_lock_holders, log_write_lock_waiter,
 )
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
@@ -1250,6 +1252,20 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    @contextlib.contextmanager
+    def _writer_lock_attributed(self):
+        """``with self._lock`` that, after WAITER_ATTRIBUTION_S of waiting, logs who holds the write
+        lock (ledger) once and keeps waiting exactly as before. Same lock, same blocking semantics; the
+        timed first try only adds the log line (t_7fe48f0b). Attribution never raises."""
+        t0 = time.monotonic()
+        if not self._lock.acquire(timeout=WAITER_ATTRIBUTION_S):
+            log_write_lock_waiter(self.db_path, time.monotonic() - t0, lock="writer")
+            self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
     ) -> T:
@@ -1270,6 +1286,7 @@ class SessionDB(
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
         lock_wait_warned = False
+        waiter_attributed = False  # one waiter-side holder line per write (t_7fe48f0b)
         while True:
             self._raise_if_db_corrupt(storage=True)
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
@@ -1284,7 +1301,7 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
+                with self._writer_lock_attributed():
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
@@ -1359,6 +1376,9 @@ class SessionDB(
                 if isinstance(exc, sqlite3.OperationalError):
                     if is_sqlite_lock_error(exc):
                         waited = time.monotonic() - (deadline - patience_s)
+                        if not waiter_attributed and waited >= WAITER_ATTRIBUTION_S:
+                            waiter_attributed = True
+                            log_write_lock_waiter(self.db_path, waited, lock="sqlite")
                         if not lock_wait_warned and patience_s > self._LOCK_WAIT_WARN_S and waited >= self._LOCK_WAIT_WARN_S:
                             lock_wait_warned = True
                             logger.warning(
