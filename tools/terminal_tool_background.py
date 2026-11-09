@@ -165,6 +165,7 @@ def spawn_background_process(
 
     from agent.delegation_context import is_delegated_child_context
 
+    completion_requested = bool(notify_on_complete)
     child_notifications = is_delegated_child_context() and bool(notify_on_complete or watch_patterns)
     if child_notifications:
         notify_on_complete, watch_patterns = False, None
@@ -179,8 +180,9 @@ def spawn_background_process(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
-            durable_output=bool(notify_on_complete),
+            durable_output=completion_requested,
         )
+        proc_session.completion_requested = completion_requested
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if child_notifications:

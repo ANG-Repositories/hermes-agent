@@ -1492,21 +1492,23 @@ class GatewayNotificationsMixin:
             return "retry"
         try:
             parent = await session_db.get_session(parent_session_id)
-            if parent is not None and _is_delegated_completion_target(parent):
-                logger.warning("Deferring completion for delegated origin %s; no human route ownership", parent_session_id)
-                return "retry"
         except Exception:
             logger.debug("Async-completion pre-flight parent lookup failed for %s", parent_session_id, exc_info=True)
             return "retry"
         if parent is None:
             return "terminal"
+        end_reason = str(parent.get("end_reason") or "")
+        if parent.get("ended_at") and end_reason in _USER_BOUNDARY_END_REASONS:
+            return "terminal"
+        if _is_delegated_completion_target(parent):
+            logger.warning("Deferring completion for delegated origin %s; no human route ownership", parent_session_id)
+            return "retry"
         if not parent.get("ended_at"):
             return "deliver"
-        end_reason = str(parent.get("end_reason") or "")
         if end_reason != "compression":
             # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
             # ends stay routable and the resolver retargets. Boundary set shared with the resolver.
-            return "terminal" if end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
+            return "deliver"
         try:
             tip_session_id = await session_db.get_compression_tip(parent_session_id)
             if not tip_session_id or tip_session_id == parent_session_id:

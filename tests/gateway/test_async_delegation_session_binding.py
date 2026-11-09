@@ -310,3 +310,25 @@ async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
         assert result is not None and result.session_id == expected
     else:
         assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["new_session", "user_exit", "session_switch"])
+async def test_user_closed_delegated_completion_is_terminal(tmp_path, monkeypatch, reason):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from hermes_state import SessionDB, AsyncSessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig())
+    db = SessionDB(db_path=tmp_path / "fixture.db")
+    db.create_session("child", source="tool", model_config={"_delegate_from": "parent"})
+    db.end_session("child", reason)
+    runner._session_db = AsyncSessionDB(db)
+    try:
+        claim = await runner._preflight_completion_delivery(
+            {"type": "completion", "session_id": "proc_closed", "parent_session_id": "child"})
+        assert not claim.proceed
+        assert claim.early_result is not False, "terminal must stop the watcher, not ask it to retry"
+    finally:
+        db.close()

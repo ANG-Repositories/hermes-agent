@@ -16,7 +16,13 @@ including provenance inherited by a child's compression continuation.
 Explicit process handoff is different: the live subagent registry and parent weak
 reference validate the transfer. Under the process lock it changes the owner and
 sets notification ownership to that verified parent's durable session ID, arming
-completion delivery even when the child originally spawned silently.
+completion delivery even when the child originally spawned silently. Gateway routing
+is read from the active session-store entry for that verified parent, not from the
+child's inherited transport context. A missing parent route refuses handoff. The
+watcher is registered as part of the transfer and its routing is checkpointed.
+Requested-notify child spawns keep file-backed output, even while chat delivery
+is disabled. Their separate `completion_requested` obligation keeps unread
+exit codes/output in the delegation result; reading the result discharges it.
 
 A child-targeted durable completion is deferred before adapter admission, not
 acknowledged as delivered or silently discarded. The output/obligation remains for

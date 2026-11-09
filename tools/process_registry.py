@@ -586,6 +586,7 @@ class ProcessSession:
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
+    completion_requested: bool = False          # Unread result obligation, independent of chat delivery
     # Something structural depends on the completion turn (a goal parked on this
     # process, a code-spawned bot delivery, a watch_patterns session promoted to
     # notify_on_complete). The gateway delivers the turn even when
@@ -652,7 +653,7 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+    "parent_session_id", "notify_on_complete", "completion_requested", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release",
     # Restart-durable spawns + agent-notify routing (t_1191e078, #1533).
     "output_log", "exit_path", "completion_required", "agent_notify_mode")
@@ -2784,20 +2785,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return [s for s in self._running.values() if s.owner_task_id == owner_task_id and not s.exited]
 
     def unread_completions_owned_by(self, owner_task_id: str) -> List[ProcessSession]:
-        """Exited ``notify_on_complete`` processes of ``owner_task_id`` whose result nobody read (no wait/log/poll).
+        """Exited processes with a requested completion whose result nobody read (no wait/log/poll).
         A child's completion notice is suppressed in the parent, so an unread exit is otherwise lost silently."""
         with self._lock:
             return [s for s in self._finished.values()
-                    if s.owner_task_id == owner_task_id and s.notify_on_complete
+                    if s.owner_task_id == owner_task_id and (s.completion_requested or s.notify_on_complete)
                     and s.exit_code is not None
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
                            to_session_key: str, note: str = "",
-                           to_parent_session_id: str = "") -> Optional[ProcessSession]:
+                           to_parent_session_id: str = "", routing_entry=None) -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
-        field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
-        whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
+        field: completion notices and teardown use it. Gateway handoffs also install a watcher using the
+        verified parent route. Returns None when unknown, already exited, or not owned by ``from_owner``
         (the caller must not report a transfer that did not happen)."""
         session = self.get(session_id)
         with self._lock:
@@ -2810,7 +2811,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if to_parent_session_id:
                 session.parent_session_id = to_parent_session_id
                 session.notify_on_complete = True
-            return session
+            if routing_entry is not None:
+                from tools.terminal_tool_background import _register_completion_watcher
+                source = routing_entry.origin
+                session.watcher_platform = source.platform.value
+                for name in _WATCHER_ROUTE_KEYS[1:]:
+                    setattr(session, "watcher_" + name, str(getattr(source, name, "") or ""))
+                _register_completion_watcher(self, session, to_session_key)
+        self._write_checkpoint()
+        return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
         """Active processes for a gateway session key. Processes older than
@@ -3118,11 +3127,19 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
     note = str(args.get("data") or "").strip()
     if not note:
         return {"error": "handoff requires `data`: one sentence saying what the process is for and what the parent should do with its result."}
+    # Resolve routing by the verified live parent, never the child's inherited context.
+    import sys
+    runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
+    runner = runner_ref() if callable(runner_ref) else None
+    parent_session_id = str(getattr(parent, "session_id", "") or "")
+    routing_entry = runner.session_store.lookup_by_session_id(parent_session_id) if runner is not None else None
+    if runner is not None and (routing_entry is None or routing_entry.origin is None):
+        return {"error": "parent has no active gateway route; wait on the process and report its result instead."}
     session = process_registry.transfer_ownership(
         session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
         to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note,
-        to_parent_session_id=str(getattr(parent, "session_id", "") or ""))
+        to_session_key=routing_entry.session_key if routing_entry is not None else parent_session_id, note=note,
+        to_parent_session_id=parent_session_id, routing_entry=routing_entry)
     if session is None:
         return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
                          "with poll/log and report it instead)."}
