@@ -15791,6 +15791,10 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        # A composed reassignment owns its final route and worker_ok release;
+        # its intermediate implementer must not clear a non-worker hold.
+        if not nested and is_worker_assignee(implementer):
+            _set_no_worker_locked(conn, task_id, False, source="request-changes")
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
@@ -15998,6 +16002,10 @@ def request_sendback(
                     )
                     if cur.rowcount != 1:
                         return False, "task changed during sendback"
+                    # Only a sendback that hands the card back to its worker
+                    # releases an operator hold; an untouched assignee keeps it.
+                    if is_worker_assignee(implementer):
+                        _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": status,
@@ -16016,6 +16024,8 @@ def request_sendback(
             )
             if cur.rowcount != 1:
                 return False, "task changed during sendback"
+            if is_worker_assignee(implementer):
+                _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": new_status,
