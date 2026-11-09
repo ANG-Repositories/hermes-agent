@@ -9,9 +9,12 @@ the import cycle.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
+import contextvars
 import dataclasses
 import logging
+import time
 from typing import Any, Optional
 
 from agent.i18n import t
@@ -256,7 +259,8 @@ class GatewayModelCommandsMixin:
         global_error: Optional[str] = None
         if ctx.persist_global:
             try:
-                await _persist_model_switch_to_config(result, ctx.config_path)
+                async with self._model_config_write_lock():
+                    await _persist_model_switch_to_config(result, ctx.config_path)
             except Exception as e:
                 logger.warning("Failed to persist model switch: %s", e)
                 global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
@@ -354,7 +358,7 @@ class GatewayModelCommandsMixin:
 
         Entry for the picker / cost-confirm callbacks, which fire outside ``_handle_model_command``
         and take the switch lock themselves; the typed path already holds it."""
-        async with self._model_switch_lock():
+        async with self._model_switch_lock(ctx.session_key):
             return await self._commit_model_switch_locked(result, ctx, source=source, picker=picker)
 
     def _channel_override_for(self, source):
@@ -369,16 +373,138 @@ class GatewayModelCommandsMixin:
             parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
         )
 
-    def _model_switch_lock(self) -> asyncio.Lock:
-        """Runner-wide lock over a /model command's read-resolve-commit. Slash commands bypass the busy
-        guard while no agent runs, so a second /model on the same (or another) session otherwise
-        interleaves with the first's store/config awaits: two ``--global`` picks left config.yaml on
-        whichever thread wrote last and a ``--global`` cleanup wiped a session pick issued after it
-        (#100314). Lazy: the runner is built without __init__ in tests."""
-        lock = self.__dict__.get("_model_switch_lock_obj")
+    def _model_switch_lock(self, session_key: str = "") -> asyncio.Lock:
+        """Per-session lock over a /model command's read-resolve-commit (t_2ab07928; was runner-wide,
+        which made one session's slow commit stall every other session's /model). Slash commands
+        bypass the busy guard while no agent runs, so a second /model on the same session otherwise
+        interleaves with the first's store awaits and a ``--global`` cleanup wiped a session pick
+        issued after it (#100314). The cross-session half of #100314 (two ``--global`` picks racing
+        on config.yaml) is held by ``_model_config_write_lock``. Lazy: the runner is built without
+        __init__ in tests."""
+        locks = self.__dict__.setdefault("_model_switch_locks", {})
+        lock = locks.get(session_key)
         if lock is None:
-            lock = self.__dict__["_model_switch_lock_obj"] = asyncio.Lock()
+            lock = locks[session_key] = asyncio.Lock()
         return lock
+
+    def _model_config_write_lock(self) -> asyncio.Lock:
+        """Runner-wide lock around the ``--global`` config.yaml write-through only (#100314)."""
+        lock = self.__dict__.get("_model_config_write_lock_obj")
+        if lock is None:
+            lock = self.__dict__["_model_config_write_lock_obj"] = asyncio.Lock()
+        return lock
+
+    def _model_switch_lock_key(self, source) -> str:
+        """Lock key for a /model from ``source``. Sync (no await before the lock is taken, so
+        same-session commands commit in issue order); the raw key, before the off-loop topic
+        normalization the handler runs."""
+        try:
+            return self._session_key_for_source(source) or ""
+        except Exception:
+            return ""
+
+    def _model_override_seq(self, session_key: str) -> int:
+        """Bumped by every in-memory /model override change (``_apply_session_model_override_in_memory``);
+        a deferred write whose seq is no longer current was superseded by a later switch."""
+        return int((self.__dict__.get("_model_override_seqs") or {}).get(session_key, 0))
+
+    # Reply-first /model (t_2ab07928): the confirmation is sent once the switch is applied in memory;
+    # the durable writes (state.db column, session-store identity, --global config.yaml) run after the
+    # send as the adapter's post-delivery callback inside the session's own task (skill
+    # latency-stage-attribution §5b). Jobs queue per session and drain FIFO under one lock, so they
+    # commit in issue order; any drain runs every job still queued (a dropped or /stop-cancelled
+    # callback leaves its job for the next one).
+
+    def _model_switch_deferral(self, source, session_key: str = ""):
+        """``(adapter, adapter_session_key)`` when this /model runs as the adapter's own session task
+        (its post-delivery callback fires after the reply); ``(None, None)`` when this session's
+        deferred writes are draining right now (a /model dispatched while the session is busy queues
+        behind them: the running drain picks it up, in issue order); else None (write inline)."""
+        try:
+            adapter = self._delivery_adapter_for(source)
+            task = asyncio.current_task()
+            if (adapter is not None and task is not None
+                    and getattr(type(adapter), "register_post_delivery_callback", None) is not None):
+                for key, owner in list((getattr(adapter, "_session_tasks", None) or {}).items()):
+                    if owner is task:
+                        return adapter, key
+        except Exception:
+            logger.debug("model switch deferral probe failed; writing inline", exc_info=True)
+        # A held write lock means a drain is inside its loop: a job appended now (no await between
+        # this check and the append) is run by that drain before it exits.
+        lock = (self.__dict__.get("_model_switch_write_locks") or {}).get(session_key)
+        if session_key and lock is not None and lock.locked():
+            return None, None
+        return None
+
+    def _defer_model_switch_writes(self, deferral, session_key: str, source, job) -> bool:
+        """Queue ``job`` (async, returns failure text or None) to run after the reply is delivered.
+        False when nothing will run it (the drain it meant to queue behind has finished since the
+        probe): the caller drains inline."""
+        adapter, adapter_key = deferral
+        pending = self.__dict__.setdefault("_model_switch_pending", {})
+        pending.setdefault(session_key, collections.deque()).append(job)
+        if adapter is None:  # queued behind the drain already running for this session
+            lock = (self.__dict__.get("_model_switch_write_locks") or {}).get(session_key)
+            return lock is not None and lock.locked()
+        active = (getattr(adapter, "_active_sessions", None) or {}).get(adapter_key)
+        generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
+        # The routed profile scope (home/secret contextvars) is gone when the adapter fires the
+        # callback; run the writes in the context captured here.
+        ctx = contextvars.copy_context()
+
+        async def _after_delivery() -> None:
+            # Awaiting the task: a /stop cancelling the session task cancels the writes with it.
+            await asyncio.create_task(self._drain_model_switch_writes(session_key, source), context=ctx)
+
+        # Unbounded, as the inline await was: the store/config writes carry no generic short timeout.
+        _after_delivery.post_delivery_timeout = None
+        adapter.register_post_delivery_callback(adapter_key, _after_delivery, generation=generation)
+        return True
+
+    async def _drain_model_switch_writes(self, session_key: str, source) -> None:
+        """Run every queued deferred /model write for ``session_key`` in issue order. A failure is
+        posted as a visible follow-up line, never dropped silently."""
+        queue = (self.__dict__.get("_model_switch_pending") or {}).get(session_key)
+        if not queue:
+            return
+        locks = self.__dict__.setdefault("_model_switch_write_locks", {})
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = locks[session_key] = asyncio.Lock()
+        async with lock:
+            while queue:
+                job = queue[0]
+                started = time.monotonic()
+                try:
+                    failure = await job()
+                except asyncio.CancelledError:
+                    logger.warning("deferred /model writes for %s interrupted; left queued for the next drain",
+                                   session_key)
+                    raise
+                except Exception as exc:
+                    failure = str(exc) or type(exc).__name__
+                queue.popleft()
+                if (took := time.monotonic() - started) > 2.0:
+                    logger.info("PHASE=model_switch_deferred_writes session=%s s=%.2f (after delivery)",
+                                session_key, took)
+                if failure:
+                    logger.warning("deferred /model writes for %s failed: %s", session_key, failure)
+                    await self._send_model_switch_followup(source, failure)
+
+    async def _send_model_switch_followup(self, source, failure: str) -> None:
+        text = f"⚠️ Model switch active for this session, but saving it failed: {failure}"
+        try:
+            adapter = self._delivery_adapter_for(source)
+            if adapter is None or not getattr(source, "chat_id", None):
+                logger.warning("model switch follow-up undeliverable (no adapter/chat): %s", text)
+                return
+            meta = None
+            with contextlib.suppress(Exception):
+                meta = self._thread_metadata_for_source(source)
+            await adapter.send(str(source.chat_id), text, metadata=meta)
+        except Exception:
+            logger.warning("model switch follow-up send failed: %s", text, exc_info=True)
 
     def _record_switch_metrics(self, result, ctx: _ModelSwitchContext, source) -> None:
         """Slash dispatch does not install the routed profile's scope, so a multiplexed runner binds
@@ -525,9 +651,9 @@ class GatewayModelCommandsMixin:
         )
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /model command — switch model. Taken under the switch lock BEFORE the first await so
-        concurrent commands commit in issue order (see ``_model_switch_lock``)."""
-        async with self._model_switch_lock():
+        """Handle /model command — switch model. Taken under this session's switch lock BEFORE the first
+        await so concurrent same-session commands commit in issue order (see ``_model_switch_lock``)."""
+        async with self._model_switch_lock(self._model_switch_lock_key(event.source)):
             return await self._handle_model_command_locked(event)
 
     async def _handle_model_command_locked(self, event: MessageEvent) -> Optional[str]:

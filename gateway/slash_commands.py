@@ -3984,38 +3984,7 @@ class GatewaySlashCommandsMixin(
                     "new_window": _sw_new_window,
                 }
 
-            # Persist the new model to the session DB so the dashboard
-            # shows the updated model (#34850).
-            _sess_db = getattr(self, "_session_db", None)
-            if _sess_db is not None:
-                try:
-                    _sess_entry = await self.async_session_store.get_or_create_session(source)
-                    # If this session was auto-reset, consume the flag so the
-                    # next regular message's cleanup does not wipe the model
-                    # override just stored below (Closes #48031).
-                    if getattr(_sess_entry, "was_auto_reset", False):
-                        _sess_entry.was_auto_reset = False
-                    await _sess_db.update_session_model(
-                        _sess_entry.session_id, result.new_model,
-                        provider=result.target_provider,
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to persist model switch to DB: %s", exc
-                    )
-
-            # No model-facing note here: the switch changes ``intended`` only, and the
-            # per-call route note (agent/route_identity.py) tells the model what serves.
-            from hermes_cli.model_switch import format_model_for_display
-
-            # Store session override so next agent creation uses the new model
-            # (single door — also persists the config-backed identity, RC-2/P3b).
-            # Off the loop: the persistability check re-resolves credentials
-            # (config load + provider resolution, which can refresh an OAuth
-            # token over the network). On-loop, this chain held Discord for
-            # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
-            # open_credentialed_url) and expired /model interactions.
-            await self._persist_session_model_override(session_key, {
+            _new_override = {
                 "model": result.new_model,
                 "provider": result.target_provider,
                 "api_key": result.api_key,
@@ -4025,7 +3994,53 @@ class GatewaySlashCommandsMixin(
                 # Upstream: the override carries the route's resolved runtime capabilities
                 # (native compaction etc.) so the next agent build does not re-probe them.
                 "capabilities": dict(result.runtime_capabilities or {}),
-            })
+            }
+            # Reply first (t_2ab07928): inside the adapter's session task the durable writes run
+            # after the confirmation is sent; a /model dispatched while this session's deferred
+            # writes drain queues behind them; elsewhere (picker tap) they stay inline, after any
+            # queued deferred write for this session.
+            _defer = self._model_switch_deferral(event.source, session_key)
+            _override_seq = None
+            if _defer is None:
+                await self._drain_model_switch_writes(session_key, event.source)
+                # Persist the new model to the session DB so the dashboard
+                # shows the updated model (#34850).
+                _sess_db = getattr(self, "_session_db", None)
+                if _sess_db is not None:
+                    try:
+                        _sess_entry = await self.async_session_store.get_or_create_session(source)
+                        # If this session was auto-reset, consume the flag so the
+                        # next regular message's cleanup does not wipe the model
+                        # override just stored below (Closes #48031).
+                        if getattr(_sess_entry, "was_auto_reset", False):
+                            _sess_entry.was_auto_reset = False
+                        await _sess_db.update_session_model(
+                            _sess_entry.session_id, result.new_model,
+                            provider=result.target_provider,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to persist model switch to DB: %s", exc
+                        )
+
+            # No model-facing note here: the switch changes ``intended`` only, and the
+            # per-call route note (agent/route_identity.py) tells the model what serves.
+            from hermes_cli.model_switch import format_model_for_display
+
+            if _defer is None:
+                # Store session override so next agent creation uses the new model
+                # (single door — also persists the config-backed identity, RC-2/P3b).
+                # Off the loop: the persistability check re-resolves credentials
+                # (config load + provider resolution, which can refresh an OAuth
+                # token over the network). On-loop, this chain held Discord for
+                # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
+                # open_credentialed_url) and expired /model interactions.
+                await self._persist_session_model_override(session_key, _new_override)
+            else:
+                # The in-memory override is authoritative for the next turn until the deferred
+                # write commits; the identity persist (and its credential re-resolve) runs after.
+                self._apply_session_model_override_in_memory(session_key, _new_override)
+                _override_seq = self._model_override_seq(session_key)
             if one_turn:
                 # A repeated --once before the turn runs must keep the EARLIEST snapshot: the
                 # later command's snapshot is the first temporary model, not the user's
@@ -4055,10 +4070,26 @@ class GatewaySlashCommandsMixin(
             # Session-override write-through (never for --once, #29923), config
             # write-through (--global), the #100314 redundant-override drop and the
             # cache eviction — one durable commit shared with the picker path.
-            _global_error = await self._commit_model_switch_durable(
-                result, session_key=session_key, source=event.source,
-                config_path=config_path, persist_global=persist_global, one_turn=one_turn,
-            )
+            if _defer is None:
+                _global_error = await self._commit_model_switch_durable(
+                    result, session_key=session_key, source=event.source,
+                    config_path=config_path, persist_global=persist_global, one_turn=one_turn,
+                )
+            else:
+                _global_error = None
+                self._evict_cached_agent(session_key)  # next turn builds fresh from the override
+                _job_source = source
+
+                async def _deferred_writes() -> Optional[str]:
+                    return await self._model_switch_deferred_writes(
+                        result, session_key=session_key, source=_job_source,
+                        event_source=event.source, config_path=config_path,
+                        persist_global=persist_global, one_turn=one_turn,
+                        override=_new_override, seq=_override_seq,
+                    )
+
+                if not self._defer_model_switch_writes(_defer, session_key, event.source, _deferred_writes):
+                    await self._drain_model_switch_writes(session_key, event.source)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
@@ -4141,6 +4172,9 @@ class GatewaySlashCommandsMixin(
                 # Never claim a clean global commit the disk did not take (#100314).
                 lines.append(t("gateway.model.warning_prefix", warning=_global_error))
                 lines.append(t("gateway.model.session_only_hint"))
+            elif persist_global and _defer is not None:
+                # Not written yet: a failure arrives as a follow-up line (t_2ab07928).
+                lines.append("    Saving to config.yaml (`--global`) after this reply; a failure is reported below.")
             elif persist_global:
                 lines.append(t("gateway.model.saved_global"))
             elif one_turn:
@@ -4203,6 +4237,8 @@ class GatewaySlashCommandsMixin(
 
     async def _commit_model_switch_durable(
         self, result, *, session_key: str, source, config_path, persist_global: bool, one_turn: bool,
+        deferred_seq: Optional[int] = None, deferred_override: Optional[dict] = None,
+        failures: Optional[list] = None,
     ) -> Optional[str]:
         """Durable half of a committed /model switch (fork handler; mirrors upstream's
         ``GatewayModelCommandsMixin._record_model_switch``): config write-through via the
@@ -4211,14 +4247,23 @@ class GatewaySlashCommandsMixin(
 
         Returns the warning for a ``--global`` switch whose config write or stale-override
         cleanup failed (the switch then truthfully stays a session override), else ``None``.
+
+        ``deferred_seq`` set = the reply-first path (t_2ab07928), running after the reply: the
+        in-memory override and eviction already happened on the loop, so the store writes are
+        skipped when a later switch superseded this one (its own write lands after, in issue
+        order) and the in-memory drop happens only while this switch is still the latest.
         """
         from gateway import slash_commands_model as _model_mixin
 
+        deferred = deferred_seq is not None
+        latest = (not deferred) or self._model_override_seq(session_key) == deferred_seq
         global_error: Optional[str] = None
         if persist_global:
             try:
                 # Resolved through the module so tests/operators can patch the writer seam.
-                await _model_mixin._persist_model_switch_to_config(result, config_path)
+                # Runner-wide: two sessions' --global picks must not interleave on config.yaml.
+                async with self._model_config_write_lock():
+                    await _model_mixin._persist_model_switch_to_config(result, config_path)
             except Exception as e:
                 logger.warning("Failed to persist model switch: %s", e)
                 global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
@@ -4227,28 +4272,75 @@ class GatewaySlashCommandsMixin(
         # after a restart (#100314). Precedence is session > channel_overrides > config.yaml, so
         # under a channel_overrides model the session override must stay.
         if persist_global and global_error is None and self._channel_override_for(source) is None:
-            try:
-                # Fork single door (P3b/RC-2): clears the in-memory override AND the persisted
-                # identity off the loop; require_persistence surfaces a failed clear so the
-                # switch truthfully stays a session override (#100314).
-                await self._persist_session_model_override(
-                    session_key, None, require_persistence=True,
-                )
-            except Exception as e:
-                logger.warning("Failed to clear persisted session model override: %s", e)
-                global_error = t("gateway.model.err_stale_override", error=e)
-        elif not one_turn:
+            if latest:
+                try:
+                    # Fork single door (P3b/RC-2): clears the in-memory override AND the persisted
+                    # identity off the loop; require_persistence surfaces a failed clear so the
+                    # switch truthfully stays a session override (#100314).
+                    await self._persist_session_model_override(
+                        session_key, None, require_persistence=True,
+                        **({"persist_only": True} if deferred else {}),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to clear persisted session model override: %s", e)
+                    global_error = t("gateway.model.err_stale_override", error=e)
+                else:
+                    if deferred and self._model_override_seq(session_key) == deferred_seq:
+                        self._session_model_overrides.pop(session_key, None)
+        elif not one_turn and latest:
             # Non-secret write-through so the override survives a restart (api_key/api_mode are
             # re-resolved on rehydration); a --once override must NOT outlive a restart (#29923).
             try:
                 await self.async_session_store.set_model_override(
-                    session_key, self._session_model_overrides[session_key],
+                    session_key,
+                    deferred_override if deferred else self._session_model_overrides[session_key],
                 )
-            except Exception:
+            except Exception as exc:
                 logger.debug("Failed to persist session model override", exc_info=True)
-        # Evict cached agent so the next turn builds fresh from the override.
-        self._evict_cached_agent(session_key)
+                if failures is not None:
+                    failures.append(f"session override not saved ({exc})")
+        if not deferred:
+            # Evict cached agent so the next turn builds fresh from the override.
+            self._evict_cached_agent(session_key)
         return global_error
+
+    async def _model_switch_deferred_writes(
+        self, result, *, session_key: str, source, event_source, config_path,
+        persist_global: bool, one_turn: bool, override: dict, seq: int,
+    ) -> Optional[str]:
+        """Durable half of a reply-first /model switch (t_2ab07928), run after the confirmation
+        was delivered: state.db model column, session-store identity, then the shared durable
+        commit. Returns the failure text for the follow-up line, or None."""
+        failures: list = []
+        _sess_db = getattr(self, "_session_db", None)
+        if _sess_db is not None:
+            try:
+                _sess_entry = await self.async_session_store.get_or_create_session(source)
+                # Consume the auto-reset flag so the next message's cleanup keeps the override (#48031).
+                if getattr(_sess_entry, "was_auto_reset", False):
+                    _sess_entry.was_auto_reset = False
+                await _sess_db.update_session_model(
+                    _sess_entry.session_id, result.new_model, provider=result.target_provider,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist model switch to DB: %s", exc)
+                failures.append(f"session database not updated ({exc})")
+        if self._model_override_seq(session_key) == seq:
+            try:
+                await self._persist_session_model_override(
+                    session_key, override, require_persistence=True, persist_only=True,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist session model override identity: %s", exc)
+                failures.append(f"session override not saved ({exc})")
+        global_error = await self._commit_model_switch_durable(
+            result, session_key=session_key, source=event_source, config_path=config_path,
+            persist_global=persist_global, one_turn=one_turn,
+            deferred_seq=seq, deferred_override=override, failures=failures,
+        )
+        if global_error is not None:
+            failures.insert(0, global_error)
+        return "; ".join(failures) or None
 
     async def _announce_model_switch(
         self,
