@@ -229,13 +229,16 @@ def test_late_inheritable_fd_is_closed(no_fork_exec, monkeypatch, tmp_path):
         os.close(secret)
 
 
-def test_explicit_standard_fd_keeps_new_session(monkeypatch, tmp_path):
+def test_explicit_standard_fd_keeps_new_session(tmp_path):
     output = tmp_path / "session"
-    result = nofork.run_nofork(
-        ["/bin/sh", "-c", f'echo "$$ $(ps -o sid= -p $$)" > "{output}"'],
+    proc = nofork.spawn_popen(
+        ["/bin/sh", "-c", f'echo "$$" > "{output}"; sleep 30'],
         stdout=1, new_session=True)
-    pid, sid = map(int, output.read_text().split())
-    assert result.returncode == 0 and pid == sid
+    try:
+        assert os.getsid(proc.pid) == proc.pid
+    finally:
+        os.killpg(proc.pid, 9)
+        proc.wait(timeout=10)
 
 
 def test_run_input_and_conflicts(no_fork_exec):
