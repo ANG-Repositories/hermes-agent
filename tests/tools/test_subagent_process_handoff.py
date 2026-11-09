@@ -170,7 +170,8 @@ async def test_child_spawn_gateway_handoff_and_unread_accounting(tmp_path, monke
     received = []
 
     async def receive(event):
-        received.append(event)
+        from agent.delegation_context import is_delegated_child_context
+        received.append((event, is_delegated_child_context()))
         event._gateway_accepted = True
         delivered.set()
 
@@ -220,9 +221,11 @@ async def test_child_spawn_gateway_handoff_and_unread_accounting(tmp_path, monke
         if handoff:
             await asyncio.wait_for(delivered.wait(), 5)
             assert len(received) == 1
-            assert received[0].source.chat_id == "123" and received[0].source.thread_id == "42"
-            assert received[0].metadata["gateway_session_id"] == entry.session_id
-            assert "TEST_FAILED" in received[0].text
+            event, child_context = received[0]
+            assert child_context is False, "parent completion inherited delegated child authority"
+            assert event.source.chat_id == "123" and event.source.thread_id == "42"
+            assert event.metadata["gateway_session_id"] == entry.session_id
+            assert "TEST_FAILED" in event.text
             assert watchers[0]["session_key"] == entry.session_key
             assert session.output_log and Path(session.output_log).is_file()
             assert session.parent_session_id == entry.session_id

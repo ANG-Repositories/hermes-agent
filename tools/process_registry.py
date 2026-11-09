@@ -2817,7 +2817,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 session.watcher_platform = source.platform.value
                 for name in _WATCHER_ROUTE_KEYS[1:]:
                     setattr(session, "watcher_" + name, str(getattr(source, name, "") or ""))
-                _register_completion_watcher(self, session, to_session_key)
+                # The verified parent owns this watcher, not the child calling handoff.
+                # Copy preserves profile scope without changing the caller's authority.
+                from contextvars import copy_context
+                from agent.delegation_context import _DELEGATED_CHILD_CONTEXT
+
+                parent_context = copy_context()
+                parent_context.run(_DELEGATED_CHILD_CONTEXT.set, False)
+                parent_context.run(_register_completion_watcher, self, session, to_session_key)
         self._write_checkpoint()
         return session
 
