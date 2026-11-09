@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -695,10 +696,20 @@ class GatewayAgentCacheMixin:
         # The turn's hard interrupt reaches only its in-turn children; background delegations were
         # detached at dispatch and would otherwise run to completion and wake the session later.
         # Each interrupted unit still returns as a completion (status=interrupted, partial output).
-        from tools.async_delegation import interrupt_for_session
-        interrupt_for_session(
-            session_key=session_key, reason=invalidation_reason,
-            parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
+        # Off the loop and fail open: the cancel takes a cross-process file lock (5 s timeout), and on
+        # 2026-11-08 15:38 that TimeoutError escaped /stop before the slot release, so the user got
+        # "TimeoutError ... async-delegations.lock" and the session stayed busy. The idle /stop path
+        # already wraps the same call; a missed cancel leaves a delegation running, which the /stop
+        # latch keeps from waking the session.
+        try:
+            from tools.async_delegation import interrupt_for_session
+            await asyncio.to_thread(
+                interrupt_for_session,
+                session_key=session_key, reason=invalidation_reason,
+                parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
+        except Exception:
+            logger.warning("async delegation cancel skipped on %s for %s", invalidation_reason, session_key,
+                           exc_info=True)
         _stop_clock.mark("deleg")
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # Superseded-turn write gate (agent/session_persistence.py): the displaced turn's late
