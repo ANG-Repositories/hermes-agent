@@ -31,12 +31,29 @@ GATED (AST/scope based, never line distance): the spawn carries a reservation bo
           references that name, or passes `reservation_id=`, or its env carries ALLOC_RESERVATION (a literal
           in the call, or an env name the function filled with ALLOC_RESERVATION).
   bash    the function (or top level) sets ALLOC_RESERVATION from `alloc-admit` BEFORE the spawn line.
+  bash    EXEMPT (t_a93526ab, until Card B ships alloc-admit): a whole line reading EXACTLY
+          `# spawn-site: supervisor-singleton <row-id>` (indent allowed) inside the function an unexpired row of
+          fleet/spawn-singletons.json {"sites": [{id, path, function, reason, expires, fn_sha}]} names, where fn_sha is
+          the sha256 of that function's RAW BYTES: from its one header line, exactly `<function>() {`, through the
+          first later line that is exactly `}`. No decoding, stripping or shell parsing: any edit re-pins. Every spawn
+          in that function is gated. Red: a malformed pragma, an unlisted / expired / other-path id, a missing or
+          repeated header, a pragma outside the function, a hash mismatch ("function changed"), a function with no
+          spawn, an id used twice in the tree, a row no pragma names (stale). A malformed list is blind (rc 2); an
+          absent one lists nothing.
 
 ALLOWLIST fleet/spawn-allowlist.json: {"sites": [{path, scope, kind, count, reason, expires}]}. A row covers
 up to `count` ungated spawns of that key until `expires` (YYYY-MM-DD, inclusive). Red when: an ungated site has
 no row, or more spawns than its count; a row is expired; a row is stale (its key is gone or now has fewer
 ungated spawns: lower the count / delete the row, so the list only shrinks). The seeded rows ARE the cutover
 inventory for Card B. Never add a row for new code: call alloc_client.
+
+OPERATOR ONE-SHOT (t_9a970a74): a script a person runs by hand against a fixed appliance or host (enroll an
+agent, install an add-on, edit a DNS rewrite) places no work, so the router has nothing to balance. Such a file
+declares it with a whole-line comment in its first 20 lines:
+    # spawn-site-oneshot: <why this is a hand-run one-shot, >= 10 chars>
+and its ssh sites (kind ssh ONLY; docker-run, systemd-run, ... still need a gate or a row) are exempt. Red when:
+the marker has no reason; the file also carries a `# SCHEDULE:` header that is not `manual` (a scheduled job is
+not a one-shot); the marked file has no ssh site left (stale marker). An unmarked ssh stays red.
 
 S6: a lint that scans nothing is RED, never clean (empty scan root, or zero files read -> rc 1).
 Exit 0 clean (silent), 1 findings (one line each), 2 blind (allowlist unreadable/invalid).
@@ -47,6 +64,11 @@ Exit 0 clean (silent), 1 findings (one line each), 2 blind (allowlist unreadable
   --seed-allowlist    write every currently ungated site as a row (keeps existing reasons/expiries). ONE-TIME
                       seeding tool; re-running it to make a new site green defeats the lint.
   --selftest          prove red and green on fixtures
+  --check-allowlist --base REF --main REF
+                      (t_262713ff) a row THIS tree adds to the allowlist (absent at --base, the PR base) whose key
+                      --main (the main tip, fetched fresh) already has is RED: two PRs fixing one main red each add
+                      the same row, both green on their own base, main red on the duplicate (#7443/#7445/#7447).
+                      Also RED: a key twice in this tree's file. No scan; exit 0 clean, 1 findings, 2 a ref unreadable.
 """
 from __future__ import annotations
 
@@ -55,14 +77,19 @@ import ast
 import bisect
 import copy
 import datetime as dt
+import hashlib
 import heapq
+import io
 import itertools
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
 import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -73,6 +100,7 @@ from scan_scope import is_live_source  # noqa: E402  scripts/retired/ + scripts/
 HERE = Path(__file__).resolve().parent
 DEFAULT_ROOT = HERE.parent
 ALLOWLIST = "fleet/spawn-allowlist.json"
+SINGLETONS = "fleet/spawn-singletons.json"   # t_a93526ab: fn_sha-pinned supervisor-singleton rows (see docstring)
 SEED_EXPIRES = "2027-01-15"
 SEED_REASON = ("grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it "
                "through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete")
@@ -116,11 +144,96 @@ SHELL_KINDS = (
     ("kanban-dispatch", re.compile(r"\b(?:hermes|hermes)\s+kanban\s+dispatch\b")),
 )
 SHELL_SSH = re.compile(r"(?:^|[\s;|&(`\"'])(?:sudo\s+)?(?:/usr/bin/)?ssh((?:\s+-\S+(?:\s+[^\s-]\S*)?)*)\s+([^\s;|&)]+)")
+# `ssh -G` (print resolved config), `-V` (version), `-Q` (query algorithms) never open a connection (t_dbe07131):
+# the pre-push keepalive check `ssh -G git@github.com` is config resolution, not a spawn
+SSH_ARG_FLAGS = frozenset("BbcDEeFIiJLlmOoPpRSWw")   # -P <tag> takes an operand too (Prism 33d81aeb3e7c)
+
+
+def _ssh_noconnect(opts) -> bool:
+    """True when ssh's options carry -G/-V/-Q. Only the option prefix counts: the walk stops at the host operand
+    (the first token not starting with "-", after skipping the operand of every SSH_ARG_FLAGS option), so a
+    remote command's flags (`ssh host ls -G`) never exempt the spawn (Prism a95bfcad2fce). Bundled flags are
+    walked up to the first operand-taking letter (`-lG host`: G is -l's operand). A non-literal argv element
+    ends the walk (unknown, still a spawn). Shell text fails closed (t_9a579e40): it is split with shell quoting
+    (`-i "/tmp/key -G"` is ONE operand, Prism 659d6121556c; an unbalanced quote is unknown), and a token the walk
+    reaches that holds `$` or a backtick, flag or operand, may expand to anything (`ssh -i $KEY -G h` with KEY empty
+    makes `-G` -i's operand and connects; `-$G`): unknown, still a spawn (Prism aad0e01e377b, 8092b537bd59)."""
+    if isinstance(opts, str):
+        raw = _sh_words(opts)
+        if raw is None:
+            return False
+        toks = [None if ("$" in w or "`" in w) else shlex.split(w)[0] for w in raw]
+    else:
+        toks = list(opts)
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if not isinstance(t, str) or not t.startswith("-") or t == "-" or t.startswith("--"):
+            return False
+        i += 1
+        for j, ch in enumerate(t[1:], 1):
+            if ch in "GVQ":
+                return True
+            if ch in SSH_ARG_FLAGS:
+                if j == len(t) - 1:
+                    if i < len(toks) and toks[i] is None:
+                        return False   # an expandable operand: what follows it is unknown
+                    i += 1   # operand is the next token (`-o X`, `-i key`, `-p 22`)
+                break
+    return False
+
+
+def _sh_words(text: str) -> list[str] | None:
+    """The raw shell words of ``text`` (quotes kept), split on unquoted whitespace; None on an unbalanced quote."""
+    out, cur, q, i = [], [], None, 0
+    while i < len(text):
+        c = text[i]
+        if q:
+            cur.append(c)
+            if c == q:
+                q = None
+            elif c == "\\" and q == '"' and i + 1 < len(text):
+                cur.append(text[i + 1])
+                i += 1
+        elif c in "'\"":
+            q = c
+            cur.append(c)
+        elif c == "\\" and i + 1 < len(text):
+            cur.append(text[i:i + 2])
+            i += 1
+        elif c.isspace():
+            if cur:
+                out.append("".join(cur))
+                cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if q:
+        return None
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _ssh_shell_opts(m) -> str:
+    """The option prefix of one SHELL_SSH match: group(1), plus group(2) only when it is itself an option (`ssh -V`
+    at end of line). group(2) is otherwise the host, and nothing past it is ssh's (t_dbe07131)."""
+    g2 = m.group(2)
+    return m.group(1) + (" " + g2 if g2.startswith("-") else "")
+
+
 SH_NOISE = re.compile(r"^\s*(?:echo|printf|say|log|_log|warn|info|die|err|usage|note|fail)\b")
 SH_FUNC = re.compile(r"^(\s*)(?:function\s+)?([A-Za-z_][\w:.-]*)\s*\(\)\s*\{?\s*(?:#.*)?$|^(\s*)function\s+([A-Za-z_][\w:.-]*)\s*\{\s*$")
 SH_SUBST = re.compile(r"\$\([^()]*\)|`[^`]*`")
 SH_GATE = re.compile(r"ALLOC_RESERVATION=.*\balloc-admit\b")
+SINGLETON_PREFIX = "# spawn-site: supervisor-singleton"
+SINGLETON_PRAGMA = re.compile(r"# spawn-site: supervisor-singleton ([A-Za-z0-9][A-Za-z0-9_.-]*)")
+SINGLETON_KEYS = ("id", "path", "function", "reason", "expires", "fn_sha")
 # python literal proof: the reservation is being SET (shell `ALLOC_RESERVATION=<x>` or a dict key), not merely named
+ONESHOT_RE = re.compile(r"^\s*#\s*spawn-site-oneshot:(.*)$")
+ONESHOT_HEAD_LINES = 20
+ONESHOT_MIN_REASON = 10
+SCHEDULE_HDR = re.compile(r"^\s*#\s*SCHEDULE:\s*(\S*)")
 PY_LITERAL_GATE = re.compile(r"(?<![-\w])ALLOC_RESERVATION\s*[=:]|[\"']ALLOC_RESERVATION[\"']\s*:")
 
 
@@ -278,7 +391,7 @@ def _declared(body: list, kind) -> set:
             if isinstance(n, kind) for g in n.names}
 
 
-def _scope_runners(node, body: list, bare: frozenset, inherited: dict) -> dict:
+def _scope_runners(node, body: list, bare: frozenset, inherited: dict, module: dict | None = None) -> dict:
     """name -> [(subprocess ref, baked args)] for the callables a scope reaches subprocess through: a parameter whose
     DEFAULT is one, a local `x = <one>` / `x = partial(<one>, ..)`, or an enclosing scope's binding not shadowed
     here. MAY: every assignment in the scope is one alternative (one branch binding `run = partial(.., ['echo'])`
@@ -286,7 +399,8 @@ def _scope_runners(node, body: list, bare: frozenset, inherited: dict) -> dict:
     there, so it never sees the enclosing binding (`runner = fake; invoke = runner` is not subprocess, Prism
     ce17a6dacbd1); at module level an assignment may not run, so the import binding stays an alternative. A
     parameter with no default (or another default) shadows the enclosing binding: a test fake `run` is not a spawn.
-    Nested def/class bodies are their own scopes and never bind here (Prism 95af992489bd)."""
+    Nested def/class bodies are their own scopes and never bind here (Prism 95af992489bd). ``module``: the module
+    environment; names this scope declares `global` resolve there for its body, AFTER its defaults (Prism ca74728a46c7)."""
     known = {k: list(v) for k, v in inherited.items()}
     is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
     params: set[str] = set()
@@ -304,6 +418,12 @@ def _scope_runners(node, body: list, bare: frozenset, inherited: dict) -> dict:
             if x is not None:
                 params.add(x.arg)
                 known.pop(x.arg, None)
+    if module is not None:   # the body's `global lr` reads the module's lr; the defaults above ran in the enclosing
+        for g in _declared(body, ast.Global):   # scope (`def middle(run=lr): global lr`, Prism ca74728a46c7)
+            if g in module:
+                known[g] = list(module[g])
+            else:
+                known.pop(g, None)
     assigns = _own_assigns(body)
     own_names = {nm for nm, _ in assigns}   # shadowing is decided by THIS scope's assignments only: a nested def's
     # `nonlocal x` may bind past this function to an outer x, so it never makes x local here (Prism de3afa4559bd)
@@ -347,16 +467,11 @@ def _scope_runners(node, body: list, bare: frozenset, inherited: dict) -> dict:
             grew = _add_alts(known, nm, _runner_ref(v, bare, known)) or grew
         for d, chain, names in exports:   # `def install(): global runner; lr = subprocess.run; runner = lr`
             enc = known
+            mod = None if is_fn else known   # names a step declares `global` resolve in the MODULE, not a shadowing
+            # enclosing local, for that step's body and everything nested in it (Prism c6cf4728910b)
             for f in chain:   # `def outer(): lr = subprocess.run; def install(): global runner; runner = lr`
-                enc = _scope_runners(f, f.body, bare, enc)
-            if not is_fn:   # names the exporter declares `global` resolve in the MODULE, not a shadowing enclosing local
-                enc = dict(enc)
-                for g in _declared(d.body, ast.Global):
-                    if g in known:
-                        enc[g] = known[g]
-                    else:
-                        enc.pop(g, None)
-            dk = _scope_runners(d, d.body, bare, enc)
+                enc = _scope_runners(f, f.body, bare, enc, mod)
+            dk = _scope_runners(d, d.body, bare, enc, mod)
             for nm in names:
                 grew = _add_alts(known, nm, dk.get(nm, [])) or grew
         if not grew:
@@ -441,6 +556,8 @@ def _classify_argv(head: list) -> str | None:
     base = os.path.basename(first.strip())
     rest = [h for h in head[1:] if isinstance(h, str)]
     if base == "ssh":
+        if _ssh_noconnect(head[1:]):
+            return None
         tgt = next((h for h in head[1:] if isinstance(h, str) and not h.startswith("-")), None)
         if tgt is not None and NON_FLEET.match(tgt) and head.index(tgt) == 1:
             return None
@@ -474,7 +591,7 @@ def _classify_shell_at(text: str) -> tuple[str | None, int]:
         m = rx.search(text)
         if m:
             return kind, m.start()
-    m = SHELL_SSH.search(text)
+    m = next((m for m in SHELL_SSH.finditer(text) if not _ssh_noconnect(_ssh_shell_opts(m))), None)
     if m and not NON_FLEET.match(m.group(2).strip("\"'")):
         return "ssh", m.start()
     return None, 0
@@ -595,14 +712,22 @@ def _heads(node, st: _St) -> list:
             # of another name (Prism 8ca6f3c667ce, 753c64420f1d). Lazy product, O(32) memory, hash-seed-free key.
             def rank(combo):
                 v = dict(zip(used, map(list, combo)))
-                return [((not _classify_argv(c), not _spawnish(c), repr(c), repr(combo)), v)
-                        for c in (_argv_head(arm, v), _argv_head(arm, v, True))]
+                return [((not k, not _spawnish(c), repr(c), repr(combo)), v, k)
+                        for c in (_argv_head(arm, v), _argv_head(arm, v, True)) for k in [_classify_argv(c)]]
             alts = [sorted(st.argv[nm], key=repr) for nm in used]
             best: dict = {}   # one view per distinct composed head BEFORE the cap (Prism 7f9bc8fca3a7), BOTH
             # views' heads ranked, so a program-name head never hides behind its view's plain head (6772d0283d54)
-            for key, v in itertools.chain.from_iterable(map(rank, itertools.product(*alts))):
+            kinds: dict = {}  # best view per spawn KIND, reserved before the cap fills: 32 docker-run heads
+            # outranked the one ssh head and dropped the ssh kind (Prism c348201f0295)
+            for key, v, k in itertools.chain.from_iterable(map(rank, itertools.product(*alts))):
                 best[key[2]] = min(best.get(key[2], (key, v)), (key, v), key=lambda kv: kv[0])
-            views = [v for _, v in heapq.nsmallest(32, best.values(), key=lambda kv: kv[0])]
+                if k:
+                    kinds[k] = min(kinds.get(k, (key, v)), (key, v), key=lambda kv: kv[0])
+            keep = sorted(kinds.values(), key=lambda kv: kv[0])[:32]
+            taken = {kv[0][2] for kv in keep}
+            keep += heapq.nsmallest(32 - len(keep), (kv for kv in best.values() if kv[0][2] not in taken),
+                                    key=lambda kv: kv[0])
+            views = [v for _, v in sorted(keep, key=lambda kv: kv[0])]
         for v in views:
             for h in (_argv_head(arm, v), _argv_head(arm, v, True)):
                 if repr(h) not in seen:
@@ -800,6 +925,12 @@ def _rebind_from(st: _St, names, bound) -> None:
     st.alias |= {a for a in bound.alias if a & names}
 
 
+def _may_be_key(a) -> bool:
+    """A removal key that MAY be ALLOC_RESERVATION: the literal, or any non-literal (`key = 'ALLOC_RESERVATION';
+    env.pop(key)` / `del env[key]`): its value is not tracked, so it invalidates the must fact (Prism d26f43b13610)."""
+    return not isinstance(a, ast.Constant) or a.value == "ALLOC_RESERVATION"
+
+
 def _apply_mutation(st: _St, call: ast.Call, may: bool = False) -> None:
     """`env.pop("ALLOC_RESERVATION")` / `env.clear()` remove the reservation; `env.update(ALLOC_RESERVATION=..)` /
     `env.setdefault("ALLOC_RESERVATION", ..)` add it; `cmd.extend([..])` / `cmd.append(x)` grow a bound argv.
@@ -818,7 +949,7 @@ def _apply_mutation(st: _St, call: ast.Call, may: bool = False) -> None:
         # bounded: an append in a loop grows the argv every pass; the head decides the kind, so 32 tokens and 16
         # alternatives keep the fixpoint finite and cheap
         _grow(st, nm, ext, may)
-    elif f.attr == "clear" or (f.attr == "pop" and call.args and is_key(call.args[0])):
+    elif f.attr == "clear" or (f.attr == "pop" and call.args and _may_be_key(call.args[0])):
         _unreserve(st, {nm})
     elif may:
         return
@@ -974,16 +1105,54 @@ def _classify_call(n: ast.Call, st: _St, bare: frozenset) -> set:
     return set()
 
 
+def _may_suppress(stmts) -> bool:
+    """True if a `finally` body can swallow a pending exception: a break/continue that binds to the loop AROUND
+    the try (not one inside a nested loop body), or a return (Prism ce7aa4b8a383). Nested scopes do not count."""
+    todo = list(stmts)
+    while todo:
+        n = todo.pop()
+        if isinstance(n, (ast.Break, ast.Continue, ast.Return)):
+            return True
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(n, (ast.For, ast.AsyncFor, ast.While)):
+            # the inner loop's own break/continue bind to it; a return in it, and its orelse, still count
+            todo += n.orelse
+            todo += [x for b in n.body for x in ast.walk(b) if isinstance(x, ast.Return)]
+            continue
+        todo += [c for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt) or hasattr(c, "body")]
+    return False
+
+
+_FIN_SPLIT_DEPTH = 4   # nested finally bodies analyzed per entry state; deeper ones get one joined pass
+
+
 class _Flow:
     """Statement-level dataflow over one scope: branches join, loops iterate to a fixpoint (a binding made later
     in a loop body reaches an earlier call through the backedge). Each call's verdict is merged over every visit:
     its kind is the union of what any visit saw, it is gated only if EVERY visit saw it gated."""
 
-    def __init__(self, bare: frozenset, runners: dict | None = None):
+    def __init__(self, bare: frozenset, runners: dict | None = None, annotations: bool = False):
         self.bare = bare
         self.runners = runners or {}
+        self.annotations = annotations    # a module/class-body AnnAssign annotation is evaluated (no __future__)
         self.hits: dict[int, list] = {}   # id(call) -> [call, kinds, gated]
         self.raises: list[list] = []      # one [joined state] per enclosing try body: its potential raise points
+        self.fin_split = 0                # enclosing finally bodies being analyzed twice (Prism b17d92ac9166)
+        # t_9a579e40 (Prism df2c474d178a): a break/continue leaves from ITS state, not the body's end state. One
+        # frame per enclosing loop ["loop", break-join, continue-join] or try-with-finally ["fin", [(kind, st)]]:
+        # a jump out of a try body or handler runs the finally first, so the try holds it until then
+        self.jumps: list[list] = []
+
+    def _jump(self, kind: str, st: _St) -> None:
+        if not self.jumps:
+            return   # a break/continue outside any loop is a SyntaxError; nothing to carry
+        f = self.jumps[-1]
+        if f[0] == "fin":
+            f[1].append((kind, st.copy()))
+            return
+        i = 1 if kind == "break" else 2
+        f[i] = st.copy() if f[i] is None else f[i].join(st)
 
     def _raise_point(self, st: _St) -> None:
         # an exception may leave any enclosing try body HERE: its handlers (and finally) see this state joined in
@@ -1015,9 +1184,15 @@ class _Flow:
         if isinstance(s, ast.If):
             self._visit(_calls_in(s.test), st)
             return self.block(s.body, st.copy()).join(self.block(s.orelse, st.copy()))
+        if isinstance(s, (ast.Break, ast.Continue)):
+            # the code after it in this block is unreachable; walking it anyway only joins in more states
+            self._jump("break" if isinstance(s, ast.Break) else "continue", st)
+            return st
         if isinstance(s, (ast.For, ast.AsyncFor, ast.While)):
             loop_test = s.test if isinstance(s, ast.While) else None
             self._visit(_calls_in(s.iter if loop_test is None else loop_test), st)
+            frame = ["loop", None, None]
+            self.jumps.append(frame)
             # the target binds one element per pass (from the iterable as built at entry); calls inside the target
             # (`for out[run([...])] in xs`) run on every pass (Prism 9660245e676f)
             cur = st
@@ -1028,14 +1203,22 @@ class _Flow:
                     # rebound per pass: a name element sees the body's mutations from the earlier passes
                     _rebind_from(body_in, _rebound([s.target]), _loop_bind(s.target, s.iter, st, body_in))
                 after = self.block(s.body, body_in)
+                if frame[2] is not None:    # a continue starts the next pass from its own state
+                    after = after.join(frame[2])
                 if loop_test is not None:   # a while condition runs again after every pass (Prism cec4be516dc4)
                     self._visit(_calls_in(loop_test), after)
                 nxt = st.join(after)
                 if nxt.key() == cur.key():
                     break
                 cur = nxt
-            return self.block(s.orelse, cur.copy())
+            self.jumps.pop()
+            # a break skips the else clause and leaves the loop from its own state
+            out = self.block(s.orelse, cur.copy())
+            return out if frame[1] is None else out.join(frame[1])
         if isinstance(s, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+            frame = ["fin", []]
+            if s.finalbody:
+                self.jumps.append(frame)
             # a handler is entered from ANY raise point in the body (every call and statement), not only from its
             # start or end: `del env[K]; prepare(); env[K] = rid` raising in prepare() reaches the handler with the
             # reservation gone (Prism 4f3ee8208e67). acc = the join of the entry state and every raise point.
@@ -1057,15 +1240,47 @@ class _Flow:
             res = outs[0]
             for o in outs[1:]:
                 res = res.join(o)
-            # finally also runs on an exception that no handler caught, from any raise point
-            return self.block(s.finalbody, res.join(mid))
+            if s.finalbody:
+                self.jumps.pop()   # a jump IN the finally binds to the enclosing loop
+            for kind, jst in frame[1]:   # a jump out of the body or a handler runs the finally on its way out
+                self._jump(kind, self.block(s.finalbody, jst))
+            # finally also runs on an exception that no handler caught, from any raise point: its sites are judged
+            # in that joined state, but that path re-raises, so the code AFTER the try continues from the normal
+            # exits only (Prism a84ed594c82f). A break/continue/return in the finally SUPPRESSES that exception, so
+            # then the exceptional state does reach the continuation (Prism ce7aa4b8a383)
+            if s.finalbody:
+                # Two passes (exceptional entry, normal entry) double the work per nested finally (Prism
+                # b17d92ac9166). One pass when both entries are the same state, or once _FIN_SPLIT_DEPTH split
+                # levels already enclose this one: the joined entry then feeds the continuation too, which can
+                # only turn a gated verdict ungated (a false RED, never a missed site).
+                exc_in = res.join(mid)
+                if exc_in.key() == res.key() or self.fin_split >= _FIN_SPLIT_DEPTH:
+                    return self.block(s.finalbody, exc_in)
+                self.fin_split += 1
+                try:
+                    exc_out = self.block(s.finalbody, exc_in)
+                    if _may_suppress(s.finalbody):
+                        return self.block(s.finalbody, res).join(exc_out)
+                    return self.block(s.finalbody, res)
+                finally:
+                    self.fin_split -= 1
+            return self.block(s.finalbody, res)
         if isinstance(s, (ast.With, ast.AsyncWith)):
             for it in s.items:
                 self._visit(_calls_in(it.context_expr), st)
                 if it.optional_vars is not None:
                     self._visit(_calls_in(it.optional_vars), st)   # `with cm as out[run([...])]`
                     _drop(st, _rebound([it.optional_vars]))
-            return self.block(s.body, st)
+            # __exit__ may SUPPRESS an exception raised anywhere in the body: the code after the with then goes on
+            # from that raise point's state. The continuation is the union of the normal exit and every raise point
+            # (Prism 53bb2362809d); a break/continue in the body reaches its loop on its own (t_9a579e40)
+            acc = [st.copy()]
+            self.raises.append(acc)
+            try:
+                out = self.block(s.body, st)
+            finally:
+                self.raises.pop()
+            return out.join(acc[0])
         if isinstance(s, getattr(ast, "Match", ())):
             self._visit(_calls_in(s.subject), st)
             res = st
@@ -1079,6 +1294,13 @@ class _Flow:
             # calls inside a target (`out[run([...])] = v`) run after the value (Prism 9f6c5aaee3d4)
             self._visit(_calls_in(*(s.targets if isinstance(s, ast.Assign) else [s.target])), st)
             _apply_assign(st, s)
+            if isinstance(s, ast.AnnAssign) and self.annotations:
+                # `x: run([...])` at module/class level runs the annotation (Prism 881328c96622); a function-local
+                # one, or any under `from __future__ import annotations`, is never evaluated. It runs AFTER the
+                # assignment binds, so it sees the new binding (Prism b17d92ac9166). Visited on a COPY: under
+                # PEP 649 (py3.14) the annotation is deferred and may never run, so its spawns are still sites but
+                # its mutations (`x: env.update(ALLOC_RESERVATION=...)`) are never credited (Prism 671505a2351e)
+                self._visit(_calls_in(s.annotation), st.copy())
             return st
         if isinstance(s, ast.Delete):
             for t in s.targets:
@@ -1086,7 +1308,8 @@ class _Flow:
                 self._visit(_calls_in(t), st)
                 if isinstance(t, ast.Name):
                     _drop(st, {t.id})
-                elif isinstance(t, ast.Subscript) and "ALLOC_RESERVATION" in _all_text(t.slice):
+                elif isinstance(t, ast.Subscript) and ("ALLOC_RESERVATION" in _all_text(t.slice)
+                                                       or _may_be_key(t.slice)):
                     _unreserve(st, {x.id for x in ast.walk(t.value) if isinstance(x, ast.Name)})
             return st
         self._visit(_calls_in(s), st)
@@ -1108,6 +1331,9 @@ def py_sites(path: str, text: str) -> list[tuple[str, str, int, bool]]:
                      | ASYNC_ATTR)
 
     runners = {id(tree): _scope_runners(tree, tree.body, bare, {})}
+    lazy_ann = any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations"
+                                                                                      for a in n.names)
+                   for n in tree.body)
 
     def collect(node, prefix, outer):
         # every function, class body and lambda is its own scope (none inherits another's admission facts).
@@ -1129,7 +1355,8 @@ def py_sites(path: str, text: str) -> list[tuple[str, str, int, bool]]:
     out = []
     module_argv: dict = {}
     for sc in scopes:
-        fl = _Flow(bare, runners.get(id(sc.node)))
+        fl = _Flow(bare, runners.get(id(sc.node)),
+                   not lazy_ann and isinstance(sc.node, (ast.Module, ast.ClassDef)))
         end = fl.block(sc.body, _St(module_argv))
         if sc is scopes[0]:   # module-level argv constants (BASE = ["ssh", ...]) are visible everywhere;
             module_argv = end.argv   # admission facts are never shared between scopes
@@ -1239,9 +1466,17 @@ def _sh_spawn_offsets(text: str, kind: str) -> list[int]:
     """Every offset in one shell command where a spawn of ``kind`` starts (a command whose quoted arguments carry two
     ssh invocations on two continued lines is a spawn on each line, as the per-line lint saw it)."""
     if kind == "ssh":
-        return [m.start() for m in SHELL_SSH.finditer(text) if not NON_FLEET.match(m.group(2).strip("\"'"))]
-    rx = dict(SHELL_KINDS)[kind]
-    return [m.start() for m in rx.finditer(text)]
+        ms = [m for m in SHELL_SSH.finditer(text)
+              if not NON_FLEET.match(m.group(2).strip("\"'")) and not _ssh_noconnect(_ssh_shell_opts(m))]
+    else:
+        ms = list(dict(SHELL_KINDS)[kind].finditer(text))
+    out = []
+    for m in ms:   # the executable token, not the delimiter the rx matched before it (Prism 7b5740dbeae1)
+        o = m.start()
+        while o < m.end() and (text[o].isspace() or text[o] in ";|&(`\"'"):
+            o += 1
+        out.append(o)
+    return out
 
 
 def _sh_blank(m) -> str:
@@ -1345,18 +1580,398 @@ def sh_sites(text: str) -> list[tuple[str, str, int, bool]]:
                 g = gated_in[scope] or (subst_gate is not None and pos[j] > subst_gate)
             # one site per PHYSICAL line the command's spawns sit on (a continued command reports where each spawn
             # is, never only its first line): discovery stays a superset of the per-line lint
-            offs = _sh_spawn_offsets(view, kind) or [0]
-            for ln in sorted({i + bisect.bisect_right(breaks, lead + pos[j] + o) for o in offs}):
-                out.append((scope, kind, ln, g))
+            # each line keeps its own kind, in _classify_shell_at's order: `bash -c 'ssh h job; \\` + `docker run
+            # img'` is ssh on line 1 AND docker-run on line 2, as the per-line lint saw it (Prism 08043514ed16)
+            at: dict = {}
+            for k in [k for k, _ in SHELL_KINDS] + ["ssh"]:
+                for o in _sh_spawn_offsets(view, k):
+                    at.setdefault(i + bisect.bisect_right(breaks, lead + pos[j] + o), k)
+            for ln, k in sorted(at.items()) or [(i + bisect.bisect_right(breaks, lead + pos[j]), kind)]:
+                out.append((scope, k, ln, g))
         if gate_at is not None:
             gated_in[scope] = True
     return out
 
 
 # ---------------------------------------------------------------- lint
-def collect_sites(root: Path, strict: bool = False):
+def _py_header_comments(text: str) -> list[tuple[int, str]]:
+    """(line number, physical line) of every whole-line COMMENT token in a Python file's header: before the first
+    statement other than the module docstring. Text inside a string or docstring is never a COMMENT token, so a
+    marker there does not count (Prism f2e898533a6d). Fails closed: a file tokenize cannot read has no header."""
+    out = []
+    docstring_ok = True
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                if not tok.line[:tok.start[1]].strip():
+                    out.append((tok.start[0], tok.line))
+            elif tok.type in (tokenize.NL, tokenize.NEWLINE, tokenize.ENCODING):
+                if tok.type == tokenize.NEWLINE:
+                    docstring_ok = False
+            elif tok.type == tokenize.STRING and docstring_ok:
+                continue
+            else:
+                break
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return []
+    return out
+
+
+def _sh_header_comments(text: str) -> list[tuple[int, str]]:
+    """(line number, line) of a shell file's leading comment block: after an optional shebang, up to the first
+    non-comment, non-blank line. A heredoc or quoted multi-line string always starts on a code line, so its
+    body is never in this block (Prism f2e898533a6d)."""
+    out = []
+    for n, line in enumerate(text.split("\n"), 1):
+        s = line.strip()
+        if not s:
+            continue
+        if not s.startswith("#"):
+            break
+        out.append((n, line))
+    return out
+
+
+def oneshot_marker(text: str, python: bool = False) -> str | None:
+    """The operator one-shot marker's reason (stripped; may be '') when a real header comment (see
+    _py_header_comments / _sh_header_comments) within the first ONESHOT_HEAD_LINES lines carries one, else None."""
+    for n, line in (_py_header_comments(text) if python else _sh_header_comments(text)):
+        if n > ONESHOT_HEAD_LINES:
+            break
+        m = ONESHOT_RE.match(line.rstrip("\r\n"))
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _scheduled(text: str) -> str | None:
+    """The first non-manual `# SCHEDULE:` header value, else None."""
+    for line in text.split("\n"):
+        m = SCHEDULE_HDR.match(line)
+        if m and m.group(1).lower() != "manual":
+            return m.group(1) or "?"
+    return None
+
+
+def load_singletons(root: Path, today: dt.date | None = None) -> tuple[dict, dict, list[str]]:
+    """({id: row} of the LIVE rows of <root>/fleet/spawn-singletons.json, {id: row} of every row, findings).
+    Absent file: no rows. A malformed file or row, or a duplicate id, raises ValueError (blind). An expired row is a
+    finding and is not live. ``today`` defaults to the wall clock: expiry is always checked."""
+    today = today or dt.date.today()
+    p = root / SINGLETONS
+    if not p.exists():
+        return {}, {}, []
+    rows = json.loads(p.read_text(encoding="utf-8")).get("sites")
+    if not isinstance(rows, list):
+        raise ValueError(f"{SINGLETONS} has no 'sites' list")
+    live, every, out = {}, {}, []
+    for r in rows:
+        if not isinstance(r, dict) or any(not isinstance(r.get(k), str) or not r[k].strip() for k in SINGLETON_KEYS):
+            raise ValueError(f"{SINGLETONS} row needs non-empty {', '.join(SINGLETON_KEYS)}: {r}")
+        if not SINGLETON_PRAGMA.fullmatch(f"{SINGLETON_PREFIX} {r['id']}"):
+            raise ValueError(f"{SINGLETONS} row id {r['id']!r} is not [A-Za-z0-9][A-Za-z0-9_.-]*")
+        if not re.fullmatch(r"[0-9a-f]{64}", r["fn_sha"]):
+            raise ValueError(f"{SINGLETONS} row {r['id']}: fn_sha must be 64 lowercase hex")
+        if r["id"] in every:
+            raise ValueError(f"{SINGLETONS}: duplicate row id {r['id']!r}")
+        every[r["id"]] = r
+        if dt.date.fromisoformat(r["expires"]) < today:
+            out.append(f"{r['path']}: {SINGLETONS} row {r['id']} ({r['function']}) EXPIRED {r['expires']}: route "
+                       f"the helper through alloc-admit, or renew the row with a reason")
+            continue
+        live[r["id"]] = r
+    return live, every, out
+
+
+SINGLETON_NEXT_HEADER = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*\(\) \{")   # a top-level function header line, fullmatch
+
+
+def singleton_function(raw: bytes, function: str) -> tuple[int, int, str] | str:
+    """(header line, last span line, fn_sha) of ``function`` in a file's raw bytes, else why not. The header is the
+    ONE physical line that is exactly `<function>() {`; the span runs to the line BEFORE the next line that is a
+    top-level function header (SINGLETON_NEXT_HEADER), or to EOF (Prism 5ed1b7be03f5: no closing-brace search, so an
+    inner column-0 `}` cannot end it early). Trailing comments/blank lines are pinned too: an edit there re-pins.
+    fn_sha = sha256 of the span's raw bytes, newlines included: no decoding, stripping or continuation logic. Lines are
+    split on b"\\n" only (a file whose decoded text breaks lines elsewhere is refused)."""
+    lines = raw.split(b"\n")
+    head = f"{function}() {{".encode("utf-8")
+    hits = [n for n, ln in enumerate(lines) if ln == head]
+    if len(hits) != 1:
+        return f"its function header `{function}() {{` is on {len(hits)} lines of this file, not exactly 1"
+    nxt = next((n for n in range(hits[0] + 1, len(lines)) if SINGLETON_NEXT_HEADER.fullmatch(lines[n])), None)
+    lo = sum(len(ln) + 1 for ln in lines[:hits[0]])
+    if nxt is None:
+        hi, end = len(raw), len(lines) - 1 - (lines[-1] == b"")   # EOF; a final newline adds no line
+    else:
+        hi, end = sum(len(ln) + 1 for ln in lines[:nxt]), nxt - 1
+    return hits[0] + 1, end + 1, hashlib.sha256(raw[lo:hi]).hexdigest()
+
+
+def singleton_pragmas(text: str) -> list[tuple[int, str | None]]:
+    """(pragma line, row id or None when malformed) for every physical line whose stripped text starts with the
+    pragma prefix. Plain text: no shell parsing at all."""
+    out = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        st = raw.strip()
+        if st.startswith(SINGLETON_PREFIX):
+            m = SINGLETON_PRAGMA.fullmatch(st)
+            out.append((n, m.group(1) if m else None))
+    return out
+
+
+def apply_singletons(sites: list, pragmas: list, live: dict, every: dict, raws: dict) -> tuple[list, list[str], set]:
+    """Mark the spawn sites inside a validly pinned function gated. pragmas: (path, line, id); raws: {path: raw bytes,
+    or None when its line breaks are not plain \\n}. Returns (sites, findings, ids named by any pragma)."""
+    uses = Counter(i for _, _, i in pragmas if i)
+    named = set(uses)
+    out, cover = [], set()
+    for p, ln, i in pragmas:
+        r = live.get(i)
+        span = None
+        if i is None:
+            why = (f"malformed: the pragma line must be exactly `{SINGLETON_PREFIX} <row-id>`, in a bash file "
+                   f"(Python spawns gate through alloc_client)")
+        elif r is None:
+            why = (f"row {i} is EXPIRED in {SINGLETONS}" if i in every
+                   else f"row {i} is not in {SINGLETONS}")
+        elif r["path"] != p:
+            why = f"row {i} is for {r['path']}, not this file"
+        elif uses[i] > 1:
+            why = f"row {i} is named by {uses[i]} pragmas in the tree; one row covers ONE function"
+        elif raws.get(p) is None:
+            why = "the file breaks lines with something other than \\n; the pinned bytes are ambiguous"
+        elif isinstance(span := singleton_function(raws[p], r["function"]), str):
+            why = f"row {i}: {span}"
+        elif not span[0] < ln < span[1]:
+            why = f"row {i}: the pragma is not inside {r['function']} (lines {span[0]}-{span[1]})"
+        elif span[2] != r["fn_sha"]:
+            why = (f"singleton: function changed, re-review and re-pin row {i} "
+                   f"({r['function']} lines {span[0]}-{span[1]} fn_sha {span[2]})")
+        elif not any(sp == p and span[0] <= sl <= span[1] for sp, _, _, sl, _ in sites):
+            why = f"row {i}: {r['function']} holds no spawn"
+        else:
+            cover.update((p, sl) for sl in range(span[0], span[1] + 1))
+            continue
+        out.append(f"{p}:{ln}: `{SINGLETON_PREFIX}` does not apply: {why}")
+    sites = [(p, sc, k, ln, g or (p, ln) in cover) for p, sc, k, ln, g in sites]
+    return sites, out, named
+
+
+# Door consumption (t_a951b32b, fleet priority P6; Apollo terminal ruling 2026-11-05 13:0x). A row of
+# fleet/spawn-allowlist.json or fleet/spawn-singletons.json that carries `"consumes": "door"` names a start site that
+# must ask the shared admission door before it starts. Exact facts only, no inference: the row's function bytes
+# (bash: the singleton_function span; Python: the def's lines `lineno..end_lineno`, joined with \n plus a final \n)
+# must hash to the row's fn_sha AND contain one of the literal tokens below. A wrapper or a sourced helper that
+# carries the token elsewhere does not count. Any other `consumes` value is red.
+DOOR_TOKENS = {"python": ("authorize_start(",),
+               "bash": ("alloc_client authorize-start", '"$CI_START_DOOR_HELPER"')}   # P2's bridge helper
+# Round 4 (reader deleg_a4368da8): a token held only by a comment or an inert string is not a call. Python: the
+# token counts only as the NAME `authorize_start` followed by the OP `(` in tokenize's stream, so STRING / COMMENT
+# bytes drop out by construction. Bash: it counts only as the FIRST word of a simple command (line start, after
+# ; & | && || ( `, inside $( ), or after if/then/do/else/elif/while/until/!/{ and prefix assignments), outside
+# comments, single quotes, double-quoted text, heredoc bodies and assignment right-hand sides.
+_SH_RESERVED = {"if", "then", "do", "else", "elif", "while", "until", "!", "{", "}", "time", "fi", "done"}
+_SH_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
+_SH_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_SH_OPS = ";&|()<>"
+
+
+def _py_door_call(body: bytes) -> bool:
+    import textwrap
+    try:
+        toks = [t for t in tokenize.generate_tokens(io.StringIO(textwrap.dedent(body.decode("utf-8"))).readline)
+                if t.type in (tokenize.NAME, tokenize.OP)]
+    except (tokenize.TokenError, IndentationError, SyntaxError, UnicodeDecodeError):
+        return False
+    return any(a.type == tokenize.NAME and a.string == "authorize_start" and b.type == tokenize.OP and b.string == "("
+               for a, b in zip(toks, toks[1:]))
+
+
+def _sh_door_hit(s: str, i: int) -> bool:
+    """A door token begins at s[i] and ends at a word boundary."""
+    for tok in ('"$CI_START_DOOR_HELPER"',):
+        if s.startswith(tok, i) and (i + len(tok) == len(s) or s[i + len(tok)] in " \t\n" + _SH_OPS):
+            return True
+    m = re.compile(r"alloc_client[ \t]+authorize-start(?=$|[ \t\n;&|()<>])").match(s, i)
+    return m is not None
+
+
+def _sh_dq(s: str, i: int, hits: list) -> int:
+    """s[i] == '"'; return the index after the closing quote. $( ) and backticks inside are command contexts."""
+    i += 1
+    while i < len(s) and s[i] != '"':
+        if s[i] == "\\":
+            i += 2
+        elif s.startswith("$((", i):
+            i = _sh_arith(s, i)
+        elif s.startswith("$(", i):
+            i = _sh_cmd(s, i + 2, ")", hits)
+        elif s[i] == "`":
+            i = _sh_cmd(s, i + 1, "`", hits)
+        else:
+            i += 1
+    return i + 1
+
+
+def _sh_arith(s: str, i: int) -> int:
+    depth, i = 0, i + 1
+    while i < len(s):
+        depth += {"(": 1, ")": -1}.get(s[i], 0)
+        i += 1
+        if depth == 0:
+            return i
+    return i
+
+
+def _sh_cmd(s: str, i: int, stop: str | None, hits: list) -> int:
+    """Scan a command context from s[i] until ``stop`` (or EOF); append a hit for a door token at command start."""
+    start, heredocs = True, []
+    while i < len(s):
+        c = s[i]
+        if stop is not None and c == stop:
+            return i + 1
+        if c == "\n":
+            i += 1
+            start = True
+            for delim, strip in heredocs:   # skip each pending heredoc body
+                while i < len(s):
+                    j = s.find("\n", i)
+                    line = s[i:] if j < 0 else s[i:j]
+                    i = len(s) if j < 0 else j + 1
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        break
+            heredocs = []
+            continue
+        if c in " \t":
+            i += 1
+            continue
+        if c == "#":   # a word-initial # opens a comment
+            j = s.find("\n", i)
+            i = len(s) if j < 0 else j
+            continue
+        if s.startswith("<<<", i):
+            i += 3
+            continue
+        m = _SH_HEREDOC.match(s, i)
+        if m:
+            heredocs.append((m.group(2), s.startswith("<<-", i)))
+            i = m.end()
+            continue
+        if c in _SH_OPS:
+            if c in "<>":
+                i += 1   # a redirection target is a word, never a command
+                continue
+            if c == ")" and stop == ")":
+                return i + 1
+            start = True
+            i += 1
+            continue
+        # a word
+        if start and _sh_door_hit(s, i):
+            hits.append(i)
+        w0 = i
+        while i < len(s) and s[i] not in " \t\n" + _SH_OPS and not (stop is not None and s[i] == stop):
+            if s[i] == "\\":
+                i += 2
+            elif s[i] == "'":
+                j = s.find("'", i + 1)
+                i = len(s) if j < 0 else j + 1
+            elif s[i] == '"':
+                i = _sh_dq(s, i, hits)
+            elif s.startswith("$((", i):
+                i = _sh_arith(s, i)
+            elif s.startswith("$(", i):
+                i = _sh_cmd(s, i + 2, ")", hits)
+            elif s[i] == "`":
+                i = _sh_cmd(s, i + 1, "`", hits)
+            else:
+                i += 1
+        word = s[w0:i]
+        if start and not (word in _SH_RESERVED or _SH_ASSIGN.match(word)):
+            start = False
+    return i
+
+
+def _sh_door_call(body: bytes) -> bool:
+    hits: list = []
+    _sh_cmd(body.decode("utf-8", errors="replace"), 0, None, hits)
+    return bool(hits)
+
+
+def door_span(raw: bytes, function: str, python: bool) -> tuple[bytes, str] | str:
+    """(function bytes, sha256) of ``function`` in ``raw``, else why not. Python: a dotted qualified def name."""
+    if not python:
+        span = singleton_function(raw, function)
+        if isinstance(span, str):
+            return span
+        return b"\n".join(raw.split(b"\n")[span[0] - 1:span[1]]), span[2]
+    try:
+        tree = ast.parse(raw)
+    except (SyntaxError, ValueError) as e:
+        return f"unparseable ({e.__class__.__name__})"
+    hits = []
+
+    def walk(node, prefix):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                q = f"{prefix}.{ch.name}" if prefix else ch.name
+                if q == function and not isinstance(ch, ast.ClassDef):
+                    hits.append(ch)
+                walk(ch, q)
+    walk(tree, "")
+    if len(hits) != 1:
+        return f"def `{function}` is defined {len(hits)} times in this file, not exactly 1"
+    body = b"\n".join(raw.split(b"\n")[hits[0].lineno - 1:hits[0].end_lineno]) + b"\n"
+    return body, hashlib.sha256(body).hexdigest()
+
+
+def door_findings(root: Path, allow_rows: list, singleton_rows: dict) -> list[str]:
+    """Red lines for every `consumes` row (see DOOR_TOKENS)."""
+    out = []
+    rows = [(r, r.get("scope")) for r in allow_rows] + [(r, r.get("function")) for r in singleton_rows.values()]
+    for r, function in rows:
+        if "consumes" not in r:
+            continue
+        where = f"{r.get('path')}: {function}"
+        if r["consumes"] != "door":
+            out.append(f"{where}: consumes must be exactly \"door\", got {r['consumes']!r}")
+            continue
+        try:
+            raw = (root / r["path"]).read_bytes()
+        except OSError as e:
+            out.append(f"{where}: consumes door: file unreadable ({e.__class__.__name__})")
+            continue
+        python = is_python(r["path"], raw.decode("utf-8", errors="replace"))
+        if function in (None, "<top>", "<module>"):
+            out.append(f"{where}: consumes door needs a function scope, not top level")
+            continue
+        span = door_span(raw, function, python)
+        if isinstance(span, str):
+            out.append(f"{where}: consumes door: {span}")
+            continue
+        body, sha = span
+        if not re.fullmatch(r"[0-9a-f]{64}", str(r.get("fn_sha", ""))):
+            out.append(f"{where}: consumes door row needs fn_sha (64 lowercase hex); current fn_sha {sha}")
+        elif r["fn_sha"] != sha:
+            out.append(f"{where}: door: function changed, re-review and re-pin fn_sha {sha}")
+        tokens = DOOR_TOKENS["python" if python else "bash"]
+        if not (_py_door_call(body) if python else _sh_door_call(body)):
+            out.append(f"{where}: start site does not consult the door: the function holds none of {list(tokens)}")
+    return out
+
+
+def collect_sites(root: Path, strict: bool = False, markers: dict | None = None, singletons: tuple | None = None,
+                  findings: list | None = None):
     """strict (the seed): a file that cannot be read raises, never shrinks the inventory silently (Prism
-    33f6bb1fe4e4: one unreadable file would otherwise delete its rows from a re-seeded allowlist)."""
+    33f6bb1fe4e4: one unreadable file would otherwise delete its rows from a re-seeded allowlist).
+    markers: when a dict, filled {path: (reason, non-manual SCHEDULE value or None)} for every file carrying
+    the operator one-shot marker (t_9a970a74).
+    singletons: (live, every) rows from load_singletons (None: read <root>/fleet/spawn-singletons.json with today's
+    date); a bash spawn under a valid supervisor-singleton pragma is gated. findings: when a list, extended with the
+    pragma and stale-row findings (t_a93526ab)."""
+    if singletons is None:
+        singletons = load_singletons(root)[:2]
+    pragmas, raws = [], {}
     files = scan_files(root, strict)
     read = 0
     sites = []   # (path, scope, kind, line, gated)
@@ -1368,10 +1983,32 @@ def collect_sites(root: Path, strict: bool = False):
                 raise
             continue
         read += 1
+        if markers is not None:
+            why = oneshot_marker(text, is_python(f, text))
+            if why is not None:
+                markers[f] = (why, _scheduled(text))
+        py = is_python(f, text)
+        if SINGLETON_PREFIX in text:   # a pragma in a Python file never applies (bash only): its id reads as None
+            pragmas += [(f, ln, None if py else i) for ln, i in singleton_pragmas(text)]
+            try:
+                raw = (root / f).read_bytes()
+            except OSError:
+                if strict:
+                    raise
+                raw = None
+            # the pragma's line number comes from text.splitlines(); the span from raw b"\n" splits: they must agree
+            raws[f] = raw if raw is not None and len(text.splitlines()) == raw.count(b"\n") + (
+                not raw.endswith(b"\n") and raw != b"") else None
         if not PREFILTER.search(text):
             continue
-        rows = py_sites(f, text) if is_python(f, text) else sh_sites(text)
+        rows = py_sites(f, text) if py else sh_sites(text)
         sites += [(f, sc, k, ln, g) for sc, k, ln, g in rows]
+    live, every = singletons
+    sites, out, named = apply_singletons(sites, pragmas, live, every, raws)
+    out += [f"{r['path']}: {SINGLETONS} row {i} ({r['function']}) is stale: no pragma names it; delete the row"
+            for i, r in sorted(live.items()) if i not in named]
+    if findings is not None:
+        findings += out
     return read, sites
 
 
@@ -1390,6 +2027,61 @@ def load_allowlist(path: Path) -> list[dict]:
             raise ValueError(f"allowlist row has an empty reason: {r}")
         dt.date.fromisoformat(r["expires"])
     return rows
+
+
+def _row_keys(rows: list) -> list:
+    return [(r.get("path"), r.get("scope"), r.get("kind")) for r in rows if isinstance(r, dict)]
+
+
+def _allowlist_at(root: Path, ref: str, rel: str = ALLOWLIST) -> list:
+    """The allowlist rows at a git ref of root. OSError/ValueError on a ref git cannot read, and on a ``rel`` that ref
+    does not hold as a regular file (Prism 04d87dca150c: an absent/symlinked/unreadable historical read is blind,
+    never an empty list). ``rel``: the SELECTED allowlist's repo-relative REAL path (check_allowlist resolves it), so
+    base and main are read under the same policy file as this tree (Prism 446d49e90065)."""
+    p = subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"], capture_output=True,
+                       timeout=60)
+    if p.returncode != 0:
+        raise ValueError(f"ref {ref!r} is not a commit in {root}")
+    p = subprocess.run(["git", "-C", str(root), "ls-tree", ref, "--", rel], capture_output=True, timeout=60)
+    mode = p.stdout.split(b" ", 1)[0] if p.returncode == 0 else b""
+    if mode not in (b"100644", b"100755"):
+        raise ValueError(f"{ref}:{rel} is not a regular file at that ref (ls-tree mode {mode.decode() or 'absent'}); "
+                         f"cannot grade the allowlist against it")
+    p = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{rel}"], capture_output=True, timeout=60)
+    if p.returncode != 0:
+        raise ValueError(f"git show {ref}:{rel} failed: {p.stderr.decode(errors='replace').strip()}")
+    rows = json.loads(p.stdout.decode("utf-8")).get("sites")
+    if not isinstance(rows, list):
+        raise ValueError(f"{ref}:{rel} has no 'sites' list")
+    return rows
+
+
+def check_allowlist(root: Path, allowlist: Path, base: str, main_ref: str) -> list[str]:
+    """t_262713ff: rows this tree adds (vs base) that main already carries, and keys twice in this tree's file. When
+    main is an ancestor of HEAD (the PR already contains main) a row main has is main's own, not a second copy.
+    Base, main and this tree all read the SELECTED --allowlist path (Prism 446d49e90065), resolved to its REAL path
+    relative to the repo (Prism 04d87dca150c: `git show` does not follow a committed symlink); one whose real path is
+    outside the repo has no base/main revision: ValueError (blind, rc 2), never a comparison against the default file."""
+    real_root = Path(os.path.realpath(root))
+    real = Path(os.path.realpath(allowlist))
+    try:
+        rel = real.relative_to(real_root).as_posix()
+    except ValueError:
+        raise ValueError(f"--allowlist {allowlist} resolves to {real}, outside {real_root}: base and main cannot "
+                         f"supply it") from None
+    mine = _row_keys(load_allowlist(real))
+    out = [f"{rel}: duplicate row {k} ({n}x in this tree)" for k, n in sorted(Counter(mine).items()) if n > 1]
+    before = set(_row_keys(_allowlist_at(root, base, rel)))
+    on_main = Counter(_row_keys(_allowlist_at(root, main_ref, rel)))
+    if subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", main_ref, "HEAD"],
+                      capture_output=True, timeout=60).returncode == 0:
+        return out
+    for k in sorted(set(mine) - before):
+        if on_main[k]:
+            out.append(f"{rel}: row {'::'.join(map(str, k))} is ADDED by this change but main ({main_ref[:12]}) "
+                       f"already has it: another PR fixed the same red first. Drop the row (rebase on main), or close "
+                       f"this PR as a duplicate")
+    return out
 
 
 def trigger_findings(root: Path) -> list[str]:
@@ -1413,22 +2105,50 @@ def trigger_findings(root: Path) -> list[str]:
     return out
 
 
+def _oneshot_ok(markers: dict) -> tuple[set, list[str]]:
+    """(files whose marker is honored, findings for markers that are not)."""
+    ok, out = set(), []
+    for f, (why, sched) in sorted(markers.items()):
+        if len(why.replace(" ", "")) < ONESHOT_MIN_REASON:
+            out.append(f"{f}: spawn-site-oneshot marker needs a reason (>= {ONESHOT_MIN_REASON} chars): say why "
+                       f"this is a hand-run one-shot")
+        elif sched is not None:
+            out.append(f"{f}: spawn-site-oneshot marker on a scheduled script (# SCHEDULE: {sched}): a scheduled "
+                       f"job is not a one-shot; gate its spawns via alloc_client")
+        else:
+            ok.add(f)
+    return ok, out
+
+
 def lint(root: Path, allowlist: Path, today: dt.date) -> list[str]:
-    read, sites = collect_sites(root)
+    markers: dict = {}
+    live, every, single_findings = load_singletons(root, today)
+    read, sites = collect_sites(root, markers=markers, singletons=(live, every), findings=single_findings)
     if read == 0:
         return [f"lint-spawn-site: scanned 0 files under {root}: a lint that scans nothing is red (S6)"]
     rows = load_allowlist(allowlist)
+    oneshot, marker_findings = _oneshot_ok(markers)
+    has_ssh = {p for p, _, k, _, _ in sites if k == "ssh"}
+    marker_findings += [f"{f}: spawn-site-oneshot marker is stale (no ssh site left): delete the marker"
+                        for f in sorted(oneshot - has_ssh)]
+    sites = [x for x in sites if not (x[2] == "ssh" and x[0] in oneshot)]
+    # Prism 64813682c743: findings about the allowlist name the SELECTED file (repo-relative), never the constant
+    # default: the owner split attributes a duplicate-row finding to its path, and --allowlist may pick another file.
+    try:
+        allow_name = Path(os.path.abspath(allowlist)).relative_to(Path(os.path.abspath(root))).as_posix()
+    except ValueError:
+        allow_name = ALLOWLIST
     ungated = Counter((p, s, k) for p, s, k, _, g in sites if not g)
     lines = defaultdict(list)
     for p, s, k, ln, g in sites:
         if not g:
             lines[(p, s, k)].append(ln)
     allowed = {}
-    findings = trigger_findings(root)
+    findings = trigger_findings(root) + marker_findings + single_findings
     for r in rows:
         key = (r["path"], r["scope"], r["kind"])
         if key in allowed:
-            findings.append(f"{ALLOWLIST}: duplicate row {key}")
+            findings.append(f"{allow_name}: duplicate row {key}")
         allowed[key] = r
         if dt.date.fromisoformat(r["expires"]) < today:
             findings.append(f"{r['path']}: {r['scope']} {r['kind']}: allowlist row EXPIRED {r['expires']} "
@@ -1447,6 +2167,7 @@ def lint(root: Path, allowlist: Path, today: dt.date) -> list[str]:
         if n < r["count"]:
             findings.append(f"{r['path']}: {r['scope']} {r['kind']}: allowlist row is stale (count {r['count']}, "
                             f"{n} ungated now): lower the count or delete the row (the list only shrinks)")
+    findings += door_findings(root, rows, every)
     return findings
 
 
@@ -1503,8 +2224,28 @@ def differential(roots, base_ref: str) -> tuple[str, list]:
         _, base = mod.collect_sites(r)
         _, mine = collect_sites(r)
         have = {(f, ln, k) for f, _, k, ln, _ in mine}
-        missing |= {(f, ln, k) for f, _, k, ln, _ in base} - have
+        missing |= {(f, ln, k) for f, _, k, ln, _ in base
+                    if (f, ln, k) not in have and not _noconnect_line(r, f, ln, k)}
     return "ran", sorted(missing)
+
+
+PY_SSH_NOCONNECT = re.compile(r"""["'](?:/usr/bin/)?ssh["']((?:\s*,\s*["'][^"']*["'])+)""")
+PY_STR = re.compile(r"""["']([^"']*)["']""")
+
+
+def _noconnect_line(root: Path, f: str, ln: int, k: str) -> bool:
+    """A base-lint ssh site this lint drops on purpose: the line runs `ssh -G/-V/-Q` (t_dbe07131)."""
+    if k != "ssh":
+        return False
+    try:
+        line = (Path(root) / f).read_text(encoding="utf-8", errors="replace").split("\n")[ln - 1]
+    except (OSError, IndexError):
+        return False
+    pm = PY_SSH_NOCONNECT.search(line)
+    if pm and _ssh_noconnect(PY_STR.findall(pm.group(1))):
+        return True
+    ms = list(SHELL_SSH.finditer(line))   # every ssh on the line must be no-connect, or the site still counts
+    return bool(ms) and all(_ssh_noconnect(_ssh_shell_opts(m)) for m in ms)
 
 
 # ---------------------------------------------------------------- selftest
@@ -1512,6 +2253,10 @@ UNGATED_DOCKER = "#!/usr/bin/env bash\nstart() {\n  ssh ci-box 'docker run -d --
 GATED_DOCKER = ("#!/usr/bin/env bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci --job \"$1\")\n"
                 "  ssh ci-box \"ALLOC_RESERVATION=$ALLOC_RESERVATION docker run -d --rm runner:latest\"\n}\n")
 UNGATED_PY_SSH = "import subprocess\n\ndef go(h):\n    subprocess.run(['ssh', '-o', 'BatchMode=yes', h, 'make test'])\n"
+ONESHOT_WHY = "operator runs this by hand to enroll one fixed appliance"
+ONESHOT_SH = f"#!/bin/bash\n# spawn-site-oneshot: {ONESHOT_WHY}\nssh -o BatchMode=yes root@192.168.1.5 'ha info'\n"
+ONESHOT_PY = (f"#!/usr/bin/env python3\n# spawn-site-oneshot: {ONESHOT_WHY}\nimport subprocess\n"
+              "subprocess.run(['ssh', '-o', 'BatchMode=yes', 'root@192.168.1.5', 'ha info'])\n")
 # Prism 10dea09c29d3: a bare MENTION of the reservation (here: removing it) is not proof of gating
 PR2_ENV_U_MENTION = "import subprocess\n\ndef go(h):\n    subprocess.run(['ssh', h, 'env -u ALLOC_RESERVATION docker run image'])\n"
 PR2_DICT_ENV = ("import subprocess\nimport alloc_client\n\ndef go(job):\n    d, rid = alloc_client.admit('x', job_id=job)\n"
@@ -1533,7 +2278,8 @@ POOL_SHAPE = ("import subprocess\n\ndef ssh(alias, script):\n    return run_it(a
 HELPER_SSH = ("import subprocess\nSSH_OPTS=['-o','BatchMode=yes']\n\ndef _ssh_cmd():\n    return ['ssh'] + SSH_OPTS\n\n"
               "def go(h, r):\n    subprocess.Popen(_ssh_cmd() + [h, r])\n")
 NOT_SPAWNS = ("#!/usr/bin/env bash\n# ssh ci-box 'docker run x'\necho \"run: ssh ci-box uptime\"\n"
-              "git push git@github.com:o/r.git\nssh -T git@github.com\nssh-keygen -t ed25519\n")
+              "git push git@github.com:o/r.git\nssh -T git@github.com\nssh-keygen -t ed25519\n"
+              "_ka=\"$(ssh -G git@github.com 2>/dev/null | awk '{print $2}')\"\nssh -G ci-box\nssh -V\n")
 RUNNER_MINT = ("class Gh:\n    def jit(self, name):\n"
                "        args = ['-X', 'POST', f'orgs/{self.org}/actions/runners/generate-jitconfig', '-f', name]\n"
                "        return self._gh(args)\n")
@@ -1729,7 +2475,28 @@ RP_SHADOWED_ALIAS = ("import subprocess\nrunner = subprocess.run\ndef fake(*a, *
                      "    runner = fake\n    invoke = runner\n    invoke(['ssh', 'ci-box', 'job'])\n")
 RP_LOCAL_ALIAS_CHAIN = ("import subprocess\ndef go():\n    runner = subprocess.run\n    invoke = runner\n"
                         "    invoke(['ssh', 'ci-box', 'job'])\n")
-PY_NOT = "import subprocess\nsubprocess.run(['ssh-keygen', '-t', 'ed25519'])\nsubprocess.run(['git', 'push'])\n"
+PY_NOT = ("import subprocess\nsubprocess.run(['ssh-keygen', '-t', 'ed25519'])\nsubprocess.run(['git', 'push'])\n"
+          "subprocess.run(['ssh', '-G', 'ci-box'], capture_output=True)\n")
+# t_dbe07131: a G inside an option operand (`-oGSSAPIAuthentication=no`, `-i G`) is not -G; still a spawn
+SSH_G_OPERAND = ("#!/usr/bin/env bash\nssh -oGSSAPIAuthentication=no ci-box uptime\n")
+# Prism a95bfcad2fce: only ssh's option prefix (up to the host) can exempt; a remote command's -G/-V is still a spawn
+SSH_REMOTE_FLAG_SH = "#!/usr/bin/env bash\nssh ci-box ls -G\n"
+SSH_REMOTE_FLAG_SH2 = "#!/usr/bin/env bash\nssh -t ci-box sort -V /tmp/x\n"
+SSH_REMOTE_FLAG_PY = "import subprocess\nsubprocess.run(['ssh', 'ci-box', 'sort', '-V'])\n"
+SSH_BUNDLED_OPERAND = "#!/usr/bin/env bash\nssh -lG ci-box uptime\n"
+SSH_BUNDLED_OPERAND_PY = "import subprocess\nsubprocess.run(['ssh', '-lG', 'ci-box', 'uptime'])\n"
+SSH_OPT_THEN_G = ("#!/usr/bin/env bash\nssh -o StrictHostKeyChecking=no -G ci-box\n")
+SSH_OPT_THEN_G_PY = "import subprocess\nsubprocess.run(['ssh', '-o', 'StrictHostKeyChecking=no', '-G', 'ci-box'])\n"
+# t_9a579e40: the no-connect walk fails closed on shell text it cannot read literally
+SSH_EXPANDED_OPERAND = "#!/usr/bin/env bash\nssh -i $KEY -G ci-box\n"            # aad0e01e377b: KEY='' -> host -G
+SSH_EXPANDED_FLAGS = ("G=t; ssh -$G ci-box uptime", "ssh -${G} ci-box uptime", 'ssh -"$G" ci-box uptime',
+                      "ssh -t$G ci-box uptime")   # 8092b537bd59: each alone, each a spawn
+SSH_QUOTED_OPERAND = '#!/usr/bin/env bash\nssh -i "/tmp/key -G" ci-box uptime\n'  # 659d6121556c: one operand
+SSH_TAG_OPERAND = "#!/usr/bin/env bash\nssh -PG ci-box uptime\n"                 # 33d81aeb3e7c: G is -P's tag
+SSH_TAG_OPERAND_PY = "import subprocess\nsubprocess.run(['ssh', '-P', '-G', 'ci-box', 'uptime'])\n"
+SSH_QUOTED_OPT_THEN_G = '#!/usr/bin/env bash\nssh -o "ConnectTimeout=5" -G ci-box\n'
+# the -G is literal and the host operand after it may expand: still config resolution (mem0-offhost-watchdog.sh)
+SSH_G_EXPANDED_HOST = '#!/usr/bin/env bash\nip="$(ssh -G "$HOST" 2>/dev/null | awk \'$1=="hostname"{print $2}\')"\n'
 
 
 # Prism round 1 on #6512
@@ -1799,6 +2566,15 @@ RP_GLOBAL_EXPORT_NESTED = ("import subprocess\ndef outer():\n    local_run = sub
 RP_GLOBAL_EXPORT_SHADOWED = ("import subprocess\nlr = subprocess.run\ndef outer():\n    lr = print\n    def install():\n"
                              "        global runner, lr\n        x = lr\n        runner = x\n    install()\nouter()\n"
                              "runner(['ssh', 'ci-box', 'job'])\n")
+# Prism c6cf4728910b: a `global lr` on an INTERMEDIATE chain function resolves in the module for its descendants too
+RP_GLOBAL_CHAIN_MIDDLE = ("import subprocess\nlr = subprocess.run\ndef outer():\n    lr = print\n    def middle():\n"
+                          "        global lr\n        def install():\n            global runner\n            runner = lr\n"
+                          "        install()\n    middle()\nouter()\nrunner(['ssh', 'ci-box', 'job'])\n")
+# Prism ca74728a46c7: an intermediate function's DEFAULT runs in the enclosing scope, before its `global lr` applies
+RP_GLOBAL_CHAIN_DEFAULT = ("import subprocess\nlr = print\ndef outer():\n    lr = subprocess.run\n"
+                           "    def middle(run=lr):\n        global lr\n        def install():\n            global runner\n"
+                           "            runner = run\n        install()\n    middle()\nouter()\n"
+                           "runner(['ssh', 'ci-box', 'job'])\n")
 # Prism b7d07f333edc: an exported RHS resolves ONLY in the exporter's scope; install()'s local `lr = print` is what
 # `runner = lr` binds, never the module's `lr = subprocess.run`
 RP_EXPORT_RHS_LOCAL = ("import subprocess\nlr = subprocess.run\nrunner = print\ndef outer():\n    def install():\n"
@@ -1850,14 +2626,89 @@ RP_LOOP_DICT_OTHER_KEY = ("import subprocess\ndef go():\n    for cmd in [{'a': [
 
 # fixtures where the BASE lint reports a site that is not a spawn, fixed on purpose: kept out of the differential
 # corpus (each is a GREEN case above, so the fix itself is still gated)
+# t_e9b7716d: the 5 Prism P1s on prism-router#597 still real at hermes-home main b9d8ad62
+RP_DYN_POP = ("import subprocess\nrid = 'x'\nbase = {'ALLOC_RESERVATION': rid}\nchild = base.copy()\n"
+              "key = 'ALLOC_RESERVATION'\nchild.pop(key)\nsubprocess.run(['docker', 'run', 'img'], env=child)\n")
+RP_DYN_DEL = ("import subprocess\nrid = 'x'\nbase = {'ALLOC_RESERVATION': rid}\nchild = base\n"
+              "key = 'ALLOC_RESERVATION'\ndel child[key]\nsubprocess.run(['docker', 'run', 'img'], env=base)\n")
+RP_ANN_MODULE = "import subprocess\nresult: subprocess.check_output(['ssh', 'ci-box', 'job'])\n"
+RP_ANN_FUTURE = "from __future__ import annotations\n" + RP_ANN_MODULE
+RP_ANN_LOCAL = "import subprocess\ndef f():\n    result: subprocess.check_output(['ssh', 'ci-box', 'job'])\n"
+# Prism b17d92ac9166: the annotation runs after the value is bound, so it sees the NEW binding
+RP_ANN_AFTER_BIND = ("import subprocess\nrid = 'x'\nenv = dict(ALLOC_RESERVATION=rid)\n"
+                     "env: subprocess.run(['docker', 'run', 'img'], env=env) = {}\n")
+RP_ANN_AFTER_BIND_CTRL = ("import subprocess\nrid = 'x'\nenv = {}\n"
+                          "env: subprocess.run(['docker', 'run', 'img'], env=env) = dict(ALLOC_RESERVATION=rid)\n")
+# Prism 671505a2351e: a module/class annotation is deferred (PEP 649), so its env.update never runs
+RP_ANN_DEFERRED_MOD = ("import subprocess\nenv = {}\nx: env.update(ALLOC_RESERVATION='r')\n"
+                       "subprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_ANN_DEFERRED_CLS = ("import subprocess\nclass C:\n    env = {}\n    x: env.update(ALLOC_RESERVATION='r')\n"
+                       "    subprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_TRY_BOTH = ("import subprocess\nrid = 'x'\ntry:\n    env = dict(ALLOC_RESERVATION=rid)\nexcept Exception:\n"
+               "    env = dict(ALLOC_RESERVATION=rid)\nsubprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_TRY_HANDLER_DROPS = RP_TRY_BOTH.replace("    env = dict(ALLOC_RESERVATION=rid)\nsubprocess",
+                                           "    env = {}\nsubprocess")
+# Prism ce7aa4b8a383: a break/continue in finally swallows the exception, so the state from the raise point (env
+# emptied, reservation never restored) reaches the spawn after the loop
+RP_FINALLY_BREAK = ("import subprocess\nenv = dict(ALLOC_RESERVATION='r')\nfor _ in [0]:\n    try:\n        env = {}\n"
+                    "        int('bad')\n        env = dict(ALLOC_RESERVATION='r')\n    finally:\n        break\n"
+                    "subprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_FINALLY_CONTINUE = RP_FINALLY_BREAK.replace("        break\n", "        continue\n")
+RP_FINALLY_INNER_BREAK = RP_FINALLY_BREAK.replace("        break\n", "        for y in []:\n            break\n")
+# Prism b17d92ac9166: 18 nested try/finally whose entry states differ. The two-pass walk doubled per level
+# (~800k visits, 12 s); past _FIN_SPLIT_DEPTH it is one pass per level. The popped reservation still reaches the
+# spawn -> RED
+RP_DEEP_FINALLY = "import subprocess\nenv = dict(ALLOC_RESERVATION='r')\n" + "".join(
+    "    " * i + "try:\n" + "    " * (i + 1) + "env.pop('ALLOC_RESERVATION'); env.update(ALLOC_RESERVATION='r')\n"
+    + "    " * i + "finally:\n" for i in range(18)) + "    " * 18 + "subprocess.run(['docker', 'run', 'img'], env=env)\n"
+# t_9a579e40 (Prism df2c474d178a): a break/continue leaves the loop (or starts the next pass) from ITS state, not
+# the body's end state; one leaving a try runs the finally on the way out
+RP_LOOP_BREAK = ("import subprocess\nenv = dict(ALLOC_RESERVATION='r')\nfor x in [0, 1]:\n    env = {}\n"
+                 "    if x:\n        break\n    env = dict(ALLOC_RESERVATION='r')\n"
+                 "subprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_LOOP_CONTINUE = RP_LOOP_BREAK.replace("        break\n", "        continue\n")
+RP_LOOP_NO_EXIT = RP_LOOP_BREAK.replace("    if x:\n        break\n", "")
+RP_TRY_BREAK = ("import subprocess\nenv = dict(ALLOC_RESERVATION='r')\nfor x in [0, 1]:\n    try:\n        env = {}\n"
+                "        if x:\n            break\n        env = dict(ALLOC_RESERVATION='r')\n    finally:\n        pass\n"
+                "subprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_TRY_BREAK_FIN_RESTORES = ("import subprocess\nenv = dict(ALLOC_RESERVATION='r')\nfor x in [0, 1]:\n    env = {}\n"
+                             "    try:\n        if x:\n            break\n    finally:\n"
+                             "        env = dict(ALLOC_RESERVATION='r')\n"
+                             "subprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_WHILE_ELSE_BREAK = ("import subprocess\nenv = dict(ALLOC_RESERVATION='r')\nwhile True:\n    env = {}\n"
+                       "    break\nelse:\n    env = dict(ALLOC_RESERVATION='r')\n"
+                       "subprocess.run(['docker', 'run', 'img'], env=env)\n")
+# t_9a579e40 (Prism 53bb2362809d / 96faa3a02853): a context manager's __exit__ may suppress an exception raised in
+# the body, so the code after the `with` continues from that raise point's state
+RP_WITH_SUPPRESS = ("import contextlib, subprocess\nenv = dict(ALLOC_RESERVATION='r')\n"
+                    "with contextlib.suppress(ValueError):\n    env = {}\n    int('x')\n"
+                    "    env = dict(ALLOC_RESERVATION='r')\nsubprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_WITH_KEEPS = ("import contextlib, subprocess\nenv = dict(ALLOC_RESERVATION='r')\n"
+                 "with contextlib.suppress(ValueError):\n    int('x')\nsubprocess.run(['docker', 'run', 'img'], env=env)\n")
+RP_WITH_IN_LOOP_BREAK = ("import contextlib, subprocess\nenv = dict(ALLOC_RESERVATION='r')\nfor x in [0, 1]:\n"
+                         "    with contextlib.suppress(ValueError):\n        env = {}\n        if x:\n            break\n"
+                         "        env = dict(ALLOC_RESERVATION='r')\nsubprocess.run(['docker', 'run', 'img'], env=env)\n")
+SH_CONT_TWO_SSH = '#!/usr/bin/env bash\nbash -c "ssh ci-box one; \\\nssh ci-box two"\n'
+SH_CONT_SSH_DOCKER = "#!/usr/bin/env bash\nbash -c 'ssh ci-box job; \\\ndocker run image'\n"
+
 DIFF_FP_FIXED = frozenset((RP_SHADOWED_ALIAS, RP_EXPORT_RHS_LOCAL, RP_EXPORT_RHS_LOCAL_NONLOCAL))
 
 
 def selftest() -> int:
+    """Every fixture tree lives under ONE scratch dir that is removed on every exit path (t_fcb77485: the hourly
+    selftest left ~200 spawn-site-* dirs per run in $TMPDIR; nothing reads them after the run)."""
+    scratch = Path(tempfile.mkdtemp(prefix="spawn-site-"))
+    try:
+        return _selftest(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _selftest(scratch: Path) -> int:
     today = dt.date(2026, 10, 15)
 
     def tree(files: dict[str, str], rows: list | None) -> Path:
-        d = Path(tempfile.mkdtemp(prefix="spawn-site-"))
+        d = Path(tempfile.mkdtemp(prefix="spawn-site-", dir=scratch))
         for n, b in files.items():
             (d / n).parent.mkdir(parents=True, exist_ok=True)
             (d / n).write_text(b)
@@ -2099,8 +2950,74 @@ def selftest() -> int:
          "(5434b042f044)", {"r.py": RP_GLOBAL_EXPORT_NESTED}, [], 1),
         ("#6549: an exporter's `global lr` resolves to the module subprocess.run, not outer()'s local print -> RED "
          "(4433291449e8)", {"r.py": RP_GLOBAL_EXPORT_SHADOWED}, [], 1),
+        ("t_14707ed4: an intermediate chain function's `global lr` resolves to the module subprocess.run for "
+         "install() -> RED (c6cf4728910b)", {"r.py": RP_GLOBAL_CHAIN_MIDDLE}, [], 1),
+        ("t_14707ed4: an intermediate chain function's default captures outer()'s subprocess.run before its "
+         "`global lr` applies -> RED (ca74728a46c7)", {"r.py": RP_GLOBAL_CHAIN_DEFAULT}, [], 1),
         ("t_f7b70a42: a local runner alias chain still resolves -> RED", {"r.py": RP_LOCAL_ALIAS_CHAIN}, [], 1),
+        ("Prism d26f43b13610: env.pop(key) with a non-literal key drops the reservation -> RED",
+         {"r.py": RP_DYN_POP}, [], 1),
+        ("Prism d26f43b13610: `del alias[key]` drops it from the aliased mapping too -> RED",
+         {"r.py": RP_DYN_DEL}, [], 1),
+        ("Prism 881328c96622: a module-level AnnAssign annotation runs -> RED", {"r.py": RP_ANN_MODULE}, [], 1),
+        ("Prism 881328c96622: under `from __future__ import annotations` it does not -> GREEN",
+         {"r.py": RP_ANN_FUTURE}, [], 0),
+        ("Prism 881328c96622: a function-local annotation is never evaluated -> GREEN", {"r.py": RP_ANN_LOCAL}, [], 0),
+        ("Prism b17d92ac9166: an annotation spawn sees the new (unreserved) binding -> RED",
+         {"r.py": RP_ANN_AFTER_BIND}, [], 1),
+        ("Prism b17d92ac9166: control: the new binding is reserved -> GREEN", {"r.py": RP_ANN_AFTER_BIND_CTRL}, [], 0),
+        ("Prism 671505a2351e: a deferred module annotation's env.update is not credited -> RED",
+         {"r.py": RP_ANN_DEFERRED_MOD}, [], 1),
+        ("Prism 671505a2351e: the class-body form is not credited either -> RED",
+         {"r.py": RP_ANN_DEFERRED_CLS}, [], 1),
+        ("Prism a84ed594c82f: try and its handler both set the reservation (no finally) -> GREEN",
+         {"r.py": RP_TRY_BOTH}, [], 0),
+        ("Prism a84ed594c82f: control: the handler drops it -> RED", {"r.py": RP_TRY_HANDLER_DROPS}, [], 1),
+        ("Prism ce7aa4b8a383: `finally: break` lets the raise-point state reach the spawn -> RED",
+         {"r.py": RP_FINALLY_BREAK}, [], 1),
+        ("Prism ce7aa4b8a383: `finally: continue` does too -> RED", {"r.py": RP_FINALLY_CONTINUE}, [], 1),
+        ("Prism ce7aa4b8a383: control: a break inside a loop nested in finally re-raises -> GREEN",
+         {"r.py": RP_FINALLY_INNER_BREAK}, [], 0),
+        ("Prism b17d92ac9166: 18 nested finally bodies lint in linear time, popped state still RED",
+         {"r.py": RP_DEEP_FINALLY}, [], 1),
+        ("Prism 7b5740dbeae1: two ssh on two continued lines vs count 1 -> RED", {"c.sh": SH_CONT_TWO_SSH},
+         [row("c.sh", "<top>", "ssh")], 1),
+        ("Prism 7b5740dbeae1: the same at count 2 -> GREEN", {"c.sh": SH_CONT_TWO_SSH},
+         [row("c.sh", "<top>", "ssh", 2)], 0),
+        ("Prism 08043514ed16: ssh line + docker-run line, only docker-run allowlisted -> RED",
+         {"c.sh": SH_CONT_SSH_DOCKER}, [row("c.sh", "<top>", "docker-run")], 1),
+        ("Prism 08043514ed16: both kinds allowlisted -> GREEN", {"c.sh": SH_CONT_SSH_DOCKER},
+         [row("c.sh", "<top>", "docker-run"), row("c.sh", "<top>", "ssh")], 0),
         ("comments, echo, github.com ssh, ssh-keygen are not spawns", {"n.sh": NOT_SPAWNS, "n.py": PY_NOT}, [], 0),
+        ("t_dbe07131: a G inside an -o operand is not -G -> RED", {"g.sh": SSH_G_OPERAND}, [], 1),
+        ("a95bfcad2fce: ssh host ls -G (remote flag) -> RED", {"g.sh": SSH_REMOTE_FLAG_SH}, [], 1),
+        ("a95bfcad2fce: ssh -t host sort -V (remote flag) -> RED", {"g.sh": SSH_REMOTE_FLAG_SH2}, [], 1),
+        ("a95bfcad2fce: [ssh, host, sort, -V] (remote flag) -> RED", {"g.py": SSH_REMOTE_FLAG_PY}, [], 1),
+        ("a95bfcad2fce: ssh -lG host (G is -l's operand) -> RED", {"g.sh": SSH_BUNDLED_OPERAND}, [], 1),
+        ("a95bfcad2fce: [ssh, -lG, host] (G is -l's operand) -> RED", {"g.py": SSH_BUNDLED_OPERAND_PY}, [], 1),
+        ("a95bfcad2fce: ssh -o X -G host is no-connect -> GREEN", {"g.sh": SSH_OPT_THEN_G, "g.py": SSH_OPT_THEN_G_PY},
+         [], 0),
+        ("aad0e01e377b: ssh -i $KEY -G host (expandable operand) -> RED", {"g.sh": SSH_EXPANDED_OPERAND}, [], 1),
+        *((f"8092b537bd59: `{c}` (expanded flag) -> RED", {"g.sh": f"#!/usr/bin/env bash\n{c}\n"}, [], 1)
+          for c in SSH_EXPANDED_FLAGS),
+        ("659d6121556c: ssh -i \"/tmp/key -G\" host (quoted operand) -> RED", {"g.sh": SSH_QUOTED_OPERAND}, [], 1),
+        ("33d81aeb3e7c: ssh -PG host (G is -P's tag) -> RED", {"g.sh": SSH_TAG_OPERAND}, [], 1),
+        ("33d81aeb3e7c: [ssh, -P, -G, host] (-G is -P's tag) -> RED", {"g.py": SSH_TAG_OPERAND_PY}, [], 1),
+        ("t_9a579e40: control: ssh -o \"X=Y\" -G host is no-connect -> GREEN", {"g.sh": SSH_QUOTED_OPT_THEN_G}, [], 0),
+        ("t_9a579e40: control: ssh -G \"$HOST\" (literal -G, expanded host) is no-connect -> GREEN",
+         {"g.sh": SSH_G_EXPANDED_HOST}, [], 0),
+        ("df2c474d178a: a break leaves the loop with the reservation dropped -> RED", {"r.py": RP_LOOP_BREAK}, [], 1),
+        ("df2c474d178a: a continue's state reaches the loop exit -> RED", {"r.py": RP_LOOP_CONTINUE}, [], 1),
+        ("df2c474d178a: control: no early exit -> GREEN", {"r.py": RP_LOOP_NO_EXIT}, [], 0),
+        ("df2c474d178a: a break in try (plain finally) leaves with the reservation dropped -> RED",
+         {"r.py": RP_TRY_BREAK}, [], 1),
+        ("df2c474d178a: control: the finally a break runs through restores it -> GREEN",
+         {"r.py": RP_TRY_BREAK_FIN_RESTORES}, [], 0),
+        ("df2c474d178a: a break skips while/else -> RED", {"r.py": RP_WHILE_ELSE_BREAK}, [], 1),
+        ("53bb2362809d: a suppressed exception in a with body reaches the code after it -> RED",
+         {"r.py": RP_WITH_SUPPRESS}, [], 1),
+        ("53bb2362809d: control: the with body never drops it -> GREEN", {"r.py": RP_WITH_KEEPS}, [], 0),
+        ("df2c474d178a: a break inside a with inside a loop -> RED", {"r.py": RP_WITH_IN_LOOP_BREAK}, [], 1),
         ("allowlisted (unexpired) site is GREEN", {"pool.sh": UNGATED_DOCKER}, [row("pool.sh", "start", "docker-run")], 0),
         ("allowlist row past expires is RED", {"pool.sh": UNGATED_DOCKER},
          [row("pool.sh", "start", "docker-run", exp="2026-10-14")], 1),
@@ -2108,6 +3025,49 @@ def selftest() -> int:
          {"pool.sh": UNGATED_DOCKER.replace("}\n", "  ssh ci-box 'docker run -d img2'\n}\n")},
          [row("pool.sh", "start", "docker-run")], 1),
         ("stale row (site now gated) is RED", {"pool.sh": GATED_DOCKER}, [row("pool.sh", "start", "docker-run")], 1),
+        ("t_9a970a74: marked operator one-shot ssh (sh) is GREEN", {"o.sh": ONESHOT_SH}, [], 0),
+        ("t_9a970a74: marked operator one-shot ssh (py) is GREEN", {"o.py": ONESHOT_PY}, [], 0),
+        ("t_9a970a74: an unmarked new ssh next to a marked file is still RED",
+         {"o.sh": ONESHOT_SH, "go.py": UNGATED_PY_SSH}, [], 1),
+        ("t_9a970a74: the marker exempts ssh only; a docker run in a marked file is RED",
+         {"o.sh": ONESHOT_SH + "docker run img\n"}, [], 1),
+        ("t_9a970a74: a marker with no reason is RED",
+         {"o.sh": ONESHOT_SH.replace(ONESHOT_WHY, "x")}, [], 1),
+        ("t_9a970a74: a marker on a scheduled script is RED",
+         {"o.sh": ONESHOT_SH.replace("#!/bin/bash\n", "#!/bin/bash\n# SCHEDULE: every 10m\n")}, [], 1),
+        ("t_9a970a74: SCHEDULE: manual keeps the marker GREEN",
+         {"o.sh": ONESHOT_SH.replace("#!/bin/bash\n", "#!/bin/bash\n# SCHEDULE: manual (operator)\n")}, [], 0),
+        ("t_9a970a74: a marker past line 20 is not honored -> RED",
+         {"o.sh": "#!/bin/bash\n" + "true\n" * 20 + ONESHOT_SH.split("\n", 1)[1]}, [], 1),
+        ("t_9a970a74: a stale marker (no ssh left) is RED",
+         {"o.sh": f"#!/bin/bash\n# spawn-site-oneshot: {ONESHOT_WHY}\necho hi\n"}, [], 1),
+        ("t_9a970a74: a marked file's ssh that is also allowlisted leaves a stale row -> RED",
+         {"o.sh": ONESHOT_SH}, [row("o.sh", "<top>", "ssh")], 1),
+        ("t_9a970a74: a marker inside a string (not a whole-line comment) is not honored -> RED",
+         {"o.py": ONESHOT_PY.replace(f"# spawn-site-oneshot: {ONESHOT_WHY}\n",
+                                     f"X = '# spawn-site-oneshot: {ONESHOT_WHY}'\n")}, [], 1),
+        ("t_9a970a74 (Prism f2e898533a6d): a marker inside a multiline string literal is not honored -> RED",
+         {"o.py": f'DOC = """\n# spawn-site-oneshot: {ONESHOT_WHY}\n"""\nimport subprocess\n'
+                  "subprocess.run(['ssh', '-o', 'BatchMode=yes', 'ci-box', 'make test'])\n"}, [], 1),
+        ("t_9a970a74: a marker inside the module docstring is not honored -> RED",
+         {"o.py": ONESHOT_PY.replace(f"# spawn-site-oneshot: {ONESHOT_WHY}\n",
+                                     f'"""Tool.\n# spawn-site-oneshot: {ONESHOT_WHY}\n"""\n')}, [], 1),
+        ("t_9a970a74: a marker comment after the module docstring is GREEN",
+         {"o.py": ONESHOT_PY.replace("#!/usr/bin/env python3\n", '#!/usr/bin/env python3\n"""Tool."""\n')}, [], 0),
+        ("t_9a970a74: a marker comment after the first statement (py) is not honored -> RED",
+         {"o.py": ONESHOT_PY.replace(f"# spawn-site-oneshot: {ONESHOT_WHY}\nimport subprocess\n",
+                                     f"import subprocess\n# spawn-site-oneshot: {ONESHOT_WHY}\n")}, [], 1),
+        ("t_9a970a74: a marker inside a heredoc is not honored -> RED",
+         {"o.sh": f"#!/bin/bash\ncat <<'EOF'\n# spawn-site-oneshot: {ONESHOT_WHY}\nEOF\n"
+                  "ssh -o BatchMode=yes root@192.168.1.5 'ha info'\n"}, [], 1),
+        ("t_9a970a74: a marker inside a quoted multi-line shell string is not honored -> RED",
+         {"o.sh": f"#!/bin/bash\nX='\n# spawn-site-oneshot: {ONESHOT_WHY}\n'\n"
+                  "ssh -o BatchMode=yes root@192.168.1.5 'ha info'\n"}, [], 1),
+        ("t_9a970a74: a marker on an indented line after code is not honored -> RED",
+         {"o.sh": f"#!/bin/bash\nif true; then\n  # spawn-site-oneshot: {ONESHOT_WHY}\n"
+                  "  ssh -o BatchMode=yes root@192.168.1.5 'ha info'\nfi\n"}, [], 1),
+        ("t_9a970a74: a marker under a blank line and other header comments (sh) is GREEN",
+         {"o.sh": ONESHOT_SH.replace("#!/bin/bash\n", "#!/bin/bash\n\n# tool: does a thing\n")}, [], 0),
     ]
     bad = 0
     for name, files, rows, want in cases:
@@ -2120,6 +3080,15 @@ def selftest() -> int:
         ok = got == want
         bad += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name} (rc {got}, want {want})" + ("" if ok else f": {got_f}"))
+    # Prism 64813682c743: a duplicate row in a custom --allowlist is attributed to THAT file, not the default
+    d = tree({"go.py": UNGATED_PY_SSH}, None)
+    (d / "ci").mkdir(exist_ok=True)
+    (d / "ci" / "custom-allow.json").write_text(json.dumps({"sites": [row("go.py", "go", "ssh"), row("go.py", "go", "ssh")]}))
+    got_f = lint(d, d / "ci" / "custom-allow.json", today)
+    ok = any(f.startswith("ci/custom-allow.json: duplicate row") for f in got_f) and \
+        not any(f.startswith(ALLOWLIST + ": duplicate row") for f in got_f)
+    print(f"{'ok  ' if ok else 'FAIL'} Prism 64813682c743: duplicate row names the selected allowlist: {got_f[:2]}")
+    bad += not ok
     # --seed-allowlist from an empty tree refuses and leaves the existing inventory untouched
     d = tree({}, [row("pool.sh", "start", "docker-run")])
     before = (d / ALLOWLIST).read_text()
@@ -2197,6 +3166,15 @@ def selftest() -> int:
     ok = got == ["ssh", "systemd-run"]
     print(f"{'ok  ' if ok else 'FAIL'} Prism 6772d0283d54: _heads cap keeps the program-name view's kind: {got}")
     bad += not ok
+    # Prism c348201f0295: 32 docker-run heads all rank "classified" and filled the cap ahead of the one ssh head,
+    # dropping the ssh KIND; one view per kind is reserved before the cap fills. Control: 31 (under the cap)
+    for n in (32, 31):
+        hst = _St()
+        hst.argv["cmd"] = [("ssh", "h", "j")] + [("docker", "run", f"img{i}") for i in range(n)]  # type: ignore
+        got = sorted({k for h in _heads(ast.parse("cmd", mode="eval").body, hst) for k in [_classify_argv(list(h))] if k})
+        ok = got == ["docker-run", "ssh"]
+        print(f"{'ok  ' if ok else 'FAIL'} Prism c348201f0295: _heads cap keeps every kind ({n} docker-run + ssh): {got}")
+        bad += not ok
     # unreadable allowlist is blind (rc 2), never clean
     d = tree({"pool.sh": GATED_DOCKER}, None)
     (d / "fleet").mkdir()
@@ -2204,10 +3182,11 @@ def selftest() -> int:
     rc = main(["--root", str(d), "--today", "2026-10-15"])
     print(f"{'ok  ' if rc == 2 else 'FAIL'} unreadable allowlist is blind (rc {rc}, want 2)")
     bad += rc != 2
+    bad += _selftest_check_allowlist(row, scratch)
     # differential arm: discovery is a superset of the base lint's over the real tree AND over a corpus of every
     # selftest fixture file (SPAWN_LINT_BASE, default origin/main): a shape class absent from the tree is still
     # measured (#4330 r7 c649f6e76616). Skipped, and said so, when there is no base ref or the lint is unchanged.
-    corpus = Path(tempfile.mkdtemp(prefix="spawn-site-corpus-"))
+    corpus = Path(tempfile.mkdtemp(prefix="spawn-site-corpus-", dir=scratch))
     for i, (_, files, _, _) in enumerate(cases):
         for n, b in files.items():
             if b in DIFF_FP_FIXED:
@@ -2220,8 +3199,74 @@ def selftest() -> int:
     print(f"{'ok  ' if ok else 'FAIL'} differential vs {ref}: {status}, {len(missing)} base-lint sites missing"
           + ("" if ok else f": {missing[:10]}"))
     bad += not ok
-    print(f"selftest: {len(cases) + 7 - bad}/{len(cases) + 7} pass")
+    print(f"selftest: {len(cases) + 9 + CHECK_ALLOWLIST_CASES - bad}/{len(cases) + 9 + CHECK_ALLOWLIST_CASES} pass")
     return 1 if bad else 0
+
+
+CHECK_ALLOWLIST_CASES = 5
+
+
+def _selftest_check_allowlist(row, scratch: Path | None = None) -> int:
+    """t_262713ff replay of #7443/#7445 (2026-10-28 04:30-04:38): two PRs off the same base each add the row for
+    scripts/live-tree-git-maint.sh::<top>::ssh; the first merges; the second, graded against its own base, was green
+    and main went red on the duplicate. --check-allowlist grades it against the main tip too."""
+    d = Path(tempfile.mkdtemp(prefix="spawn-allowlist-dup-", dir=scratch))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}   # git-env-scrub: a fixture repo only
+    env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True, env=env, check=True).stdout
+
+    def commit(rows, msg):
+        (d / "fleet").mkdir(exist_ok=True)
+        (d / ALLOWLIST).write_text(json.dumps({"sites": rows}, indent=1) + "\n")
+        git("add", ALLOWLIST)
+        git("commit", "-q", "--only", "-m", msg, "--", ALLOWLIST)   # scoped: gate 89 (shared-index-committer)
+        return git("rev-parse", "HEAD").strip()
+
+    old = row("scripts/old.sh", "<top>", "ssh")
+    dup = row("scripts/live-tree-git-maint.sh", "<top>", "ssh")
+    git("init", "-q")
+    base = commit([old], "base")
+    pr_a = commit([old, dup], "#7443 adds the row")          # merged first: main tip
+    git("checkout", "-q", "-b", "b", base)
+    pr_b = commit([old, dup], "#7445 adds the same row")     # the duplicate fix, green against its own base
+    bad = 0
+
+    def case(name, want, base_ref, main_ref, rows=None):
+        nonlocal bad
+        if rows is not None:
+            (d / ALLOWLIST).write_text(json.dumps({"sites": rows}))
+        got_f = check_allowlist(d, d / ALLOWLIST, base_ref, main_ref)
+        got = 1 if got_f else 0
+        ok = got == want
+        bad += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} t_262713ff: {name} (rc {got}, want {want})" + ("" if ok else f": {got_f}"))
+
+    case("second PR adding a row main already has is RED", 1, base, pr_a)
+    case("the same PR before the first merged (main = base) is GREEN", 0, base, base)
+    git("checkout", "-q", pr_a)
+    case("the PR that merged first, graded at main, is GREEN (its row is main's own)", 0, base, pr_a)
+    case("a key twice in this tree's file is RED", 1, pr_a, pr_a, rows=[old, dup, dup])
+    git("checkout", "-q", "--", ALLOWLIST)
+    try:
+        check_allowlist(d, d / ALLOWLIST, base, "0" * 40)
+        ok = False
+    except ValueError:
+        ok = True
+    bad += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} t_262713ff: an unreadable --main ref is blind, never clean")
+    del pr_b
+    shutil.rmtree(d, ignore_errors=True)
+    return bad
+
+
+def _allowlist_rows_by_path(text: str) -> dict:
+    """{path: its allowlist rows, canonical} for lint_scope.own_registry_rows (t_109bdf21)."""
+    by = defaultdict(list)
+    for r in (json.loads(text).get("sites") or []) if text.strip() else []:
+        by[r.get("path", "")].append(json.dumps(r, sort_keys=True))
+    return {p: sorted(v) for p, v in by.items()}
 
 
 def main(argv=None) -> int:
@@ -2232,17 +3277,34 @@ def main(argv=None) -> int:
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--seed-allowlist", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--check-allowlist", action="store_true")
+    ap.add_argument("--base")
+    ap.add_argument("--main")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
     root = a.root.resolve()
     allow = a.allowlist or root / ALLOWLIST
+    if a.check_allowlist:
+        if not (a.base and a.main):
+            ap.error("--check-allowlist needs --base <PR base ref> and --main <main tip ref>")
+        try:
+            findings = check_allowlist(root, allow, a.base, a.main)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+            print(f"lint-spawn-site: --check-allowlist blind: {e}", file=sys.stderr)
+            return 2
+        for f in findings:
+            print(f)
+        return 1 if findings else 0
     if a.seed_allowlist:
         return seed(root, allow)
     if a.list:
-        read, sites = collect_sites(root)
+        markers: dict = {}
+        read, sites = collect_sites(root, markers=markers)
+        oneshot, _ = _oneshot_ok(markers)
         for p, s, k, ln, g in sites:
-            print(f"{'gated  ' if g else 'UNGATED'} {k:15} {p}:{ln} {s}")
+            v = "gated  " if g else ("oneshot" if k == "ssh" and p in oneshot else "UNGATED")
+            print(f"{v} {k:15} {p}:{ln} {s}")
         print(f"# {read} files read, {len(sites)} spawn sites, {sum(not x[4] for x in sites)} ungated")
         return 0
     today = dt.date.fromisoformat(a.today) if a.today else dt.date.today()
@@ -2254,6 +3316,45 @@ def main(argv=None) -> int:
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
         print(f"lint-spawn-site: blind: {e}", file=sys.stderr)
         return 2
+    # t_109bdf21: on a pull_request run only findings in the PR's own files fail; main's print as INFO.
+    # An allowlist edit owns the paths whose rows it changed (a dropped row cannot hide the site it exposes).
+    # The base scan and the row ownership read the SAME policy file the head scan used (the selected --allowlist,
+    # repo-relative); one outside the repo or absent at base grades the whole tree (Prism 048d29f5be75).
+    import lint_scope
+    sc = lint_scope.from_env(root, "spawn-site-lint", inputs=["scripts/lint-spawn-site.py", SINGLETONS])
+    # The SELECTED path, not its symlink target (Prism efcb3903ef49): a PR that repoints a symlinked allowlist
+    # changes that path, and the base scan must read the base revision's link (and so its old target).
+    allow_rel = ""
+    for anchor in (root, Path(os.path.abspath(a.root))):
+        try:
+            allow_rel = Path(os.path.normpath(os.path.abspath(allow))).relative_to(anchor).as_posix()
+            break
+        except ValueError:
+            continue
+    if not allow_rel:
+        try:
+            allow_rel = (allow.parent.resolve() / allow.name).relative_to(root).as_posix()
+        except (ValueError, OSError):
+            allow_rel = ""
+    if sc.pr and not allow_rel:
+        sc.force_full(f"--allowlist {allow} is outside the repo: base cannot supply it; full tree (fail closed)")
+    elif sc.pr and not lint_scope.inside(root, allow):
+        # a link (or linked dir) that leaves the repo: base would read the SAME outside file the head read, so the
+        # base scan would run under head policy (Prism a573b8bf9a89)
+        sc.force_full(f"--allowlist {allow_rel} resolves outside the repo; full tree (fail closed)")
+    elif sc.pr and not sc._at_base(allow_rel):
+        sc.force_full(f"--allowlist {allow_rel} is not readable at base {sc.base[:12]}; full tree (fail closed)")
+    sc.own_registry_rows(allow_rel, _allowlist_rows_by_path)
+
+    def _base_args(br):
+        base_allow = Path(br) / allow_rel
+        if not lint_scope.inside(br, base_allow):   # base's link escapes its worktree (absolute / ../ target)
+            raise RuntimeError(f"--allowlist {allow_rel} at base resolves outside the base tree")
+        return ["--root", br, "--allowlist", base_allow, "--today", today.isoformat()]
+    # RULE B: base's own lint-spawn-site.py on the base tree
+    # RULE P2: owner = the text up to the FIRST ':' (every finding shape here is `<path>:...`)
+    findings = sc.split(findings, base_args=_base_args, base_parse=lambda out: [ln for ln in out.splitlines() if ln],
+                        owner_delim=":")
     for f in findings:
         print(f)
     return 1 if findings else 0

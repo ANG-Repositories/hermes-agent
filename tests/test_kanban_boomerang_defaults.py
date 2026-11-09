@@ -1,6 +1,7 @@
 """Default subscriptions and quiet, single-line boomerang handbacks."""
 import asyncio
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,13 @@ import pytest
 from gateway import kanban_boomerang_wake as bw
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_notify as kbn
+
+
+@pytest.fixture(autouse=True)
+def owner_scope(monkeypatch):
+    from gateway import kanban_owner_wake as ow
+    home = SimpleNamespace(origin=SimpleNamespace(chat_id="42", platform="discord"))
+    monkeypatch.setattr(ow, "resolve_owner", lambda *a: home)
 
 
 @pytest.mark.parametrize("configured,explicit,worker,expected", [
@@ -55,7 +63,8 @@ def _runner(outcomes, sent):
         if o:
             sent.append(text)
         return SendResult(success=bool(o), error=None if o else "injected")
-    return SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send))
+    return SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send),
+                           _async_profile_scope_for_source=lambda source: nullcontext())
 
 
 @pytest.mark.parametrize("stale", [False, True])

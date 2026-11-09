@@ -98,17 +98,38 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return default
 
 
-def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
-    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
+def _git_out(
+    cwd: Path, *args: str, timeout: int = 30, workspace_probe: bool = False,
+) -> Optional[str]:
+    """Return git stdout, preserving executable failures on workspace probes.
+
+    A failed executable is not evidence that the workspace is not a repository.
+    Other callers retain the historical best-effort (None on failure) behavior.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, check=False,
+            timeout=timeout, check=False, stdin=subprocess.DEVNULL,
         )
+    except OSError as exc:
+        if workspace_probe and exc.filename == "git":
+            raise RuntimeError(f"git executable unavailable: {exc}") from exc
+        return None
     except Exception:
         return None
     if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        executable_failure = result.returncode in (126, 127) or (
+            "no such file or directory" in stderr.lower()
+            and ("exec" in stderr.lower() or re.search(
+                r"/[^\s:]*[/]git(?:-[\w.-]+)?(?=['\"\s:]|$)", stderr,
+            ))
+        )
+        if workspace_probe and executable_failure:
+            raise RuntimeError(
+                f"git executable unavailable (exit {result.returncode}): {stderr}"
+            )
         return None
     return (result.stdout or "").strip() or None
 
@@ -2559,6 +2580,7 @@ class Task:
     # Boomerang wake level (Ace 2026-10-22): True/False = the card's subscription level is
     # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
     boomerang_wake: Optional[bool] = None
+    asap: bool = False  # Explicit operator edit only; never inherited at creation.
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2578,6 +2600,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            asap=bool(g("asap")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
             pin_sub_reason=g("pin_sub_reason") or None,
@@ -5573,7 +5596,6 @@ def _origin_line(body: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 NEEDS_INPUT_PAGE_MIN_PRIORITY = 100
-NEEDS_INPUT_PAGE_ALERTS_PRIORITY = 200
 _NEEDS_INPUT_PAGE_OFF = "needs_input_page_off"
 _NEEDS_INPUT_PAGE_ON = "needs_input_page_on"
 # ``origin: discord <name> (<numeric channel id>) · session ...`` (see
@@ -5738,15 +5760,16 @@ def needs_input_page_candidates(
     comment newer than its latest block (answered, waiting on an unblock; see
     ``_ruled_since_block``), and has ``priority >= min_priority``
     OR an ``origin:`` line naming a numeric Discord channel. Each item carries
-    ``channel`` (origin channel id or None) and ``alerts`` (priority >= 200).
+    ``channel`` (origin channel id or None), ``session_id`` (the card's home
+    session, which the pager resolves to a chat when ``channel`` is None).
     """
     rows = list(conn.execute(
-        "SELECT id, title, body, priority, status, block_kind FROM tasks "
+        "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks "
         "WHERE status IN ('blocked', 'triage') AND block_kind = 'needs_input' ORDER BY id"
     ))
     if include_dependency:
         rows += list(conn.execute(
-            "SELECT id, title, body, priority, status, block_kind FROM tasks t "
+            "SELECT id, title, body, priority, status, block_kind, session_id FROM tasks t "
             "WHERE status IN ('todo', 'blocked') AND block_kind = 'dependency' "
             "AND EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
             "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) IN (?, ?) "
@@ -5790,7 +5813,7 @@ def needs_input_page_candidates(
             "kind": row["block_kind"],
             "reason": reason or "(no reason given)",
             "channel": channel,
-            "alerts": priority >= NEEDS_INPUT_PAGE_ALERTS_PRIORITY,
+            "session_id": row["session_id"],
         })
     return out
 
@@ -5833,7 +5856,8 @@ class NearDuplicateError(ValueError):
 # per rolling 24 h; the (N+1)th raises :class:`MintCapError`. ``force_reason`` (CLI ``--force``) overrides
 # it and is ledgered as a ``mint_cap_forced`` event on the new card. Kill switch:
 # ``HERMES_KANBAN_MINT_CAP=0`` (env; ``HERMES_KANBAN_MINT_CAP=<n>`` resizes). Idempotent re-mints that
-# return an existing card never count: the check runs after the idempotency lookup.
+# return an existing card never count: the check runs after the idempotency lookup. Every refusal, force and
+# kill-switch bypass is ledgered in ``<db>.mint-cap.jsonl`` (:func:`mint_cap_ledger_path`, t_f956f87f).
 MINT_CAP_PER_DAY = 24
 MINT_CAP_WINDOW_S = 24 * 3600
 MINT_CAP_HUMAN_PREFIXES = ("human:",)
@@ -5871,6 +5895,53 @@ def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int]
         (created_by, now - MINT_CAP_WINDOW_S),
     ).fetchone()
     return int(row[0] if row else 0)
+
+
+def mint_cap_ledger_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """``<board db>.mint-cap.jsonl`` beside the connection's own db file; None for an in-memory/unnamed db.
+
+    t_f956f87f: one append-only row per cap outcome a ``task_events`` row cannot carry (a refusal has no card)
+    or would scatter: ``refused``, ``forced``, ``bypassed`` (minted past the default cap under the kill switch).
+    The one-week readout counts these instead of recomputing from ``created_at``."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    file = row[2] if row else ""
+    return Path(file + ".mint-cap.jsonl") if file else None
+
+
+def _ledger_mint_cap(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Append one ledger row. Best effort: a write failure never changes the create outcome."""
+    try:
+        p = mint_cap_ledger_path(conn)
+        if p is None:
+            return
+        rec = dict(fields, outcome=outcome, at=int(time.time()))
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:  # noqa: BLE001 - the ledger is evidence, never a gate
+        _log.debug("mint-cap ledger write failed", exc_info=True)
+
+
+def _ledger_on_commit(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Queue a ledger row for the outer COMMIT of the enclosing write_txn (kanban_db_connect.on_commit)."""
+    from hermes_cli.kanban_db_connect import on_commit
+    on_commit(conn, lambda: _ledger_mint_cap(conn, outcome, **fields))
+
+
+def mint_cap_bypass(conn: sqlite3.Connection, created_by: Optional[str]) -> Optional[dict]:
+    """The kill switch is set and an automated ``created_by`` is at/over the DEFAULT cap: the mint that follows
+    would have been refused. -> {created_by, count, cap, env}, else None. Ledgered as ``bypassed`` and a
+    ``mint_cap_bypassed`` event so a kill-switch storm is visible on the board (11-06: 15 cards, no trace)."""
+    if mint_cap() > 0 or not mint_cap_applies(created_by):
+        return None
+    by = (created_by or "").strip()
+    n = mint_count_24h(conn, by)
+    if n < MINT_CAP_PER_DAY:
+        return None
+    return {"created_by": by, "count": n, "cap": MINT_CAP_PER_DAY,
+            "env": "HERMES_KANBAN_MINT_CAP=%s" % os.environ.get("HERMES_KANBAN_MINT_CAP", "").strip()}
 
 
 def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
@@ -6194,6 +6265,21 @@ def _workspace_of_copy(conn: sqlite3.Connection, of: str, kind: Optional[str],
                              f"{bound}, where its directory is; remove the host: line "
                              "(the card co-locates with it) or drop --workspace-of")
     return of_kind, of_path
+
+
+def _insert_task_row(conn, fields):
+    """SQL-only insertion shared by legacy create and prevalidated authority create.
+
+    Caller owns the transaction and validation. No hooks or network here.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError('task insert requires write transaction')
+    columns = tuple(fields)
+    allowed = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+    if not columns or not set(columns) <= allowed:
+        raise ValueError('unknown task column')
+    conn.execute('INSERT INTO tasks (' + ','.join(columns) + ') VALUES (' +
+                 ','.join('?' for _ in columns) + ')', tuple(fields.values()))
 
 
 def create_task(
@@ -6568,9 +6654,12 @@ def create_task(
         check_mint_cap(conn, created_by)
     except MintCapError as exc:
         if not force_reason:
+            _ledger_mint_cap(conn, "refused", created_by=exc.created_by, count=exc.count, cap=exc.cap,
+                             idempotency_key=idempotency_key)
             raise
         mint_cap_forced = {"created_by": exc.created_by, "count": exc.count, "cap": exc.cap,
                            "reason": force_reason}
+    mint_cap_bypassed = mint_cap_bypass(conn, created_by)
 
     now = int(time.time())
 
@@ -6800,52 +6889,38 @@ def create_task(
                         "(tool: i_mean_blocks) if the parent closing really is the gate.",
                         time_gate_hit or "",
                     )
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        reasoning_effort, pin_sub_reason, pin_sub_fallback,
-                        goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, boomerang_wake, signature
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        title.strip(),
-                        body,
-                        assignee,
-                        task_status,
-                        priority,
-                        created_by,
-                        now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
-                        project_id,
-                        tenant,
-                        idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        int(max_retries) if max_retries is not None else None,
-                        model_override,
-                        provider_override,
-                        reasoning_effort,
-                        pin_sub_reason,
-                        1 if (pin_sub_reason and pin_sub_fallback) else 0,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
-                        session_id,
-                        completion_contract,
-                        brain,
-                        workspace_of,
-                        1 if boomerang_wake else 0,
-                        signature,
-                    ),
-                )
+                _insert_task_row(conn, {
+                    'id': task_id,
+                    'title': title.strip(),
+                    'body': body,
+                    'assignee': assignee,
+                    'status': task_status,
+                    'priority': priority,
+                    'created_by': created_by,
+                    'created_at': now,
+                    'workspace_kind': workspace_kind,
+                    'workspace_path': workspace_path,
+                    'branch_name': branch_name,
+                    'project_id': project_id,
+                    'tenant': tenant,
+                    'idempotency_key': idempotency_key,
+                    'max_runtime_seconds': int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                    'skills': json.dumps(skills_list) if skills_list is not None else None,
+                    'max_retries': int(max_retries) if max_retries is not None else None,
+                    'model_override': model_override,
+                    'provider_override': provider_override,
+                    'reasoning_effort': reasoning_effort,
+                    'pin_sub_reason': pin_sub_reason,
+                    'pin_sub_fallback': 1 if (pin_sub_reason and pin_sub_fallback) else 0,
+                    'goal_mode': 1 if goal_mode else 0,
+                    'goal_max_turns': int(goal_max_turns) if goal_max_turns is not None else None,
+                    'session_id': session_id,
+                    'completion_contract': completion_contract,
+                    'brain': brain,
+                    'workspace_of': workspace_of,
+                    'boomerang_wake': 1 if boomerang_wake else 0,
+                    'signature': signature,
+                })
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links "
@@ -6944,6 +7019,15 @@ def create_task(
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 if mint_cap_forced:
                     _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
+                if mint_cap_bypassed:
+                    _append_event(conn, task_id, "mint_cap_bypassed", mint_cap_bypassed)
+                # Prism 31f2934ed515: a create nested in a caller's write_txn only releases a savepoint here, so the
+                # ledger row of a card is queued for the OUTER commit (dropped on any rollback); never a row for a
+                # card that does not exist. A refusal (no card) stays an immediate append.
+                if mint_cap_forced:
+                    _ledger_on_commit(conn, "forced", task_id=task_id, **mint_cap_forced)
+                if mint_cap_bypassed:
+                    _ledger_on_commit(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
                 if mint_breaker_forced:
                     _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
@@ -9639,6 +9723,9 @@ def _claim_and_open_run(
     a card whose origin host is paused (fleet pause layer 2, t_133d6efd)."""
     from hermes_cli.kanban_pause_hold import refuse_if_held
     refuse_if_held(conn, task_id)
+    from hermes_cli.kanban_failure_ownership import recheck_for_claim
+    if recheck_for_claim(conn, task_id).action != 'claim':
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -10286,6 +10373,9 @@ def _open_review_run(
     if spawns and not operator_claim:
         from hermes_cli.kanban_pause_hold import refuse_if_held
         refuse_if_held(conn, task_id)
+        from hermes_cli.kanban_failure_ownership import recheck_for_claim
+        if recheck_for_claim(conn, task_id).action != 'claim':
+            return None
     cur = conn.execute(
         """
         UPDATE tasks
@@ -12003,11 +12093,17 @@ def complete_task(
                     with write_txn(conn):
                         _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
 
+            # The card's Intent block into its own PR bodies before the ready flip (t_deee5435);
+            # None when KANBAN_PR_INTENT/KANBAN_HANDOFF_PR_INTENT=0. Never raises.
+            from hermes_cli import kanban_pr_intent as _intent
+            intent_fn = _intent.applier_for_task(conn, task_id, summary, metadata)
+
             def _freshness_gate(refs, allow_arm):
                 try:
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
+                        intent=intent_fn,
                     )
                 except _fresh.DraftPrError as draft_err:
                     _record_flips(draft_err.flipped)
@@ -16052,6 +16148,20 @@ def reopen_task(
     # where the review-card closer completes it on REST merged=true.
     review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
+        if _task_status(conn, task_id) != "done":
+            return False, f"task {task_id} changed state concurrently; retry"
+        candidate_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
+            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if to_status == "review":
+            from hermes_cli.kanban_review_handoff import record_reopened_candidate
+            try:
+                record_reopened_candidate(conn, task_id, actor=actor, reviewer=review_assignee,
+                                          reason=reason, run_id=int(candidate_run["id"]) if candidate_run else None)
+            except ValueError as exc:
+                return False, str(exc)
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
@@ -16073,12 +16183,7 @@ def reopen_task(
                 "previous_path": dead_scratch,
                 "survivor_baseline": _reset_survivor_baseline(conn, task_id),
             })
-        run_id = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
-            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        voided_run = int(run_id["id"]) if run_id else None
+        voided_run = int(candidate_run["id"]) if candidate_run else None
         if voided_run is not None:
             conn.execute(
                 "UPDATE task_runs SET outcome = 'voided' WHERE id = ?",

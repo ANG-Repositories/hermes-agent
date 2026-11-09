@@ -27,6 +27,8 @@ DEFAULT_CODEX_MODELS: List[str] = [
     # (2026-09-30), but the Codex responses endpoint serves it (measured
     # 921,028-token request OK), so it is curated + forward-compat'd here.
     "gpt-6.1-sol",
+    # GPT-6.1 Terra (2026-10-26): listed by all three account catalogs at client 0.162.1 (2026-11-06).
+    "gpt-6.1-terra",
     "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -51,6 +53,7 @@ DEFAULT_CODEX_MODELS: List[str] = [
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
     ("gpt-6-sol", ("gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
     ("gpt-6.1-sol", ("gpt-6-sol", "gpt-5.6-sol")),
+    ("gpt-6.1-terra", ("gpt-5.6-terra", "gpt-6.1-sol")),
     ("gpt-6-luna", ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),

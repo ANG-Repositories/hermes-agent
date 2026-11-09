@@ -224,6 +224,7 @@ class GatewayTurnMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
         persisted_route_lookup: Optional["PersistedSessionRouteLookup"] = None,
+        background: bool = False,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -244,7 +245,8 @@ class GatewayTurnMixin:
         # Every exit path starts clean: the /model-override fast path returns before the pop below,
         # and hygiene/inbound callers resolve without a turn runner consuming the stash — a stale
         # notice must never attach to another session's next turn (#74349).
-        self._pre_agent_fallback_notice = None
+        if not background:
+            self._pre_agent_fallback_notice = None
 
         persisted_identity = None
         route_lookup = None
@@ -338,15 +340,17 @@ class GatewayTurnMixin:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
         # runner surfaces it through the agent's one-shot fallback notice (#74349).
-        self._pre_agent_fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+        fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
             model = runtime_model
-        if unavailable_override and not self._pre_agent_fallback_notice:
+        if unavailable_override and not fallback_notice:
             from hermes_cli.fallback_config import pre_agent_fallback_notice
-            self._pre_agent_fallback_notice = pre_agent_fallback_notice(
+            fallback_notice = pre_agent_fallback_notice(
                 unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
+        if not background:
+            self._pre_agent_fallback_notice = fallback_notice
 
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
         if cfg and source is not None:
@@ -1719,14 +1723,15 @@ class GatewayTurnMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
-        _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
+        _silence_kind = agent_result.get(
+            "queued_terminal_display_kind", agent_result.get("effective_display_kind", persist_user_display_kind))
         _internal_turn = _silence_kind == "internal_notification"
         _intentional_silence = self._is_intentional_silence(
             agent_result, response, internal=_internal_turn,
         )
         if _internal_turn:
             _log_internal_silence_verdict(response, _intentional_silence, _platform_name, source)
-        _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
+        _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", agent_result.get("effective_reply_expected", reply_expected))
         if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
@@ -2171,6 +2176,12 @@ class GatewayTurnMixin:
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         _entered = time.monotonic()
+        # Delivery returns text/None rather than the result dict; preserve completion for /goal.
+        from agent.turn_failure_copy import is_max_iteration_handoff
+
+        event._goal_turn_completed = (
+            agent_result.get("completed") is not False or is_max_iteration_handoff(agent_result)
+        )
         # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
         with suppress(Exception):
             event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
@@ -2235,6 +2246,9 @@ class GatewayTurnMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # The /goal hook reads this: an errored turn pauses the goal instead of judging the error reply.
+        with suppress(Exception):
+            event._goal_turn_failed = type(e).__name__
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -2593,6 +2607,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            event._goal_execution_started = True
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -4321,9 +4336,9 @@ class GatewayTurnMixin:
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(
             _delivery_result, first_response,
-            internal=turn_ctx.persist_user_display_kind == "internal_notification",
+            internal=turn_ctx.effective_display_kind == "internal_notification",
         ):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            if silence_allowed(turn_ctx.effective_display_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -4336,7 +4351,7 @@ class GatewayTurnMixin:
                 )
                 first_response = _unexpected_silence_reply()
                 _already_streamed = False
-        elif first_response and turn_ctx.persist_user_display_kind == "internal_notification":
+        elif first_response and turn_ctx.effective_display_kind == "internal_notification":
             from gateway.run import _gateway_surface_passes_raw_text
             if not _gateway_surface_passes_raw_text(turn_ctx.source.platform):
                 from gateway.response_filters import strip_internal_silence_marker_lines
@@ -4584,8 +4599,8 @@ class GatewayTurnMixin:
             merged = {
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
-                "queued_terminal_display_kind": next_display_kind,
-                "queued_terminal_reply_expected": next_reply_expected,
+                "queued_terminal_display_kind": followup_result.get("effective_display_kind", next_display_kind),
+                "queued_terminal_reply_expected": followup_result.get("effective_reply_expected", next_reply_expected),
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
@@ -4992,6 +5007,7 @@ class GatewayTurnMixin:
             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
         )
 
+        response = None
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
@@ -5025,6 +5041,12 @@ class GatewayTurnMixin:
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )
+            # Snapshot after drain awaits, before any queued/depth-cap return.
+            # Either result object may be returned by the follow-up helper.
+            for turn_result in (response, result):
+                if isinstance(turn_result, dict):
+                    turn_result["effective_display_kind"] = turn_ctx.effective_display_kind
+                    turn_result["effective_reply_expected"] = turn_ctx.reply_expected
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
@@ -5034,6 +5056,12 @@ class GatewayTurnMixin:
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
             )
+            # Cleanup can await while this turn still accepts steering. Refresh only
+            # this owner's objects: recursive follow-ups return their own policy.
+            for turn_result in (response, turn_ctx.result_holder[0]):
+                if isinstance(turn_result, dict):
+                    turn_result["effective_display_kind"] = turn_ctx.effective_display_kind
+                    turn_result["effective_reply_expected"] = turn_ctx.reply_expected
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)

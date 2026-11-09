@@ -1459,6 +1459,10 @@ def _revert_credential_rotation(agent) -> None:
     agent._credential_pool_revert_id = None
 
 
+from agent.route_snapshot import route_mutation
+
+
+@route_mutation
 def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents). ``_policy_decision`` is the mid-turn
@@ -2651,6 +2655,7 @@ def _persist_switch_billing_route(agent) -> None:
         logger.warning("Failed to persist billing route after model switch", exc_info=True)
 
 
+@route_mutation
 def switch_model(
     agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None,
     session_reasoning_config=_SESSION_REASONING_UNSET,

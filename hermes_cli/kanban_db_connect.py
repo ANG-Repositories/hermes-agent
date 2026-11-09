@@ -835,6 +835,8 @@ def connect(
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _kb._ensure_status_audit(conn)
+                from hermes_cli.kanban_failure_ownership import migrate
+                migrate(conn)
                 _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 
@@ -946,6 +948,7 @@ _RENAMED_TASK_COLUMNS = (
 # NULL / 0 defaults below reproduce the behaviour existing rows had before the
 # column existed.
 _LATER_TASK_COLUMNS = (
+    ("asap", "asap INTEGER NOT NULL DEFAULT 0"),
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),

@@ -46,7 +46,8 @@ def _setup(*, deliver, consumer):
     runner._deliver_queued_first_response = deliver
     source = SimpleNamespace(platform=Platform.DISCORD, chat_id="1564352776253997189",
                              thread_id="1564352776253997189", chat_type="thread", parent_chat_id=None)
-    turn_ctx = SimpleNamespace(
+    from gateway.turn_context import TurnContext
+    turn_ctx = TurnContext(
         source=source, session_id="sid", session_key=SK, run_generation=1, _interrupt_depth=0,
         history=[], _status_thread_metadata=None, context_prompt=None, result_holder=[None],
         mute_notification_reply=False, stream_consumer_holder=[consumer],
