@@ -54,6 +54,42 @@ def test_sendback_releases_no_worker(board, sendback):
     assert kb.claim_task(board, tid) is not None
 
 
+_SENDBACK = {
+    "v": 1, "key": "example/repo#1@" + "a" * 40 + ":ci-red:test",
+    "repo": "example/repo", "pr": 1, "head": "a" * 40,
+    "source": "ci-red", "reason": "ci-red:test", "retry": "after_change",
+    "summary": "fix the failing test", "evidence": {}, "round": 1,
+}
+
+
+def test_ready_sendback_without_reassignment_keeps_operator_hold(board):
+    """Prism 3e4739f2dcfa: a sendback that leaves the assignee alone is not a release."""
+    tid = kb.create_task(board, title="held", assignee="builder")
+    assert kb.set_no_worker(board, tid, True)
+    assert kb.request_sendback(board, tid, payload=dict(_SENDBACK)) == (True, "requeued")
+    task = kb.get_task(board, tid)
+    assert (task.status, task.assignee, task.no_worker) == ("ready", "builder", True)
+    assert not [e for e in kb.list_events(board, tid) if e.kind == "no_worker_cleared"]
+
+
+def test_demoted_sendback_that_restores_worker_releases_hold(board):
+    """Control: a todo sendback that moves the card from its reviewer back to the worker releases."""
+    parent = kb.create_task(board, title="parent", assignee="planner")
+    assert kb.complete_task(board, parent, result="done")
+    tid = kb.create_task(board, title="demoted", assignee="builder", parents=[parent])
+    run = kb.claim_task(board, tid)
+    assert kb.request_review(board, tid, summary="ready", reviewer="argus",
+                             expected_run_id=run.current_run_id)
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+    assert kb.claim_review_task(board, tid) is None
+    assert kb.get_task(board, tid).assignee == "argus"
+    assert kb.set_no_worker(board, tid, True)
+    assert kb.request_sendback(board, tid, payload=dict(_SENDBACK)) == (True, "requeued")
+    task = kb.get_task(board, tid)
+    assert (task.assignee, task.no_worker) == ("builder", False)
+
+
 @pytest.mark.parametrize("target", ["human", None])
 def test_composed_sendback_preserves_nonworker_hold(board, target):
     tid = kb.create_task(board, title="operator rework", assignee="builder")

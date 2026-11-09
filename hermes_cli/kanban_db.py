@@ -15952,9 +15952,10 @@ def request_sendback(
                     )
                     if cur.rowcount != 1:
                         return False, "task changed during sendback"
-            target = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
-            if is_worker_assignee(target):
-                _set_no_worker_locked(conn, task_id, False, source="sendback")
+                    # Only a sendback that hands the card back to its worker
+                    # releases an operator hold; an untouched assignee keeps it.
+                    if is_worker_assignee(implementer):
+                        _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": status,
