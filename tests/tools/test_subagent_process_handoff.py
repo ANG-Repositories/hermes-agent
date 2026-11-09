@@ -59,13 +59,14 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
     _register(sid, child)
     try:
         handed = process_registry.spawn_local("sleep 0.4; echo ci-green", task_id=sid, owner_task_id=sid)
-        handed.notify_on_complete = True
+        assert handed.notify_on_complete is False
         leftover = process_registry.spawn_local("sleep 30", task_id=sid, owner_task_id=sid)
 
         out = json.loads(_handle_process(
             {"action": "handoff", "session_id": handed.id, "data": "CI watcher for PR 1"}, task_id=sid))
         assert out["status"] == "handed_off"
         assert handed.owner_task_id == "parent-turn-1" and handed.session_key == "sess-handoff"
+        assert handed.notify_on_complete is True and handed.parent_session_id == parent.session_id
         assert child._handed_off_processes[0]["session_id"] == handed.id
 
         # Only the un-handed sibling is left in the child's name — this is what the result entry reports as orphaned.

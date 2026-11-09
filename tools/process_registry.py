@@ -2793,7 +2793,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "") -> Optional[ProcessSession]:
+                           to_session_key: str, note: str = "",
+                           to_parent_session_id: str = "") -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
         field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
         whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
@@ -2806,6 +2807,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
+            if to_parent_session_id:
+                session.parent_session_id = to_parent_session_id
+                session.notify_on_complete = True
             return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
@@ -3117,7 +3121,8 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
     session = process_registry.transfer_ownership(
         session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
         to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note)
+        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note,
+        to_parent_session_id=str(getattr(parent, "session_id", "") or ""))
     if session is None:
         return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
                          "with poll/log and report it instead)."}

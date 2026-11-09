@@ -26,6 +26,14 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 
+def _is_delegated_completion_target(row: dict) -> bool:
+    # Compression inherits provenance; a child continuation is still not a human owner.
+    config = row.get("model_config") or {}
+    if isinstance(config, str):
+        config = json.loads(config)
+    return row.get("source") == "tool" or bool(config.get("_delegate_from"))
+
+
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
@@ -301,6 +309,9 @@ class GatewayNotificationsMixin:
                 "Async-delegation completion has unknown spawning session %s; "
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
+            return None
+        if _is_delegated_completion_target(pinned_row):
+            logger.warning("Refusing completion route pin to delegated session %s", pinned_session_id)
             return None
         target_session_id = pinned_session_id
         follows_compression = False
@@ -1481,6 +1492,9 @@ class GatewayNotificationsMixin:
             return "retry"
         try:
             parent = await session_db.get_session(parent_session_id)
+            if parent is not None and _is_delegated_completion_target(parent):
+                logger.warning("Deferring completion for delegated origin %s; no human route ownership", parent_session_id)
+                return "retry"
         except Exception:
             logger.debug("Async-completion pre-flight parent lookup failed for %s", parent_session_id, exc_info=True)
             return "retry"
