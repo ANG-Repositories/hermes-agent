@@ -5462,6 +5462,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             # Name what it needs (t_aea826a9): ``studio_affinity:studio_needs(vault,skills_tree)``.
             return "local", f"studio_affinity:{rule}({','.join(sorted(_kwp.card_needs(row['body'])))})"
         return "local", f"studio_affinity:{rule}"
+    if rule == "workspace_kind" and (row["workspace_kind"] or "scratch") == "worktree":
+        # Linked worktrees reference the Studio's git common dir. Only the
+        # mirror-backed clone route above can safely move their baseline.
+        return "local", ("not_portable:workspace_kind:worktree is Studio-only without a safe mirror-backed "
+                         "clone; fleet/kanban-worktree-mirrors.json must list the repo and destination "
+                         "host, and the source must be an eligible anchor or clean pushed card worktree")
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
@@ -7892,10 +7898,11 @@ def _dispatch_once_locked(
                 resolved_branch_name = (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
                 claimed.workspace_kind, claimed.workspace_path = "scratch", None
                 workspace = _kbw.resolve_workspace(claimed, board=board)
-                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_port[1],
+                _wt_mirror = _kwt.mirror_for(_wt_port, placed_host.name)
+                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_mirror,
                                    resolved_branch_name)
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
-                             host=placed_host.name, slug=_wt_port[0], mirror=_wt_port[1])
+                             host=placed_host.name, slug=_wt_port[0], mirror=_wt_mirror)
             elif claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:

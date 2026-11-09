@@ -336,6 +336,11 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                         _kb._append_event(conn, tid, "placement_affinity", dict(aff))
                 elif last is not None and not last.get("cleared"):
                     _kb._append_event(conn, tid, "placement_affinity", dict(CLEARED))
+                    if last.get("mode") == "enforce" and str(last.get("rule", "")).startswith("requires:"):
+                        _kb.add_comment(conn, tid, "dispatcher",
+                                        f"auto-pin released: {last['rule']} no longer binds under the current "
+                                        "body and skills. Placement re-evaluated this tick; other constraints "
+                                        "and host capacity still apply.")
                     # The binding's wait ends with it, or the same wait after a
                     # re-bind would read as a duplicate (Prism 0f21fb8c).
                     cleared_wait.add(tid)

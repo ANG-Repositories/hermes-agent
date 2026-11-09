@@ -54,24 +54,38 @@ _origin_cache: Dict[str, Tuple[float, Optional[str]]] = {}
 _log = logging.getLogger(__name__)
 
 
-def read_mirrors(fleet_dir: Path) -> Dict[str, Tuple[str, Tuple[str, ...]]]:
-    """``{owner/repo (lower): (mirror path, hosts)}``; {} on any doubt."""
+def read_mirrors(fleet_dir: Path) -> Dict[str, Tuple[str, Tuple[str, ...], Dict[str, str]]]:
+    """``{owner/repo (lower): (mirror path, hosts, {host: mirror path})}``; {} on any doubt.
+
+    ``mirrors`` (optional, beside ``mirror``) overrides the path per host: macOS
+    hosts have a sealed root and cannot hold ``/srv`` (mbp-2026 keeps them under
+    ``/Users/Shared/git-mirrors``). A malformed ``mirrors`` drops the whole row."""
     try:
         doc = json.loads((Path(fleet_dir) / MIRRORS_FILE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     repos = doc.get("repos") if isinstance(doc, dict) and doc.get("schema") == 1 else None
-    out: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
+    out: Dict[str, Tuple[str, Tuple[str, ...], Dict[str, str]]] = {}
     for slug, row in (repos.items() if isinstance(repos, dict) else ()):
         if not isinstance(slug, str) or "/" not in slug or not isinstance(row, dict):
             continue
-        mirror, hosts = row.get("mirror"), row.get("hosts")
+        mirror, hosts, per_host = row.get("mirror"), row.get("hosts"), row.get("mirrors", {})
         if not (isinstance(mirror, str) and mirror.startswith("/")) or not isinstance(hosts, list):
+            continue
+        if not isinstance(per_host, dict) or not all(
+                isinstance(h, str) and h and isinstance(p, str) and p.startswith("/")
+                for h, p in per_host.items()):
             continue
         hs = tuple(h.lower() for h in hosts if isinstance(h, str) and h)
         if hs:
-            out[slug.lower()] = (mirror, hs)
+            out[slug.lower()] = (mirror, hs, {h.lower(): p for h, p in per_host.items()})
     return out
+
+
+def mirror_for(port: tuple, host: str) -> str:
+    """The mirror path ``host`` holds for a :func:`port_for` result."""
+    overrides = port[3] if len(port) > 3 else {}
+    return overrides.get(str(host).lower(), port[1])
 
 
 def origin_slug(repo: Path, runner: Callable = subprocess.run) -> Optional[str]:
@@ -206,9 +220,9 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
 def port_for(task_id: str, workspace_path: Optional[str], board_default: Optional[str],
              fleet_dir: Path, runner: Callable = subprocess.run, *,
              branch: Optional[str] = None,
-             allow_studio_tree: bool = False) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
-    """``(owner/repo, mirror, hosts)`` when this worktree card may run on a
-    pool host, else None."""
+             allow_studio_tree: bool = False) -> Optional[Tuple[str, str, Tuple[str, ...], Dict[str, str]]]:
+    """``(owner/repo, mirror, hosts, {host: mirror})`` when this worktree card
+    may run on a pool host, else None (:func:`mirror_for` picks the path)."""
     mirrors = read_mirrors(fleet_dir)
     if not mirrors:
         return None
@@ -216,7 +230,7 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
                        allow_studio_tree=allow_studio_tree)
     slug = origin_slug(repo, runner) if repo is not None else None
     row = mirrors.get(slug.lower()) if slug else None
-    return (slug, row[0], row[1]) if row else None
+    return (slug, row[0], row[1], row[2]) if row else None
 
 
 def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], fleet_dir: Path,
