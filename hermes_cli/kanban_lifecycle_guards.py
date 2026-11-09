@@ -62,7 +62,9 @@ def _trigger_definitions() -> dict[str, str]:
             INSERT INTO task_events(task_id, kind, payload, created_at)
             VALUES(NEW.id, 'review_requested', json_object(
                 'implementer', COALESCE(NEW.assignee, 'human:operator'),
-                'reviewer', NEW.assignee, 'source', 'lifecycle_entry_repair'),
+                'reviewer', NEW.assignee, 'source', 'lifecycle_entry_repair',
+                'review_exit_id', (SELECT COALESCE(max(id), 0) FROM task_status_audit
+                    WHERE task_id=NEW.id AND old_status='review' AND new_status!='review')),
                 CAST(strftime('%s','now') AS INTEGER));
         END
     """.strip()
@@ -75,6 +77,9 @@ def _trigger_definitions() -> dict[str, str]:
             AND kind='review_requested'
             AND json_valid(payload)
             AND length(json_extract(payload, '$.implementer')) > 0
+            AND COALESCE(json_extract(payload, '$.review_exit_id'), 0) =
+                (SELECT COALESCE(max(id), 0) FROM task_status_audit
+                 WHERE task_id=NEW.id AND old_status='review' AND new_status!='review')
           )
         BEGIN
             INSERT INTO task_events(task_id, kind, payload, created_at)
@@ -87,7 +92,9 @@ def _trigger_definitions() -> dict[str, str]:
                      ORDER BY id DESC LIMIT 1),
                     CASE WHEN OLD.assignee != 'human' AND OLD.assignee NOT LIKE 'human:%'
                          THEN OLD.assignee END, 'human:operator'),
-                'reviewer', NEW.assignee, 'source', 'lifecycle_entry_repair'),
+                'reviewer', NEW.assignee, 'source', 'lifecycle_entry_repair',
+                'review_exit_id', (SELECT COALESCE(max(id), 0) FROM task_status_audit
+                    WHERE task_id=NEW.id AND old_status='review' AND new_status!='review')),
                 CAST(strftime('%s','now') AS INTEGER));
         END
     """.strip()
