@@ -1741,8 +1741,11 @@ def test_pause_hold_refusal_stops_a_runner_found_running_under_the_lock(monkeypa
 
 
 @pytest.fixture
-def detached_fallback(monkeypatch):
+def detached_fallback(monkeypatch, home):
     """The default ``background_kanban_fallback: detached``; the detached child is recorded, not spawned."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda name: str(home))
+    (home / "config.yaml").write_text("model:\n  default: gpt-4.1-mini\n")
     from tools import delegate_detached as dd
     from tools import delegate_tool_config as cfgmod
 
@@ -1826,6 +1829,13 @@ def test_detached_fallback_coordinates_with_an_in_process_profile(monkeypatch, t
     handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
     assert calls == [] and seen == ["B"]
     assert _record(handle["delegation_id"])["state"] == "done"
+    # Adoption installs the real child PID even when both runtime knobs are now off.
+    with ad._records_lock:
+        ad._records["adopted"] = {"status": "running", "execution_pid": os.getpid() + 1}
+    assert file_state._cross_process_enabled()
+    with ad._records_lock:
+        ad._records["adopted"]["status"] = "completed"
+    assert not file_state._cross_process_enabled()
 
 
 def test_refuse_in_process_raises():

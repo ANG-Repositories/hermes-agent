@@ -1170,6 +1170,14 @@ def kanban_active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES and r.get("kanban_unit"))
 
 
+def cross_process_active_count() -> int:
+    """Live units running (or about to run) outside this gateway PID, across all profiles."""
+    with _records_lock:
+        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES
+                   and (r.get("execution_pid", os.getpid()) != os.getpid()
+                        or r.get("kanban_unit") or r.get("detached_unit")))
+
+
 def in_process_active_count() -> int:
     """The live units of ``active_count`` this process runs, from ONE snapshot: the difference of
     two separately locked counts can hide one when a kanban unit lands between them."""
@@ -1883,7 +1891,10 @@ def _fall_back_in_process(delegation_id: str, record: Dict[str, Any], launched: 
         raise RuntimeError("background unit stopped before it started (attempt no longer current)")
     with _records_lock:
         record["attempt_id"] = new_attempt
-        record.pop("kanban_unit", None)  # an in-process unit now: shutdown/interrupt_all treat it as one
+        record.pop("kanban_unit", None)  # the card-end watcher no longer owns this attempt
+        # Publish before the child can edit, not after Popen/supervision (a profile with both knobs
+        # off must already take the shared lock). Zero reserves a PID outside this gateway.
+        record["execution_pid"] = 0 if detached else os.getpid()
     if not _store.mark_submitted(delegation_id, new_attempt, profile_home=profile_home):
         raise RuntimeError("background unit stopped before it started (fallback attempt refused)")
 
@@ -1914,7 +1925,7 @@ def _install_detached_supervision(delegation_id: str, pid: Any, create_time: Any
         rec.update(
             interrupt_fn=lambda: dd.terminate_job(job_dir, pid, create_time),
             progress_fn=dd.heartbeat_progress_fn(lambda: job_dir),
-            detached_unit=True, _started=started, _progress_token=None, _progress_ts=time.time())
+            detached_unit=True, execution_pid=pid, _started=started, _progress_token=None, _progress_ts=time.time())
     _ensure_stale_monitor()
     return True
 
