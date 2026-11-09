@@ -25,7 +25,8 @@ _HAVE_CLOSEFROM = hasattr(os, "POSIX_SPAWN_CLOSEFROM")
 # -I -S ignores PYTHON* and site/user startup code. Failure to list/close aborts exec.
 _CLOSE_EXEC = (
     "import os,sys,signal; "
-    "[signal.signal(s,signal.SIG_DFL) for s in (getattr(signal,n,None) for n in ('SIGPIPE','SIGXFZ','SIGXFSZ')) if s is not None]; "
+    "restore=sys.argv.pop(1)=='1'; "
+    "[signal.signal(s,signal.SIG_DFL) for s in (getattr(signal,n,None) for n in ('SIGPIPE','SIGXFZ','SIGXFSZ')) if restore and s is not None]; "
     "fds=[int(n) for n in os.listdir('/proc/self/fd' if sys.platform.startswith('linux') else '/dev/fd')]; "
     "os.closerange(3,max(fds+[2])+1); os.execvpe(sys.argv[1],sys.argv[1:],os.environ)"
 )
@@ -69,7 +70,8 @@ def _popen_class(base):
             if _HAVE_CLOSEFROM:
                 actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))
             else:
-                argv = [sys.executable, "-I", "-S", "-c", _CLOSE_EXEC, *argv]
+                argv = [sys.executable, "-I", "-S", "-c", _CLOSE_EXEC,
+                        "1" if bound["restore_signals"] else "0", *argv]
             spawn_kwargs = {"file_actions": actions}
             if bound["restore_signals"]:
                 spawn_kwargs["setsigdef"] = [

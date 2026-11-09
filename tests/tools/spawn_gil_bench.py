@@ -63,11 +63,30 @@ def main() -> int:
     ap.add_argument("--spawns", type=int, default=40)
     ap.add_argument("--threads", type=int, default=200)
     ap.add_argument("--modes", default="legacy,legacy-fork,nofork")
+    ap.add_argument("--fds", type=int, default=1500)
     opts = ap.parse_args()
+    descriptors = [os.open(os.devnull, os.O_RDONLY) for _ in range(opts.fds)]
+    counters = {"fork_exec": 0, "posix_spawn": 0}
+    real_spawn = os.posix_spawn
 
-    blob = bytearray(int(opts.rss_gb * (1 << 30)))
-    view = memoryview(blob)
-    view[::4096] = b"\x01" * len(range(0, len(blob), 4096))  # touch every page: real RSS
+    def counted_spawn(*args, **kwargs):
+        counters["posix_spawn"] += 1
+        return real_spawn(*args, **kwargs)
+
+    os.posix_spawn = counted_spawn
+    real_fork = subprocess._fork_exec
+
+    def counted_fork(*args, **kwargs):
+        counters["fork_exec"] += 1
+        return real_fork(*args, **kwargs)
+
+    subprocess._fork_exec = counted_fork
+
+    # Many separately allocated, page-touched chunks reproduce a fragmented heap,
+    # unlike one contiguous bytearray (especially important for macOS fork cost).
+    chunks = [bytearray(64 * 1024) for _ in range(int(opts.rss_gb * (1 << 30)) // (64 * 1024))]
+    for chunk in chunks:
+        chunk[::4096] = b"\x01" * 16
     idle = threading.Event()
     for _ in range(opts.threads):
         threading.Thread(target=idle.wait, daemon=True).start()
@@ -80,6 +99,7 @@ def main() -> int:
     results = {"python": sys.version.split()[0], "platform": sys.platform, "rss_mb": rss_kb // 1024,
                "threads": threading.active_count(), "pid": os.getpid(), "modes": {}}
     for mode in opts.modes.split(","):
+        counters.update(fork_exec=0, posix_spawn=0)
         subprocess._USE_VFORK = mode != "legacy-fork"
         stalls, walls = [], []
         for _ in range(opts.spawns):
@@ -93,6 +113,7 @@ def main() -> int:
         subprocess._USE_VFORK = True
         ms = lambda xs, q: round(1000 * statistics.quantiles(xs, n=20)[q], 3)  # noqa: E731
         results["modes"][mode] = {
+            "calls": dict(counters),
             "gil_stall_ms_p50": round(1000 * statistics.median(stalls), 3), "gil_stall_ms_p95": ms(stalls, 18),
             "gil_stall_ms_max": round(1000 * max(stalls), 3),
             "spawn_wall_ms_p50": round(1000 * statistics.median(walls), 3), "spawn_wall_ms_p95": ms(walls, 18)}

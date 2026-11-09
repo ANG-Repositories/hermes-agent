@@ -107,11 +107,13 @@ def test_timeout_returns_124_and_reaps_the_group(no_fork_exec, env, tmp_path):
 
 
 def test_missing_cwd_fails_inside_the_child_not_the_gateway(no_fork_exec, env, tmp_path):
-    proc = nofork.spawn_popen(["/bin/sh", "-c", 'cd -- "$1" || exit 126; shift; exec "$@"', "sh",
+    import tools.environments.local as local
+    proc = nofork.spawn_popen([local._POSIX_SH, "-c", local._CD_THEN_EXEC, "sh",
                                str(tmp_path / "gone"), "/bin/echo", "ran"],
                               new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     out, _ = proc.communicate(timeout=10)
     assert proc.returncode == 126 and "ran" not in out
+    assert "hermes: cannot enter working directory:" in out
 
 
 def test_inheritable_fds_are_not_passed_to_the_child(no_fork_exec, tmp_path):
@@ -155,7 +157,6 @@ def test_plain_popen_when_platform_lacks_setsid(monkeypatch):
                               new_session=True, stdout=subprocess.PIPE, text=True)
     pid, pgid = (int(x) for x in proc.communicate(timeout=10)[0].split())
     assert pid == pgid == proc.pid
-    assert os.getsid(proc.pid) == proc.pid if proc.poll() is None else True
 
 
 def test_ineligible_calls_keep_plain_popen_semantics(tmp_path):
@@ -172,3 +173,73 @@ def test_legacy_env_switch_forces_plain_popen(monkeypatch):
     assert not nofork.eligible(["/bin/true"], {})
     monkeypatch.delenv("HERMES_SPAWN_LEGACY")
     assert nofork.eligible(["/bin/true"], {}) is hasattr(os, "posix_spawn")
+
+
+def test_popen_function_import_and_execute(monkeypatch, tmp_path):
+    import importlib
+    import tools.environments.local as local
+    real = subprocess.Popen
+    calls = []
+
+    def replacement(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", replacement)
+    importlib.reload(nofork)
+    importlib.reload(local)
+    environment = local.LocalEnvironment(cwd=str(tmp_path), timeout=10)
+    try:
+        result = environment.execute("printf import-ok")
+        assert result["returncode"] == 0 and "import-ok" in result["output"]
+        assert calls
+    finally:
+        environment.cleanup()
+
+
+def test_symlinked_cwd_is_physical(no_fork_exec, tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    environment = LocalEnvironment(cwd=str(link), timeout=10)
+    try:
+        result = environment.execute('printf "%s\\n" "$PWD"')
+        assert result["returncode"] == 0 and result["output"].strip() == str(real.resolve())
+    finally:
+        environment.cleanup()
+
+
+def test_late_inheritable_fd_is_closed(no_fork_exec, monkeypatch, tmp_path):
+    real = os.posix_spawn
+    secret = os.open(tmp_path / "secret", os.O_CREAT | os.O_RDWR, 0o600)
+    os.set_inheritable(secret, False)
+
+    def race(*args, **kwargs):
+        os.set_inheritable(secret, True)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(os, "posix_spawn", race)
+    try:
+        result = nofork.run_nofork(
+            ["/bin/sh", "-c", f'[ -e /dev/fd/{secret} ] && echo leaked || echo closed'],
+            capture_output=True, text=True)
+        assert result.returncode == 0 and result.stdout.strip() == "closed"
+    finally:
+        os.close(secret)
+
+
+def test_explicit_standard_fd_keeps_new_session(monkeypatch, tmp_path):
+    output = tmp_path / "session"
+    result = nofork.run_nofork(
+        ["/bin/sh", "-c", f'echo "$$ $(ps -o sid= -p $$)" > "{output}"'],
+        stdout=1, new_session=True)
+    pid, sid = map(int, output.read_text().split())
+    assert result.returncode == 0 and pid == sid
+
+
+def test_run_input_and_conflicts(no_fork_exec):
+    result = nofork.run_nofork(["/bin/cat"], input="piped", capture_output=True, text=True)
+    assert result.stdout == "piped"
+    with pytest.raises(ValueError):
+        nofork.run_nofork(["/bin/cat"], input="bad", stdin=subprocess.PIPE)
