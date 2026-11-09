@@ -1026,21 +1026,32 @@ async def deliver_turn(runner: Any, entry: Any, text: str,
                        cards: Optional[list[dict]] = None) -> bool:
     """Enqueue one handoff turn into ``entry``'s session. Raises on no route.
 
+    Header: ``kanban wake · <sub> · <card>``; the sub-kind comes from the cards' item kinds/triggers
+    (``gateway.wake_kind.kanban_wake_sub``: a boomerang re-surface trigger reads ``boomerang``), the
+    card only when the turn carries exactly one.
+
     Returns the adapter's admission receipt (``event._gateway_accepted is True``): False when the
     turn was not taken, e.g. a busy session whose queue is at ``_BUSY_QUEUE_MAX_PENDING``."""
     from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.wake_kind import KANBAN, kanban_wake_sub, single_card, wake_meta
 
     source = dataclasses.replace(entry.origin)
     adapter = runner._adapter_for_source(source)  # noqa: SLF001
     if adapter is None:
         raise RuntimeError(f"no live adapter for {getattr(source.platform, 'value', source.platform)}")
+    _items = [i for c in cards or [] for i in c.get("items") or []]
     event = MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=source,
         internal=True,
         allow_gateway_control=False,
+        wake_kind=KANBAN,
         metadata={
+            **wake_meta(
+                sub=kanban_wake_sub([i.get("kind") for i in _items], [i.get("trigger") for i in _items]),
+                card_id=single_card(c.get("task_id") for c in cards or []),
+            ),
             "kanban_owner_wake": True,
             "gateway_session_key": entry.session_key,
             # Not strict: a turn queued behind a busy session survives a

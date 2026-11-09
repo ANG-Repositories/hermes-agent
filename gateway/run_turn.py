@@ -30,6 +30,7 @@ from gateway.response_filters import (
     wake_chrome_muted, wake_progress_header,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
+from gateway.wake_kind import STEER, wake_display_metadata
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -2621,7 +2622,8 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
-                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
+                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event),
+                    **wake_display_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
@@ -4220,7 +4222,8 @@ class GatewayTurnMixin:
                     )
                     return
         self._session_state(session_key).conversation.queued_events.append(
-            MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+            MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+                         wake_kind=STEER if internal else None)
         )
         logger.info(
             "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
@@ -4281,7 +4284,7 @@ class GatewayTurnMixin:
                 # A steered completion re-seated as text runs as the internal wake it was, not as a
                 # human turn (visible fallback, auth path, no silence allowance) (t_506536db).
                 pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
-                                             internal=True)
+                                             internal=True, wake_kind=STEER)
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
         elif result and result.get("pending_steer") and adapter and session_key:
             # Fork (2026-09-29): a follow-up already owns the next turn. Queue the leftover steer
@@ -4576,7 +4579,8 @@ class GatewayTurnMixin:
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
-                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event),
+                    **wake_display_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(

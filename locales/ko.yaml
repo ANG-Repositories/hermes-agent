@@ -900,7 +900,7 @@ gateway:
     working_heartbeat: "⏳ 작업 중 — {minutes}분{detail}"
     thinking_prefix: "💬 {text}"
     tool_head: "{emoji} {tool}"
-    wake_head: "🔔 wake · {label}"
+    wake_head: "🔔 {label}"
     tool_verbose: "{emoji} {tool}({keys})\n{args}"
     tool_preview: "{emoji} {tool}: \"{preview}\""
     tool_pending: "{emoji} {tool}..."

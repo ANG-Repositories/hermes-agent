@@ -1280,7 +1280,8 @@ class GatewayNotificationsMixin:
                 source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
                 scope = _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
             deliver = lambda: deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, profile=served,
-                notification_category="diagnostic" if diagnostic_process_event(evt) else "result")  # noqa: E731
+                notification_category="diagnostic" if diagnostic_process_event(evt) else "result",
+                wake_kind="process")  # noqa: E731
         try:
             logger.info(info, raw_sid)
             async with scope:
@@ -1405,6 +1406,7 @@ class GatewayNotificationsMixin:
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
+                wake_kind="delegation" if evt.get("type") == "async_delegation" else "process",
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",

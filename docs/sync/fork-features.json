@@ -1,5 +1,39 @@
 [
   {
+    "feature": "wake headers name their kind from producer metadata: '🔔 kanban wake · review · t_X', '🔔 goal wake · check-in 1/3', loop/delegation/process/restart/watcher/heartbeat/webhook; the card id comes only from card_id metadata, never the wake text",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_wake_kind_headers.py",
+      "tests/gateway/test_wake_kind_producer_contract.py",
+      "tests/gateway/test_wake_progress_header.py"
+    ],
+    "paths": [
+      "gateway/wake_kind.py",
+      "gateway/wake.py",
+      "gateway/response_filters.py",
+      "gateway/platforms/event.py",
+      "gateway/run_goals.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_*.py",
+      "gateway/kanban_owner_wake.py",
+      "gateway/kanban_watchers.py",
+      "gateway/kanban_watchers_*.py",
+      "gateway/kanban_wake_defer.py",
+      "gateway/run_notifications.py",
+      "gateway/run_startup.py",
+      "locales/*.yaml"
+    ],
+    "why": "2026-11-08: 38 /goal idle check-ins rendered '🔔 wake · internal · t_c676b4f3' because wake_progress_header (fork PR #2127) guessed the label from a leading [tag] and took the FIRST t_xxxxxxxx in the body; the goal text named a card and Ace read it as a kanban wake (Ace 17:53/18:05 PT, discord 1569168012643410073 / 1569170967492562995). Every producer now stamps MessageEvent.wake_kind / deliver_wake(wake_kind=) and puts wake_sub / wake_name / card_id in metadata; run_turn spreads wake_display_metadata(event) into persist_user_display_metadata, which the header reads. The text tag survives only as a WARNING-logged legacy fallback. Upstream has the header's ancestor but none of the kinds: resolving response_filters.py, run_goals.py or run_turn.py toward upstream drops the label silently, and an upstream wake producer added by a parity merge renders unlabeled. Card t_17ba87a6.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_wake_kind_headers.py (RED-proven t_17ba87a6: wake_progress_header reverted to the regex-only form; wake_kind dropped from the goal idle-wake producer)"
+  },
+  {
     "feature": "delegated process completion preserves human route and execution ownership",
     "tests": [
       "tests/tools/test_subagent_process_handoff.py",
