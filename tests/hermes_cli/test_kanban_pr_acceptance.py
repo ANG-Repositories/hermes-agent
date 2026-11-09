@@ -197,7 +197,7 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             run_id = owner.current_run_id
             def reclaim():
                 with connect() as rival:
-                    assert kb.block_task(rival, tid, reason="Reassigned during acceptance")
+                    assert kb.block_task(rival, tid, reason="Reassigned during acceptance", kind="needs_input")
                     assert kb.unblock_task(rival, tid)
                     github["replacement"] = kb.claim_task(rival, tid).current_run_id
             github.update(conclusion=conclusion, race=reclaim)
@@ -335,7 +335,11 @@ def test_human_review_lane_reads_with_the_ambient_login(tmp_path, monkeypatch, a
     kb.init_db()
     with connect() as conn:
         tid = kb.create_task(conn, title="review-lane", completion_contract="acme/repo",
-                             assignee=assignee)
+                             assignee="implementer")
+        assert kb.claim_task(conn, tid) is not None
+        # Keep a real implementation run when handing the card to the human lane.
+        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (assignee, tid))
+        conn.commit()
         kb.complete_task(conn, tid, result="done",
                          metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(

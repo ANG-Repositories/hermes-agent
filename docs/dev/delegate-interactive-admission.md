@@ -22,8 +22,9 @@ inside an already-admitted worker and is unchanged.
 
 The incident registry was reported by Apollo as exactly 256 retained terminal
 records, not 256 active children. `_prune` stops at the cap while admission rejects
-at the cap; retention has not expired. Changing that retention policy is outside
-this fix: an exact-full store must reject promptly, whether settled or pending.
+at the cap; retention has not expired. Current main's admission policy prunes
+settled history to make one slot at the exact cap, while pending obligations
+refuse promptly and remain intact. This fix preserves that policy.
 
 ## Implementation decision
 
@@ -81,7 +82,11 @@ therefore still surface the submission failure. No new retry thread or arbitrary
 I/O timeout is introduced. Injected exceptions at teardown, manifest, metrics and
 acknowledgement all return truthful rejection with the failed stage recorded.
 
-Exact-cap controls use a real retained terminal record from another session,
-both delivered and pending, and verify it is unchanged by refusal. Retention is
-unchanged by explicit operator direction. Apollo owns independent final review,
-CI/merge, live deployment and original-conversation acceptance.
+Exact-cap controls use real retained terminal records from other sessions:
+pending-only capacity refuses without changing the record; mixed settled/pending
+capacity prunes the settled record, admits the new child, and preserves the pending
+record and its replay. Main's pre-construction admission checks and turn-stop
+ownership remain in force. Post-construction refusal tests explicitly bypass
+preflight to exercise the dispatch race, including all five inline-fallback mutants.
+Apollo owns independent final review, CI/merge, live deployment and
+original-conversation acceptance.

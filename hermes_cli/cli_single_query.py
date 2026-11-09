@@ -107,7 +107,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
 
     def _block(reason: str) -> None:
         with _kbc.connect_closing() as c:
-            _kb.block_task(c, task_id, reason=reason, expected_run_id=expected_run_id)
+            _kb.block_task(c, task_id, reason=reason, kind="needs_input", expected_run_id=expected_run_id)
 
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
@@ -601,6 +601,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # The --skills preload starts only now, so no skill payload (inline shell included)
         # is rendered on a host the boot gate would have refused (Apollo, fbadb37df1b5).
         cli.start_preloaded_skills()
+        # t_c418eebc: a fix round starts with this card's own PR back in draft, so its WIP pushes skip CI;
+        # the handback flips it ready once. Logs and continues on any failure.
+        from hermes_cli.kanban_round_draft import run_from_env as _round_draft
+        _round_draft()
     if not cli._claim_active_session("cli", stderr=bool(quiet)):
         exit_single_query(1)
     try:

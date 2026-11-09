@@ -51,6 +51,8 @@ def reject_background_admission(*, reason, children, task_list, live_deleg_id, l
         ))
     return json.dumps({
         "status": "rejected", "mode": "background", "started": False,
+        "count": len(task_list), "goals": [task["goal"] for task in task_list],
+        "error": (dispatch or {}).get("error") or "background delegation was not admitted",
         "reason": reason, "retryable": True,
         **({"cleanup_pending": cleanup_pending} if cleanup_pending else {}),
         "note": "No subagents started or queued. Continue the parent conversation; retry "

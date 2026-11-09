@@ -46,6 +46,8 @@ def admission(monkeypatch):
                                     "pool_capacity", "submission_failed"])
 def test_interactive_admission_returns_without_executing_child(admission, monkeypatch, failure):
     dt, release, entered = admission
+    # Exercise the post-construction race; main tests preflight refusals separately.
+    monkeypatch.setattr(ad, "preflight_admission", lambda **kw: None)
     if failure == "durable_intent_unavailable":
         monkeypatch.setattr(dt, "_build_durable_background_spec", Mock(side_effect=OSError("intent")))
     elif failure in {"registry_cap", "registry_error"}:
@@ -84,9 +86,13 @@ def test_interactive_admission_returns_without_executing_child(admission, monkey
         assert "error" not in result, result
         value = result["value"]
         assert value["status"] == "rejected"
-        assert value["reason"] == failure
+        assert value["reason"] == ("durable_intent_error"
+                                   if failure == "durable_intent_unavailable" else failure)
         assert value["started"] is False
         assert value["retryable"] is True
+        assert value["count"] == 1
+        assert value["goals"] == ["sentinel"]
+        assert value["error"]
         assert "delegation_id" not in value
         assert parent._active_children == []
         assert len(closed) == 1

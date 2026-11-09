@@ -808,25 +808,9 @@ class GatewaySlashCommandsMixin(
             logger.warning("Failed to persist user_stopped marker for idle-stopped session %s",
                            session_key, exc_info=True)
 
-        # Detached delegations can outlive the parent turn, leaving no resident
-        # agent even though this session still owns cancellable work.
-        try:
-            from tools.async_delegation import interrupt_for_session
-
-            async_stopped = interrupt_for_session(
-                session_key=session_key,
-                parent_session_id=str(getattr(session_entry, "session_id", "") or ""),
-                reason="stop_command",
-            )
-        except Exception:
-            logger.debug(
-                "Failed to cancel background delegations for session %s",
-                session_key,
-                exc_info=True,
-            )
-            async_stopped = 0
-        if async_stopped:
-            return EphemeralReply(t("gateway.stop.stopped"))
+        # Background delegations this session dispatched are NOT cancelled here: they are owned by the
+        # async registry, not by a turn, and deliver through the outbox (t_8c4608e6). /stop ends turns;
+        # delegate_task action='stop' (or a session reset) ends background units.
 
         # No running agent anywhere for this scope. A platform status
         # indicator can still be stuck — e.g. Slack's persistent

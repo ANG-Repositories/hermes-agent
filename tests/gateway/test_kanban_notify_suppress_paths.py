@@ -317,7 +317,7 @@ def test_operator_homed_self_block_is_withheld_as_own_echo(board, monkeypatch):
     try:
         tid = _operator_card(conn)
         with kb.mutation_actor(session_ids=[OP_SID], profile="default", surface="gateway"):
-            assert kb.block_task(conn, tid, reason="waiting on Ace") is True
+            assert kb.block_task(conn, tid, reason="waiting on Ace", kind="needs_input") is True
         assert _events(conn, tid, "blocked")[0].actor_profile == "default"
     finally:
         conn.close()
@@ -341,7 +341,7 @@ def test_operator_homed_worker_block_still_wakes(board, monkeypatch):
         kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
         with kb.mutation_actor(session_ids=["20261106_000001_worker"], profile="worker", surface="worker"):
-            assert kb.block_task(conn, tid, reason="need creds", expected_run_id=run_id) is True
+            assert kb.block_task(conn, tid, reason="need creds", expected_run_id=run_id, kind="needs_input") is True
     finally:
         conn.close()
     adapter = Adapter()

@@ -985,6 +985,27 @@ def redact_url(url: Any) -> str:
     return urlunsplit((parsed.scheme, host, parsed.path, query, ""))
 
 
+def admission_refusal(*, profile_home: Path | None = None, max_records: int | None = None) -> str | None:
+    """Would ``persist_dispatch`` refuse a new record right now? ``registry_cap`` / ``registry_error`` / None.
+
+    A preflight, not a reservation: delegate_task asks before it builds any child, so a full or unreadable
+    registry refuses the call with zero child sessions. ``persist_dispatch`` stays the binding check."""
+    record_limit = MAX_REGISTRY_RECORDS if max_records is None else max_records
+    path = registry_path(profile_home)
+    try:
+        with locked_registry(path=path) as registry:
+            # Same eviction as persist_dispatch (cap-1, settled terminal records only), so the preflight
+            # never refuses a full-but-evictable registry the binding check would accept (Prism
+            # c-e0bb5594880eff70: that would bring the 2026-11-08 registry_cap degradation back).
+            _prune(registry, time.time(), path, limit=record_limit - 1)
+            if len(registry["records"]) >= record_limit:
+                return "registry_cap"
+    except Exception as exc:
+        logger.error("async_delegation_admission_preflight_failed path=%s reason=%s", path, exc)
+        return "registry_error"
+    return None
+
+
 def persist_dispatch(
     *,
     delegation_id: str,

@@ -1635,5 +1635,85 @@
     "surfaces": [
       "gateway"
     ]
+  },
+  {
+    "feature": "a command the busy path would reject (/model, /reasoning, /moa...) sent while /stop is still tearing the turn down waits (bounded 120 s) for the slot release and then runs on the idle path, instead of replying 'Agent is running, wait or /stop first'; a stop that outlives the bound gets an honest 'still finishing' reply",
+    "tests": [
+      "tests/gateway/test_busy_slash_after_stop.py::test_model_sent_during_stop_runs_after_the_slot_frees",
+      "tests/gateway/test_busy_slash_after_stop.py::test_reject_command_without_a_stop_still_rejects_immediately",
+      "tests/gateway/test_busy_slash_after_stop.py::test_stop_that_never_settles_gets_an_honest_reply"
+    ],
+    "paths": [
+      "gateway/session_state.py",
+      "gateway/run_agent_cache.py",
+      "gateway/run_inbound.py",
+      "gateway/run_inbound_*.py",
+      "gateway/run_busy.py",
+      "locales/*.yaml"
+    ],
+    "why": "Ace 2026-11-08 11:27 (#fix-bottlenecks): /stop at :04, /model at :08 bounced, slot freed at :41. PR #128. Upstream shape: TurnState.stopping set after the generation bump in the stop funnel, waited on before the busy fast-path.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "/stop's durable user-stopped marker reads only the newest message row (get_messages latest=True limit=1), and every stop logs PHASE=stop_stages (per-stage time + default-pool queue) and rowid_s/store_s on PHASE=user_stopped",
+    "tests": [
+      "tests/gateway/test_stop_marker_fast_lookup.py::test_marker_reads_only_the_newest_row",
+      "tests/gateway/test_stop_marker_fast_lookup.py::test_every_stop_logs_its_stages"
+    ],
+    "paths": [
+      "gateway/run.py",
+      "gateway/run_*.py",
+      "gateway/run_agent_cache.py"
+    ],
+    "why": "37 Discord stops 11-04..11-08: p90 15 s, max 38.7 s; the stage line is what attributed the remaining cost to the marker write. PR #132, card t_eae5d4ab.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "busy /stop runs the async-delegation cancel off the event loop and fails open: a TimeoutError on state/async-delegations.lock no longer escapes /stop before the marker, adapter interrupt and slot release",
+    "tests": [
+      "tests/gateway/test_stop_survives_delegation_lock_timeout.py::test_stop_releases_the_session_when_the_delegation_cancel_times_out"
+    ],
+    "paths": [
+      "gateway/run_agent_cache.py"
+    ],
+    "why": "Ace 2026-11-08 15:38: /stop replied 'Sorry, I encountered an error (TimeoutError) timed out acquiring .../async-delegations.lock' and the session stayed busy (next /model refused). PR #134. Idle /stop and /new already failed open on the same call.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "mark_user_stopped / clear_user_stopped persist with the single-entry routing UPSERT (_save_entry), not the whole-index rewrite plus sessions.json mirror; still durable before the method returns",
+    "tests": [
+      "tests/gateway/test_stop_marker_single_row_write.py::test_mark_and_clear_skip_the_full_rewrite_and_land_on_disk",
+      "tests/gateway/test_stop_marker_single_row_write.py::test_out_of_order_stop_still_persists_the_newer_marker_with_one_row"
+    ],
+    "paths": [
+      "gateway/session.py",
+      "gateway/session_*.py"
+    ],
+    "why": "PHASE=user_stopped store_s measured 0.6 s, 5.5 s, 2.8 s on live stops 2026-11-08: /stop queued behind every other session's full routing save. Card t_eae5d4ab.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
   }
 ]
