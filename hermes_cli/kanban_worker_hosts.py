@@ -337,9 +337,9 @@ WORKSPACE_THROWAWAY_GLOBS = ("*.log", "*.patch", "pr-body.md")
 WORKSPACE_SCAN_MAX_ENTRIES = 2000
 WORKSPACE_GIT_TIMEOUT_SECONDS = 20
 WORKSPACE_LS_REMOTE_TIMEOUT_SECONDS = 10
-# Only the remote-containment answer is cached (the one network call), keyed by the checkout and its exact HEAD
-# sha, so a new HEAD misses by construction. The local half (``git status``) runs on every call: an edit inside a
-# checkout never touches the workspace root's mtime (t_e7c03f48 Prism 5c1daae965e0).
+# Only negative/unverified remote-containment answers are cached, keyed by checkout and exact HEAD sha.
+# Positive containment is re-proven every call: its only remote ref can be deleted inside the TTL. The local half
+# (``git status``) also runs every call: checkout edits never touch the workspace root's mtime (5c1daae965e0).
 WORKSPACE_BINDING_TTL_SECONDS = 120
 _binding_cache: Dict[tuple, tuple] = {}
 
@@ -399,7 +399,10 @@ def _git_binding(repo: str, rel: str, runner: Callable, t: float) -> Optional[st
     :data:`WORKSPACE_THROWAWAY_GLOBS`, a HEAD no remote tip contains (``@unpushed:<sha>``), or a HEAD whose
     containment the remote could not confirm now (``remote-unverified: <rel>``). Ignored files are the repo's own
     throwaway list. Any git failure binds (fail closed)."""
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+    from hermes_cli._subprocess_compat import noninteractive_git_env
+
+    env = noninteractive_git_env(os.environ)
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
     for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
         env.pop(k, None)
 
@@ -441,7 +444,7 @@ def _git_binding(repo: str, rel: str, runner: Callable, t: float) -> Optional[st
                 contained = _remote_contains(git, head)
             except (OSError, subprocess.SubprocessError, ValueError):
                 contained = None
-            if contained is not None:  # cache only an answer the remote gave; a failure re-asks next call
+            if contained is not True:  # cache only fail-closed answers; a containing remote ref can vanish now
                 if len(_binding_cache) > 4096:
                     _binding_cache.clear()
                 _binding_cache[key] = (t, contained)
@@ -464,8 +467,8 @@ def local_workspace_binding(path: Optional[str], *, runner: Callable = subproces
     :data:`WORKSPACE_THROWAWAY_GLOBS`. Anything else binds: another file, a symlink, a special file, an unpushed
     HEAD, a HEAD the remote cannot confirm now, a scan or git error, more than :data:`WORKSPACE_SCAN_MAX_ENTRIES`
     entries outside checkouts. An empty or missing workspace is None (:func:`local_workspace_has_content`). The
-    scan and ``git status`` run on every call; only the remote-containment answer is cached (per HEAD sha, for
-    :data:`WORKSPACE_BINDING_TTL_SECONDS`).
+    scan and ``git status`` run on every call; only negative/unverified remote answers are cached (per HEAD sha,
+    for :data:`WORKSPACE_BINDING_TTL_SECONDS`). Positive containment is always re-proven.
     """
     import time as _time
     if not local_workspace_has_content(path):

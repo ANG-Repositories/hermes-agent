@@ -703,8 +703,9 @@ def test_an_ls_remote_failure_binds_as_remote_unverified(reproducible_workspace,
             return subprocess.CompletedProcess(argv, 128, b"", b"fatal: unable to access")
         return subprocess.run(argv, **kw)
     assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
-    # a failure is never cached: the next call asks the remote again and the real answer is portable
-    assert kwh.local_workspace_binding(str(ws), now=1) is None
+    # Unverified answers may be cached: they only keep a card local. Re-ask after the bounded TTL.
+    assert kwh.local_workspace_binding(str(ws), now=1) == "remote-unverified: repo"
+    assert kwh.local_workspace_binding(str(ws), now=121) is None
     assert repo.exists()
 
 
@@ -732,10 +733,12 @@ def test_remote_containment_cache_is_keyed_by_head_but_status_always_runs(reprod
     assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) is None
     assert kwh.local_workspace_binding(str(ws), runner=runner, now=1) is None
     assert sum("status" in a for a in calls) == 2
-    assert sum("ls-remote" in a for a in calls) == 1
+    assert sum("ls-remote" in a for a in calls) == 2
     _git(repo, "commit", "-q", "--allow-empty", "-m", "local only")
     assert (kwh.local_workspace_binding(str(ws), runner=runner, now=2) or "").startswith("repo@unpushed:")
-    assert sum("ls-remote" in a for a in calls) == 2
+    assert sum("ls-remote" in a for a in calls) == 3
+    assert (kwh.local_workspace_binding(str(ws), runner=runner, now=3) or "").startswith("repo@unpushed:")
+    assert sum("ls-remote" in a for a in calls) == 3  # negative answer is safe to cache
 
 
 def test_remote_containment_accepts_ancestor_of_a_current_remote_tip(reproducible_workspace, tmp_path):
@@ -759,10 +762,55 @@ def test_remote_tip_not_present_locally_binds_as_unverified(reproducible_workspa
     assert repo.exists()
 
 
-def test_remote_containment_cache_expires_after_deleted_remote_branch(reproducible_workspace, tmp_path):
+def test_remote_containment_rechecks_positive_after_deleted_remote_branch(reproducible_workspace, tmp_path):
     ws = tmp_path / "ws"
     repo = reproducible_workspace(ws)
     assert kwh.local_workspace_binding(str(ws), now=0) is None
     _git(tmp_path, "--git-dir", str(tmp_path / "origin.git"), "branch", "-D", "feat-ws")
-    assert (kwh.local_workspace_binding(str(ws), now=121) or "").startswith("repo@unpushed:")
+    assert (kwh.local_workspace_binding(str(ws), now=1) or "").startswith("repo@unpushed:")
     assert repo.exists()
+
+
+@pytest.mark.parametrize("source", ["fsmonitor", "hooks", "inherited-config"])
+def test_workspace_git_probes_do_not_execute_checkout_config(reproducible_workspace, tmp_path, monkeypatch, source):
+    """Prism 4d0629af60fb: dispatcher probes must not execute checkout-controlled programs."""
+    import os
+    import shlex
+
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    marker = tmp_path / "executed"
+    program = tmp_path / "marker-command"
+    program.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
+    program.chmod(0o755)
+    if source == "fsmonitor":
+        _git(repo, "config", "core.fsmonitor", str(program))
+    elif source == "hooks":
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        hook = hooks / "reference-transaction"
+        hook.write_text(program.read_text())
+        hook.chmod(0o755)
+        _git(repo, "config", "core.hooksPath", str(hooks))
+    else:
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(program))
+
+    environments = []
+
+    def runner(argv, **kw):
+        environments.append(kw["env"])
+        return subprocess.run(argv, **kw)
+
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) is None
+    assert not marker.exists(), f"{source} executed as the dispatcher"
+    # Read-only probes do not trigger reference-transaction themselves; also pin the hooks override on
+    # EVERY subprocess so the test catches an unhardened hooks path without introducing a write probe.
+    for env in environments:
+        overrides = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+                     for i in range(int(env.get("GIT_CONFIG_COUNT", "0")))}
+        assert overrides.get("core.hooksPath") == os.devnull
+        assert overrides.get("core.fsmonitor") == "false"
+        assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
