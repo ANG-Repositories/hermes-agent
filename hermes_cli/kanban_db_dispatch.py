@@ -5208,9 +5208,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     wt_hosts = None
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
+        from hermes_cli import placement_policy as _ppol
+        fleet = _kb.kanban_home() / "fleet"
         port = _kwt.port_for(row["id"], row["workspace_path"],
-                             _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet",
-                             branch=_kb._row_get(row, "branch_name"))
+                             _kwt.board_default_workdir(board), fleet,
+                             branch=_kb._row_get(row, "branch_name"),
+                             allow_studio_tree=_ppol.load(fleet).is_last_resort(_kwp.STUDIO_HOST))
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
