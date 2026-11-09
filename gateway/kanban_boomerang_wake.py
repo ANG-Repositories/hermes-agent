@@ -1222,6 +1222,20 @@ def _card_status(entry: dict) -> str:
         return "?"
 
 
+async def _home_is_live(runner: Any, entry: dict) -> bool:
+    """True when the card's home session is a live chat origin (the precondition ``resurface`` needs)."""
+    from gateway import kanban_home_route as _hr
+    from gateway import kanban_owner_wake as _ow
+
+    try:
+        home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
+                                       entry.get("home_sid") or "", _hr.read_session_row)
+        return home is not None and bool(_ow.is_chat_origin(home))
+    except Exception as exc:   # unknown = not provably live: keep the chat line
+        logger.debug("kanban boomerang-wake: home check for %s failed: %s", entry.get("task_id"), exc)
+        return False
+
+
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
                 text: Optional[str] = None) -> None:
     """Commit the original wake obligation before any best-effort delivery. A freshness refusal
@@ -1230,16 +1244,22 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
     superseded = reason in _SUPERSEDE_REASONS
     handback = handback_row(entry, {"summary": reason},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
-    if superseded:
+    status = await asyncio.to_thread(_card_status, entry) if superseded else ""
+    # Quiet only when the re-delivered wake has somewhere to land. With no live home the turn part
+    # retries silently forever, so the origin chat keeps ONE plain line (Prism c-4e2273b5aa3cb68a).
+    quiet = superseded and await _home_is_live(runner, entry)
+    if quiet:
         handback[1]["parts"] = [PART_TURN]
         handback[1]["line"] = ""
+    elif superseded:
+        handback[1]["line"] = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before "
+                               f"the wake ran; no live home session, so the original wake was NOT re-delivered")
     else:
         handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
                             outcome="superseded" if superseded else "failed",
                             reason=reason, resurfaced=True, resurface_delivered=False, handback=handback)
-    if superseded:
-        status = await asyncio.to_thread(_card_status, entry)
+    if quiet:
         line = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before the wake ran; "
                 f"original wake re-delivered")
         logger.info("kanban boomerang-wake: %s", line)

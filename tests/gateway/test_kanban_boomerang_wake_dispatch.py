@@ -378,6 +378,29 @@ def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):
     assert claim["reason"] == "state moved" and claim["resurface_delivered"] is True
 
 
+def test_card_moved_with_no_live_home_keeps_one_plain_chat_line(env):
+    """Prism c-4e2273b5aa3cb68a: a supersede whose wake cannot be re-delivered (no live home) must
+    not vanish. One plain (non-⚠️) origin-chat line says so; no #logs 're-delivered' claim."""
+    logs: list = []
+    env["monkeypatch"].setattr(ah, "post_logs", logs.append)
+    # The home resolves (dispatch proceeds) but is not a live chat origin, the exact condition under
+    # which resurface() cannot re-deliver the wake.
+    env["monkeypatch"].setattr(ow, "is_chat_origin", lambda *_a, **_k: False)
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        assert kb.reopen_task(conn, tid, actor="ci-sendback", reason="CI red")[0]
+    _run(env, entry, "completed", _verdict(entry, "complete"))
+    assert env["adapter"].sent == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
+                                   f"no live home session, so the original wake was NOT re-delivered"], \
+        env["adapter"].sent
+    assert logs == [], logs
+    assert env["adapter"].handled == []
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
+
+
 def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
     """D-14: a surfaced child's summary + evidence lead the re-delivered wake (original after
     ``---``) and are recorded once on the card; a replayed handoff adds no second comment."""
