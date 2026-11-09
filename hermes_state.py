@@ -7,7 +7,6 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
-import contextlib
 import hashlib
 import json
 import logging
@@ -1252,19 +1251,27 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
-    @contextlib.contextmanager
-    def _writer_lock_attributed(self):
-        """``with self._lock`` that, after WAITER_ATTRIBUTION_S of waiting, logs who holds the write
-        lock (ledger) once and keeps waiting exactly as before. Same lock, same blocking semantics; the
-        timed first try only adds the log line (t_7fe48f0b). Attribution never raises."""
-        t0 = time.monotonic()
-        if not self._lock.acquire(timeout=WAITER_ATTRIBUTION_S):
-            log_write_lock_waiter(self.db_path, time.monotonic() - t0, lock="writer")
-            self._lock.acquire()
+    def _writer_wait_timer(self):
+        """Waiter-side attribution for the in-process writer lock (t_7fe48f0b): when ``self._lock`` is
+        already held, arm a daemon timer that logs the ledger's current holder once if this writer has
+        not entered ``with self._lock`` within WAITER_ATTRIBUTION_S. The lock itself is still taken by the
+        caller's plain ``with self._lock`` (same acquire, same blocking); the caller cancels the timer
+        as its first statement inside the lock. Uncontended writes start no thread. Never raises."""
         try:
-            yield
-        finally:
-            self._lock.release()
+            locked = getattr(self._lock, "locked", None)
+            if not callable(locked) or not locked():
+                return None
+            t0, db_path = time.monotonic(), self.db_path
+            timer = threading.Timer(
+                WAITER_ATTRIBUTION_S,
+                lambda: log_write_lock_waiter(db_path, time.monotonic() - t0, lock="writer"),
+            )
+            timer.daemon = True
+            timer.name = "state-db-writer-waiter"
+            timer.start()
+            return timer
+        except Exception:
+            return None
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
@@ -1301,7 +1308,10 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._writer_lock_attributed():
+                waiter_timer = self._writer_wait_timer()
+                with self._lock:
+                    if waiter_timer is not None:
+                        waiter_timer.cancel()
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
