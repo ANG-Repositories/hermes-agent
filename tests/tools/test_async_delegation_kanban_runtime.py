@@ -1561,44 +1561,89 @@ def test_pause_hold_refusal_never_falls_back_in_process(monkeypatch, tmp_path, s
     assert statuses == ["archived"]
 
 
-def test_pause_hold_refusal_on_a_card_it_could_not_archive(monkeypatch, tmp_path, spawner):
-    """Prism c-c6546d2332b994d5 / 2de869079d8e: spawn_now refused by a pause hold, and the container card could
-    not be archived (launch_unit says fenced=False). The card stays ready and is dispatched once the hold clears.
-    The launch fence cannot stop that (only the card-end watcher reads it); the failed record does: the late
-    runner finds nothing to run. So the fence is released, the failure names the unarchived card, and once the
-    late card ends the watcher archives it and marks it drained (a kept fence would skip it forever)."""
+def test_pause_hold_refusal_on_a_card_it_could_not_archive_blocks_it(monkeypatch, tmp_path, spawner):
+    """Prism c-0f03927fd807dfe8 (send-back 2026-11-08): spawn_now refused by a pause hold and the container card
+    could not be archived. An in-memory fence never stopped dispatch, so the card must end in a DURABLE state the
+    dispatcher honours: the archive is retried, then the card is blocked with the hold named. Once the hold clears
+    no runner is ever started for it; the fence is released and the card-end watcher drains it normally."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli import kanban_pause_hold as kph
-    from tools import delegation_unit_worker as duw
 
     why = "pause_hold (ci-box:fwa:pause:20261107T150000Z-ci-box-fwa00001 by apollo stage=destination)"
     monkeypatch.setattr(kph, "local_destination_wait", lambda cache: why)
-    monkeypatch.setattr(akb, "_archive_quietly", lambda task_id: False)
+    archives = []
+    monkeypatch.setattr(akb, "_archive_quietly", lambda task_id: archives.append(task_id) and False)
+    monkeypatch.setattr(ad, "_HELD_ARCHIVE_RETRY_SECONDS", 0.0, raising=False)
     handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
     did = handle["delegation_id"]
     rec = _record(did)
     task_id = rec["kanban"]["task_id"]
     assert calls == [] and spawner.procs == [], "nothing ran under the hold"
     assert rec["state"] == "failed" and rec["attempt"]["generation"] == 0
-    assert not akb._fenced_launch(task_id), "the fence does not stop dispatch: it is released"
-    terminal = json.dumps([e for e in rec["outbox"] if e.get("type") == "async_delegation"])
-    assert f"card {task_id} could not be archived" in terminal, terminal
+    assert len(archives) > 1, "the archive is retried before the card is blocked"
+    assert not akb._fenced_launch(task_id), "no fence is left installed"
     card, _ = _card(task_id)
-    assert card.status == "ready", "the archive failed: the card is still dispatchable"
-    # The hold clears and dispatch processes the card: its runner must not run the failed delegation.
+    assert card.status == "blocked", "an unarchivable held card is blocked, never left ready"
+    with kb.connect_closing(board="delegations") as conn:
+        reason = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                              (task_id,)).fetchone()
+    assert reason is not None and "pause_hold (ci-box:fwa:" in reason["payload"], reason
+    terminal = json.dumps([e for e in rec["outbox"] if e.get("type") == "async_delegation"])
+    assert "pause_hold (ci-box:fwa:" in terminal and f"card {task_id} could not be archived and is blocked" \
+        in terminal, terminal
+    # The hold clears: dispatch refuses the blocked card, no runner is ever started for it.
     monkeypatch.setattr(kph, "local_destination_wait", lambda cache: None)
     with kb.connect_closing(board="delegations") as conn:
-        assert kbd.spawn_now(conn, task_id, board="delegations", spawn_fn=spawner)
-    assert len(spawner.procs) == 1
-    _, current = duw.read_unit(task_id)
-    assert current is None, "the delegation reported failed is not run by the late card"
-    assert _record(did)["state"] == "failed" and calls == []
-    # The late card ends: the card-end watcher drains it like any other ended card of a failed delegation.
-    _end_card(task_id, "done")
+        with pytest.raises(kbd.SpawnNowError):
+            kbd.spawn_now(conn, task_id, board="delegations", spawn_fn=spawner)
+    assert spawner.procs == [] and calls == []
+    # The blocked card is an ended card: the watcher drains and archives it like any other.
     for _ in range(3):
         _drain()
         _deliver(_queued())
     card, kinds = _card(task_id)
     assert kinds.count(akb.DRAINED_EVENT) == 1 and card.status == "archived", (card.status, kinds)
-    assert _record(did)["state"] == "failed" and calls == []
+    assert _record(did)["state"] == "failed" and calls == [] and spawner.procs == []
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "no-hold-kill-switch"])
+def test_dispatch_lock_contention_never_falls_back_on_a_held_host(monkeypatch, tmp_path, spawner, held):
+    """Prism c-fe2befb7c5f6b742 / f74fcf83e838: spawn_now can fail on the board's tick lock (plain SpawnNowError,
+    raised before the pause fence in _spawn_now_locked). With a live FWA hold on this host the generic in-process
+    fallback would run the unit on the held host anyway: the hold is re-checked first, nothing runs and the
+    delegation fails naming the hold. With no hold the fallback is today's (one in-process run)."""
+    import contextlib
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_pause_hold as kph
+
+    why = "pause_hold (ci-box:fwa:pause:20261107T150000Z-ci-box-fwa00001 by apollo stage=destination)"
+    monkeypatch.setattr(kph, "local_destination_wait", lambda cache: why if held else None)
+
+    @contextlib.contextmanager
+    def _busy(path):
+        yield False
+
+    real_spawn_now = kbd.spawn_now
+    monkeypatch.setattr(kbd._kbc, "_dispatch_tick_lock", _busy)
+    monkeypatch.setattr(kbd, "spawn_now", lambda conn, task_id, **kw: real_spawn_now(
+        conn, task_id, lock_wait_seconds=0, **kw))
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert spawner.procs == [], "the tick lock was never taken: no worker spawned"
+    with kb.connect_closing(board="delegations") as conn:
+        statuses = [r["status"] for r in conn.execute("SELECT status FROM tasks")]
+    assert statuses == ["archived"]
+    runtime = ad.kanban_launch_runtime(did, timeout=0)
+    if held:
+        assert calls == [], "no in-process fallback on a held host"
+        assert rec["state"] == "failed" and rec["attempt"]["generation"] == 0
+        terminal = json.dumps([e for e in rec["outbox"] if e.get("type") == "async_delegation"])
+        assert "pause_hold (ci-box:fwa:" in terminal, terminal
+        assert runtime.startswith("none (kanban pause hold"), runtime
+    else:
+        assert len(calls) == 1 and rec["state"] == "done" and rec["attempt"]["generation"] == 1
+        assert runtime.startswith("in_process (kanban spawn failed: SpawnNowError"), runtime
