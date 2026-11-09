@@ -5,7 +5,7 @@ The real ``browser_harness.daemon.Daemon`` (pinned fleet fork commit) is driven 
 goes red here. A stub of the pre-lease daemon keeps the fail-closed path covered.
 """
 import asyncio
-import inspect
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -54,11 +54,25 @@ ROUTE = SimpleNamespace(cdp_url="ws://127.0.0.1:9222/devtools/browser/x", ready=
 
 
 def test_installed_daemon_dispatches_lease_metas():
-    source = inspect.getsource(daemon.Daemon.handle)
-    for meta in ("lease_acquire", "lease_check", "lease_release"):
-        assert f'"{meta}"' in source, f"installed browser_harness.daemon lacks the {meta} IPC meta"
-    for method in ("_lease_acquire", "_lease_check", "_lease_release"):
-        assert callable(getattr(daemon.Daemon, method, None))
+    """Each lease meta goes through the installed Daemon.handle dispatch and gets a lease reply."""
+    d = _real_daemon()
+
+    def send(req):
+        return asyncio.run(d.handle(req))
+
+    # The daemon expires a lease whose owner pid is dead, so the owner is this (live) process.
+    acquired = send({"meta": "lease_acquire", "ttl": 30, "owner_pid": os.getpid()})
+    assert set(acquired) >= {"token", "targetId", "generation"}, acquired
+    assert acquired["targetId"] == "T1" and acquired["url"] == "https://login.example/"
+    token = acquired["token"]
+
+    checked = send({"meta": "lease_check", "token": token})
+    assert (checked["targetId"], checked["generation"]) == ("T1", acquired["generation"]), checked
+    assert send({"meta": "lease_check", "token": "not-the-token"}) == {"error": "lease_invalid"}
+
+    assert send({"meta": "lease_release", "token": "not-the-token"}) == {"released": False}
+    assert send({"meta": "lease_release", "token": token}) == {"released": True}
+    assert send({"meta": "lease_check", "token": token}) == {"error": "lease_invalid"}
 
 
 def test_lease_round_trip_against_installed_daemon(monkeypatch):
