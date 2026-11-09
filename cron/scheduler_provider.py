@@ -255,7 +255,7 @@ class CronScheduler(ABC):
         clobbered, and neither is a job that has since run again.
         """
         from cron.executions import list_executions
-        from cron.jobs import load_jobs, mark_job_run
+        from cron.jobs import load_jobs, mark_job_run, replay_interrupted_oneshot
 
         seen: set = set()
         reconciled = 0
@@ -273,6 +273,8 @@ class CronScheduler(ABC):
             last_run = job.get("last_run_at") or ""
             if _stamp_not_before(last_run, claimed_at):
                 continue  # the job already recorded this run (or a newer one)
+            if replay_interrupted_oneshot(job_id, row):
+                continue  # a never-run one-shot whose owner died is re-armed once (t_b5c315bb)
             mark_job_run(
                 job_id, False,
                 "Interrupted: the scheduler process exited before this run's "

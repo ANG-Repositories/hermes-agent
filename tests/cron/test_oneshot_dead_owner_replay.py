@@ -178,6 +178,107 @@ def test_replay_killed_again_is_not_replayed_and_pages_once(home, monkeypatch):
     # Wedged for more than 2 ticks with a dead-owner claim: exactly one page, for this job.
     assert len(home.pages) == 1
     argv = home.pages[0]
-    assert argv[0] == "page" and JOB_ID in argv
+    assert argv[0] == "page"
+    key = argv[argv.index("--key") + 1]
+    assert key == "%s:%s" % (jobs_mod._dead_owner_episode_scope(), JOB_ID)
     text = argv[argv.index("--text") + 1]
     assert JOB_ID in text and "dead" in text
+
+
+_PAUSED_OWNER = textwrap.dedent(
+    f"""
+    import time
+    from cron.jobs import claim_dispatch, claim_job_for_fire, get_due_jobs
+
+    due = [j["id"] for j in get_due_jobs()]
+    assert due == [{JOB_ID!r}], due
+    assert claim_job_for_fire({JOB_ID!r})
+    assert claim_dispatch({JOB_ID!r})
+    print("CLAIMED", flush=True)  # paused before create_execution: no ledger row yet
+    time.sleep(600)
+    """
+)
+
+
+def test_live_owner_with_expired_claims_and_no_ledger_row_is_not_replayed(home, monkeypatch):
+    """Prism 9e9a051f53d3: TTL expiry is not death. A live owner paused between claim_dispatch
+    and create_execution must not have its one-shot replayed under it."""
+    import cron.jobs as jobs_mod
+    from cron.executions import latest_execution
+
+    _seed(home.path, datetime.now(timezone.utc).astimezone() - timedelta(seconds=1))
+    env = {k: v for k, v in os.environ.items() if k != "HERMES_MACHINE_ID"}
+    env["HERMES_HOME"] = str(home.path)
+    env["PYTHONPATH"] = str(REPO)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _PAUSED_OWNER], cwd=str(REPO), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        if line.strip() != "CLAIMED":
+            proc.kill()
+            _, err = proc.communicate(timeout=30)
+            pytest.fail(f"owner never claimed: {line!r} {err[-2000:]}")
+        assert latest_execution(JOB_ID) is None
+        # Both claims far past their TTLs while the owner process is still alive.
+        _shift_clock(monkeypatch, 4 * 3600)
+        for _ in range(4):
+            assert [j["id"] for j in jobs_mod.get_due_jobs()] == []
+        assert proc.poll() is None
+        job = next((j for j in jobs_mod.load_jobs() if j["id"] == JOB_ID), None)
+        if job is not None:
+            assert job["repeat"]["completed"] == 1
+            assert not job.get(jobs_mod.RESTART_REQUEUE_COUNT_KEY)
+        assert latest_execution(JOB_ID) is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def test_startup_recovery_preserves_the_replay(home, monkeypatch):
+    """Prism 36f55300e879: scheduler startup runs recover_interrupted() before the first due
+    scan; its jobs.json reconcile must arm the replay, not record the run and retire the job."""
+    import cron.jobs as jobs_mod
+    from cron.executions import latest_execution
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    _seed(home.path, datetime.now(timezone.utc).astimezone() - timedelta(seconds=1))
+    _sigterm_owner_mid_run(home.path)
+
+    assert InProcessCronScheduler().recover_interrupted() >= 1
+    recovered = _store(home.path)
+    assert recovered["last_run_at"] is None
+    assert recovered["run_claim"] is None and recovered["fire_claim"] is None
+    assert recovered["repeat"]["completed"] == 0
+    assert recovered[jobs_mod.RESTART_REQUEUE_COUNT_KEY] == 1
+    assert latest_execution(JOB_ID)["status"] == "unknown"
+
+    _shift_clock(monkeypatch, 5)
+    assert [j["id"] for j in jobs_mod.get_due_jobs()] == [JOB_ID]
+    assert [j["id"] for j in jobs_mod.get_due_jobs()] == []  # no double fire
+    assert home.pages == []
+
+
+def test_dead_owner_episodes_are_isolated_per_store(home, monkeypatch, tmp_path):
+    """Prism 4e78fd657d34: another profile's scan of a job with the same id neither counts nor
+    clears this store's open episode."""
+    import cron.jobs as jobs_mod
+
+    _seed(home.path, datetime.now(timezone.utc).astimezone() - timedelta(seconds=1))
+    _sigterm_owner_mid_run(home.path)
+    raw = jobs_mod.load_jobs()
+    raw[0][jobs_mod.RESTART_REQUEUE_COUNT_KEY] = 1
+    jobs_mod.save_jobs(raw)
+    _shift_clock(monkeypatch, 4493)
+    for _ in range(3):
+        jobs_mod.get_due_jobs()
+    assert [a[0] for a in home.pages] == ["page"]
+    key_a = home.pages[0][home.pages[0].index("--key") + 1]
+
+    other = tmp_path / "other-profile"
+    with jobs_mod.use_cron_store(other):
+        assert jobs_mod._dead_owner_episode_scope() != key_a.rsplit(":", 1)[0]
+        healthy = dict(raw[0], run_claim=None, fire_claim=None)
+        jobs_mod._warn_overdue_oneshots_not_due([healthy], [], set(), jobs_mod._hermes_now())
+    assert [a[0] for a in home.pages] == ["page"]  # store A's episode was not cleared
+    assert key_a in jobs_mod._dead_owner_wedge_paged
