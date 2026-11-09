@@ -860,14 +860,16 @@ class TurnRunner:
                 last_edit_ts = time.monotonic()
                 await self._progress_restore_typing(st)
             except queue.Empty:
-                # A cancel raised in here would not reach the sibling CancelledError clause below, so the
-                # drain (and the notice's removal) would be skipped (Prism 3e31f1099cb9): catch it here too.
+                # A cancel raised in here does not reach the sibling CancelledError clause below, so the
+                # drain (and the notice's removal) would be skipped (Prism 3e31f1099cb9). Drain, then let the
+                # cancel propagate exactly as before: callers await the task and expect CancelledError.
                 try:
                     await self._paint_inflight_notice(st)
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
-                    await self._drain_progress_on_cancel(st)
-                    return
+                    with suppress(Exception):
+                        await self._drain_progress_on_cancel(st)
+                    raise
             except asyncio.CancelledError:
                 await self._drain_progress_on_cancel(st)
                 return

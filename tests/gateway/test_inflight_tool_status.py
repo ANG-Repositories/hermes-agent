@@ -280,7 +280,8 @@ async def test_cancel_during_idle_sleep_still_retires_the_notice(monkeypatch):
     monkeypatch.setattr(tr, "_progress_edit_state", lambda _a: st)   # the loop uses the seeded bubble
     assert seeded is not None
 
-    await tr.send_progress_messages()   # must return, not propagate the cancel
+    with pytest.raises(real_asyncio.CancelledError):   # the cancel still propagates to the awaiting caller
+        await tr.send_progress_messages()
 
     final = adapter.edits[-1]["content"]
     assert "still inside" not in final, final
