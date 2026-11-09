@@ -7,6 +7,8 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 import contextlib
 import hashlib
+import json
+import os
 import random
 import re
 import secrets
@@ -40,6 +42,15 @@ _CORRUPT_BACKUP_RETENTION = 10
 # then proceed without the lock (in-process _INIT_LOCK + idempotent init backstop).
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
+
+# Cross-process healthy verdict: ``_INITIALIZED_PATHS`` is per-process, so every
+# fresh CLI/worker process re-ran a full integrity_check (~2-3 s on a 740 MB
+# board) under the init lock and queued the rest behind it (t_5e8801d8). A clean
+# check leaves ``<db>.integrity-ok`` bound to the file's (st_dev, st_ino); it is
+# trusted for the TTL only. Env override (seconds, 0 disables), env-only like
+# the busy timeout so connect() never loads config.yaml.
+_INTEGRITY_STAMP_TTL_ENV = "HERMES_KANBAN_INTEGRITY_STAMP_TTL_SECONDS"
+_INTEGRITY_STAMP_TTL_SECONDS = 900
 
 
 def _resolve_busy_timeout_ms() -> int:
@@ -526,6 +537,46 @@ def _probe_for_corruption(resolved: Path) -> tuple[Optional[list[str]], Optional
     return messages, f"integrity_check returned {messages[0] if messages else '<no row>'!r}"
 
 
+def _integrity_stamp_path(resolved: Path) -> Path:
+    return resolved.with_name(resolved.name + ".integrity-ok")
+
+
+def _integrity_stamp_is_fresh(resolved: Path, identity: Optional[tuple[int, int]]) -> bool:
+    """True iff the stamp names this exact file and is younger than the TTL.
+    Missing/unreadable/malformed/foreign-inode/expired/future stamps are False."""
+    ttl = _kb._env_int(_INTEGRITY_STAMP_TTL_ENV, _INTEGRITY_STAMP_TTL_SECONDS, minimum=0)
+    if ttl <= 0 or identity is None:
+        return False
+    try:
+        data = json.loads(_integrity_stamp_path(resolved).read_text())
+        stamped = (int(data["dev"]), int(data["ino"]))
+        age = time.time() - float(data["checked_at"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    return stamped == identity and 0 <= age < ttl
+
+
+def _write_integrity_stamp(resolved: Path, identity: Optional[tuple[int, int]], checked_at: float) -> None:
+    """Record a clean verdict for ``identity``; skipped if the file was swapped
+    during the check. Best effort: a failed write only costs the next process a
+    full check."""
+    if identity is None or _kb._path_identity(resolved) != identity:
+        return
+    stamp = _integrity_stamp_path(resolved)
+    tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps({"dev": identity[0], "ino": identity[1], "checked_at": checked_at}))
+        os.replace(tmp, stamp)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _drop_integrity_stamp(resolved: Path) -> None:
+    with contextlib.suppress(OSError):
+        _integrity_stamp_path(resolved).unlink()
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
@@ -536,8 +587,10 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     the file + sidecars and raise :class:`KanbanDbCorruptError` so callers
     never recreate the schema on top of a damaged DB. ``OperationalError``
     (lock/busy) is NOT corruption and propagates raw (no spurious backup).
-    No-op for missing / zero-byte files and paths already proven healthy this
-    process. All writes are confined to the resolved path's parent.
+    No-op for missing / zero-byte files, paths already proven healthy this
+    process, and a fresh ``<db>.integrity-ok`` stamp for this exact file
+    (another process's clean verdict within the TTL). All writes are confined
+    to the resolved path's parent.
     """
     try:
         resolved = path.resolve()
@@ -545,9 +598,15 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if _missing_or_empty(resolved) or str(resolved) in _INITIALIZED_PATHS:
         return
+    identity = _kb._path_identity(resolved)
+    if _integrity_stamp_is_fresh(resolved, identity):
+        return
+    checked_at = time.time()
     messages, reason = _probe_for_corruption(resolved)
     if reason is None:
+        _write_integrity_stamp(resolved, identity, checked_at)
         return
+    _drop_integrity_stamp(resolved)
     # Quarantine FIRST — both the repair and fail-closed paths preserve the
     # pre-touch bytes before anything mutates the file.
     backup = _backup_corrupt_db(resolved)
@@ -637,6 +696,7 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
         if reason is None:
             return RepairResult(status="ok", db_path=resolved, messages=messages)
 
+        _drop_integrity_stamp(resolved)
         # Quarantine FIRST — identical policy to the connect-time guard.
         backup = _backup_corrupt_db(resolved)
         index_names = _repairable_index_names(messages)
