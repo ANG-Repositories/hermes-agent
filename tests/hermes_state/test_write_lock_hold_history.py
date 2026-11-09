@@ -373,10 +373,17 @@ def test_clock_and_logging_failures_never_change_write_result(db, monkeypatch, p
         def emit(self, record):
             raise RuntimeError("logging handler failed")
 
-    def broken_clock():
-        raise RuntimeError("diagnostic clock failed")
+    writer_tid = threading.get_ident()
 
-    clock = SimpleNamespace(monotonic=broken_clock, time=broken_clock, thread_time=broken_clock)
+    def writer_clock(real):
+        def read():
+            if threading.get_ident() == writer_tid:
+                raise RuntimeError("diagnostic clock failed")
+            return real()
+        return read
+
+    clock = SimpleNamespace(**{name: writer_clock(getattr(time, name))
+                               for name in ("monotonic", "time", "thread_time")})
     original = ValueError("original callback error")
     handler = RaisingHandler()
     monkeypatch.setattr(lockowners.logger, "level", logging.DEBUG)
