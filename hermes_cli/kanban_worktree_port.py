@@ -280,7 +280,7 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
            why: Optional[List[str]] = None) -> Tuple[Optional[Path], Optional[Tuple[str, str, str, str]]]:
     """``(anchor repo | None, push)``: :func:`anchor_repo`'s checks, with the reason a card stays local
     appended to ``why``. ``push_ok`` (derived mode, t_1d2c5939): a card branch whose commits origin lacks is
-    no longer a refusal; ``push`` = ``(repo, branch, expected origin sha or "")`` and the spawn pushes it
+    no longer a refusal; ``push`` = ``(repo, branch, expected origin sha or "", assessed local sha)`` and the spawn pushes it
     (:func:`push_card_branch`) before the clone. Still local: an own tree with uncommitted/untracked work
     (``unpushed_dirty_tree``), and a branch that diverged from origin (a push would drop origin's commits)."""
     from hermes_cli.kanban_db_workspace import _git_toplevel, _is_linked_worktree_checkout

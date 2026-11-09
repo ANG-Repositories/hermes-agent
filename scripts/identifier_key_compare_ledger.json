@@ -57,6 +57,21 @@
   }
  ],
  "sites": {
+  "hermes_cli/kanban_worktree_port.py::read_overrides::fold::slug::out[slug.lower()] = (val.get(\"*\"), {h.lower(): p for h, p in val.items() if h != \"*\"})": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; mirror override keys intentionally share GitHub identity semantics.",
+   "where": "hermes_cli/kanban_worktree_port.py:165 read_overrides"
+  },
+  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::if slug.lower() in exclude:": {
+   "verdict": "kept",
+   "why": "GitHub repository exclusions must cover case aliases of the same repository, not task or session identifiers.",
+   "where": "hermes_cli/kanban_worktree_port.py:178 derived_route"
+  },
+  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::default, per_host = paths.get(slug.lower(), (None, {}))": {
+   "verdict": "kept",
+   "why": "GitHub repository names are case-insensitive; match the normalized override map.",
+   "where": "hermes_cli/kanban_worktree_port.py:185 derived_route"
+  },
   "hermes_cli/kanban.py::_cmd_set_model::fold::model::clearing = args.model is None or str(args.model).lower() in {\"none\", \"-\", \"null\", \"\"}": {
    "verdict": "kept",
    "why": "sentinel-word detection on CLI input (`none`/`null`/`-` clears the pin); the model id itself is stored unfolded.",
