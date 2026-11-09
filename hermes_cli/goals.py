@@ -966,42 +966,53 @@ def _goal_loop_session_activity(db: Any) -> Tuple[Dict[str, float], Dict[str, st
 
 
 def _retire_if_still_orphaned(
-    db: Any, prefix: str, sid: str, cutoff: float, is_routed: Callable[[str], bool], retire: Callable,
-) -> bool:
+    db: Any, prefix: str, sid: str, cutoff: float, scanned: Dict[str, Optional[str]], retire: Callable,
+) -> Optional[Tuple[str, str]]:
     """Retire ``<prefix><sid>`` only if, read inside ONE write transaction (BEGIN IMMEDIATE, so no
-    writer can land between the check and the write), it is still active, every row clock of the
-    session's goal AND loop is <= *cutoff*, the session store's recency (heartbeat, messages, start) is
-    <= *cutoff*, and *is_routed* (the LIVE routing table, re-read here) says unrouted. Anything that
-    turned live after the candidate scan (a message, an activity heartbeat, a goal turn, a loop resume,
-    a /resume that re-routes the key) keeps the row. *retire*: ``raw -> new raw | None``.
+    writer can land between the check and the write), nothing about the session changed since the
+    candidate scan:
+    - fence: each of the session's goal/loop rows that the scan saw ACTIVE is byte-identical to the
+      scanned row, so any edit (a turn, ``/goal`` subgoal/gate/contract edits that move no clock, a
+      loop re-arm) keeps BOTH rows;
+    - a sibling row the scan did NOT see active (e.g. a paused loop resumed since) has every clock
+      <= *cutoff*;
+    - the session store's recency (activity heartbeat, messages, start) is <= *cutoff*.
+    Routing is NOT read here: the caller checks it outside the transaction (a routing lookup can
+    re-enter this SessionDB's non-reentrant write lock). *scanned*: ``{prefix: raw | None}``.
+    *retire*: ``raw -> new raw | None``. Returns ``(old_raw, new_raw)`` when written, else None.
     Raises on a read failure (the caller counts nothing)."""
     key = f"{prefix}{sid}"
     recency = _orphan_gc_session_activity_sql()
 
-    def _txn(conn) -> bool:
+    def _txn(conn) -> Optional[Tuple[str, str]]:
         def _raw(k):
             row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (k,)).fetchone()
             return row[0] if row else None
 
         raw = _raw(key)
-        if _active_row_clock(prefix, raw) is None:
-            return False
+        if raw is None or raw != scanned.get(prefix):
+            return None
         for p, _clocks in _ORPHAN_GC_ROW_CLOCKS:
-            last = _active_row_clock(p, raw if p == prefix else _raw(f"{p}{sid}"))
+            if p == prefix:
+                continue
+            sibling = _raw(f"{p}{sid}")
+            if scanned.get(p) is not None:
+                if sibling != scanned[p]:
+                    return None
+                continue
+            last = _active_row_clock(p, sibling)
             if last is not None and last > cutoff:
-                return False
+                return None
         srow = conn.execute(f"SELECT {recency} FROM sessions s WHERE s.id = ?", (sid,)).fetchone()
         if srow is not None and float(srow[0] or 0.0) > cutoff:
-            return False
-        if is_routed(sid):
-            return False
+            return None
         new = retire(raw)
         if new is None:
-            return False
+            return None
         conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (new, key))
-        return True
+        return raw, new
 
-    return bool(db._execute_write(_txn))
+    return db._execute_write(_txn)
 
 
 def reap_orphaned_goals_and_loops(
@@ -1035,18 +1046,31 @@ def reap_orphaned_goals_and_loops(
     from hermes_cli.loops import _retired_loop_json
 
     for sid in orphaned_goal_and_loop_ids(now, routed, activity, gc_days=gc_days):
-        for prefix, rows, counter, retire in (
-            ("goal:", goal_sids, "orphaned",
+        scanned = {"goal:": goal_sids.get(sid), "loop:": loop_sids.get(sid)}
+        for prefix, counter, retire in (
+            ("goal:", "orphaned",
              functools.partial(_retired_goal_json, status="orphaned", reason=f"{reason}; /goal resume restores")),
-            ("loop:", loop_sids, "loops",
+            ("loop:", "loops",
              functools.partial(_retired_loop_json, session_id=sid, status="orphaned",
                                reason=f"{reason}; /loop resume restores")),
         ):
-            if sid not in rows:
+            if scanned[prefix] is None:
                 continue
             try:
-                if _retire_if_still_orphaned(db, prefix, sid, cutoff, live_routed, retire):
-                    counts[counter] += 1
+                # Live routing is read OUTSIDE the write transaction: a SessionStore lookup may load
+                # routing from this same SessionDB, whose write lock is not reentrant (Prism 0d90dba2499b).
+                if live_routed(sid):
+                    continue
+                written = _retire_if_still_orphaned(db, prefix, sid, cutoff, scanned, retire)
+                if not written:
+                    continue
+                # A /resume that routed the session between the check above and the commit: give the
+                # row back (CAS, so a newer edit is never clobbered).
+                if live_routed(sid):
+                    db.compare_and_set_meta(f"{prefix}{sid}", written[1], written[0])
+                    continue
+                scanned[prefix] = written[1]  # our own write is not a concurrent edit for the sibling's fence
+                counts[counter] += 1
             except Exception as exc:
                 logger.debug("goal-gc: retiring %s%s failed, left active: %s", prefix, sid, exc)
     return counts

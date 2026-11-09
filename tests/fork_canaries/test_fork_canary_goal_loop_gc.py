@@ -231,6 +231,10 @@ _LIVE_AFTER_SCAN = {
     "heartbeat": lambda db, routes: db.touch_session_activity("s", ts=time.time()),
     # Prism 257ff1d18304: the goal itself runs a turn.
     "goal-turn": lambda db, routes: _rewrite(db, "goal:s", goals.GoalState, last_turn_at=time.time()),
+    # Prism f0485ed61fa5: user edits that move NO clock (the scanned-row fence is what keeps these).
+    "goal-subgoal": lambda db, routes: goals.GoalManager("s").add_subgoal("new requirement"),
+    "goal-gate": lambda db, routes: goals.GoalManager("s").add_gate("pytest -q"),
+    "goal-contract": lambda db, routes: goals.GoalManager("s").set_contract(goals.GoalContract(outcome="ship it")),
     # Prism 4ca29f7a0858 (txn side): the sibling loop is re-armed (what resume() writes).
     "loop-rearm": lambda db, routes: _rewrite(db, "loop:s", loops.LoopState, next_due_at=time.time()),
     # Prism d6291f28e729: /resume (or a topic rebind) routes the session after the routing snapshot.
@@ -239,8 +243,9 @@ _LIVE_AFTER_SCAN = {
 
 
 @pytest.mark.parametrize("event", sorted(_LIVE_AFTER_SCAN))
-def test_reaper_rechecks_eligibility_inside_the_retiring_write(tmp_path, event):
+def test_reaper_keeps_a_session_that_turned_live_after_the_scan(tmp_path, monkeypatch, event):
     db = _db(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
     now = time.time()
     try:
         _put_goal(db, "s", age_days=9, now=now)
@@ -253,13 +258,84 @@ def test_reaper_rechecks_eligibility_inside_the_retiring_write(tmp_path, event):
                                                      is_routed=live_routes.__contains__)
 
         assert hooked.fired == 1  # the interleaving really ran between scan and retire
-        # RED-proof (M13) message/heartbeat: in hermes_cli/goals.py::_retire_if_still_orphaned
-        #   (~line 994) delete the `srow = conn.execute(...)` recheck and its `return False`.
-        # RED-proof (M10) goal-turn/loop-rearm: in the same function (~line 990) delete the
-        #   `for p, _clocks in _ORPHAN_GC_ROW_CLOCKS:` row-clock recheck loop.
-        # RED-proof (M15) route: in the same function (~line 997) delete `if is_routed(sid): return False`.
+        # RED-proof, all in hermes_cli/goals.py:
+        # (M13) message/heartbeat: in _retire_if_still_orphaned (~line 1006) delete the
+        #   `if srow is not None and float(srow[0] or 0.0) > cutoff: return None` session recheck.
+        # (M10) goal-turn/goal-subgoal/goal-gate/goal-contract/loop-rearm: in _retire_if_still_orphaned
+        #   (~line 993) drop `or raw != scanned.get(prefix)` (the scanned-row fence on the retired row).
+        # (M19) goal-subgoal: in _retire_if_still_orphaned (~line 1000) delete the sibling fence
+        #   `if sibling != scanned[p]: return None` -> the loop is retired beside the edited goal.
+        # (M15) route: in reap_orphaned_goals_and_loops (~line 1061) delete the pre-write
+        #   `if live_routed(sid): continue`.
         assert counts["orphaned"] == 0 and counts["loops"] == 0
         assert _goal(db, "s").status == "active" and _loop(db, "s").status == "active"
+    finally:
+        db.close()
+
+
+def test_sibling_loop_resumed_after_the_scan_keeps_the_goal(tmp_path, monkeypatch):
+    """A loop that was PAUSED at scan time (so it has no scanned row to fence) is resumed before the
+    goal's retiring write: its re-armed ``next_due_at`` is a live clock, so the goal is kept."""
+    db = _db(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    now = time.time()
+    try:
+        _put_goal(db, "s", age_days=9, now=now)
+        _put_loop(db, "s", status="paused", age_days=9, now=now)
+        _session_row(db, "s", last_active=now - 8 * DAY)
+        hooked = _HookAfterScanDB(db, lambda: loops.LoopManager("s").resume())
+        counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=hooked)
+        assert hooked.fired == 1
+        # RED-proof (M20): in hermes_cli/goals.py::_retire_if_still_orphaned (~line 1003) delete
+        # `if last is not None and last > cutoff: return None` (the unscanned-sibling clock check).
+        assert counts["orphaned"] == 0
+        assert _goal(db, "s").status == "active" and _loop(db, "s").status == "active"
+    finally:
+        db.close()
+
+
+def test_routing_is_never_read_while_the_db_write_lock_is_held(tmp_path):
+    """Prism 0d90dba2499b: the gateway's routing lookup can load routing from this same SessionDB,
+    whose write lock is a non-reentrant ``threading.Lock``. It must run outside ``_execute_write``."""
+    db = _db(tmp_path / "state.db")
+    now = time.time()
+    held, calls = [], []
+
+    def _is_routed(sid):
+        calls.append(sid)
+        if db._lock.locked():  # single-threaded test: only the reaper's own write could hold it
+            held.append(sid)
+        return False
+
+    try:
+        _put_goal(db, "s", age_days=9, now=now)
+        _put_loop(db, "s", age_days=9, now=now)
+        counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db, is_routed=_is_routed)
+        assert counts == {"scanned": 1, "orphaned": 1, "loops": 1} and calls
+        # RED-proof (M18): in hermes_cli/goals.py::reap_orphaned_goals_and_loops (~line 1063) wrap
+        # `retire` so it calls live_routed(sid) (routing read back inside the write txn, the round-2 shape).
+        assert held == []
+    finally:
+        db.close()
+
+
+def test_route_landing_during_the_write_gives_the_row_back(tmp_path):
+    """The session is unrouted at the pre-write check and routed by the post-commit check (a /resume
+    landed in between): the retirement is undone byte-for-byte."""
+    db = _db(tmp_path / "state.db")
+    now = time.time()
+    answers = iter([False, True])  # goal: pre-write check, post-commit check; then routed for good
+    try:
+        _put_goal(db, "s", age_days=9, now=now)
+        _put_loop(db, "s", age_days=9, now=now)
+        before_goal, before_loop = db.get_meta_committed("goal:s"), db.get_meta_committed("loop:s")
+        counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db,
+                                                     is_routed=lambda sid: next(answers, True))
+        # RED-proof (M17): in hermes_cli/goals.py::reap_orphaned_goals_and_loops (~line 1069) delete
+        # the post-commit `if live_routed(sid): db.compare_and_set_meta(...); continue` -> goal stays orphaned.
+        assert counts["orphaned"] == 0 and counts["loops"] == 0
+        assert db.get_meta_committed("goal:s") == before_goal
+        assert db.get_meta_committed("loop:s") == before_loop
     finally:
         db.close()
 
