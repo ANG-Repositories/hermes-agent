@@ -693,23 +693,23 @@ class GatewayAgentCacheMixin:
                 logger.warning("queue hold skipped on /stop for %s", session_key, exc_info=True)
         _stop_clock.mark("hold")
         from gateway.run import _AGENT_PENDING_SENTINEL
-        # The turn's hard interrupt reaches only its in-turn children; background delegations were
-        # detached at dispatch and would otherwise run to completion and wake the session later.
-        # Each interrupted unit still returns as a completion (status=interrupted, partial output).
-        # Off the loop and fail open: the cancel takes a cross-process file lock (5 s timeout), and on
-        # 2026-11-08 15:38 that TimeoutError escaped /stop before the slot release, so the user got
-        # "TimeoutError ... async-delegations.lock" and the session stayed busy. The idle /stop path
-        # already wraps the same call; a missed cancel leaves a delegation running, which the /stop
-        # latch keeps from waking the session.
-        try:
-            from tools.async_delegation import interrupt_for_session
-            await asyncio.to_thread(
-                interrupt_for_session,
-                session_key=session_key, reason=invalidation_reason,
-                parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
-        except Exception:
-            logger.warning("async delegation cancel skipped on %s for %s", invalidation_reason, session_key,
-                           exc_info=True)
+        # The turn's hard interrupt reaches only its in-turn children. Background delegations were
+        # detached at dispatch and belong to the async registry: /stop (and /queue run) end the
+        # parent's TURN only, so those units keep running and deliver through the outbox (Ace
+        # 2026-11-08, t_8c4608e6; delegate_task action='stop' ends one). A session reset (/new)
+        # leaves them no return address, so it still cancels them.
+        # That cancel runs off the loop and fails open (#134): it takes a cross-process file lock (5 s
+        # timeout), and on 2026-11-08 15:38 a TimeoutError there escaped before the slot release.
+        if not (_reason.startswith("stop_command") or _reason == "queue_run"):
+            try:
+                from tools.async_delegation import interrupt_for_session
+                await asyncio.to_thread(
+                    interrupt_for_session,
+                    session_key=session_key, reason=invalidation_reason,
+                    parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
+            except Exception:
+                logger.warning("async delegation cancel skipped on %s for %s", invalidation_reason, session_key,
+                               exc_info=True)
         _stop_clock.mark("deleg")
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # Superseded-turn write gate (agent/session_persistence.py): the displaced turn's late
