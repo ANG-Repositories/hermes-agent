@@ -22,6 +22,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 from typing import Callable, Dict, Mapping, MutableMapping, Optional
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
@@ -408,43 +409,139 @@ def carry_path_shared(conn, task_id: str, workspace_path: Optional[str]) -> bool
     return False
 
 
+def _carry_root(path: Optional[str]) -> Optional[str]:
+    """The cache key of a carry candidate, or None when it can never be carried (unsafe / unresolvable)."""
+    if not path or not carry_path_safe(path):
+        return None
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        return canon(path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _carry_walk(root: str, max_bytes: int, max_entries: int) -> "tuple[bool, int]":
+    """``(ok, entries_seen)`` for ``root``: bytes and entries, symlinks not followed. Stops AT the cap
+    (t_3489445d): the walk reads one directory entry at a time and returns at entry ``max_entries + 1`` or
+    the first byte over ``max_bytes``, so a 1M-entry directory costs ``max_entries`` reads, never a full
+    listing. Any scan error is ``ok=False`` (the card keeps the old rule)."""
+    total = entries = 0
+    stack = [root]
+    try:
+        while stack:
+            with os.scandir(stack.pop()) as it:
+                for entry in it:
+                    entries += 1
+                    st = entry.stat(follow_symlinks=False)
+                    total += st.st_size
+                    if entries > max_entries or total > max_bytes:
+                        return False, entries
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+    except OSError:
+        return False, entries
+    return True, entries
+
+
+# Per-tick counters of the carry scan (t_3489445d): the dispatcher logs and resets them once per routing pass.
+_carry_stats: Dict[str, float] = {}
+# Paths a routing pass asked about with no fresh verdict, oldest first: root -> (max_bytes, max_entries, cold).
+_carry_pending: Dict[str, tuple] = {}
+_carry_lock = threading.Lock()
+# Entries one :func:`carry_scan_refresh` call may walk before it starts no further walk (one capped walk may
+# finish past it, so the worst case per call is about twice this). At the default 60 s dispatch interval that
+# is ~330 lstat/s, whatever the number of carry candidates; measured before (t_3489445d) on 85 real workspaces,
+# 72 of them repo-sized: ~1.53M lstat per 300 s TTL cycle, ~5,100 lstat/s.
+CARRY_WALK_BUDGET_ENTRIES = CARRY_MAX_ENTRIES
+
+
+def _stat(key: str, n: float = 1) -> None:
+    _carry_stats[key] = _carry_stats.get(key, 0) + n
+
+
+def carry_size_known(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
+                     max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None) -> Optional[bool]:
+    """The cached :func:`carry_size_ok` verdict, WITHOUT touching the filesystem tree (t_3489445d). The
+    dispatcher's routing pass asks this for every local_files candidate, every tick. None = unknown (never
+    scanned): the caller keeps the old rule and the path is queued for :func:`carry_scan_refresh`. A verdict
+    older than ``CARRY_SCAN_TTL_SECONDS`` is still answered and the path is queued for a re-scan."""
+    import time as _time
+    root = _carry_root(path)
+    if root is None:
+        return False
+    t = _time.monotonic() if now is None else now
+    with _carry_lock:
+        _stat("asks")
+        seen = _carry_stats.setdefault("_paths", set())  # type: ignore[arg-type]
+        seen.add(root)  # type: ignore[union-attr]
+        hit = _carry_scan_cache.get(root)
+        if hit is None:
+            _stat("misses")
+            _carry_pending.setdefault(root, (max_bytes, max_entries, True))
+            return None
+        if t - hit[0] < CARRY_SCAN_TTL_SECONDS:
+            _stat("hits")
+        else:
+            _stat("stale")
+            _carry_pending.setdefault(root, (max_bytes, max_entries, False))
+        return hit[1]
+
+
+def carry_scan_refresh(*, budget_entries: Optional[int] = None, now: Optional[float] = None) -> int:
+    """Walk queued carry candidates, never-scanned ones first, until ``budget_entries`` are spent; the rest
+    stay queued for the next call. Runs after the routing pass, never inside it. Returns entries walked."""
+    import time as _time
+    budget = CARRY_WALK_BUDGET_ENTRIES if budget_entries is None else budget_entries
+    used = 0
+    while used < budget:
+        with _carry_lock:
+            if not _carry_pending:
+                break
+            root = next((r for r, v in _carry_pending.items() if v[2]), None) or next(iter(_carry_pending))
+            max_bytes, max_entries, _cold = _carry_pending.pop(root)
+        t0 = _time.perf_counter()
+        ok, seen = _carry_walk(root, max_bytes, max_entries)
+        dt = _time.perf_counter() - t0
+        used += seen
+        t = _time.monotonic() if now is None else now
+        with _carry_lock:
+            _carry_scan_cache[root] = (t, ok)
+            _stat("walks")
+            _stat("walk_entries", seen)
+            _stat("walk_s", dt)
+    return used
+
+
+def carry_scan_stats(reset: bool = True) -> Dict[str, float]:
+    """This pass's counters: asks, hits, stale, misses, walks, walk_entries, walk_s, distinct paths, pending."""
+    with _carry_lock:
+        out = {k: v for k, v in _carry_stats.items() if k != "_paths"}
+        out["paths"] = len(_carry_stats.get("_paths") or ())  # type: ignore[arg-type]
+        out["pending"] = len(_carry_pending)
+        if reset:
+            _carry_stats.clear()
+    return out
+
+
 def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                   max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None) -> bool:
     """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed) and its
     path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path for
-    ``CARRY_SCAN_TTL_SECONDS``: the dispatcher asks every tick."""
+    ``CARRY_SCAN_TTL_SECONDS``. This one WALKS on a miss; the dispatcher's routing pass uses
+    :func:`carry_size_known` instead (t_3489445d)."""
     import time as _time
-    if not path or not carry_path_safe(path):
-        return False
-    try:
-        from hermes_cli.kanban_db_workspace import canon
-        root = canon(path)
-    except (OSError, RuntimeError, ValueError):
+    root = _carry_root(path)
+    if root is None:
         return False
     t = _time.monotonic() if now is None else now
     hit = _carry_scan_cache.get(root)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
         return hit[1]
-    total = entries = 0
-    ok = True
-    try:
-        for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
-            for name in (*dirnames, *filenames):
-                entries += 1
-                total += os.lstat(os.path.join(dirpath, name)).st_size
-                if entries > max_entries or total > max_bytes:
-                    ok = False
-                    break
-            if not ok:
-                break
-    except OSError:
-        ok = False
-    _carry_scan_cache[root] = (t, ok)
+    ok, _seen = _carry_walk(root, max_bytes, max_entries)
+    with _carry_lock:
+        _carry_scan_cache[root] = (t, ok)
+        _carry_pending.pop(root, None)
     return ok
-
-
-def _raise(exc: OSError) -> None:
-    raise exc
 
 
 def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subprocess.run) -> None:

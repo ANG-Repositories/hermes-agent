@@ -5228,6 +5228,23 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
     return _only, _job
 
 
+def _carry_scan_after_routing() -> None:
+    """The local_files carry scan, OFF the routing pass (t_3489445d): walk the paths this pass found unknown or
+    stale, within ``CARRY_WALK_BUDGET_ENTRIES``, then log the pass's counters at debug level. Never raises."""
+    try:
+        _kb._kwh.carry_scan_refresh()
+        s = _kb._kwh.carry_scan_stats()
+    except Exception as exc:  # a scan must never cost the tick
+        _kb._log.debug("kanban carry scan refresh failed: %s: %s", type(exc).__name__, exc)
+        return
+    if s.get("asks"):
+        _kb._log.debug(
+            "kanban carry scan: asks=%d paths=%d hits=%d stale=%d misses=%d walks=%d entries=%d walk_ms=%.1f "
+            "pending=%d", s.get("asks", 0), s.get("paths", 0), s.get("hits", 0), s.get("stale", 0),
+            s.get("misses", 0), s.get("walks", 0), s.get("walk_entries", 0), 1000 * s.get("walk_s", 0.0),
+            s.get("pending", 0))
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5375,7 +5392,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                                if scan else False), **_portable_kw)
     carried = False
     if (not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None
-            and _kb._kwh.carry_size_ok(row["workspace_path"])
+            # Cache only, never a walk here (t_3489445d): unknown (None) keeps the old rule this tick, and the
+            # path is scanned by carry_scan_refresh after the routing pass.
+            and _kb._kwh.carry_size_known(row["workspace_path"]) is True
             and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])):
         # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
         # while the Studio has room. Every OTHER rule is judged as if the directory were empty; a card that is
@@ -6775,6 +6794,7 @@ def _dispatch_once_locked(
                                          worktree_out=_worktree_ports, board=board,
                                          carry_out=_carry_rows)
                      for r in ready_rows}
+        _carry_scan_after_routing()
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"origin": 0, "pin": 0, "wait": 1, "local": 1, "portable": 2}

@@ -1232,9 +1232,29 @@ def kanban_home() -> Path:
         if kanban_sandbox_enabled():
             root = _sandbox_kanban_home(root)
         else:
-            _refuse_nested_non_profile_home(root)
+            _refuse_nested_non_profile_home_memo(root)
     _refuse_live_kanban_root_in_isolation(root, "kanban_home()")
     return root
+
+
+# kanban_home() runs many times per dispatcher tick; its nested-home check resolves paths and the live roots
+# every call (~2% of gateway GIL samples, t_3489445d). A PASSING check is memoized per process, keyed on what it
+# reads: the root, HERMES_HOME, and the resolver functions themselves (a monkeypatched resolver is a new key).
+# A refusal is never memoized, so it re-raises every call.
+_NESTED_HOME_OK: set = set()
+
+
+def _refuse_nested_non_profile_home_memo(root: Path) -> None:
+    import hermes_state as _cc
+    key = (str(root), os.environ.get("HERMES_HOME", ""), _refuse_nested_non_profile_home,
+           _matching_live_root, _live_kanban_roots, _rel_to_live, _live_kanban_root, _LIVE_KANBAN_ROOT_MEMO,
+           _account_home_board_root, _cc._deployed_hermes_home_root, _cc._os_account_home)
+    if key in _NESTED_HOME_OK:
+        return
+    _refuse_nested_non_profile_home(root)
+    if len(_NESTED_HOME_OK) > 256:
+        _NESTED_HOME_OK.clear()
+    _NESTED_HOME_OK.add(key)
 
 
 class KanbanLiveBoardRefusedError(RuntimeError):
