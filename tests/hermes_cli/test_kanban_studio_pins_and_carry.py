@@ -16,6 +16,7 @@ fleet/placement-policy.json; off / absent = every old pin, exactly as before.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -647,3 +648,71 @@ def test_a_git_failure_binds(tmp_path):
     (ws / "repo").mkdir(parents=True)
     (ws / "repo" / ".git").write_text("gitdir: /nonexistent/gitdir\n")
     assert (kwh.local_workspace_binding(str(ws)) or "").startswith("repo@git-")
+
+
+# -- t_e7c03f48 Prism round 1: each of these let local-only work read "reproducible" --------------------------------
+
+def test_an_edit_inside_a_checkout_between_two_calls_binds(reproducible_workspace, tmp_path):
+    """Prism 5c1daae965e0: a cache keyed on the workspace root mtime missed an edit inside the checkout."""
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    (repo / "README.md").write_text("edited after the first call\n")
+    assert kwh.local_workspace_binding(str(ws), now=1) == "repo/README.md"
+
+
+def test_a_submodule_edit_hidden_by_ignore_all_binds(reproducible_workspace, tmp_path):
+    """Prism 812f89f3c723: ``submodule.<x>.ignore=all`` must not hide a modified tracked file in a submodule."""
+    sub_origin, sub_seed = tmp_path / "sub.git", tmp_path / "sub-seed"
+    _git(tmp_path, "init", "-q", "--bare", str(sub_origin))
+    _git(tmp_path, "clone", "-q", str(sub_origin), str(sub_seed))
+    (sub_seed / "lib.py").write_text("x = 1\n")
+    _git(sub_seed, "add", "lib.py")
+    _git(sub_seed, "commit", "-q", "-m", "lib")
+    _git(sub_seed, "push", "-q", "origin", "HEAD:main")
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_origin), "sub")
+    _git(repo, "commit", "-q", "-m", "add sub")
+    _git(repo, "push", "-q", "origin", "HEAD")
+    _git(repo, "config", "submodule.sub.ignore", "all")
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    (repo / "sub" / "lib.py").write_text("x = 2  # local only\n")
+    assert kwh.local_workspace_binding(str(ws), now=1) == "repo/sub"
+
+
+def test_a_branch_deleted_on_the_remote_binds_despite_the_stale_tracking_ref(reproducible_workspace, tmp_path):
+    """Prism 1c3c50990907: the local ``origin/<branch>`` ref outlives the remote branch; ask the remote."""
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    branch = f"feat-{ws.name}"
+    _git(tmp_path, "--git-dir", str(tmp_path / "origin.git"), "branch", "-D", branch)
+    tracking = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
+                              capture_output=True)
+    assert tracking.returncode == 0  # the stale local tracking ref is still there
+    assert (kwh.local_workspace_binding(str(ws), now=0) or "").startswith("repo@unpushed:")
+
+
+def test_an_ls_remote_failure_binds_as_remote_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+
+    def runner(argv, **kw):
+        if "ls-remote" in argv:
+            return subprocess.CompletedProcess(argv, 128, b"", b"fatal: unable to access")
+        return subprocess.run(argv, **kw)
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
+    # a failure is never cached: the next call asks the remote again and the real answer is portable
+    assert kwh.local_workspace_binding(str(ws), now=1) is None
+    assert repo.exists()
+
+
+def test_an_ls_remote_timeout_binds_as_remote_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    reproducible_workspace(ws)
+
+    def runner(argv, **kw):
+        if "ls-remote" in argv:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        return subprocess.run(argv, **kw)
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
