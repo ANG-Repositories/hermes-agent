@@ -336,6 +336,31 @@ def test_carry_size_ok_bounds(tmp_path):
     assert not kwh.carry_size_ok(None)
 
 
+def test_carry_scan_deadline_fails_closed_and_caches_refusal(tmp_path, monkeypatch):
+    import time
+
+    d = tmp_path / "bounded"
+    d.mkdir()
+    for i in range(10):
+        (d / str(i)).write_text("work")
+    kwh._carry_scan_cache.clear()
+    ticks = iter([0.0, 0.0, 0.0, 1.0])
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 1.0))
+    assert not kwh.carry_size_ok(str(d))
+    # Refusals are cached at completion, not at the start of a slow scan.
+    monkeypatch.setattr(kwh.os, "scandir", lambda *_: pytest.fail("rescanned"))
+    assert not kwh.carry_size_ok(str(d), now=2.0)
+
+
+def test_carry_scan_cache_respects_limits(tmp_path):
+    d = tmp_path / "limits"
+    d.mkdir()
+    (d / "work").write_bytes(b"x" * 10)
+    kwh._carry_scan_cache.clear()
+    assert kwh.carry_size_ok(str(d), max_bytes=100)
+    assert not kwh.carry_size_ok(str(d), max_bytes=5)
+
+
 def test_carry_workspace_runs_mkdir_then_rsync():
     calls = []
 
