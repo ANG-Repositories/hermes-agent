@@ -5132,7 +5132,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                binds: Optional[dict] = None,
                held: Optional[dict] = None,
                worktree_out: Optional[dict] = None,
-               board: Optional[str] = None) -> "tuple[str, Optional[str]]":
+               board: Optional[str] = None,
+               carry_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5201,19 +5202,25 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
-    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or (),
-                                    getattr(plan.config, "pin_aliases", None))
+    # Studio last resort (t_e604c0f9 on top of t_c2fce87e's host_preference switch: fleet/placement-policy.json
+    # host_preference.consumers.kanban "on" + mac-studio in last_resort; off/absent = the old rules): a bare
+    # `host: studio` with no requires: reason the Studio serves is dropped, and local_files is continuity only.
+    _fleet_dir = _kb.kanban_home() / "fleet"
+    last_resort = _studio_last_resort(_fleet_dir)
+    studio_reasons = _kwp.studio_pin_reasons(caps) if last_resort else None
+    pin, ignored, pin_dropped = _kwp.effective_pin(row["body"], plan.config.hosts or (),
+                                                   getattr(plan.config, "pin_aliases", None), studio_reasons)
+    if pin_dropped:
+        _kwp.note_dropped_studio_pin(row["id"])
     # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
-        from hermes_cli import placement_policy as _ppol
-        fleet = _kb.kanban_home() / "fleet"
         port = _kwt.port_for(row["id"], row["workspace_path"],
-                             _kwt.board_default_workdir(board), fleet,
+                             _kwt.board_default_workdir(board), _fleet_dir,
                              branch=_kb._row_get(row, "branch_name"),
-                             allow_studio_tree=_ppol.load(fleet).is_last_resort(_kwp.STUDIO_HOST))
+                             allow_studio_tree=last_resort)
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -5234,17 +5241,29 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             if caps_out is not None:
                 caps_out.setdefault("reasons", {})[row["id"]] = [verdict.wait]
             return "wait", verdict.wait
-    ok, rule, route_class = _kwp.portable(
+    _portable_kw = dict(
         workspace_kind=row["workspace_kind"], has_links=linked, workspace_bind=bind,
-        workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
-                               if scan else False),
         assignee=assignee, body=row["body"],
         skills=skills, pool=plan.config,
         native_command=native, manifest=manifest, targets=targets,
         requires=verdict.for_portable() if verdict is not None else None,
         body_signals=caps is None or caps.legacy_body,
-        worktree_hosts=wt_hosts,
+        worktree_hosts=wt_hosts, studio_reasons=studio_reasons,
     )
+    ok, rule, route_class = _kwp.portable(
+        workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
+                               if scan else False), **_portable_kw)
+    carried = False
+    if (not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None
+            and _kb._kwh.carry_size_ok(row["workspace_path"])):
+        # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
+        # while the Studio has room. Every OTHER rule is judged as if the directory were empty; a card that is
+        # then portable runs locally when the local gate admits, else on a pool host with the directory carried
+        # there first (kanban_worker_hosts.carry_workspace). A card some other rule keeps local stays local_files.
+        ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
+        if ok2:
+            ok, rule, route_class, carried = ok2, rule2, class2, True
+            carry_out[row["id"]] = True
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
     if (verdict is not None and not ok and pin in (None, _kwp.PIN_ANY)
@@ -5290,7 +5309,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                 rules_out[row["id"]] = f"{_pr.BIND_HOST}:{bind[2]}({bind[0]})"
             return "pin", bind[2]
         if rules_out is not None:
-            rules_out[row["id"]] = _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY
+            rules_out[row["id"]] = (_pr.LOCAL_FILES if carried
+                                    else _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY)
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.PIN_UNKNOWN_HOST:
         # A host: line naming no host: never runs anywhere, named, parked
@@ -5359,6 +5379,29 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
+
+
+_last_resort_cache: dict = {}
+
+
+def _studio_last_resort(fleet_dir) -> bool:
+    """``placement_policy.load(fleet).is_last_resort(mac-studio)`` (t_c2fce87e's ONE switch), re-read only when the
+    policy file's stat changes or the env override does: ``_route_row`` asks once per ready row per tick."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    from hermes_cli import placement_policy as _ppol
+    path = Path(fleet_dir) / _ppol.POLICY_FILE
+    try:
+        st = path.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = (str(path), stamp, os.environ.get(_ppol.LAST_RESORT_ENV))
+    hit = _last_resort_cache.get("v")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    val = _ppol.load(Path(fleet_dir)).is_last_resort(_kwp.STUDIO_HOST)
+    _last_resort_cache["v"] = (key, val)
+    return val
 
 
 _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body",
@@ -5880,11 +5923,13 @@ def _i0_counts(reason) -> bool:
 _I0_EXEMPT = frozenset({"unassigned", "per_profile_cap"})
 
 
-def _portable_goes_remote(local_free: bool, cap_only, plan, browser_joined: bool = False) -> bool:
+def _portable_goes_remote(local_free: bool, cap_only, plan, browser_joined: bool = False,
+                          continuity: bool = False) -> bool:
     """Does a ``portable`` row ask the pool before a local slot? The ONE rule: the spawn loop and the door
     publisher (kanban_priority.waiting_by_host) both call it, so a card waits where it would start (round 5,
-    Prism a51c53f3bd02). A browser-joined row keeps the host its join was cut for."""
-    remote_first = bool(getattr(plan, "default_remote", False)) and not browser_joined
+    Prism a51c53f3bd02). A browser-joined row keeps the host its join was cut for. A ``continuity`` row (its
+    files are in the Studio scratch dir, t_e604c0f9) keeps the Studio while the local gate admits."""
+    remote_first = bool(getattr(plan, "default_remote", False)) and not browser_joined and not continuity
     return not local_free or bool(cap_only) or remote_first
 
 
@@ -6557,6 +6602,7 @@ def _dispatch_once_locked(
     row_route: dict = {}
     row_rules: dict = {}  # task id -> portable() rule, for the placement record
     _worktree_ports: dict = {}  # worktree card -> (repo, mirror, hosts) (t_6d9e7d90)
+    _carry_rows: dict = {}  # local_files card -> True: local while the gate admits, else carried (t_e604c0f9)
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
     # ran the classifier on every one of them) and, of those, the ones the
     # spawn loop reached: the affinity event log reconciles against both.
@@ -6588,7 +6634,8 @@ def _dispatch_once_locked(
                                          rules_out=row_rules,
                                          access_out=result.access_contradictions,
                                          binds=_binds, held=_pause_held,
-                                         worktree_out=_worktree_ports, board=board)
+                                         worktree_out=_worktree_ports, board=board,
+                                         carry_out=_carry_rows)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
@@ -7587,7 +7634,8 @@ def _dispatch_once_locked(
         _forced_remote = force_host is not None and force_host != _FORCE_LOCAL
         if _forced_remote or (force_host is None and (route in ("pin", "origin") or (
                 route == "portable" and _portable_goes_remote(local_free, _cap_only, spillover,
-                                                              row["id"] in result.browser_joins)))):
+                                                              row["id"] in result.browser_joins,
+                                                              continuity=row["id"] in _carry_rows)))):
             # A refused take() NEVER falls through to a local spawn (I-11),
             # except a portable row under kanban.placement.default: remote,
             # which spawns locally as the LAST RESORT (spec v0.3 §3.1 step 2).
@@ -7758,6 +7806,15 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
+                if placed_host is not None and claimed.id in _carry_rows and not dry_run:
+                    # local_files continuity overflow (t_e604c0f9): the Studio was full, so the card's
+                    # Studio scratch dir goes to the chosen host first, same path; a failure is a spawn
+                    # failure (claim released, reservation refunded), never an empty-dir run.
+                    _kb._kwh.carry_workspace(placed_host, str(workspace))
+                    with _kbc.write_txn(conn):
+                        _kb._append_event(conn, claimed.id, _kb._kwh.CARRIED_EVENT,
+                                          {"host": placed_host.name, "workspace": str(workspace)},
+                                          run_id=claimed.current_run_id)
             if protected is not None:
                 validate_mount(
                     protected.root, expected_mount=protected.mount_path,

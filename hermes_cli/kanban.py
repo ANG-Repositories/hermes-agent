@@ -929,6 +929,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: {exc}", 2)
     if branch_name and ws_kind != "worktree":
         return _err("kanban: --branch is only valid with --workspace worktree", 2)
+    # Studio last resort (t_e604c0f9): a portable worktree target is rewritten to its anchor form, and the
+    # placement notes (rewrite, why a worktree stays Studio-local) are printed after the create.
+    _placement_notes: list = []
+    try:
+        from hermes_cli import kanban_worktree_port as _kwt
+        ws_path, _wt_note = _kwt.mint_rewrite(ws_kind, ws_path, kb.kanban_home() / "fleet")
+        if _wt_note:
+            _placement_notes.append(_wt_note)
+    except Exception:
+        pass
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1145,6 +1155,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
         scope_warning = kb.inferred_scope_warning(task.body)
         if scope_warning:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
+        try:
+            from hermes_cli import kanban_worker_pool as _kpool
+            _pin_note = _kpool.mint_studio_pin_note(task.body, kb.kanban_home() / "fleet")
+        except Exception:
+            _pin_note = None
+        for _note in (*_placement_notes, *((_pin_note,) if _pin_note else ())):
+            print(f"placement: {task_id}: {_note}", file=sys.stderr)
 
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
