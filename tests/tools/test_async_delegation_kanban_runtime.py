@@ -1773,6 +1773,61 @@ def test_default_fallback_runs_a_failed_spawn_as_a_detached_child(monkeypatch, t
     assert _record(did)["state"] == "done"
 
 
+def test_detached_fallback_coordinates_with_an_in_process_profile(monkeypatch, tmp_path, detached_fallback):
+    """ce25fd513d3b: failed kanban launch, detached A, in-process B, one real file lock."""
+    from tools import delegate_tool_config as cfgmod, file_state
+
+    monkeypatch.setattr(cfgmod, "_get_background_runtime", lambda: "in_process")
+    monkeypatch.setattr(cfgmod, "_get_detached_background", lambda: False)
+    monkeypatch.setattr(file_state, "FORCE_CROSS_PROCESS", False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "locks"))
+    target = tmp_path / "shared.txt"
+    target.write_text("initial")
+    seen = []
+
+    def detached(did, *args, **kwargs):
+        # The supervision boundary must advertise the different PID before it starts editing.
+        assert file_state._cross_process_enabled(), "profile B lost coordination after kanban fallback"
+        code = (
+            "import sys\nfrom pathlib import Path\n"
+            "from tools.delegate_detached import _isolate_process_checkpoint\n"
+            "from tools import file_state\n"
+            "_isolate_process_checkpoint(Path(sys.argv[2]))\n"
+            "assert file_state._cross_process_enabled(), 'detached A lost coordination'\n"
+            "with file_state.lock_path(sys.argv[1]):\n"
+            " print('locked', flush=True)\n sys.stdin.readline()\n"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", code, str(target), str(tmp_path)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+        try:
+            assert proc.stdout.readline().strip() == "locked", proc.stderr.read() if proc.poll() is not None else ""
+            entered = threading.Event()
+            def writer_b():
+                with file_state.lock_path(str(target)):
+                    target.write_text("B")
+                    entered.set()
+            thread = threading.Thread(target=writer_b)
+            thread.start()
+            assert not entered.wait(0.1), "B entered while A held the cross-process lock"
+            proc.stdin.write("release\n")
+            proc.stdin.flush()
+            proc.wait(timeout=10)
+            thread.join(timeout=10)
+            assert proc.returncode == 0 and entered.is_set()
+            seen.append(target.read_text())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+        return {"status": "completed", "summary": "serialized"}, None
+
+    monkeypatch.setattr(ad, "_run_detached_unit", detached)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    assert calls == [] and seen == ["B"]
+    assert _record(handle["delegation_id"])["state"] == "done"
+
+
 def test_refuse_in_process_raises():
     with pytest.raises(RuntimeError, match="no in-process fallback"):
         ad._refuse_in_process()
