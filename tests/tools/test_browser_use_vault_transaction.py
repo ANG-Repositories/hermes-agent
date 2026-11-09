@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.tools._browser_use_daemon_fake import FakeDaemon, install
 from tools import browser_supervisor as s, browser_use_cli as cli
 from tools import browser_use_target as t, browser_vault_tool as v
 
@@ -61,7 +62,7 @@ def test_daemon_selection_follows_backend_browser_across_tasks(monkeypatch, sess
     assert (route_a.cdp_url == route_b.cdp_url) == bool(session)
     assert daemons[route_b.env['BU_NAME']] == ('T2' if session else 'T1')
     assert (route_a.env['BU_NAME'] == route_b.env['BU_NAME']) == bool(session)
-    monkeypatch.setattr(t, 'selected_target', lambda r: (123, daemons[r.env['BU_NAME']]))
+    install(monkeypatch, t, FakeDaemon(observe=lambda r: (123, daemons[r.env['BU_NAME']])))
     if session:
         with pytest.raises(RuntimeError, match='route changed'):
             t.begin('taskA', expected_route=route_a)
@@ -85,7 +86,7 @@ def test_selection_change_waits_for_dispatch_ack(monkeypatch):
     monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
     env = {'BU_NAME': 'shared', 'BU_CDP_WS': 'ws://synthetic'}
     route = t.record_route('taskA', env)
-    monkeypatch.setattr(t, 'selected_target', lambda _: (1, 'login'))
+    install(monkeypatch, t, FakeDaemon(observe=lambda _: (1, 'login')))
     token = t.begin('taskA', expected_route=route)
     tx = t._pin.get()
     attempted, changed = threading.Event(), threading.Event()
@@ -120,7 +121,7 @@ def test_probe_cannot_import_cwd_or_inherited_pythonpath(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, '_find_cli', lambda: [sys.executable, '-m', 'browser_harness.run'])
     route = t.BrowserUseRoute({'PYTHONPATH': str(tmp_path)}, 'ws://synthetic', False)
     with pytest.raises(RuntimeError):
-        t.selected_target(route)
+        t._daemon_request(route, {'meta': 'current_tab'})
     assert not marker.exists()
 
 
@@ -128,7 +129,7 @@ def test_route_replaced_in_final_probe_cannot_dispatch(monkeypatch):
     monkeypatch.setattr(t, '_routes', {})
     monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
     route = t.record_route('task', {'BU_CDP_WS': 'ws://synthetic'})
-    monkeypatch.setattr(t, 'selected_target', lambda _: (1, 'login'))
+    daemon = install(monkeypatch, t, FakeDaemon(observe=lambda _: (1, 'login')))
     calls = []
     monkeypatch.setattr(s.SUPERVISOR_REGISTRY, 'get_or_start', lambda **kw: SimpleNamespace(
         evaluate_runtime=lambda *a, **kw: calls.append(a) or {'ok': True}))
@@ -138,7 +139,7 @@ def test_route_replaced_in_final_probe_cannot_dispatch(monkeypatch):
         def swap(_):
             t.record_route('task', {'BU_CDP_WS': 'ws://replacement'})
             return (1, 'login')
-        monkeypatch.setattr(t, 'selected_target', swap)
+        daemon.observe = swap
         assert not view.evaluate_runtime('synthetic-write')['ok']
         assert not calls
     finally:
@@ -157,7 +158,7 @@ def test_supervisor_dispatch_rechecks_transaction_after_setup(monkeypatch, chang
     env = {'BU_CDP_WS': 'ws://synthetic', 'BU_NAME': 'shared-research'}
     route = t.record_route('task', env, local=True)
     selected = ['login']
-    monkeypatch.setattr(t, 'selected_target', lambda _: (1, selected[0]))
+    install(monkeypatch, t, FakeDaemon(observe=lambda _: (1, selected[0])))
     if change == 'shared_selection':
         import subprocess
         monkeypatch.setattr(cli, '_find_cli', lambda: ['synthetic-cli'])
@@ -273,7 +274,7 @@ def test_isolated_probe_real_installed_harness_ipc(monkeypatch, tmp_path, layout
     route = t.BrowserUseRoute({'BU_NAME': 'scoped', 'BH_RUNTIME_DIR': str(runtime),
         'BH_TMP_DIR': str(runtime), 'PYTHONPATH': str(tmp_path / 'untrusted')}, 'ws://synthetic', False)
     try:
-        assert t.selected_target(route) == (123, 'login')
+        assert t._daemon_request(route, {'meta': 'current_tab'}) == (123, {'targetId': 'login'})
         if layout == 'pm-generation':
             assert not marker.exists()
         thread.join(5)
@@ -333,3 +334,102 @@ def test_real_loop_timeout_revokes_setup_or_reports_unknown(phase):
         loop.call_soon_threadsafe(loop.stop)
         thread.join(5)
         loop.close()
+
+
+def test_other_process_cannot_move_shared_selection_before_dispatch(monkeypatch):
+    """P1 d118eabaa559: a second process sharing the named daemon switches its tab while this
+    vault op awaits Target.attachToTarget. The daemon must own the selection, so the write only
+    ever reaches the tab the daemon still has selected."""
+    monkeypatch.setattr(t, '_routes', {})
+    monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
+    daemon = install(monkeypatch, t, FakeDaemon(target='login'))
+    route = t.record_route('task', {'BU_CDP_WS': 'ws://synthetic', 'BU_NAME': 'shared-research'})
+    token = t.begin('task', expected_route=route)
+    tx = t._pin.get()
+    sup = s.CDPSupervisor('synthetic', 'ws://synthetic')
+    sup._loop = SimpleNamespace(is_running=lambda: True)
+    sup._active, sup._page_session_id = True, 'initial'
+    switches, dispatched = [], []
+    async def cdp(method, params=None, **kw):
+        if method == 'Target.getTargetInfo':
+            return {'result': {'targetInfo': {'type': 'page', 'targetId': params['targetId']}}}
+        if method == 'Target.attachToTarget':
+            # Process B, straight over the daemon's IPC (no Hermes lock involved).
+            switches.append(daemon.request(route, {'meta': 'set_session', 'session_id': 's-T2',
+                                                   'target_id': 'other-tab'})[1])
+            return {'result': {'sessionId': 'pinned'}}
+        if method == 'Runtime.evaluate':
+            dispatched.append(daemon.target)
+        return {'result': {}}
+    sup._cdp = cdp
+    monkeypatch.setattr(s, '_schedule', lambda coro, loop, **kw: asyncio.run(coro))
+    try:
+        tx.validate()
+        sup.evaluate_runtime('synthetic-write', target_id=tx.target, dispatch_guard=tx.dispatch)
+    finally:
+        t.end(token)
+    assert switches and 'error' in switches[0], 'shared daemon accepted a selection move during the write'
+    assert dispatched in ([], ['login']), f'write dispatched while the daemon had {dispatched} selected'
+    assert daemon.lease is None, 'lease must be released when the vault op ends'
+    assert daemon.switch('other-tab') == {'session_id': 's-other-tab'}
+
+
+def test_native_selection_retires_stale_browser_use_route(monkeypatch):
+    """P1 ccb1c23940f1: once the native browser stack is current, a Browser Use route recorded
+    earlier for the same task must not route vault ops to the old Browser Use tab."""
+    monkeypatch.setattr(t, '_routes', {})
+    monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
+    t.record_route('task', {'BU_CDP_WS': 'ws://old-browser-use', 'BU_NAME': 'shared'})
+    monkeypatch.setattr(cli, 'is_browser_use_cli_mode', lambda: False)
+    native = SimpleNamespace(name='native-supervisor')
+    monkeypatch.setattr(s.SUPERVISOR_REGISTRY, 'get', lambda task_id: native if task_id == 'task' else None)
+    monkeypatch.setattr('tools.browser_tool._active_sessions', {'task': {'features': {'local': False}}})
+    monkeypatch.setattr(t, 'begin', lambda *a, **kw: pytest.fail('vault op pinned the stale Browser Use route'))
+    fenced = []
+    monkeypatch.setattr('tools.browser_tool_session.run_fenced', lambda session, fn: fenced.append(session) or fn())
+    assert v._ensure_supervisor('task') is native
+    assert json.loads(v._fenced_page_op('task', lambda: json.dumps({'success': True}))) == {'success': True}
+    assert fenced == [{'features': {'local': False}}]
+    assert t.route_for_task('task') is None
+
+
+def test_queued_exec_rechecks_desktop_lease_after_selection_wait(monkeypatch):
+    """P1 6b3e4e4d1085: a local exec admitted by run_fenced then queued behind another exec's
+    selection lock must not launch if a human took the screen while it waited."""
+    import subprocess
+    from tools.bot_desktop import lease
+    monkeypatch.setattr(t, '_routes', {})
+    monkeypatch.setattr('tools.browser_tool_cdp._resolve_cdp_override', lambda url: url)
+    monkeypatch.setattr(cli, '_find_cli', lambda: ['synthetic-cli'])
+    monkeypatch.setattr(cli, '_base_subprocess_env', lambda: {})
+    monkeypatch.setattr(cli, '_read_browser_cfg', lambda: {})
+    monkeypatch.setattr(cli, '_workspace_dir', lambda _: None)
+    monkeypatch.setattr(cli, '_attach_vault_supervisor', lambda *a: None)
+    def route_backend(env, *args):
+        env['BU_CDP_WS'] = 'ws://bot-desktop'
+        env[cli._BOT_DESKTOP_BROWSER_SENTINEL] = '1'
+        env[cli._PRIVATE_BROWSER_SENTINEL] = '1'
+    monkeypatch.setattr(cli, '_route_backend', route_backend)
+    state = {'epoch': 4, 'human': False}
+    def may_act(profile=None):
+        if state['human']:
+            raise lease.HumanHasControl('human has control')
+        return SimpleNamespace(epoch=state['epoch'])
+    monkeypatch.setattr(lease, 'assert_agent_may_act', may_act)
+    monkeypatch.setattr(lease, 'get', lambda profile=None: SimpleNamespace(epoch=state['epoch']))
+    monkeypatch.setattr('tools.browser_tool_session._shares_bot_desktop_browser', lambda info: True)
+    real_lock = t._lock
+    class TakeoverWhileQueued:
+        # Execution A held the selection lock; the human took over before B acquired it.
+        def __enter__(self):
+            state['human'], state['epoch'] = True, state['epoch'] + 1
+            return real_lock.__enter__()
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
+    monkeypatch.setattr(t, '_lock', TakeoverWhileQueued())
+    launched = []
+    monkeypatch.setattr(cli, '_run_cli_killing_process_group',
+                        lambda cmd, code, env, timeout: launched.append(code) or subprocess.CompletedProcess(cmd, 0, '', ''))
+    result = json.loads(cli.browser_exec('click("Submit")', task_id='taskB'))
+    assert launched == [], 'queued exec ran against the human-controlled browser'
+    assert result.get('code') == 'human_has_control'

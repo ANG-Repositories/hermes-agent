@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 import json
+import os
 import subprocess
 import threading
 import time
@@ -33,6 +34,22 @@ _pin: ContextVar[VaultTransaction | None] = ContextVar("browser_use_vault_target
 def route_for_task(task_id):
     with _lock:
         return _routes.get((hermes_home_key(), task_id or "default"))
+
+
+def retire_route(task_id):
+    """The task's native browser session became current: its Browser Use route no longer owns vault ops."""
+    with _lock:
+        _routes.pop((hermes_home_key(), task_id or "default"), None)
+
+
+def browser_use_owns(task_id):
+    """Whether Browser Use owns this task's vault ops. Only in CLI mode; outside it a recorded
+    route is stale (the native browser stack is current) and is retired, never consulted."""
+    from tools.browser_use_cli import is_browser_use_cli_mode
+    if is_browser_use_cli_mode():
+        return True
+    retire_route(task_id)
+    return False
 
 
 def record_route(task_id, env, local=False, ready=True):
@@ -98,6 +115,8 @@ for root in json.loads(sys.argv[1]):
 else:
     raise RuntimeError('Trusted browser-harness installation unavailable')
 from browser_harness import _ipc
+# The daemon request arrives on stdin so lease tokens never appear in argv.
+request = json.loads(sys.stdin.read())
 c, token = _ipc.connect(os.environ.get('BU_NAME', 'default'), timeout=5)
 try:
     ping = _ipc.request(c, token, {'meta': 'ping'})
@@ -105,14 +124,19 @@ finally:
     c.close()
 c, token = _ipc.connect(os.environ.get('BU_NAME', 'default'), timeout=5)
 try:
-    tab = _ipc.request(c, token, {'meta': 'current_tab'})
+    reply = _ipc.request(c, token, request)
 finally:
     c.close()
-print(json.dumps({'pid': ping.get('pid'), 'target': tab.get('targetId')}))
+print(json.dumps({'pid': ping.get('pid'), 'reply': reply}))
 """
 
+# A vault operation is bounded by its 300s transaction deadline; the daemon lease
+# outlives it slightly so selection stays pinned through the final dispatch ACK.
+_LEASE_TTL = 330
 
-def selected_target(route):
+
+def _daemon_request(route, request):
+    """Send one request to the route's Browser Use daemon -> (daemon pid, reply dict)."""
     import sys
     import sysconfig
     if not route.cdp_url or not route.ready:
@@ -131,15 +155,41 @@ def selected_target(route):
             bundle / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages") if p.is_dir())
     env = {k: v for k, v in route.env.items() if not k.startswith("PYTHON")}
     proc = subprocess.run([sys.executable, "-I", "-c", _PROBE, json.dumps(sorted(roots))],
-                          env=env, stdin=subprocess.DEVNULL,
+                          env=env, input=json.dumps(request),
                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
     try:
         data = json.loads(proc.stdout) if proc.returncode == 0 else {}
-        if type(data.get("pid")) is not int or not data.get("target"):
+        if type(data.get("pid")) is not int or not isinstance(data.get("reply"), dict):
             raise ValueError()
-        return data["pid"], data["target"]
+        return data["pid"], data["reply"]
     except (ValueError, AttributeError):
-        raise RuntimeError("Browser Use selected target is closed or unavailable; select a live tab with browser_exec and retry") from None
+        raise RuntimeError("Browser Use daemon is unavailable; select a live tab with browser_exec and retry") from None
+
+
+def acquire_lease(route):
+    """Pin the daemon's selected tab for every daemon caller -> (pid, target, generation, token)."""
+    pid, reply = _daemon_request(route, {"meta": "lease_acquire", "ttl": _LEASE_TTL, "owner_pid": os.getpid()})
+    if str(reply.get("error", "")).startswith("selection_leased"):
+        raise RuntimeError("Another caller holds this browser's tab selection; retry shortly")
+    if "error" in reply or not reply.get("token") or not reply.get("targetId") or type(reply.get("generation")) is not int:
+        # A daemon started before the lease API answers with an unrelated error: never proceed unpinned.
+        raise RuntimeError("Browser Use daemon could not pin the selected tab (closed tab, or a daemon that "
+                           "predates selection leases: restart it); select a live tab with browser_exec and retry")
+    return pid, reply["targetId"], reply["generation"], reply["token"]
+
+
+def check_lease(route, token):
+    pid, reply = _daemon_request(route, {"meta": "lease_check", "token": token})
+    if "error" in reply:
+        raise RuntimeError("Browser Use selection lease lost or selection changed; retry")
+    return pid, reply.get("targetId"), reply.get("generation")
+
+
+def release_lease(route, token):
+    try:
+        _daemon_request(route, {"meta": "lease_release", "token": token})
+    except Exception:
+        pass  # The daemon also frees the lease on TTL expiry or this process's exit.
 
 
 @dataclass(frozen=True)
@@ -151,11 +201,13 @@ class VaultTransaction:
     target: str
     lease_epoch: int | None
     deadline: float
+    selection: int = -1
+    selection_lease: str = ""
 
     def validate(self):
         from tools.browser_tool_cdp import _resolve_cdp_override
         if (time.monotonic() >= self.deadline
-                or selected_target(self.route) != (self.generation, self.target)
+                or check_lease(self.route, self.selection_lease) != (self.generation, self.target, self.selection)
                 or _resolve_cdp_override(self.route.env.get("BU_CDP_WS") or self.route.env.get("BU_CDP_URL")) != self.route.cdp_url
                 or route_for_task(self.task_id) is not self.route):
             raise RuntimeError("Browser Use target/endpoint changed or deadline expired; retry")
@@ -192,14 +244,21 @@ def begin(task_id, *, expected_route):
     if route.local:
         from tools.bot_desktop import lease
         epoch = lease.assert_agent_may_act(profile).epoch
-    generation, target = selected_target(route)
+    # The daemon itself refuses selection moves from every caller (other Hermes
+    # processes, direct IPC) while this lease is held, through the dispatch ACK.
+    generation, target, selection, lease = acquire_lease(route)
     if route_for_task(task_id) is not route:
+        release_lease(route, lease)
         raise RuntimeError("Browser Use route changed during target selection; retry")
-    return _pin.set(VaultTransaction(task_id, profile, route, generation, target, epoch, deadline))
+    return _pin.set(VaultTransaction(task_id, profile, route, generation, target, epoch, deadline,
+                                     selection, lease))
 
 
 def end(token):
+    tx = _pin.get()
     _pin.reset(token)
+    if tx is not None:
+        release_lease(tx.route, tx.selection_lease)
 
 
 def supervisor_for_task(task_id):

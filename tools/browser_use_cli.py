@@ -647,7 +647,20 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     def dispatch() -> Dict[str, Any]:
         from tools.browser_use_target import selection_execution
+        admitted = None
+        if bot_desktop_browser:
+            from tools.bot_desktop import lease as _bd_lease
+            admitted = _bd_lease.get().epoch  # run_fenced admitted this epoch just before calling us
         with selection_execution(task_id, env, local=bot_desktop_browser) as complete:
+            if admitted is not None:
+                # The selection wait can span another execution; a human may have taken the
+                # screen meanwhile. Re-admit before anything reaches the page.
+                try:
+                    if _bd_lease.assert_agent_may_act().epoch != admitted:
+                        raise _bd_lease.HumanHasControl("A human took over the bot's screen while this "
+                                                        "browser command waited; it did not run.")
+                except _bd_lease.HumanHasControl as e:
+                    return {"success": False, "code": "human_has_control", "error": str(e)}
             _attach_vault_supervisor(env, task_id)
             try:
                 proc = _run_cli_killing_process_group(cmd, code, env, timeout)

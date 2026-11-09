@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.tools._browser_use_daemon_fake import FakeDaemon, install
 from tools import browser_use_cli as bu
 from tools import browser_vault_tool as vault
 
@@ -25,7 +26,7 @@ def target_route(monkeypatch):
     monkeypatch.setattr(bu, "is_browser_use_cli_mode", lambda: True)
     monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
     selected = [42, "login-tab"]
-    monkeypatch.setattr(target, "selected_target", lambda route: tuple(selected))
+    install(monkeypatch, target, FakeDaemon(observe=lambda route: tuple(selected)))
     calls = []
     def evaluate(expression, **kw):
         calls.append((expression, kw["target_id"]))
@@ -106,14 +107,13 @@ def test_route_change_between_fence_and_pin_refuses_before_secret_access(target_
 def test_route_change_during_target_probe_refuses_before_secret_access(target_route, monkeypatch):
     target, route, selected, calls = target_route
 
-    def race(expected):
-        target.record_route("task", {"BU_CDP_WS": "ws://replacement"}, local=True)
-        return tuple(selected)
-
-    monkeypatch.setattr(target, "selected_target", race)
+    daemon = install(monkeypatch, target, FakeDaemon(observe=lambda route: tuple(selected)))
+    daemon.hooks["lease_acquire"] = lambda: target.record_route(
+        "task", {"BU_CDP_WS": "ws://replacement"}, local=True)
     with pytest.raises(RuntimeError, match="route changed"):
         target.begin("task", expected_route=route)
     assert calls == []
+    assert daemon.lease is None, "a refused begin must not leave the daemon selection leased"
 
 
 @pytest.mark.parametrize("cleanup", ["error", "timeout", "stalled"])
@@ -181,14 +181,18 @@ def test_selected_probe_uses_named_route_and_fixed_argv(monkeypatch):
     seen = []
     def run(argv, **kw):
         seen.append((argv, kw))
-        return SimpleNamespace(returncode=0, stdout='{"pid":42,"target":"login-tab"}')
+        return SimpleNamespace(returncode=0, stdout='{"pid":42,"reply":{"targetId":"login-tab","generation":3}}')
     monkeypatch.setattr(target.subprocess, "run", run)
-    assert target.selected_target(route) == (42, "login-tab")
+    assert target.check_lease(route, "synthetic-lease-token") == (42, "login-tab", 3)
     assert seen[0][1]["env"]["BU_NAME"] == "named-session"
     import sys
     assert seen[0][0][:4] == [sys.executable, "-I", "-c", target._PROBE]
+    assert len(seen[0][0]) == 5
     assert "PYTHONPATH" not in seen[0][1]["env"]
     assert all(isinstance(root, str) for root in json.loads(seen[0][0][4]))
+    # The lease token rides the probe's stdin, never its argv.
+    assert json.loads(seen[0][1]["input"]) == {"meta": "lease_check", "token": "synthetic-lease-token"}
+    assert not any("synthetic-lease-token" in arg for arg in seen[0][0])
 
 
 def test_profile_and_task_route_isolation(monkeypatch):
