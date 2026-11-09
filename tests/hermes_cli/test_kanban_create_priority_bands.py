@@ -163,6 +163,20 @@ def test_live_band_inferred_root_cli_alias(kanban_home, monkeypatch):
     assert _create_priority("root disabled") == 0
 
 
+@pytest.mark.parametrize("profile", ["apollo", "daedalus", "daedalus-opus"])
+def test_live_band_bare_cli_create_under_operator_profile(kanban_home, monkeypatch, profile):
+    # Prism 99f2e8531865: argparse's --created-by default "user" must not mask an allowlisted operator profile.
+    monkeypatch.setattr(kc, "_profile_author", lambda: profile)
+    monkeypatch.setattr(kb, "classify_create_origin", lambda: "worker")
+    _seed_spawns([170, 170, 170])
+    assert _create_priority(f"operator filing {profile}") == 170
+    with kbc.connect_closing() as conn:
+        assert next(t.created_by for t in kb.list_tasks(conn)
+                    if t.title == f"operator filing {profile}") == "user"
+    monkeypatch.setattr(kc, "_profile_author", lambda: "landing-queue")
+    assert _create_priority("landing queue sweep") == 0
+
+
 def test_live_band_default_gateway_alias_preserves_author(kanban_home, monkeypatch):
     from gateway.session_context import set_session_vars, restore_session_vars
     from tools import kanban_tools as kt

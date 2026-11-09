@@ -1021,9 +1021,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 _priority_author = args.created_by or (
                     _author if _author == "default" or _author in _LIVE_BAND_OPERATORS else HUMAN_CREATED_BY)
                 # argparse's historical default is "user"; preserve that persisted author,
-                # but retain the verified root alias for operator eligibility.
-                if _priority_author == HUMAN_CREATED_BY and _profile_author() == "default":
-                    _priority_author = "default"
+                # but retain the verified profile (root alias or any allowlisted operator) for
+                # eligibility (Prism 99f2e8531865).
+                if _priority_author == HUMAN_CREATED_BY:
+                    _verified = _profile_author()
+                    if _verified == "default" or _verified in _LIVE_BAND_OPERATORS:
+                        _priority_author = _verified
                 _default_priority = live_band_default(conn, _priority_author)
                 if _default_priority is None:
                     _default_priority = create_default_priority(args.created_by)
