@@ -1647,3 +1647,84 @@ def test_dispatch_lock_contention_never_falls_back_on_a_held_host(monkeypatch, t
     else:
         assert len(calls) == 1 and rec["state"] == "done" and rec["attempt"]["generation"] == 1
         assert runtime.startswith("in_process (kanban spawn failed: SpawnNowError"), runtime
+
+
+def _held_dispatch_with_archive(monkeypatch, tmp_path, spawner, on_call):
+    """A pause-held launch whose container card can never be archived. ``on_call(n, task_id)`` runs on the n-th
+    ``_archive_quietly`` call (1 = launch_unit's own) before it reports failure: the seam a dispatcher races."""
+    from hermes_cli import kanban_pause_hold as kph
+
+    why = "pause_hold (ci-box:fwa:pause:20261107T150000Z-ci-box-fwa00001 by apollo stage=destination)"
+    hold = {"on": True}
+    monkeypatch.setattr(kph, "local_destination_wait", lambda cache: why if hold["on"] else None)
+    n = {"calls": 0}
+
+    def _archive(task_id):
+        n["calls"] += 1
+        on_call(n["calls"], task_id, hold)
+        return False
+
+    monkeypatch.setattr(akb, "_archive_quietly", _archive)
+    monkeypatch.setattr(ad, "_HELD_ARCHIVE_RETRY_SECONDS", 0.0, raising=False)
+    return _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+
+
+def _dispatcher_starts(task_id, spawner):
+    """The hold has cleared and a dispatcher tries to start the card now (no lock wait)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kb.connect_closing(board="delegations") as conn:
+        try:
+            kbd.spawn_now(conn, task_id, board="delegations", spawn_fn=spawner, lock_wait_seconds=0)
+        except kbd.SpawnNowError:
+            pass
+
+
+def _all_dead(procs, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(p.poll() is not None for p in procs):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_pause_hold_refusal_parks_the_card_before_the_archive_retries(monkeypatch, tmp_path, spawner):
+    """Prism c-e276793faf9cd84a (send-back 2026-11-08 21:0x): during the archive retries the card must already be
+    un-dispatchable. Here the hold clears and a dispatcher tries the card during the first retry: it must be
+    refused (the card was parked first, under the board's dispatch lock), so no worker runs after the refusal."""
+    def _race(n, task_id, hold):
+        if n == 2:    # the first archive retry after launch_unit's own failed archive
+            hold["on"] = False
+            _dispatcher_starts(task_id, spawner)
+
+    handle, calls = _held_dispatch_with_archive(monkeypatch, tmp_path, spawner, _race)
+    rec = _record(handle["delegation_id"])
+    task_id = rec["kanban"]["task_id"]
+    assert spawner.procs == [], "a dispatcher started the card during the archive retries"
+    card, _ = _card(task_id)
+    assert card.status == "blocked" and rec["state"] == "failed" and calls == []
+    assert not akb._fenced_launch(task_id)
+
+
+def test_pause_hold_refusal_stops_a_runner_found_running_under_the_lock(monkeypatch, tmp_path, spawner):
+    """Prism c-e276793faf9cd84a, part 2: a runner that started before the park took the dispatch lock is stopped,
+    never just relabelled ``blocked`` (block_task clears worker_pid without killing it, and the worker's cancel
+    poll reacts only to ``archived``). The card ends parked, the result says the runner was stopped."""
+    def _race(n, task_id, hold):
+        if n == 1:    # launch_unit's own archive: the hold clears and a dispatcher starts the card first
+            hold["on"] = False
+            _dispatcher_starts(task_id, spawner)
+            hold["on"] = True
+
+    handle, calls = _held_dispatch_with_archive(monkeypatch, tmp_path, spawner, _race)
+    rec = _record(handle["delegation_id"])
+    task_id = rec["kanban"]["task_id"]
+    assert len(spawner.procs) == 1, "the race seam started a runner before the park"
+    assert _all_dead(spawner.procs), "the runner found running under the lock was not stopped"
+    card, _ = _card(task_id)
+    assert card.status == "blocked" and card.worker_pid is None, (card.status, card.worker_pid)
+    terminal = json.dumps([e for e in rec["outbox"] if e.get("type") == "async_delegation"])
+    assert f"card {task_id} was running; its runner was stopped" in terminal, terminal
+    assert rec["state"] == "failed" and calls == [] and not akb._fenced_launch(task_id)
