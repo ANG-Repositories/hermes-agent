@@ -748,7 +748,9 @@ class GatewaySlashCommandsMixin(
         async def _stop(key: str, invalidation_reason: str) -> None:
             await self._interrupt_and_clear_session(
                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
-                invalidation_reason=invalidation_reason)
+                invalidation_reason=invalidation_reason,
+                **({"invoke_timing": event.invoke_timing}
+                   if isinstance(getattr(event, "invoke_timing", None), dict) else {}))
         def _queue_suffix() -> str:
             try:  # import here: a queue_mgmt failure must never stop /stop from stopping a hung agent
                 from gateway import queue_mgmt
@@ -803,7 +805,8 @@ class GatewaySlashCommandsMixin(
         # Same contract as the busy path (run_agent_cache): a marker write failure must not abort
         # /stop before detached delegations are cancelled and the typing status is cleared.
         try:
-            await self._mark_user_stopped(session_key)
+            # Bounded, like the busy path (t_41843f70): the write keeps running after the reply.
+            await self._mark_user_stopped_bounded(session_key)
         except Exception:
             logger.warning("Failed to persist user_stopped marker for idle-stopped session %s",
                            session_key, exc_info=True)

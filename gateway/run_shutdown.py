@@ -2711,6 +2711,21 @@ class GatewayShutdownMixin:
             _new, float(_cur) if _cur is not None else -1.0, _remaining, _elapsed_now,
         )
 
+    # Upper bound per flush; normally nothing is pending and the flush costs nothing.
+    _USER_STOP_FLUSH_TIMEOUT_S = 10.0
+
+    async def _stop_flush_user_stop_writes(self, phase: str) -> None:
+        """Fail-open wrapper: a flush failure is logged and never aborts the shutdown."""
+        _flush = getattr(self, "_flush_pending_user_stop_writes", None)
+        if not callable(_flush):
+            return
+        try:
+            _left = await _flush(GatewayShutdownMixin._USER_STOP_FLUSH_TIMEOUT_S)
+            if _left:
+                logger.warning("Shutdown phase (%s): %d /stop marker write(s) still in flight", phase, _left)
+        except Exception:
+            logger.warning("Shutdown phase (%s): /stop marker flush failed", phase, exc_info=True)
+
     async def _stop_impl(self) -> None:
         """Run every ``_stop_*`` phase under the thread-based shutdown watchdog."""
         from gateway.run import GatewayRunner
@@ -2746,11 +2761,16 @@ class GatewayShutdownMixin:
                     "timeout of %.0fs — launchd SIGKILLs past it",
                     timeout, self._restart_drain_timeout, self._launchd_exit_timeout_s,
                 )
+            # /stop acks before its user_stopped write lands (t_41843f70). Land in-flight marker
+            # writes before any session is marked resumable, and again before the DBs close, so a
+            # restart between /stop's ack and its write never resumes the stopped session.
+            await GatewayRunner._stop_flush_user_stop_writes(self, "pre-drain")
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
             await GatewayRunner._stop_finalize_agents_and_adapters(self, ctx)
             await GatewayRunner._stop_release_runtime_state(self, ctx)
+            await GatewayRunner._stop_flush_user_stop_writes(self, "pre-close")
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
         finally:

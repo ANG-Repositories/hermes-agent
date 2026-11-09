@@ -7836,7 +7836,89 @@ class GatewayRunner(
 
         return model, provider, api_mode
 
-    async def _mark_user_stopped(self, session_key: str) -> bool:
+    # How long /stop waits for the durable user_stopped write before it acks and releases the slot
+    # anyway (t_41843f70: the write waited up to 12.7 s behind other store writers).
+    _STOP_MARKER_WAIT_S = 0.5
+
+    async def _mark_user_stopped_bounded(self, session_key: str) -> str:
+        """Run ``_mark_user_stopped`` with a bounded wait; returns a ``PHASE=stop_stages`` fragment.
+
+        The boot-gate ruling stands: the marker is durable before a restart can resume the
+        session. Before any await, the store records a pending stop (``note_user_stop_pending``),
+        so every resume mark in this process refuses the session until the write lands, and
+        graceful shutdown waits for the write (``_flush_pending_user_stop_writes``) before it
+        marks sessions or closes the DB. The write itself keeps running after a timeout.
+        """
+        generation = self._current_session_run_generation(session_key)
+        store = getattr(self, "session_store", None)
+        note = getattr(store, "note_user_stop_pending", None)
+        noted = False
+        if callable(note):
+            try:
+                note(session_key)
+                noted = True
+            except Exception:
+                logger.debug("user_stop pending note failed for %s", session_key, exc_info=True)
+        timings: dict = {}
+        from agent.interrupt_compat import _accepts_keyword
+        _mark = self._mark_user_stopped
+        task = asyncio.ensure_future(
+            _mark(session_key, generation=generation, timings=timings)
+            if _accepts_keyword(_mark, "timings") else _mark(session_key))
+        pending = self.__dict__.setdefault("_pending_user_stop_writes", set())
+        pending.add(task)
+
+        def _done(t: "asyncio.Future") -> None:
+            pending.discard(t)
+            if noted:
+                try:
+                    store.release_user_stop_pending(session_key)
+                except Exception:
+                    logger.debug("user_stop pending release failed for %s", session_key, exc_info=True)
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning("Failed to persist user_stopped marker for stopped session %s",
+                               session_key, exc_info=t.exception())
+
+        task.add_done_callback(_done)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=self._STOP_MARKER_WAIT_S)
+        except asyncio.TimeoutError:
+            logger.info("PHASE=user_stopped_deferred key=%s waited=%.2f: marker write still in flight; "
+                        "resume marks refuse the session until it lands", session_key,
+                        self._STOP_MARKER_WAIT_S)
+            return "marker_deferred=1"
+        except Exception:
+            return "marker_deferred=0 marker_err=1"  # logged by _done
+        return "marker_deferred=0 " + self._render_user_stop_timings(timings)
+
+    @staticmethod
+    def _render_user_stop_timings(timings: dict) -> str:
+        keys = ("rowid_s", "store_s", "lock_s", "save_lock_s", "upsert_s", "fallback_s", "other_s")
+        return " ".join(
+            f"{k}={timings[k]:.3f}" if isinstance(timings.get(k), (int, float)) else f"{k}=-"
+            for k in keys)
+
+    async def _flush_pending_user_stop_writes(self, timeout: float) -> int:
+        """Wait (bounded) for in-flight /stop marker writes; returns how many are still pending.
+
+        Graceful shutdown calls this before it marks sessions resumable and before it closes the
+        session DBs, so a restart that lands between /stop's ack and its durable write still
+        finds the marker on disk at the next boot.
+        """
+        pending = [t for t in getattr(self, "_pending_user_stop_writes", ()) if not t.done()]
+        if not pending:
+            return 0
+        _, still = await asyncio.wait(pending, timeout=max(0.0, float(timeout)))
+        if still:
+            logger.warning("PHASE=user_stop_flush_timeout pending=%d after %.1fs", len(still), timeout)
+        else:
+            logger.info("PHASE=user_stop_flush flushed=%d", len(pending))
+        return len(still)
+
+    async def _mark_user_stopped(
+        self, session_key: str, *, generation: Optional[int] = None,
+        timings: Optional[dict] = None,
+    ) -> bool:
         """Durably record that ``session_key``'s turn was ended by ``/stop``.
 
         The rowid stamped here is the session's newest persisted message at
@@ -7852,7 +7934,10 @@ class GatewayRunner(
         """
         last_message_id: Optional[int] = None
         # Claimed before any await: a resume racing this write is compared against it.
-        generation = self._current_session_run_generation(session_key)
+        # ``_mark_user_stopped_bounded`` claims it synchronously and passes it in.
+        if generation is None:
+            generation = self._current_session_run_generation(session_key)
+        timings = timings if timings is not None else {}
         entry = None
         try:
             entry = self.session_store._entries.get(session_key)  # noqa: SLF001
@@ -7887,20 +7972,28 @@ class GatewayRunner(
             boot_id = self._current_boot_id()
         except Exception:
             boot_id = None
-        marked = await self.async_session_store.mark_user_stopped(
-            session_key,
-            boot_id=boot_id,
-            last_message_id=last_message_id,
-            generation=generation,
-        )
+        try:
+            marked = await self.async_session_store.mark_user_stopped(
+                session_key,
+                boot_id=boot_id,
+                last_message_id=last_message_id,
+                generation=generation,
+                timings=timings,
+            )
+        finally:
+            # store_s = executor queue + lock_s + save_lock_s + upsert_s (+ fallback_s); other_s is
+            # the remainder (thread-pool queue and in-memory work), so the wait is attributable.
+            timings["rowid_s"] = _t1 - _t0
+            timings["store_s"] = time.monotonic() - _t1
+            timings["other_s"] = max(0.0, timings["store_s"] - sum(
+                float(timings.get(k) or 0.0) for k in ("lock_s", "save_lock_s", "upsert_s", "fallback_s")))
         logger.info(
-            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s rowid_s=%.3f store_s=%.3f",
+            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s %s",
             session_key,
             boot_id,
             last_message_id,
             marked,
-            _t1 - _t0,
-            time.monotonic() - _t1,
+            self._render_user_stop_timings(timings),
         )
         return bool(marked)
 

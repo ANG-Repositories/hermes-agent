@@ -1975,8 +1975,12 @@ class SessionStore(
         candidate_entry: Optional[Dict[str, Any]],
         *,
         lock_held: bool = False,
+        timings: Optional[Dict[str, float]] = None,
     ) -> None:
-        """Write one captured routing entry; the I/O half of ``_save_entry``."""
+        """Write one captured routing entry; the I/O half of ``_save_entry``.
+
+        ``timings`` receives ``save_lock_s`` / ``upsert_s`` / ``fallback_s`` (see
+        ``mark_user_stopped``)."""
         saver = self._routing_db_method("save_gateway_routing_entry")
         if saver is not None:
             from gateway.routing_identity import SessionKeyConflict
@@ -1985,7 +1989,10 @@ class SessionStore(
                 save_lock = threading.Lock()
                 self._save_lock = save_lock
             try:
+                _t_save_lock = time.monotonic()
                 with save_lock:
+                    if timings is not None:
+                        timings["save_lock_s"] = time.monotonic() - _t_save_lock
                     if getattr(self, "_persisted_routing_generation", 0) >= revision:
                         return
                     fast_persisted = getattr(self, "_fast_persisted_entries", None)
@@ -1995,7 +2002,12 @@ class SessionStore(
                     persisted = fast_persisted.get(session_key)
                     if persisted is not None and persisted[0] >= revision:
                         return
-                    saver(session_key, entry_json, scope=self._routing_scope())
+                    _t_upsert = time.monotonic()
+                    try:
+                        saver(session_key, entry_json, scope=self._routing_scope())
+                    finally:
+                        if timings is not None:
+                            timings["upsert_s"] = time.monotonic() - _t_upsert
                     fast_persisted[session_key] = (revision, entry_json)
                     self._valid_routing_keys.add(session_key)
                 return
@@ -2007,6 +2019,18 @@ class SessionStore(
                     "(%s); falling back to full index rewrite",
                     session_key, exc,
                 )
+        _t_fallback = time.monotonic()
+        try:
+            self._persist_captured_entry_fallback(session_key, revision, candidate_entry, lock_held)
+        finally:
+            if timings is not None:
+                timings["fallback_s"] = time.monotonic() - _t_fallback
+
+    def _persist_captured_entry_fallback(
+        self, session_key: str, revision: int, candidate_entry: Optional[Dict[str, Any]],
+        lock_held: bool,
+    ) -> None:
+        """Full-rewrite fallback of ``_persist_captured_entry`` (no DB, or the upsert failed)."""
         if candidate_entry is not None:
             # DB upsert failed (or no DB): build the full snapshot now, carrying
             # the candidate entry so the fallback persists the intended
@@ -2213,7 +2237,8 @@ class SessionStore(
         # whole class instead of each caller remembering. The marker itself is
         # retired by the next real user message (``clear_user_stopped``), so a
         # stopped session that the user resumes by hand marks normally again.
-        if entry.user_stopped_at is not None:
+        # A /stop whose durable write is still in flight counts too (user_stop_pending).
+        if entry.user_stopped_at is not None or self.user_stop_pending(entry.session_key):
             logger.info(
                 "Refusing resume mark for /stop'd session %s (reason=%s)",
                 session_key,
@@ -2316,6 +2341,41 @@ class SessionStore(
             self._ensure_sessions_json_writer_locked()
             self._sessions_json_cv.notify_all()
 
+    def _user_stop_pending_map(self) -> tuple:
+        state = self.__dict__.get("_user_stop_pending_state")
+        if state is None:
+            state = self.__dict__.setdefault("_user_stop_pending_state", (threading.Lock(), {}))
+        return state
+
+    def note_user_stop_pending(self, session_key: str) -> None:
+        """Record, without ``_lock``, that a /stop marker write for ``session_key`` is in flight.
+
+        /stop acknowledges and releases the slot before its durable write lands (t_41843f70:
+        that write waited up to 12.7 s behind other store writers). Until
+        ``release_user_stop_pending``, every resume mark refuses the session exactly as if the
+        marker were already set, so no in-process path can re-arm a turn the user just stopped.
+        Safe from the event loop: a dict update under a private mutex no I/O ever holds.
+        """
+        guard, pending = self._user_stop_pending_map()
+        with guard:
+            pending[session_key] = pending.get(session_key, 0) + 1
+
+    def release_user_stop_pending(self, session_key: str) -> None:
+        guard, pending = self._user_stop_pending_map()
+        with guard:
+            count = pending.get(session_key, 0) - 1
+            if count > 0:
+                pending[session_key] = count
+            else:
+                pending.pop(session_key, None)
+
+    def user_stop_pending(self, session_key: Optional[str]) -> bool:
+        if not session_key:
+            return False
+        guard, pending = self._user_stop_pending_map()
+        with guard:
+            return pending.get(session_key, 0) > 0
+
     def mark_user_stopped(
         self,
         session_key: str,
@@ -2323,6 +2383,7 @@ class SessionStore(
         boot_id: Optional[str] = None,
         last_message_id: Optional[int] = None,
         generation: Optional[int] = None,
+        timings: Optional[Dict[str, float]] = None,
     ) -> bool:
         """Persist "the user ended this turn with /stop" and retire the hedge.
 
@@ -2330,12 +2391,14 @@ class SessionStore(
         cleared at that generation or later, this stop lost the race and is skipped, so a stop
         write that lands after the user resumed never re-latches the session.
 
-        Durability is the whole point: the marker must be on disk before
-        ``/stop`` acknowledges, or a SIGKILL in that window leaves a stopped
-        turn looking exactly like an interrupted one and the next boot
-        re-prompts it. ``_save`` writes state.db (and the sessions.json
-        mirror) synchronously here, so the write happens before the caller
-        can reply.
+        Durability is the whole point: the marker must be on disk before a
+        restart can resume the session, or the stopped turn looks exactly like
+        an interrupted one and the next boot re-prompts it. The write lands
+        before this method returns. The runner (``_mark_user_stopped_bounded``)
+        waits for it only briefly before acknowledging /stop; until it lands,
+        ``user_stop_pending`` makes every resume mark refuse the session, and
+        graceful shutdown flushes in-flight marker writes before it closes the
+        DB (t_41843f70).
 
         ``resume_pending`` is cleared in the same critical section: a stop
         consumes restart-recovery intent, and leaving the two markers to be
@@ -2343,8 +2406,16 @@ class SessionStore(
         resume-pending session with no stop marker.
 
         Returns True when a session existed and was marked.
+
+        ``timings`` (optional dict) receives the sub-stages of this call in seconds:
+        ``lock_s`` (wait for ``_lock``), and from the single-row write ``save_lock_s`` (wait for
+        ``_save_lock``, held by whole-index rewrites), ``upsert_s`` (the SQLite UPSERT) and
+        ``fallback_s`` (full rewrite after a failed upsert).
         """
+        _t_lock = time.monotonic()
         with self._lock:
+            if timings is not None:
+                timings["lock_s"] = time.monotonic() - _t_lock
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
@@ -2359,7 +2430,7 @@ class SessionStore(
                     # boot gate, so the late write changes nothing in memory. Its caller still
                     # acknowledges /stop, so persist the newer marker first: that write may be
                     # deferred behind the save lock or may have failed.
-                    self._save_entry(session_key, lock_held=True)
+                    self._save_entry(session_key, lock_held=True, timings=timings)
                     return True
                 fence[0] = int(generation)
             # An untracked stop (no generation) leaves the fence as is: never lowered.
@@ -2375,10 +2446,10 @@ class SessionStore(
             self._clear_resume_pending_entry(entry)
             # One-row UPSERT, not the whole-index rewrite: only this entry's marker fields changed
             # and the key -> session_id mapping did not. The write still runs (deferred to the
-            # lock release in this thread) before this method returns, so the marker is on disk
-            # before /stop acknowledges; a failed upsert falls back to the full rewrite. Live
+            # lock release in this thread) before this method returns; a failed upsert falls
+            # back to the full rewrite. Live
             # 2026-11-08: the full _save made /stop wait 0.6-5.5 s behind other sessions' saves.
-            self._save_entry(session_key, lock_held=True)
+            self._save_entry(session_key, lock_held=True, timings=timings)
         return True
 
     def clear_stale_resume_pending(self, max_age_seconds: float) -> int:
@@ -2849,7 +2920,7 @@ class SessionStore(
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
-                if entry.user_stopped_at is not None:
+                if entry.user_stopped_at is not None or self.user_stop_pending(entry.session_key):
                     # A /stop'd turn is never auto-resumed (ruling 2026-09-21).
                     # This wholesale post-crash re-mark is precisely the path
                     # that made a stopped session indistinguishable from an
