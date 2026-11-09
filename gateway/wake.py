@@ -90,18 +90,21 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
                        notification_category: str = "result", profile: Optional[str] = None,
-                       metadata: Optional[dict] = None) -> None:
+                       metadata: Optional[dict] = None, wake_kind: Optional[str] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
     names the served profile that canonically owns a non-push destination; a non-default value is
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
-    Raises on failure so the caller can rewind/retry."""
+    ``wake_kind`` (``gateway.wake_kind``) names the wake for its progress header; detail rides
+    ``metadata`` (``wake_sub`` / ``wake_name`` / ``card_id``). Raises on failure so the caller can
+    rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
+                                   wake_kind=wake_kind,
                                    metadata={**(metadata or {}),
                                              "notification_category": notification_category})
         await admit_internal_event(adapter, synth_event)

@@ -6,9 +6,12 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # Canonical model-emitted control token for intentional silence (fork).
 SILENT_REPLY_TOKEN = "NO_REPLY"
@@ -277,10 +280,11 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
     return display_kind in MACHINERY_DISPLAY_KINDS
 
 
-# A wake's own bracket tag (``[kanban review deadman] ...``): a short word label, never a
-# ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION COMPLETE — id]`` sentence.
+# LEGACY fallback only (a wake whose producer stamped no ``wake_kind``, e.g. an external caller):
+# its own bracket tag (``[kanban review deadman] ...``), a short word label, never a
+# ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION COMPLETE — id]`` sentence. The card id is never read
+# from the body any more (t_17ba87a6: a goal text naming a card read as a kanban wake).
 _WAKE_TAG_RE = re.compile(r"\A\s*\[([A-Za-z][A-Za-z0-9 _-]{0,39})\]")
-_WAKE_CARD_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
 
 
 def _wake_fallback_label(text: str, metadata: dict) -> str:
@@ -301,11 +305,17 @@ def wake_progress_header(message: Any, display_kind: Any, metadata: Optional[dic
     """
     if not is_machinery_display_kind(display_kind) or not isinstance(message, str) or not message.strip():
         return None
-    tag = _WAKE_TAG_RE.match(message)
-    label = " ".join(tag.group(1).split()) if tag else _wake_fallback_label(message, metadata or {})
-    card = _WAKE_CARD_RE.search(message)
-    if card:
-        label = f"{label} · {card.group(0)}"
+    # The producer names the wake (``wake_kind`` + ``wake_sub`` / ``wake_name`` / ``card_id``);
+    # the prose is never parsed for it (t_17ba87a6).
+    from gateway.wake_kind import wake_label
+    label = wake_label(metadata)
+    if label is None:
+        tag = _WAKE_TAG_RE.match(message)
+        legacy = " ".join(tag.group(1).split()) if tag else _wake_fallback_label(message, metadata or {})
+        label = f"wake · {legacy}"
+        logger.warning(
+            "wake header: unlabeled wake (producer stamped no wake_kind; got %r), legacy label %r; "
+            "wake opens %r", (metadata or {}).get("wake_kind"), legacy, message.lstrip()[:60])
     from agent.i18n import t
     return t("gateway.progress.wake_head", label=label)
 

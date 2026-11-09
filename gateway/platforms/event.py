@@ -98,6 +98,10 @@ class MessageEvent:
     # of publishing a second public message. Adapters that never defer leave it False.
     suppress_public_echo: bool = False
     deferred_reply_text: Optional[str] = None
+    # Fork (t_17ba87a6): what kind of self-injected wake this is (``gateway.wake_kind``: kanban,
+    # goal, loop, ...), named by its PRODUCER; detail rides ``metadata`` (wake_sub/wake_name/card_id).
+    # The progress header reads it instead of guessing from the text. None = a human turn.
+    wake_kind: Optional[str] = None
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

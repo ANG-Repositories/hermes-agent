@@ -36,6 +36,16 @@ GOAL_PIN_FAILED = ("<goal pin failed>",)
 _LOOP_JUDGE_DEFER: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar("loop_judge_defer", default=None)
 
 
+def _goal_idle_wake_sub(prompt: str, mgr: Any, max_checkins: int) -> str:
+    """Header sub-kind of a goal idle wake: ``check-in N/M`` for a counted check-in (N from the goal
+    state this wake just saved), else ``park expired`` (a timed park's deadline passed)."""
+    from hermes_cli.goals import GOAL_CHECKIN_PREFIX
+    if str(prompt or "").startswith(GOAL_CHECKIN_PREFIX):
+        n = getattr(getattr(mgr, "state", None), "idle_wakes", None)
+        return f"check-in {n}/{max_checkins}" if isinstance(n, int) else "check-in"
+    return "park expired"
+
+
 class GatewayGoalsMixin:
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
 
@@ -156,15 +166,19 @@ class GatewayGoalsMixin:
         return await self._manager_for_event(event, "heartbeat", _load)
 
     @staticmethod
-    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
+    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False,
+                                wake_kind: Optional[str] = None, wake_sub: Optional[str] = None) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
         The stored source's ``message_id`` is the message that registered the watch; a synthetic
         prompt is not a reply to it, so it is dropped or every progress bubble and final reply
         would quote that stale message (Telegram DM topics route anchorless via the topic id).
+        ``wake_kind`` / ``wake_sub`` name the wake for its progress header (``gateway.wake_kind``).
         """
+        from gateway.wake_kind import wake_meta
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
-        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+                            wake_kind=wake_kind, metadata=wake_meta(sub=wake_sub))
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -223,7 +237,7 @@ class GatewayGoalsMixin:
             return
         if not prompt:
             return
-        event = self._synthetic_prompt_event(source, prompt)
+        event = self._synthetic_prompt_event(source, prompt, wake_kind="heartbeat")
         event.metadata["gateway_session_key"] = quick_key
         event._heartbeat_execution_started = False
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
@@ -460,7 +474,9 @@ class GatewayGoalsMixin:
                 # this flag the shared-multi-user sender prefix would stamp "[<user>] " onto it
                 # (impersonation; same class as the boot-resume ghost message, 2026-07-10).
                 self._enqueue_fifo(
-                    _quick_key, self._synthetic_prompt_event(source, prompt, internal=True), adapter,
+                    _quick_key,
+                    self._synthetic_prompt_event(source, prompt, internal=True, wake_kind="goal", wake_sub="continue"),
+                    adapter,
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
@@ -697,7 +713,7 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            event = self._synthetic_prompt_event(source, wakeup, internal=True)
+            event = self._synthetic_prompt_event(source, wakeup, internal=True, wake_kind="loop")
             refused = []
 
             def _admit(key: str) -> bool:
@@ -909,7 +925,9 @@ class GatewayGoalsMixin:
                         "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
                         quick_key, session_id, prompt.splitlines()[0][:80],
                     )
-                    event = self._synthetic_prompt_event(source, prompt, internal=True)
+                    event = self._synthetic_prompt_event(
+                        source, prompt, internal=True, wake_kind="goal",
+                        wake_sub=_goal_idle_wake_sub(prompt, mgr, max_checkins))
                     event._goal_idle_wake = True
                     event.metadata["gateway_session_key"] = quick_key
                     def _admit(key: str) -> bool:
