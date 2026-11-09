@@ -74,13 +74,16 @@ def main() -> int:
         return real_spawn(*args, **kwargs)
 
     os.posix_spawn = counted_spawn
-    real_fork = subprocess._fork_exec
+    import _posixsubprocess
+    fork_owner = subprocess if hasattr(subprocess, "_fork_exec") else _posixsubprocess
+    fork_name = "_fork_exec" if fork_owner is subprocess else "fork_exec"
+    real_fork = getattr(fork_owner, fork_name)
 
     def counted_fork(*args, **kwargs):
         counters["fork_exec"] += 1
         return real_fork(*args, **kwargs)
 
-    subprocess._fork_exec = counted_fork
+    setattr(fork_owner, fork_name, counted_fork)
 
     # Many separately allocated, page-touched chunks reproduce a fragmented heap,
     # unlike one contiguous bytearray (especially important for macOS fork cost).
