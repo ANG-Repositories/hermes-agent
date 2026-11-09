@@ -100,6 +100,10 @@ TRIGGER_REVIEW_DEADMAN = "review_deadman"
 # failure/handoff, an obligation reconciler routine wake) on a boomerang-wake card, as an event instead of a
 # direct control-socket turn. Off boomerang it is the owner turn, like every other row.
 TRIGGER_MECHANICAL_WAKE = "mechanical_wake"
+# Event kinds whose producer resolves the recipient itself and may carry an alerts-home / fallback session key
+# (t_3151f3fd review deadman; t_6a70430e mechanical wake). hermes-home card_mechanical_wake.consumer_ready() reads
+# this name in the LOADED tree before a producer puts a routed recipient on a mechanical_wake event.
+ROUTED_RECIPIENT_KINDS = (TRIGGER_REVIEW_DEADMAN, TRIGGER_MECHANICAL_WAKE)
 
 _WAKE_OFF_RE = re.compile(r"^\s*wake\s*:\s*off\s*$", re.I | re.M)
 # A block reason that names WHEN or ON WHAT the card can move again.
@@ -795,7 +799,7 @@ def routed_recipient(item: dict) -> str:
     wake sub). On a boomerang card it now emits the event on those routes too, carrying
     ``recipient_session_key``; the owner-wake then wakes THAT session (or hands it to a
     boomerang child routed there), never the #alerts home. Any other kind: ""."""
-    if item.get("kind") != TRIGGER_REVIEW_DEADMAN:
+    if item.get("kind") not in ROUTED_RECIPIENT_KINDS:
         return ""
     p = item.get("payload") or {}
     if p.get("recipient_route") not in ("alerts-home", "fallback"):

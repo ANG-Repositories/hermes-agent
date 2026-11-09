@@ -1414,3 +1414,23 @@ def test_acknowledge_refuses_a_card_that_moved_since_the_claim(env):
     assert not res["ok"] and "moved" in res["reason"], res
     with kb.connect_closing() as conn:
         assert not [e for e in kb.list_events(conn, tid) if e.kind == ah.RECEIPT_KIND]
+
+
+
+@pytest.mark.parametrize("route", ["alerts-home", "fallback"])
+def test_routed_mechanical_wake_on_boomerang_card_is_one_child_routed_to_the_recipient(env, route):
+    other = "1502228850338435153"
+    rcpt = env["runner"].session_store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id=other, chat_type="group", user_id=HUMAN))
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "mechanical_wake", {
+            "by": "card-mechanical-wake", "source": "detached-run", "episode": "detached:r1", "text": "rc=1",
+            "recipient_route": route, "recipient_session_key": rcpt.session_key,
+            "recipient_chat": other, "recipient_profile": "default"})
+    turns = _tick(env)
+    assert turns == [], [t.text for t in turns]
+    assert len(env["dispatched"]) == 1, env["dispatched"]
+    d = env["dispatched"][0]
+    assert d["row"] == "mechanical_wake" and str(d["route"]["chat_id"]) == other, d
