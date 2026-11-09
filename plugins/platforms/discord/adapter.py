@@ -5680,6 +5680,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self, interaction: discord.Interaction, command_text: str, followup_msg: str | None = None,
     ) -> None:
         """Defer, dispatch the command string, then replace/delete the "thinking..." indicator."""
+        # Invoke stamps for PHASE=stop_stages inv_lag / inv_auth / inv_defer (t_41843f70: 5.35 s
+        # between this log line and /stop's generation bump, not attributed by any stage).
+        _invoked_at = time.monotonic()
         # Log the invoker so ghost-command reports can be triaged post-mortem.
         try:
             _user = interaction.user
@@ -5694,12 +5697,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Auth gate must precede defer() so the ephemeral rejection can still be sent.
         if not await self._check_slash_authorization(interaction, command_text):
             return
+        _authed_at = time.monotonic()
         deferred_response = await self._defer_unless_expired(
             interaction,
             "[Discord] slash %s: interaction expired before defer. "
             "Executing command anyway, skipping interaction followup.", command_text,
         )
         event = self._build_slash_event(interaction, command_text)
+        try:
+            event.invoke_timing = {"at": _invoked_at, "auth": _authed_at - _invoked_at,
+                                   "defer": time.monotonic() - _authed_at}
+        except Exception:
+            pass  # diagnostics only
         # This interaction is deferred and WE will answer it below. Tell the
         # base adapter's inline command-dispatch paths (busy bypass,
         # interrupt-then-dispatch, clarify intercept) to hand their reply

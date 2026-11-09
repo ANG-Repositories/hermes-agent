@@ -748,7 +748,9 @@ class GatewaySlashCommandsMixin(
         async def _stop(key: str, invalidation_reason: str) -> None:
             await self._interrupt_and_clear_session(
                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
-                invalidation_reason=invalidation_reason)
+                invalidation_reason=invalidation_reason,
+                **({"invoke_timing": event.invoke_timing}
+                   if isinstance(getattr(event, "invoke_timing", None), dict) else {}))
         def _queue_suffix() -> str:
             try:  # import here: a queue_mgmt failure must never stop /stop from stopping a hung agent
                 from gateway import queue_mgmt
