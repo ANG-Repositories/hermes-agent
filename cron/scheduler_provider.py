@@ -617,13 +617,15 @@ class InProcessCronScheduler(CronScheduler):
         # store here must not take the whole ticker thread down (#111010) — the loop's own
         # per-tick handling logs, persists the reason and keeps the thread alive.
         try:
+            if lane != "script":
+                _shutdown_replay_pass("pre")
             recovered = self.recover_interrupted()
             if recovered:
                 logger.warning(
                     "Marked %d interrupted cron execution(s) unknown after restart", recovered
                 )
             if lane != "script":
-                _consume_shutdown_replays()
+                _shutdown_replay_pass("post")
             # Heartbeat before the first sleep so `hermes cron status` sees a live ticker
             # immediately.
             record_ticker_heartbeat()
@@ -738,6 +740,8 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 with _profile_cron_scope(home):
                     if startup_recovery:
+                        if lane != "script":
+                            _shutdown_replay_pass("pre")
                         recovered = self.recover_interrupted()
                         if recovered:
                             logger.warning(
@@ -745,7 +749,7 @@ class InProcessCronScheduler(CronScheduler):
                                 recovered, home,
                             )
                         if lane != "script":
-                            _consume_shutdown_replays()
+                            _shutdown_replay_pass("post")
                     if heartbeat:
                         record_ticker_heartbeat()
             except BaseException as e:
@@ -889,15 +893,19 @@ class InProcessCronScheduler(CronScheduler):
             stop_event.wait(max(0.0, next_tick - now))
 
 
-def _consume_shutdown_replays() -> None:
-    """Boot pass over the current store's stop-drain replay markers and hard-kill claims.
-    Never lets that bookkeeping break scheduler startup."""
+def _shutdown_replay_pass(phase: str) -> None:
+    """Boot pass of cron/shutdown_replay.py for the current store: ``"pre"`` (before execution
+    recovery) releases hard-kill claims, ``"post"`` consumes stop-drain replay markers. Never
+    lets that bookkeeping break scheduler startup."""
     try:
-        from cron.shutdown_replay import consume_at_startup
+        from cron import shutdown_replay
 
-        consume_at_startup()
+        if phase == "pre":
+            shutdown_replay.release_orphaned_claims()
+        else:
+            shutdown_replay.consume_replay_markers()
     except Exception:
-        logger.warning("cron shutdown-replay startup pass failed", exc_info=True)
+        logger.warning("cron shutdown-replay %s-recovery pass failed", phase, exc_info=True)
 
 
 def _stamp_not_before(last_run: str, claimed_at: str) -> bool:

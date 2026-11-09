@@ -87,7 +87,7 @@ DEFAULT_MIRROR_INTERVAL_S = 30.0
 #   cron/scheduler_delivery.py (update_job per delivery)         last_delivery_unverified,
 #                                                                last_delivery_queued
 #   cron/monitor.py check_monitor                                monitor_state
-#   cron/shutdown_replay.py mark_replay_pending / consume_at_startup  replay_pending
+#   cron/shutdown_replay.py mark_replay_pending / consume_replay_markers  replay_pending
 #   note_fire_forward_failure                                    last_fire_error
 # ``repeat.completed`` is the one nested key: ``repeat.times`` is definition, ``completed`` is
 # bumped on every recurring run. ``state``/``enabled``/``paused_*`` stay definitions: they are
