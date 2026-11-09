@@ -179,6 +179,53 @@ def create_default_priority(created_by: str | None, origin: str | None = None) -
     return 0 if (origin or kb.classify_create_origin()) in _MINTER_ORIGINS else HUMAN_DEFAULT_PRIORITY
 
 
+# Live band (t_febbdb61, ruling:t_febbdb61-live-band-scope): a person's or an operator's create with no
+# --priority lands at the median priority of the cards spawned in the last 24 h (floor 100), so filed
+# work is not starved under incident minters at 300-410. Machine minters keep the bands above (<= 59).
+# KANBAN_LIVE_BAND=off restores the flat human default (100).
+LIVE_BAND_WINDOW_S = 86400
+_LIVE_BAND_OPERATORS = frozenset({"apollo", "daedalus", "daedalus-opus"})
+
+
+def live_priority_band(conn, *, now: int | None = None) -> int:
+    """Median ``tasks.priority`` over the ``spawned`` events of the last 24 h (one value per spawn, so the band
+    follows where the dispatcher's capacity actually went), floor 100."""
+    import statistics
+    import time
+    since = int(time.time() if now is None else now) - LIVE_BAND_WINDOW_S
+    rows = conn.execute(
+        "SELECT t.priority FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = 'spawned' AND e.created_at >= ?", (since,)).fetchall()
+    prios = [int(r[0] or 0) for r in rows]
+    return max(HUMAN_DEFAULT_PRIORITY, int(statistics.median(prios))) if prios else HUMAN_DEFAULT_PRIORITY
+
+
+def live_band_default(conn, author: str | None, origin: str | None = None) -> int | None:
+    """The live band for a no-``--priority`` create by a person (``user``, not a cron/worker/script process)
+    or a named operator profile (apollo, daedalus, daedalus-opus; never from a cron job), else None."""
+    off = ("0", "off", "false", "no")
+    if ((os.environ.get("KANBAN_PRIORITY_BANDS") or "").strip().lower() == "off"
+            or (os.environ.get("KANBAN_LIVE_BAND") or "").strip().lower() in off):
+        return None
+    from gateway.session_context import is_cron_session
+
+    # Task-local cron scope outranks process/profile identity, including root's alias.
+    if is_cron_session():
+        return None
+    author = "apollo" if author == "default" else author  # eligibility only; never rewrite the creator
+    origin = origin or kb.classify_create_origin()
+    if author == HUMAN_CREATED_BY:
+        eligible = origin not in _MINTER_ORIGINS
+    else:
+        eligible = author in _LIVE_BAND_OPERATORS and origin != kb.CREATE_ORIGIN_CRON
+    if not eligible:
+        return None
+    try:
+        return live_priority_band(conn)
+    except Exception:  # a band read must never fail the create
+        return HUMAN_DEFAULT_PRIORITY
+
+
 _CREATE_PRIORITY = _arg(
     "--priority", type=priority_value, default=None,
     help="Dispatch priority, higher = first: int or tier p0=300 p1=200 p2=100 p3=0. Bands: ace_direct 300, "

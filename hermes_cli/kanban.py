@@ -44,7 +44,9 @@ from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
-from hermes_cli.kanban_parser import create_default_priority
+from hermes_cli.kanban_parser import (
+    HUMAN_CREATED_BY, _LIVE_BAND_OPERATORS, create_default_priority, live_band_default,
+)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
@@ -1013,20 +1015,32 @@ def _cmd_create(args: argparse.Namespace) -> int:
                                 and _auto_wake(None)
                                 and _resolve_notify_target(require_platform_identity=True))
                 or bool(_explicit_sid and routable_home_target(_explicit_sid) is not None))
+            _author = args.created_by or _profile_author()
+            _default_priority = None
+            if args.priority is None:  # live band for a person/operator create (t_febbdb61)
+                _priority_author = args.created_by or (
+                    _author if _author == "default" or _author in _LIVE_BAND_OPERATORS else HUMAN_CREATED_BY)
+                # argparse's historical default is "user"; preserve that persisted author,
+                # but retain the verified root alias for operator eligibility.
+                if _priority_author == HUMAN_CREATED_BY and _profile_author() == "default":
+                    _priority_author = "default"
+                _default_priority = live_band_default(conn, _priority_author)
+                if _default_priority is None:
+                    _default_priority = create_default_priority(args.created_by)
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
                 title=args.title,
                 body=args.body,
                 assignee=args.assignee,
-                created_by=args.created_by or _profile_author(),
+                created_by=_author,
                 workspace_kind=ws_kind,
                 workspace_path=ws_path,
                 branch_name=branch_name,
                 project_id=getattr(args, "project", None),
                 tenant=args.tenant,
                 priority=(args.priority if args.priority is not None
-                          else create_default_priority(args.created_by)),
+                          else _default_priority),
                 parents=tuple(args.parent or ()),
                 parents_kind=getattr(args, "parent_kind", None),
                 continues=getattr(args, "continues", None),
