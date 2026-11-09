@@ -377,7 +377,7 @@ def _sync_completion(conn, event, result, disposition=None):
 
 def _canonical_terminal(registry, delegation_id):
     """Resolve current-attempt terminal evidence while holding the JSON lock."""
-    terminal = _store.canonical_terminal(registry, delegation_id)
+    terminal = _store.canonical_terminal(registry, delegation_id, path=_registry_path())
     if terminal is None:
         return None
     return {**terminal, "payload": {**terminal["payload"],
