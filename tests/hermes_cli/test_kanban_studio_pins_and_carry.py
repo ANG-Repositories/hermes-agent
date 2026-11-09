@@ -678,6 +678,7 @@ def test_a_submodule_edit_hidden_by_ignore_all_binds(reproducible_workspace, tmp
     _git(repo, "config", "submodule.sub.ignore", "all")
     assert kwh.local_workspace_binding(str(ws), now=0) is None
     (repo / "sub" / "lib.py").write_text("x = 2  # local only\n")
+    kwh._binding_cache.clear()  # isolate the status override from the stale-local-verdict regression
     assert kwh.local_workspace_binding(str(ws), now=1) == "repo/sub"
 
 
@@ -716,3 +717,52 @@ def test_an_ls_remote_timeout_binds_as_remote_unverified(reproducible_workspace,
             raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
         return subprocess.run(argv, **kw)
     assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
+
+
+
+def test_remote_containment_cache_is_keyed_by_head_but_status_always_runs(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        return subprocess.run(argv, **kw)
+
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) is None
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=1) is None
+    assert sum("status" in a for a in calls) == 2
+    assert sum("ls-remote" in a for a in calls) == 1
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "local only")
+    assert (kwh.local_workspace_binding(str(ws), runner=runner, now=2) or "").startswith("repo@unpushed:")
+    assert sum("ls-remote" in a for a in calls) == 2
+
+
+def test_remote_containment_accepts_ancestor_of_a_current_remote_tip(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "later")
+    _git(repo, "push", "-q", "origin", "HEAD")
+    _git(repo, "checkout", "-q", "--detach", "HEAD~1")
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+
+
+def test_remote_tip_not_present_locally_binds_as_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", "-q", str(tmp_path / "origin.git"), str(other))
+    _git(other, "checkout", "-q", "feat-ws")
+    _git(other, "commit", "-q", "--allow-empty", "-m", "tip not fetched by workspace")
+    _git(other, "push", "-q", "origin", "HEAD")
+    assert kwh.local_workspace_binding(str(ws), now=0) == "remote-unverified: repo"
+    assert repo.exists()
+
+
+def test_remote_containment_cache_expires_after_deleted_remote_branch(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    _git(tmp_path, "--git-dir", str(tmp_path / "origin.git"), "branch", "-D", "feat-ws")
+    assert (kwh.local_workspace_binding(str(ws), now=121) or "").startswith("repo@unpushed:")
+    assert repo.exists()
