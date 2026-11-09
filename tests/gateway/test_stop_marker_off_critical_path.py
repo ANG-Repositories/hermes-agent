@@ -302,7 +302,9 @@ async def test_deferred_marker_write_is_bound_to_the_session_stop_saw(tmp_path, 
     assert store._entries[key].session_id == "sess-after-new"
     assert store._entries[key].user_stopped_at is None, "the new session inherited the old /stop"
     assert any("Skipping user_stopped write" in m for m in caplog.messages)
-    assert not list((tmp_path / "sessions" / "user_stop_intents").glob("*.json"))
+    # A skipped write proves nothing durable about the replacement route, so the intent stays
+    # (Prism r3 c-fef208c96fa65cce); the next boot drops it once the new route is on disk.
+    assert list((tmp_path / "sessions" / "user_stop_intents").glob("*.json"))
     db.close()
 
 
@@ -515,4 +517,179 @@ def test_fallback_routing_load_keeps_the_intent_and_applies_it_after_reconcile(
         assert revived.session_id == sid_b
         assert revived.user_stopped_at is not None, "the acked /stop was lost after reconcile"
         assert revived.resume_pending is False
+    db.close()
+
+
+# --- Prism r3 (round 3 on #165, Apollo send-back @ 6dfdeb5227) repros -----------------------
+
+
+def _record_dir_fsyncs(monkeypatch) -> list:
+    """Patch os.fsync to record the inode of every directory fsync'd (and still fsync it)."""
+    import os as _os
+    import stat as _stat
+
+    real_fsync = _os.fsync
+    seen: list = []
+
+    def _fsync(fd):
+        st = _os.fstat(fd)
+        if _stat.S_ISDIR(st.st_mode):
+            seen.append(st.st_ino)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(_os, "fsync", _fsync)
+    return seen
+
+
+def test_intent_write_completes_a_short_write_and_fails_on_no_progress(tmp_path, monkeypatch):
+    """Prism r3 P1 c-2dc0ab551bad124b: one ``os.write`` may write part of the payload. The intent
+    must hold the whole payload, and a write that makes no progress must raise (and leave no
+    intent), so /stop falls back to waiting for the marker."""
+    import os as _os
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_source())
+    real_write = _os.write
+    monkeypatch.setattr(_os, "write", lambda fd, data: real_write(fd, bytes(data[:16])))
+    path = store.write_user_stop_intent(entry.session_key, entry.session_id, generation=7)
+    data = json.loads(path.read_text(encoding="utf-8"))  # truncated JSON before the fix
+    assert data["session_id"] == entry.session_id and data["generation"] == 7
+
+    monkeypatch.setattr(_os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError):
+        store.write_user_stop_intent(entry.session_key, entry.session_id)
+    left = [p.name for p in path.parent.iterdir() if p != path]
+    assert left == [], f"a failed intent write left {left}"
+
+
+def test_intent_write_fsyncs_the_parent_of_a_directory_it_creates(tmp_path, monkeypatch):
+    """Prism r3 P1 c-8ff907760b0b3857: the first /stop creates ``user_stop_intents``. Its entry in
+    ``sessions_dir`` is durable only once ``sessions_dir`` itself is fsync'd."""
+    import os as _os
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_source())
+    sessions_dir = tmp_path / "sessions"
+    assert not (sessions_dir / "user_stop_intents").exists()
+    seen = _record_dir_fsyncs(monkeypatch)
+    store.write_user_stop_intent(entry.session_key, entry.session_id)
+    assert _os.stat(sessions_dir / "user_stop_intents").st_ino in seen
+    assert _os.stat(sessions_dir).st_ino in seen, "the new intent directory's parent was not fsync'd"
+
+
+def test_intent_retirement_fsyncs_the_directory(tmp_path, monkeypatch):
+    """Prism r3 P1 c-1efe0292ac7e504a: an unlink a crash can undo brings a retired intent back,
+    and the next boot re-stops a session the user resumed. Both retire paths fsync the dir."""
+    import os as _os
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_source())
+    intents = tmp_path / "sessions" / "user_stop_intents"
+    first = store.write_user_stop_intent(entry.session_key, entry.session_id)
+    seen = _record_dir_fsyncs(monkeypatch)
+    store.retire_user_stop_intent(first)
+    assert not first.exists()
+    assert _os.stat(intents).st_ino in seen, "retire_user_stop_intent: no directory fsync"
+
+    second = store.write_user_stop_intent(entry.session_key, entry.session_id)
+    seen.clear()
+    store.clear_user_stopped(entry.session_key)  # -> _retire_user_stop_intents_for_key
+    assert not second.exists()
+    assert _os.stat(intents).st_ino in seen, "_retire_user_stop_intents_for_key: no directory fsync"
+
+
+def test_stop_landing_after_compression_marks_the_continuation(tmp_path, monkeypatch):
+    """Prism r3 P1 c-d9f504b2a0758b66: compression rotates the key's session id while the
+    deferred marker write is queued. The compression tip of the stopped id is the same
+    conversation, so the stop must land on it (fail-closed rowid), and a boot that applies a
+    surviving intent must honour it too. /new (an unrelated id) still does not inherit it."""
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_source())
+    key, tip = entry.session_key, entry.session_id
+    pre = "sess-before-compression"
+    tips = {pre: tip}
+    monkeypatch.setattr(SessionStore, "_compression_tip_for_session_id",
+                        lambda self, sid: tips.get(sid, sid))
+    assert store.mark_resume_pending(key, "shutdown_timeout")
+
+    timings: dict = {}
+    assert store.mark_user_stopped(key, expected_session_id=pre, last_message_id=41,
+                                   generation=3, timings=timings) is True
+    assert store._entries[key].user_stopped_at is not None, "a stop during compression was dropped"
+    assert store._entries[key].user_stopped_message_id is None  # pre-compression rowid: fail closed
+    assert store._entries[key].resume_pending is False
+    assert timings["outcome"] == "written"
+
+    # Boot path: an intent written for the pre-compression id survives a crash.
+    store.clear_user_stopped(key)
+    store.write_user_stop_intent(key, pre, generation=9)
+    reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    assert reloaded.get_or_create_session(_source()).user_stopped_at is not None
+
+    # Negative control: an unrelated id (what /new routes to) is still skipped.
+    other: dict = {}
+    assert store.mark_user_stopped(key, expected_session_id="sess-unrelated", generation=10,
+                                   timings=other) is False
+    assert other["outcome"] == "skipped_route"
+
+
+@pytest.mark.asyncio
+async def test_skipped_marker_write_keeps_the_intent_for_the_next_boot(tmp_path, monkeypatch):
+    """Prism r3 P1 c-fef208c96fa65cce: a write skipped because the key routes elsewhere is not
+    proof the replacement is durable (``_replace_route_locked`` publishes before its deferred
+    save). The intent must survive, so a crash before the replacement lands still boots the
+    stopped session as stopped. A written marker does retire it (positive control)."""
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    entry = store.get_or_create_session(_source())
+    key = entry.session_key
+    intents = tmp_path / "sessions" / "user_stop_intents"
+
+    real_mark = runner._mark_user_stopped
+
+    async def _mark_after_new(session_key, **kwargs):
+        # /new published in memory only (its deferred save has not landed) before the write runs.
+        store._entries[key] = dataclasses.replace(store._entries[key], session_id="sess-after-new")
+        return await real_mark(session_key, **kwargs)
+
+    monkeypatch.setattr(runner, "_mark_user_stopped", _mark_after_new)
+    await runner._mark_user_stopped_bounded(key)
+    await _settle_pending_writes(runner)
+    assert list(intents.glob("*.json")), "a skipped marker write retired the only durable stop"
+    # Crash now: disk still routes the key to the stopped session; the boot must refuse it.
+    reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    assert reloaded.get_or_create_session(_source()).user_stopped_at is not None
+
+    # Positive control: a written marker retires its intent.
+    monkeypatch.setattr(runner, "_mark_user_stopped", real_mark)
+    store._entries[key] = dataclasses.replace(store._entries[key], session_id=entry.session_id)
+    store.clear_user_stopped(key)
+    assert not list(intents.glob("*.json"))
+    await runner._mark_user_stopped_bounded(key)
+    await _settle_pending_writes(runner)
+    assert store._entries[key].user_stopped_at is not None
+    assert not list(intents.glob("*.json")), "a written marker left its intent behind"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_intent_write_runs_off_the_event_loop(tmp_path, monkeypatch, caplog):
+    """Prism r3 P2 c-8f4218c9f5df3ee0: the intent's mkdir/write/fsync/rename are blocking I/O and
+    must not run on the event loop thread; their time is still reported as intent_s."""
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    key = store.get_or_create_session(_source()).session_key
+    real_writer = store.write_user_stop_intent
+    threads: list = []
+
+    def _writer(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return real_writer(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write_user_stop_intent", _writer)
+    frag = await runner._mark_user_stopped_bounded(key)
+    await _settle_pending_writes(runner)
+    assert threads, "the intent writer was not called"
+    assert threads[0] is not threading.main_thread(), "intent I/O ran on the event loop thread"
+    assert "intent=1" in frag and "intent_s=" in frag, frag
     db.close()
