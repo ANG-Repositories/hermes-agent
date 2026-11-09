@@ -475,6 +475,19 @@ def held_destinations(names, cache: dict) -> dict:
     return out
 
 
+DEST_STAGE = "stage=destination"
+
+
+def label_verdict(origin_host: Optional[str], task_id: str, detail, cache: dict):
+    """Whether an open ``pause_hold`` label still holds, as :func:`decide` returns it. A label a DESTINATION fence
+    wrote (detail ``<host>:fwa:... stage=destination``) is judged by that host, which it names first: its card may
+    have no origin, or an unheld one (Prism b622dcc4adae / 5afa560835bc). Any other label is judged by its origin."""
+    if isinstance(detail, str) and detail.rstrip().endswith(DEST_STAGE):
+        why = destination_wait(detail.split(":", 1)[0].strip(), cache)
+        return None if why is None else ("wait", why)
+    return decide(origin_host, task_id, cache)
+
+
 def _valid(doc) -> bool:
     """Every field :func:`decide` dereferences has the shape it expects (Prism aceb690c4071)."""
     if not isinstance(doc, dict) or not isinstance(doc.get("phase"), str) or not doc.get("host"):
@@ -833,11 +846,13 @@ def clear_stale_labels(conn, result, dry_run: bool, cache: dict) -> list:
         for tid, origin, detail in _open_pause_labels(conn):
             if tid in waits:
                 continue                           # this tick holds it: its own wait row is current
-            verdict = decide(origin, tid, cache)
+            verdict = label_verdict(origin, tid, detail, cache)
             if verdict is not None and verdict[0] == "wait":
                 continue
             doc = cache.get(str(origin)) if origin else None
-            now_reads = ("card has no origin_host" if not origin else
+            now_reads = (f"{str(detail).split(':', 1)[0]} has no live fwa kanban hold"
+                         if isinstance(detail, str) and detail.rstrip().endswith(DEST_STAGE) else
+                         "card has no origin_host" if not origin else
                          f"{origin} manifest phase {doc.get('phase')}" if isinstance(doc, dict) else
                          f"{origin} has no manifest.json")
             stale.append((tid, f"{CODE} ({detail}) no longer holds: {now_reads}"))
@@ -905,7 +920,7 @@ def holds(conn=None, *, now: Optional[float] = None) -> dict:
     if conn is not None:
         cache: dict = {}
         for tid, origin, detail in _open_pause_labels(conn):
-            verdict = decide(origin, tid, cache)
+            verdict = label_verdict(origin, tid, detail, cache)
             cards.append({"task_id": tid, "origin_host": origin, "label": detail,
                           "live": verdict is not None and verdict[0] == "wait",
                           "now": None if verdict is None else list(verdict)})
