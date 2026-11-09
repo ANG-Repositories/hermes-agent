@@ -277,6 +277,138 @@ def test_stale_marker_pages_once_and_is_not_replayed(home, monkeypatch):
     assert len(home.pages) == 1  # the episode was paged once; the marker is gone
 
 
+def test_stale_marker_retires_job_so_catchup_scan_cannot_fire_it(home, monkeypatch):
+    """P1 d31d3ad3ad35: catch-up window (24 h) wider than the 6 h marker cap. The stale marker
+    must retire the one-shot in the same write, or the catch-up scan fires it anyway."""
+    import cron.jobs as jobs_mod
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda *a, **k: {"cron": {"oneshot_catchup_s": 86400}})
+    _seed()
+    owner = _owner(home.path, "run", signal.SIGTERM)
+    assert owner.swept == [JOB_ID], owner.err[-3000:]
+
+    _shift_clock(monkeypatch, 7 * 3600)  # past the 6 h cap, inside the 24 h catch-up window
+    _restart()
+    job = _job()
+    assert "replay_pending" not in job
+    assert job["enabled"] is False and job["state"] == "completed"
+    assert job["fire_claim"] is None and job.get("run_claim") is None
+    assert _fire_if_due() == []
+    _shift_clock(monkeypatch, 60)  # one more scheduler tick
+    assert _fire_if_due() == []
+    assert [k for k, _ in home.pages] == [f"stale-{JOB_ID}"]
+    assert f"hermes cron resume {JOB_ID} --run-now" in home.pages[0][1]
+
+    # The page's re-run command re-arms it.
+    jobs_mod.rearm_oneshot(JOB_ID, jobs_mod._hermes_now().isoformat())
+    assert _fire_if_due() == [JOB_ID]
+
+
+def test_thread_ownership_loss_after_marking_still_replays_exactly_once(home):
+    """P1 5291f0ebb63c: the marker releases fire_claim while the run's thread is still going.
+    That thread then sees an ownership loss; its ledger write must not read as a terminal
+    outcome that cancels the replay."""
+    from unittest.mock import patch
+
+    import cron.jobs as jobs_mod
+    import cron.scheduler as sched
+    from cron.executions import get_execution
+    from cron.shutdown_replay import INTERRUPTED_ERROR
+
+    _seed()
+    assert jobs_mod.claim_job_for_fire(JOB_ID)
+    job = _job()
+    swept = []
+
+    def run_job(*_a, **_k):
+        # The drain expires while the agent is mid-run: the gateway's sweep runs, then the
+        # agent's turn returns normally before the process exits.
+        swept.extend(sched.mark_running_jobs_interrupted("drain expired", replay_marker=True))
+        return True, "full output", "final response", None
+
+    with patch("cron.scheduler.run_job", side_effect=run_job), \
+         patch("cron.scheduler._deliver_result", return_value=None) as deliver:
+        assert sched.run_one_job(job) is True
+    assert swept == [JOB_ID]
+    deliver.assert_not_called()
+    assert get_execution(job["execution_id"])["error"] == INTERRUPTED_ERROR
+    assert _job()["replay_pending"]["run_id"] == job["execution_id"]
+
+    _restart()
+    assert _fire_if_due() == [JOB_ID]
+    assert _fire_if_due() == []
+    _finish_fired()
+    _restart()
+    assert _fire_if_due() == []
+    assert home.pages == []
+
+
+def test_ownership_lost_row_written_after_marking_is_not_a_terminal_outcome(home):
+    """A run caught by the release before its body started records 'ownership lost'; written
+    after marked_at that is the interruption, so the marker still replays once."""
+    from cron import executions
+
+    _seed()
+    owner = _owner(home.path, "run", signal.SIGTERM)
+    assert owner.swept == [JOB_ID], owner.err[-3000:]
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET status='failed', error=?, finished_at=? WHERE id=?",
+            ("Fire claim ownership lost; stale result was discarded.",
+             datetime.now(timezone.utc).astimezone().isoformat(), owner.run_id))
+    _restart()
+    assert _fire_if_due() == [JOB_ID]
+    assert _fire_if_due() == []
+
+
+def test_ownership_lost_row_from_before_marking_is_terminal(home):
+    from cron import executions
+
+    _seed()
+    owner = _owner(home.path, "run", signal.SIGTERM)
+    marked_at = datetime.fromisoformat(_job()["replay_pending"]["marked_at"])
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET status='failed', error=?, finished_at=? WHERE id=?",
+            ("Fire claim ownership lost; stale result was discarded.",
+             (marked_at - timedelta(seconds=5)).isoformat(), owner.run_id))
+    _restart()
+    assert _fire_if_due() == []
+    assert _job()["state"] == "completed"
+
+
+@pytest.mark.parametrize("ledger", ["missing", "running", "wedged"])
+def test_marker_whose_run_cannot_be_proven_cut_off_is_retired_and_paged(home, ledger):
+    """P1 39cb8aa0809e: replay only on positive evidence the run was cut off by this stop.
+    A missing row, a row still open, or a wedged-owner unknown proves nothing: page, retire."""
+    from cron import executions
+
+    _seed()
+    owner = _owner(home.path, "run", signal.SIGTERM)
+    assert owner.swept == [JOB_ID], owner.err[-3000:]
+    with executions._transaction() as conn:
+        if ledger == "missing":
+            conn.execute("DELETE FROM executions WHERE id=?", (owner.run_id,))
+        elif ledger == "running":
+            # A live owner still holds it (e.g. a worker that outlived the gateway).
+            conn.execute(
+                "UPDATE executions SET process_id=?, pid=?, process_started_at=NULL WHERE id=?",
+                (executions._PROCESS_ID, os.getpid(), owner.run_id))
+        else:
+            conn.execute(
+                "UPDATE executions SET status='unknown', error=?, finished_at=? WHERE id=?",
+                (executions._OWNER_WEDGED_REASON, datetime.now(timezone.utc).isoformat(),
+                 owner.run_id))
+    _restart()
+    job = _job()
+    assert "replay_pending" not in job
+    assert job["enabled"] is False and job["state"] == "completed"
+    assert _fire_if_due() == []
+    assert [k for k, _ in home.pages] == [f"uncertain-{JOB_ID}"]
+    assert f"hermes cron resume {JOB_ID} --run-now" in home.pages[0][1]
+
+
 def test_sigkill_mid_run_is_not_replayed_and_pages_once(home):
     _seed()
     owner = _owner(home.path, "run", signal.SIGKILL)

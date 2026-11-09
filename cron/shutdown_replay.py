@@ -11,8 +11,8 @@ after a crash cannot know whether the work survived, so it never replays.
 2. Fire once on boot. ``consume_replay_markers`` (after execution recovery) pops every marker under ``_jobs_lock`` in one save
    and stamps a run-now (``next_run_at == manual_run_at``) for the fresh ones, so one marker
    gives at most one fire. A marker whose execution reached a real terminal state is recorded
-   and cleared instead. A stale marker (older than the one-shot catch-up window, capped at 6 h)
-   is cleared and paged once.
+   and cleared instead. A stale marker (older than the one-shot catch-up window, capped at 6 h),
+   or one whose ledger row cannot prove the run was cut off, retires the one-shot and pages once.
 3. Only gateway-owned agent work is marked. Script-lane (``no_agent``) jobs are not: the script
    runner owns their lifecycle and the child may outlive the gateway.
 4. A hard kill (SIGKILL, OOM, power loss) has no drain and no marker. At boot a claim whose owner
@@ -39,6 +39,16 @@ MAX_AGE_CAP_S = 6 * 3600
 INTERRUPTED_ERROR = "Interrupted by gateway shutdown before terminal completion."
 # Same sweep, but the run had already delivered its result: a terminal outcome, never replayed.
 INTERRUPTED_AFTER_DELIVERY_ERROR = "Interrupted by gateway shutdown after its result was delivered."
+# What the marked run's own thread may write once the marker released its fire claim and it reads
+# that as an ownership loss before any delivery (the run body records INTERRUPTED_ERROR instead
+# while the sweep's interrupt flag is set; these cover a run caught before its body started).
+# Finished at or after ``marked_at`` they are the interruption itself, not the run's outcome.
+# "...lost before terminal completion." is deliberately absent: it can follow a delivery.
+OWNERSHIP_LOST_BY_STOP_ERRORS = frozenset({
+    "Fire claim ownership lost; stale result was discarded.",
+    "Fire claim ownership lost before execution started.",
+    "Fire claim ownership could not be validated before execution started.",
+})
 PRODUCER = "cron-shutdown-replay"
 
 
@@ -142,30 +152,45 @@ def _max_age_s() -> float:
     return min(grace, float(MAX_AGE_CAP_S))
 
 
-def _terminal_outcome(run_id: Optional[str]) -> Optional[Tuple[bool, Optional[str]]]:
-    """``(success, error)`` when the marked run reached its own terminal state, else None.
+def _classify_run(run_id: Optional[str], marked_at: datetime) -> Tuple[str, Any]:
+    """What the marked run's ledger row says, read after execution recovery.
 
-    ``completed`` and a ``failed`` row with any error other than the shutdown interruption are
-    the run's real outcome. ``unknown`` (startup recovery of the dead owner's row), a ``failed``
-    row carrying the interruption error, and a missing or still-open row are not.
+    ``("replay", None)``: the row proves the run was cut off by this stop before it delivered:
+    ``unknown`` written by recovery because the owner is gone (``_OWNER_GONE_REASON``), ``failed``
+    with ``INTERRUPTED_ERROR`` (only ever written for a run the stop sweep flagged), or ``failed``
+    with an ``OWNERSHIP_LOST_BY_STOP_ERRORS`` error finished at or after ``marked_at``.
+    ``("terminal", (success, error))``: the run reached its own outcome.
+    ``("uncertain", why)``: anything else (no run id, unreadable ledger, missing row, a row still
+    open under a live owner, a wedged-owner ``unknown``). Not provable, so never replayed.
     """
     if not run_id:
-        return None
-    from cron.executions import get_execution
+        return "uncertain", "the marker carries no execution id"
+    from cron.executions import _OWNER_GONE_REASON, get_execution
 
     try:
         row = get_execution(run_id)
     except Exception:
         logger.warning("cron.shutdown_replay: execution %s unreadable", run_id, exc_info=True)
-        return None
+        return "uncertain", f"execution {run_id} could not be read"
     if not row:
-        return None
+        return "uncertain", f"execution {run_id} is not in the ledger"
     status = row.get("status")
+    error = row.get("error") or ""
     if status == "completed":
-        return True, None
-    if status == "failed" and (row.get("error") or "") != INTERRUPTED_ERROR:
-        return False, row.get("error") or "unknown failure"
-    return None
+        return "terminal", (True, None)
+    if status == "unknown":
+        if error == _OWNER_GONE_REASON:
+            return "replay", None
+        return "uncertain", f"execution {run_id} is unknown ({error or 'no reason'})"
+    if status == "failed":
+        finished = _parse(row.get("finished_at"))
+        if error == INTERRUPTED_ERROR:
+            return "replay", None
+        if (error in OWNERSHIP_LOST_BY_STOP_ERRORS and finished is not None
+                and finished >= marked_at):
+            return "replay", None
+        return "terminal", (False, error or "unknown failure")
+    return "uncertain", f"execution {run_id} is still {status} under a live owner"
 
 
 def _all_claims_dead(job: Dict[str, Any]) -> bool:
@@ -242,13 +267,14 @@ def release_orphaned_claims() -> List[str]:
 def consume_replay_markers() -> Dict[str, List[str]]:
     """Boot pass AFTER execution recovery: consume every ``replay_pending`` marker once.
 
-    Returns ``{"replayed", "terminal", "stale"}`` job-id lists. Every marker is popped in one
+    Returns ``{"replayed", "terminal", "stale", "uncertain"}`` job-id lists. A stale or
+    uncertain marker retires the one-shot in the same write, so the catch-up scan cannot fire it. Every marker is popped in one
     ``save_jobs`` under ``_jobs_lock``, so two concurrent boots cannot both stamp the same
     replay. Pages go out after the write.
     """
     from cron import jobs as J
 
-    out: Dict[str, List[str]] = {"replayed": [], "terminal": [], "stale": []}
+    out: Dict[str, List[str]] = {"replayed": [], "terminal": [], "stale": [], "uncertain": []}
     pages: List[Tuple[str, str]] = []
     with J._jobs_lock():
         jobs = J.load_jobs()
@@ -263,10 +289,14 @@ def consume_replay_markers() -> Dict[str, List[str]]:
             job_id = str(job.get("id") or "")
             name = job.get("name") or job_id
             run_id = marker.get("run_id") if isinstance(marker, dict) else None
-            outcome = _terminal_outcome(run_id)
-            if outcome is not None:
-                success, error = outcome
-                stamp = now.isoformat()
+            marked_at = _parse(marker.get("marked_at")) if isinstance(marker, dict) else None
+            age = (now - marked_at).total_seconds() if marked_at else None
+            verdict, detail = (
+                _classify_run(run_id, marked_at) if marked_at is not None
+                else ("uncertain", "the marker carries no marked_at"))
+            stamp = now.isoformat()
+            if verdict == "terminal":
+                success, error = detail
                 J._record_run_outcome(job, success, error, None, None, stamp)
                 J._advance_after_run(job, stamp)
                 out["terminal"].append(job_id)
@@ -275,21 +305,20 @@ def consume_replay_markers() -> Dict[str, List[str]]:
                     "terminal state (%s); recorded, not replayed",
                     name, job_id, run_id, "ok" if success else "failed")
                 continue
-            marked_at = _parse(marker.get("marked_at")) if isinstance(marker, dict) else None
-            age = (now - marked_at).total_seconds() if marked_at else None
-            if age is None or age < 0 or age > _max_age_s():
-                out["stale"].append(job_id)
+            if verdict == "uncertain" or age is None or age < 0 or age > _max_age_s():
+                kind = "uncertain" if verdict == "uncertain" else "stale"
+                why = detail if kind == "uncertain" else (
+                    f"the next boot came after its replay window ({int(_max_age_s() // 60)} min)")
+                _retire_unreplayed(J, job, stamp, why)
+                out[kind].append(job_id)
                 logger.warning(
-                    "cron.shutdown_replay.stale job='%s' id=%s run_id=%s age=%s: marker past "
-                    "its freshness window; cleared, not replayed", name, job_id, run_id,
-                    None if age is None else int(age))
-                pages.append((f"stale-{job_id}", (
+                    "cron.shutdown_replay.%s job='%s' id=%s run_id=%s age=%s: %s; retired, "
+                    "not replayed", kind, name, job_id, run_id,
+                    None if age is None else int(age), why)
+                pages.append((f"{kind}-{job_id}", (
                     f"cron one-shot '{name}' ({job_id}) was interrupted by a gateway shutdown, "
-                    f"but the next boot came after its replay window "
-                    f"({int(_max_age_s() // 60)} min), so it was not re-run. "
-                    f"Re-run it by hand: {_rerun_command(job)}")))
+                    f"but it was not re-run: {why}. Re-run it by hand: {_rerun_command(job)}")))
                 continue
-            stamp = now.isoformat()
             job["next_run_at"] = stamp
             job["manual_run_at"] = stamp
             job[J.RESTART_REQUEUE_COUNT_KEY] = int(job.get(J.RESTART_REQUEUE_COUNT_KEY) or 0) + 1
@@ -302,6 +331,18 @@ def consume_replay_markers() -> Dict[str, List[str]]:
     for key, text in pages:
         page_alerts(key, text)
     return out
+
+
+def _retire_unreplayed(J, job: Dict[str, Any], stamp: str, why: str) -> None:
+    """Close a marked one-shot that will not be replayed: record the interruption, take back the
+    dispatch slot the marker gave back and retire the record. ``hermes cron resume <id>
+    --run-now`` (``rearm_oneshot``) re-arms it by hand."""
+    J._record_run_outcome(
+        job, False, f"Interrupted by gateway shutdown; not replayed: {why}.", None, None, stamp)
+    repeat = job.get("repeat")
+    if isinstance(repeat, dict) and isinstance(repeat.get("times"), int) and repeat["times"] > 0:
+        repeat["completed"] = repeat["times"]
+    J._complete_job_record(job)
 
 
 def page_alerts(key: str, text: str) -> bool:
