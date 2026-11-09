@@ -260,8 +260,7 @@ class GatewayModelCommandsMixin:
         global_error: Optional[str] = None
         if ctx.persist_global:
             try:
-                async with self._model_config_write_lock():
-                    await _persist_model_switch_to_config(result, ctx.config_path)
+                await self._persist_ordered_model_config(result, ctx.config_path)
             except Exception as e:
                 logger.warning("Failed to persist model switch: %s", e)
                 global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
@@ -395,6 +394,23 @@ class GatewayModelCommandsMixin:
             lock = self.__dict__["_model_config_write_lock_obj"] = asyncio.Lock()
         return lock
 
+    def _claim_global_model_switch(self, result) -> None:
+        if not hasattr(result, "_gateway_global_seq"):
+            seq = self.__dict__.get("_global_model_issue_seq", 0) + 1
+            self.__dict__["_global_model_issue_seq"] = seq
+            result._gateway_global_seq = seq
+
+    async def _persist_ordered_model_config(self, result, config_path) -> bool:
+        """Serialize config writes without letting a delayed older confirmation undo a newer one."""
+        self._claim_global_model_switch(result)
+        async with self._model_config_write_lock():
+            seq = result._gateway_global_seq
+            if seq < self.__dict__.get("_global_model_committed_seq", 0):
+                return False
+            await _persist_model_switch_to_config(result, config_path)
+            self.__dict__["_global_model_committed_seq"] = seq
+            return True
+
     def _model_switch_lock_key(self, source) -> str:
         """Lock key for a /model from ``source``. Sync (no await before the lock is taken, so
         same-session commands commit in issue order). A Telegram DM's session key is only known
@@ -476,34 +492,10 @@ class GatewayModelCommandsMixin:
         # Unbounded, as the inline await was: the store/config writes carry no generic short timeout.
         _after_delivery.post_delivery_timeout = None
         adapter.register_post_delivery_callback(adapter_key, _after_delivery, generation=generation)
-        # Fallback (Prism 49cf8836d4b4): the callback can be skipped (an exception before it, a
-        # generation mismatch, a /stop cancelling it mid-job). When the session task ends with this
-        # session's jobs still queued and no drain running, drain them then, in the captured context.
-        # Serialized by the write lock and resumed from each job's recorded progress, and every inline
-        # /model commit drains first, so it cannot reorder writes; the in-memory override already
-        # decides every turn.
-        task = asyncio.current_task()
-        if task is not None:
-            task.add_done_callback(lambda _t: self._drain_orphaned_model_switch_writes(session_key, source, ctx))
+        # A skipped/cancelled callback leaves its job queued for the next owned drain.
+        # Never restart persistence from a task-done callback: the adapter has released the
+        # session at that point, so /stop, /new and shutdown cannot own or cancel that work.
         return True
-
-    def _drain_orphaned_model_switch_writes(self, session_key: str, source, ctx) -> None:
-        if not self._model_switch_write_pending(session_key):
-            return
-        lock = (self.__dict__.get("_model_switch_write_locks") or {}).get(session_key)
-        if lock is not None and lock.locked():
-            return  # the running drain takes every queued job
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.warning("deferred /model writes for %s left queued: no running loop", session_key)
-            return
-        logger.info("deferred /model writes for %s: post-delivery callback did not run them; draining now",
-                    session_key)
-        tasks = self.__dict__.setdefault("_model_switch_orphan_drains", set())
-        task = loop.create_task(self._drain_model_switch_writes(session_key, source), context=ctx)
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
 
     async def _drain_model_switch_writes(self, session_key: str, source) -> None:
         """Run every queued deferred /model write for ``session_key`` in issue order. A failure is

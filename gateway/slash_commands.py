@@ -3892,6 +3892,9 @@ class GatewaySlashCommandsMixin(
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
+            if persist_global:
+                self._claim_global_model_switch(result)
+            _defer = self._model_switch_deferral(event.source, session_key)
             # If there's a cached agent, update it in-place
             _switch_announce_kwargs = {}
             cached_entry = None
@@ -3931,6 +3934,9 @@ class GatewaySlashCommandsMixin(
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
+                        # Gateway owns the deferred durable phase; the resident swap must not
+                        # write its billing route before the confirmation.
+                        **({"persist_billing_route": False} if _defer is not None else {}),
                         # Keep the session's /reasoning override across the
                         # route change (#467 contract) — see the picker path.
                         **self._switch_reasoning_kwargs(
@@ -4093,6 +4099,19 @@ class GatewaySlashCommandsMixin(
                 _job_done: set = set()  # completed phases survive a cancelled drain
 
                 async def _deferred_writes() -> Optional[str]:
+                    if cached_entry and "billing" not in _job_done:
+                        db = getattr(cached_entry[0], "_session_db", None)
+                        sid = getattr(cached_entry[0], "session_id", None)
+                        if db is not None and sid:
+                            try:
+                                await asyncio.to_thread(
+                                    db.update_session_billing_route, sid,
+                                    provider=result.target_provider, base_url=result.base_url,
+                                    billing_mode=result.api_mode,
+                                )
+                            except Exception as exc:
+                                _job_done.add(("failure", f"billing route not saved ({exc})"))
+                        _job_done.add("billing")
                     return await self._model_switch_deferred_writes(
                         result, session_key=session_key, source=_job_source,
                         event_source=event.source, config_path=config_path,
@@ -4265,8 +4284,7 @@ class GatewaySlashCommandsMixin(
             try:
                 # Resolved through the module so tests/operators can patch the writer seam.
                 # Runner-wide: two sessions' --global picks must not interleave on config.yaml.
-                async with self._model_config_write_lock():
-                    await _model_mixin._persist_model_switch_to_config(result, config_path)
+                await self._persist_ordered_model_config(result, config_path)
             except Exception as e:
                 logger.warning("Failed to persist model switch: %s", e)
                 global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
@@ -4341,8 +4359,7 @@ class GatewaySlashCommandsMixin(
             # Global intent is independent of this session's latest override. A later
             # session-only pick must not discard the confirmed global default change.
             try:
-                async with self._model_config_write_lock():
-                    await _model_mixin._persist_model_switch_to_config(result, config_path)
+                if await self._persist_ordered_model_config(result, config_path):
                     done.add("config_written")
             except Exception as e:
                 logger.warning("Failed to persist model switch: %s", e)

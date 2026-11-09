@@ -2658,7 +2658,7 @@ def _persist_switch_billing_route(agent) -> None:
 @route_mutation
 def switch_model(
     agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None,
-    session_reasoning_config=_SESSION_REASONING_UNSET,
+    session_reasoning_config=_SESSION_REASONING_UNSET, persist_billing_route=True,
 ):
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
@@ -2762,7 +2762,8 @@ def switch_model(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
     )
-    _persist_switch_billing_route(agent)
+    if persist_billing_route:
+        _persist_switch_billing_route(agent)
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):

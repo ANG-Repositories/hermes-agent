@@ -338,20 +338,25 @@ async def test_cancelled_drain_does_not_replay_a_completed_config_write(tmp_path
     await h.adapter.cancel_session_processing(h.key())  # /stop mid store phase
     assert h.runner._model_switch_write_pending(h.key())
     store_gate.set()
+    await h.runner._drain_model_switch_writes(h.key(), _source())
     await _drained(h)
     assert writes == ["model-A"], "the completed config.yaml write was replayed"
 
 
 @pytest.mark.asyncio
-async def test_writes_still_land_when_the_post_delivery_callback_is_skipped(tmp_path, monkeypatch):
-    """Prism 49cf8836d4b4: if the adapter never fires the callback, the session task's end drains."""
+async def test_writes_stay_queued_when_the_post_delivery_callback_is_skipped(tmp_path, monkeypatch):
+    """No detached recovery task may persist after the adapter releases session ownership."""
     h = _Harness(tmp_path, monkeypatch)
     h.db.release.set()
     h.adapter._fire_post_delivery_callback = lambda *_a, **_k: asyncio.sleep(0)
     await h.adapter.handle_message(_ev("/model gpt-5.5"))
-    await _wait_for(lambda: h.db.models == ["gpt-5.5"], "orphaned deferred write drained")
-    await _drained(h)
-    assert h.runner.session_store.get_model_override(h.key())["model"] == "gpt-5.5"
+    await _wait_for(lambda: not h.adapter._session_tasks, "session released")
+    await asyncio.sleep(0.1)
+    assert h.db.models == [], "a detached orphan task wrote after session release"
+    assert h.runner._model_switch_write_pending(h.key())
+    # A subsequent owned command resumes the queue before its own inline commit.
+    await h.runner._handle_model_command(_ev("/model model-B"))
+    assert h.runner.session_store.get_model_override(h.key())["model"] == "model-B"
 
 
 def test_telegram_dm_commands_share_one_switch_lock(tmp_path, monkeypatch):
@@ -419,5 +424,59 @@ async def test_config_failure_survives_cancelled_drain(tmp_path, monkeypatch):
     await asyncio.wait_for(entered.wait(), 5)
     await h.adapter.cancel_session_processing(h.key())
     release.set()
+    await h.runner._drain_model_switch_writes(h.key(), _source())
     await _drained(h)
     assert any("config disk full" in line for line in h.sent_with(FOLLOWUP))
+
+
+@pytest.mark.asyncio
+async def test_global_issue_order_survives_cross_session_db_delay(tmp_path, monkeypatch):
+    h = _Harness(tmp_path, monkeypatch)
+    first_entered, release = asyncio.Event(), asyncio.Event()
+
+    async def update(session_id, model, **kw):
+        if model == "model-A":
+            first_entered.set()
+            await release.wait()
+
+    h.db.update_session_model = update
+    await h.adapter.handle_message(_ev("/model model-A --global", "111"))
+    await asyncio.wait_for(first_entered.wait(), 5)
+    await h.adapter.handle_message(_ev("/model model-B --global", "222"))
+    await _wait_for(lambda: yaml.safe_load(h.cfg_path.read_text())["model"]["default"] == "model-B", "newer global saved")
+    release.set()
+    await _drained(h)
+    await _wait_for(lambda: not h.runner._model_switch_write_pending(h.key("111")), "older global settled")
+    assert yaml.safe_load(h.cfg_path.read_text())["model"]["default"] == "model-B"
+
+
+@pytest.mark.asyncio
+async def test_cached_agent_billing_write_runs_after_confirmation(tmp_path, monkeypatch):
+    from tests.agent.test_switch_model_pool_reload import _make_agent, _make_pool
+    from run_agent import AIAgent
+    from unittest.mock import Mock
+    from types import MethodType
+
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    resident = _make_agent("openrouter", "old-model", _make_pool("openrouter"))
+    resident.switch_model = MethodType(AIAgent.switch_model, resident)
+    resident.session_id = "resident-session"
+    entered, release = threading.Event(), threading.Event()
+
+    def billing(*args, **kwargs):
+        entered.set()
+        assert release.wait(10), "billing write never released"
+
+    resident._session_db = Mock(update_session_billing_route=billing)
+    h.runner._agent_cache_lock = threading.Lock()
+    h.runner._agent_cache = {h.key(): (resident, time.monotonic())}
+    try:
+        await h.adapter.handle_message(_ev("/model model-A"))
+        await _wait_for(lambda: h.sent_with(_switched("model-A")), "confirmation before resident billing I/O", 3)
+        assert resident.model == "model-A"
+        await _wait_for(entered.is_set, "deferred billing write", 3)
+    finally:
+        release.set()
+    await _drained(h)
+
