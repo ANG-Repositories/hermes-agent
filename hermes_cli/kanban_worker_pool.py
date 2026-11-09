@@ -1445,7 +1445,7 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
     # prevents missing commands/files from shifting CPU/clock/pressure fields.
     script = (
         "import json,os,sys,time\n"
-        "load=os.getloadavg()\n"
+        "load=os.getloadavg()\n"  # admission-lint: not-a-decider remote telemetry capture only; admission occurs in the shared predicate
         "pressure=''\n"
         "if len(sys.argv)>1:\n"
         " path=sys.argv[1]\n"

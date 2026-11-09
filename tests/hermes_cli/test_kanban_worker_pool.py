@@ -363,6 +363,12 @@ def _cgroup_ssh(argv, **kw):
     each core-count command the way the real host did as kanbanw."""
     cmd = argv[-1]
     load = "12.00 9.00 7.00 1/900 99"  # ordinary ace-ai load1, under 0.8 x 24
+    if "SC_NPROCESSORS_ONLN" in cmd:
+        import json
+        return _Proc(0, "@@hermes-probe-v1\n" + json.dumps({
+            "schema": 1, "load1": 12.0, "load5": 9.0, "ncpu": 24,
+            "remote_now": 1791200100, "pressure_text": "{}",
+        }) + "\n")
     if "os.cpu_count()" in cmd:
         ncpu = "24"
     elif "; nproc" in cmd:
