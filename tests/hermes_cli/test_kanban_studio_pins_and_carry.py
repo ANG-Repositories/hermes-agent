@@ -299,3 +299,35 @@ def test_a_paused_local_gate_still_places_a_portable_card_remote(kanban_home):
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0,
                              spawn_paused="utilization: saturated:cpu -0.10 (binding cpu)")
     assert (tid, "ace-ai") in spawned
+
+
+# -- item 7: the replay of a window of placement events ----------------------------------------------------------
+
+def test_replay_counts_studio_placements_before_and_after(kanban_home, monkeypatch, anchor):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "kanban_studio_pin_replay", Path(__file__).resolve().parents[2] / "scripts" / "kanban_studio_pin_replay.py")
+    rp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rp)
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    kwh._carry_scan_cache.clear()
+    _mirrors(kanban_home)
+    with kb.connect_closing() as conn:
+        bare = kb.create_task(conn, title="a", assignee="alpha", body="host: studio\nfix it")
+        kept = kb.create_task(conn, title="b", assignee="alpha", body="host: studio\nrequires: studio-state")
+        lf, _ = _card_with_files(conn)
+        wt = _wt_card(conn, anchor)
+        remote = kb.create_task(conn, title="r", assignee="alpha")
+        for tid, route, rule in ((bare, "local", "host_studio"), (bare, "local", "host_studio"),
+                                 (kept, "local", "host_studio"), (lf, "local", "local_files"),
+                                 (wt, "local", "workspace_kind"), (remote, "remote-policy", "policy"),
+                                 (remote, "local", "default")):
+            kb._append_event(conn, tid, "placement", {"route": route, "rule": rule})
+        conn.commit()
+    res = rp.replay(kanban_home / "kanban.db", 24, kanban_home / "fleet")
+    assert res["placements"] == 7 and res["studio_before"] == 6
+    assert res["before"] == {"host_studio": 3, "local_files": 1, "workspace_kind": 1, "default": 1}
+    assert res["after"] == {"fwa": 3, "host_studio": 1, "studio-while-room": 1, "default": 1}
+    assert res["studio_after_pinned"] == 2
+    assert res["moved"]["host_studio->fwa"] == [bare]
+    assert "host_studio" in rp.render(res)
