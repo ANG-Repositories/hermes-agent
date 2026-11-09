@@ -3044,7 +3044,7 @@ def _host_fault(exc: BaseException) -> Optional[dict]:
     so the card spills on the next tick instead of waiting."""
     from tools.process_registry import RestartSafeScopeUnavailable
 
-    if isinstance(exc, RestartSafeScopeUnavailable):
+    if isinstance(exc, (RestartSafeScopeUnavailable, LocalLedgerUnavailable)):
         return {}
     if isinstance(exc, _kb._kwh.RemoteWorkspaceUnavailable):
         _kb._kwh.note_board_fault(exc.host, exc.board, str(exc))
@@ -3383,6 +3383,29 @@ def _set_worker_pid(
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool
     with _kbc.write_txn(conn):
+        launching_run_id = run_id if run_id is not None else _kb._current_run_id(conn, task_id)
+        # Correlate even a late start with its launching run, never its successor.
+        from hermes_cli.kanban_priority_door import EVENT
+        authorization = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+            (task_id, launching_run_id, EVENT)).fetchone()
+        if authorization is not None:
+            import hashlib
+            grant = json.loads(authorization[0])
+            route = (placement or {}).get("route_class")
+            entry = (placement or {}).get("entry")
+            if entry == "spawn_now":
+                boundary = "forced"
+            elif route == "pin":
+                boundary = "pinned"
+            elif route == "local":
+                boundary = "local"
+            else:
+                boundary = "dispatch"
+            source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+            spawn_payload.update({k: grant[k] for k in ("host", "unit_id", "reservation_id")})
+            spawn_payload.update(consumer="kanban", process_id=int(pid), at=time.time(),
+                                 boundary=boundary, source_ref=f"sha256:{source}:_set_worker_pid")
         if run_id is not None:
             held = conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
@@ -4297,6 +4320,51 @@ class _LaunchState:
     proc: Optional[subprocess.Popen] = None
 
 
+class LocalLedgerUnavailable(RuntimeError):
+    """A LOCAL start could not book its lease on the shared ledger (t_02aa6d86): the worker is not started. A host
+    fault (``_host_fault``), never charged to the card."""
+
+
+LOCAL_LEDGER_ENV = "KANBAN_LOCAL_LEDGER"
+
+
+def local_ledger_enabled(env=None) -> bool:
+    """``KANBAN_LOCAL_LEDGER`` (default on): "0" = a local start books nothing (the pre-t_02aa6d86 behaviour)."""
+    env = os.environ if env is None else env
+    return str(env.get(LOCAL_LEDGER_ENV, "1")).strip() != "0"
+
+
+def _book_local_start(conn: sqlite3.Connection, claimed: Task) -> Optional[str]:
+    """Doctrine rule 15 (t_02aa6d86): a start the Studio's own LoadGate admitted still books its lease on the shared
+    ledger BEFORE launch, so Prism / test-gate / allocd admissions on this host see it the same tick. The lease is a
+    ``local_admitted`` run event carrying the reservation: ``_end_run`` releases it and ``renew_running`` renews it,
+    exactly like a pool run's ``worker_placed`` row. No table / no ``local`` host = nothing booked (None). An
+    unreadable ledger or a failed event write raises LocalLedgerUnavailable: the worker does not start."""
+    from hermes_cli import kanban_priority_door as door
+    if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
+        raise door.DoorHeld("run already authorized; reconcile original start")
+    if not local_ledger_enabled():
+        return None
+    from hermes_cli import kanban_headroom as _kh
+    from hermes_cli.fleet_placement import placement as _placement
+    unit = f"{claimed.id}#{claimed.current_run_id}"
+    try:
+        rid = _kh.book_local(unit, _placement.Job(profile=claimed.assignee or None))
+    except _placement.PlacementError as exc:
+        raise LocalLedgerUnavailable(f"local start not booked on the shared ledger: {exc}") from exc
+    if rid is None:
+        return None
+    try:
+        with _kbc.write_txn(conn):
+            _kb._append_event(conn, claimed.id, _kh.LOCAL_ADMITTED_EVENT,
+                              {"host": _kh.LOCAL_HOST_ALIAS, "unit": unit, _kh.RESERVATION_KEY: rid},
+                              run_id=claimed.current_run_id)
+    except Exception as exc:
+        _kh.release_local(rid)          # no event = nothing would ever release the row before its TTL
+        raise LocalLedgerUnavailable(f"local start lease {rid} not recorded on the run: {exc}") from exc
+    return rid
+
+
 def _launch_claimed(
     conn: sqlite3.Connection,
     claimed: Task,
@@ -4322,8 +4390,13 @@ def _launch_claimed(
     from hermes_cli.kanban_continuation import record_placement
     from hermes_cli import kanban_placement_reasons as _pr
 
+    from hermes_cli import kanban_priority_door as door
+    if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
+        raise door.DoorHeld("run already authorized; reconcile original start")
     if not record_placement(conn, claimed.id, claimed.current_run_id, host):
         return _LAUNCH_NOT_OWNED
+    if host is None:
+        reservation_id = _book_local_start(conn, claimed)
     from hermes_cli.kanban_priority_door import spawn as _priority_spawn
     pid = _priority_spawn(conn, claimed, workspace, host=host, spawn=spawn,
                           spawn_kwargs=spawn_kwargs, state=state, reservation_id=reservation_id)
@@ -5132,7 +5205,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                binds: Optional[dict] = None,
                held: Optional[dict] = None,
                worktree_out: Optional[dict] = None,
-               board: Optional[str] = None) -> "tuple[str, Optional[str]]":
+               board: Optional[str] = None,
+               carry_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5187,6 +5261,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _ported = _kwt.ported_host(conn, row["id"], row["workspace_path"])
         if _ported:
             bind = (_kwt.PORT_BIND_RULE, row["id"], _ported)
+        else:
+            # A carried local_files card's real workspace is the copy on the host it was carried to
+            # (t_e604c0f9, Prism 86a85c6c299a / 6c03238719d2): every rerun binds there, whatever
+            # placement.continuation or the host_preference switch say. The Studio original is stale from the
+            # carry on: no local run against it, no second carry over the remote work; an absent host waits.
+            _carried = _kb._kwh.carried_host(conn, row["id"], row["workspace_path"])
+            if _carried:
+                bind = (_kb._kwh.CARRY_BIND_RULE, row["id"], _carried)
     # An unassigned card is routed as the assignee the loop will give it.
     assignee = row["assignee"] or default_assignee
     allowlisted = bool(assignee) and assignee in tuple(plan.config.profiles or ())
@@ -5201,16 +5283,29 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
-    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or (),
-                                    getattr(plan.config, "pin_aliases", None))
+    # Studio last resort (t_e604c0f9 on top of t_c2fce87e's host_preference switch: fleet/placement-policy.json
+    # host_preference.consumers.kanban "on" + mac-studio in last_resort; off/absent = the old rules): a bare
+    # `host: studio` with no requires: reason the Studio serves is dropped, and local_files is continuity only.
+    _fleet_dir = _kb.kanban_home() / "fleet"
+    last_resort = _studio_last_resort(_fleet_dir)
+    studio_reasons = _kwp.studio_pin_reasons(caps) if last_resort else None
+    if _kwp.skills_need_studio(skills, getattr(caps, "cmap", None), studio_reasons):
+        # An attached skill needs a capability the Studio serves (identity-only docker included): its
+        # `host: studio` pin is justified, in this check and in portable() alike (Prism f5bbe97bc028).
+        studio_reasons = None
+    pin, ignored, pin_dropped = _kwp.effective_pin(row["body"], plan.config.hosts or (),
+                                                   getattr(plan.config, "pin_aliases", None), studio_reasons)
+    if pin_dropped:
+        _kwp.note_dropped_studio_pin(row["id"])
     # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
         port = _kwt.port_for(row["id"], row["workspace_path"],
-                             _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet",
-                             branch=_kb._row_get(row, "branch_name"))
+                             _kwt.board_default_workdir(board), _fleet_dir,
+                             branch=_kb._row_get(row, "branch_name"),
+                             allow_studio_tree=last_resort)
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -5231,17 +5326,30 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             if caps_out is not None:
                 caps_out.setdefault("reasons", {})[row["id"]] = [verdict.wait]
             return "wait", verdict.wait
-    ok, rule, route_class = _kwp.portable(
+    _portable_kw = dict(
         workspace_kind=row["workspace_kind"], has_links=linked, workspace_bind=bind,
-        workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
-                               if scan else False),
         assignee=assignee, body=row["body"],
         skills=skills, pool=plan.config,
         native_command=native, manifest=manifest, targets=targets,
         requires=verdict.for_portable() if verdict is not None else None,
         body_signals=caps is None or caps.legacy_body,
-        worktree_hosts=wt_hosts,
+        worktree_hosts=wt_hosts, studio_reasons=studio_reasons,
     )
+    ok, rule, route_class = _kwp.portable(
+        workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
+                               if scan else False), **_portable_kw)
+    carried = False
+    if (not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None
+            and _kb._kwh.carry_size_ok(row["workspace_path"])
+            and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])):
+        # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
+        # while the Studio has room. Every OTHER rule is judged as if the directory were empty; a card that is
+        # then portable runs locally when the local gate admits, else on a pool host with the directory carried
+        # there first (kanban_worker_hosts.carry_workspace). A card some other rule keeps local stays local_files.
+        ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
+        if ok2:
+            ok, rule, route_class, carried = ok2, rule2, class2, True
+            carry_out[row["id"]] = True
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
     if (verdict is not None and not ok and pin in (None, _kwp.PIN_ANY)
@@ -5287,7 +5395,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                 rules_out[row["id"]] = f"{_pr.BIND_HOST}:{bind[2]}({bind[0]})"
             return "pin", bind[2]
         if rules_out is not None:
-            rules_out[row["id"]] = _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY
+            rules_out[row["id"]] = (_pr.LOCAL_FILES if carried
+                                    else _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY)
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.PIN_UNKNOWN_HOST:
         # A host: line naming no host: never runs anywhere, named, parked
@@ -5356,6 +5465,29 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
+
+
+_last_resort_cache: dict = {}
+
+
+def _studio_last_resort(fleet_dir) -> bool:
+    """``placement_policy.load(fleet).is_last_resort(mac-studio)`` (t_c2fce87e's ONE switch), re-read only when the
+    policy file's stat changes or the env override does: ``_route_row`` asks once per ready row per tick."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    from hermes_cli import placement_policy as _ppol
+    path = Path(fleet_dir) / _ppol.POLICY_FILE
+    try:
+        st = path.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = (str(path), stamp, os.environ.get(_ppol.LAST_RESORT_ENV))
+    hit = _last_resort_cache.get("v")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    val = _ppol.load(Path(fleet_dir)).is_last_resort(_kwp.STUDIO_HOST)
+    _last_resort_cache["v"] = (key, val)
+    return val
 
 
 _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body",
@@ -5877,11 +6009,13 @@ def _i0_counts(reason) -> bool:
 _I0_EXEMPT = frozenset({"unassigned", "per_profile_cap"})
 
 
-def _portable_goes_remote(local_free: bool, cap_only, plan, browser_joined: bool = False) -> bool:
+def _portable_goes_remote(local_free: bool, cap_only, plan, browser_joined: bool = False,
+                          continuity: bool = False) -> bool:
     """Does a ``portable`` row ask the pool before a local slot? The ONE rule: the spawn loop and the door
     publisher (kanban_priority.waiting_by_host) both call it, so a card waits where it would start (round 5,
-    Prism a51c53f3bd02). A browser-joined row keeps the host its join was cut for."""
-    remote_first = bool(getattr(plan, "default_remote", False)) and not browser_joined
+    Prism a51c53f3bd02). A browser-joined row keeps the host its join was cut for. A ``continuity`` row (its
+    files are in the Studio scratch dir, t_e604c0f9) keeps the Studio while the local gate admits."""
+    remote_first = bool(getattr(plan, "default_remote", False)) and not browser_joined and not continuity
     return not local_free or bool(cap_only) or remote_first
 
 
@@ -6554,6 +6688,7 @@ def _dispatch_once_locked(
     row_route: dict = {}
     row_rules: dict = {}  # task id -> portable() rule, for the placement record
     _worktree_ports: dict = {}  # worktree card -> (repo, mirror, hosts) (t_6d9e7d90)
+    _carry_rows: dict = {}  # local_files card -> True: local while the gate admits, else carried (t_e604c0f9)
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
     # ran the classifier on every one of them) and, of those, the ones the
     # spawn loop reached: the affinity event log reconciles against both.
@@ -6585,7 +6720,8 @@ def _dispatch_once_locked(
                                          rules_out=row_rules,
                                          access_out=result.access_contradictions,
                                          binds=_binds, held=_pause_held,
-                                         worktree_out=_worktree_ports, board=board)
+                                         worktree_out=_worktree_ports, board=board,
+                                         carry_out=_carry_rows)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
@@ -6619,6 +6755,13 @@ def _dispatch_once_locked(
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
+        # A carried card's workspace is on its carry host (Prism fd679a4c5702): with no plan it waits there,
+        # never runs on the Studio's stale copy, whatever the host_preference switch says.
+        for _rid in _kb._kwh.carried_ids(conn, [r["id"] for r in ready_rows]):
+            _r = next(r for r in ready_rows if r["id"] == _rid)
+            if (_r["workspace_kind"] or "scratch") == "scratch" \
+                    and _kb._kwh.carried_host(conn, _rid, _r["workspace_path"]):
+                row_route.setdefault(_rid, ("wait", "pool_unavailable"))
         # Identity-only capabilities (docker) hold with or without a plan:
         # no plan is the normal admitting band, and an unpinned docker card
         # must not spawn locally there either (Prism b83b86d68a65 on #1902).
@@ -6712,7 +6855,8 @@ def _dispatch_once_locked(
                 [*ready_rows, *review_rows], spillover, routes=row_route, local_host="local", board=board,
                 default_assignee=default_assignee, conn=conn, caps=_caps,
                 cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports,
-                local_budget=local_budget, browser_joins=result.browser_joins)
+                local_budget=local_budget, browser_joins=result.browser_joins,
+                continuity=_carry_rows)
             _priority.publish_waiting(conn, _waiting, verdicts=_priority.verdicts_for_plan(spillover))
         except Exception as exc:
             _kb._log.warning("kanban door publication failed (starts remain fail-closed): %s", exc)
@@ -7584,7 +7728,8 @@ def _dispatch_once_locked(
         _forced_remote = force_host is not None and force_host != _FORCE_LOCAL
         if _forced_remote or (force_host is None and (route in ("pin", "origin") or (
                 route == "portable" and _portable_goes_remote(local_free, _cap_only, spillover,
-                                                              row["id"] in result.browser_joins)))):
+                                                              row["id"] in result.browser_joins,
+                                                              continuity=row["id"] in _carry_rows)))):
             # A refused take() NEVER falls through to a local spawn (I-11),
             # except a portable row under kanban.placement.default: remote,
             # which spawns locally as the LAST RESORT (spec v0.3 §3.1 step 2).
@@ -7755,6 +7900,18 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
+                if placed_host is not None and claimed.id in _carry_rows and not dry_run:
+                    # local_files continuity overflow (t_e604c0f9): the Studio was full, so the card's
+                    # Studio scratch dir goes to the chosen host first, same path; a failure is a spawn
+                    # failure (claim released, reservation refunded), never an empty-dir run.
+                    _kb._kwh.carry_workspace(placed_host, str(workspace))
+                    with _kbc.write_txn(conn):
+                        # "workspace" = the stored path at carry time, "path" = the spelling persisted just
+                        # below; carried_host() binds on either (Prism 34bd0265a601).
+                        _kb._append_event(conn, claimed.id, _kb._kwh.CARRIED_EVENT,
+                                          {"host": placed_host.name, "workspace": claimed.workspace_path,
+                                           "path": str(workspace)},
+                                          run_id=claimed.current_run_id)
             if protected is not None:
                 validate_mount(
                     protected.root, expected_mount=protected.mount_path,
@@ -8240,19 +8397,22 @@ def _dispatch_once_locked(
                 continue
             if _review_origin_host:
                 _kb._kwh.prepare_remote_workspace(_review_origin_host, str(workspace))
+            else:
+                _review_rid = _book_local_start(conn, claimed)
             import inspect
 
             def _review_spawn(task, path):
+                kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
                 try:
                     sig = inspect.signature(_spawn)
-                    kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
-                    if "board" in sig.parameters:
-                        kwargs['board'] = board
-                    return _spawn(task, path, **kwargs)
                 except (TypeError, ValueError):
                     if _review_origin_host:
                         raise
-                    return _spawn(task, path)
+                else:
+                    if "board" in sig.parameters:
+                        kwargs['board'] = board
+                # Execution errors may follow process creation; never retry a spawn.
+                return _spawn(task, path, **kwargs)
             # The review start is a start like any other (round 5, Prism 7851057bf109): one door authorization,
             # upgraded in place from the booked pin reservation, before the worker exists.
             pid = _review_door.spawn(conn, claimed, str(workspace),
@@ -8263,6 +8423,7 @@ def _dispatch_once_locked(
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
+                placement={"route_class": "pin" if _review_origin_host else "local", "entry": "review"},
             ):
                 _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
                 continue

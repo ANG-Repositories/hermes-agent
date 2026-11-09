@@ -291,10 +291,14 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
         # spent_live with no receipt on this run: the earlier reply was lost. Cancel, never a second spawn.
         client.release(ans["reservation_id"], consumer=f"kanban@{hid}")
         raise DoorCancelled("reconciled uncertain authorization; retry with new ID")
+    import time
     doc = {"reservation_id": ans["reservation_id"], "consumer": f"kanban@{hid}",
-           "host": hid, "unit_id": uid, "until": ans["until"]}
+           "host": hid, "unit_id": uid, "until": ans["until"],
+           "at": time.time(), "at_source": "authorization_receipt_received"}
     try:
         _receipt(conn, task, doc)
+        if time.time() >= doc["until"]:
+            raise DoorCancelled("authorization expired before launch; retry with new ID")
         yield
     except BaseException:
         # Caller must stop an already-created worker before propagating an error.

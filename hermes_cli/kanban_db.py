@@ -5887,6 +5887,42 @@ def mint_cap_applies(created_by: Optional[str]) -> bool:
     return not any(by.lower().startswith(p) for p in MINT_CAP_HUMAN_PREFIXES)
 
 
+# Mint moratorium (Ace 2026-11-08 22:5x, t_fb98bedc): while ``<kanban root>/state/kanban-mint-moratorium`` exists,
+# no automated creator (:func:`mint_cap_applies`) mints a NEW card. Humans, the operator CLI default, apollo/aegis
+# and worker-created cards (``creator_task_id`` set) are exempt; re-mints that return an existing card
+# (idempotency_key / signature reuse) create nothing and are never refused. ``force_reason`` overrides. Refusals
+# and forces go to ``<db>.mint-cap.jsonl`` as ``moratorium_refused`` / ``moratorium_forced``. Read per call, so
+# touching or removing the flag takes effect on the next ``hermes kanban create`` with no restart.
+MINT_MORATORIUM_FLAG = ("state", "kanban-mint-moratorium")
+
+
+class MintMoratoriumError(ValueError):
+    """``create_task`` refused: the mint moratorium flag is set and ``created_by`` is an automated creator."""
+
+    def __init__(self, message: str, created_by: str, flag: Path):
+        super().__init__(message)
+        self.created_by = created_by
+        self.flag = flag
+
+
+def mint_moratorium_flag() -> Path:
+    return kanban_home().joinpath(*MINT_MORATORIUM_FLAG)
+
+
+def check_mint_moratorium(created_by: Optional[str], creator_task_id: Optional[str] = None) -> None:
+    """Raise :class:`MintMoratoriumError` when the flag file exists and the creator is automated, not a worker."""
+    if creator_task_id or not mint_cap_applies(created_by):
+        return
+    flag = mint_moratorium_flag()
+    if not flag.exists():
+        return
+    by = (created_by or "").strip()
+    raise MintMoratoriumError(
+        "mint moratorium: no automated producer creates a new card while %s exists (created_by=%r). Send the "
+        "finding back to the existing card instead (comment / reopen / request-changes). Override: --force "
+        "\"<why this card must exist now>\"." % (flag, by), by, flag)
+
+
 def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int] = None) -> int:
     """Cards this creator minted in the trailing window, archived ones included (a reaped card still cost a run)."""
     now = int(time.time()) if now is None else int(now)
@@ -6476,7 +6512,11 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    from hermes_cli import kanban_boomerang_default as _kbd
     from hermes_cli import kanban_mint_lint as _mint_lint
+
+    # Every producer gets the boomerang default here; an explicit value is kept as given.
+    boomerang_wake, boomerang_source = _kbd.resolve(boomerang_wake)
 
     if until is not None:
         until = validate_wake_at(until)
@@ -6648,6 +6688,17 @@ def create_task(
         else:
             if owner:
                 return owner
+    # Mint moratorium (see MINT_MORATORIUM_FLAG): after both reuse paths, so a re-mint that returns an existing
+    # card is never refused; before the write txn, so a refusal holds no lock and inserts nothing.
+    moratorium_forced: Optional[dict] = None
+    try:
+        check_mint_moratorium(created_by, creator_task_id)
+    except MintMoratoriumError as exc:
+        if not force_reason:
+            _ledger_mint_cap(conn, "moratorium_refused", created_by=exc.created_by, title=(title or "")[:120],
+                             idempotency_key=idempotency_key)
+            raise
+        moratorium_forced = {"created_by": exc.created_by, "reason": force_reason}
     try:
         check_mint_cap(conn, created_by)
     except MintCapError as exc:
@@ -6924,7 +6975,7 @@ def create_task(
                     'completion_contract': completion_contract,
                     'brain': brain,
                     'workspace_of': workspace_of,
-                    'boomerang_wake': None if boomerang_wake is None else (1 if boomerang_wake else 0),
+                    'boomerang_wake': 1 if boomerang_wake else 0,
                     'signature': signature,
                     'next_eligible_at': int(until) if until is not None else None,
                 })
@@ -6934,8 +6985,8 @@ def create_task(
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
-                if boomerang_wake is not None:   # mirror into the legacy column (Prism 921e843952a6)
-                    write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
+                # mirror into the legacy column (Prism 921e843952a6)
+                write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
                 from hermes_cli import kanban_continuation as _kcont_create
                 if continues:
                     _kcont_create.transfer_workspace(conn, continues, task_id)
@@ -6968,7 +7019,8 @@ def create_task(
                         "provider_override": provider_override,
                         "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
-                        **({"boomerang_wake": bool(boomerang_wake)} if boomerang_wake is not None else {}),
+                        "boomerang_wake": bool(boomerang_wake),
+                        "boomerang_wake_source": boomerang_source,
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -7034,6 +7086,10 @@ def create_task(
                     _ledger_on_commit(conn, "forced", task_id=task_id, **mint_cap_forced)
                 if mint_cap_bypassed:
                     _ledger_on_commit(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
+                if moratorium_forced:
+                    _append_event(conn, task_id, "moratorium_forced", moratorium_forced)
+                    _ledger_on_commit(conn, "moratorium_forced", task_id=task_id, title=(title or "")[:120],
+                                      **moratorium_forced)
                 if mint_breaker_forced:
                     _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
@@ -16461,6 +16517,7 @@ def unblock_task(
     comment: Optional[tuple] = None,
     expect_block_event: Optional[int] = None,
     expect_last_comment: Optional[int] = None,
+    expect_card_text: Optional[tuple] = None,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -16477,6 +16534,8 @@ def unblock_task(
     that latest ``scheduled``/``schedule_wake_set`` event id, t_7f670c57) and that latest comment
     id (0 = none), checked inside the same IMMEDIATE txn as the flip. A card
     re-blocked or re-pointed in between returns False and is left alone.
+    ``expect_card_text`` pins ``(title, body)`` under that same lock, for callers
+    whose authorization decision depends on tags embedded in those fields.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -16487,6 +16546,10 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
+        if expect_card_text is not None:
+            row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or tuple(row) != expect_card_text:
+                return False
         if (expect_block_event is not None or expect_last_comment is not None) and not (
             _unblock_expectation_holds(conn, task_id, expect_block_event, expect_last_comment)
         ):

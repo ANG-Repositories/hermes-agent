@@ -634,6 +634,8 @@ def _build_result_entry(
             entry["failure_reason"] = _failure_reason
     elif interrupt_note:
         entry["error"] = interrupt_note
+    if status == "interrupted" and result.get("interrupt_message"):
+        entry["interrupt_message"] = result["interrupt_message"]
 
     # Schema-validation outcome — emitted ONLY when a schema was requested, so
     # legacy (schema-less) payloads keep their exact shape.

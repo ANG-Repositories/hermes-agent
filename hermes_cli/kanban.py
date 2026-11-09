@@ -929,6 +929,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: {exc}", 2)
     if branch_name and ws_kind != "worktree":
         return _err("kanban: --branch is only valid with --workspace worktree", 2)
+    # Studio last resort (t_e604c0f9): a portable worktree target is rewritten to its anchor form, and the
+    # placement notes (rewrite, why a worktree stays Studio-local) are printed after the create.
+    _placement_notes: list = []
+    try:
+        from hermes_cli import kanban_worktree_port as _kwt
+        ws_path, _wt_note = _kwt.mint_rewrite(ws_kind, ws_path, kb.kanban_home() / "fleet")
+        if _wt_note:
+            _placement_notes.append(_wt_note)
+    except Exception:
+        pass
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1021,9 +1031,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 _priority_author = args.created_by or (
                     _author if _author == "default" or _author in _LIVE_BAND_OPERATORS else HUMAN_CREATED_BY)
                 # argparse's historical default is "user"; preserve that persisted author,
-                # but retain the verified root alias for operator eligibility.
-                if _priority_author == HUMAN_CREATED_BY and _profile_author() == "default":
-                    _priority_author = "default"
+                # but retain the verified profile (root alias or any allowlisted operator) for
+                # eligibility (Prism 99f2e8531865).
+                if _priority_author == HUMAN_CREATED_BY:
+                    _verified = _profile_author()
+                    if _verified == "default" or _verified in _LIVE_BAND_OPERATORS:
+                        _priority_author = _verified
                 _default_priority = live_band_default(conn, _priority_author)
                 if _default_priority is None:
                     _default_priority = create_default_priority(args.created_by)
@@ -1064,7 +1077,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
-                boomerang_wake=boomerang,
+                # Only the caller's own choice; create_task applies the default and records which.
+                boomerang_wake=getattr(args, "boomerang_wake", None),
                 initial_status=getattr(args, "initial_status", "running"),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
@@ -1095,6 +1109,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 explicit_home=(task.session_id or "" if getattr(args, "session", None) is not None
                                else None),
                 home_fallback=bool(boomerang) and not is_dispatcher_owned_worker_context())
+            from hermes_cli.kanban_boomerang_default import wake_route
+            route = wake_route(conn, task_id)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1115,7 +1131,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         # t_d59f722a: the home the card was BORN with, so a loader can assert it.
-        _print_json(dict(_task_to_dict(task), home=("unhomed" if task.unhomed else task.session_id)))
+        _print_json(dict(_task_to_dict(task), home=("unhomed" if task.unhomed else task.session_id),
+                         wake_route=route))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
         if auto_added:
@@ -1128,6 +1145,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 "Subscribed the calling session for finish notifications "
                 "(kanban.cli_auto_subscribe)."
             )
+        if route.get("note"):
+            print(f"\n⚠  {task_id}: {route['note']}", file=sys.stderr)
         if dup_warning:
             similar = ", ".join(
                 f"{d['id']} ({d['score']:.2f})" for d in dup_warning.get("duplicates", [])
@@ -1136,6 +1155,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
         scope_warning = kb.inferred_scope_warning(task.body)
         if scope_warning:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
+        try:
+            from hermes_cli import kanban_worker_pool as _kpool
+            _pin_note = _kpool.mint_studio_pin_note(task.body, kb.kanban_home() / "fleet",
+                                                    getattr(task, "skills", None))
+        except Exception:
+            _pin_note = None
+        for _note in (*_placement_notes, *((_pin_note,) if _pin_note else ())):
+            print(f"placement: {task_id}: {_note}", file=sys.stderr)
 
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.

@@ -5315,11 +5315,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 # the latter terminates an orphan whose stop_typing never ran.
                 while (not stop_event.is_set()
                        and self._typing_token_is_current(chat_id, my_token)):
+                    # connect() publishes the replacement before login initializes
+                    # its HTTP state. Keep this owner alive, but never POST through
+                    # a missing, closed or not-yet-ready transport.
+                    client = self._client
+                    if client is None or client.is_closed() or not client.is_ready():
+                        await _interruptible_sleep(_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS)
+                        continue
                     try:
                         route = discord.http.Route(
                             "POST", "/channels/{channel_id}/typing", channel_id=chat_id,
                         )
-                        await self._client.http.request(route)
+                        await client.http.request(route)
                         successful_posts += 1
                         consecutive_failures = 0
                     except asyncio.CancelledError:
@@ -5332,6 +5339,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         consecutive_failures += 1
                         retry_after = self._extract_discord_retry_after(e)
                         if retry_after is None:
+                            # A request can be in flight when its client is retired.
+                            if client is not self._client or client.is_closed() or not client.is_ready():
+                                await _interruptible_sleep(_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS)
+                                continue
                             exit_reason = "request_failed"
                             logger.warning(
                                 "Discord typing indicator failed for %s (%s); loop ending",

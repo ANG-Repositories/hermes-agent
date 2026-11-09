@@ -518,6 +518,21 @@ def test_ac17_admitting_pins_only_holds_portable_local_full(kanban_home):
         assert [e["code"] for e in _events(conn, port, "placement_wait")] == ["local_full"]
 
 
+def test_saturated_studio_sends_portable_to_free_pool_host(kanban_home):
+    """t_4a046fb0: a saturated Studio (band spilling, allowance 0, NOT paused)
+    must not hold a portable card ``local_full`` while a pool host is free; only
+    the Studio-bound card waits on the Studio's own gate."""
+    plan = _plan(free=2, band="spilling")
+    assert plan.pins_only is False
+    with kb.connect_closing() as conn:
+        (port,) = _make(conn, 1, body="host: any", priority=2)
+        (studio,) = _make(conn, 1, body="host: studio", priority=1)
+        res, spawned = _tick(conn, spillover=plan, spawn_limit=0)
+        assert spawned == [(port, "ace-ai")]
+        assert [e["route"] for e in _events(conn, port, "placement")] == ["remote-policy"]
+        assert res.placement_waits == {studio: "local_full"}
+
+
 # -- AC-19 ----------------------------------------------------------------------
 
 def test_ac19_every_row_past_the_slot_wall_is_recorded(kanban_home):

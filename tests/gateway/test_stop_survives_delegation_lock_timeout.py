@@ -19,7 +19,10 @@ from tests.gateway.test_stop_marker_fast_lookup import _SpyDB, _runner, _source
 
 
 @pytest.mark.asyncio
-async def test_stop_releases_the_session_when_the_delegation_cancel_times_out(monkeypatch):
+@pytest.mark.parametrize("reason,cancels", [("stop_command", False), ("new_command", True)])
+async def test_stop_releases_the_session_when_the_delegation_cancel_times_out(monkeypatch, reason, cancels):
+    """/stop leaves background delegations running (t_8c4608e6), so it never takes the lock at all; a
+    session reset (/new) still cancels them, and that cancel must time out off the loop and fail open."""
     seen = {}
 
     def _timeout(**_kwargs):
@@ -36,9 +39,13 @@ async def test_stop_releases_the_session_when_the_delegation_cancel_times_out(mo
     runner._session_state(key).turn.started_ts = time.time()
 
     await runner._interrupt_and_clear_session(
-        key, source, interrupt_reason="stop", invalidation_reason="stop_command")
+        key, source, interrupt_reason="stop", invalidation_reason=reason)
 
     assert not runner._is_session_running(key), "slot must be released even when the cancel fails"
-    assert runner._test_marks, "the user-stopped marker must still be written"
-    # The lock wait runs on a worker thread, never on the event loop.
-    assert seen["thread"] is not threading.main_thread()
+    if reason == "stop_command":
+        assert runner._test_marks, "the user-stopped marker must still be written"
+    if cancels:
+        # The lock wait runs on a worker thread, never on the event loop.
+        assert seen["thread"] is not threading.main_thread()
+    else:
+        assert "thread" not in seen, "/stop must not cancel registry-owned background delegations"

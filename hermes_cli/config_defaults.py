@@ -1672,6 +1672,9 @@ DEFAULT_CONFIG = {
         # chat) and that the user did not author queues no continuation; the idle check-in is the
         # next nudge. True restores a continuation after every judged-continue turn.
         "nudge_on_read_only_turns": False,
+        # Gateway: once an hour, an ACTIVE goal/loop whose session no routed key holds and that
+        # was idle this many days is retired as ``orphaned`` (/goal resume restores). 0 = off.
+        "orphan_gc_days": 7,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
@@ -2632,7 +2635,7 @@ DEFAULT_CONFIG = {
         # session: notify+wake (Ace 2026-10-03, t_74bf5296). One waker per
         # card is enforced in the store; false = notify-only.
         "auto_subscribe_wake": True,
-        "auto_subscribe_boomerang": True,  # operator auto-subscriptions use a child by default
+        "auto_subscribe_boomerang": True,  # every new card's boomerang_wake level unless set explicitly
         # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
         # host_axis cpu (default): downgrade at cpu_pause (0.90) busy. host_axis
         # load1 (kill switch): the pause_above / resume_below band set HERE.

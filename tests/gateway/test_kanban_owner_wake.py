@@ -100,7 +100,7 @@ def _tick(env):
 def _card(env, *, session="owner", title="card", body=None, parents=()):
     sid = env["owner"].session_id if session == "owner" else session
     with kb.connect_closing() as conn:
-        return kb.create_task(conn, title=title, assignee="worker", session_id=sid,
+        return kb.create_task(conn, boomerang_wake=False, title=title, assignee="worker", session_id=sid,
                               body=body, parents=parents)
 
 
@@ -1095,3 +1095,51 @@ def test_routed_recipient_is_read_only_from_review_deadman_events():
         "recipient_route": "home", "recipient_session_key": "k"}}) == ""
     assert ow.routed_recipient({"kind": "blocked", "payload": {
         "recipient_route": "fallback", "recipient_session_key": "k"}}) == ""
+
+
+
+# --- t_6a70430e: a routed mechanical_wake event wakes the recipient the producer resolved --------------------------
+def _mech(tid, extra=None):
+    _event(tid, "mechanical_wake", dict({"by": "card-mechanical-wake", "source": "detached-run",
+                                         "episode": "detached:r1", "text": "job x rc=1"}, **(extra or {})))
+
+
+@pytest.mark.parametrize("route", ["alerts-home", "fallback"])
+def test_routed_mechanical_wake_wakes_the_named_recipient_not_the_home(env, route):
+    rcpt = _recipient_session(env)
+    tid = _card(env)
+    _mech(tid, {"recipient_route": route, "recipient_session_key": rcpt.session_key,
+                "recipient_chat": OTHER_CHAT, "recipient_profile": "default"})
+    handled = _tick(env)
+    assert len(handled) == 1, [e.text for e in handled]
+    assert handled[0].metadata["gateway_session_key"] == rcpt.session_key
+    assert handled[0].source.chat_id == OTHER_CHAT and tid in handled[0].text
+
+
+def test_home_route_mechanical_wake_wakes_the_home(env):
+    tid = _card(env)
+    _mech(tid, {"recipient_route": "home", "recipient_session_key": "ignored"})
+    [ev] = _tick(env)
+    assert ev.metadata["gateway_session_key"] == env["owner"].session_key
+
+
+def test_mechanical_wake_without_a_recipient_wakes_the_home(env):
+    tid = _card(env)
+    _mech(tid)
+    [ev] = _tick(env)
+    assert ev.metadata["gateway_session_key"] == env["owner"].session_key
+
+
+def test_routed_mechanical_wake_to_a_recipient_with_no_live_session_wakes_nobody_else(env):
+    tid = _card(env)
+    _mech(tid, {"recipient_route": "fallback", "recipient_session_key": "agent:main:discord:group:999:999"})
+    handled = _tick(env)
+    assert all(e.metadata.get("gateway_session_key") != env["owner"].session_key for e in handled), \
+        "a routed event never falls back to the home session"
+
+
+def test_routed_recipient_reads_both_producer_kinds():
+    p = {"recipient_route": "fallback", "recipient_session_key": "k"}
+    assert ow.routed_recipient({"kind": "mechanical_wake", "payload": p}) == "k"
+    assert ow.routed_recipient({"kind": "review_deadman", "payload": p}) == "k"
+    assert ow.routed_recipient({"kind": "mechanical_wake", "payload": dict(p, recipient_route="home")}) == ""

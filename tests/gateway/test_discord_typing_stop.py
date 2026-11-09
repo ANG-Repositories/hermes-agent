@@ -52,7 +52,7 @@ class _FakeRateLimit(Exception):
 def _make_adapter(request_side_effect):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     http = SimpleNamespace(request=AsyncMock(side_effect=request_side_effect))
-    adapter._client = SimpleNamespace(http=http)
+    adapter._client = SimpleNamespace(http=http, is_closed=lambda: False, is_ready=lambda: True)
     return adapter
 
 

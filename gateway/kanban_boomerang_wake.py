@@ -155,6 +155,13 @@ class BoomerangWakeState:
             claims = self._claims_of(data)
             if key in claims:
                 return False
+            if entry.get("row") == "blocked_assess":
+                retries = self._retries_of(data)
+                spent = int(retries.get(entry["task_id"], 0))
+                entry["blocked_budget_exhausted"] = spent >= 1
+                if not entry["blocked_budget_exhausted"]:
+                    retries[entry["task_id"]] = spent + 1
+                    data["retries"] = retries
             claims[key] = dict(entry)
             data["claims"] = claims
             self._write(data)
@@ -277,7 +284,7 @@ STATE_TERMINAL, STATE_CANCELLED = "terminal", "cancelled"
 OPEN_STATES = frozenset({STATE_CLAIMED, STATE_RUNNING, STATE_EXECUTING, STATE_CANCELLED})
 
 ACTIONS = frozenset({"complete", "request_changes", "redispatch", "retry", "surface", "handled", "land_inherited",
-                     "comment_why_waits"})
+                     "comment_why_waits", "acknowledge"})
 # RC-2: kind × action, keyed on the row stored at claim time (pass-5 RC-A).
 ALLOWED = {
     "completed": frozenset({"complete", "request_changes", "surface"}),
@@ -288,10 +295,14 @@ ALLOWED = {
     # outside the card's state machine); ``handled`` writes only the receipt, the card stays in review.
     "own_repo_review_all_keys_answered": frozenset({"handled", "surface"}),
     "changes_requested": frozenset({"redispatch", "surface"}),
+    "blocked_assess": frozenset({"retry", "surface"}),
     "crash_first_occurrence": frozenset({"retry", "surface"}),
     # t_1e0ffee4: a review-deadman tier-1 page. comment_why_waits = the executor posts ONE bounded
     # why-waits comment (WHY_WAITS_FIELDS); the card stays in review.
     "review_deadman": frozenset({"comment_why_waits", "surface"}),
+    # t_6a70430e: a producer's mechanical wake. acknowledge = the executor writes the receipt and ONE comment on
+    # an OPEN card of any status (not review-only); it changes no card state and claims no obligation.
+    "mechanical_wake": frozenset({"acknowledge", "surface"}),
 }
 
 #: comment_why_waits: the verdict's ``why_waits`` object; each field a non-empty line, clipped.
@@ -365,6 +376,7 @@ def enabled() -> bool:
 
 ROW_REVIEW_ALL_ANSWERED = "review_all_answered"
 ROW_REVIEW_DEADMAN = "review_deadman"
+ROW_MECHANICAL_WAKE = "mechanical_wake"
 
 
 def row_enabled(name: str) -> bool:
@@ -573,10 +585,15 @@ def card_snapshot(board: Optional[str], task_id: str) -> dict:
         top = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
                            (task_id,)).fetchone()[0]
         pr, head = _pr_and_head(kb, conn, task_id)
+        last_comment = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
     finally:
         conn.close()
     return {"status": getattr(task, "status", None), "assignee": getattr(task, "assignee", None),
-            "top_event_id": int(top or 0), "pr": pr, "head": head}
+            "top_event_id": int(top or 0), "pr": pr, "head": head,
+            "card_text": [getattr(task, "title", None), getattr(task, "body", None)],
+            "last_comment": int(last_comment)}
 
 
 # --- delegation ledger (boomerang skill Step 0 shape) -------------------------------------
@@ -668,6 +685,22 @@ REVIEW_DEADMAN_STEPS = (
 )
 
 
+MECHANICAL_WAKE_STEPS = (
+    "1. Read the card: `hermes kanban --board {board} show {task_id}` (status, the comment thread, any "
+    "`mechanical_wake` event's payload: its `source`, `episode` and `text`).",
+    "2. Read what the event points at (a detached job's log path, the obligation rows it lists) read-only.",
+    "3. Return `acknowledge` ONLY when nothing in it needs the card owner: the outcome is expected, already "
+    "handled on the card, or already re-queued. Your summary becomes the one card comment. If anything needs a "
+    "decision (fix and re-queue, claim an obligation, answer a question), return `surface`. You cannot claim or "
+    "resolve an obligation; acknowledging never stops its escalation clock.",
+)
+
+
+def _mechanical_wake_brief(entry: dict) -> str:
+    fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"]}
+    return "Do this read:\n" + "\n".join(s.format(**fields) for s in MECHANICAL_WAKE_STEPS) + "\n"
+
+
 def _review_deadman_brief(entry: dict) -> str:
     from hermes_constants import display_hermes_home, get_default_hermes_root
 
@@ -676,9 +709,27 @@ def _review_deadman_brief(entry: dict) -> str:
     return "Do this attended read:\n" + "\n".join(s.format(**fields) for s in REVIEW_DEADMAN_STEPS) + "\n"
 
 
+def _blocked_brief(entry: dict) -> str:
+    return (
+        "Assess the block, not its label: read the latest card, block reason and comments; "
+        "check the named prerequisite with bounded read-only probes. needs_input/capability "
+        "is not proof that a human is needed. Do not mutate the card yourself. "
+        "If existing authority permits retry AND observed evidence proves the prerequisite "
+        "is now satisfied, return retry with nonempty evidence and "
+        '`"block_resolution": {"resolved": true, "authority": "existing", '
+        '"check": "<probe and observed result>"}`. Never retry just to see if it works. '
+        "No inferred approval for spending, outbound communication, destruction, credentials, "
+        "restarts or privilege changes. If any such approval is needed, access is missing, "
+        "or the block remains unresolved, return surface with the concrete blocker, attempted "
+        "checks and what the OWNER must assess next. The owner decides whether to ask Ace.\n"
+    )
+
+
 #: Row-specific instructions appended to the generic goal (keyed on the claim-time row).
-ROW_BRIEFS = {"own_repo_review_all_keys_answered": _review_all_answered_brief,
-              "review_deadman": _review_deadman_brief}
+ROW_BRIEFS = {"blocked_assess": _blocked_brief,
+              "own_repo_review_all_keys_answered": _review_all_answered_brief,
+              "review_deadman": _review_deadman_brief,
+              "mechanical_wake": _mechanical_wake_brief}
 
 
 def build_goal(entry: dict) -> str:
@@ -827,6 +878,9 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
         elif action in ("handled", "comment_why_waits"):   # receipt (+ the why-waits comment); card stays in review
             if status != "review":
                 raise RuntimeError(f"{action} on a {status} card")
+        elif action == "acknowledge":   # t_6a70430e: receipt + one comment, no state change; any OPEN card
+            if status is None or status in ("done", "archived"):
+                raise RuntimeError(f"{action} on a {status} card")
         elif action == "land_inherited":   # the ONE write is the landing-queue enqueue (plan re-verified)
             if status != "review":
                 raise RuntimeError(f"land_inherited on a {status} card")
@@ -842,8 +896,25 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
             current = entry.get("assignee")   # RC-4: the CURRENT assignee only, never the child's pick
             if current and getattr(kb.get_task(conn, tid), "assignee", None) != current:
                 kb.assign_task(conn, tid, current, worker_ok=True)
-        elif status == "blocked":             # redispatch / retry of a parked card
-            if not kb.unblock_task(conn, tid):
+        elif status == "blocked" or entry.get("row") == "blocked_assess":
+            kwargs = {"expect_block_event": int(entry["event_id"])} if entry.get("row") == "blocked_assess" else {}
+            if entry.get("row") == "blocked_assess":
+                from gateway.kanban_wake_disposition import card_tags, SURFACE_TAGS
+
+                current = kb.get_task(conn, tid)
+                if card_tags(current) & SURFACE_TAGS:
+                    raise RuntimeError("restricted card requires owner assessment")
+                # Bind evidence to the dispatch snapshot, not freshly edited text.
+                # The DB checks it under its writer lock with the block-event CAS.
+                assessed_text = entry.get("assessed_card_text")
+                if not isinstance(assessed_text, list) or len(assessed_text) != 2:
+                    raise RuntimeError("assessed card text unavailable")
+                kwargs["expect_card_text"] = tuple(assessed_text)
+                last_comment = entry.get("assessed_last_comment")
+                if not isinstance(last_comment, int):
+                    raise RuntimeError("assessed comment revision unavailable")
+                kwargs["expect_last_comment"] = last_comment
+            if not kb.unblock_task(conn, tid, **kwargs):
                 raise RuntimeError("unblock refused")
         elif status in ("ready", "todo"):
             ok, detail = kb.requeue_task(conn, tid, actor=AUTHOR, reason=f"{entry['delegation_id']} {summary}")
@@ -1000,6 +1071,14 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     if action not in ALLOWED.get(live.get("row") or "", frozenset()):
         return {"ok": False, "action": action, "reason": f"action not allowed for {live.get('row')}",
                 "summary": summary, "refused": True, **finding}
+    if live.get("row") == "blocked_assess" and action == "retry":
+        resolution = verdict.get("block_resolution")
+        if (live.get("blocked_budget_exhausted") or not isinstance(resolution, dict)
+                or resolution.get("resolved") is not True
+                or resolution.get("authority") != "existing"
+                or not _first_line(resolution.get("check")) or not finding["evidence"]):
+            return {"ok": False, "action": "surface", "reason": "block resolution not established",
+                    "summary": summary, "surface": True, **finding}
     if action == "surface":
         why = _stale_refusal(live, "execute_verdict")
         if why:
@@ -1016,6 +1095,15 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
         why = _moved(live, kb, conn)
         if why:
             return {"ok": False, "action": action, "reason": why, "summary": summary}
+        if live.get("row") == "blocked_assess":
+            from gateway.kanban_wake_disposition import card_tags, SURFACE_TAGS
+
+            task = kb.get_task(conn, live["task_id"])
+            if card_tags(task) & SURFACE_TAGS:
+                return {"ok": False, "action": "surface", "reason": "restricted card requires owner assessment",
+                        "summary": summary, "surface": True, **finding}
+            if getattr(task, "status", None) != "blocked":
+                return {"ok": False, "action": action, "reason": "state moved", "summary": summary}
         if action == "land_inherited":
             degraded = _verify_land_inherited(live, verdict, kb, conn)
             if degraded:
@@ -1274,8 +1362,15 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
     from gateway import kanban_owner_wake as _ow
 
     try:
+        home_sid = entry.get("home_sid") or ""
+        if entry.get("kind") == "blocked":
+            from hermes_cli import kanban_db as kb
+
+            current = await asyncio.to_thread(_ow.read_card, kb, entry.get("board"), entry["task_id"])
+            # Never fall back to a former owner when a card was rehomed or lost its home.
+            home_sid = (current or {}).get("session_id") or ""
         home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
-                                       entry.get("home_sid") or "", _hr.read_session_row)
+                                       home_sid, _hr.read_session_row)
         if home is None or not _ow.is_chat_origin(home):
             logger.warning("kanban boomerang-wake: no live home for %s; wake not re-surfaced", entry.get("task_id"))
             return False
@@ -1293,14 +1388,85 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
         return False
 
 
+#: The RC-3 freshness refusals (``_moved`` and the write path wrapping it): the card moved under
+#: the claim, a normal supersede, not a fault (t_ce8bd439).
+_SUPERSEDE_REASONS = frozenset({"state moved", "write refused: state moved"})
+
+
+def _card_status(entry: dict) -> str:
+    from hermes_cli import kanban_db as kb
+
+    try:
+        conn = kb.connect(board=entry.get("board"))
+        try:
+            return str(getattr(kb.get_task(conn, entry["task_id"]), "status", None) or "?")
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("kanban boomerang-wake: status read for %s failed: %s", entry.get("task_id"), exc)
+        return "?"
+
+
+async def _home_is_live(runner: Any, entry: dict) -> bool:
+    """True when the card's home session is a live chat origin (the precondition ``resurface`` needs)."""
+    from gateway import kanban_home_route as _hr
+    from gateway import kanban_owner_wake as _ow
+
+    try:
+        home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
+                                       entry.get("home_sid") or "", _hr.read_session_row)
+        return home is not None and bool(_ow.is_chat_origin(home))
+    except Exception as exc:   # unknown = not provably live: keep the chat line
+        logger.debug("kanban boomerang-wake: home check for %s failed: %s", entry.get("task_id"), exc)
+        return False
+
+
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
                 text: Optional[str] = None) -> None:
-    """Commit the original wake obligation before any best-effort delivery."""
+    """Commit the original wake obligation before any best-effort delivery. A freshness refusal
+    (the card moved under the claim) is a supersede, not a fault (t_ce8bd439): the handback keeps
+    only the re-delivered wake, the origin chat gets no line, and one #logs line records it."""
+    if entry.get("row") == "blocked_assess":
+        result = {"summary": reason, "action": "surface", "detail": reason}
+        await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                                outcome="failed", reason=reason, resurfaced=True, resurface_delivered=False,
+                                handback=handback_row(entry, result,
+                                    turn_text=text or finding_text(entry, result, "owner assessment required")))
+        try:
+            await asyncio.to_thread(record_surface, entry, reason)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: blocked escalation comment failed: %s", exc)
+        await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
+        return
+    superseded = reason in _SUPERSEDE_REASONS
+    stopped = reason == "stopped by /stop"
     handback = handback_row(entry, {"summary": reason},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
-    handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
-    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="failed",
+    status = await asyncio.to_thread(_card_status, entry) if superseded else ""
+    # Quiet only when the re-delivered wake has somewhere to land. With no live home the turn part
+    # retries silently forever, so the origin chat keeps ONE plain line (Prism c-4e2273b5aa3cb68a).
+    quiet = superseded and await _home_is_live(runner, entry)
+    if quiet:
+        handback[1]["parts"] = [PART_TURN]
+        handback[1]["line"] = ""
+    elif superseded:
+        handback[1]["line"] = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before "
+                               f"the wake ran; no live home session, so the original wake was NOT re-delivered")
+    elif stopped:
+        handback[1]["line"] = f"boomerang-wake stopped {entry['task_id']}: stopped by /stop"
+    else:
+        handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                            outcome="superseded" if superseded else "stopped" if stopped else "failed",
                             reason=reason, resurfaced=True, resurface_delivered=False, handback=handback)
+    if quiet:
+        line = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before the wake ran; "
+                f"original wake re-delivered")
+        logger.info("kanban boomerang-wake: %s", line)
+        try:
+            post_logs(line)
+        except Exception as exc:
+            logger.debug("kanban boomerang-wake: superseded #logs line failed: %s", exc)
     await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
 
 
@@ -1400,6 +1566,12 @@ def _run_child_delegate(parent: Any, goal: str, mode: str) -> tuple:
     if data.get("error"):
         return "failed", str(data["error"])
     res = (data.get("results") or [{}])[0]
+    from gateway.run import _INTERRUPT_REASON_STOP
+
+    # The gateway propagates this control message to owned children; never infer /stop
+    # from the placeholder final_response (also used by watchdogs and provider failures).
+    if res.get("status") == "interrupted" and res.get("interrupt_message") == _INTERRUPT_REASON_STOP:
+        return "stopped", "stopped by /stop"
     return str(res.get("status") or "failed"), str(res.get("summary") or res.get("error") or "")
 
 
@@ -1466,6 +1638,11 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
 async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState) -> None:
     """The dispatched task: parent → child → verdict executor → one origin line."""
     key = entry["key"]
+    if entry.get("blocked_budget_exhausted"):
+        live = await asyncio.to_thread(state.get_claim, key) or entry
+        if live.get("state") not in (STATE_CANCELLED, STATE_TERMINAL) and not live.get("resurfaced"):
+            await _fail(runner, live, "blocked assessment budget exhausted; owner assessment required", state)
+        return
     try:
         parent, mode = await parent_resolver(runner, entry)
         entry = await asyncio.to_thread(state.update_claim, key, state=STATE_RUNNING, inherit_mode=mode) or entry
@@ -1488,7 +1665,8 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
     except Exception as exc:
         logger.debug("kanban boomerang-wake: ledger close failed: %s", exc)
     if status != "completed":
-        await _fail(runner, live, f"child {status}: {_first_line(final, 200)}", state)
+        reason = "stopped by /stop" if status == "stopped" else f"child {status}: {_first_line(final, 200)}"
+        await _fail(runner, live, reason, state)
         return
     if await asyncio.to_thread(deadman_owner_acted, live):
         logger.info("kanban boomerang-wake: stale surface refused task=%s stage=run_entry "
@@ -1557,6 +1735,8 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         "event_ts": event_ts, "row": disposition.row, "mode": disposition.mode or "fork",
         "status": snap["status"], "assignee": snap["assignee"], "pr": snap["pr"], "head": snap["head"],
         "cursor_event_id": max(int(event_id), snap["top_event_id"]),
+        "assessed_card_text": snap["card_text"],
+        "assessed_last_comment": snap["last_comment"],
         "home_sid": home_sid or "", "route": dict(route or {}), "path": path,
         "title": str(_field(task, "title") or "")[:160], "wake_text": wake_text,
         "verdict_nonce": secrets.token_hex(8), "delegation_id": mint_delegation_id(),
@@ -1586,6 +1766,21 @@ async def dispatch_or_warn(runner: Any, entry_route: dict, **kw: Any) -> bool:
     """``dispatch`` for a wake path: True = a claim owns the event (this path's or the other
     path's), so the caller withholds its wake. A raised dispatch posts the warning line and
     returns False: the caller surfaces the wake (INV-6)."""
+    if getattr(kw.get("disposition"), "row", None) == "blocked_assess":
+        from gateway import kanban_home_route as _hr
+        from gateway import kanban_owner_wake as _ow
+
+        if kw.get("path") == "notifier" and not _ow.is_chat_origin(
+                SimpleNamespace(origin=SimpleNamespace(**entry_route))):
+            return False  # a chat home does not own a non-chat subscription
+        try:
+            home = await asyncio.to_thread(
+                _ow.resolve_owner, getattr(runner, "session_store", None),
+                kw.get("home_sid") or "", _hr.read_session_row)
+            if home is None or not _ow.is_chat_origin(home):
+                return False  # preserve native subscription delivery; no claim owns it
+        except Exception:
+            return False  # cannot establish the unresolved-handback destination
     try:
         await dispatch(runner, route=entry_route, **kw)
         return True   # accepted here, or already claimed by the other path: either way owned
@@ -1639,6 +1834,8 @@ def _owner_candidates(board: str, task_id: str, items: list) -> dict:
             disp = classify_event(str(i.get("kind") or ""), payload, task, retries)
             if disp.row == ROW_REVIEW_DEADMAN and not row_enabled(ROW_REVIEW_DEADMAN):
                 continue   # row off: the owner-wake delivers the deadman page as today's turn
+            if disp.row == ROW_MECHANICAL_WAKE and not row_enabled(ROW_MECHANICAL_WAKE):
+                continue   # row off: the owner-wake delivers the mechanical wake as today's turn
             if disp.verdict == "auto":
                 out[int(i["event_id"])] = disp
         return out
@@ -1708,6 +1905,9 @@ def _alive(key: str) -> bool:
 
 
 async def _lost(runner: Any, entry: dict, reason: str, state: BoomerangWakeState) -> None:
+    if entry.get("row") == "blocked_assess":
+        await _fail(runner, entry, f"blocked assessment lost: {reason}; owner assessment required", state)
+        return
     ok = await resurface(runner, entry)
     # The reconciler's observable (README §5, smoke step 4 / AC-11): it was the only boomerang-wake
     # outcome with no log line, so a correct re-surface read as FAIL live (2026-10-19 23:07).

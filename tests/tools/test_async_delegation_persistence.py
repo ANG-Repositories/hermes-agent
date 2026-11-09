@@ -620,6 +620,23 @@ def test_record_cap_full_of_settled_terminal_records_admits_new_dispatch(monkeyp
     gate.set()
 
 
+def test_admission_preflight_agrees_with_persist_on_a_full_but_evictable_registry():
+    """Prism c-e0bb5594880eff70: the preflight must apply persist_dispatch's eviction. A registry at cap made
+    only of settled, delivered records is admissible; refusing it at preflight is the 2026-11-08 bug again."""
+    old = _running_record(delegation_id="old")
+    old.update({"state": "done", "updated_at": time.time() - 60, "outbox": [{"state": "delivered"}]})
+    newer = _running_record(delegation_id="newer")
+    newer.update({"state": "failed", "outbox": []})
+    ad._write_registry_for_tests({"schema_version": 1, "updated_at": time.time(),
+                                  "records": {"old": old, "newer": newer}})
+    assert ad._store.admission_refusal(max_records=2) is None
+    # Live records are still never evicted: two running records at cap 2 stay refused.
+    ad._write_registry_for_tests({"schema_version": 1, "updated_at": time.time(), "records": {
+        "a": _running_record(delegation_id="a"), "b": _running_record(delegation_id="b")}})
+    assert ad._store.admission_refusal(max_records=2) == "registry_cap"
+    assert set(_load()["records"]) == {"a", "b"}
+
+
 def test_resume_disabled_does_not_mutate_or_dispatch(monkeypatch):
     record = _running_record()
     _write_record(record)

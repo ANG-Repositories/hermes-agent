@@ -983,6 +983,96 @@ def resolve_pin(body: Optional[str], known_hosts: Iterable[str],
     return None, ignored
 
 
+def studio_pin_reasons(caps) -> Optional[frozenset]:
+    """The ``requires:`` words that justify a ``host: studio`` pin (t_e604c0f9): every capability the capability
+    map's Studio row serves (browser-session, studio-state, control-plane, docker identity-only, ...) plus the
+    Studio-only access word ``control-plane-read``. None (= every Studio pin is honoured, the pre-t_e604c0f9
+    behaviour) when the capability layer is off this tick, its map is absent or malformed, or the Studio row
+    lists nothing: an unreadable vocabulary must not move Studio work."""
+    return studio_map_reasons(getattr(caps, "cmap", None))
+
+
+def studio_map_reasons(cmap) -> Optional[frozenset]:
+    """:func:`studio_pin_reasons` from a ``CapabilityMap`` (``kanban create`` has no tick)."""
+    if cmap is None or not getattr(cmap, "valid", False):
+        return None
+    from hermes_cli import kanban_host_capabilities as _khc
+    studio = (getattr(cmap, "hosts", None) or {}).get(_khc.STUDIO_ROW)
+    if not studio:
+        return None
+    return frozenset(studio) | {_reasons.ACCESS_CONTROL_PLANE_READ}
+
+
+def studio_pin_justified(body: Optional[str], reasons: Optional[frozenset]) -> bool:
+    """Does the card's ``requires:`` line name a reason the Studio pin needs? ``reasons`` None = always."""
+    if reasons is None:
+        return True
+    from hermes_cli import kanban_host_capabilities as _khc
+    return any(w in reasons for w in _khc.declared_words(body))
+
+
+def skills_need_studio(skills: Optional[Iterable[Any]], cmap, reasons: Optional[frozenset]) -> bool:
+    """Does an ATTACHED skill need a capability the Studio row serves (Prism f5bbe97bc028)? The capability index
+    maps skill -> capabilities (identity-only docker included), and the verdict enforces those; a `host: studio`
+    pin such a card carries is justified even with no ``requires:`` line. False when the map or index is
+    unreadable (``reasons`` is then None anyway, or the index cannot say)."""
+    if not reasons or cmap is None or getattr(cmap, "index_error", None) is not None:
+        return False
+    from hermes_cli import kanban_host_capabilities as _khc
+    index = getattr(cmap, "index", None) or {}
+    return any(c in reasons for s in (skills or ()) if isinstance(s, str)
+               for c in index.get(_khc.skill_key(s), ()))
+
+
+def effective_pin(body: Optional[str], known_hosts: Iterable[str],
+                  aliases: Optional[Mapping[str, str]] = None,
+                  studio_reasons: Optional[frozenset] = None) -> Tuple[Optional[str], Optional[str], bool]:
+    """:func:`resolve_pin` plus the Studio last-resort rule (Ace 2026-11-08 16:38, t_e604c0f9): a bare
+    ``host: studio`` line with no ``requires:`` reason the Studio serves is DROPPED (not a pin, not an unknown
+    word: the card is placed by FWA like any unpinned card). ``(pin, ignored, dropped)``."""
+    pin, ignored = resolve_pin(body, known_hosts, aliases)
+    if pin == PIN_STUDIO and not studio_pin_justified(body, studio_reasons):
+        return None, None, True
+    return pin, ignored, False
+
+
+def note_dropped_studio_pin(card_id: str) -> None:
+    """One INFO per card per 5 minutes for a dropped bare ``host: studio`` pin."""
+    now = time.monotonic()
+    key = f"studio-pin:{card_id}"
+    last = _ignored_pin_warned.get(key)
+    if last is None or now - last >= IGNORED_PIN_WARN_SECONDS:
+        _ignored_pin_warned[key] = now
+        _log.info("kanban pool: card %s: bare `host: studio` dropped (no requires: reason the Studio serves); "
+                  "placed by FWA", card_id)
+
+
+def mint_studio_pin_note(body: Optional[str], fleet_dir: Path,
+                         skills: Optional[Iterable[Any]] = None) -> Optional[str]:
+    """``kanban create``'s line for a bare ``host: studio`` the dispatcher will drop (t_e604c0f9), else None. The
+    same predicate as dispatch: the host_preference switch (t_c2fce87e), the capability map's Studio row, the
+    card's ``requires:`` words."""
+    try:
+        from hermes_cli import placement_policy as _ppol
+        if not _ppol.load(fleet_dir).is_last_resort(STUDIO_HOST):
+            return None
+        pin, _ignored = resolve_pin(body, known_host_ids(fleet_dir), pin_aliases(fleet_dir))
+        if pin != PIN_STUDIO:
+            return None
+        from hermes_cli import kanban_host_capabilities as _khc
+        cmap = _khc.load_map(fleet_dir)
+        reasons = studio_map_reasons(cmap)
+        if skills_need_studio(skills, cmap, reasons):
+            return None
+    except Exception:
+        return None
+    if reasons is None or studio_pin_justified(body, reasons):
+        return None
+    return ("`host: studio` will be DROPPED at dispatch: no `requires:` line names a reason the Studio serves "
+            f"({', '.join(sorted(reasons))}); FWA places this card like any other. Add the requires: line if "
+            "it must run on the Studio.")
+
+
 def _studio_words() -> frozenset:
     """Words for the dispatcher's own machine: the constants plus the live
     ``socket.gethostname()`` short form, lower-cased."""
@@ -1113,7 +1203,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              targets: Optional[Mapping[str, str]] = None,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
              body_signals: bool = True,
-             worktree_hosts: Optional[Tuple[str, ...]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+             worktree_hosts: Optional[Tuple[str, ...]] = None,
+             studio_reasons: Optional[frozenset] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1149,6 +1240,11 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     hosts holding a git mirror of a ``worktree`` card's repo. Non-empty, the
     card is judged like a scratch card (the dispatcher clones it on the
     chosen host); a pin to a host outside that set keeps it local.
+
+    ``studio_reasons`` (t_e604c0f9, :func:`studio_pin_reasons`): a ``host:
+    studio`` pin holds only when the card's ``requires:`` line names one of
+    them; a bare one is dropped and the card is judged unpinned. None = every
+    Studio pin holds (kill switch, or no capability map this tick).
     """
     kind = workspace_kind or "scratch"
     if kind != "scratch" and not (kind == "worktree" and worktree_hosts):
@@ -1181,7 +1277,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     access = access_bound_for(body, pool)
     if access is not None:
         return False, _reasons.access_bound(access), None
-    pin, ignored = resolve_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None))
+    pin, ignored, _dropped = effective_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None),
+                                           studio_reasons)
     if bind_rule:
         # The bind is the pin; a body pin may only agree with it (spec §5).
         if pin not in (None, PIN_ANY, bind_host.lower()):
@@ -1440,12 +1537,26 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
     tail = f"; {_boards_cmd(workspaces_root)}" if workspaces_root else ""
     if workspace_paths:
         tail += f"; {_states_cmd(workspace_paths)}"
-    if pressure_path is None:
-        return f"cat /proc/loadavg; {_NCPU_CMD}{tail}"
     import shlex
-    # ONE round-trip (RC9): the age is remote_now - at, both from this host.
-    return (f"cat /proc/loadavg; {_NCPU_CMD}; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
-            f"{tail}")
+    # Python's native APIs work on Linux and Darwin. A single JSON envelope
+    # prevents missing commands/files from shifting CPU/clock/pressure fields.
+    script = (
+        "import json,os,sys,time\n"
+        "load=os.getloadavg()\n"  # admission-lint: not-a-decider remote telemetry capture only; admission occurs in the shared predicate
+        "pressure=''\n"
+        "if len(sys.argv)>1:\n"
+        " path=sys.argv[1]\n"
+        " if sys.platform=='darwin' and path=='/var/lib/placement/host-pressure.json':\n"
+        "  path=os.path.expanduser('~/.local/share/placement/host-pressure.json')\n"
+        " try:\n"
+        "  with open(path, encoding='utf-8-sig', errors='replace') as f: pressure=f.read()\n"
+        " except OSError: pass\n"
+        "print('@@hermes-probe-v1')\n"
+        "print(json.dumps(dict(schema=1,load1=load[0],load5=load[1],"
+        "ncpu=os.sysconf('SC_NPROCESSORS_ONLN'),remote_now=time.time(),pressure_text=pressure)))\n"
+    )
+    args = " " + shlex.quote(pressure_path) if pressure_path is not None else ""
+    return f"python3 -c {shlex.quote(script)}{args}{tail}"
 
 
 def _probe_once(h: PoolHost, runner: Callable, *,
@@ -1510,6 +1621,27 @@ def _probe_once(h: PoolHost, runner: Callable, *,
         if not sep:
             return None, "probe output missing board list"  # fail closed
         boards = frozenset(b.strip() for b in listed.split("\n") if b.strip())
+    if out.startswith("@@hermes-probe-v1\n"):
+        import math
+        try:
+            doc = json.loads(out.split("\n", 1)[1])
+            if doc.get("schema") != 1:
+                raise ValueError("schema")
+            load1, load5 = doc["load1"], doc["load5"]
+            ncpu, remote_now = doc["ncpu"], doc["remote_now"]
+            if (type(ncpu) is not int or ncpu <= 0
+                    or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0
+                           for v in (load1, load5, remote_now))
+                    or not isinstance(doc["pressure_text"], str)):
+                raise ValueError("axes")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, "invalid structured probe output"
+        if pressure_path is None and boards is None and states is None:
+            return (load1, ncpu), ""
+        return HostSample(load1, ncpu, remote_now, doc["pressure_text"], boards,
+                          load5=load5, workspace_states=states), ""
+    # Compatibility for cached/injected legacy probes. New commands always
+    # emit the versioned envelope; never interpret a damaged envelope as lines.
     lines = out.split("\n")
     try:
         load1 = float(lines[0].split()[0])

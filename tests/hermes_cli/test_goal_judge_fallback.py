@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 import pytest
 
@@ -26,6 +27,8 @@ def endpoint():
             value = replies.get(model, 503)
             if callable(value):
                 value = value()
+            if value is None:  # a hung route released after its client was killed: no reply
+                return
             if isinstance(value, int):
                 self.send_response(value)
                 self.end_headers()
@@ -53,7 +56,7 @@ def configure(home, url, **extra):
     route = dict(provider='custom', base_url=url, api_key='test-only', timeout=15)
     config = dict(route, model='primary', total_timeout=60,
                   fallback_chain=[dict(route, model=m) for m in ('sol', 'grok', 'kimi')], **extra)
-    (home / 'config.yaml').write_text(json.dumps({'auxiliary': {'goal_judge': config}}))
+    (home / 'config.yaml').write_text(json.dumps({'auxiliary': {'goal_judge': config}}), encoding='utf-8')
 
 
 @pytest.mark.slow_test(120, reason='Real fresh-interpreter provider resolution on up to four sequential routes')
@@ -223,7 +226,7 @@ def test_pause_cancels_chain_without_failure_increment(tmp_path, monkeypatch):
     configure(tmp_path, 'http://127.0.0.1:9/v1')
     manager = goals.GoalManager('cancel-chain')
     manager.set('deliver')
-    def attempt(route, messages, max_tokens, deadline, cancel_check=None):
+    def attempt(route, messages, max_tokens, deadline, cancel_check=None, **kwargs):
         goals.GoalManager('cancel-chain').pause('user stop')
         assert cancel_check()
         raise AuxiliaryExplicitCancellation()
@@ -353,7 +356,8 @@ def test_stuck_cleanup_retains_owner_and_inhibits_retry(tmp_path, monkeypatch, c
                 chain.run_attempt(route, [], 10, started + 0.3, cancel_check=lambda: True)
         else:
             result = chain.judge_chain(([route, route], 0.3), 's', 'p', 10, goals._parse_judge_response)
-            assert result[4] and 'cleanup_pending' in result[1]
+            # Its own stuck reap does not stop the chain; the spent budget does. Never done.
+            assert result[0] == 'continue' and result[4] and 'total_timeout' in result[1]
         assert time.monotonic() - started < 2
         assert cleanup_started.wait(1)
         assert chain.run_attempt(route, [], 10, time.monotonic() + 1)['category'] == 'cleanup_pending'
@@ -361,6 +365,144 @@ def test_stuck_cleanup_retains_owner_and_inhibits_retry(tmp_path, monkeypatch, c
     finally:
         release.set()
         assert chain._cleanup_finished(str(tmp_path), timeout=2)
+
+
+_STUBBORN_CHILD = (
+    'import signal, runpy; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+    "runpy.run_module('hermes_cli.goal_judge_chain', run_name='__main__')"
+)
+
+
+def _slow_kill(monkeypatch, chain, delay):
+    """The reaper's kill lands `delay` s late: a loaded host, or a child that resists termination."""
+    import agent.deadline
+    real_killpg = getattr(chain.os, 'killpg', None)  # windows-footgun: ok — POSIX-only, None on Windows
+    real_tree = agent.deadline.kill_process_tree
+    def late(real):
+        def kill(*args, **kwargs):
+            time.sleep(delay)
+            return real(*args, **kwargs)
+        return kill
+    if real_killpg is not None:
+        monkeypatch.setattr(chain.os, 'killpg', late(real_killpg))
+    monkeypatch.setattr(agent.deadline, 'kill_process_tree', late(real_tree))
+
+
+@pytest.mark.slow_test(120, reason='Real fresh-interpreter judge children on two sequential routes')
+@pytest.mark.parametrize('reap_delay', [0.0, 0.5, 2.0])
+def test_hung_primary_is_killed_and_sol_wins(tmp_path, monkeypatch, endpoint, caplog, reap_delay):
+    """Apollo 11-08 12:24-12:57: a timed-out primary's slow reap fenced every later rung (cleanup_pending)."""
+    import logging
+    import subprocess
+    from hermes_cli import goal_judge_chain as chain
+    url, calls, replies = endpoint
+    release = threading.Event()
+    replies['primary'] = lambda: release.wait(60) and None
+    replies['gpt-6.1-sol'] = json.dumps(dict(verdict='done', reason='evidence'))
+    home = tmp_path
+    route = dict(provider='custom', base_url=url, api_key='test-only')
+    (home / 'config.yaml').write_text(json.dumps({'auxiliary': {'goal_judge': dict(
+        route, model='primary', timeout=4, total_timeout=240,
+        fallback_chain=[dict(route, model=m, timeout=45) for m in ('gpt-6.1-sol', 'grok', 'kimi')])}}),
+        encoding='utf-8')
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    children = []
+    actual_popen = subprocess.Popen
+    def spawn(argv, *args, **kwargs):
+        # 2.0: the primary's child also ignores SIGTERM; only the (late) SIGKILL ends it.
+        if reap_delay >= 2:
+            argv = [argv[0], '-c', _STUBBORN_CHILD]
+        children.append(actual_popen(argv, *args, **kwargs))
+        return children[-1]
+    monkeypatch.setattr(chain.subprocess, 'Popen', spawn)
+    _slow_kill(monkeypatch, chain, reap_delay)
+    caplog.set_level(logging.INFO, logger=chain.__name__)
+    try:
+        result = goals.judge_goal('verify', 'evidence')
+    finally:
+        release.set()
+    assert calls == ['primary', 'gpt-6.1-sol']
+    assert result[0] == 'done' and not result[2] and not result[4]
+    assert 'goal judge winner: rung=1 provider=custom model=gpt-6.1-sol served_model=gpt-6.1-sol' in caplog.text
+    assert 'category=timeout' in caplog.text
+    # No leftover socket owner, and no fence left behind for the next judge of this home.
+    assert [child.poll() is not None for child in children] == [True, True]
+    assert str(home) not in chain._CLEANUPS
+
+
+def test_own_unreaped_rung_does_not_fence_next_rung_but_fences_others(tmp_path, monkeypatch):
+    """Past the reap grace the chain still advances; the stuck reap keeps inhibiting OTHER judges."""
+    from hermes_cli import goal_judge_chain as chain
+    import subprocess, sys
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(chain, '_REAP_GRACE', 0.1)
+    actual_popen = subprocess.Popen
+    children = []
+    def spawn(argv, *args, **kwargs):
+        children.append(actual_popen([sys.executable, '-c', 'import time; time.sleep(60)'], *args, **kwargs))
+        return children[-1]
+    monkeypatch.setattr(chain.subprocess, 'Popen', spawn)
+    _slow_kill(monkeypatch, chain, 1.0)
+    routes = [dict(provider='custom', model=m, timeout=0.3) for m in ('primary', 'second')]
+    original = chain.run_attempt
+    seen = []
+    def attempt(route, *args, **kwargs):
+        outcome = original(route, *args, **kwargs)
+        seen.append((route['model'], outcome['category']))
+        if route['model'] == 'second':
+            return dict(category='ok', content='{"verdict":"continue","reason":"ran"}')
+        return outcome
+    monkeypatch.setattr(chain, 'run_attempt', attempt)
+    result = chain.judge_chain((routes, 30), 's', 'p', 10, goals._parse_judge_response)
+    assert [model for model, _ in seen] == ['primary', 'second'] and len(children) == 2
+    assert seen[0][1] == 'cleanup_pending'
+    assert result[0] == 'continue' and result[1] == 'ran' and not result[4]
+    # A foreign judge for this home is still fenced until the stuck reap lands.
+    if str(tmp_path) in chain._CLEANUPS:
+        assert original(routes[0], [], 10, time.monotonic() + 1)['category'] == 'cleanup_pending'
+        assert len(children) == 2
+    assert chain._cleanup_finished(str(tmp_path), timeout=5)
+    assert all(child.poll() is not None for child in children)
+
+
+def test_foreign_pending_cleanup_advances_chain_without_spawning(tmp_path, monkeypatch):
+    from hermes_cli import goal_judge_chain as chain
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    foreign = threading.Event()
+    chain._CLEANUPS[str(tmp_path)] = {foreign}
+    monkeypatch.setattr(chain.subprocess, 'Popen', lambda *a, **kw: pytest.fail('fenced home spawned'))
+    routes = [dict(provider='custom', model=m, timeout=1) for m in ('primary', 'second', 'third')]
+    try:
+        with mock.patch.object(chain.logger, 'info') as info:
+            result = chain.judge_chain((routes, 5), 's', 'p', 10, goals._parse_judge_response)
+    finally:
+        chain._release_cleanup(str(tmp_path), foreign)
+    failed = [c.args for c in info.call_args_list if 'attempt failed' in c.args[0]]
+    assert [args[1] for args in failed] == [0, 1, 2]
+    assert all(args[-1] == 'cleanup_pending' for args in failed)
+    assert result[0] == 'continue' and result[4] and 'cleanup_pending' in result[1]
+
+
+def test_child_relaunch_opt_out_and_stderr_tail(tmp_path, monkeypatch, caplog):
+    """ACE-AI 19:5x: outside the gateway unit the child was relaunched and read EMPTY stdin."""
+    import logging
+    import subprocess, sys
+    from hermes_cli import goal_judge_chain as chain
+    monkeypatch.delenv('HERMES_DISABLE_LAZY_INSTALLS', raising=False)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    actual_popen = subprocess.Popen
+    envs = []
+    def spawn(argv, *args, **kwargs):
+        envs.append(kwargs['env'].get('HERMES_DISABLE_LAZY_INSTALLS'))
+        # The relaunched child's shape: payload lost, json.load fails, exit 1 with a traceback.
+        child = 'import io, json; json.load(io.StringIO(""))'
+        return actual_popen([sys.executable, '-c', child], *args, **kwargs)
+    monkeypatch.setattr(chain.subprocess, 'Popen', spawn)
+    caplog.set_level(logging.WARNING, logger=chain.__name__)
+    outcome = chain.run_attempt(dict(provider='custom', model='primary', timeout=10), [], 10, time.monotonic() + 10)
+    assert envs == ['1']
+    assert outcome['category'] == 'worker_error'
+    assert 'goal judge worker_error: returncode=1' in caplog.text and 'JSONDecodeError' in caplog.text
 
 
 @pytest.mark.parametrize('case', ['long', 'accounting_cancel', 'concurrent', 'storage', 'affinity'])
@@ -419,10 +561,10 @@ def test_review_boundary_contracts(tmp_path, monkeypatch, endpoint, case):
         monkeypatch.setattr(db, 'get_meta_committed', lambda *a: (_ for _ in ()).throw(OSError('read failed')))
         manager.evaluate_after_turn('evidence')
     else:
-        config = json.loads((tmp_path / 'config.yaml').read_text())
+        config = json.loads((tmp_path / 'config.yaml').read_text(encoding='utf-8-sig'))
         config['custom_providers'] = [{'name': 'session-relay', 'base_url': url,
                                       'api_key': 'test-only', 'session_affinity_header': 'x-session-id'}]
-        (tmp_path / 'config.yaml').write_text(json.dumps(config))
+        (tmp_path / 'config.yaml').write_text(json.dumps(config), encoding='utf-8')
         # Inspect the actual request at the HTTP server, not just the IPC payload.
         endpoint_headers = replies['_headers'] = []
         replies['primary'] = '{"verdict":"continue"}'

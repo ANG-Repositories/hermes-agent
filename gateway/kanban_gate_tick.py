@@ -258,8 +258,9 @@ class GateTickBuilder:
             policy=ppolicy.load(self._fleet_dir()),
             ledger_dir=pledger.ledger_dir(root),
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
-            placement_table=kh.load_table(root),
-            placement_reservations=root / placement.RESERVATIONS_REL,
+            # ONE root for the table and the ledger it is checked against: the fleet root (Prism c17555de1567).
+            placement_table=kh.load_table(kh.ledger_root()),
+            placement_reservations=kh.ledger_root() / placement.RESERVATIONS_REL,
             allocd=kh.allocd_mode(cfg),
         )
 
@@ -517,12 +518,14 @@ class GateTickBuilder:
         now = time.time() if now is None else now
         if self._boards is None or now - self._renewed_at < kh.RENEW_EVERY_S:
             return None
-        root = self._root()
-        if not kh.table_path(root).is_file():
+        # The fleet root, never the board home (Prism 87f95a7e001f / baca55317404): the table gate, the renewal and
+        # the reaper all read the ledger booking writes (``kh.ledger_root()``).
+        fleet = kh.ledger_root()
+        if not kh.table_path(fleet).is_file():
             return None
         self._renewed_at = now
         try:
-            got = kh.renew_running(self._boards, self._connect, root / placement.RESERVATIONS_REL, now=now)
+            got = kh.renew_running(self._boards, self._connect, fleet / placement.RESERVATIONS_REL, now=now)
         except Exception as exc:
             self._log(logger.warning, f"kanban pool: reservation renewal failed: {exc}")
             return None
@@ -531,7 +534,7 @@ class GateTickBuilder:
         # The reaper (allocation 2.3): rows whose holder died without a release
         # lapse at TTL, like claim_expires; each is ledgered as ``expired``.
         try:
-            got["reaped"] = placement.reap(path=root / placement.RESERVATIONS_REL, now=now)
+            got["reaped"] = placement.reap(path=fleet / placement.RESERVATIONS_REL, now=now)
         except placement.PlacementError as exc:
             self._log(logger.warning, f"kanban pool: reservation reap failed: {exc}")
         return got

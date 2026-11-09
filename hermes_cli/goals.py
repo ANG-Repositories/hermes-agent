@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -846,6 +847,233 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GoalManager: goal migration failed: %s", exc)
         return False
+
+
+# ── Orphan GC (t_92fc3ff0) ────────────────────────────────────────────
+# A goal row is keyed by session id. When the gateway replaces a routed conversation (/new, /reset,
+# an auto-reset) the old id stops being routed, and an ACTIVE row left on it never wakes anyone but
+# is loaded by every 15 s idle-wake scan. Rotations retire it (``superseded``); the hourly reaper
+# retires what any other path leaves behind (``orphaned``). Retire, never delete: ``/goal resume``
+# (or ``save_goal``) restores the row.
+
+DEFAULT_ORPHAN_GC_DAYS = 7   # goals.orphan_gc_days; 0 disables the reaper
+_ORPHAN_GC_SCAN_CHUNK = 500  # bound on one sessions IN (...) read
+
+
+def _retired_goal_json(raw: Optional[str], status: str, reason: str) -> Optional[str]:
+    """*raw* re-stamped *status* / *reason*, or None when it is not an ACTIVE goal (never revive or
+    re-stamp a done, paused or /stop-latched goal: Ace 2026-10-19)."""
+    state = GoalState.from_json(raw) if raw else None
+    if state is None or state.status != "active":
+        return None
+    state.status, state.paused_reason = status, reason
+    state.clear_wait()
+    state.revision += 1
+    return state.to_json()
+
+
+def retire_goal(session_id: str, status: str, reason: str, *, db: Any = None) -> bool:
+    """Flip an ACTIVE goal row to *status* (``superseded``) with ``paused_reason`` *reason*.
+    Compare-and-set against the row read here, so a concurrent edit wins. Never touches a non-active
+    row. *db*: the store holding the row (gateway rotations pass the routing key's profile store).
+    The reaper does NOT use this: it retires through :func:`_retire_if_still_orphaned`, which re-checks
+    eligibility inside the write. Best-effort, never raises; True when this call retired it."""
+    if not session_id:
+        return False
+    db = db if db is not None else _get_session_db()
+    if db is None:
+        return False
+    key = _meta_key(session_id)
+    try:
+        raw = db.get_meta_committed(key)
+        new = _retired_goal_json(raw, status, reason)
+        return new is not None and bool(db.compare_and_set_meta(key, raw, new))
+    except Exception as exc:
+        logger.debug("GoalManager: retiring goal %s failed: %s", session_id, exc)
+        return False
+
+
+def orphaned_goal_and_loop_ids(
+    now: float, routing: Any, session_activity: Dict[str, float], *, gc_days: int = DEFAULT_ORPHAN_GC_DAYS,
+) -> List[str]:
+    """Pure: the session ids in *session_activity* (``{sid: last activity epoch}`` for every session
+    with an active goal or loop) that are NOT routed (*routing*: current session ids of every routed
+    key, all served profiles) AND idle for >= *gc_days*. CLI/TUI sessions are never routed, so the
+    idle test alone protects them. ``gc_days <= 0`` returns nothing."""
+    if gc_days <= 0:
+        return []
+    routed = set(routing or ())
+    cutoff = now - gc_days * 86400
+    return sorted(sid for sid, last in session_activity.items() if sid not in routed and (last or 0.0) <= cutoff)
+
+
+# Every clock that says a goal/loop row is live: set/resume, last turn, last idle wake, park start; a
+# loop's last tick and the ``next_due_at`` that ``LoopManager.resume()`` re-arms to now.
+_ORPHAN_GC_ROW_CLOCKS = (
+    ("goal:", ("created_at", "resumed_at", "last_turn_at", "last_idle_wake_at", "waiting_since")),
+    ("loop:", ("created_at", "last_fired_at", "next_due_at")),
+)
+
+
+def _orphan_gc_session_activity_sql() -> str:
+    """Session-store recency for a ``sessions s`` row: the fleet's canonical freshest-of (the
+    ``last_activity_at`` heartbeat that ``touch_session_activity`` stamps during API/tool/compaction
+    work before any message lands, the newest message, else ``started_at``) and ``effective_last_active``.
+    The scan and the in-transaction recheck both use this one expression."""
+    from hermes_state_common import _sql_session_last_active
+
+    return f"MAX(COALESCE(s.effective_last_active, 0), COALESCE({_sql_session_last_active('s')}, 0))"
+
+
+def _active_row_clock(prefix: str, raw: Optional[str]) -> Optional[float]:
+    """Latest liveness clock of an ACTIVE goal/loop row, or None when the row is absent or not active."""
+    try:
+        data = json.loads(raw) if raw else None
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("status") != "active":
+        return None
+    clocks = dict(_ORPHAN_GC_ROW_CLOCKS)[prefix]
+    return max(float(data.get(c) or 0.0) for c in clocks)
+
+
+def _goal_loop_session_activity(db: Any) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """``(activity, goal_rows, loop_rows)`` for sessions with an ACTIVE goal or loop row in *db*.
+    Activity is the latest of the rows' clocks and the session store's recency. This scan only picks
+    CANDIDATES; :func:`_retire_if_still_orphaned` re-decides each one inside the write. A failed read
+    raises: an unreadable store must not look idle."""
+    activity: Dict[str, float] = {}
+    rows_by_prefix: Dict[str, Dict[str, str]] = {"goal:": {}, "loop:": {}}
+    for prefix, _clocks in _ORPHAN_GC_ROW_CLOCKS:
+        for key, raw in db.list_meta_prefix(prefix):
+            sid = key[len(prefix):]
+            last = _active_row_clock(prefix, raw)
+            if not sid or last is None:
+                continue
+            rows_by_prefix[prefix][sid] = raw
+            activity[sid] = max(activity.get(sid, 0.0), last)
+    ids = sorted(activity)
+    recency = _orphan_gc_session_activity_sql()
+    for i in range(0, len(ids), _ORPHAN_GC_SCAN_CHUNK):
+        chunk = ids[i:i + _ORPHAN_GC_SCAN_CHUNK]
+        rows = db._read_all(
+            f"SELECT s.id, {recency} FROM sessions s WHERE s.id IN ({','.join('?' * len(chunk))})",
+            tuple(chunk),
+        )
+        for sid, last in rows:
+            activity[sid] = max(activity[sid], float(last or 0.0))
+    return activity, rows_by_prefix["goal:"], rows_by_prefix["loop:"]
+
+
+def _retire_if_still_orphaned(
+    db: Any, prefix: str, sid: str, cutoff: float, scanned: Dict[str, Optional[str]], retire: Callable,
+) -> Optional[Tuple[str, str]]:
+    """Retire ``<prefix><sid>`` only if, read inside ONE write transaction (BEGIN IMMEDIATE, so no
+    writer can land between the check and the write), nothing about the session changed since the
+    candidate scan:
+    - fence: each of the session's goal/loop rows that the scan saw ACTIVE is byte-identical to the
+      scanned row, so any edit (a turn, ``/goal`` subgoal/gate/contract edits that move no clock, a
+      loop re-arm) keeps BOTH rows;
+    - a sibling row the scan did NOT see active (e.g. a paused loop resumed since) has every clock
+      <= *cutoff*;
+    - the session store's recency (activity heartbeat, messages, start) is <= *cutoff*.
+    Routing is NOT read here: the caller checks it outside the transaction (a routing lookup can
+    re-enter this SessionDB's non-reentrant write lock). *scanned*: ``{prefix: raw | None}``.
+    *retire*: ``raw -> new raw | None``. Returns ``(old_raw, new_raw)`` when written, else None.
+    Raises on a read failure (the caller counts nothing)."""
+    key = f"{prefix}{sid}"
+    recency = _orphan_gc_session_activity_sql()
+
+    def _txn(conn) -> Optional[Tuple[str, str]]:
+        def _raw(k):
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (k,)).fetchone()
+            return row[0] if row else None
+
+        raw = _raw(key)
+        if raw is None or raw != scanned.get(prefix):
+            return None
+        for p, _clocks in _ORPHAN_GC_ROW_CLOCKS:
+            if p == prefix:
+                continue
+            sibling = _raw(f"{p}{sid}")
+            if scanned.get(p) is not None:
+                if sibling != scanned[p]:
+                    return None
+                continue
+            last = _active_row_clock(p, sibling)
+            if last is not None and last > cutoff:
+                return None
+        srow = conn.execute(f"SELECT {recency} FROM sessions s WHERE s.id = ?", (sid,)).fetchone()
+        if srow is not None and float(srow[0] or 0.0) > cutoff:
+            return None
+        new = retire(raw)
+        if new is None:
+            return None
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (new, key))
+        return raw, new
+
+    return db._execute_write(_txn)
+
+
+def reap_orphaned_goals_and_loops(
+    routed_session_ids: Any, *, gc_days: int = DEFAULT_ORPHAN_GC_DAYS, now: Optional[float] = None, db: Any = None,
+    is_routed: Optional[Callable[[str], bool]] = None,
+) -> Dict[str, int]:
+    """Retire (status ``orphaned``) every active goal and loop in this profile's store that
+    :func:`orphaned_goal_and_loop_ids` selects AND that is still orphaned when re-checked inside the
+    retiring write. *routed_session_ids*: the routing snapshot for the candidate scan. *is_routed*: the
+    live routing lookup re-read per row inside the write (gateway: ``SessionStore.lookup_by_session_id``);
+    defaults to membership in the snapshot. Returns ``{"scanned", "orphaned", "loops"}`` (scanned =
+    sessions holding an active goal or loop). Any read failure reaps nothing."""
+    counts = {"scanned": 0, "orphaned": 0, "loops": 0}
+    if gc_days <= 0:
+        return counts
+    db = db if db is not None else _get_session_db()
+    if db is None:
+        return counts
+    now = time.time() if now is None else now
+    try:
+        activity, goal_sids, loop_sids = _goal_loop_session_activity(db)
+    except Exception as exc:
+        logger.debug("goal-gc: activity read failed, nothing reaped: %s", exc)
+        return counts
+    counts["scanned"] = len(activity)
+    routed = set(routed_session_ids or ())
+    live_routed = is_routed if is_routed is not None else routed.__contains__
+    cutoff = now - gc_days * 86400
+    stamp = time.strftime("%Y-%m-%d", time.localtime(now))
+    reason = f"orphan-gc: unrouted and idle >= {gc_days}d (retired {stamp})"
+    from hermes_cli.loops import _retired_loop_json
+
+    for sid in orphaned_goal_and_loop_ids(now, routed, activity, gc_days=gc_days):
+        scanned = {"goal:": goal_sids.get(sid), "loop:": loop_sids.get(sid)}
+        for prefix, counter, retire in (
+            ("goal:", "orphaned",
+             functools.partial(_retired_goal_json, status="orphaned", reason=f"{reason}; /goal resume restores")),
+            ("loop:", "loops",
+             functools.partial(_retired_loop_json, session_id=sid, status="orphaned",
+                               reason=f"{reason}; /loop resume restores")),
+        ):
+            if scanned[prefix] is None:
+                continue
+            try:
+                # Live routing is read OUTSIDE the write transaction: a SessionStore lookup may load
+                # routing from this same SessionDB, whose write lock is not reentrant (Prism 0d90dba2499b).
+                if live_routed(sid):
+                    continue
+                written = _retire_if_still_orphaned(db, prefix, sid, cutoff, scanned, retire)
+                if not written:
+                    continue
+                # A /resume that routed the session between the check above and the commit: give the
+                # row back (CAS, so a newer edit is never clobbered).
+                if live_routed(sid):
+                    db.compare_and_set_meta(f"{prefix}{sid}", written[1], written[0])
+                    continue
+                scanned[prefix] = written[1]  # our own write is not a concurrent edit for the sibling's fence
+                counts[counter] += 1
+            except Exception as exc:
+                logger.debug("goal-gc: retiring %s%s failed, left active: %s", prefix, sid, exc)
+    return counts
 
 
 # ── Judge ─────────────────────────────────────────────────────────────

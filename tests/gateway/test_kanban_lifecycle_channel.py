@@ -57,7 +57,7 @@ def _set_channel(value):
 
 
 def _card(conn, priority=0, mode="notify+wake"):
-    tid = kb.create_task(conn, title="card", assignee="worker", priority=priority)
+    tid = kb.create_task(conn, boomerang_wake=False, title="card", assignee="worker", priority=priority)
     kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="origin",
                       chat_type="group", user_id="u1", delivery_mode=mode)
     return tid
