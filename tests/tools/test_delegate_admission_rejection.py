@@ -190,19 +190,14 @@ async def test_http_parent_followup_before_child_release(admission, monkeypatch,
         db.close()
 
 
-@pytest.mark.parametrize("settled", [False, True])
-def test_exact_cap_retained_history_is_preserved_on_refusal(admission, monkeypatch, settled):
+def test_exact_cap_pending_obligation_is_preserved_on_refusal(admission, monkeypatch):
     from tests.tools.test_async_delegation_terminal_receipts import dispatch, registry_record
     from tools.process_registry import process_registry
 
     dt, release, entered = admission
     identifier, worker, _ = dispatch(monkeypatch, session_key="another-session")
     worker()
-    event = process_registry.completion_queue.get_nowait()
-    if settled:
-        claim = ad.claim_event_delivery(event, "other-consumer")
-        assert claim
-        ad.complete_event_delivery(event, claim)
+    process_registry.completion_queue.get_nowait()
     before = registry_record(identifier)
     monkeypatch.setattr(ad, "_MAX_REGISTRY_RECORDS", 1)
     result = json.loads(dt.delegate_task(goal="cap sentinel", background=True, parent_agent=_fake_parent()))
@@ -210,7 +205,40 @@ def test_exact_cap_retained_history_is_preserved_on_refusal(admission, monkeypat
     assert result["reason"] == "registry_cap"
     assert not entered.is_set()
     assert registry_record(identifier) == before
-    assert ad.enqueue_pending_outbox(current_boot_id="other-replay") == (0 if settled else 1)
+    assert ad.enqueue_pending_outbox(current_boot_id="other-replay") == 1
+
+
+def test_exact_cap_settled_history_makes_room_without_losing_pending_obligation(admission, monkeypatch):
+    from tests.tools.test_async_delegation_terminal_receipts import dispatch, registry_record
+    from tools.process_registry import process_registry
+
+    dt, release, entered = admission
+    # Restore the real executor before admitting the sentinel child.
+    with monkeypatch.context() as seed:
+        settled, worker, _ = dispatch(seed, session_key="settled-session")
+        worker()
+        event = process_registry.completion_queue.get_nowait()
+        claim = ad.claim_event_delivery(event, "other-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        pending, worker, _ = dispatch(seed, session_key="pending-session")
+        worker()
+        process_registry.completion_queue.get_nowait()
+    before = registry_record(pending)
+    monkeypatch.setattr(ad, "_MAX_REGISTRY_RECORDS", 2)
+    result = json.loads(dt.delegate_task(goal="cap sentinel", background=True, parent_agent=_fake_parent()))
+    assert result["status"] == "dispatched"
+    assert entered.wait(8)
+    assert not release.is_set()
+    records = json.loads(ad._registry_path().read_text(encoding="utf-8"))["records"]
+    assert set(records) == {pending, result["delegation_id"]}
+    assert settled not in records
+    assert registry_record(pending) == before
+    assert ad.enqueue_pending_outbox(current_boot_id="other-replay") == 1
+    assert process_registry.completion_queue.get_nowait()["delegation_id"] == pending
+    release.set()
+    assert process_registry.completion_queue.get(timeout=8)["delegation_id"] == result["delegation_id"]
+    assert process_registry.completion_queue.empty()
 
 
 @pytest.mark.parametrize("target,label", [
