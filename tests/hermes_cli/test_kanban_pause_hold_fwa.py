@@ -783,3 +783,25 @@ def test_fqdn_is_resolved_once_per_process(home, monkeypatch):
     for _ in range(3):
         kph.local_names()
     assert calls == ["fwa-test-runner.lan"]
+
+
+# -- round 6 (Prism round 4 @ 13b1957d: 96dd675bda52) ------------------------------------------------------------------
+
+def test_held_portable_destination_is_filtered_case_insensitively(home, monkeypatch):
+    """96dd675bda52: the pool names ``CI-BOX`` while the reach filter returns ``ci-box``. The held host must still be
+    dropped from the portable pick, so the card places on the unheld host instead of waiting on the post-take belt."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_worker_pool as kwp
+    from tests.hermes_cli.test_kanban_pause_hold import _host
+    hosts = [_host("CI-BOX"), _host("ace-ai")]
+    cfg = kwp.PoolConfig(hosts=("CI-BOX", "ace-ai"), profiles=("alpha",), pool_hosts=tuple(hosts))
+    plan = kwp.plan(hosts, {}, probe=lambda h: (1.0, 16), config=cfg)
+    plan.band, plan.spill_reason, plan.default_remote = "admitting", None, True
+    monkeypatch.setattr(kbd, "_portable_only", lambda *a, **k: (("ci-box", "ace-ai"), None))
+    _hold(home, host="CI-BOX")
+    assert kph.held_destinations(["CI-BOX", "ace-ai"], {}).keys() == {"CI-BOX"}
+    with kb.connect_closing() as conn:
+        tids = [_unorigined(conn, "do the thing") for _ in range(2)]
+        res, spawned = _tick(conn, plan)
+        assert {(t, "ace-ai") for t in tids} <= set(spawned), (spawned, res.placement_waits)
+        assert not any(t in res.placement_waits for t in tids), res.placement_waits
