@@ -1807,3 +1807,30 @@ def test_transient_launch_error_is_retried_before_leaving_kanban(monkeypatch, tm
     did = handle["delegation_id"]
     assert len(tries) == 2 and calls == [] and detached_fallback == []
     assert ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+
+
+def test_transient_error_after_the_card_exists_is_not_retried(monkeypatch, tmp_path, spawner, detached_fallback):
+    """Prism 9fd4d9c1e37e: a timeout in set_kanban_block leaves an archived card naming the current attempt. No
+    retry (its fence would be released and the drain would fail the attempt): the fallback supersedes it, and the
+    card-end drain never fails the delivered unit."""
+    from tools import async_delegation_store as st
+
+    real = st.set_kanban_block
+    calls_block = []
+
+    def _timeout_once(*a, **kw):
+        calls_block.append(1)
+        if len(calls_block) == 1:
+            raise TimeoutError("timed out acquiring async-delegations.lock")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(st, "set_kanban_block", _timeout_once)
+    monkeypatch.setattr(ad, "_KANBAN_LAUNCH_RETRY_DELAYS", (0.0, 0.0))
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    assert len(calls_block) == 1, "no second launch"
+    assert spawner.procs == [] and calls == [] and len(detached_fallback) == 1
+    assert ad.kanban_launch_runtime(did, timeout=0) == "detached (kanban spawn failed: TimeoutError)"
+    _drain()
+    rec = _record(did)
+    assert rec["state"] == "done" and rec["attempt"]["generation"] == 1, rec["state"]

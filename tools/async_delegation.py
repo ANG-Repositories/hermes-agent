@@ -1656,10 +1656,11 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
             spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"),
             flagship_reason=kanban.get("flagship_reason"))
         transient = str(launched.get("error") or "").split(":", 1)[0] in _TRANSIENT_LAUNCH_ERRORS
-        if launched.get("ok") or launched.get("paused") or not launched.get("fenced") or not transient \
-                or delay is None:
+        # Retry only a launch that failed before creating a card. An archived card names the still-current
+        # attempt: released from its fence it would be drained as a dead runner and fail the attempt (Prism
+        # 9fd4d9c1e37e / 9e36f53682e3). Once a card exists the fallback supersedes the attempt under the fence.
+        if launched.get("ok") or launched.get("task_id") or not transient or delay is None:
             break
-        _akb.release_launch_fence(launched.get("task_id"))
         logger.info("async_delegation_kanban_spawn_retry delegation_id=%s error=%s delay=%.1fs",
                     delegation_id, launched.get("error"), delay)
         time.sleep(delay)
