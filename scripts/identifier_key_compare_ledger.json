@@ -547,6 +547,11 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_worktree_port.py:146 port_for"
   },
+  "hermes_cli/kanban_worktree_port.py::mint_rewrite::fold::slug::row = read_mirrors(fleet_dir).get(slug.lower()) if slug else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. Same lookup as port_for (t_e604c0f9 kanban create rewrite).",
+   "where": "hermes_cli/kanban_worktree_port.py:234 mint_rewrite"
+  },
   "hermes_cli/kanban_worktree_port.py::read_mirrors::fold::slug::out[slug.lower()] = (mirror, hs)": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",

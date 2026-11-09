@@ -85,7 +85,7 @@ def sync_door_asap(conn, task_id, *, client=None) -> None:
 
 def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default_assignee=None,
                     conn=None, caps=None, cap_only=None, worktree_ports=None, local_budget=None,
-                    browser_joins=None):
+                    browser_joins=None, continuity=None):
     """Use the dispatcher's resolved routes, never its pressure-filtered slot budget.
 
     No age or workload ordering is decided here. The common publisher selects its
@@ -138,7 +138,8 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
         local_free = local_budget is None or local_used < local_budget
         remote = (route == "portable" and plan is not None
                   and _portable_goes_remote(local_free, own_only.get(card["id"]), plan,
-                                            card["id"] in (browser_joins or {})))
+                                            card["id"] in (browser_joins or {}),
+                                            continuity=card["id"] in (continuity or {})))
         if route == "local" or (route == "portable" and not remote
                                 and (allowed is None or local_names & allowed)):
             out[local_host].append(card)

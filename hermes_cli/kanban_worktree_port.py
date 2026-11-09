@@ -111,6 +111,20 @@ def _clean_on_branch(tree: Path, branch: str, runner: Callable) -> bool:
     return status is not None and status.strip() == ""
 
 
+def worktree_target_anchor(path: Path, name: Optional[str] = None) -> Optional[Path]:
+    """The repo root a NOT-YET-CREATED ``<repo>/.worktrees/<name>`` target names, else None (t_e604c0f9). An
+    existing target is never re-anchored: it may hold a prior run's work. ``name`` None accepts any leaf (the
+    ``kanban create`` rewrite, before the card has an id); else the leaf must be that card id."""
+    try:
+        if not path.is_absolute() or path.exists() or path.parent.name != ".worktrees":
+            return None
+    except OSError:
+        return None
+    if name is not None and path.name != name:
+        return None
+    return path.parent.parent
+
+
 def anchor_repo(task_id: str, workspace_path: Optional[str],
                 board_default: Optional[str], branch: Optional[str] = None,
                 runner: Callable = subprocess.run, *,
@@ -134,6 +148,11 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     if not raw:
         return None
     p = Path(raw).expanduser()
+    # <repo>/.worktrees/<id> not made yet: the repo is the anchor (t_e604c0f9). Only under the same switch as
+    # the own-tree port: with host_preference off a concrete target keeps today's Studio pin (Prism 7eba47409a75).
+    target = worktree_target_anchor(p, task_id) if allow_studio_tree else None
+    if target is not None:
+        p = target
     if not p.is_absolute() or not p.is_dir():
         return None
     top = _git_toplevel(p)
@@ -198,6 +217,44 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
     slug = origin_slug(repo, runner) if repo is not None else None
     row = mirrors.get(slug.lower()) if slug else None
     return (slug, row[0], row[1]) if row else None
+
+
+def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], fleet_dir: Path,
+                 runner: Callable = subprocess.run) -> Tuple[Optional[str], Optional[str]]:
+    """``kanban create`` half of t_e604c0f9: ``(workspace_path, note)``. A ``worktree:<repo>/.worktrees/<x>``
+    target that does not exist yet, on a repo with a row in ``kanban-worktree-mirrors.json``, is rewritten to the
+    anchor form ``worktree:<repo>`` (the dispatcher can then port it: FWA places it and the worktree is built on
+    the chosen host). ``note`` says what happened, or why the card stays Studio-local; None for non-worktree cards
+    and whenever the host_preference switch (t_c2fce87e) does not make the Studio a last resort: then ``kanban
+    create`` stores and prints exactly what it did before (Prism 7eba47409a75)."""
+    if workspace_kind != "worktree" or not workspace_path:
+        return workspace_path, None
+    try:
+        from hermes_cli import placement_policy as _ppol
+        from hermes_cli.kanban_worker_pool import STUDIO_HOST
+        if not _ppol.load(Path(fleet_dir)).is_last_resort(STUDIO_HOST):
+            return workspace_path, None
+    except Exception:
+        return workspace_path, None
+    from hermes_cli.kanban_db_workspace import _git_toplevel
+    p = Path(workspace_path).expanduser()
+    target = worktree_target_anchor(p)
+    repo = target if target is not None else p
+    top = _git_toplevel(repo) if repo.is_dir() else None
+    slug = origin_slug(top, runner) if top is not None else None
+    row = read_mirrors(fleet_dir).get(slug.lower()) if slug else None
+    if row is None:
+        why = (f"{slug} has no row in fleet/{MIRRORS_FILE}" if slug
+               else f"{workspace_path} is not a GitHub repo checkout")
+        return workspace_path, f"worktree card stays Studio-local: {why}"
+    hosts = ", ".join(row[1])
+    if target is not None and top == target.resolve():
+        return str(top), (f"workspace rewritten: worktree:{workspace_path} -> worktree:{top} ({slug} has a "
+                          f"pool clone on {hosts}; FWA places the card and the worktree is built on that host)")
+    if top == p.resolve():
+        return workspace_path, f"worktree card is portable ({slug} has a pool clone on {hosts}; FWA places it)"
+    return workspace_path, ("worktree card stays Studio-local: a concrete existing target path "
+                            f"({workspace_path}) is kept where it is")
 
 
 def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,

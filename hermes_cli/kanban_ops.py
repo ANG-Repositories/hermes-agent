@@ -198,7 +198,10 @@ def _cli_utilization_gate(conn, args, gate, out, emit, load1):
              f"cpu_busy={busy})")
         return out
     if reason:
-        emit(f"Load gate: utilization SATURATED cpu_busy={busy} (load {l1} not read) - spawning 0 this call: {reason}")
+        # spawn_limit 0 is the LOCAL budget only (dispatch_once local_budget); the saturated band is `spilling`,
+        # so the pool plan still places portable cards remote this call (t_e604c0f9: the old line read as 0 total).
+        emit(f"Load gate: utilization SATURATED cpu_busy={busy} (load {l1} not read) - spawning 0 LOCAL this call "
+             f"(remote placement continues via the pool plan): {reason}")
         out["spawn_paused"] = reason
         out["spawn_limit"] = 0
         out["limit_source"] = "load gate"
