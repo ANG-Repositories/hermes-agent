@@ -163,9 +163,10 @@ def main() -> int:
         work.mkdir()
         env = dict(os.environ)
         if a.home != "inherit":
-            home = Path(a.home) if a.home else tmp / "home"
+            home = (Path(a.home).expanduser() if a.home else tmp / "home").resolve()
             home.mkdir(parents=True, exist_ok=True)
             env["HERMES_HOME"] = str(home)
+            env["HOME"] = str(home.resolve())  # hooks using Path.home() / ~ stay in the scratch home too
         hooks = [{"script": s, "args": [], "timeout": a.timeout} for s in scripts]
         requests = []
         for i in range(a.warmup + a.n):

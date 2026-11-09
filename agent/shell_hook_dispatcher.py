@@ -34,9 +34,11 @@ lists), which calls it can act on. The dispatcher reads it with ``ast`` (never e
 compile. A hook is not forked, and answers ``rc 0`` with stdout ``{}`` (the no-op every hook mode
 accepts) plus ``"skipped": true``, only when its declaration provably misses: ``tools`` names the
 tool calls it acts on and the payload's ``tool_name`` is a string outside it; ``tokens`` are
-substrings of which none occurs in the raw payload, in any decoded string in it, or in that string
-re-joined after ``shlex.split`` (so shell quoting such as ``g''it`` still matches ``git``). A hook
-without a valid declaration, or a payload that is not a JSON object, runs as before. Tokens cannot
+substrings of which none occurs in the raw payload, in any decoded string in it (keys and values),
+or in that string re-joined after ``shlex.split`` (so shell quoting such as ``g''it`` still matches
+``git``); when any string in the payload does not shell-split, tokens never skip. A hook without a
+valid declaration, or a payload that is not a JSON object, runs as before. A hook file written
+while the dispatcher reads it is not cached. Tokens cannot
 see through shell indirection (``$X``, ``eval``): declare tokens only when the hook itself acts on
 nothing but the literal text.
 
@@ -174,13 +176,19 @@ def _load(script):
         return hit[1], hit[2]
     try:
         with open(path, "rb") as fh:
+            before = _stat_key(os.fstat(fh.fileno()))
             source = fh.read()
-            key = _stat_key(os.fstat(fh.fileno()))  # the key of the bytes actually read
+            after = _stat_key(os.fstat(fh.fileno()))
         code = compile(source, path, "exec")
     except Exception:
         _compiled.pop(path, None)
         return None, None
     prefilter = _read_prefilter(source)
+    if before != after or after != key:
+        # Written while we read: the bytes match no single version. Use nothing cached; the child
+        # reads the file itself, and the next request compiles the settled version.
+        _compiled.pop(path, None)
+        return None, None
     _compiled[path] = (key, code, prefilter)
     return code, prefilter
 
@@ -189,7 +197,8 @@ def _strings(value, out):
     if isinstance(value, str):
         out.append(value)
     elif isinstance(value, dict):
-        for v in value.values():
+        for k, v in value.items():
+            _strings(k, out)
             _strings(v, out)
     elif isinstance(value, list):
         for v in value:
@@ -197,7 +206,9 @@ def _strings(value, out):
 
 
 def _payload_view(payload):
-    """``(tool_name, haystack)`` for prefilter matching, or None when the payload is not a JSON object."""
+    """``(tool_name, haystack)`` for prefilter matching, or None when the payload is not a JSON object.
+    ``haystack`` is None when a string in the payload does not shell-split: then no token miss is
+    provable (a hook may parse it another way), so token declarations never skip."""
     try:
         text = payload.decode("utf-8")
         data = json.loads(text)
@@ -213,7 +224,7 @@ def _payload_view(payload):
         try:
             parts.append(" ".join(shlex.split(s)))
         except ValueError:
-            pass
+            return data.get("tool_name"), None
     return data.get("tool_name"), "\n".join(parts)
 
 
@@ -226,7 +237,7 @@ def _prefilter_skips(prefilter, view):
     if tools is not None and isinstance(tool_name, str) and tool_name not in tools:
         return True
     tokens = prefilter.get("tokens")
-    if tokens is not None and not any(t in haystack for t in tokens):
+    if tokens is not None and haystack is not None and not any(t in haystack for t in tokens):
         return True
     return False
 

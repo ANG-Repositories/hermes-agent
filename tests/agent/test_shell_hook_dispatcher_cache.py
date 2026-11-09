@@ -93,6 +93,31 @@ def test_load_leaves_an_uncompilable_hook_to_the_child(disp, tmp_path: Path) -> 
     assert str(hook) not in disp._compiled
 
 
+def test_load_does_not_cache_a_hook_written_while_it_is_read(disp, tmp_path: Path, monkeypatch) -> None:
+    """Prism 4fd96f14c9d0: an edit landing between read() and the closing fstat() must not pin the old
+    bytes under the new file's key."""
+    hook = tmp_path / "race.py"
+    hook.write_text('V = "old"\n', encoding="utf-8")
+    real_fstat = disp.os.fstat
+    calls = []
+
+    def fstat(fd):
+        calls.append(fd)
+        if len(calls) == 2:  # after read(), before the closing stat: the edit lands now
+            hook.write_text('V = "new"\n', encoding="utf-8")
+            _bump_mtime(hook)
+        return real_fstat(fd)
+
+    monkeypatch.setattr(disp.os, "fstat", fstat)
+    assert disp._load(str(hook)) == (None, None)
+    assert str(hook) not in disp._compiled
+    monkeypatch.setattr(disp.os, "fstat", real_fstat)
+    code, _ = disp._load(str(hook))
+    ns: dict = {}
+    exec(code, ns)
+    assert ns["V"] == "new" and disp._load(str(hook))[0] is code
+
+
 def test_serve_recompiles_a_hook_edited_on_disk(serve, tmp_path: Path) -> None:
     """Same size, new mtime: the warm dispatcher runs the new source, not the cached code."""
     hook = tmp_path / "ver.py"
@@ -139,6 +164,22 @@ def test_prefilter_declaration_is_parsed_strictly(disp, source: bytes, expected)
 ])
 def test_prefilter_skips_only_a_provable_miss(disp, decl, payload: str, skips: bool) -> None:
     assert disp._prefilter_skips(decl, disp._payload_view(payload.encode())) is skips
+
+
+def test_prefilter_sees_escaped_tokens_in_json_keys(disp) -> None:
+    """Prism d94179e7de9f: a token present only in a (JSON-escaped) key is a match, not a miss."""
+    payload = json.dumps({"tool_name": "terminal", "tool_input": {"café.txt": "x"}}).encode()
+    assert b"caf\\u00e9" in payload  # ensure_ascii: the raw text does not carry the token
+    assert disp._prefilter_skips({"tokens": ("café",)}, disp._payload_view(payload)) is False
+
+
+def test_prefilter_runs_the_hook_when_a_string_does_not_shell_split(disp) -> None:
+    """Prism 3d73a10a918e: `g''it push # '` is valid shell (the quote is in a comment) but
+    shlex.split(comments=False) raises; a hook parsing it with comments=True sees `git push`."""
+    view = disp._payload_view(_payload("g''it push # '").encode())
+    assert disp._prefilter_skips({"tokens": ("git push",)}, view) is False
+    tools_only = disp._payload_view(_payload("g''it push # '", tool="read_file").encode())
+    assert disp._prefilter_skips({"tools": frozenset({"terminal"})}, tools_only) is True
 
 
 def test_prefilter_never_skips_on_an_unreadable_payload_or_unnamed_tool(disp) -> None:
@@ -247,3 +288,42 @@ def test_each_dispatcher_run_logs_per_hook_milliseconds(manager, monkeypatch, tm
     per_hook = dict(cell.split("=") for cell in cells.split(","))
     assert set(per_hook) == {"slow_hook", "fast", "gated"} and per_hook["gated"] == "skip"
     assert int(per_hook["slow_hook"]) >= 300 and int(per_hook["fast"]) < int(per_hook["slow_hook"])
+
+
+def test_timing_log_follows_the_calling_profile_home(manager, tmp_path: Path) -> None:
+    """Prism fadc5208e248: the reader thread does not inherit ContextVars, so the log directory is
+    resolved in the caller's scope; a routed profile's row lands in its own home, not the launch one."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    launch = Path(os.environ["HERMES_HOME"])
+    routed = tmp_path / "routed-home"
+    routed.mkdir()
+    hook = tmp_path / "ok.py"
+    hook.write_text('import sys\nsys.stdin.read()\nprint("{}")\n', encoding="utf-8")
+    _register([hook], fail_closed=True)
+    token = set_hermes_home_override(routed)
+    try:
+        assert _fire(manager, "ls") == []
+    finally:
+        reset_hermes_home_override(token)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not list((routed / "logs" / "hook-dispatch").glob("*.tsv")):
+        time.sleep(0.05)
+    assert len(list((routed / "logs" / "hook-dispatch").glob("*.tsv"))) == 1
+    assert not (launch / "logs" / "hook-dispatch").exists()
+
+
+def test_bench_isolates_home_for_hooks_that_use_path_home(tmp_path: Path) -> None:
+    """Prism 96f2a41718c6: the default scratch home covers HOME too, so Path.home() writes stay there."""
+    bench = Path(shell_hooks_batch.DISPATCHER).parent.parent / "scripts" / "bench_shell_hooks.py"
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "home_writer.py").write_text(
+        'import sys\nfrom pathlib import Path\nsys.stdin.read()\n'
+        'Path.home().joinpath(".bench-probe").write_text("bench")\nprint("{}")\n', encoding="utf-8")
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    env = dict(os.environ, HOME=str(fake_home))
+    proc = subprocess.run([sys.executable, str(bench), "--hooks-dir", str(hooks), "--n", "1", "--warmup", "0",
+                           "--before", shell_hooks_batch.DISPATCHER], capture_output=True, timeout=120, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert not (fake_home / ".bench-probe").exists()

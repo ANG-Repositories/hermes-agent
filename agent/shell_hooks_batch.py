@@ -95,9 +95,11 @@ def _hook_label(script: str) -> str:
     return "".join("_" if ch.isspace() or ch in "=," else ch for ch in name) or "-"
 
 
-def _log_latency(items: List[Tuple[Any, str, List[str]]], rows: Dict[int, Dict[str, Any]], total_s: float) -> None:
-    """Append one per-hook timing line for a finished dispatcher run. Never raises: timing must not
-    change a verdict."""
+def _log_latency(dirpath: Optional[str], items: List[Tuple[Any, str, List[str]]], rows: Dict[int, Dict[str, Any]],
+                 total_s: float) -> None:
+    """Append one per-hook timing line for a finished dispatcher run into ``dirpath``, resolved by the
+    caller in the owning profile's scope (the reader thread does not inherit its ContextVars).
+    Never raises: timing must not change a verdict."""
     try:
         cells = []
         slowest, slowest_s = "-", -1.0
@@ -116,7 +118,8 @@ def _log_latency(items: List[Tuple[Any, str, List[str]]], rows: Dict[int, Dict[s
                     slowest, slowest_s = label, s
         now = time.time()
         line = "%d %d %s %s\n" % (int(now), int(round(total_s * 1000)), slowest, ",".join(cells) or "-")
-        dirpath = _latency_dir()
+        if not dirpath:
+            return
         path = os.path.join(dirpath, time.strftime("%Y%m%d%H", time.gmtime(now)) + ".tsv")
         fresh = not os.path.exists(path)
         os.makedirs(dirpath, exist_ok=True)
@@ -264,6 +267,10 @@ def _start_dispatcher(python: str, items: List[Tuple[Any, str, List[str]]], slot
         release_all()
         return
     proc = d.proc
+    try:
+        logdir: Optional[str] = _latency_dir()  # here, in the calling profile's scope
+    except Exception:
+        logdir = None
     killed = threading.Event()
 
     def kill_on_budget() -> None:
@@ -318,7 +325,7 @@ def _start_dispatcher(python: str, items: List[Tuple[Any, str, List[str]]], slot
                 d.close()
             release_all()
             if ended:
-                _log_latency(items, rows, time.monotonic() - t0)  # after the callbacks are released
+                _log_latency(logdir, items, rows, time.monotonic() - t0)  # after the callbacks are released
 
     timer.start()
     threading.Thread(target=run, name="hermes-hook-dispatch", daemon=True).start()
