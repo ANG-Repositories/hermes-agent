@@ -1098,7 +1098,7 @@ def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str,
                        run_id: Optional[int] = None) -> None:
     _set_task_column(conn, task_id, "workspace_path", str(path), run_id)
     from hermes_cli.kanban_survivor import record_baseline
-    record_baseline(conn, task_id, path)
+    record_baseline(conn, task_id, path, run_id=run_id)   # fenced too: the lock is handed back (t_89e3e083)
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str, *,
