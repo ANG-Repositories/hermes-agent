@@ -436,6 +436,10 @@ def _run_hooks(request, payload, sel):
                 try:
                     n = os.write(h.in_w, h.payload[:_CHUNK])
                     h.payload = h.payload[n:]
+                except (BlockingIOError, InterruptedError):
+                    # A nonblocking pipe can become full after readiness was reported.
+                    # Keep the unwritten suffix and retry; closing here truncates hook JSON.
+                    continue
                 except (BrokenPipeError, OSError):
                     h.payload = h.payload[:0]
                 if not len(h.payload):
