@@ -198,7 +198,7 @@ def _bounded_local_read(path: Path, max_bytes: int) -> Optional[str]:
     Reads at most one byte over budget so lifecycle_guard's sanitizer still
     fails an oversized file closed. Missing/unreadable paths yield None, as
     the failed ``head`` did. Non-regular files yield None without reading:
-    the walk's own reader already refused FIFOs/devices before this callback,
+    the walk's own reader already rejects FIFOs/devices before this callback,
     and O_NONBLOCK keeps a path swapped for a FIFO since then from blocking."""
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))

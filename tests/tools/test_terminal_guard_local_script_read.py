@@ -84,7 +84,7 @@ def _block(command, env, *, env_type="local", cwd, workdir=None):
 
 def _write(path, text, mode=0o755):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    path.write_text(text, encoding="utf-8")
     path.chmod(mode)
     return path
 
@@ -98,9 +98,9 @@ def test_local_missing_script_is_not_read_through_env_execute(tmp_path, local_en
 
 
 def test_local_unreadable_script_keeps_verdict_without_env_execute(tmp_path, local_env):
-    if os.geteuid() == 0:
+    if getattr(os, "geteuid", lambda: 1)() == 0:
         pytest.skip("root reads mode-000 files")
-    script = _write(tmp_path / "locked.sh", f"#!/bin/bash\n{RESTART}\n", mode=0o000)
+    script = _write(tmp_path / "locked.sh", f"#!/usr/bin/env bash\n{RESTART}\n", mode=0o000)
     env = local_env
     try:
         # Same verdict the shell-out reached on the same host: `head` cannot open it either.
@@ -111,7 +111,7 @@ def test_local_unreadable_script_keeps_verdict_without_env_execute(tmp_path, loc
 
 
 def test_local_readable_unsafe_script_is_blocked_without_env_execute(tmp_path, local_env):
-    script = _write(tmp_path / "restart.sh", f"#!/bin/bash\n{RESTART}\n")
+    script = _write(tmp_path / "restart.sh", f"#!/usr/bin/env bash\n{RESTART}\n")
     env = local_env
     blocked = _block(f"bash {script}", env, cwd=str(tmp_path))
     assert blocked is not None and "referenced script" in json.loads(blocked)["error"]
@@ -154,8 +154,8 @@ def test_local_fifo_script_fails_closed_without_blocking_or_env_execute(tmp_path
 
 
 def test_local_nested_relative_unsafe_script_is_blocked(tmp_path, local_env):
-    inner = _write(tmp_path / "proj" / "lib" / "inner.sh", f"#!/bin/bash\n{RESTART}\n")
-    _write(tmp_path / "proj" / "run.sh", "#!/bin/bash\nbash ./lib/inner.sh\n")
+    inner = _write(tmp_path / "proj" / "lib" / "inner.sh", f"#!/usr/bin/env bash\n{RESTART}\n")
+    _write(tmp_path / "proj" / "run.sh", "#!/usr/bin/env bash\nbash ./lib/inner.sh\n")
     env = local_env
     assert inner.exists()
     # relative to the command cwd, after a tracked `cd`, and via an explicit relative workdir root
@@ -166,7 +166,7 @@ def test_local_nested_relative_unsafe_script_is_blocked(tmp_path, local_env):
 
 
 def test_local_safe_script_passes_without_env_execute(tmp_path, local_env):
-    script = _write(tmp_path / "ok.sh", "#!/bin/bash\necho hi\n")
+    script = _write(tmp_path / "ok.sh", "#!/usr/bin/env bash\necho hi\n")
     env = local_env
     assert _block(f"bash {script}", env, cwd=str(tmp_path)) is None
     assert env.calls == []
@@ -176,7 +176,7 @@ def test_local_safe_script_passes_without_env_execute(tmp_path, local_env):
 
 @pytest.mark.parametrize("env_type", ["ssh", "docker", "modal"])
 def test_remote_backend_still_reads_missing_script_via_env_execute(tmp_path, env_type):
-    env = _SentinelEnv("/remote/workspace", output=f"#!/bin/bash\n{RESTART}\n", returncode=0)
+    env = _SentinelEnv("/remote/workspace", output=f"#!/usr/bin/env bash\n{RESTART}\n", returncode=0)
     blocked = _block("bash /remote/workspace/remote.sh", env, env_type=env_type, cwd="/remote/workspace")
     assert blocked is not None and "referenced script" in json.loads(blocked)["error"]
     assert any("head -c" in c and "/remote/workspace/remote.sh" in c for c in env.calls)
