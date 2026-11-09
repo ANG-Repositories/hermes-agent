@@ -2376,6 +2376,112 @@ class SessionStore(
         with guard:
             return pending.get(session_key, 0) > 0
 
+    # Durable stop intent (t_41843f70, Prism r1): /stop writes one tiny fsync'd file BEFORE it acks,
+    # outside ``_lock`` and the executor, so a SIGKILL before the deferred marker write lands still
+    # leaves a stop the next boot honours (``_apply_user_stop_intents_locked``). The landed write,
+    # or the user's next message (``clear_user_stopped``), retires it.
+    _USER_STOP_INTENT_DIR = "user_stop_intents"
+
+    def _user_stop_intent_dir(self) -> Path:
+        return Path(self.sessions_dir) / self._USER_STOP_INTENT_DIR
+
+    @staticmethod
+    def _user_stop_intent_prefix(session_key: str) -> str:
+        return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24]
+
+    def write_user_stop_intent(
+        self, session_key: str, session_id: str, *, boot_id: Optional[str] = None,
+    ) -> Path:
+        """Durably record a /stop for ``session_key``/``session_id``; returns the intent path.
+
+        No ``_lock``, no DB: a ~200-byte file, fsync'd, renamed into place, directory fsync'd.
+        One file per stop (a unique suffix), so a landed write retires only its own intent.
+        Raises on I/O failure; the caller then waits for the full marker write instead.
+        """
+        directory = self._user_stop_intent_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{self._user_stop_intent_prefix(session_key)}.{uuid.uuid4().hex[:12]}.json"
+        tmp = path.with_suffix(".tmp")
+        payload = json.dumps({
+            "session_key": session_key, "session_id": session_id,
+            "stopped_at": _iso(_now()), "boot_id": boot_id,
+        }).encode("utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            logger.debug("user_stop intent dir fsync failed for %s", directory, exc_info=True)
+        return path
+
+    @staticmethod
+    def retire_user_stop_intent(path) -> None:
+        """Delete one intent once its marker write landed (best effort)."""
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            logger.debug("user_stop intent retire failed for %s", path, exc_info=True)
+
+    def _retire_user_stop_intents_for_key(self, session_key: str) -> int:
+        """Delete every intent for ``session_key`` (the user spoke again); returns the count."""
+        directory = self._user_stop_intent_dir()
+        if not directory.is_dir():
+            return 0
+        removed = 0
+        for path in directory.glob(f"{self._user_stop_intent_prefix(session_key)}.*.json"):
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                logger.debug("user_stop intent retire failed for %s", path, exc_info=True)
+        return removed
+
+    def _apply_user_stop_intents_locked(self) -> None:
+        """At load (lock held): turn surviving stop intents into in-memory stop markers.
+
+        An intent survives only when the process died between /stop's ack and its marker write.
+        It is applied exactly as ``mark_user_stopped`` would have (marker set, resume hedge
+        cleared) with ``user_stopped_message_id=None``, which the boot gate treats as fail-closed.
+        The file stays until the user speaks again (``clear_user_stopped``), so a second crash
+        before any save re-applies it. An intent whose key is gone or now routes to another
+        session_id, or whose entry already carries a marker on disk, is deleted.
+        """
+        directory = self._user_stop_intent_dir()
+        if not directory.is_dir():
+            return
+        for path in sorted(directory.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                key = data["session_key"]
+                session_id = data.get("session_id")
+            except Exception:
+                logger.warning("Dropping unreadable user_stop intent %s", path, exc_info=True)
+                self.retire_user_stop_intent(path)
+                continue
+            entry = self._entries.get(key)
+            if entry is None or (session_id and entry.session_id != session_id):
+                self.retire_user_stop_intent(path)
+                continue
+            if entry.user_stopped_at is not None:
+                self.retire_user_stop_intent(path)
+                continue
+            entry.user_stopped_at = _parse_iso(data.get("stopped_at")) or _now()
+            entry.user_stopped_boot_id = data.get("boot_id")
+            entry.user_stopped_message_id = None
+            self._clear_resume_pending_entry(entry)
+            logger.warning(
+                "PHASE=user_stop_intent_applied key=%s session=%s: a /stop acked before its marker "
+                "write landed; the session is treated as stopped", key, entry.session_id)
+
     def mark_user_stopped(
         self,
         session_key: str,
@@ -2384,8 +2490,12 @@ class SessionStore(
         last_message_id: Optional[int] = None,
         generation: Optional[int] = None,
         timings: Optional[Dict[str, float]] = None,
+        expected_session_id: Optional[str] = None,
     ) -> bool:
         """Persist "the user ended this turn with /stop" and retire the hedge.
+
+        ``expected_session_id`` binds a deferred write to the session /stop saw: if the key
+        now routes to another session (``/new`` landed first), the write is skipped.
 
         ``generation`` is the gateway run generation this stop claimed. If a resume already
         cleared at that generation or later, this stop lost the race and is skipped, so a stop
@@ -2419,6 +2529,11 @@ class SessionStore(
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
+                return False
+            if expected_session_id is not None and entry.session_id != expected_session_id:
+                logger.info(
+                    "Skipping user_stopped write for %s: key now routes to session %s, /stop "
+                    "was for %s", session_key, entry.session_id, expected_session_id)
                 return False
             fence = self._user_stop_fence_locked(session_key)
             if generation is not None:
@@ -2963,6 +3078,9 @@ class SessionStore(
                 fence[1] = max(fence[1], int(generation))
                 if fence[0] > generation:
                     return False
+            # The user spoke after the stop: retire its durable intent too (an in-flight write
+            # for it is fenced out by fence[1] above, or lands and is cleared by the next message).
+            self._retire_user_stop_intents_for_key(session_key)
             if entry is None or entry.user_stopped_at is None:
                 return False
             entry.user_stopped_at = None

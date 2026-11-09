@@ -7843,14 +7843,36 @@ class GatewayRunner(
     async def _mark_user_stopped_bounded(self, session_key: str) -> str:
         """Run ``_mark_user_stopped`` with a bounded wait; returns a ``PHASE=stop_stages`` fragment.
 
-        The boot-gate ruling stands: the marker is durable before a restart can resume the
-        session. Before any await, the store records a pending stop (``note_user_stop_pending``),
-        so every resume mark in this process refuses the session until the write lands, and
-        graceful shutdown waits for the write (``_flush_pending_user_stop_writes``) before it
-        marks sessions or closes the DB. The write itself keeps running after a timeout.
+        The boot-gate ruling stands: the stop is durable before /stop acks. Before any await,
+        (1) the store writes a durable stop intent (``write_user_stop_intent``: one fsync'd file,
+        no store lock, no executor), which the next boot applies as a stop marker if the process
+        dies before the marker write lands, and (2) the store records a pending stop
+        (``note_user_stop_pending``), so every resume mark in this process refuses the session
+        until the write lands. The write is bound to the session_id /stop saw, so a ``/new``
+        that lands first is never marked. Graceful shutdown still flushes in-flight writes
+        (``_flush_pending_user_stop_writes``). If no intent could be written, /stop waits for the
+        full marker write, as before this change.
         """
         generation = self._current_session_run_generation(session_key)
         store = getattr(self, "session_store", None)
+        try:
+            session_id = getattr(store._entries.get(session_key), "session_id", None)  # noqa: SLF001
+        except Exception:
+            session_id = None
+        intent_path = None
+        _t_intent = time.monotonic()
+        writer = getattr(store, "write_user_stop_intent", None)
+        if callable(writer) and session_id:
+            try:
+                try:
+                    boot_id = self._current_boot_id()
+                except Exception:
+                    boot_id = None
+                intent_path = writer(session_key, session_id, boot_id=boot_id)
+            except Exception:
+                logger.warning("user_stop intent write failed for %s; /stop waits for the marker "
+                               "write instead", session_key, exc_info=True)
+        intent_frag = f"intent={1 if intent_path else 0} intent_s={time.monotonic() - _t_intent:.3f}"
         note = getattr(store, "note_user_stop_pending", None)
         noted = False
         if callable(note):
@@ -7862,9 +7884,12 @@ class GatewayRunner(
         timings: dict = {}
         from agent.interrupt_compat import _accepts_keyword
         _mark = self._mark_user_stopped
-        task = asyncio.ensure_future(
-            _mark(session_key, generation=generation, timings=timings)
-            if _accepts_keyword(_mark, "timings") else _mark(session_key))
+        _kwargs: dict = {}
+        if _accepts_keyword(_mark, "timings"):
+            _kwargs.update(generation=generation, timings=timings)
+        if session_id and _accepts_keyword(_mark, "expected_session_id"):
+            _kwargs["expected_session_id"] = session_id
+        task = asyncio.ensure_future(_mark(session_key, **_kwargs))
         pending = self.__dict__.setdefault("_pending_user_stop_writes", set())
         pending.add(task)
 
@@ -7875,21 +7900,37 @@ class GatewayRunner(
                     store.release_user_stop_pending(session_key)
                 except Exception:
                     logger.debug("user_stop pending release failed for %s", session_key, exc_info=True)
-            if not t.cancelled() and t.exception() is not None:
-                logger.warning("Failed to persist user_stopped marker for stopped session %s",
-                               session_key, exc_info=t.exception())
+            if t.cancelled() or t.exception() is not None:
+                if not t.cancelled():
+                    logger.warning("Failed to persist user_stopped marker for stopped session %s; "
+                                   "its durable intent stays for the next boot", session_key,
+                                   exc_info=t.exception())
+                return
+            # The write landed (or was fenced out by a newer resume/session): the intent is spent.
+            if intent_path is not None:
+                try:
+                    store.retire_user_stop_intent(intent_path)
+                except Exception:
+                    logger.debug("user_stop intent retire failed for %s", session_key, exc_info=True)
 
         task.add_done_callback(_done)
+        if intent_path is None:
+            # No durable intent: keep the old contract, the marker lands before /stop acks.
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                return f"{intent_frag} marker_deferred=0 marker_err=1"  # logged by _done
+            return f"{intent_frag} marker_deferred=0 " + self._render_user_stop_timings(timings)
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=self._STOP_MARKER_WAIT_S)
         except asyncio.TimeoutError:
             logger.info("PHASE=user_stopped_deferred key=%s waited=%.2f: marker write still in flight; "
-                        "resume marks refuse the session until it lands", session_key,
-                        self._STOP_MARKER_WAIT_S)
-            return "marker_deferred=1"
+                        "durable intent written, resume marks refuse the session until it lands",
+                        session_key, self._STOP_MARKER_WAIT_S)
+            return f"{intent_frag} marker_deferred=1"
         except Exception:
-            return "marker_deferred=0 marker_err=1"  # logged by _done
-        return "marker_deferred=0 " + self._render_user_stop_timings(timings)
+            return f"{intent_frag} marker_deferred=0 marker_err=1"  # logged by _done
+        return f"{intent_frag} marker_deferred=0 " + self._render_user_stop_timings(timings)
 
     @staticmethod
     def _render_user_stop_timings(timings: dict) -> str:
@@ -7917,7 +7958,7 @@ class GatewayRunner(
 
     async def _mark_user_stopped(
         self, session_key: str, *, generation: Optional[int] = None,
-        timings: Optional[dict] = None,
+        timings: Optional[dict] = None, expected_session_id: Optional[str] = None,
     ) -> bool:
         """Durably record that ``session_key``'s turn was ended by ``/stop``.
 
@@ -7943,7 +7984,9 @@ class GatewayRunner(
             entry = self.session_store._entries.get(session_key)  # noqa: SLF001
         except Exception:
             entry = None
-        session_id = getattr(entry, "session_id", None)
+        # A deferred write is bound to the session /stop saw (``expected_session_id``), never to
+        # whatever the key routes to by the time the write runs.
+        session_id = expected_session_id or getattr(entry, "session_id", None)
         _t0 = time.monotonic()
         if self._session_db is not None and session_id:
             try:
@@ -7972,6 +8015,7 @@ class GatewayRunner(
             boot_id = self._current_boot_id()
         except Exception:
             boot_id = None
+        _bind = {"expected_session_id": expected_session_id} if expected_session_id else {}
         try:
             marked = await self.async_session_store.mark_user_stopped(
                 session_key,
@@ -7979,6 +8023,7 @@ class GatewayRunner(
                 last_message_id=last_message_id,
                 generation=generation,
                 timings=timings,
+                **_bind,
             )
         finally:
             # store_s = executor queue + lock_s + save_lock_s + upsert_s (+ fallback_s); other_s is

@@ -2471,12 +2471,18 @@ class GatewayShutdownMixin:
         _api_live = ctx.api_live
         _api_worker_live = self._active_api_worker_count()
         _deferred_live = ctx.deferred_count()
-        if _cron_live or _api_live or _api_worker_live or _deferred_live:
+        # /stop marker writes run on the loop's default executor too, and the pre-close flush may
+        # have timed out with one mid-write; its durable stop intent covers the next boot
+        # (t_41843f70), so leave the handles open rather than close under it.
+        _stop_marker_live = sum(
+            1 for _t in tuple(getattr(self, "_pending_user_stop_writes", ()) or ()) if not _t.done())
+        if _cron_live or _api_live or _api_worker_live or _deferred_live or _stop_marker_live:
             logger.warning(
                 "Shutdown phase: %d cron job(s) / %d API-server run(s) / %d API-server worker(s) / "
-                "%d deferred worker(s) still running after the executor quiesce — skipping the SessionDB "
-                "close/checkpoint, leaving state.db open for the live writer (#102198, #116535)",
-                _cron_live, _api_live, _api_worker_live, _deferred_live,
+                "%d deferred worker(s) / %d /stop marker write(s) still running after the executor "
+                "quiesce — skipping the SessionDB close/checkpoint, leaving state.db open for the live "
+                "writer (#102198, #116535)",
+                _cron_live, _api_live, _api_worker_live, _deferred_live, _stop_marker_live,
             )
             return
         _step = GatewayShutdownMixin._quiet_step

@@ -301,6 +301,13 @@ class SessionPersistenceMixin:
         self._seed_chat_model_pins_locked()
         self._routing_db_loaded = db_load_succeeded
         self._routing_fallback_baseline = None if db_load_succeeded else self._entries_as_dicts()
+        # A /stop acked before its marker write landed left a durable intent (t_41843f70).
+        _apply_stop_intents = getattr(self, "_apply_user_stop_intents_locked", None)
+        if callable(_apply_stop_intents):
+            try:
+                _apply_stop_intents()
+            except Exception:
+                logger.warning("Applying user_stop intents failed", exc_info=True)
         # Legacy spellings the resolver already retires (Discord ``channel`` -> ``group``) are
         # folded into the canonical key HERE, before any producer can write: the adapter-driven
         # migration runs only after every platform connects (76s live on 2026-09-09) while the
