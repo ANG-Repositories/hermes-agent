@@ -5887,6 +5887,42 @@ def mint_cap_applies(created_by: Optional[str]) -> bool:
     return not any(by.lower().startswith(p) for p in MINT_CAP_HUMAN_PREFIXES)
 
 
+# Mint moratorium (Ace 2026-11-08 22:5x, t_fb98bedc): while ``<kanban root>/state/kanban-mint-moratorium`` exists,
+# no automated creator (:func:`mint_cap_applies`) mints a NEW card. Humans, the operator CLI default, apollo/aegis
+# and worker-created cards (``creator_task_id`` set) are exempt; re-mints that return an existing card
+# (idempotency_key / signature reuse) create nothing and are never refused. ``force_reason`` overrides. Refusals
+# and forces go to ``<db>.mint-cap.jsonl`` as ``moratorium_refused`` / ``moratorium_forced``. Read per call, so
+# touching or removing the flag takes effect on the next ``hermes kanban create`` with no restart.
+MINT_MORATORIUM_FLAG = ("state", "kanban-mint-moratorium")
+
+
+class MintMoratoriumError(ValueError):
+    """``create_task`` refused: the mint moratorium flag is set and ``created_by`` is an automated creator."""
+
+    def __init__(self, message: str, created_by: str, flag: Path):
+        super().__init__(message)
+        self.created_by = created_by
+        self.flag = flag
+
+
+def mint_moratorium_flag() -> Path:
+    return kanban_home().joinpath(*MINT_MORATORIUM_FLAG)
+
+
+def check_mint_moratorium(created_by: Optional[str], creator_task_id: Optional[str] = None) -> None:
+    """Raise :class:`MintMoratoriumError` when the flag file exists and the creator is automated, not a worker."""
+    if creator_task_id or not mint_cap_applies(created_by):
+        return
+    flag = mint_moratorium_flag()
+    if not flag.exists():
+        return
+    by = (created_by or "").strip()
+    raise MintMoratoriumError(
+        "mint moratorium: no automated producer creates a new card while %s exists (created_by=%r). Send the "
+        "finding back to the existing card instead (comment / reopen / request-changes). Override: --force "
+        "\"<why this card must exist now>\"." % (flag, by), by, flag)
+
+
 def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int] = None) -> int:
     """Cards this creator minted in the trailing window, archived ones included (a reaped card still cost a run)."""
     now = int(time.time()) if now is None else int(now)
@@ -6652,6 +6688,17 @@ def create_task(
         else:
             if owner:
                 return owner
+    # Mint moratorium (see MINT_MORATORIUM_FLAG): after both reuse paths, so a re-mint that returns an existing
+    # card is never refused; before the write txn, so a refusal holds no lock and inserts nothing.
+    moratorium_forced: Optional[dict] = None
+    try:
+        check_mint_moratorium(created_by, creator_task_id)
+    except MintMoratoriumError as exc:
+        if not force_reason:
+            _ledger_mint_cap(conn, "moratorium_refused", created_by=exc.created_by, title=(title or "")[:120],
+                             idempotency_key=idempotency_key)
+            raise
+        moratorium_forced = {"created_by": exc.created_by, "reason": force_reason}
     try:
         check_mint_cap(conn, created_by)
     except MintCapError as exc:
@@ -7039,6 +7086,10 @@ def create_task(
                     _ledger_on_commit(conn, "forced", task_id=task_id, **mint_cap_forced)
                 if mint_cap_bypassed:
                     _ledger_on_commit(conn, "bypassed", task_id=task_id, **mint_cap_bypassed)
+                if moratorium_forced:
+                    _append_event(conn, task_id, "moratorium_forced", moratorium_forced)
+                    _ledger_on_commit(conn, "moratorium_forced", task_id=task_id, title=(title or "")[:120],
+                                      **moratorium_forced)
                 if mint_breaker_forced:
                     _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
