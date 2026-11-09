@@ -1910,7 +1910,13 @@ class GatewayKanbanWatchersMixin:
             )
             from gateway.kanban_wake_freshness import obligation_wake
             text, wake_metadata = obligation_wake(text)
-            await deliver_wake(adapter, text=text, source=source, metadata=wake_metadata)
+            # An external caller (a script/cron watcher) names itself: ``wake_name`` (else its
+            # text's own bracket tag), optional ``wake_kind`` from the vocabulary (default
+            # ``watcher``), ``wake_sub`` and ``card_id`` (t_17ba87a6).
+            from gateway.wake_kind import control_wake_identity
+            _wake_kind, _wake_detail = control_wake_identity(params, text)
+            await deliver_wake(adapter, text=text, source=source, wake_kind=_wake_kind,
+                               metadata={**(wake_metadata or {}), **_wake_detail})
         except Exception as exc:
             logger.warning(
                 "control wake failed on %s/%s: %s", platform_str, chat_id, exc,
@@ -3405,6 +3411,7 @@ class GatewayKanbanWatchersMixin:
                                         text=_synth,
                                         session_id=_session_key,
                                         profile=_served_profile,
+                                        wake_kind="kanban",
                                     )
                                 _mark_red_carried()
                                 logger.info(
@@ -3474,12 +3481,16 @@ class GatewayKanbanWatchersMixin:
                             # self-post branch is handled BEFORE the
                             # cursor advance above).
                             from gateway import kanban_wake_freshness as _fresh
+                            from gateway.wake_kind import kanban_wake_sub, wake_meta
                             await deliver_wake(
                                 adapter,
                                 text=_synth,
                                 session_id=_session_key,
                                 source=_source,
-                                metadata={_fresh.META_KEY: [_fresh.card_entry(
+                                wake_kind="kanban",
+                                metadata={**wake_meta(sub=kanban_wake_sub(_wake_kinds),
+                                                      card_id=sub["task_id"]),
+                                          _fresh.META_KEY: [_fresh.card_entry(
                                     board_slug, sub["task_id"], _wake_kinds,
                                     max((ev.created_at for ev in d["events"]), default=None),
                                     _synth,

@@ -1415,6 +1415,7 @@ class GatewayBusySessionMixin:
                 reply_to_is_own_message=event.reply_to_is_own_message, auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt, channel_context=event.channel_context,
                 internal=event.internal, timestamp=event.timestamp,
+                wake_kind=getattr(event, "wake_kind", None),
             )
             held_reply = queue_mgmt.append_if_held(self, quick_key, _queued_event)
             if held_reply:

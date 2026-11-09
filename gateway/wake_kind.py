@@ -11,6 +11,7 @@ and ``card_id`` (kanban only). ``tests/gateway/test_wake_kind_producer_contract.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Optional
 
 KANBAN = "kanban"
@@ -88,6 +89,29 @@ def single_card(cards: Iterable[Any]) -> Optional[str]:
     """The card id when a wake is about exactly one card, else ``None`` (no misleading id)."""
     ids = {str(c) for c in cards if c}
     return next(iter(ids)) if len(ids) == 1 else None
+
+
+_CARD_ID_RE = re.compile(r"\At_[0-9a-f]{8}\Z")
+_TEXT_TAG_RE = re.compile(r"\A\s*\[([A-Za-z][A-Za-z0-9 _-]{0,39})\]")
+
+
+def control_wake_identity(params: dict, text: str) -> tuple:
+    """``(wake_kind, metadata detail)`` for an EXTERNAL control-socket wake (a script/cron watcher).
+
+    The caller names itself: ``wake_name`` (or ``caller``), else the wake text's own leading bracket
+    tag; an optional ``wake_kind`` from the vocabulary (default ``watcher``), ``wake_sub`` and a
+    ``card_id`` (``t_xxxxxxxx`` only; a card is never read out of the text).
+    """
+    kind = str(params.get(WAKE_KIND_KEY) or "").strip().lower()
+    if kind not in WAKE_KIND_LABELS:
+        kind = WATCHER
+    name = params.get(WAKE_NAME_KEY) or params.get("caller")
+    if not name:
+        tag = _TEXT_TAG_RE.match(text or "")
+        name = tag.group(1) if tag else None
+    card = str(params.get(CARD_ID_KEY) or "").strip()
+    return kind, wake_meta(sub=params.get(WAKE_SUB_KEY), name=name,
+                           card_id=card if _CARD_ID_RE.match(card) else None)
 
 
 def wake_display_metadata(event: Any) -> dict:

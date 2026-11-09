@@ -4222,7 +4222,8 @@ class GatewayTurnMixin:
                     )
                     return
         self._session_state(session_key).conversation.queued_events.append(
-            MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+            MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+                         wake_kind=STEER if internal else None)
         )
         logger.info(
             "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
