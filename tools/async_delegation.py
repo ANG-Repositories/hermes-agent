@@ -1640,13 +1640,15 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
     if launched.get("paused"):
         # A live FWA hold closed this host to new work (Prism 0f110d29ad76): running the unit in-process or
         # detached here would start it on the held host anyway. Nothing runs; the delegation ends naming the hold.
+        # Released either way: the fence only holds the card-end watcher off, it never stops dispatch, so a kept
+        # fence would leave the late card undrained for the process's life (Prism 2de869079d8e). An unarchived
+        # card (Prism c-c6546d2332b994d5) may still be dispatched once the hold clears; the failed record is what
+        # stops it (its runner finds no running attempt), and the watcher drains it when it ends.
+        _akb.release_launch_fence(launched.get("task_id"))
         unfenced = ""
-        if launched.get("fenced"):
-            _akb.release_launch_fence(launched.get("task_id"))
-        else:
-            # The card could not be archived and stays ready: the hold clearing would dispatch it. Keep the
-            # fence on it (Prism c-c6546d2332b994d5) and say so in the failure.
-            unfenced = f"; card {launched.get('task_id')} could not be archived and stays fenced"
+        if not launched.get("fenced"):
+            unfenced = (f"; card {launched.get('task_id')} could not be archived (its runner finds no running "
+                        "attempt; the card-end watcher drains it)")
         _note_kanban_launch(delegation_id, "none (kanban pause hold; not run)")
         raise RuntimeError(f"background unit not started: {launched['paused']}{unfenced}; no in-process "
                            "fallback while the host is held")
