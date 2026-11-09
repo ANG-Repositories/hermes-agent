@@ -11,6 +11,8 @@ the board loop.
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
@@ -53,6 +55,52 @@ _WAKING_SQL = (
     "ON p.id = l.parent_id WHERE l.child_id = t.id AND COALESCE(l.kind,'blocks') = 'blocks' "
     "AND p.status NOT IN ('done','archived'))) LIMIT 1"
 )
+
+
+# Idle ticks (no plan needed) re-read the pool for health at most this often.
+POOL_HEALTH_IDLE_S = 60.0
+
+
+def pool_health(root, pool, last: Optional[bool] = None) -> Optional[bool]:
+    """Page once (episode_pager, #logs) when the derived pool has ZERO usable
+    hosts or a refused pool file; clear on recovery (t_c1c6eb0f).
+
+    ``last`` is the state this process last delivered (True = paged bad, False =
+    cleared healthy, None = unknown). A tick whose state equals ``last`` spawns
+    nothing; a change, the first tick, or a failed send runs the pager. Returns
+    the new ``last``. The home pager owns durable de-duplication across restarts.
+    Non-fleet installs without the pager are a no-op.
+    """
+    bad = pool.refused is not None or not pool.pool_hosts
+    if last is bad:
+        return last
+    script = root / "scripts" / "lib" / "episode_pager.py"
+    if not script.is_file():
+        logger.warning("kanban pool health: episode_pager.py missing at %s", script)
+        return last
+    args = ["page" if bad else "clear", "--producer", "kanban-pool-health",
+            "--key", "pool-unavailable", "--via", "fleet-alert", "--severity", "notice",
+            "--subsystem", "kanban-pool"]
+    if bad:
+        why = f"refused {pool.refused} file" if pool.refused is not None else "0 usable hosts"
+        detail = "; ".join(pool.warnings) or "no host carries the kanban-worker role"
+        args += ["--text", f"Kanban pool unavailable ({why}): nothing spills. {detail}"[:1800],
+                 "--remind-h", "inf"]
+    else:
+        args += ["--resolve-text", f"Kanban pool recovered: {len(pool.pool_hosts)} usable hosts."]
+    try:
+        result = subprocess.run([sys.executable, str(script), *args],
+                                stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace",
+                                timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("kanban pool health pager unavailable", exc_info=True)
+        return None
+    if result.returncode:
+        logger.warning("kanban pool health pager failed rc=%s: %s",
+                       result.returncode, result.stderr[:300])
+        return None
+    return bad
 
 
 def admitting_overflow(pool_cfg) -> bool:
@@ -241,6 +289,8 @@ class GateTickBuilder:
         self._boards = None                        # last build()'s boards (renewal)
         self._renewed_at: float = 0.0
         self._seeded: Dict[tuple, float] = {}      # out-of-tick local runs already booked
+        self._pool_bad: Optional[bool] = None      # pool_health's last delivered state
+        self._pool_checked_at: float = float("-inf")  # monotonic, last pool_health read
 
     def _root(self):
         return self._fleet_dir().parent
@@ -397,6 +447,13 @@ class GateTickBuilder:
                     any_remote_pin(boards, self._connect, kwp.known_host_ids(self._fleet_dir()),
                                    kwp.pin_aliases(self._fleet_dir())))):
             gate.pool = {"planned": False, "reason": "not_needed"}
+            # A quiet board must still learn the pool is empty (t_c1c6eb0f):
+            # health-only read, throttled, since no plan reads the files this tick.
+            now = time.monotonic()
+            if now - self._pool_checked_at >= POOL_HEALTH_IDLE_S:
+                self._pool_checked_at = now
+                self._pool_bad = pool_health(
+                    self._root(), kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg), self._pool_bad)
             return None
         plan = self.build_pool_plan(boards, remote_by_host, cfg)
         if plan is not None:
@@ -436,6 +493,8 @@ class GateTickBuilder:
         default_remote = kwp.placement_default(cfg) == kwp.PLACEMENT_DEFAULT_REMOTE
         from hermes_cli import kanban_continuation as kc
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
+        self._pool_checked_at = time.monotonic()
+        self._pool_bad = pool_health(self._root(), pool, self._pool_bad)
         for warning in pool.warnings:
             self._log(logger.warning, warning)
         if pool.refused is not None:

@@ -117,6 +117,133 @@ def _write_pool(fleet: Path, *, roles=None, sidecar=None):
     return sidecar
 
 
+@pytest.mark.parametrize("bad", [
+    {"roles": {}, "state": "active"},
+    {"roles": {"kanban-worker": {"slots": 0}}, "state": "active"},
+    {"roles": {"kanban-worker": {}}, "state": "invalid"},
+    None,
+])
+def test_reader_quarantines_invalid_role_host_not_whole_fleet(tmp_path, bad):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "ace-media": bad,
+        "studio-arm": {"roles": {}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+    assert any("ace-media" in w and "host dropped" in w for w in cfg.warnings)
+    assert any("studio-arm" in w and "non-empty" in w for w in cfg.warnings)
+    # Authoring validators remain strict; only the runtime read quarantines rows.
+    with pytest.raises(kwp.PoolError):
+        kwp.parse_roles(roles)
+
+
+@pytest.mark.parametrize("bad", [[], "kanban-worker", 7])
+def test_reader_drops_a_host_row_that_is_not_an_object(tmp_path, bad):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "ace-media": bad,
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+    assert any("ace-media" in w and "host dropped" in w for w in cfg.warnings)
+
+
+def test_reader_incident_shape_keeps_n_minus_one_hosts(tmp_path):
+    """2026-11-07 11:54: review-worker cut from every row left studio-arm ``roles: {}``
+    and the whole file was refused (pool=0). Only studio-arm may drop now."""
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}, "ci-runner": {}}, "state": "active"},
+        "ace-media": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "studio-arm": {"roles": {}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai", "ace-media"]
+    assert [w for w in cfg.warnings if "studio-arm" in w] == [
+        "kanban pool: fleet-roles.json: host studio-arm: roles must be a non-empty object (host dropped)"]
+
+
+def test_reader_envelope_errors_still_refuse_the_file(tmp_path):
+    _write_pool(tmp_path, roles={"schema": 2, "hosts": {}})
+    assert kwp.read_pool(tmp_path).refused == "roles"
+    _write_pool(tmp_path, roles={"schema": 1, "hosts": []})
+    assert kwp.read_pool(tmp_path).refused == "roles"
+
+
+def _pager_calls(tmp_path, monkeypatch, rc=0):
+    from gateway import kanban_gate_tick as gt
+    script = tmp_path / "scripts" / "lib" / "episode_pager.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.touch()
+    calls = []
+    monkeypatch.setattr(gt.subprocess, "run", lambda argv, **kw: (
+        calls.append((argv, kw)) or gt.subprocess.CompletedProcess(argv, rc, "paged", "")))
+    return gt, calls
+
+
+def test_all_hosts_malformed_is_zero_pool_and_pages_with_per_host_reason(tmp_path, monkeypatch):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {}, "state": "active"},
+        "ace-media": None,
+    }}
+    _write_pool(tmp_path / "fleet", roles=roles)
+    cfg = kwp.read_pool(tmp_path / "fleet")
+    assert cfg.refused is None and cfg.pool_hosts == ()
+    gt, calls = _pager_calls(tmp_path, monkeypatch)
+    assert gt.pool_health(tmp_path, cfg) is True
+    (argv, kw), = calls
+    assert argv[2:5] == ["page", "--producer", "kanban-pool-health"]
+    text = argv[argv.index("--text") + 1]
+    assert "0 usable hosts" in text and "ace-ai" in text and "ace-media" in text
+    assert argv[argv.index("--severity") + 1] == "notice"   # notice -> #logs
+    assert argv[argv.index("--via") + 1] == "fleet-alert"
+    assert kw["timeout"] == 10 and kw["stdin"] == gt.subprocess.DEVNULL
+
+
+def test_pool_health_pages_once_per_state_and_clears_on_recovery(tmp_path, monkeypatch):
+    gt, calls = _pager_calls(tmp_path, monkeypatch)
+    last = None
+    for cfg in (kwp.PoolConfig(), kwp.PoolConfig(refused="roles", warnings=("broken roles",)),
+                kwp.PoolConfig(pool_hosts=(_host(),)), kwp.PoolConfig(pool_hosts=(_host(),))):
+        last = gt.pool_health(tmp_path, cfg, last)
+    # bad, bad (same state: no spawn), healthy (clear), healthy (no spawn)
+    assert [argv[2] for argv, _ in calls] == ["page", "clear"]
+    assert last is False
+    assert all("pool-unavailable" in argv for argv, _ in calls)
+
+
+def test_pool_health_failed_send_retries_next_tick(tmp_path, monkeypatch):
+    gt, calls = _pager_calls(tmp_path, monkeypatch, rc=3)
+    last = gt.pool_health(tmp_path, kwp.PoolConfig())
+    assert last is None
+    gt.pool_health(tmp_path, kwp.PoolConfig(), last)
+    assert [argv[2] for argv, _ in calls] == ["page", "page"]
+
+
+def test_pool_health_noop_without_pager(tmp_path):
+    from gateway import kanban_gate_tick as gt
+    assert gt.pool_health(tmp_path, kwp.PoolConfig(), None) is None
+
+
+def test_idle_tick_still_pages_an_empty_pool(kanban_home, monkeypatch):
+    """A quiet board (no plan needed) must not hide pool=0 (t_c1c6eb0f)."""
+    _write_pool(kanban_home / "fleet", roles={"schema": 1, "hosts": {
+        "ace-ai": {"roles": {}, "state": "active"}}})
+    gt, calls = _pager_calls(kanban_home, monkeypatch)
+    gate, b = _admitting_builder(kanban_home / "fleet", V01)
+    assert b.plan_pool([{"slug": "default"}], {}) is None
+    assert gate.pool == {"planned": False, "reason": "not_needed"}
+    assert [argv[2] for argv, _ in calls] == ["page"]
+    b.plan_pool([{"slug": "default"}], {})        # throttled + same state: no second spawn
+    assert len(calls) == 1
+
+
 def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     _write_pool(tmp_path)
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
