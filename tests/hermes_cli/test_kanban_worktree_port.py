@@ -318,10 +318,10 @@ def test_a_local_branch_ahead_of_origin_keeps_the_card_local(kanban_home, anchor
 # ---- derived mode (t_1d2c5939): every repo, every pool host, push-then-port ----
 
 def _origin_with_push(anchor, tmp_path):
-    """The anchor's fetch URL stays github (origin_slug), its push URL is a local bare repo."""
+    """Local fetch repository; tests can install a distinct pushurl to exercise it."""
     bare = tmp_path / "pushed.git"
     _git("init", "-q", "--bare", str(bare), cwd=tmp_path)
-    _git("remote", "set-url", "--push", "origin", str(bare), cwd=anchor)
+    _git("remote", "set-url", "origin", str(bare), cwd=anchor)
     return bare
 
 
@@ -413,6 +413,7 @@ def test_kill_switch_file_or_env_restores_the_hand_list(kanban_home, anchor, mon
 def test_derived_unpushed_commits_are_pushed_then_ported(kanban_home, anchor, tmp_path, monkeypatch):
     """A card branch with commits origin never saw: pushed (lease: must not exist) BEFORE the clone."""
     bare = _origin_with_push(anchor, tmp_path)
+    monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: SLUG)
     _commit(anchor, "base")
     order = []
     real_push = kwt.push_card_branch
@@ -428,7 +429,7 @@ def test_derived_unpushed_commits_are_pushed_then_ported(kanban_home, anchor, tm
         _git("checkout", "-q", "main", cwd=anchor)
         out: dict = {}
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
-        assert out[tid][4] == (str(anchor.resolve()), f"wt/{tid}", "")
+        assert out[tid][4] == (str(anchor.resolve()), f"wt/{tid}", "", _ref(anchor, f"wt/{tid}"))
         _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
     assert (tid, "ace-ai") in spawned
     assert order == ["push", ("clone", "ace-ai", f"wt/{tid}")]
@@ -445,7 +446,7 @@ def test_push_lease_refuses_a_branch_moved_on_origin(anchor, tmp_path):
     _git("branch", "-f", "feature", "HEAD", cwd=anchor)
     # the routing saw no origin ref (""): origin's feature appeared since, so the lease refuses
     with pytest.raises(RuntimeError, match="before the port failed"):
-        kwt.push_card_branch((str(anchor), "feature", ""))
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "feature")))
     assert _ref(bare, "refs/heads/feature") == theirs
 
 
@@ -467,7 +468,7 @@ def test_derived_dirty_own_tree_stays_local_named(kanban_home, anchor, monkeypat
         _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c", cwd=wt)
         out: dict = {}
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
-        assert out[tid][4][1:] == (f"wt/{tid}", "")
+        assert out[tid][4][1:] == (f"wt/{tid}", "", _ref(wt, "HEAD"))
 
 
 def test_derived_diverged_branch_stays_local_and_ahead_branch_pushes(anchor):
@@ -480,7 +481,7 @@ def test_derived_diverged_branch_stays_local_and_ahead_branch_pushes(anchor):
     _git("checkout", "-q", "main", cwd=anchor)
     # ahead only (fast-forward): pushed with the lease pinned to origin's sha
     assert kwt.assess("t_x", str(anchor), None, "feature", push_ok=True) == (
-        anchor.resolve(), (str(anchor.resolve()), "feature", base))
+        anchor.resolve(), (str(anchor.resolve()), "feature", base, _ref(anchor, "feature")))
     # the hand-list semantics are unchanged: local
     assert kwt.anchor_repo("t_x", str(anchor), None, "feature") is None
     # origin moved to a commit the Studio lacks: a push would drop it, so local, named
@@ -489,6 +490,27 @@ def test_derived_diverged_branch_stays_local_and_ahead_branch_pushes(anchor):
     why: list = []
     assert kwt.assess("t_x", str(anchor), None, "feature", push_ok=True, why=why) == (None, None)
     assert why == ["diverged_from_origin"]
+
+
+def test_push_uses_assessed_sha_despite_branch_reset_and_ignores_pushurl(anchor, tmp_path):
+    bare = _origin_with_push(anchor, tmp_path)
+    _commit(anchor, "parent")
+    parent = _ref(anchor, "HEAD")
+    _commit(anchor, "remote")
+    _git("push", "-q", "origin", "main:refs/heads/feature", cwd=anchor)
+    remote = _ref(anchor, "HEAD")
+    _git("checkout", "-q", "-b", "feature", cwd=anchor)
+    _commit(anchor, "assessed")
+    assessed = _ref(anchor, "HEAD")
+    _, push = kwt.assess("t_x", str(anchor), None, "feature", push_ok=True)
+    other = tmp_path / "wrong.git"
+    _git("init", "-q", "--bare", str(other), cwd=tmp_path)
+    _git("remote", "set-url", "--push", "origin", str(other), cwd=anchor)
+    _git("checkout", "-q", "main", cwd=anchor)
+    _git("branch", "-f", "feature", parent, cwd=anchor)
+    kwt.push_card_branch(push)
+    assert _ref(bare, "refs/heads/feature") == assessed != remote
+    assert not _ref(other, "refs/heads/feature")
 
 
 def test_clone_script_expands_a_home_relative_mirror(tmp_path):

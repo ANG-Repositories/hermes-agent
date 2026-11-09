@@ -277,7 +277,7 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
 def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[str],
            branch: Optional[str] = None, runner: Callable = subprocess.run, *,
            allow_studio_tree: bool = False, push_ok: bool = False,
-           why: Optional[List[str]] = None) -> Tuple[Optional[Path], Optional[Tuple[str, str, str]]]:
+           why: Optional[List[str]] = None) -> Tuple[Optional[Path], Optional[Tuple[str, str, str, str]]]:
     """``(anchor repo | None, push)``: :func:`anchor_repo`'s checks, with the reason a card stays local
     appended to ``why``. ``push_ok`` (derived mode, t_1d2c5939): a card branch whose commits origin lacks is
     no longer a refusal; ``push`` = ``(repo, branch, expected origin sha or "")`` and the spawn pushes it
@@ -362,7 +362,7 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
         if anc is None or getattr(anc, "returncode", 1) != 0:
             _why(why, "diverged_from_origin")
             return None, None  # origin has commits the Studio lacks: a push would drop them
-    return top, (str(top), b, remote)
+    return top, (str(top), b, remote, local)
 
 
 def _on_branch(tree: Path, branch: str, runner: Callable) -> bool:
@@ -374,14 +374,19 @@ def _on_branch(tree: Path, branch: str, runner: Callable) -> bool:
     return getattr(proc, "returncode", 1) == 0 and (proc.stdout or "").strip() == branch
 
 
-def push_card_branch(push: Tuple[str, str, str], runner: Callable = subprocess.run) -> None:
+def push_card_branch(push: Tuple[str, str, str, str], runner: Callable = subprocess.run) -> None:
     """Push the card branch to origin before the port (t_1d2c5939): ``--force-with-lease`` pinned to the
     origin sha the routing saw ("" = the branch must not exist on origin), so a branch someone moved since
     is refused, never overwritten. Raises on failure (a spawn failure; the card stays where it is)."""
-    repo, branch, expected = push
+    repo, branch, expected, source = push
+    # Push to the fetch URL explicitly: a remote's pushurl may name another repo.
+    dest = runner(["git", "-C", repo, "remote", "get-url", "origin"], capture_output=True,
+                  text=True, timeout=10, stdin=subprocess.DEVNULL)
+    if dest.returncode != 0 or not dest.stdout.strip():
+        raise RuntimeError("cannot resolve clone source before push")
     proc = runner(["git", "-C", repo, "push", "--porcelain",
                    f"--force-with-lease=refs/heads/{branch}:{expected}",
-                   "origin", f"refs/heads/{branch}:refs/heads/{branch}"],
+                   dest.stdout.strip(), f"{source}:refs/heads/{branch}"],
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=PUSH_TIMEOUT_S, stdin=subprocess.DEVNULL)
     rc = getattr(proc, "returncode", 1)
