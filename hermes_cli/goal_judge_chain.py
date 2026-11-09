@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 _LABEL = re.compile(r'[^a-zA-Z0-9_.:/-]')
 _CLEANUP_LOCK = threading.Lock()
 _CLEANUPS = {}
+# A killed rung may take this long to be reaped, drawn from the chain's total budget
+# (not the timed-out rung's own, already spent, budget). A loaded host needs more than 50 ms.
+_REAP_GRACE = 5.0
+_STDERR_TAIL = 300
 
 
 def _label(value):
@@ -108,13 +113,17 @@ def _stop(proc, home, deadline, finished):
         _release_cleanup(home, finished)
 
     threading.Thread(target=reap, name='goal-judge-reaper', daemon=True).start()
-    stopped = finished.wait(max(0, min(0.05, deadline - time.monotonic())))
+    stopped = finished.wait(max(0, deadline - time.monotonic()))
     if not stopped:
         logger.warning('goal judge cleanup pending: pid=%d; profile retries inhibited', proc.pid)
     return stopped
 
 
-def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
+def run_attempt(route, messages, max_tokens, deadline, cancel_check=None, *,
+                budget_deadline=None, own_cleanups=None):
+    """One rung in an owned child. ``own_cleanups`` holds this chain's still-unreaped
+    rungs: they do not fence the next rung (it gets its own process); any other
+    pending reap for the home does. ``budget_deadline`` bounds the reap grace."""
     from agent.auxiliary_client import raise_if_aux_cancel_requested
     from hermes_constants import get_hermes_home
     from tools.environments.local import served_profile_child_env
@@ -123,28 +132,38 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
     raise_if_aux_cancel_requested()
     finished = threading.Event()
     with _CLEANUP_LOCK:
-        if home in _CLEANUPS:
+        if _CLEANUPS.get(home, set()) - (own_cleanups or set()):
             return dict(category='cleanup_pending')
+    err = None
     try:
         from agent.auxiliary_client import _runtime_main_value
         from agent.portal_tags import get_affinity_scope, get_conversation_context
         env = served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
         env['PYTHONIOENCODING'] = 'utf-8'
+        # Outside a gateway unit the launcher's source-update relaunch re-execs this
+        # child and the payload on stdin never reaches it. The judge child never owes
+        # that tail (and has no budget for it); the gateway unit already sets this.
+        env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
         payload = json.dumps(dict(route=route, messages=messages, max_tokens=max_tokens,
                                   affinity_scope=get_affinity_scope(), conversation=get_conversation_context(),
                                   session_id=_runtime_main_value('session_id'),
                                   cache_scope=_runtime_main_value('cache_scope')))
         # -m uses THIS source checkout, not the installed runtime's editable root.
+        # stderr goes to an unlinked file, read only to explain a worker_error.
+        err = tempfile.TemporaryFile()
         proc = subprocess.Popen(
             [sys.executable, '-m', 'hermes_cli.goal_judge_chain'],
             cwd=str(Path(__file__).resolve().parent.parent), env=env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
             text=True, encoding='utf-8',
             start_new_session=os.name == 'posix',
         )
     except (OSError, ValueError, TypeError):
+        if err is not None:
+            err.close()
         return dict(category='worker_error')
     outcome = dict(category='timeout')
+    graceful = False
     try:
         pending = payload
         next_state_check = 0.0
@@ -178,11 +197,35 @@ def run_attempt(route, messages, max_tokens, deadline, cancel_check=None):
                 break
             except subprocess.TimeoutExpired:
                 pending = None
+        graceful = True
     except (OSError, ValueError, UnicodeError):
         outcome = dict(category='worker_error')
+        graceful = True
     finally:
-        stopped = _stop(proc, home, deadline, finished)
+        now = time.monotonic()
+        # Explicit cancel (or any escaping exception) keeps the old 50 ms bound and
+        # propagates at once; a finished rung may spend part of the chain budget on reaping.
+        if graceful and budget_deadline is not None:
+            until = min(budget_deadline, now + _REAP_GRACE)
+        else:
+            until = min(deadline, now + 0.05)
+        stopped = _stop(proc, home, until, finished)
+        if not stopped and own_cleanups is not None:
+            own_cleanups.add(finished)
+        if graceful and outcome.get('category') == 'worker_error':
+            logger.warning('goal judge worker_error: returncode=%s stderr_tail=%r',
+                           proc.returncode, _tail(err))
+        err.close()
     return outcome if stopped else dict(category='cleanup_pending')
+
+
+def _tail(stream):
+    try:
+        stream.seek(0, os.SEEK_END)
+        stream.seek(max(0, stream.tell() - _STDERR_TAIL))
+        return ' '.join(stream.read().decode('utf-8', 'replace').split())
+    except (OSError, ValueError, AttributeError):
+        return ''
 
 
 def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=None):
@@ -191,6 +234,7 @@ def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=N
     deadline = time.monotonic() + total
     messages = [dict(role='system', content=system_prompt), dict(role='user', content=prompt)]
     last_category = 'unavailable'
+    own_cleanups = set()  # this chain's killed-but-unreaped rungs; still fence other judges
     for index, route in enumerate(routes):
         raise_if_aux_cancel_requested()
         if time.monotonic() >= deadline:
@@ -199,7 +243,8 @@ def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=N
         provider, model = _label(route['provider']), _label(route['model'])
         logger.info('goal judge attempt: rung=%d provider=%s model=%s', index, provider, model)
         outcome = run_attempt(route, messages, max_tokens,
-                              min(deadline, time.monotonic() + route['timeout']), cancel_check=cancel_check)
+                              min(deadline, time.monotonic() + route['timeout']), cancel_check=cancel_check,
+                              budget_deadline=deadline, own_cleanups=own_cleanups)
         category = outcome.get('category', 'worker_error')
         if category == 'ok':
             verdict, reason, failed, directive = parse(outcome.get('content', ''))
@@ -211,7 +256,10 @@ def judge_chain(policy, system_prompt, prompt, max_tokens, parse, cancel_check=N
         logger.info('goal judge attempt failed: rung=%d provider=%s model=%s category=%s',
                     index, provider, model, category)
         last_category = category
-        if category not in {'unavailable', 'timeout', 'invalid_output', 'configuration', 'worker_error'}:
+        # cleanup_pending: a reap still owed (ours, or another judge's for this home) is
+        # an unavailable rung, not a verdict; the next rung runs while budget remains.
+        if category not in {'unavailable', 'timeout', 'invalid_output', 'configuration', 'worker_error',
+                            'cleanup_pending'}:
             break
     return 'continue', f'goal judge chain failed: {last_category}', last_category == 'invalid_output', None, last_category != 'invalid_output'
 
