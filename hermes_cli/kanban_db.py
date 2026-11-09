@@ -9279,14 +9279,24 @@ def _append_event(
     actor_profile, actor_session_id = _event_actor()
     boot = _boot_evidence() if kind in _BOOT_EVIDENCE_KINDS else None
     if kind == "review_requested":
+        review_exit_id = conn.execute(
+            "SELECT COALESCE(max(id), 0) FROM task_status_audit "
+            "WHERE task_id=? AND old_status='review' AND new_status!='review'", (task_id,),
+        ).fetchone()[0]
+        payload = {**(payload or {}), "review_exit_id": review_exit_id}
         # A raw-entry trigger supplies provisional provenance before the normal
         # handoff writer has finished. Finalize that row rather than publish two
-        # handoffs (and two notifications) for the same entry.
+        # handoffs (and two notifications) for the same entry. Bind adoption
+        # to the most recent review EXIT, not event recency: unrelated events
+        # may follow a raw entry before its canonical handoff is written.
         provisional = conn.execute(
             "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_requested' "
             "AND json_valid(payload) AND json_extract(payload,'$.source')='lifecycle_entry_repair' "
-            "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested')",
-            (task_id, task_id),
+            "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested') "
+            "AND COALESCE(json_extract(payload,'$.review_exit_id'), 0)="
+            "(SELECT COALESCE(max(id), 0) FROM task_status_audit "
+            "WHERE task_id=? AND old_status='review' AND new_status!='review')",
+            (task_id, task_id, task_id),
         ).fetchone()
         if provisional is not None:
             payload = {**json.loads(provisional[1]), **(payload or {})}
