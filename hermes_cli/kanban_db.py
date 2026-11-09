@@ -6457,8 +6457,12 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
-    from hermes_cli.kanban_ruling_citation import validate_fields
-    validate_fields(conn, [("title", title), ("body", body)])
+    # A delegations-board card contains an already-admitted delegate_task call, not a new work item.
+    # Its goal-derived title may quote a ruling without minting a ruling-bearing task.
+    container_card = _kdb.conn_is_delegations(conn)
+    if not container_card:
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("title", title), ("body", body)])
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")

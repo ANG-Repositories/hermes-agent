@@ -1656,6 +1656,9 @@ DEFAULT_CONFIG = {
         # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
         # Default "kanban" since option C P3 (t_3646c28e: drills + daedalus canary).
         "background_runtime": "kanban",
+        # A kanban-eligible unit whose card cannot spawn: "detached" runs it as a detached child process
+        # (survives a restart; never a gateway thread). "in_process" is the kill switch (t_49e02567).
+        "background_kanban_fallback": "detached",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
