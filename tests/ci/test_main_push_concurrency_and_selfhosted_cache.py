@@ -270,8 +270,8 @@ def test_warm_job_has_its_own_budget_and_never_gates_main():
     assert _warm_job()["timeout-minutes"] >= 60
     on = _load(_WARM).get("on", _load(_WARM).get(True))
     assert "workflow_call" not in on
-    assert on["push"]["branches"] == ["main"]
-    assert set(on) <= {"push", "workflow_dispatch"}
+    # Public mirror load guard: warming stays manual and outside the required CI graph.
+    assert set(on) == {"workflow_dispatch"}
     for orchestrator in ("ci.yaml", "ci-local.yaml"):
         assert _WARM.name not in _reachable_workflows(orchestrator), orchestrator
     assert "warm-selfhosted-cache" not in _tests_jobs()

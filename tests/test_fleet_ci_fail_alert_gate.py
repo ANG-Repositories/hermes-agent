@@ -1704,7 +1704,8 @@ def _sweep(tmp_path, reds, *, sweeps=(), sweep_jobs=None, listener=None, event="
 
 def test_no_workflow_run_trigger_left():
     on = _workflow()["on"]
-    assert "workflow_run" not in on and "schedule" in on and "workflow_dispatch" in on
+    # Public mirror load guard also disables the periodic sweep. Manual replay remains.
+    assert set(on) == {"workflow_dispatch"}
 
 
 def test_matrix_leg_feeds_the_route_step():
