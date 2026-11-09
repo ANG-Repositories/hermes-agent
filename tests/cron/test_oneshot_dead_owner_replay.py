@@ -277,8 +277,9 @@ def test_dead_owner_episodes_are_isolated_per_store(home, monkeypatch, tmp_path)
 
     other = tmp_path / "other-profile"
     with jobs_mod.use_cron_store(other):
-        assert jobs_mod._dead_owner_episode_scope() != key_a.rsplit(":", 1)[0]
         healthy = dict(raw[0], run_claim=None, fire_claim=None)
         jobs_mod._warn_overdue_oneshots_not_due([healthy], [], set(), jobs_mod._hermes_now())
     assert [a[0] for a in home.pages] == ["page"]  # store A's episode was not cleared
     assert key_a in jobs_mod._dead_owner_wedge_paged
+    with jobs_mod.use_cron_store(other):
+        assert jobs_mod._dead_owner_episode_scope() != key_a.rsplit(":", 1)[0]
