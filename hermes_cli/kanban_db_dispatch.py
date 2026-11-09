@@ -4424,6 +4424,15 @@ class SpawnNowError(RuntimeError):
     """:func:`spawn_now` did not start a worker; the card's state says why."""
 
 
+class SpawnNowPaused(SpawnNowError):
+    """:func:`spawn_now` refused by a pause hold (a policy refusal, not a launch failure): the caller must not run
+    the unit some other way on the same held host (Prism 0f110d29ad76). ``reason`` is the ``pause_hold (...)`` text."""
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 _SPAWN_NOW_LOCK_WAIT_SECONDS = 30.0
 
 
@@ -4468,11 +4477,11 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
     # fence as a tick's local start applies before any run opens (Prism b256ef26919e). Off under the kill switch.
     _local_wait = _kph.local_destination_wait({})
     if _local_wait is not None:
-        raise SpawnNowError(f"{task_id}: pause hold: {_local_wait}")
+        raise SpawnNowPaused(f"{task_id}: pause hold: {_local_wait}", _local_wait)
     try:
         claimed = _kb.claim_task(conn, task_id)
     except _kph.PauseHeld as exc:
-        raise SpawnNowError(f"{task_id}: pause hold: {exc.reason}") from exc
+        raise SpawnNowPaused(f"{task_id}: pause hold: {exc.reason}", str(exc.reason)) from exc
     if claimed is None:
         raise SpawnNowError(f"{task_id}: not claimable (not ready, or already claimed)")
     from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
