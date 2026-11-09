@@ -124,7 +124,12 @@ finally:
     c.close()
 c, token = _ipc.connect(os.environ.get('BU_NAME', 'default'), timeout=5)
 try:
-    reply = _ipc.request(c, token, request)
+    try:
+        reply = _ipc.request(c, token, request)
+    except Exception as exc:
+        # The daemon answered ping but dropped this request (a pre-lease daemon fails the unknown
+        # meta and closes the connection): report it as an unsupported request, not as a dead daemon.
+        reply = {'error': 'request_dropped: ' + type(exc).__name__}
 finally:
     c.close()
 print(json.dumps({'pid': ping.get('pid'), 'reply': reply}))

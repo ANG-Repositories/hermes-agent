@@ -85,3 +85,51 @@ def test_pre_lease_daemon_fails_closed(monkeypatch):
     _route_into(monkeypatch, _PreLeaseDaemon())
     with pytest.raises(RuntimeError, match="predates selection leases"):
         target.acquire_lease(ROUTE)
+
+
+@pytest.mark.platforms("posix")
+def test_pre_lease_daemon_dropping_the_request_reports_predates_leases(monkeypatch):
+    """A daemon that answers ping but drops the lease request mid-connection (closed with the
+    request unread, so the probe's send/recv raises) must read as "predates selection leases"
+    through the real isolated probe, not as the generic "daemon is unavailable". (A released
+    0.1.13 daemon instead replies {"error": "'method'"}, which already took that path.)"""
+    import json
+    import socket
+    import tempfile
+    import threading
+    from importlib.metadata import distribution
+    from pathlib import Path
+
+    site = Path(distribution("browser-harness").locate_file(""))
+    monkeypatch.setattr("sysconfig.get_path", lambda _: str(site))
+    monkeypatch.setattr("pm.environments.committed_venv", lambda _: None)
+    runtime = tempfile.TemporaryDirectory(prefix="bu-")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(Path(runtime.name) / "bu.sock"))
+    server.listen()
+    server.settimeout(5)
+    seen = []
+
+    def serve():
+        for _ in range(2):
+            conn, _ = server.accept()
+            with conn:
+                if not seen:
+                    seen.append(json.loads(conn.recv(4096))["meta"])
+                    conn.sendall(json.dumps({"pid": 123}).encode() + b"\n")
+                else:
+                    seen.append("dropped")  # close with the request unread: the client errors
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    route = target.BrowserUseRoute({"BU_NAME": "scoped", "BH_RUNTIME_DIR": runtime.name,
+                                    "BH_TMP_DIR": runtime.name}, "ws://synthetic", False)
+    try:
+        with pytest.raises(RuntimeError, match="predates selection leases"):
+            target.acquire_lease(route)
+        thread.join(5)
+        assert seen == ["ping", "dropped"]
+    finally:
+        server.close()
+        thread.join(5)
+        runtime.cleanup()
