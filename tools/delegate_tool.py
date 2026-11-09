@@ -4902,6 +4902,14 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        from tools.delegate_tool_admission import reject_background_admission
+
+        def _reject_admission(reason, dispatch=None):
+            return reject_background_admission(
+                reason=reason, children=_child_agents, task_list=task_list,
+                live_deleg_id=live_deleg_id, live_writers=live_writers, dispatch=dispatch,
+            )
+
         try:
             _durable_spec, _gateway_boot_id = _build_durable_background_spec(
                 task_list=task_list,
@@ -4924,11 +4932,14 @@ def delegate_task(
                 routing_cfg=routing_cfg,
             )
         except Exception as exc:
-            logger.error("delegate_task: durable restart intent unavailable (%s); refusing the background unit", exc)
-            return _background_not_started(
-                {"reason": "durable_intent_error",
-                 "error": f"restart-safe background persistence unavailable: {type(exc).__name__}"},
-                _goals, _child_agents)
+            logger.error(
+                "delegate_task: durable restart intent unavailable (%s); "
+                "background admission rejected; no children started",
+                exc,
+            )
+            return _reject_admission("durable_intent_error", {
+                "error": f"restart-safe background persistence unavailable: {type(exc).__name__}",
+            })
         # Kanban runtime (docs/dev/delegate-background-on-kanban-runtime.md §5.1-5.2): an eligible durable
         # unit runs as one card on the internal ``delegations`` board, in its own process. The allowlist
         # fails closed: any condition not positively true keeps today's in-process unit (I6).
@@ -5067,19 +5078,7 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Refused (pool at capacity, registry full/unreadable, schedule failure, retiring backend): the
-        # built children never ran. Close them and tell the model the truth; never join them inline.
-        _fallback_event_id = dispatch.get("fallback_event_id")
-        if _fallback_event_id:
-            from tools.async_delegation import acknowledge_outbox_event
-
-            acknowledge_outbox_event(
-                _fallback_event_id,
-                outcome="dropped",
-                reason="not_started",
-                profile_home=dispatch.get("_registry_profile_home") or None,
-            )
-        return _background_not_started(dispatch, _goals, _child_agents)
+        return _reject_admission(dispatch.get("reason") or "admission_unavailable", dispatch)
 
     # ----- Synchronous path -----
     # A recovered async unit (_recovery_spec) delivers only via its own

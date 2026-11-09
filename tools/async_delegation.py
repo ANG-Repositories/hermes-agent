@@ -1432,7 +1432,7 @@ def _dispatch_admitted(
                 return {
                     "status": "rejected",
                     "reason": rejection,
-                    "error": "Durable async delegation registry unavailable.",
+                    "error": "Durable async delegation registry unavailable; no children started.",
                 }
             record["attempt_id"] = durable["attempt"]["attempt_id"]
             record["owner_boot_id"] = current_boot_id or ""
