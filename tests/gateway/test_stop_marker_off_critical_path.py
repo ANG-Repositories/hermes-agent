@@ -672,6 +672,47 @@ async def test_skipped_marker_write_keeps_the_intent_for_the_next_boot(tmp_path,
     db.close()
 
 
+def test_applied_intent_does_not_pin_stale_fallback_metadata(tmp_path, monkeypatch):
+    """Prism r3 P1 5c177a7cf2d6 (c-a2b2c6ddbd0a1f35): a fallback-only load applies an intent to
+    the sessions.json copy of K. The reconcile must still take state.db's row for K (the intent
+    is not a user edit made on fallback), and the stop must survive that swap."""
+    import hermes_state as _hs
+
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    entry = store.get_or_create_session(_source())
+    key, sid = entry.session_key, entry.session_id
+    assert store.mark_resume_pending(key, "shutdown_timeout")
+    store.drain_sessions_json_writes(timeout=5.0)
+    durable_name = store._entries[key].display_name
+    stale = dict(store._entries[key].to_dict(), display_name="stale-fallback-name")
+    (tmp_path / "sessions" / "sessions.json").write_text(json.dumps({key: stale}), encoding="utf-8")
+    store.write_user_stop_intent(key, sid, boot_id="b1")
+
+    real_load = _hs.SessionDB.load_gateway_routing_entries
+    state = {"fail": True}
+
+    def _load(self, *a, **k):
+        if state["fail"]:
+            raise OSError("injected state.db routing read failure")
+        return real_load(self, *a, **k)
+
+    monkeypatch.setattr(_hs.SessionDB, "load_gateway_routing_entries", _load)
+    reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    with reloaded._lock:
+        reloaded._ensure_loaded_locked()
+        assert reloaded._entries[key].display_name == "stale-fallback-name"  # fallback load
+        assert reloaded._entries[key].user_stopped_at is not None
+    state["fail"] = False
+    with reloaded._lock:
+        reloaded._ensure_loaded_locked()  # reconcile
+        revived = reloaded._entries[key]
+        assert revived.display_name == durable_name, "the applied intent pinned the stale copy"
+        assert revived.user_stopped_at is not None, "the stop was lost when state.db's row won"
+        assert revived.resume_pending is False
+    db.close()
+
+
 @pytest.mark.asyncio
 async def test_intent_write_runs_off_the_event_loop(tmp_path, monkeypatch, caplog):
     """Prism r3 P2 c-8f4218c9f5df3ee0: the intent's mkdir/write/fsync/rename are blocking I/O and
