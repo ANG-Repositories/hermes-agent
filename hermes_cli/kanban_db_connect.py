@@ -324,10 +324,16 @@ class TickLockWindow:
         self._held_since, self._released_since = None, now
         self.windows += 1
 
-    def hold(self) -> None:
-        """Take the lock back, waiting as long as it takes: every holder now keeps it only for decisions."""
+    @property
+    def active(self) -> bool:
+        """True when :meth:`release` really hands the board lock back (narrow_lock on, lock held here)."""
+        return self._state is not None
+
+    def hold(self) -> bool:
+        """Take the lock back, waiting as long as it takes: every holder now keeps it only for decisions.
+        True when it was handed back, i.e. the board may have moved since this tick last read it."""
         if not self.released:
-            return
+            return False
         start = self._clock()
         warn_at = start + self.WARN_EVERY_S
         while True:
@@ -347,6 +353,7 @@ class TickLockWindow:
         now = self._clock()
         self._unlocked_s += now - self._released_since
         self._held_since, self._released_since = now, None
+        return True
 
     def held_s(self) -> float:
         now = self._clock()

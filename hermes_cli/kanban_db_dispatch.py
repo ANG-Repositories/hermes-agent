@@ -6927,15 +6927,20 @@ def _dispatch_once_locked(
         return _kb.resolve_per_profile_cap(_per_profile_spec, assignee)
 
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+
+    def _load_per_profile_running() -> None:
         from hermes_cli.kanban_terminal_pending import NOT_EXTENDED_LEASE_SQL
 
+        _per_profile_running.clear()
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             f"WHERE status = 'running' AND assignee IS NOT NULL AND {NOT_EXTENDED_LEASE_SQL} "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+
+    if _per_profile_cap is not None:
+        _load_per_profile_running()
     # One budget, one order (FWA-I, t_cd43f4ff, audit K8): no slot is held
     # back for the review lane. A spawnable review row at the same or a higher
     # priority than a ready row keeps its place ahead of it (a review finishes
@@ -6953,6 +6958,47 @@ def _dispatch_once_locked(
         )
     )
     local_spawned = 0
+    # Narrow lock (t_f60f502f, Prism 3c47847c9979): while the lock is handed back for a spawn, another
+    # dispatcher or `kanban admit` can claim, so every cap above is a snapshot of a board that has moved.
+    # Each re-take re-reads the board and tightens them before the next decision; a budget never grows
+    # inside a tick. ``spawned`` counts this tick's starts, which the running count already includes.
+    _running_at_release = 0
+
+    def _release_lock() -> None:
+        nonlocal _running_at_release
+        if _lw.active and not _lw.released:
+            _running_at_release = count_running_tasks(conn)
+        _lw.release()
+
+    def _hold_lock() -> None:
+        nonlocal spawn_budget, budget_gate, local_budget
+        if not _lw.hold():
+            return
+        running = count_running_tasks(conn)
+        caps = []
+        if max_spawn is not None:
+            caps.append((spawned + max(0, max_spawn - running), _pr.TOTAL_MAX_SPAWN))
+        if max_in_progress is not None:
+            room = max_in_progress - running - count_running_tasks_other_boards(board)
+            caps.append((spawned + max(0, room), _pr.TOTAL_MAX_IN_PROGRESS))
+        level = "unknown" if skip_host_admission else _memory_pressure_level()
+        if level == "critical":
+            result.memory_pressure = level
+            caps.append((spawned, _pr.TOTAL_MEMORY_CRITICAL))
+        elif level == "elevated":
+            result.memory_pressure = result.memory_pressure or level
+            caps.append((1, _pr.TOTAL_MEMORY_ELEVATED))
+        for cap, gate in caps:
+            if spawn_budget is None or cap < spawn_budget:
+                spawn_budget, budget_gate = cap, gate
+        # Starts by others in the window take this host's load-gate allowance too (conservative: a
+        # remote start by another dispatcher is charged as local).
+        others = running - _running_at_release
+        if local_budget is not None and others > 0:
+            local_budget = max(0, local_budget - others)
+        if _per_profile_cap is not None:
+            _load_per_profile_running()
+
     # Lazily populated only when a ready card reaches the point where it would
     # actually spawn. A queue containing only unassigned, capped, guarded, or
     # control-plane cards pays zero collision-scan queries on every idle tick.
@@ -7526,7 +7572,7 @@ def _dispatch_once_locked(
     _portable_room: set = set()
     _lw.mark("route")
     for row_index, row in enumerate(ready_rows):
-        _lw.hold()          # every decision below runs under the board lock (t_f60f502f)
+        _hold_lock()        # every decision below runs under the board lock (t_f60f502f)
         route, route_arg = row_route.get(row["id"], ("local", None))
         if record_only is not None:
             result.placement_waits[row["id"]] = (
@@ -7919,7 +7965,7 @@ def _dispatch_once_locked(
         # Claimed and routed: what follows writes only this claimed run (workspace, clone, spawn), so
         # the board lock goes back until the next row's decision (t_f60f502f, kanban.dispatch.narrow_lock).
         _lw.mark("decide")
-        _lw.release()
+        _release_lock()
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -8174,7 +8220,7 @@ def _dispatch_once_locked(
 
     _lw.mark("decide")
     if not _admit:
-        _lw.hold()          # admit returns below: nothing after its one start needs the board lock
+        _hold_lock()        # admit returns below: nothing after its one start needs the board lock
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete and not _admit)
     if _admit:
         return result
@@ -8253,7 +8299,7 @@ def _dispatch_once_locked(
     review_pool_reserve.clear()
     _lw.mark("post_loop")
     for row in review_rows:
-        _lw.hold()
+        _hold_lock()
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         _review_origin_host = None
@@ -8374,7 +8420,7 @@ def _dispatch_once_locked(
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = fallback_route_source(review_route_source, fallback_selection)
         _lw.mark("review_decide")
-        _lw.release()       # same as the ready lane: only this claimed run is written until the next row
+        _release_lock()     # same as the ready lane: only this claimed run is written until the next row
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )

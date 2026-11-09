@@ -130,6 +130,82 @@ def test_held_time_p95_stays_under_two_seconds_when_spawns_are_slow(kanban_home,
         assert min(held) >= 1.2, held
 
 
+def _status(conn, task_id: str) -> str:
+    return conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+
+
+def _claim_in_window(db_path: Path, title: str, assignee: str = "alpha") -> str:
+    """What a concurrent `kanban admit` does while the tick has the lock handed back: take the board lock
+    (a separate open file) and claim a card."""
+    with kbc._dispatch_tick_lock(db_path) as held:
+        assert held, "the tick kept the lock through its spawn"
+        with kbc.connect() as other:
+            tid = kb.create_task(other, title=title, assignee=assignee)
+            assert kb.claim_task(other, tid) is not None
+    return tid
+
+
+def test_a_claim_made_while_the_lock_is_handed_back_counts_against_max_in_progress(
+        kanban_home, all_assignees_spawnable, monkeypatch):
+    """Prism 3c47847c9979: max_in_progress=2, nothing running, A and B ready. The tick claims A and hands the
+    lock back for A's spawn; an admit claims C in that window. On re-taking the lock the tick must see 2
+    running and leave B ready (the budget computed at tick start said 2 more)."""
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda *a, **k: "ok")
+    db_path = kb.kanban_db_path(board="default")
+    claimed_in_window = []
+
+    def spawn(task, workspace):
+        if not claimed_in_window:
+            claimed_in_window.append(_claim_in_window(db_path, "C"))
+        return None
+
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="A", assignee="alpha")
+        b = kb.create_task(conn, title="B", assignee="alpha")
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_in_progress=2)
+        assert [s[0] for s in res.spawned] == [a]
+        assert _status(conn, b) == "ready"
+        assert kbd.count_running_tasks(conn) == 2
+
+
+def test_a_claim_made_while_the_lock_is_handed_back_counts_against_the_per_profile_cap(
+        kanban_home, all_assignees_spawnable, monkeypatch):
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda *a, **k: "ok")
+    db_path = kb.kanban_db_path(board="default")
+    claimed_in_window = []
+
+    def spawn(task, workspace):
+        if not claimed_in_window:
+            claimed_in_window.append(_claim_in_window(db_path, "C"))
+        return None
+
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="A", assignee="alpha")
+        b = kb.create_task(conn, title="B", assignee="alpha")
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_in_progress_per_profile=2)
+        assert [s[0] for s in res.spawned] == [a]
+        assert _status(conn, b) == "ready"
+        assert b in [s[0] for s in res.skipped_per_profile_capped]
+
+
+def test_memory_pressure_rising_while_the_lock_is_handed_back_stops_the_tick(
+        kanban_home, all_assignees_spawnable, monkeypatch):
+    level = {"now": "ok"}
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda *a, **k: level["now"])
+
+    def spawn(task, workspace):
+        level["now"] = "critical"
+        return None
+
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="A", assignee="alpha")
+        b = kb.create_task(conn, title="B", assignee="alpha")
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert [s[0] for s in res.spawned] == [a]
+        assert _status(conn, b) == "ready"
+        assert res.memory_pressure == "critical"
+
+
 def test_narrow_lock_config_reader():
     assert kbd.narrow_lock_enabled({}) is True
     assert kbd.narrow_lock_enabled({"dispatch": {"narrow_lock": True}}) is True
