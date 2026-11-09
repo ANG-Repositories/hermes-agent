@@ -52,8 +52,15 @@ def test_worktree_card_without_a_mirror_row_stays_local(kanban_home, anchor):
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
         rules: dict = {}
-        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules)[0] == "local"
+        route, reason = kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules)
+        assert route == "local"
+        assert "worktree is Studio-only" in reason
+        assert "kanban-worktree-mirrors.json" in reason
+        assert "clean pushed" in reason
         assert rules[tid] == "workspace_kind"
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        assert spawned == []
+        assert res.placement_waits[tid] == reason
 
 
 def test_worktree_card_with_a_mirror_is_portable_and_clones_on_the_host(

@@ -5462,6 +5462,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             # Name what it needs (t_aea826a9): ``studio_affinity:studio_needs(vault,skills_tree)``.
             return "local", f"studio_affinity:{rule}({','.join(sorted(_kwp.card_needs(row['body'])))})"
         return "local", f"studio_affinity:{rule}"
+    if rule == "workspace_kind" and (row["workspace_kind"] or "scratch") == "worktree":
+        # Linked worktrees reference the Studio's git common dir. Only the
+        # mirror-backed clone route above can safely move their baseline.
+        return "local", ("not_portable:workspace_kind:worktree is Studio-only without a safe mirror-backed "
+                         "clone; fleet/kanban-worktree-mirrors.json must list the repo and destination "
+                         "host, and the source must be an eligible anchor or clean pushed card worktree")
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)

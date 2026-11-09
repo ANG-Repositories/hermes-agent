@@ -190,6 +190,35 @@ def test_body_sniff_pins_and_comments(home, fleet, monkeypatch):
 
 # -- 4: overrides and the rule order (F3) ----------------------------------------
 
+@pytest.mark.parametrize("override", ["host: any", "requires: none", ""])
+def test_held_body_sniff_rechecked_next_tick(home, fleet, monkeypatch, override):
+    _mode(monkeypatch)
+    with kb.connect_closing() as conn:
+        body = "add these to the cart on :9222"
+        tid = _card(conn, body=body)
+        res, spawned = _tick(conn)
+        assert spawned == []
+        assert res.placement_waits[tid] == "studio_affinity:requires:browser-session"
+        conn.execute("UPDATE tasks SET body=? WHERE id=?", (override + "\n" + body, tid))
+        conn.commit()
+    # Reopen the DB to exclude in-memory routing state from the proof.
+    with kb.connect_closing() as conn:
+        res, spawned = _tick(conn)
+        if override:
+            assert spawned == [(tid, "ace-ai")]
+            assert tid not in res.placement_waits
+            assert _events(conn, tid, "placement_affinity")[-1] == {"cleared": True}
+            released = _comments(conn, tid, prefix="auto-pin released:")
+            assert len(released) == 1
+            assert "current body and skills" in released[0]
+            # A later tick must not repeat the release confirmation.
+            _tick(conn)
+            assert _comments(conn, tid, prefix="auto-pin released:") == released
+        else:
+            assert spawned == []
+            assert res.placement_waits[tid] == "studio_affinity:requires:browser-session"
+
+
 def test_body_sniff_overridden_by_host_any(home, fleet, monkeypatch):
     _mode(monkeypatch)
     with kb.connect_closing() as conn:
