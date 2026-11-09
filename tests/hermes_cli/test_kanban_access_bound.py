@@ -139,6 +139,33 @@ def test_prose_is_not_access_bound(body):
     assert not (rule or "").startswith(pr.ACCESS_BOUND), rule
 
 
+@pytest.mark.parametrize("body", [
+    # t_e32e34f0's shape: a PR that edits the TRACKED repo copy (every pool clone has it).
+    "Edit fleet/kanban-pool.json in hermes-home: add ace-media to priority, open a PR.\n",
+    "files: `fleet/kanban-pool.json`, scripts/kanban-pool-lint.py\n",
+    "- M fleet/kanban-pool.json\n- A tests/fixtures/state/kanban.db\n",
+    "scripts/tools/load_gate.json is the fixture; tests/data/gateway.log the sample\n",
+])
+def test_repo_relative_control_plane_path_is_portable(body):
+    """RED ON BASE: (False, 'access_bound:control-plane-read', None) - any path shape bound (t_e7c03f48)."""
+    assert _portable(body) == (True, None, "policy")
+
+
+@pytest.mark.parametrize("body", [
+    KANBAN_DB,                                                       # ~-rooted live board
+    "sqlite3 /Users/alexgierczyk/.hermes/kanban.db .tables\n",       # absolute home path
+    "jq . $HOME/.hermes/fleet/kanban-pool.json\n",                   # $HOME-rooted live pool file
+    "tail logs/gateway.log\n",                                        # the live logs/ dir
+    "jq . state/load_gate.json\n",                                    # the live state/ dir
+    "cat ./kanban.db\n",
+    "Edit fleet/kanban-pool.json, then check ~/.hermes/kanban.db\n",  # one live path on the line binds
+    "requires: control-plane-read\nEdit fleet/kanban-pool.json in a PR.\n",  # explicit override still binds
+])
+def test_live_control_plane_path_still_binds(body):
+    """MUTATION (bind nothing): every live form and the explicit declaration keep the card on the Studio."""
+    assert _portable(body) == (False, "access_bound:control-plane-read", None)
+
+
 def test_quoted_remote_command_with_and_and_still_binds():
     assert _portable("ssh ci-box 'uptime && sudo dmesg | tail'\n") == \
         (False, "access_bound:ssh-root:ci-box", None)

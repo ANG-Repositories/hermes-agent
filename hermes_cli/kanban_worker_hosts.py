@@ -329,6 +329,130 @@ def local_workspace_has_content(path: Optional[str]) -> bool:
         return True
 
 
+# local_files binds only on content the remote cannot reproduce (t_e7c03f48): t_e32e34f0's Studio scratch dir held a
+# clean worktree whose HEAD was the pushed PR head plus logs and a patch, and that alone kept it Studio-only for 2 h+
+# while the pool sat idle. A placed run starts from a fresh directory on the pool host (workspaces are host-local,
+# TERMINAL_SSH_SYNC_FILES=false) and re-clones from the remote; the Studio directory is left in place, untouched.
+WORKSPACE_THROWAWAY_GLOBS = ("*.log", "*.patch", "pr-body.md")
+WORKSPACE_SCAN_MAX_ENTRIES = 2000
+WORKSPACE_GIT_TIMEOUT_SECONDS = 20
+WORKSPACE_BINDING_TTL_SECONDS = 120
+_binding_cache: Dict[str, tuple] = {}
+
+
+def _throwaway(name: str) -> bool:
+    import fnmatch
+    return any(fnmatch.fnmatchcase(name, g) for g in WORKSPACE_THROWAWAY_GLOBS)
+
+
+def _show(rel: str) -> str:
+    """``rel`` safe for a one-line reason detail (no parens, no control characters), bounded."""
+    text = "".join(c if c.isprintable() and c not in "()" else "?" for c in rel)
+    return text[:200] or "."
+
+
+def _git_binding(repo: str, rel: str, runner: Callable) -> Optional[str]:
+    """The first thing in git checkout ``repo`` the remote cannot reproduce, or None: a dirty tracked path, an
+    untracked file outside :data:`WORKSPACE_THROWAWAY_GLOBS`, or a HEAD no remote-tracking ref contains. Ignored
+    files are the repo's own throwaway list. Any git failure binds (fail closed)."""
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(k, None)
+
+    def git(*args):
+        return runner(["git", "-C", repo, *args], capture_output=True, env=env, stdin=subprocess.DEVNULL,
+                      timeout=WORKSPACE_GIT_TIMEOUT_SECONDS)
+
+    def join(p: str) -> str:
+        return p if rel in ("", ".") else f"{rel}/{p}"
+
+    try:
+        st = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        if st.returncode != 0:
+            return f"{rel or '.'}@git-status-failed"
+        recs = (st.stdout or b"").split(b"\0")
+        i = 0
+        while i < len(recs):
+            rec = recs[i].decode("utf-8", "replace")
+            i += 1
+            if len(rec) < 4:
+                continue
+            code, path = rec[:2], rec[3:]
+            if code[0] in "RC":
+                i += 1  # the rename/copy source record follows
+            if code == "??" and _throwaway(os.path.basename(path.rstrip("/"))):
+                continue
+            return join(path)
+        head = git("rev-list", "-n1", "HEAD", "--not", "--remotes")
+        if head.returncode != 0:
+            return f"{rel or '.'}@git-head-unreadable"
+        sha = (head.stdout or b"").decode("ascii", "replace").strip()
+        if sha:
+            return f"{rel or '.'}@unpushed:{sha[:12]}"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return f"{rel or '.'}@git-failed"
+    return None
+
+
+def local_workspace_binding(path: Optional[str], *, runner: Callable = subprocess.run,
+                            now: Optional[float] = None) -> Optional[str]:
+    """None when the card's LOCAL workspace holds nothing a pool host cannot reproduce; else the first binding
+    path, relative to the workspace (the ``local_files`` reason detail).
+
+    Reproducible = (a) a git checkout that is clean (no dirty tracked path, no untracked file outside
+    :data:`WORKSPACE_THROWAWAY_GLOBS`) with HEAD contained in a remote-tracking ref, and (b) files matching
+    :data:`WORKSPACE_THROWAWAY_GLOBS`. Anything else binds: another file, a symlink, a special file, an unpushed
+    HEAD, a scan or git error, more than :data:`WORKSPACE_SCAN_MAX_ENTRIES` entries outside checkouts. An empty
+    or missing workspace is None (:func:`local_workspace_has_content`). Cached per path for
+    :data:`WORKSPACE_BINDING_TTL_SECONDS` and the root's mtime: the dispatcher asks every tick.
+    """
+    import time as _time
+    if not local_workspace_has_content(path):
+        return None
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        root = str(canon(path))
+        stamp = os.stat(root).st_mtime_ns
+    except (OSError, RuntimeError, ValueError):
+        return "."
+    t = _time.monotonic() if now is None else now
+    hit = _binding_cache.get(root)
+    if hit is not None and hit[1] == stamp and t - hit[0] < WORKSPACE_BINDING_TTL_SECONDS:
+        return hit[2]
+    seen = [0]
+
+    def walk(d: str, rel: str) -> Optional[str]:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return _git_binding(d, rel, runner)
+        try:
+            with os.scandir(d) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            return rel or "."
+        for e in entries:
+            r = e.name if not rel else f"{rel}/{e.name}"
+            seen[0] += 1
+            if seen[0] > WORKSPACE_SCAN_MAX_ENTRIES:
+                return f"{r}@scan-limit"
+            try:
+                if e.is_symlink():
+                    return r
+                if e.is_dir(follow_symlinks=False):
+                    sub = walk(e.path, r)
+                    if sub is not None:
+                        return sub
+                elif not (e.is_file(follow_symlinks=False) and _throwaway(e.name)):
+                    return r
+            except OSError:
+                return r
+        return None
+
+    verdict = walk(root, "")
+    verdict = None if verdict is None else _show(verdict)
+    _binding_cache[root] = (t, stamp, verdict)
+    return verdict
+
+
 # local_files continuity overflow (t_e604c0f9): a card whose Studio scratch dir holds files runs on the Studio while
 # its gate admits; when it does not, the dir is carried to the chosen pool host (same path) and the card runs there.
 # The bounds keep the in-tick scan and copy short; they are a cost bound, not a capacity count: a bigger dir keeps

@@ -515,3 +515,135 @@ def test_a_carried_card_waits_when_there_is_no_pool_plan(kanban_home, carried):
         conn.commit()
         _res, spawned = _tick(conn, spillover=None, spawn_limit=4)
     assert (tid, None) not in spawned and (plain, None) in spawned
+
+
+# -- t_e7c03f48: only content the remote cannot reproduce binds ------------------------------------------------
+# t_e32e34f0's Studio scratch dir held a clean git worktree whose HEAD was the pushed PR head, plus logs and a patch;
+# that kept it Studio-only (local_files) for 2 h+ while the pool sat idle.
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                    "-c", "init.defaultBranch=main", *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+@pytest.fixture
+def reproducible_workspace(tmp_path):
+    """A workspace dir holding a clean `git worktree` (HEAD pushed) plus three logs, a patch and pr-body.md."""
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    origin, seed = tmp_path / "origin.git", tmp_path / "seed"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    _git(tmp_path, "clone", "-q", str(origin), str(seed))
+    (seed / "README.md").write_text("x\n")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-q", "-m", "seed")
+    _git(seed, "push", "-q", "origin", "HEAD:main")
+
+    def make(ws: Path) -> Path:
+        ws.mkdir(parents=True, exist_ok=True)
+        repo = ws / "repo"
+        _git(seed, "worktree", "add", "-q", "-b", f"feat-{ws.name}", str(repo), "HEAD")
+        (repo / "fix.py").write_text("print(1)\n")
+        _git(repo, "add", "fix.py")
+        _git(repo, "commit", "-q", "-m", "fix")
+        _git(repo, "push", "-q", "origin", "HEAD")
+        for name in ("run.log", "test.log", "gate.log", "fix.patch", "pr-body.md"):
+            (ws / name).write_text("throwaway\n")
+        return repo
+    return make
+
+
+def _card_in(conn, make, body=None):
+    tid = kb.create_task(conn, title="lf", assignee="alpha", body=body)
+    path = Path(kbw.resolve_workspace(kb.get_task(conn, tid)))
+    repo = make(path)
+    kbw.set_workspace_path(conn, tid, str(path))
+    return tid, path, repo
+
+
+def test_clean_pushed_worktree_plus_logs_is_portable(kanban_home, carried, reproducible_workspace):
+    """RED ON BASE: ((portable, None), 'local_files', True) - any file bound the card (it was carried at best)."""
+    with kb.connect_closing() as conn:
+        tid, path, _repo = _card_in(conn, reproducible_workspace)
+        assert _route(conn, tid, None) == (("portable", None), "policy", False)
+        assert kwh.local_workspace_binding(str(path)) is None
+
+
+def test_clean_pushed_worktree_is_portable_under_the_kill_switch_too(kanban_home, carried, reproducible_workspace):
+    """The fix is in the classifier, not in the continuity carry: the old pin rule no longer sees content."""
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, _path, _repo = _card_in(conn, reproducible_workspace)
+        assert _route(conn, tid, None) == (("portable", None), "policy", False)
+
+
+def test_one_untracked_file_binds_and_is_named(kanban_home, carried, reproducible_workspace):
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, path, repo = _card_in(conn, reproducible_workspace)
+        (repo / "scratch.txt").write_text("unsaved work\n")
+        assert _route(conn, tid, None) == (("local", None), "local_files", False)
+        assert kwh.local_workspace_binding(str(path)) == "repo/scratch.txt"
+
+
+def test_host_any_wait_reason_names_the_binding_path(kanban_home, carried, reproducible_workspace):
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, _path, repo = _card_in(conn, reproducible_workspace, body="host: any\nfix it")
+        (repo / "scratch.txt").write_text("unsaved work\n")
+        route, rule, _ = _route(conn, tid, None)
+    assert route == ("local", "not_portable:local_files(repo/scratch.txt)") and rule == "local_files"
+
+
+def test_dirty_tracked_file_binds(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    (repo / "README.md").write_text("edited\n")
+    assert kwh.local_workspace_binding(str(ws)) == "repo/README.md"
+
+
+def test_unpushed_commit_binds(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    (repo / "more.py").write_text("x\n")
+    _git(repo, "add", "more.py")
+    _git(repo, "commit", "-q", "-m", "local only")
+    assert (kwh.local_workspace_binding(str(ws)) or "").startswith("repo@unpushed:")
+
+
+@pytest.mark.parametrize("name", ["notes.md", "session.jsonl", "pr-body.md.bak"])
+def test_a_file_outside_the_throwaway_list_binds(reproducible_workspace, tmp_path, name):
+    ws = tmp_path / "ws"
+    reproducible_workspace(ws)
+    (ws / name).write_text("x\n")
+    assert kwh.local_workspace_binding(str(ws)) == name
+
+
+def test_a_symlink_binds(tmp_path):
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "run.log").write_text("x\n")
+    (ws / "link").symlink_to(tmp_path)
+    assert kwh.local_workspace_binding(str(ws)) == "link"
+
+
+def test_throwaway_only_workspace_is_portable_and_empty_is_none(tmp_path):
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    assert kwh.local_workspace_binding(str(ws)) is None          # missing
+    ws.mkdir()
+    assert kwh.local_workspace_binding(str(ws)) is None          # empty
+    (ws / "logs").mkdir()
+    (ws / "logs" / "a.log").write_text("x\n")
+    (ws / "b.patch").write_text("x\n")
+    assert kwh.local_workspace_binding(str(ws)) is None
+
+
+def test_a_git_failure_binds(tmp_path):
+    """A worktree whose gitdir is gone cannot be proven reproducible: fail closed."""
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    (ws / "repo").mkdir(parents=True)
+    (ws / "repo" / ".git").write_text("gitdir: /nonexistent/gitdir\n")
+    assert (kwh.local_workspace_binding(str(ws)) or "").startswith("repo@git-")
