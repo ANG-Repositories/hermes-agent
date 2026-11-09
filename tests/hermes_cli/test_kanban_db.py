@@ -330,7 +330,7 @@ def test_explicit_block_cannot_spoof_legacy_creation_reason(kanban_home):
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
-        assert kb.schedule_task(conn, t, reason="run next week") is True
+        assert kb.schedule_task(conn, t, reason="run next week", wake_at=2_000_000_000) is True
         task = kb.get_task(conn, t)
         assert task.status == "scheduled"
         assert kb.claim_task(conn, t) is None
@@ -340,7 +340,7 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         # a plain park of a ready card resumes as an implementation run.
         assert any(
             e.kind == "scheduled"
-            and e.payload == {"reason": "run next week", "source_status": "ready"}
+            and e.payload == {"reason": "run next week", "source_status": "ready", "until": 2_000_000_000}
             for e in events
         )
 
@@ -3243,7 +3243,7 @@ def test_create_task_with_open_parent_emits_dependency_wait(kanban_home):
     unfinished parent must carry the same dependency_wait as a link-time gate."""
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="blocked parent")
-        kb.block_task(conn, parent, reason="waiting on files")
+        kb.block_task(conn, parent, reason="waiting on files", kind="needs_input")
 
         child = kb.create_task(conn, title="support card", parents=(parent,))
 

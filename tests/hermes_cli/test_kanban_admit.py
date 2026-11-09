@@ -758,8 +758,14 @@ def _site_triggers():
 
     def human_lane(m, ctx):
         upd("UPDATE tasks SET assignee='human:apollo' WHERE id=?", ctx)
+        with kb.connect_closing() as conn:
+            for tid in ctx["tids"]:
+                task = kb.get_task(conn, tid)
+                assert task is not None and task.status == "todo"
         m.setattr(profiles, "profile_exists", lambda name: not str(name).startswith("human"))
-        return "studio", "twin", "not a spawnable profile"
+        # The lifecycle entry guard parks human assignments before dispatch.
+        # admit reports its ready-only precondition; the tick never sees the row.
+        return "studio", "admit", "status is todo"
 
     def pause_pre(m, ctx):
         m.setattr(kph, "held_routes", lambda rows, cache: {r["id"]: ("wait", "pause_hold (test)") for r in rows})

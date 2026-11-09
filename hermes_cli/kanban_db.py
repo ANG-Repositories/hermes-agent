@@ -6926,6 +6926,7 @@ def create_task(
                     'workspace_of': workspace_of,
                     'boomerang_wake': None if boomerang_wake is None else (1 if boomerang_wake else 0),
                     'signature': signature,
+                    'next_eligible_at': int(until) if until is not None else None,
                 })
                 for pid in parents:
                     conn.execute(
@@ -9221,6 +9222,25 @@ def _append_event(
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
     boot = _boot_evidence() if kind in _BOOT_EVIDENCE_KINDS else None
+    if kind == "review_requested":
+        # A raw-entry trigger supplies provisional provenance before the normal
+        # handoff writer has finished. Finalize that row rather than publish two
+        # handoffs (and two notifications) for the same entry.
+        provisional = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_requested' "
+            "AND json_valid(payload) AND json_extract(payload,'$.source')='lifecycle_entry_repair' "
+            "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested')",
+            (task_id, task_id),
+        ).fetchone()
+        if provisional is not None:
+            payload = {**json.loads(provisional[1]), **(payload or {})}
+            payload.pop("source", None)
+            conn.execute(
+                "UPDATE task_events SET run_id=?,payload=?,actor_profile=?,actor_session_id=? WHERE id=?",
+                (run_id, _json_or_null(payload), actor_profile, actor_session_id, provisional[0]),
+            )
+            _journal_append(conn, task_id, kind, payload, run_id=run_id)
+            return
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
         "actor_profile, actor_session_id, boottime, boot_id) "
@@ -9633,7 +9653,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -9661,6 +9681,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if all(p["status"] in ("done", "archived") and p["kind"] != LINK_KIND_AFTER_MERGE
                    for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
+                if resume_status == "ready" and is_human_reviewer(row["assignee"]):
+                    continue
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
                     # recover -> respawn -> exhaust -> block forever). The
@@ -14057,6 +14079,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
     if until is not None and kind != "deferred":
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
@@ -14069,11 +14092,16 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, claim_lock FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, claim_lock, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        if expected_run_id is not None and cur_row["current_run_id"] != expected_run_id:
+            return False
+        if (kind is None and cur_row["status"] in ('running', 'ready', 'review')
+                and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or "")):
+            raise BlockRefused("block needs a kind or an explicit unblock_when predicate")
         if require_unclaimed_ready and (cur_row["status"] != "ready" or cur_row["claim_lock"] is not None):
             return False
         # Refuse only where a block could have landed; a done/archived/
@@ -17979,22 +18007,25 @@ def set_task_priority(
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park until a validated wake time, atomically with ending the run."""
+    if wake_at is not None:
+        wake_at = validate_wake_at(wake_at)
     with write_txn(conn):
-        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT status, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        from hermes_cli.kanban_lifecycle_guards import has_event_gate
+        if wake_at is None and not (row and has_event_gate(row["body"])):
+            raise ValueError("scheduled needs a wake time (--at or --now) or unblock_when: event:<name>")
         parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
-        params: list[Any] = [task_id]
+        params: list[Any] = [wake_at, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL,
-                   -- A leftover rate-limit cooldown would read as a timed wake
-                   -- to wake_due_scheduled; set_schedule_wake stamps a real one.
-                   next_eligible_at = NULL
+                   next_eligible_at = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
@@ -18007,7 +18038,7 @@ def schedule_task(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, "scheduled",
-                      {"reason": reason, "source_status": parked_from}, run_id=run_id)
+                      {"reason": reason, "source_status": parked_from, "until": wake_at}, run_id=run_id)
         return True
 
 # Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a
