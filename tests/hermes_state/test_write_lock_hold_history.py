@@ -108,8 +108,8 @@ def test_history_is_bounded_to_one_rotation(db, monkeypatch):
     ledger = Path(lockowners._ledger_dir(db.db_path))
     current, backup = ledger / "history.jsonl", ledger / "history.jsonl.1"
     assert backup.exists() and current.stat().st_size <= 600 and backup.stat().st_size <= 600
-    assert sorted(p.name for p in ledger.iterdir() if p.name.startswith("history")) == ["history.jsonl",
-                                                                                          "history.jsonl.1"]
+    assert sorted(p.name for p in ledger.iterdir() if p.name.startswith("history.jsonl")) == [
+        "history.jsonl", "history.jsonl.1"]
     assert lockowners.ledger_history(db.db_path, 0, time.time() + 1), "both generations are readable"
 
 
@@ -133,10 +133,12 @@ def test_concurrent_rotation_never_clobbers_the_archived_generation(tmp_path, mo
     conflict exactly like two processes."""
     ledger = tmp_path / "state.db.lockholders"
     ledger.mkdir(mode=0o700)
-    monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 200)
+    # Cap sized so the pre-filled file is over it but A's and B's records fit together after ONE
+    # rotation: any second rotation is then the race, not the cap.
+    monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 600)
     monkeypatch.setattr(lockowners, "_HISTORY_LOCK_WAIT_S", 5.0)
-    full = b"".join(b'{"since": 1.0, "op": "archived", "n": %d}\n' % i for i in range(5))
-    assert len(full) > 150
+    full = b"".join(b'{"since": 1.0, "op": "archived", "n": %02d}\n' % i for i in range(16))
+    assert len(full) > 600
     (ledger / "history.jsonl").write_bytes(full)
 
     real_replace = os.replace
@@ -188,6 +190,21 @@ def test_busy_history_lock_appends_without_rotating(tmp_path, monkeypatch):
     assert not (ledger / "history.jsonl.1").exists()
     data = (ledger / "history.jsonl").read_bytes()
     assert data.startswith(full) and b'"contended"' in data
+
+
+def test_unusable_history_lock_still_appends_and_never_rotates(tmp_path, monkeypatch):
+    """Prism acdf6a446932: a directory planted as history.lock must not drop records. The lock only
+    guards rotation, so the record is appended and the full file is left unrotated."""
+    ledger = tmp_path / "state.db.lockholders"
+    ledger.mkdir(mode=0o700)
+    (ledger / "history.lock").mkdir()
+    monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 100)
+    full = b"y" * 150 + b"\n"
+    (ledger / "history.jsonl").write_bytes(full)
+    lockowners._append_history(_fake_hold(ledger, 1, "release"), {"held_s": 3.0, "state": "released"})
+    data = (ledger / "history.jsonl").read_bytes()
+    assert data.startswith(full) and b'"release"' in data, data
+    assert not (ledger / "history.jsonl.1").exists()
 
 
 def _waiter_lines(caplog):

@@ -418,6 +418,19 @@ def _try_lock_fd(lock_fd: int) -> bool:
         return False
 
 
+def _open_history_lock(name: str, *, dir_fd: Optional[int] = None) -> Optional[int]:
+    """fd of history.lock, or None when it cannot be opened (a directory or symlink planted under that
+    name, EACCES). None means "rotate nothing, still append" (Prism acdf6a446932): the lock guards only
+    rotation, so an unusable lock file must never cost the record itself."""
+    try:
+        if dir_fd is None:
+            return os.open(name, os.O_RDWR | os.O_CREAT, 0o600)
+        return os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError:
+        logger.debug("state.db lock-holder history.lock unusable; appending without rotation", exc_info=True)
+        return None
+
+
 def _acquire_history_lock(lock_fd: int) -> bool:
     """True once the cross-process history lock is held; False after _HISTORY_LOCK_WAIT_S."""
     deadline = time.monotonic() + _HISTORY_LOCK_WAIT_S
@@ -446,24 +459,25 @@ def _append_history(hold: dict, fields: dict) -> None:
             if os.path.islink(ledger) or not os.path.isdir(ledger):
                 return
             path = os.path.join(ledger, _HISTORY_NAME)
-            lock_fd = os.open(os.path.join(ledger, _HISTORY_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+            lock_fd = _open_history_lock(os.path.join(ledger, _HISTORY_LOCK_NAME))
             try:
-                if _acquire_history_lock(lock_fd):  # released by the close below
+                if lock_fd is not None and _acquire_history_lock(lock_fd):  # released by the close below
                     with contextlib.suppress(OSError):
                         if os.path.getsize(path) + len(line) > _HISTORY_MAX_BYTES:
                             os.replace(path, path + ".1")
                 with open(path, "ab") as handle:
                     handle.write(line)
             finally:
-                os.close(lock_fd)
+                if lock_fd is not None:
+                    os.close(lock_fd)
             return
         fd = _open_ledger(ledger, create=False)
         if fd is None:
             return
         try:
-            lock_fd = os.open(_HISTORY_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            lock_fd = _open_history_lock(_HISTORY_LOCK_NAME, dir_fd=fd)
             try:
-                if _acquire_history_lock(lock_fd):  # released by the close below
+                if lock_fd is not None and _acquire_history_lock(lock_fd):  # released by the close below
                     # Size check under the lock: a peer that rotated first left a small file here.
                     with contextlib.suppress(FileNotFoundError):
                         st = os.stat(_HISTORY_NAME, dir_fd=fd, follow_symlinks=False)
@@ -476,7 +490,8 @@ def _append_history(hold: dict, fields: dict) -> None:
                 finally:
                     os.close(out)
             finally:
-                os.close(lock_fd)
+                if lock_fd is not None:
+                    os.close(lock_fd)
         finally:
             os.close(fd)
     except Exception:
