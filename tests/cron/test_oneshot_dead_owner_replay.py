@@ -283,3 +283,97 @@ def test_dead_owner_episodes_are_isolated_per_store(home, monkeypatch, tmp_path)
     assert key_a in jobs_mod._dead_owner_wedge_paged
     with jobs_mod.use_cron_store(other):
         assert jobs_mod._dead_owner_episode_scope() != key_a.rsplit(":", 1)[0]
+
+
+def test_repeated_recovery_reconcile_keeps_the_armed_replay(home, monkeypatch):
+    """Prism c140f4b963a7 / 928f8b0f4e8d: a second reconcile of the same ``unknown`` execution
+    (another job's recovery, or a restart before dispatch) must keep the armed replay pending,
+    not fall through to mark_job_run and retire the one-shot unrun."""
+    import cron.jobs as jobs_mod
+    from cron.executions import latest_execution
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    _seed(home.path, datetime.now(timezone.utc).astimezone() - timedelta(seconds=1))
+    _sigterm_owner_mid_run(home.path)
+    assert InProcessCronScheduler().recover_interrupted() >= 1
+    armed_of = latest_execution(JOB_ID)["id"]
+    assert _store(home.path)[jobs_mod.DEAD_OWNER_REPLAY_OF_KEY] == armed_of
+
+    for _ in range(2):
+        InProcessCronScheduler._reconcile_jobs_after_recovery()
+    again = _store(home.path)
+    assert again["last_run_at"] is None
+    assert again["repeat"]["completed"] == 0
+    assert again[jobs_mod.RESTART_REQUEUE_COUNT_KEY] == 1
+
+    _shift_clock(monkeypatch, 5)
+    assert [j["id"] for j in jobs_mod.get_due_jobs()] == [JOB_ID]
+    assert [j["id"] for j in jobs_mod.get_due_jobs()] == []
+
+
+@pytest.mark.parametrize("path", ["due_scan", "startup"])
+def test_rescheduled_future_instant_is_kept(home, monkeypatch, path):
+    """Prism 86a33629e76f: a one-shot rescheduled into the future after its owner died keeps
+    that instant; the dead claims are no licence to run it now."""
+    import cron.jobs as jobs_mod
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    _seed(home.path, datetime.now(timezone.utc).astimezone() - timedelta(seconds=1))
+    _sigterm_owner_mid_run(home.path)
+    tomorrow = (datetime.now(timezone.utc).astimezone() + timedelta(days=1)).replace(microsecond=0)
+    jobs_mod.update_job(JOB_ID, {"schedule": {"kind": "once", "run_at": tomorrow.isoformat()}})
+    planned = _store(home.path)["next_run_at"]
+    assert jobs_mod._parse_aware(planned) > datetime.now(timezone.utc)
+    assert _store(home.path)["run_claim"]  # the dead claims survive the edit
+
+    if path == "startup":
+        InProcessCronScheduler().recover_interrupted()
+    _shift_clock(monkeypatch, 5)
+    assert [j["id"] for j in jobs_mod.get_due_jobs()] == []
+    kept = _store(home.path)
+    assert kept["next_run_at"] == planned
+    assert kept["last_run_at"] is None
+    assert kept.get("manual_run_at") != planned
+
+
+def _write_outcome_record(dead_pid: int) -> Path:
+    """An outcome record the orphaned script still owns: no .rc yet, inside the settle grace."""
+    import time
+
+    from cron.script_outcome_records import _records_dir
+
+    d = _records_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    base = d / "exec-orphan"
+    base.with_suffix(".json").write_text(json.dumps({
+        "job_id": JOB_ID, "execution_id": "exec-orphan", "owner_pid": dead_pid,
+        "owner_started_at": None, "started_at": time.time()}))
+    return base
+
+
+@pytest.mark.parametrize("path", ["due_scan", "startup"])
+def test_unsettled_orphan_script_defers_the_replay(home, monkeypatch, path):
+    """Prism b0a1982205e6: a dead owner does not prove its script stopped. While the script's
+    outcome record exists, never replay (a second concurrent copy) and never retire the job;
+    once settle removes the record, the replay fires exactly once."""
+    import cron.jobs as jobs_mod
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    _seed(home.path, datetime.now(timezone.utc).astimezone() - timedelta(seconds=1))
+    dead_pid = _sigterm_owner_mid_run(home.path)
+    base = _write_outcome_record(dead_pid)
+
+    if path == "startup":
+        InProcessCronScheduler().recover_interrupted()
+        held = _store(home.path)
+        assert held["last_run_at"] is None  # not retired by reconcile's mark_job_run
+        assert held["run_claim"] and held["repeat"]["completed"] == 1
+    _shift_clock(monkeypatch, 4493)
+    for _ in range(4):
+        assert [j["id"] for j in jobs_mod.get_due_jobs()] == []
+    assert not _store(home.path).get(jobs_mod.RESTART_REQUEUE_COUNT_KEY)
+    assert home.pages == []  # an orphan still running is not a wedge
+
+    base.with_suffix(".json").unlink()  # settle proved it killed (no .rc) and discarded it
+    assert [j["id"] for j in jobs_mod.get_due_jobs()] == [JOB_ID]
+    assert [j["id"] for j in jobs_mod.get_due_jobs()] == []
