@@ -461,7 +461,8 @@ def test_a_studio_pin_a_skill_needs_is_kept(kanban_home, monkeypatch):
         route, rule, _ = _route(conn, tid, caps)
         bare = kb.create_task(conn, title="y", assignee="alpha", body="host: studio\nfix the lint")
         assert _route(conn, bare, caps)[0] == ("portable", None)  # no such skill: still dropped
-    assert route[0] == "local" and rule == "host_studio", (route, rule)
+    # The skill's need is enforced by the capability verdict first, so the card is held local under that rule.
+    assert route == ("local", "studio_affinity:requires:docker") and rule == "requires:docker", (route, rule)
     monkeypatch.setattr(khc, "load_map", lambda fleet: cmap)
     assert kwp.mint_studio_pin_note("host: studio", kanban_home / "fleet", ["docker-ops"]) is None
     assert kwp.mint_studio_pin_note("host: studio", kanban_home / "fleet") is not None
@@ -487,7 +488,8 @@ def test_a_shared_workspace_is_never_carried(kanban_home, carried):
         other = kb.create_task(conn, title="o", assignee="alpha")
         kbw.set_workspace_path(conn, other, path)
         assert kwh.carry_path_shared(conn, tid, path)
-        assert _route(conn, tid, None) == (("local", None), "local_files", False)
+        # The shared-workspace pin fires before local_files: local, not carried.
+        assert _route(conn, tid, None) == (("local", None), f"workspace_shared:{other}", False)
         _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="saturated:cpu")
     assert carried == [] and all(t != tid for t, _h in spawned)
 
