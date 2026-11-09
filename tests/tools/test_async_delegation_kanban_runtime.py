@@ -1743,19 +1743,26 @@ def test_pause_hold_refusal_stops_a_runner_found_running_under_the_lock(monkeypa
 @pytest.fixture
 def detached_fallback(monkeypatch, home):
     """The default ``background_kanban_fallback: detached``; the detached child is recorded, not spawned."""
-    from hermes_cli import profiles
-    monkeypatch.setattr(profiles, "resolve_profile_env", lambda name: str(home))
-    (home / "config.yaml").write_text("model:\n  default: gpt-4.1-mini\n")
+    from hermes_cli import model_policy
+    monkeypatch.setattr(model_policy, "assignee_pinned_model", lambda assignee, model: model)
+    monkeypatch.setattr(model_policy, "assignee_default_model", lambda assignee: "gpt-4.1-mini")
     from tools import delegate_detached as dd
     from tools import delegate_tool_config as cfgmod
 
     monkeypatch.setattr(cfgmod, "_get_kanban_launch_fallback", lambda: "detached")
     monkeypatch.setattr(dd, "spawn_mode", lambda: "scoped")
+    from gateway import kanban_watchers
+    receipts = []
+    monkeypatch.setattr(kanban_watchers, "_alert_notify_script", lambda: Path("sandbox-notify.py"))
+    monkeypatch.setattr(kanban_watchers, "_notify_send",
+                        lambda script, message, extra, **kw: receipts.append((message, extra)) or True)
     seen = []
 
     def _fake_detached(delegation_id, attempt_id, profile_home, *, continuation, live_delegation_id,
                        fallback_runner, on_spawned=None):
         seen.append({"attempt_id": attempt_id, "record": _record(delegation_id), "fallback": fallback_runner})
+        assert len(receipts) == 1 and "runtime=detached" in receipts[0][0]
+        assert receipts[0][1] == ["--target", kanban_watchers._needs_input_channels()[1]]
         return {"results": [{"task_index": 0, "status": "completed", "summary": "detached result"}],
                 "total_duration_seconds": 0.1}, None
 
@@ -1826,6 +1833,8 @@ def test_detached_fallback_coordinates_with_an_in_process_profile(monkeypatch, t
         return {"status": "completed", "summary": "serialized"}, None
 
     monkeypatch.setattr(ad, "_run_detached_unit", detached)
+    monkeypatch.setattr(akb, "launch_unit", lambda **kw: {
+        "ok": False, "error": "OSError: forced launch failure", "task_id": None, "fenced": True})
     handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
     assert calls == [] and seen == ["B"]
     assert _record(handle["delegation_id"])["state"] == "done"

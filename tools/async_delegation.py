@@ -1731,7 +1731,25 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
     finally:
         _akb.release_launch_fence(launched.get("task_id"))
     _note_kanban_launch(delegation_id, f"{mode} (kanban spawn failed: {error_class})")
+    _note_kanban_fallback_receipt(delegation_id, mode, error_class, record)
     return mode
+
+
+def _note_kanban_fallback_receipt(delegation_id: str, mode: str, reason: str, record: dict) -> None:
+    """Best-effort fleet #logs receipt via the existing sandbox-aware notify boundary."""
+    logger.warning("async_delegation_runtime_fallback delegation_id=%s runtime=%s reason=%s",
+                   delegation_id, mode, reason)
+    try:
+        from gateway.kanban_watchers import _alert_notify_script, _needs_input_channels, _notify_send
+
+        script = _alert_notify_script()
+        if script is not None:
+            _notify_send(script, f"delegate_task {delegation_id}: kanban ineligible ({reason}); "
+                         f"runtime={mode}", ["--target", _needs_input_channels()[1]],
+                         profile=str(record.get("profile") or "default"))
+    except Exception:
+        logger.warning("async_delegation_fallback_receipt_failed delegation_id=%s", delegation_id,
+                       exc_info=True)
 
 
 def _refuse_in_process() -> Dict[str, Any]:
