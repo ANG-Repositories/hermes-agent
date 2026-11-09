@@ -828,6 +828,13 @@ class GatewayGoalsMixin:
             return totals
         entries = await self._run_in_executor_with_context(store.list_sessions)
         routed = {e.session_id for e in entries if getattr(e, "session_id", None)}
+        lookup = getattr(store, "lookup_by_session_id", None)
+
+        def _is_routed_now(sid: str) -> bool:
+            # Re-read inside each retiring write: a /resume or topic rebind that routes the session
+            # after the snapshot above keeps its goal/loop. No lookup -> trust the snapshot.
+            return sid in routed if lookup is None else lookup(sid) is not None
+
         ran = False
         for _profile_name, profile_home in scopes:
             async with scope_cm(profile_home):
@@ -837,7 +844,8 @@ class GatewayGoalsMixin:
                     continue
                 await self._warm_goals_session_db("goal orphan gc")
                 counts = await self._run_in_executor_with_context(
-                    functools.partial(reap_orphaned_goals_and_loops, routed, gc_days=gc_days))
+                    functools.partial(reap_orphaned_goals_and_loops, routed, gc_days=gc_days,
+                                      is_routed=_is_routed_now))
             ran = True
             for k in totals:
                 totals[k] += counts.get(k, 0)

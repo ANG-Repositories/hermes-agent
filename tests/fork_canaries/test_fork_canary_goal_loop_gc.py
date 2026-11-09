@@ -70,8 +70,8 @@ def _session_row(db, sid, *, last_active):
     db.create_session(session_id=sid, source="cli")
 
     def _txn(conn):
-        conn.execute("UPDATE sessions SET started_at = ?, effective_last_active = ? WHERE id = ?",
-                     (last_active, last_active, sid))
+        conn.execute("UPDATE sessions SET started_at = ?, effective_last_active = ?, last_activity_at = ? "
+                     "WHERE id = ?", (last_active, last_active, last_active, sid))
         conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'hi', ?)",
                      (sid, last_active))
 
@@ -192,48 +192,123 @@ def test_reaper_disabled_at_zero_days(tmp_path):
         db.close()
 
 
-class _RefreshAfterScanDB:
-    """Delegates to a real SessionDB; right after the reaper's ``goal:`` scan, another writer
-    commits a fresh ``last_turn_at`` (Prism 257ff1d18304's repro: refreshed between scan and retire)."""
+class _HookAfterScanDB:
+    """Delegates to a real SessionDB and runs *hook* right after the reaper's candidate scan (its
+    last read, the sessions recency query) and before any retiring write: a deterministic stand-in
+    for another writer landing between scan and retire. No sleeps."""
 
-    def __init__(self, db, sid):
-        self._db, self._sid = db, sid
+    def __init__(self, db, hook):
+        self._db, self._hook, self.fired = db, hook, 0
 
     def __getattr__(self, name):
         return getattr(self._db, name)
 
-    def list_meta_prefix(self, prefix):
-        rows = list(self._db.list_meta_prefix(prefix))
-        if prefix == "goal:":
-            state = _goal(self._db, self._sid)
-            state.last_turn_at = time.time()
-            self._db.set_meta(f"goal:{self._sid}", state.to_json())
+    def _read_all(self, *args, **kwargs):
+        rows = self._db._read_all(*args, **kwargs)
+        self._hook()
+        self.fired += 1
         return rows
 
 
-def test_reaper_never_retires_a_row_refreshed_after_the_scan(tmp_path):
+def _rewrite(db, key, cls, **fields):
+    state = cls.from_json(db.get_meta_committed(key))
+    for name, value in fields.items():
+        setattr(state, name, value)
+    db.set_meta(key, state.to_json())
+
+
+def _message_now(db, sid):
+    db._execute_write(lambda conn: conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'back', ?)",
+        (sid, time.time())))
+
+
+# Every way a session turns live between the scan and the retiring write. Each must keep BOTH rows.
+_LIVE_AFTER_SCAN = {
+    # Prism f0a17e9ea50d: a message lands; the goal JSON is unchanged.
+    "message": lambda db, routes: _message_now(db, "s"),
+    # Prism 3f5809a119d6 (txn side): the API/tool/compaction heartbeat, before any message persists.
+    "heartbeat": lambda db, routes: db.touch_session_activity("s", ts=time.time()),
+    # Prism 257ff1d18304: the goal itself runs a turn.
+    "goal-turn": lambda db, routes: _rewrite(db, "goal:s", goals.GoalState, last_turn_at=time.time()),
+    # Prism 4ca29f7a0858 (txn side): the sibling loop is re-armed (what resume() writes).
+    "loop-rearm": lambda db, routes: _rewrite(db, "loop:s", loops.LoopState, next_due_at=time.time()),
+    # Prism d6291f28e729: /resume (or a topic rebind) routes the session after the routing snapshot.
+    "route": lambda db, routes: routes.add("s"),
+}
+
+
+@pytest.mark.parametrize("event", sorted(_LIVE_AFTER_SCAN))
+def test_reaper_rechecks_eligibility_inside_the_retiring_write(tmp_path, event):
     db = _db(tmp_path / "state.db")
+    now = time.time()
     try:
-        _put_goal(db, "s", age_days=8)
-        counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=_RefreshAfterScanDB(db, "s"))
-        # RED-proof (M10): in hermes_cli/goals.py::retire_goal (~line 880) delete
-        # `if expected_raw is not None and raw != expected_raw: return False` -> the refreshed goal is orphaned.
-        assert counts["orphaned"] == 0
+        _put_goal(db, "s", age_days=9, now=now)
+        _put_loop(db, "s", age_days=9, now=now)
+        _session_row(db, "s", last_active=now - 8 * DAY)
+        live_routes: set = set()
+        hooked = _HookAfterScanDB(db, lambda: _LIVE_AFTER_SCAN[event](db, live_routes))
+
+        counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=hooked,
+                                                     is_routed=live_routes.__contains__)
+
+        assert hooked.fired == 1  # the interleaving really ran between scan and retire
+        # RED-proof (M13) message/heartbeat: in hermes_cli/goals.py::_retire_if_still_orphaned
+        #   (~line 994) delete the `srow = conn.execute(...)` recheck and its `return False`.
+        # RED-proof (M10) goal-turn/loop-rearm: in the same function (~line 990) delete the
+        #   `for p, _clocks in _ORPHAN_GC_ROW_CLOCKS:` row-clock recheck loop.
+        # RED-proof (M15) route: in the same function (~line 997) delete `if is_routed(sid): return False`.
+        assert counts["orphaned"] == 0 and counts["loops"] == 0
+        assert _goal(db, "s").status == "active" and _loop(db, "s").status == "active"
+    finally:
+        db.close()
+
+
+def test_reaper_control_same_setup_without_activity_is_retired(tmp_path):
+    """Control for the test above: with a no-op hook the same rows ARE retired, so each live event
+    (not the setup) is what keeps them."""
+    db = _db(tmp_path / "state.db")
+    now = time.time()
+    try:
+        _put_goal(db, "s", age_days=9, now=now)
+        _put_loop(db, "s", age_days=9, now=now)
+        _session_row(db, "s", last_active=now - 8 * DAY)
+        counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=_HookAfterScanDB(db, lambda: None))
+        assert counts == {"scanned": 1, "orphaned": 1, "loops": 1}
+    finally:
+        db.close()
+
+
+def test_activity_heartbeat_protects_a_resumed_cli_session(tmp_path):
+    """Prism 3f5809a119d6's repro: every scanned clock is 8 days old, then
+    ``touch_session_activity(now)`` (no message yet) -> the goal must stay active."""
+    db = _db(tmp_path / "state.db")
+    now = time.time()
+    try:
+        _put_goal(db, "s", age_days=8, now=now)
+        _session_row(db, "s", last_active=now - 8 * DAY)
+        db.touch_session_activity("s", ts=now)
+        # RED-proof (M14): in hermes_cli/goals.py::_orphan_gc_session_activity_sql (~line 924)
+        # return the pre-fix expression (started_at / effective_last_active / messages, no
+        # last_activity_at) -> the live goal is orphaned.
+        assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, now=now, db=db)["orphaned"] == 0
         assert _goal(db, "s").status == "active"
     finally:
         db.close()
 
 
-def test_resumed_loop_is_not_reaped_before_its_first_tick(tmp_path, monkeypatch):
-    """Prism 4ca29f7a0858: ``LoopManager.resume()`` moves neither ``created_at`` nor ``last_fired_at``."""
+@pytest.mark.parametrize("prior", ["orphaned", "paused"])
+def test_resumed_loop_is_not_reaped_before_its_first_tick(tmp_path, monkeypatch, prior):
+    """Prism 4ca29f7a0858's repro: ``LoopManager.resume()`` of an old orphaned or paused loop moves
+    neither ``created_at`` nor ``last_fired_at``; the next hourly pass must not cancel the resume."""
     db = _db(tmp_path / "state.db")
     monkeypatch.setattr(goals, "_get_session_db", lambda: db)
     try:
-        _put_loop(db, "s", age_days=9)
-        assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db)["loops"] == 1
+        _put_loop(db, "s", status=prior, age_days=9)
         assert loops.LoopManager("s").resume() is not None
-        # RED-proof (M11): in hermes_cli/goals.py::_goal_loop_session_activity (~line 920) drop
-        # "next_due_at" from the loop clocks -> the next hourly pass re-orphans the resumed loop.
+        assert _loop(db, "s").status == "active"
+        # RED-proof (M11): drop "next_due_at" from the loop clocks in
+        # hermes_cli/goals.py::_ORPHAN_GC_ROW_CLOCKS (~line 912) -> the resumed loop is re-orphaned.
         assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db)["loops"] == 0
         assert _loop(db, "s").status == "active"
     finally:
@@ -345,6 +420,27 @@ async def test_each_profile_reads_its_own_orphan_gc_days(gw_rig, monkeypatch):
     # `gc_days = self._goal_int_setting(...)` read above the scope loop -> root's 0 disables sec too.
     assert _goal(dbs[None], "root-orphan").status == "active"
     assert _goal(dbs["sec"], "sec-orphan").status == "orphaned"
+
+
+@pytest.mark.asyncio
+async def test_gateway_revalidates_routing_against_the_live_store(gw_rig):
+    """Prism d6291f28e729: the routing snapshot (``list_sessions``) says unrouted, but by the time the
+    row is retired the live store routes it (a /resume landed). The gateway must pass the live
+    lookup, so the goal is kept; an id the live store does not route is still reaped."""
+    runner, dbs, scope_cm = gw_rig
+    resumed = SimpleNamespace(session_key="agent:main:telegram:dm:7", session_id="resumed")
+    runner.session_store = SimpleNamespace(
+        list_sessions=lambda: [],  # stale snapshot
+        lookup_by_session_id=lambda sid: resumed if sid == "resumed" else None,
+    )
+    _put_goal(dbs[None], "resumed", age_days=20)
+    _put_goal(dbs[None], "gone", age_days=20)
+
+    await runner._goal_orphan_gc([(None, None)], scope_cm)
+    # RED-proof (M16): in gateway/run_goals.py::_goal_orphan_gc (~line 848) drop
+    # `is_routed=_is_routed_now` from the reap call -> the resumed conversation's goal is orphaned.
+    assert _goal(dbs[None], "resumed").status == "active"
+    assert _goal(dbs[None], "gone").status == "orphaned"
 
 
 def test_gc_runs_at_most_once_per_hour(monkeypatch):
