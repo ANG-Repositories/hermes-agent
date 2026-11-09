@@ -181,6 +181,30 @@ def test_pruned_sidecar_is_removed_once_the_write_commits():
     assert not (store.sidecar_dir(path) / "big.json").exists()
 
 
+def test_same_id_replacement_keeps_its_sidecar_after_the_queued_unlink():
+    """Prism c41dd8d3a75b: one transaction prunes an expired offloaded ``big`` and offloads a new
+    ``big`` to the same ``big.json``; the queued unlink must not delete the committed sidecar."""
+    _seed({"big": _big_done_record("big")})
+    store.persist_dispatch(delegation_id="n0", durable_spec=_spec(), boot_id="100:1.0",
+                           dispatched_at=time.time())
+    path = store.registry_path()
+    with store.locked_registry() as registry:
+        registry["records"]["big"]["updated_at"] = time.time() - store.TERMINAL_RETENTION_SECONDS - 60
+    replacement = _big_done_record("big", size=300_000)
+    text = "y" * 120_000
+    replacement["terminal"]["result"]["summary"] = text
+    with store.locked_registry(path=path) as registry:
+        store._prune(registry, time.time(), path)
+        assert "big" not in registry["records"]
+        registry["records"]["big"] = replacement
+        assert store._offload_oversized(registry, path) == 1
+    store._REGISTRY_CACHE.clear()
+    stub = _load()["records"]["big"]
+    assert (path.parent / stub["offloaded"]["sidecar"]).exists(), "replacement sidecar deleted"
+    full = store.canonical_terminal(store.read_registry(), "big", path=path)["execution_result"]
+    assert full is not None and full["summary"] == text
+
+
 def test_offloaded_lone_surrogate_result_reads_back_in_full():
     """Prism: the sidecar was encoded with surrogatepass (not UTF-8) and read back with a strict
     decode, so a lone surrogate made the full body unreadable after the record was stubbed. The

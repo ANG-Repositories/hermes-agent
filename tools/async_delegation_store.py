@@ -533,7 +533,15 @@ def locked_registry(
         unlinks = registry.pop(_SIDECAR_UNLINKS_KEY, [])
         if write:
             _write(path, registry)
-            for sidecar in unlinks:
+            # A same-id record offloaded later in this transaction reuses the queued path; keep
+            # every sidecar the committed registry still references (Prism c41dd8d3a75b).
+            referenced = {
+                str(path.parent / r["offloaded"]["sidecar"])
+                for r in registry.get("records", {}).values()
+                if isinstance(r, dict) and isinstance(r.get("offloaded"), dict)
+                and isinstance(r["offloaded"].get("sidecar"), str)
+            }
+            for sidecar in set(unlinks) - referenced:
                 with contextlib.suppress(OSError):
                     Path(sidecar).unlink()
     finally:
