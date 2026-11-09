@@ -611,7 +611,7 @@ class TurnRunner:
         return st
 
     def _live_progress_adapter(self):
-        """The adapter registered for this chat RIGHT NOW (None mid-reconnect). Never raises."""
+        """The adapter registered for this chat RIGHT NOW (None mid-reconnect or on a lookup error)."""
         try:
             return self._runner._delivery_adapter_for(self._ctx.source)
         except Exception:
@@ -619,7 +619,7 @@ class TurnRunner:
 
     def _progress_transport_stale(self, st) -> bool:
         """True when ``st.adapter`` is dead or superseded (t_8783804a): a failure through it says nothing
-        about the message, so it must not disable editing. Discord's liveness probe closes the session and
+        about the message, so editing stays enabled. Discord's liveness probe closes the session and
         the reconnect watcher installs a NEW adapter object; the old one answers "Session is closed"."""
         if getattr(st.adapter, "has_fatal_error", False) is True:
             return True
