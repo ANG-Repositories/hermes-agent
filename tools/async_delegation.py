@@ -1637,20 +1637,21 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         return True
     logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
                    delegation_id, old_attempt, launched.get("error"))
-    if launched.get("paused"):
-        # A live FWA hold closed this host to new work (Prism 0f110d29ad76): running the unit in-process or
-        # detached here would start it on the held host anyway. Nothing runs; the delegation ends naming the hold.
-        # Released either way: the fence only holds the card-end watcher off, it never stops dispatch, so a kept
-        # fence would leave the late card undrained for the process's life (Prism 2de869079d8e). An unarchived
-        # card (Prism c-c6546d2332b994d5) may still be dispatched once the hold clears; the failed record is what
-        # stops it (its runner finds no running attempt), and the watcher drains it when it ends.
-        _akb.release_launch_fence(launched.get("task_id"))
-        unfenced = ""
-        if not launched.get("fenced"):
-            unfenced = (f"; card {launched.get('task_id')} could not be archived (its runner finds no running "
-                        "attempt; the card-end watcher drains it)")
+    # One rule at one point: a launch refused OR failed while this host is held never falls back (in-process or
+    # detached would run it on the held host). A pause refusal names its hold; any other failure (a tick-lock
+    # timeout raises before spawn_now's pause fence, Prism c-fe2befb7c5f6b742) re-checks it. No hold: today's path.
+    held = launched.get("paused") or _local_hold_reason()
+    if held:
+        task_id = launched.get("task_id")
+        try:
+            # The card must end in a state the dispatcher honours, never only in this process's memory: the
+            # in-memory fence never stopped dispatch (Prism c-0f03927fd807dfe8).
+            parked = _park_held_card(task_id, held) if task_id else ""
+        finally:
+            _akb.release_launch_fence(task_id)    # every path: the card-end watcher drains the card normally
+        failed = "" if launched.get("paused") else f" (launch failed: {launched.get('error')})"
         _note_kanban_launch(delegation_id, "none (kanban pause hold; not run)")
-        raise RuntimeError(f"background unit not started: {launched['paused']}{unfenced}; no in-process "
+        raise RuntimeError(f"background unit not started: {held}{failed}{parked}; no in-process "
                            "fallback while the host is held")
     error_class = str(launched.get("error") or "").split(":", 1)[0] or "unknown"
     try:
@@ -1662,6 +1663,68 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         _akb.release_launch_fence(launched.get("task_id"))
     _note_kanban_launch(delegation_id, f"in_process (kanban spawn failed: {error_class})")
     return on_card
+
+
+#: Archive attempts on a held launch's card before it is blocked instead, and the pause between them.
+_HELD_ARCHIVE_TRIES = 3
+_HELD_ARCHIVE_RETRY_SECONDS = 0.5
+
+
+def _local_hold_reason() -> Optional[str]:
+    """The live FWA hold closing this host to new kanban work, else ``None`` (also under the kill switch). An
+    unreadable hold is no hold, as before this check existed: the kill-switch path stays today's."""
+    from hermes_cli import kanban_pause_hold as _kph
+
+    try:
+        return _kph.local_destination_wait({})
+    except Exception:
+        logger.warning("async_delegation_kanban_hold_unreadable", exc_info=True)
+        return None
+
+
+def _held_card_status(task_id: str) -> Optional[str]:
+    from tools import async_delegation_kanban as _akb
+
+    kb = _akb._kb()
+    try:
+        with kb.connect_closing(board=_akb._board()) as conn:
+            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    except Exception:
+        logger.warning("async_delegation_kanban_card_unreadable task_id=%s", task_id, exc_info=True)
+        return None
+    return row["status"] if row is not None else None
+
+
+def _park_held_card(task_id: str, why: str) -> str:
+    """Make a held launch's card durably un-dispatchable: archived (retried), else blocked naming the hold.
+    Returns the failure-text suffix: ``""`` when archived."""
+    from tools import async_delegation_kanban as _akb
+
+    for attempt in range(_HELD_ARCHIVE_TRIES):
+        status = _held_card_status(task_id)
+        if status == "archived":
+            return ""
+        if status == "blocked":
+            return f"; card {task_id} is blocked"
+        if _akb._archive_quietly(task_id):
+            return ""
+        if attempt + 1 < _HELD_ARCHIVE_TRIES:
+            time.sleep(_HELD_ARCHIVE_RETRY_SECONDS)
+    kb = _akb._kb()
+    try:
+        with kb.connect_closing(board=_akb._board()) as conn:
+            if kb.block_task(conn, task_id, kind="capability",
+                             reason=f"delegation launch refused on a held host; archive failed: {why}"):
+                logger.warning("async_delegation_kanban_held_card_blocked task_id=%s", task_id)
+                return f"; card {task_id} could not be archived and is blocked"
+    except Exception:
+        logger.warning("async_delegation_kanban_block_failed task_id=%s", task_id, exc_info=True)
+    final = _held_card_status(task_id)
+    if final in ("archived", "blocked"):
+        return f"; card {task_id} is {final}"
+    logger.error("async_delegation_kanban_held_card_unparked task_id=%s", task_id)
+    return (f"; card {task_id} could not be archived or blocked (its runner finds no running attempt; "
+            "the card-end watcher drains it)")
 
 
 #: ``runtime`` delegate_task reports for a unit whose card spawned.
