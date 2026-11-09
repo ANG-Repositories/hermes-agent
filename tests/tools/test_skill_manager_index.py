@@ -219,7 +219,8 @@ def test_skill_manage_patch_walks_at_most_once(tmp_path):
         encoding="utf-8")
     with _roots(local), patch("tools.skill_manager_tool.HERMES_HOME", tmp_path), \
          patch("tools.skill_manager_tool._apply_skill_write_gate", return_value=None), \
-         _count_walks() as walks:
+         _count_walks() as walks, \
+         patch.object(smt, "_find_skill_indexed", wraps=smt._find_skill_indexed) as resolve:
         out = smt.skill_manage(action="patch", name="alpha", old_string="old line", new_string="new line")
         assert '"success": true' in out, out
         assert "new line" in (d / "SKILL.md").read_text(encoding="utf-8")
@@ -227,6 +228,68 @@ def test_skill_manage_patch_walks_at_most_once(tmp_path):
         out = smt.skill_manage(action="patch", name="alpha", old_string="new line", new_string="old line")
         assert '"success": true' in out, out
         assert len(walks) == 1, walks
+        assert resolve.call_count == 2  # exactly one resolution per public operation
+
+
+def test_thread_invalidation_discards_inflight_build(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    local = tmp_path / "skills"
+    d = _mk(local, "cat/alpha")
+    built, release = threading.Event(), threading.Event()
+    real = smt._build_skill_index
+    count = 0
+
+    def blocked(roots):
+        nonlocal count
+        index = real(roots)
+        count += 1
+        if count == 1:
+            built.set()
+            assert release.wait(10)
+        return index
+
+    with _roots(local), patch.object(smt, "_build_skill_index", side_effect=blocked), \
+         ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(smt._find_skill, "alpha")
+        try:
+            assert built.wait(10)
+            d.rename(local / "cat/beta")
+            smt._invalidate_skill_index()
+        finally:
+            release.set()
+        assert future.result(timeout=10) is None
+        assert smt._find_skill("beta")["path"] == local / "cat/beta"
+        assert count == 2
+
+
+def test_concurrent_builders_share_one_walk(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    local = tmp_path / "skills"
+    _mk(local, "cat/alpha")
+    barrier = threading.Barrier(8)
+
+    def lookup(_):
+        barrier.wait(timeout=10)
+        return smt._find_skill("alpha")
+
+    with _roots(local), _count_walks() as walks, ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(r["path"] == local / "cat/alpha" for r in pool.map(lookup, range(8)))
+        assert len(walks) == 1
+
+
+@pytest.mark.parametrize("root_kind", ["local", "external"])
+def test_external_nested_empty_category_create(tmp_path, root_kind):
+    local, ext = tmp_path / "skills", tmp_path / "ext"
+    root = local if root_kind == "local" else ext
+    (root / "deep/empty").mkdir(parents=True)
+    with _roots(local, ext), _count_walks() as walks:
+        assert smt._find_skill("beta") is None
+        _mk(root, "deep/empty/beta")
+        assert smt._find_skill("beta")["path"] == root / "deep/empty/beta"
 
 
 @pytest.mark.parametrize("n", [2000])

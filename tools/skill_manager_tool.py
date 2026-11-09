@@ -513,8 +513,7 @@ def _find_skill_indexed(name: str) -> Optional[Dict[str, Any]]:
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
     categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
     categorized form matches RELATIVE to the local root only (relative_to raises for external dirs).
-    Served from the validated index above; a miss or a stale hit costs exactly one re-walk."""
-    import time
+    Served from a topology-validated index; unchanged misses are cached with the root set."""
     from agent.skill_utils import get_all_skills_dirs
     local_root = None
     if "/" in name or "\\" in name:
@@ -1207,6 +1206,8 @@ def _bind_skill_targets(fn):
 
     @wraps(fn)
     def bound(*args, **kwargs):
+        if kwargs.get("operations") is not None:
+            return fn(*args, **kwargs)  # batch snapshots/rollback need fresh post-op lookups
         token = _SKILL_OPERATION_TARGETS.set({})
         try:
             return fn(*args, **kwargs)
@@ -1226,6 +1227,8 @@ def skill_manage(
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
+    if name:
+        _find_skill(name)  # bind once before guards, approval, ledger and write helpers
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless
@@ -1252,10 +1255,9 @@ def skill_manage(
         # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
         # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
         _ledger_before = None
-        _pre = None
+        _pre = _find_skill(name)
         with suppress(Exception):
             from tools import skill_ledger as _ledger
-            _pre = _find_skill(name)
             _ledger_before = _ledger.capture_before(
                 _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
