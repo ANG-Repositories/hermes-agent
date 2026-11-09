@@ -1543,9 +1543,11 @@ def _handle_create(args: dict, **kw) -> str:
                 and not args.get("workspace_of")):
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        # Prism a8e263caef71: "false" is a truthy string; normalise before the default helper.
+        boomerang_arg = (None if args.get("boomerang_wake") is None
+                         else _parse_bool_arg(args, "boomerang_wake"))
         boomerang = _auto_boomerang(
-            # Prism a8e263caef71: "false" is a truthy string; normalise before the default helper.
-            None if args.get("boomerang_wake") is None else _parse_bool_arg(args, "boomerang_wake"),
+            boomerang_arg,
             worker=_is_dispatcher_owned_worker(),
             subscribed=bool(not unhomed and _auto_wake(args.get("wake"))
                             and _resolve_notify_target()
@@ -1576,7 +1578,8 @@ def _handle_create(args: dict, **kw) -> str:
             reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
-            boomerang_wake=boomerang,
+            # Only the caller's own choice; create_task applies the default and records which.
+            boomerang_wake=boomerang_arg,
             initial_status=str(args.get("initial_status") or "running"),
             # Fan-out brake: worker-created cards park per kanban.worker_created_status.
             forced_status=_worker_policy.resolve_park_status(
@@ -1593,25 +1596,29 @@ def _handle_create(args: dict, **kw) -> str:
             "SELECT payload FROM task_events WHERE task_id = ? AND "
             "kind = 'assignee_remapped' ORDER BY id DESC LIMIT 1", (new_tid,)).fetchone()
         assignee_remap = json.loads(_remap_row[0]) if _remap_row and _remap_row[0] else None
-        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS + ("reasoning_effort",))
+        landed = _fields(kb.get_task(conn, new_tid),
+                         _CREATED_FIELDS + ("reasoning_effort", "boomerang_wake"))
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(
-                       conn, new_tid,
-                       # boomerang wake is a wake level: it always subscribes as a waker.
-                       wake=(True if boomerang
-                             else args.get("wake") if isinstance(args.get("wake"), bool) else None),
-                       # t_ea40ff83: an explicit foreign home subscribes the home, not this chat.
-                       # Prism 8efbb3c7ece2: the PERSISTED home (an idempotency hit or an
-                       # inherited home can differ from the session_id argument).
-                       explicit_home=((kb.get_task(conn, new_tid).session_id or "",
-                                       _current_session_id()
-                                       or get_session_env("HERMES_SESSION_ID", "") or None)
-                                      if args.get("session_id") and session_id else None),
-                       # Ace 2026-11-06: the env-less home row is the boomerang default's
-                       # half; an opt-out (or worker) create keeps today's no-row behaviour.
-                       home_fallback=bool(boomerang) and not _is_dispatcher_owned_worker()),
+        subscribed = _maybe_auto_subscribe(
+            conn, new_tid,
+            # boomerang wake is a wake level: it always subscribes as a waker.
+            wake=(True if boomerang
+                  else args.get("wake") if isinstance(args.get("wake"), bool) else None),
+            # t_ea40ff83: an explicit foreign home subscribes the home, not this chat.
+            # Prism 8efbb3c7ece2: the PERSISTED home (an idempotency hit or an
+            # inherited home can differ from the session_id argument).
+            explicit_home=((kb.get_task(conn, new_tid).session_id or "",
+                            _current_session_id()
+                            or get_session_env("HERMES_SESSION_ID", "") or None)
+                           if args.get("session_id") and session_id else None),
+            # Ace 2026-11-06: the env-less home row is the boomerang default's
+            # half; an opt-out (or worker) create keeps today's no-row behaviour.
+            home_fallback=bool(boomerang) and not _is_dispatcher_owned_worker())
+        from hermes_cli.kanban_boomerang_default import wake_route
+        # ``wake_route``: whether any chat will actually be woken (never assumed).
+        return _ok(task_id=new_tid, **landed, **gate, subscribed=subscribed,
+                   wake_route=wake_route(conn, new_tid),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
@@ -1711,7 +1718,9 @@ def resolve_notify_target_for_source(source: dict[str, Any], *,
 
 
 def _auto_boomerang(value: Optional[bool], *, worker: bool, subscribed: bool) -> Optional[bool]:
-    """Only operator-created auto-subscriptions inherit the runtime default."""
+    """Whether this create SUBSCRIBES its chat as a boomerang waker. Only operator-created
+    auto-subscriptions follow the runtime default here; the card's own ``boomerang_wake``
+    default is applied for every producer by ``kanban_db.create_task``."""
     if value is not None:
         return bool(value)
     if worker or not subscribed:

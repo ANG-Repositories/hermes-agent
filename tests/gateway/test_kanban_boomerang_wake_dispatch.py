@@ -332,15 +332,300 @@ def test_suppressor_withheld_event_is_never_dispatched(env):
     assert env["dispatched"] == [] and _claims() == {} and turns == []
 
 
-def test_needs_input_block_surfaces_and_is_never_dispatched(env):
-    """INV-5 through the real branch: a judgment event on an opted-in card wakes as today."""
+@pytest.mark.parametrize("block_kind", ["needs_input", "transient", "capability"])
+def test_block_child_first(env, block_kind):
+    """A label is not a decision: diagnose before waking the owner."""
     tid = _card(env)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn), \
             kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
-        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "A or B?"})  # noqa: SLF001
+        kb._append_event(conn, tid, "blocked", {"kind": block_kind, "reason": "A or B?"})  # noqa: SLF001
     turns = _tick(env)
-    assert env["dispatched"] == [] and len(turns) == 1
+    assert len(env["dispatched"]) == 1 and turns == []
+    assert env["dispatched"][0]["row"] == "blocked_assess"
+    _tick(env)
+    assert len(env["dispatched"]) == 1
+
+
+@pytest.mark.parametrize("reason", ["missing capability", "restart requires approval", "unresolved transient"])
+def test_block_unresolved_reaches_owner_once(env, reason):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "capability", "reason": reason})
+    assert _tick(env) == []
+    entry = env["dispatched"][0]
+    final = _verdict(entry, "surface", summary=reason, evidence=["read prerequisite: unavailable"])
+    _run(env, entry, "completed", final)
+    _run(env, entry, "completed", final)
+    _tick(env)
+    assert len(env["adapter"].handled) == 1
+    assert reason in env["adapter"].handled[0].text
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert len([c for c in kb.list_comments(conn, tid) if "surfaced:" in c.body]) == 1
+
+
+def test_block_retry_requires_resolution_evidence(env):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "dependency unavailable"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "retry"))
+    assert len(env["adapter"].handled) == 1
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_block_resolved_retry_and_budget(env):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": "service unavailable"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["health probe: healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "health probe: healthy"}))
+    assert env["adapter"].handled == []
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        assert kb.get_task(conn, tid).status != "blocked"
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": "failed again"})
+    _tick(env)
+    second = env["dispatched"][-1]
+    assert second["blocked_budget_exhausted"] is True
+    _run(env, second, "completed", "must not run")
+    assert len(env["adapter"].handled) == 1
+    assert ah.BoomerangWakeState().retries(tid) == 1
+
+
+@pytest.mark.parametrize("auto,on", [(False, True), (True, False)])
+def test_block_legacy_and_kill_switch(env, auto, on):
+    _config(on)
+    tid = _card(env, auto=auto)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": "offline"})
+    assert _tick(env)
+    assert not env["dispatched"]
+
+
+@pytest.mark.parametrize("tag", ["spend", "outbound", "irreversible"])
+def test_block_restricted_retry_is_not_authorized(env, tag):
+    tid = _card(env, title=f"[{tag}] restricted")
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "approval"})
+    assert _tick(env) == []
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "retry",
+         block_resolution={"resolved": True, "authority": "existing", "check": "claimed approval"}))
+    assert len(env["adapter"].handled) == 1
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_block_restricted_edit_before_unblock(env, field):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    original = kb.unblock_task
+
+    def race(conn, task_id, **kwargs):
+        with kb.connect_closing() as other, kb.write_txn(other):
+            other.execute(f"UPDATE tasks SET {field} = '[spend] approval required' WHERE id = ?", (tid,))
+        return original(conn, task_id, **kwargs)
+
+    env["monkeypatch"].setattr(kb, "unblock_task", race)
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["probe healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "probe healthy"}))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert len(env["adapter"].handled) == 1
+
+
+@pytest.mark.parametrize("platform", [None, "api_server", "cli"])
+def test_block_nonchat_owner_preserves_notifier_wake(env, platform):
+    tid = _card(env)
+    _sub(tid)
+    owner = None if platform is None else SimpleNamespace(
+        origin=SimpleNamespace(platform=platform, chat_id=CHAT))
+    env["monkeypatch"].setattr(ow, "resolve_owner", lambda *_a: owner)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+    assert len(_tick(env)) == 1
+    assert not env["dispatched"]
+    assert not _claims()
+
+
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_block_assessed_text_changed_before_verdict(env, field):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    # Text updates need not append an event. Old evidence cannot authorize
+    # a different prerequisite, even without a restricted tag.
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute(f"UPDATE tasks SET {field} = 'different prerequisite' WHERE id = ?", (tid,))
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["old probe healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "old probe healthy"}))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert len(env["adapter"].handled) == 1
+
+
+def test_block_api_subscription_with_chat_home_keeps_native_wake(env):
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+        event = kb.list_events(conn, tid)[-1]
+        task = kb.get_task(conn, tid)
+    remaining = asyncio.run(ah.notifier_dispatch(
+        env["runner"], {"events": [event], "auto": {event.id: Disposition("auto", "fork", 0, "blocked_assess")}},
+        {"platform": "api_server", "chat_id": "api-session"}, None, task, {"blocked"}, "blocked"))
+    assert remaining == {"blocked"}
+    assert not _claims()
+    assert not env["dispatched"]
+
+
+@pytest.mark.parametrize("block_kind", ["capability", "transient"])
+@pytest.mark.parametrize("auto,on", [(True, True), (False, True), (True, False)])
+def test_block_owner_only_admission(env, block_kind, auto, on):
+    _config(on)
+    tid = _card(env, auto=auto)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": block_kind, "reason": "service offline"})
+    assert _tick(env) == []
+    assert len(env["dispatched"]) == int(auto and on)
+    if auto and on:
+        entry = env["dispatched"][0]
+        assert entry["path"] == "owner-wake"
+        _run(env, entry, "completed", _verdict(entry, "surface", summary="service still offline"))
+        assert len(env["adapter"].handled) == 1
+    _tick(env)
+    assert len(env["dispatched"]) == int(auto and on)
+
+
+@pytest.mark.parametrize("timing", ["before_verdict", "inside_unblock"])
+def test_block_withdrawn_comment_authority(env, timing):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient"})
+        kb.add_comment(conn, tid, "operator", "Retry once service is healthy")
+    _tick(env)
+    entry = env["dispatched"][0]
+    def withdraw():
+        with kb.connect_closing() as other:
+            kb.add_comment(other, tid, "operator", "Approval withdrawn; do not retry")
+    if timing == "before_verdict":
+        withdraw()
+    else:
+        original = kb.unblock_task
+        def race(conn, task_id, **kwargs):
+            withdraw()
+            return original(conn, task_id, **kwargs)
+        env["monkeypatch"].setattr(kb, "unblock_task", race)
+    _run(env, entry, "completed", _verdict(entry, "retry", evidence=["probe healthy"],
+         block_resolution={"resolved": True, "authority": "existing", "check": "probe healthy"}))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert len(env["adapter"].handled) == 1
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_block_escalation_follows_rehome(env, pending):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "capability"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    new_home = env["runner"].session_store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id="new-owner-chat", chat_type="group", user_id=HUMAN))
+    real_deliver = ow.deliver_turn
+    targets = []
+    async def deliver(runner, home, text, cards):
+        targets.append(home.session_key)
+        return await real_deliver(runner, home, text, cards)
+    env["monkeypatch"].setattr(ow, "deliver_turn", deliver)
+    final = _verdict(entry, "surface", summary="missing capability")
+    if pending:
+        async def refuse(*args, **kwargs):
+            return False
+        env["monkeypatch"].setattr(ow, "deliver_turn", refuse)
+        _run(env, entry, "completed", final)
+        assert ah.BoomerangWakeState().handbacks()
+        env["monkeypatch"].setattr(ow, "deliver_turn", deliver)
+    if pending:
+        # A temporarily unhomed card retains the obligation, never uses the old home.
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET session_id = NULL WHERE id = ?", (tid,))
+        asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
+        assert targets == []
+        assert ah.BoomerangWakeState().handbacks()
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET session_id = ? WHERE id = ?", (new_home.session_key, tid))
+    if pending:
+        asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
+    else:
+        _run(env, entry, "completed", final)
+    asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
+    assert targets == [new_home.session_key]
+    assert len(env["adapter"].handled) == 1
+    assert not ah.BoomerangWakeState().handbacks()
+
+
+def test_block_claim_concurrent_budget(env):
+    state = ah.BoomerangWakeState()
+    barrier = threading.Barrier(2)
+    results = []
+    def claim():
+        barrier.wait()
+        results.append(state.claim("default:t:1", {"task_id": "t", "row": "blocked_assess"}))
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(results) == [False, True]
+    assert state.retries("t") == 1
+
+
+def test_block_lost_child_reconciles_to_owner_once(env):
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "capability", "reason": "missing tool"})
+    _tick(env)
+    entry = env["dispatched"][0]
+    _kill(env, entry)
+    state = ah.BoomerangWakeState()
+    asyncio.run(ah.reconcile(env["runner"], state=state))
+    asyncio.run(ah.reconcile(env["runner"], state=state))
+    assert len(env["dispatched"]) == 1
+    assert len(env["adapter"].handled) == 1
+    assert "blocked assessment lost" in env["adapter"].handled[0].text
+    assert not state.handbacks()
 
 
 def test_dispatch_raising_posts_warning_and_surfaces_the_wake(env):
@@ -459,7 +744,51 @@ def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
     _run(env, entry, "failed", "rate_limit")
     assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: child failed") for s in env["adapter"].sent)
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
-    assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "failed"
+
+
+def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):
+    """t_ce8bd439: the card left the claim-time status before the verdict ran. No origin-chat
+    line, one #logs line, the original wake still re-surfaces, outcome superseded."""
+    logs: list = []
+    env["monkeypatch"].setattr(ah, "post_logs", logs.append)
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        assert kb.reopen_task(conn, tid, actor="ci-sendback", reason="CI red")[0]
+    _run(env, entry, "completed", _verdict(entry, "complete"))
+    assert env["adapter"].sent == [], env["adapter"].sent
+    assert logs == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
+                    f"original wake re-delivered"], logs
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
+    assert claim["reason"] == "state moved" and claim["resurface_delivered"] is True
+
+
+def test_card_moved_with_no_live_home_keeps_one_plain_chat_line(env):
+    """Prism c-4e2273b5aa3cb68a: a supersede whose wake cannot be re-delivered (no live home) must
+    not vanish. One plain (non-⚠️) origin-chat line says so; no #logs 're-delivered' claim."""
+    logs: list = []
+    env["monkeypatch"].setattr(ah, "post_logs", logs.append)
+    # The home resolves (dispatch proceeds) but is not a live chat origin, the exact condition under
+    # which resurface() cannot re-deliver the wake.
+    env["monkeypatch"].setattr(ow, "is_chat_origin", lambda *_a, **_k: False)
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        assert kb.reopen_task(conn, tid, actor="ci-sendback", reason="CI red")[0]
+    _run(env, entry, "completed", _verdict(entry, "complete"))
+    assert env["adapter"].sent == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
+                                   f"no live home session, so the original wake was NOT re-delivered"], \
+        env["adapter"].sent
+    assert logs == [], logs
+    assert env["adapter"].handled == []
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
 
 
 def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):

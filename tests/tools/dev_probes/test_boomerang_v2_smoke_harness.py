@@ -450,10 +450,11 @@ def test_step3_canary_record_carrying_a_fleet_header_is_fail(env, monkeypatch):
     assert "fake-canary-1: x-hermes-qa-canary" in env["evidence"].read_text()
 
 
-def test_step1_fault_asserts_warning_and_resurfaced_wake(env):
+def test_step1_fault_asserts_superseded_line_and_resurfaced_wake(env):
     assert run.main(["--step", "1", "--dry-run"]) == 0
     text = env["evidence"].read_text()
-    assert "warning reason is the injected fault (/state moved/) | PASS |" in text
+    assert "gateway log: `boomerang-wake superseded t_5m0ce003: card moved to <status> ...` | PASS |" in text
+    assert "origin chat: no `warning boomerang-wake failed t_5m0ce003` line (supersede) | PASS |" in text
     assert "home session: re-delivered wake turn for t_5m0ce003 | PASS |" in text
     assert "msg='[kanban] Task t_5m0ce003 completed." in text
     assert "no `no live home for t_5m0ce003` line | PASS |" in text
@@ -474,20 +475,25 @@ def test_step1_fault_without_resurfaced_wake_fails(env, monkeypatch):
     assert "no `no live home for t_5m0ce003` line | FAIL |" in text
 
 
-def test_step1_fault_with_a_different_reason_fails(env, monkeypatch):
-    """A warning from some other failure (e.g. the old rehome fault) is not the injected one."""
+def test_step1_supersede_posted_as_a_chat_warning_fails(env, monkeypatch):
+    """t_ce8bd439: the old shape (a warning line in the origin chat, no superseded log line) FAILS."""
     fx = _copy_fixtures(env["tmp"])
-    chat = fx / "fake_origin_chat.jsonl"
-    chat.write_text(chat.read_text().replace("write refused: state moved",
-                                             "child failed: dispatch failed: home session not live here"))
+    chat, log = fx / "fake_origin_chat.jsonl", fx / "fake_gateway.log"
+    with chat.open("a") as fh:
+        fh.write(json.dumps({"ts": 1792378930.0,
+                             "content": "\u26a0\ufe0f boomerang-wake failed t_5m0ce003: write refused: state moved"}) + "\n")
+    log.write_text("".join(ln for ln in log.read_text().splitlines(True) if "superseded t_5m0ce003" not in ln))
     monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
+    monkeypatch.setenv("BV2_GATEWAY_LOG", str(log))
     assert run.main(["--step", "1", "--dry-run"]) == 1
-    assert "warning reason is the injected fault (/state moved/) | FAIL |" in env["evidence"].read_text()
+    text = env["evidence"].read_text()
+    assert "origin chat: no `warning boomerang-wake failed t_5m0ce003` line (supersede) | FAIL |" in text
+    assert "gateway log: `boomerang-wake superseded t_5m0ce003: card moved to <status> ...` | FAIL |" in text
 
 
 FAKE_FAULT_KANBAN = r"""#!/usr/bin/env python3
 # Fake kanban CLI + gateway for the AC-7 fault: the failure card's `complete` dispatches only;
-# the `comment` (inject_failure) refuses its verdict: warning line + re-delivered home wake.
+# the `comment` (inject_failure) refuses its verdict: superseded log line + re-delivered home wake.
 import json, os, sys, time
 argv = sys.argv[1:]
 state = os.environ["FAKE_STATE"]
@@ -518,7 +524,8 @@ elif verb == "complete":
         say(f"[boomerang-wake] {card} \u2014 verified")
 elif verb == "comment":
     card = argv[argv.index("comment") + 1]
-    say(f"\u26a0\ufe0f boomerang-wake failed {card}: write refused: state moved")
+    logline(f"gateway.kanban_boomerang_wake: kanban boomerang-wake: boomerang-wake superseded {card}: "
+            f"card moved to done before the wake ran; original wake re-delivered")
     logline(f"gateway.run: inbound message: platform=discord user=u chat=c msg='[kanban] Task {card} completed. "
             f"Title: x' reply_to_id=None reply_to_text=''")
 """

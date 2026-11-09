@@ -100,7 +100,7 @@ def _tick(env):
 def _card(env, *, session="owner", title="card", body=None, parents=()):
     sid = env["owner"].session_id if session == "owner" else session
     with kb.connect_closing() as conn:
-        return kb.create_task(conn, title=title, assignee="worker", session_id=sid,
+        return kb.create_task(conn, boomerang_wake=False, title=title, assignee="worker", session_id=sid,
                               body=body, parents=parents)
 
 

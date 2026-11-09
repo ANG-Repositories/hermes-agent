@@ -147,6 +147,13 @@ concurrency:
   cancel-in-progress: ${{ inputs.release != true && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
 
 jobs:
+  # Keep the regression under the allowlisted orchestrator (no extra PR trigger).
+  vault-page-target:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    uses: ./.github/workflows/vault-page-target.yml
+    permissions:
+      contents: read
+
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
   # to decide whether to run. On push/dispatch the classifier fails open
@@ -541,6 +548,7 @@ jobs:
   all-checks-pass:
     name: All required checks pass
     needs:
+      - vault-page-target
       - detect
       - tests
       - tests-os
