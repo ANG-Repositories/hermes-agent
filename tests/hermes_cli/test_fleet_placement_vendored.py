@@ -48,11 +48,16 @@ def test_candidate_receipt_package_closure(tmp_path):
     import subprocess
     import sys
     import pytest
-    source = Path(os.environ.get("ADMISSION_SOURCE_REPO", Path.home() / ".hermes"))
-    ref = os.environ.get("ADMISSION_CANDIDATE_REF", "e65e27833ef171a37582507ed72bd9ac8bcd3fd1")
-    # CI must supply the canonical object explicitly until final merged vendoring.
-    if not (source / ".git").exists():
+    # CI must supply the canonical object explicitly until final merged vendoring. Skip BEFORE
+    # any filesystem access: defaulting to ~/.hermes probes the real home, which the
+    # autouse home_io_guard refuses.
+    source_env = os.environ.get("ADMISSION_SOURCE_REPO")
+    if not source_env:
         pytest.skip("candidate-only experiment needs ADMISSION_SOURCE_REPO; final vendor pin is a release gate")
+    source = Path(source_env)
+    ref = os.environ.get("ADMISSION_CANDIDATE_REF", "e65e27833ef171a37582507ed72bd9ac8bcd3fd1")
+    if not (source / ".git").exists():
+        pytest.skip(f"ADMISSION_SOURCE_REPO={source} is not a git checkout")
     package = tmp_path / "candidate" / "hermes_cli" / "fleet_placement"
     package.mkdir(parents=True)
     (package.parent / "__init__.py").write_text("")
