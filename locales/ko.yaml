@@ -754,6 +754,7 @@ gateway:
     reject_model: "에이전트가 실행 중이에요 — 기다리거나 먼저 /stop한 뒤 모델을 바꾸세요."
     reject_codex_runtime: "에이전트가 실행 중이에요 — 기다리거나 먼저 /stop한 뒤 런타임을 바꾸세요."
     reject_moa: "에이전트가 실행 중이에요 — 기다리거나 먼저 /stop한 뒤 /moa를 실행하세요."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ 게이트웨이가 {action}이에요 — 복구된 뒤 다음 턴에 처리되도록 대기열에 넣었어요."
     drain_rejected: "⏳ 게이트웨이가 {action}이어서 지금은 다른 턴을 받을 수 없어요."
     drain_rejected_new_work: "⏳ 게이트웨이가 {action}이어서 지금은 새 작업을 받을 수 없어요."

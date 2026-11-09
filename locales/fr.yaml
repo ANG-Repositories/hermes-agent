@@ -875,6 +875,7 @@ gateway:
     reject_model: "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis changez de modèle."
     reject_codex_runtime: "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis changez de runtime."
     reject_moa: "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis lancez /moa."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ Gateway {action} — mis en file pour le prochain tour, une fois qu'il sera de retour."
     drain_rejected: "⏳ Le gateway est {action} et n'accepte pas d'autre tour pour le moment."
     drain_rejected_new_work: "⏳ Le gateway est {action} et n'accepte pas de nouveau travail pour le moment."

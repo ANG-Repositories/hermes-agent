@@ -28,6 +28,8 @@ def ctx(monkeypatch):
          "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"),
          "limits": ad.Limits(mem_reserve_gb=128.0), "mem_available_gb": 160.0, "mem_total_gb": 512.0}
     monkeypatch.setattr(klg, "utilization_context", lambda: dict(c))
+    monkeypatch.setattr(klg.os, "cpu_count", lambda: 32)
+    monkeypatch.setattr(ad, "read_slice_memory", lambda **kw: None)
     monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
                                                     "psi_io_some10": 0.0})
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")   # no fleet demand file in a temp home

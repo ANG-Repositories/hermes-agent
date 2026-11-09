@@ -464,7 +464,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
           flipped: Optional[dict] = None, evaluate: Optional[ArmFn] = None,
-          event_land: Optional[bool] = None, round_runs=None, marked=None, consume=None) -> dict:
+          event_land: Optional[bool] = None, round_runs=None, marked=None, consume=None,
+          intent=None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -490,6 +491,11 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     ``round_runs``: this card's run ids; ``marked``: this card's persisted round-draft marks
     (:func:`kanban_round_draft.mark_records`). A same-head draft whose persisted mark is by one of those runs
     (:func:`kanban_round_draft.round_marked`, t_c418eebc) is the worker's own round draft, flipped like any own draft.
+
+    ``intent`` (t_deee5435): ``(repo, number) -> status`` from :func:`kanban_pr_intent.applier`. It writes the
+    card's Intent block into each OWN PR body (:func:`_owns_draft`, draft or not) after every refusal check and
+    BEFORE the ready flip, so Prism starts on a body that carries the card's ask. Its status lands in
+    ``entry["intent"]``; it never raises or refuses.
     """
     from hermes_cli import kanban_round_draft as _rd
     report: dict = {"prs": {}, "checked_at": int(time.time())}
@@ -523,11 +529,14 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     drafts = []
     unreadable = []
     own_drafts: dict = {}
+    intent_targets = []
     for ref in refs:
         key = f"{ref.repo}#{ref.number}"
         pr = _lookup_pr(gh, ref)   # t_5c6c67c5: one retry before failing open
         entry: dict = {}
         report["prs"][key] = entry
+        if intent is not None and isinstance(pr, dict) and _owns_draft(ref, pr, task_id):
+            intent_targets.append((ref, entry))
         if not isinstance(pr, dict):
             if not draft_ok and _unread_refuses(ref, key, armable_keys):
                 entry["lookup"] = "failed after retry (refused)"
@@ -574,6 +583,15 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         foreign = [k for k in drafts if k not in own]
         if foreign or not own:
             raise DraftPrError(task_id, drafts)
+    # Every refusal is above: a refused handoff writes no PR body. The flip is below, so the body is
+    # written while the PR is still a draft and Prism never reviews it without the Intent block.
+    for ref, entry in intent_targets:
+        try:
+            entry["intent"] = intent(ref.repo, ref.number)
+        except Exception as exc:  # noqa: BLE001 -- never blocks the handback
+            entry["intent"] = f"error: {str(exc)[:160]}"
+            _log.warning("handoff freshness: pr intent %s#%s failed: %s", ref.repo, ref.number, exc)
+    if drafts and not draft_ok:
         ready = ready or _default_ready()
         failed = []
         flipped_now: dict = {}
