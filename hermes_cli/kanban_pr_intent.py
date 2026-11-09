@@ -248,7 +248,8 @@ def render(card: dict, verification: list) -> tuple:
             args = [sys.executable or "python3", str(lib), "render", "--card-json", tmp[0]]
             if verification:
                 args += ["--verification", tmp[1]]
-            proc = subprocess.run(args, capture_output=True, text=True, timeout=_TIMEOUT_S, check=False)
+            proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=_TIMEOUT_S, check=False)
             section = (proc.stdout or "").strip("\n")
             if proc.returncode == 0 and section.startswith(START) and section.endswith(END):
                 return section, "library"
