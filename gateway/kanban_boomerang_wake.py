@@ -284,7 +284,7 @@ STATE_TERMINAL, STATE_CANCELLED = "terminal", "cancelled"
 OPEN_STATES = frozenset({STATE_CLAIMED, STATE_RUNNING, STATE_EXECUTING, STATE_CANCELLED})
 
 ACTIONS = frozenset({"complete", "request_changes", "redispatch", "retry", "surface", "handled", "land_inherited",
-                     "comment_why_waits"})
+                     "comment_why_waits", "acknowledge"})
 # RC-2: kind × action, keyed on the row stored at claim time (pass-5 RC-A).
 ALLOWED = {
     "completed": frozenset({"complete", "request_changes", "surface"}),
@@ -300,6 +300,9 @@ ALLOWED = {
     # t_1e0ffee4: a review-deadman tier-1 page. comment_why_waits = the executor posts ONE bounded
     # why-waits comment (WHY_WAITS_FIELDS); the card stays in review.
     "review_deadman": frozenset({"comment_why_waits", "surface"}),
+    # t_6a70430e: a producer's mechanical wake. acknowledge = the executor writes the receipt and ONE comment on
+    # an OPEN card of any status (not review-only); it changes no card state and claims no obligation.
+    "mechanical_wake": frozenset({"acknowledge", "surface"}),
 }
 
 #: comment_why_waits: the verdict's ``why_waits`` object; each field a non-empty line, clipped.
@@ -373,6 +376,7 @@ def enabled() -> bool:
 
 ROW_REVIEW_ALL_ANSWERED = "review_all_answered"
 ROW_REVIEW_DEADMAN = "review_deadman"
+ROW_MECHANICAL_WAKE = "mechanical_wake"
 
 
 def row_enabled(name: str) -> bool:
@@ -681,6 +685,22 @@ REVIEW_DEADMAN_STEPS = (
 )
 
 
+MECHANICAL_WAKE_STEPS = (
+    "1. Read the card: `hermes kanban --board {board} show {task_id}` (status, the comment thread, any "
+    "`mechanical_wake` event's payload: its `source`, `episode` and `text`).",
+    "2. Read what the event points at (a detached job's log path, the obligation rows it lists) read-only.",
+    "3. Return `acknowledge` ONLY when nothing in it needs the card owner: the outcome is expected, already "
+    "handled on the card, or already re-queued. Your summary becomes the one card comment. If anything needs a "
+    "decision (fix and re-queue, claim an obligation, answer a question), return `surface`. You cannot claim or "
+    "resolve an obligation; acknowledging never stops its escalation clock.",
+)
+
+
+def _mechanical_wake_brief(entry: dict) -> str:
+    fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"]}
+    return "Do this read:\n" + "\n".join(s.format(**fields) for s in MECHANICAL_WAKE_STEPS) + "\n"
+
+
 def _review_deadman_brief(entry: dict) -> str:
     from hermes_constants import display_hermes_home, get_default_hermes_root
 
@@ -708,7 +728,8 @@ def _blocked_brief(entry: dict) -> str:
 #: Row-specific instructions appended to the generic goal (keyed on the claim-time row).
 ROW_BRIEFS = {"blocked_assess": _blocked_brief,
               "own_repo_review_all_keys_answered": _review_all_answered_brief,
-              "review_deadman": _review_deadman_brief}
+              "review_deadman": _review_deadman_brief,
+              "mechanical_wake": _mechanical_wake_brief}
 
 
 def build_goal(entry: dict) -> str:
@@ -856,6 +877,9 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                 raise RuntimeError(f"complete on a {status} card")
         elif action in ("handled", "comment_why_waits"):   # receipt (+ the why-waits comment); card stays in review
             if status != "review":
+                raise RuntimeError(f"{action} on a {status} card")
+        elif action == "acknowledge":   # t_6a70430e: receipt + one comment, no state change; any OPEN card
+            if status is None or status in ("done", "archived"):
                 raise RuntimeError(f"{action} on a {status} card")
         elif action == "land_inherited":   # the ONE write is the landing-queue enqueue (plan re-verified)
             if status != "review":
@@ -1800,6 +1824,8 @@ def _owner_candidates(board: str, task_id: str, items: list) -> dict:
             disp = classify_event(str(i.get("kind") or ""), payload, task, retries)
             if disp.row == ROW_REVIEW_DEADMAN and not row_enabled(ROW_REVIEW_DEADMAN):
                 continue   # row off: the owner-wake delivers the deadman page as today's turn
+            if disp.row == ROW_MECHANICAL_WAKE and not row_enabled(ROW_MECHANICAL_WAKE):
+                continue   # row off: the owner-wake delivers the mechanical wake as today's turn
             if disp.verdict == "auto":
                 out[int(i["event_id"])] = disp
         return out

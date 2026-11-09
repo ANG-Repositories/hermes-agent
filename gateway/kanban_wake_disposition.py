@@ -137,6 +137,10 @@ _TABLE: tuple = (
     # (hermes-home scripts/kanban-review-deadman.py) instead of a direct wake. The child does the
     # attended read: a bounded why-waits comment, or surface.
     _Row(4, "review_deadman", lambda c: c.kind == "review_deadman", AUTO, MODE_FORK),
+    # t_6a70430e: a producer's card-owned mechanical wake (a detached job's failure/handoff, an obligation
+    # routine wake), emitted as a ``mechanical_wake`` card event instead of a direct socket turn. The child
+    # reads it and acknowledges (receipt + one comment, any open status) or surfaces it.
+    _Row(4, "mechanical_wake", lambda c: c.kind == "mechanical_wake", AUTO, MODE_FORK),
     # Tier 5 — default: upstream handbacks, repeat crashes, reclaimed, skipped_nonspawnable,
     # status/heartbeat plumbing and any kind nobody listed.
     _Row(5, "default", lambda c: True, SURFACE),

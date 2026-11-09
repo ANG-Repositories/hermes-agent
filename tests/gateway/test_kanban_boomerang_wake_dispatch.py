@@ -1672,3 +1672,94 @@ def test_routed_review_deadman_on_boomerang_card_is_one_child_routed_to_the_reci
     env["runner"]._kanban_owner_wake_state.last_wake.clear()
     _tick(env)
     assert len(env["dispatched"]) == 1, "an active child: no second dispatch"
+
+
+# --- t_6a70430e: a producer's card-owned mechanical wake (detached-run / obligation reconciler) -------------------
+
+
+def _mechanical_card(env, *, auto=True, status="running") -> str:
+    """A worker card (NOT in review) + the producer's raw mechanical_wake event (hermes-home
+    scripts/lib/card_mechanical_wake.py writes it raw, like the review deadman)."""
+    tid = _card(env, auto=auto)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "mechanical_wake", json.dumps({"by": "card-mechanical-wake", "source": "detached-run",
+                                                          "episode": "detached:r1", "text": "job x rc=1"}),
+                      int(time.time())))
+    return tid
+
+
+def test_mechanical_wake_on_a_non_review_card_is_one_child_and_no_turn(env):
+    tid = _mechanical_card(env)
+    turns = _tick(env)
+    assert [(e["row"], e["mode"], e["task_id"]) for e in env["dispatched"]] == [("mechanical_wake", "fork", tid)]
+    assert turns == [], [t.text for t in turns]
+    goal = ah.build_goal(env["dispatched"][0])
+    assert "allowed actions: acknowledge, surface" in goal and "never stops its escalation clock" in goal
+
+
+def test_mechanical_wake_off_boomerang_is_the_owner_turn(env):
+    tid = _mechanical_card(env, auto=False)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert len(turns) == 1 and tid in turns[0].text and "detached-run reported" in turns[0].text
+
+
+def test_mechanical_wake_row_off_is_the_owner_turn(env):
+    from hermes_constants import get_hermes_home
+
+    (get_hermes_home() / "config.yaml").write_text("kanban:\n  boomerang_wake_rows:\n    mechanical_wake: false\n")
+    tid = _mechanical_card(env)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert len(turns) == 1 and tid in turns[0].text
+
+
+def test_acknowledge_on_a_running_card_is_one_receipt_and_comment_no_state_change(env):
+    tid = _mechanical_card(env)
+    _tick(env)
+    entry = ah.BoomerangWakeState().get_claim(env["dispatched"][0]["key"])
+    res = ah.execute_verdict(entry, _verdict(entry, "acknowledge", summary="expected waiter timeout"))
+    assert res["ok"], res
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    rec = [e for e in events if e.kind == ah.RECEIPT_KIND]
+    assert task.status == "running" and len(rec) == 1
+    assert rec[0].payload["action"] == "acknowledge" and rec[0].payload["claim_event_id"] == entry["event_id"]
+    assert [c.body for c in comments if "acknowledge" in c.body] and len(comments) == 1
+    assert not ah.execute_verdict(entry, _verdict(entry, "complete"))["ok"], "complete is not this row's action"
+
+
+def test_acknowledge_refuses_a_card_that_moved_since_the_claim(env):
+    tid = _mechanical_card(env)
+    _tick(env)
+    entry = ah.BoomerangWakeState().get_claim(env["dispatched"][0]["key"])
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+    res = ah.execute_verdict(entry, _verdict(entry, "acknowledge", summary="late"))
+    assert not res["ok"] and "moved" in res["reason"], res
+    with kb.connect_closing() as conn:
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == ah.RECEIPT_KIND]
+
+
+
+@pytest.mark.parametrize("route", ["alerts-home", "fallback"])
+def test_routed_mechanical_wake_on_boomerang_card_is_one_child_routed_to_the_recipient(env, route):
+    other = "1502228850338435153"
+    rcpt = env["runner"].session_store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id=other, chat_type="group", user_id=HUMAN))
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "mechanical_wake", {
+            "by": "card-mechanical-wake", "source": "detached-run", "episode": "detached:r1", "text": "rc=1",
+            "recipient_route": route, "recipient_session_key": rcpt.session_key,
+            "recipient_chat": other, "recipient_profile": "default"})
+    turns = _tick(env)
+    assert turns == [], [t.text for t in turns]
+    assert len(env["dispatched"]) == 1, env["dispatched"]
+    d = env["dispatched"][0]
+    assert d["row"] == "mechanical_wake" and str(d["route"]["chat_id"]) == other, d

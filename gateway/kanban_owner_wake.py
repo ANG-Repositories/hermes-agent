@@ -75,6 +75,7 @@ STATE_FILENAME = "kanban_owner_wake.json"
 SCAN_KINDS = (
     "blocked", "stalled", "crashed", "gave_up", "timed_out", "reclaimed",
     "completed", "review_requested", "skipped_nonspawnable", "review_deadman",
+    "mechanical_wake",
 )
 STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
 # Kinds the per-subscription notify+wake path turns into a wake. The owner-wake
@@ -95,6 +96,14 @@ TRIGGER_LAST_BLOCKER = "last_blocker_done"
 TRIGGER_RED_HANDBACK = "red_handback"
 TRIGGER_WOKE_NONSPAWNABLE = "woke_nonspawnable"
 TRIGGER_REVIEW_DEADMAN = "review_deadman"
+# t_6a70430e: a card-owned MECHANICAL wake (hermes-home scripts/lib/card_mechanical_wake.py: a detached job's
+# failure/handoff, an obligation reconciler routine wake) on a boomerang-wake card, as an event instead of a
+# direct control-socket turn. Off boomerang it is the owner turn, like every other row.
+TRIGGER_MECHANICAL_WAKE = "mechanical_wake"
+# Event kinds whose producer resolves the recipient itself and may carry an alerts-home / fallback session key
+# (t_3151f3fd review deadman; t_6a70430e mechanical wake). hermes-home card_mechanical_wake.consumer_ready() reads
+# this name in the LOADED tree before a producer puts a routed recipient on a mechanical_wake event.
+ROUTED_RECIPIENT_KINDS = (TRIGGER_REVIEW_DEADMAN, TRIGGER_MECHANICAL_WAKE)
 
 _WAKE_OFF_RE = re.compile(r"^\s*wake\s*:\s*off\s*$", re.I | re.M)
 # A block reason that names WHEN or ON WHAT the card can move again.
@@ -245,6 +254,8 @@ def describe(item: dict) -> str:
     elif trig == TRIGGER_REVIEW_DEADMAN:
         out = (f"waiting {item.get('waiting_min') or '?'}m in review on you with no owner comment (review deadman "
                "tier 1): land it, request changes, or comment why it waits")
+    elif trig == TRIGGER_MECHANICAL_WAKE:
+        out = f"{item.get('source') or 'automation'} reported on this card: read it and decide what it needs"
     else:
         out = str(item.get("kind"))
     if reason:
@@ -788,7 +799,7 @@ def routed_recipient(item: dict) -> str:
     wake sub). On a boomerang card it now emits the event on those routes too, carrying
     ``recipient_session_key``; the owner-wake then wakes THAT session (or hands it to a
     boomerang child routed there), never the #alerts home. Any other kind: ""."""
-    if item.get("kind") != TRIGGER_REVIEW_DEADMAN:
+    if item.get("kind") not in ROUTED_RECIPIENT_KINDS:
         return ""
     p = item.get("payload") or {}
     if p.get("recipient_route") not in ("alerts-home", "fallback"):
@@ -845,6 +856,10 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
     elif kind == "review_deadman":
         # t_1e0ffee4: the review deadman's tier-1 page as an event (hermes-home kanban-review-deadman.py)
         item.update(trigger=TRIGGER_REVIEW_DEADMAN, waiting_min=(payload or {}).get("waiting_min"))
+    elif kind == "mechanical_wake":
+        p = payload or {}
+        item.update(trigger=TRIGGER_MECHANICAL_WAKE, source=_clip(p.get("source"), 80),
+                    reason=_clip(p.get("text")))
     else:
         return None
     return item

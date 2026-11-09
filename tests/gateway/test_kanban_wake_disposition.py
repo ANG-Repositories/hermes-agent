@@ -33,6 +33,7 @@ OWNER_WAKE_TRIGGER_EVENTS = {
     ow.TRIGGER_RED_HANDBACK: [("review_requested", {"own_repo": True, "pr_state": "red"})],
     ow.TRIGGER_WOKE_NONSPAWNABLE: [("skipped_nonspawnable", {"assignee": "apollo"})],
     ow.TRIGGER_REVIEW_DEADMAN: [("review_deadman", {"waiting_min": 25})],
+    ow.TRIGGER_MECHANICAL_WAKE: [("mechanical_wake", {"source": "detached-run", "text": "rc=1"})],
 }
 
 PLAIN = {"id": "t_1", "title": "plain card", "body": "do the thing"}
@@ -51,6 +52,7 @@ EXPECTED = {
     "review_requested": SURFACE,   # no own_repo/pr_state -> upstream row -> surface
     "reclaimed": SURFACE, "skipped_nonspawnable": SURFACE,
     "review_deadman": AUTO,   # t_1e0ffee4: the deadman's tier-1 event -> the attended-read child
+    "mechanical_wake": AUTO,   # t_6a70430e: a producer's mechanical wake -> the acknowledge/surface child
 }
 
 
@@ -235,3 +237,9 @@ def test_review_deadman_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
     d = classify("review_deadman", {"waiting_min": 25}, PLAIN)
     assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "review_deadman")
     assert classify("review_deadman", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE
+
+
+def test_mechanical_wake_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
+    d = classify("mechanical_wake", {"source": "detached-run"}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "mechanical_wake")
+    assert classify("mechanical_wake", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE
