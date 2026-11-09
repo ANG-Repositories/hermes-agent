@@ -2479,7 +2479,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     probed: Dict[str, dict] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
+        free = (UNCOUNTED_TICK_FREE if signal.allocd == "on" else count_free(h, running)) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
                "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
