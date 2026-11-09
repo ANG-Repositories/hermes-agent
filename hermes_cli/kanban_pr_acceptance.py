@@ -258,7 +258,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
                         outcomes.append("success")
                         break
         attr_missing = any(e["name"] == _ATTR_CONTEXT and e["classification"] == "missing" for e in receipt["checks"])
-        if current.get("merged") and attr_missing and current["head"]["sha"] == sha:
+        # A user-posted attribution status on this head (any state; the operator-lane path above
+        # owns it) is an explicit verdict: a retroactive record never overrides it (Prism dbe6b95e2c87).
+        if current.get("merged") and attr_missing and operator_candidate is None and current["head"]["sha"] == sha:
             stage = "verify retroactive attribution"
             retro = _retroactive_attribution(repo, canonical or repo, number, sha, current, profile_home)
             if retro:
@@ -385,29 +387,29 @@ def _retroactive_attribution(repo: str, canonical: str, number: int, sha: str, c
     logins = cfg.get("operator_logins") if isinstance(cfg, dict) else None
     if not isinstance(approvers, list) or not approvers:
         return None
-    record = approval = None
+    record = approval = latest_cov = None
     try:
         with (hermes_root / "state" / "merge-ledger.jsonl").open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if sha not in line:
-                    continue
                 try:
                     row = json.loads(line)
                 except ValueError:
                     continue
-                if (not isinstance(row, dict) or str(row.get("repo", "")).lower() != canonical.lower()
-                        or str(row.get("pr")) != str(number)):
+                # fleet-merge writes GitHub's canonical OWNER/REPO, so the compare is byte-exact.
+                if not isinstance(row, dict) or row.get("repo") != canonical or str(row.get("pr")) != str(number):
                     continue
                 if (row.get("action") == "record-only" and row.get("gate_kind") == "retroactive"
                         and row.get("head") == sha and row.get("by") in approvers
                         and row.get("lane") in _OPERATOR_LANES):
                     record = row
                 cov = row.get("operator_coverage")
-                if (isinstance(cov, dict) and cov.get("verdict") == "APPROVE" and cov.get("head_sha") == sha
-                        and cov.get("by") in approvers):
-                    approval = cov
+                if isinstance(cov, dict) and cov.get("head_sha") == sha:
+                    latest_cov = cov  # the newest verdict at this head decides (Prism 61279c7e7bcd)
     except OSError:
         return None
+    if (isinstance(latest_cov, dict) and latest_cov.get("verdict") == "APPROVE"
+            and latest_cov.get("by") in approvers):
+        approval = latest_cov
     if not record or not approval:
         return None
     authors = {merger, *(logins if isinstance(logins, list) else [])}

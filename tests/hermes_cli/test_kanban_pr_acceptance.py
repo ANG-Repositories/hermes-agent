@@ -818,7 +818,7 @@ def test_operator_lane_negatives_stay_missing(github, tmp_path, case):
 def _retroactive(tmp_path, *, gate_kind="retroactive", action="record-only", by="apollo", lane="operator",
                  approve=True, approve_head=_HEAD, approve_by="apollo/operator", ledger_head=_HEAD,
                  ledger_repo="acme/repo", author="ang-fleet-interactive[bot]", comment_by="apollo",
-                 comment_lane="operator", statuses=None, extra_check=False):
+                 comment_lane="operator", statuses=None, extra_check=False, later_verdict=None):
     cfg = tmp_path / "home" / "config" / "operator-approvers.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(json.dumps({"approvers": ["apollo", "apollo/operator"], "operator_logins": ["Kyzcreig"]}),
@@ -831,6 +831,9 @@ def _retroactive(tmp_path, *, gate_kind="retroactive", action="record-only", by=
         rows.append({"event": "land-request", "repo": ledger_repo, "pr": 7, "review_head_sha": approve_head,
                      "status": "STALE", "operator_coverage": {"verdict": "APPROVE", "head_sha": approve_head,
                                                               "by": approve_by}})
+    if later_verdict:    # a newer operator verdict at the same head, appended after the APPROVE
+        rows.append({"event": "land-request", "repo": ledger_repo, "pr": 7, "review_head_sha": approve_head,
+                     "operator_coverage": {"verdict": later_verdict, "head_sha": approve_head, "by": approve_by}})
     ledger.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     checks = [{"context": _ATTR, "app_id": 5078363}] + ([{"context": "ci", "app_id": 1}] if extra_check else [])
     body = f"\U0001f916 merged-by: {comment_by} \u00b7 lane: {comment_lane} \u00b7 gate: RETROACTIVE \u00b7 why: x"
@@ -869,7 +872,8 @@ def test_retroactive_card_completes_through_complete_task(github, tmp_path):
 @pytest.mark.parametrize("case", ["open_pr", "no_record", "not_retroactive", "record_other_head", "record_not_approver",
                                   "record_bad_lane", "record_other_repo", "no_approve", "approve_other_head",
                                   "approve_not_approver", "comment_by_other", "comment_other_agent", "no_comment",
-                                  "attribution_failed", "other_check_missing"])
+                                  "attribution_failed", "other_check_missing", "user_attribution_failure",
+                                  "user_attribution_error", "approve_superseded", "ledger_repo_case"])
 def test_retroactive_negatives_stay_refused(github, tmp_path, case):
     from hermes_cli import kanban_pr_acceptance as acc
     kw = {}
@@ -901,6 +905,13 @@ def test_retroactive_negatives_stay_refused(github, tmp_path, case):
                            "description": "refused", "creator": {"login": "ang-fleet-lander[bot]", "type": "Bot"}}]
     elif case == "other_check_missing":    # only attribution is satisfied, never CI
         kw["extra_check"] = True
+    elif case in ("user_attribution_failure", "user_attribution_error"):    # Prism dbe6b95e2c87
+        kw["statuses"] = [{"id": 6, "context": _ATTR, "state": case.rsplit("_", 1)[1], "target_url": None,
+                           "description": "operator refused", "creator": {"login": "Kyzcreig", "type": "User"}}]
+    elif case == "approve_superseded":    # Prism 61279c7e7bcd: a later REQUEST_CHANGES revokes the APPROVE
+        kw["later_verdict"] = "REQUEST_CHANGES"
+    elif case == "ledger_repo_case":    # the ledger repo must equal GitHub's canonical name byte-for-byte
+        kw["ledger_repo"] = "ACME/Repo"
     state = _retroactive(tmp_path, **kw)
     if case == "open_pr":
         state["pr_state"] = "OPEN"
@@ -912,3 +923,17 @@ def test_retroactive_negatives_stay_refused(github, tmp_path, case):
     receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
     assert receipt["ok"] is False, receipt
     assert receipt["classification"] == ("failure" if case == "attribution_failed" else "missing"), receipt
+
+
+@pytest.mark.platforms("posix")
+def test_retroactive_latest_head_verdict_decides(github, tmp_path):
+    """A REQUEST_CHANGES followed by an APPROVE at the same head: the newest (APPROVE) decides."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    state = _retroactive(tmp_path, later_verdict="APPROVE")
+    ledger = tmp_path / "home" / "state" / "merge-ledger.jsonl"
+    rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    rows[1]["operator_coverage"]["verdict"] = "REQUEST_CHANGES"
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    github.update(state)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True and receipt["checks"][0]["classification"] == "waived", receipt
