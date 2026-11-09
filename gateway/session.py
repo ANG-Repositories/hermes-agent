@@ -2359,7 +2359,7 @@ class SessionStore(
                     # boot gate, so the late write changes nothing in memory. Its caller still
                     # acknowledges /stop, so persist the newer marker first: that write may be
                     # deferred behind the save lock or may have failed.
-                    self._save()
+                    self._save_entry(session_key, lock_held=True)
                     return True
                 fence[0] = int(generation)
             # An untracked stop (no generation) leaves the fence as is: never lowered.
@@ -2373,7 +2373,12 @@ class SessionStore(
                 else None
             )
             self._clear_resume_pending_entry(entry)
-            self._save()
+            # One-row UPSERT, not the whole-index rewrite: only this entry's marker fields changed
+            # and the key -> session_id mapping did not. The write still runs (deferred to the
+            # lock release in this thread) before this method returns, so the marker is on disk
+            # before /stop acknowledges; a failed upsert falls back to the full rewrite. Live
+            # 2026-11-08: the full _save made /stop wait 0.6-5.5 s behind other sessions' saves.
+            self._save_entry(session_key, lock_held=True)
         return True
 
     def clear_stale_resume_pending(self, max_age_seconds: float) -> int:
@@ -2892,7 +2897,7 @@ class SessionStore(
             entry.user_stopped_at = None
             entry.user_stopped_boot_id = None
             entry.user_stopped_message_id = None
-            self._save()
+            self._save_entry(session_key, lock_held=True)  # one-row write, see mark_user_stopped
             return True
 
     def _reject_session_key_conflict(self, conflict) -> None:
