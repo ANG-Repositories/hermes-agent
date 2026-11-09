@@ -245,3 +245,38 @@ def test_real_harness_binds_to_current_target(bu_pages, real_harness, action):
     assert out["success"] is (action == "fill"), out
     assert bu_pages.current.locator("input").input_value() == (VALUE if action == "fill" else "")
     assert bu_pages.wrong.locator("input").input_value() == ""
+
+
+@pytest.mark.parametrize("action", ["fill", "navigation", "tab_switch"])
+def test_real_harness_handler_holds_daemon_selection_lease(bu_pages, real_harness, monkeypatch, action):
+    """The tool handler path on the real lease daemon: _fenced_page_op takes the daemon's selection
+    lease, the document on the leased target carries the operation witness, and the write lands
+    only there. A same-target navigation (new document) or a tab switch during the op refuses."""
+    from tools import browser_use_target as target
+    monkeypatch.setattr(target, "_routes", {})
+    assert "/current" in real_harness(_SWITCH.format(suffix="/current"))
+    switched, leased, drivers = [], [], []
+    acquire, pin = target.acquire_lease, vault._pin_page
+    monkeypatch.setattr(target, "acquire_lease", lambda route: leased.append(acquire(route)) or leased[-1])
+    monkeypatch.setattr(vault, "_pin_page", lambda tid: drivers.append(pin(tid)) or drivers[-1])
+
+    def resolve(_):
+        if action == "navigation":      # same target, new document: the witness is gone
+            bu_pages.current.goto("https://site.example.test/replaced")
+        elif action == "tab_switch":    # another browser_exec tries to move the leased selection
+            switched.append(json.loads(bu.browser_exec(_SWITCH.format(suffix="/other"), task_id=TASK)))
+        return {"address_line1": VALUE}
+    bu_pages.backend.resolve_secret = resolve
+    try:
+        out = json.loads(vault._handle_vault_fill({"handle": "fixture-address"}, task_id=TASK))
+    finally:
+        SUPERVISOR_REGISTRY.stop_all()
+    assert out["success"] is (action == "fill"), out
+    assert bu_pages.current.locator("input").input_value() == (VALUE if action == "fill" else "")
+    assert bu_pages.wrong.locator("input").input_value() == ""
+    # The real daemon granted a selection lease and the page was bound on the leased target.
+    assert len(leased) == 1 and leased[0][3], leased
+    assert [b.driver for b in drivers] == ["browser-use-lease"], drivers
+    if action == "tab_switch":
+        assert not switched[0].get("success"), switched
+        assert "selection_leased" in json.dumps(switched[0]), switched

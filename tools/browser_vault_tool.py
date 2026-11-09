@@ -43,7 +43,7 @@ _PAGE_BINDING: ContextVar[Any] = ContextVar("vault_page_binding", default=None)
 
 class _Binding(NamedTuple):
     task_id: str
-    key: Any        # agent-browser session key, or the Browser Use route dict
+    key: Any        # agent-browser session key, the Browser Use route dict, or the leased VaultTransaction
     session: Any    # agent-browser session record (None on Browser Use)
     witness: str
     driver: str = "agent-browser"
@@ -61,6 +61,11 @@ def _pin_page(task_id):
     # while another backend owns navigation.
     if _is_camofox_mode():
         return None
+    from tools.browser_use_target import _pin, browser_use_owns
+    # The tool handlers (_fenced_page_op) always hold a daemon selection lease here; a direct
+    # call without one binds through navigation's driver route instead.
+    if browser_use_owns(task_id) and _pin.get() is not None:
+        return _pin_selected_target_page(task_id)
     if _is_browser_use_cli_mode():
         return _pin_browser_use_page(task_id)
     key = _last_session_key(task_id)
@@ -91,6 +96,32 @@ def _pin_browser_use_page(task_id):
         return None
     return _Binding(task_id, route, None, witness, "browser-use",
                     (seen["target_id"], seen["session_id"], seen.get("pid")))
+
+
+def _selected_target_eval(task_id, expression: str) -> Dict[str, Any]:
+    """Evaluate on the Browser Use target the daemon selection lease pins (validated per call)."""
+    try:
+        supervisor = _ensure_supervisor(task_id)
+        sup = supervisor.evaluate_runtime(expression)
+        return {"success": bool(sup.get("ok")), "result": sup.get("result"),
+                "error": sup.get("error", "")}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _pin_selected_target_page(task_id):
+    """Browser Use with a daemon selection lease (_fenced_page_op began it): mark the document on
+    the leased target with the operation witness. No lease for this task: refuse."""
+    from tools import browser_use_target as target
+
+    tx = target._pin.get()
+    if tx is None or tx.task_id != task_id:
+        return None
+    witness = secrets.token_hex(24)
+    seen = _selected_target_eval(task_id, f"(window[{json.dumps(witness)}] = true, window.location.href)")
+    if not seen.get("success"):
+        return None
+    return _Binding(task_id, tx, None, witness, "browser-use-lease", (tx.target,))
 
 
 def _bound_page(fn):
@@ -124,6 +155,10 @@ def _binding_is_current(binding):
     )
     if _is_camofox_mode():
         return False
+    if binding.driver == "browser-use-lease":
+        from tools import browser_use_target as target
+        return (target.browser_use_owns(binding.task_id) and target._pin.get() is binding.key
+                and target.route_for_task(binding.task_id) is binding.key.route)
     if binding.driver == "browser-use":
         from tools import browser_use_cli as bu
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
@@ -138,6 +173,8 @@ def _driver_eval_bound(binding, expression: str) -> Dict[str, Any]:
     """Evaluate in the navigation driver's CURRENT page, only while it is still the pinned document."""
     witness = json.dumps(binding.witness)
     guarded = f"window[{witness}] === true ? ({expression}) : null"
+    if binding.driver == "browser-use-lease":
+        return _selected_target_eval(binding.task_id, guarded)
     if binding.driver == "browser-use":
         from tools import browser_use_cli as bu
         seen = bu.driver_eval(binding.task_id, binding.key, guarded)
@@ -183,6 +220,9 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
         if not _binding_is_current(binding):
             return {"success": False, "error": "Browser session changed"}
         return _driver_eval_bound(binding, expression)
+    from tools.browser_use_target import browser_use_owns
+    if browser_use_owns(task_id):
+        return _selected_target_eval(task_id, expression)
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -217,7 +257,10 @@ def _ensure_supervisor(task_id: str):
     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
     Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_use_target import browser_use_owns, supervisor_for_task
 
+    if browser_use_owns(task_id):
+        return supervisor_for_task(task_id)
     from tools.browser_tool import _last_session_key
     task_id = _last_session_key(task_id)
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
@@ -290,14 +333,17 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         if not _eval_js(task_id, "true").get("result"):
             return {"success": False, "error_type": "page_changed", "error": "Current browser page changed"}
         witness = json.dumps(binding.witness)
-        focused = supervisor.focus_page("", accept=f"window[{witness}] === true")
-        if not focused.get("ok"):
-            return {"success": False, "error_type": "page_changed", "error": "Bound document no longer exists"}
-        # Browser Use names its current target: the supervisor must have selected exactly that one.
-        if binding.target is not None and focused.get("target_id") != binding.target[0]:
-            return {"success": False, "error_type": "page_changed", "error": "Supervisor selected another tab"}
-        if not _binding_is_current(binding) or not _eval_js(task_id, "true").get("result"):
-            return {"success": False, "error_type": "page_changed", "error": "Browser page changed during target selection"}
+        # Under a daemon selection lease the write is already pinned to the leased target
+        # (supervisor_for_task); otherwise the supervisor selects the bound document here.
+        if binding.driver != "browser-use-lease":
+            focused = supervisor.focus_page("", accept=f"window[{witness}] === true")
+            if not focused.get("ok"):
+                return {"success": False, "error_type": "page_changed", "error": "Bound document no longer exists"}
+            # Browser Use names its current target: the supervisor must have selected exactly that one.
+            if binding.target is not None and focused.get("target_id") != binding.target[0]:
+                return {"success": False, "error_type": "page_changed", "error": "Supervisor selected another tab"}
+            if not _binding_is_current(binding) or not _eval_js(task_id, "true").get("result"):
+                return {"success": False, "error_type": "page_changed", "error": "Browser page changed during target selection"}
         expression = (f"window[{witness}] === true ? ({expression}) : "
                       "JSON.stringify({refused: 'origin_changed'})")
     sup = supervisor.evaluate_runtime(expression)
@@ -305,6 +351,7 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         return {"success": True, "result": sup.get("result")}
     return {
         "success": False,
+        "outcome": sup.get("outcome", "unknown"),
         "error_type": "supervisor_required"
         if "supervisor" in str(sup.get("error") or "").lower()
         else "eval_failed",
@@ -510,7 +557,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
     del code
     if not result.get("success"):
-        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+        return json.dumps({"success": False, "outcome": result.get("outcome", "unknown"),
+                           "error": str(result.get("error") or "fill failed")[:200]})
     parsed = _parse_json_result(result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
@@ -691,7 +739,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         )
     if not fill_result.get("success"):
         err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
-        out = {"success": False, "error": err}
+        out = {"success": False, "error": err, "outcome": fill_result.get("outcome", "unknown")}
         if fill_result.get("error_type"):
             out["error_type"] = fill_result["error_type"]
         return json.dumps(out)
@@ -887,6 +935,10 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
+    from tools.browser_use_target import browser_use_owns, route_for_task
+    route = route_for_task(task_id) if browser_use_owns(task_id) else None
+    if route is not None:
+        return route.local
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import _shares_bot_desktop_browser
     return _shares_bot_desktop_browser(_active_sessions.get(_last_session_key(task_id or "default")) or {})
@@ -899,8 +951,37 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import run_fenced
 
-    session = _active_sessions.get(_last_session_key(task_id or "default")) or {}
-    res = run_fenced(session, lambda: {"raw": fn()})
+    from tools.browser_use_target import begin, browser_use_owns, end, route_for_task
+
+    tid = task_id or "default"
+    owned = browser_use_owns(tid)
+    route = route_for_task(tid) if owned else None
+    session = ({"features": {"local": route.local}} if route is not None else
+               _active_sessions.get(_last_session_key(tid)) or {})
+
+    def pinned_op():
+        token = None
+        try:
+            if route_for_task(tid) is not route:
+                raise RuntimeError("Browser Use route changed after takeover fence selection")
+            if owned:
+                token = begin(tid, expected_route=route)
+        except Exception:
+            return {"raw": json.dumps({"success": False, "error_type": "selected_target_unavailable",
+                    "outcome": "not_dispatched",
+                    "error": "Browser Use selected target changed, closed, or is unavailable; select a live tab with browser_exec and retry. Nothing was written."})}
+        try:
+            return {"raw": fn()}
+        except Exception:
+            # The callback may already have dispatched a fill (or saved an item).
+            # Never misreport an arbitrary callback failure as a pre-write refusal.
+            return {"raw": json.dumps({"success": False, "error_type": "operation_outcome_unknown",
+                    "outcome": "unknown", "error": "Vault operation outcome unknown; inspect the page and saved item before retrying."})}
+        finally:
+            if token is not None:
+                end(token)
+
+    res = run_fenced(session, pinned_op)
     return res["raw"] if "raw" in res else json.dumps(res)
 
 

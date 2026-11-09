@@ -685,12 +685,21 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     route_err = _route_backend(env, session, task_id, bool(local))
     if route_err:
         return tool_error(route_err)
+    # Match the provider browser's lifetime: explicit names persist across tasks,
+    # unnamed browsers remain task-scoped. Vault transaction authorization stays per-task.
+    import hashlib
+    from hermes_constants import hermes_home_key
+    from tools.browser_tool_cdp import _resolve_cdp_override
+    endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+    daemon_scope = json.dumps([hermes_home_key(), _backend_cache_key(task_id, session), env.get("BU_NAME", "default"),
+                              _resolve_cdp_override(endpoint) if endpoint else ""])
+    env["BU_NAME"] = "hermes-" + hashlib.sha256(daemon_scope.encode()).hexdigest()[:40]
     bot_desktop_browser = bool(env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None))
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
-    if session and not private_browser:
+    if not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -706,17 +715,36 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> Dict[str, Any]:
-        _record_route(task_id, session, env, _attach_vault_supervisor(env, task_id))
-        try:
-            return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
-        except subprocess.TimeoutExpired:
-            return {"error_result": tool_error(
-                f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
-                f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
-                "append to workspace files — anything already written to the workspace is preserved."
-            )}
-        except OSError as e:
-            return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
+        from tools.browser_use_target import selection_execution
+        admitted = None
+        if bot_desktop_browser:
+            from tools.bot_desktop import lease as _bd_lease
+            admitted = _bd_lease.get().epoch  # run_fenced admitted this epoch just before calling us
+        with selection_execution(task_id, env, local=bot_desktop_browser) as complete:
+            if admitted is not None:
+                # The selection wait can span another execution; a human may have taken the
+                # screen meanwhile. Re-admit before anything reaches the page.
+                try:
+                    if _bd_lease.assert_agent_may_act().epoch != admitted:
+                        raise _bd_lease.HumanHasControl("A human took over the bot's screen while this "
+                                                        "browser command waited; it did not run.")
+                except _bd_lease.HumanHasControl as e:
+                    return {"success": False, "code": "human_has_control", "error": str(e)}
+            # Record the daemon name this exec actually drives (BU_NAME is scoped above), so vault
+            # driver queries reach the same daemon.
+            _record_route(task_id, env.get("BU_NAME", ""), env, _attach_vault_supervisor(env, task_id))
+            try:
+                proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+                complete(proc.returncode == 0)
+                return {"proc": proc}
+            except subprocess.TimeoutExpired:
+                return {"error_result": tool_error(
+                    f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
+                    f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
+                    "append to workspace files — anything already written to the workspace is preserved."
+                )}
+            except OSError as e:
+                return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
 
     if bot_desktop_browser:
         from tools.browser_tool_session import run_fenced

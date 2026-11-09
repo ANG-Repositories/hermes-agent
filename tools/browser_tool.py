@@ -785,6 +785,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # Only a successful, non-blocked navigation becomes the task owner: failed opens
     # and blocked redirects must not retarget follow-up clicks to an irrelevant session.
     _last_active_session_key[effective_task_id] = nav_session_key
+    from tools.browser_use_target import retire_route
+    retire_route(effective_task_id)  # the native session now owns this task's page; vault ops must follow it
     _lp._copy_fallback_warning(response, result)
     _add_navigate_warnings(response, title, session_info if is_first_nav else None)
     _attach_auto_snapshot(response, nav_session_key)
