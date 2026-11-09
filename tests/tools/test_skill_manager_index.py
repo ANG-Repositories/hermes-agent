@@ -168,15 +168,45 @@ def test_mutating_call_sees_external_local_override_within_ttl(tmp_path):
         assert (ext / "dup" / "SKILL.md").read_text(encoding="utf-8") == ext_before
 
 
-def test_ttl_bounds_shadow_staleness(tmp_path):
+def test_repeated_missing_lookups_walk_once(tmp_path):
+    local = tmp_path / "skills"
+    _mk(local, "nested/category/alpha")
+    with _roots(local), _count_walks() as walks:
+        for _ in range(50):
+            assert smt._find_skill("absent") is None
+        assert len(walks) == 1
+        _mk(local, "nested/category/absent")
+        assert smt._find_skill("absent")["path"] == local / "nested/category/absent"
+        assert len(walks) == 2
+
+
+def test_invalidated_build_is_never_returned(tmp_path):
+    local = tmp_path / "skills"
+    d = _mk(local, "cat/alpha")
+    real = smt._build_skill_index
+    builds = []
+
+    def racing(roots):
+        index = real(roots)
+        builds.append(index)
+        if len(builds) == 1:
+            d.rename(local / "cat/beta")
+            smt._invalidate_skill_index()
+        return index
+
+    with _roots(local), patch.object(smt, "_build_skill_index", side_effect=racing):
+        assert smt._find_skill("alpha") is None
+        assert smt._find_skill("beta")["path"] == local / "cat/beta"
+        assert len(builds) == 2
+
+
+def test_external_shadow_is_visible_without_ttl(tmp_path):
     local, ext = tmp_path / "skills", tmp_path / "shared" / "devops"
     _mk(ext, "dup")
     with _roots(local, ext):
         assert smt._find_skill("dup")["path"] == ext / "dup"
         _mk(local, "cat/dup")
-        real = time.monotonic
-        with patch("time.monotonic", lambda: real() + smt._SKILL_INDEX_TTL_SECONDS + 1):
-            assert smt._find_skill("dup")["path"] == local / "cat" / "dup"
+        assert smt._find_skill("dup")["path"] == local / "cat/dup"
 
 
 def test_skill_manage_patch_walks_at_most_once(tmp_path):
@@ -193,7 +223,10 @@ def test_skill_manage_patch_walks_at_most_once(tmp_path):
         out = smt.skill_manage(action="patch", name="alpha", old_string="old line", new_string="new line")
         assert '"success": true' in out, out
         assert "new line" in (d / "SKILL.md").read_text(encoding="utf-8")
-        assert len(walks) <= 1, walks
+        assert len(walks) == 1, walks
+        out = smt.skill_manage(action="patch", name="alpha", old_string="new line", new_string="old line")
+        assert '"success": true' in out, out
+        assert len(walks) == 1, walks
 
 
 @pytest.mark.parametrize("n", [2000])

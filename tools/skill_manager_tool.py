@@ -393,44 +393,82 @@ def _iter_skill_dirs(root: Path):
             yield skill_md.parent
 
 
-# Name -> skill-dir index for _find_skill. A full walk (_iter_skill_dirs over every root) costs
-# ~1.7k SKILL.md plus their support trees and showed as ~10% of gateway GIL samples, because one
-# skill_manage call resolves the same name up to four times. The index is rebuilt by ONE walk and
-# is never trusted blindly:
-#   * every hit is re-validated (SKILL.md still a file, not excluded) -> an external delete/move
-#     forces a rebuild on the very next lookup of that name;
-#   * every miss rebuilds once before answering None -> an external create is seen immediately;
-#   * a rebuild also happens after _SKILL_INDEX_TTL_SECONDS (bounds the one case validation cannot
-#     see: a NEW same-named skill appearing EARLIER in scan order) and after any skill_manage
-#     mutation in this process (generation bump).
-# Key = the ordered root list, so a config change to external_dirs or a profile switch is a new index.
-_SKILL_INDEX_TTL_SECONDS = 30.0
-_SKILL_INDEX_LOCK = threading.Lock()
+# Root-set indexes cache hits AND misses. Watch all discovery directories (including empty
+# categories) so external additions and precedence changes are visible without another rglob.
+# Directory metadata is sampled once per operation; downstream users share its bound target.
+_SKILL_INDEX_LOCK = threading.RLock()
+_SKILL_INDEX_BUILD_LOCK = threading.RLock()
+_SKILL_OPERATION_TARGETS = _ctxvars.ContextVar("skill_operation_targets", default=None)
+
+
+def _directory_stamp(path):
+    try:
+        st = path.stat()
+        return st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns
+    except OSError:
+        return None
+
+
+def _directory_shape(path):
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
+    try:
+        skill = (path / "SKILL.md").is_file()
+        return (tuple(sorted(p.name for p in path.iterdir() if p.is_dir()
+                             and p.name not in EXCLUDED_SKILL_DIRS
+                             and not (skill and p.name in SKILL_SUPPORT_DIRS))), skill)
+    except OSError:
+        return None
+
+
+def _index_tree_unchanged(index):
+    for path, (stamp, shape) in index["directories"].items():
+        current = _directory_stamp(path)
+        if current != stamp:
+            if _directory_shape(path) != shape:
+                return False
+            # Atomic content replacement changes directory mtime, not discovery topology.
+            index["directories"][path] = (current, shape)
+    return True
 _SKILL_INDEX: Dict[Tuple[str, ...], Dict[str, Any]] = {}
 _SKILL_INDEX_GENERATION = 0
 
 
-def _invalidate_skill_index() -> None:
-    """Drop every cached index (called after this process mutates a skill tree)."""
+def _invalidate_skill_index(path: Optional[Path] = None) -> None:
+    """Invalidate affected root sets after a topology mutation, fencing in-flight builds."""
     global _SKILL_INDEX_GENERATION
     with _SKILL_INDEX_LOCK:
         _SKILL_INDEX_GENERATION += 1
-        _SKILL_INDEX.clear()
+        for key, index in list(_SKILL_INDEX.items()):
+            if path is None or any(path.is_relative_to(Path(root)) for root in key):
+                del _SKILL_INDEX[key]
+            else:
+                index["gen"] = _SKILL_INDEX_GENERATION
 
 
 def _build_skill_index(roots: List[Path]) -> Dict[str, Any]:
     """One walk over ``roots`` in precedence order -> ordered dirs + first-wins name map. The
     generation is read BEFORE the walk, so a mutation that lands mid-walk voids the build."""
+    import os
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
     gen = _SKILL_INDEX_GENERATION
+    directories = {}
     ordered: List[Path] = []
     by_name: Dict[str, Path] = {}
     for skills_dir in roots:
+        directories[skills_dir] = (_directory_stamp(skills_dir), _directory_shape(skills_dir))
+        for base, dirs, files in os.walk(skills_dir):
+            directory = Path(base)
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS
+                       and not ("SKILL.md" in files and d in SKILL_SUPPORT_DIRS)]
+            directories[directory] = (_directory_stamp(directory),
+                                      (tuple(sorted(dirs)), "SKILL.md" in files))
         if not skills_dir.exists():
             continue
         for skill_dir in _iter_skill_dirs(skills_dir):
             ordered.append(skill_dir)
             by_name.setdefault(skill_dir.name, skill_dir)
-    return {"ordered": ordered, "by_name": by_name, "by_rel": {}, "gen": gen}
+    return {"ordered": ordered, "by_name": by_name, "by_rel": {}, "gen": gen,
+            "directories": directories}
 
 
 def _skill_index_lookup(index: Dict[str, Any], name: str, local_root: Optional[Path]) -> Optional[Path]:
@@ -461,6 +499,15 @@ def _skill_dir_still_valid(skill_dir: Path) -> bool:
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+    targets = _SKILL_OPERATION_TARGETS.get()
+    if targets is None:
+        return _find_skill_indexed(name)
+    if name not in targets:
+        targets[name] = _find_skill_indexed(name)
+    return targets[name]
+
+
+def _find_skill_indexed(name: str) -> Optional[Dict[str, Any]]:
     """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
@@ -480,25 +527,35 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
             local_root = _skills_dir()
     roots = list(get_all_skills_dirs())
     key = tuple(str(r) for r in roots)
-    now = time.monotonic()
-    with _SKILL_INDEX_LOCK:
-        cached = _SKILL_INDEX.get(key)
-    fresh = (cached is not None and cached["gen"] == _SKILL_INDEX_GENERATION
-             and now - cached["built_at"] < _SKILL_INDEX_TTL_SECONDS)
-    if fresh:
-        hit = _skill_index_lookup(cached, name, local_root)
-        if hit is not None and _skill_dir_still_valid(hit):
-            return {"path": hit}
-    # Miss, stale hit, expired or absent index: one walk, then answer from it.
-    index = _build_skill_index(roots)
-    index["built_at"] = now
-    with _SKILL_INDEX_LOCK:
-        if index["gen"] == _SKILL_INDEX_GENERATION:  # never publish a build that raced a mutation
-            if key not in _SKILL_INDEX and len(_SKILL_INDEX) >= 16:  # one per profile root-set
-                _SKILL_INDEX.clear()
-            _SKILL_INDEX[key] = index
-    hit = _skill_index_lookup(index, name, local_root)
-    return {"path": hit} if hit is not None else None
+    # Serialize builders, but let invalidation bump the generation during filesystem work.
+    # Never return an obsolete build, even when it was correctly withheld from publication.
+    with _SKILL_INDEX_BUILD_LOCK:
+        for _ in range(3):
+            with _SKILL_INDEX_LOCK:
+                cached = _SKILL_INDEX.get(key)
+                generation = _SKILL_INDEX_GENERATION
+            if (cached is not None and cached["gen"] == generation
+                    and _index_tree_unchanged(cached)):
+                hit = _skill_index_lookup(cached, name, local_root)
+                if hit is None or _skill_dir_still_valid(hit):
+                    with _SKILL_INDEX_LOCK:
+                        if generation == _SKILL_INDEX_GENERATION:
+                            return {"path": hit} if hit is not None else None
+                with _SKILL_INDEX_LOCK:
+                    _SKILL_INDEX.pop(key, None)
+                continue
+            index = _build_skill_index(roots)
+            if not _index_tree_unchanged(index):
+                continue
+            with _SKILL_INDEX_LOCK:
+                if index["gen"] != _SKILL_INDEX_GENERATION:
+                    continue
+                if key not in _SKILL_INDEX and len(_SKILL_INDEX) >= 16:
+                    _SKILL_INDEX.clear()
+                _SKILL_INDEX[key] = index
+                hit = _skill_index_lookup(index, name, local_root)
+                return {"path": hit} if hit is not None else None
+    raise RuntimeError("Skill tree changed repeatedly during discovery; retry the operation")
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -1145,6 +1202,20 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _maybe_debounced_sync_push(name)
 
 
+def _bind_skill_targets(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def bound(*args, **kwargs):
+        token = _SKILL_OPERATION_TARGETS.set({})
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _SKILL_OPERATION_TARGETS.reset(token)
+    return bound
+
+
+@_bind_skill_targets
 def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
@@ -1152,10 +1223,6 @@ def skill_manage(
     session_id: str = None, operations=None, justification: str = None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
-    # A valid cached external hit cannot reveal a newly created local override.
-    # Refresh before guards, approval targeting, or batch snapshots choose a mutation
-    # target; all subsequent lookups in this call share the rebuilt index.
-    _invalidate_skill_index()
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
@@ -1185,6 +1252,7 @@ def skill_manage(
         # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
         # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
         _ledger_before = None
+        _pre = None
         with suppress(Exception):
             from tools import skill_ledger as _ledger
             _pre = _find_skill(name)
@@ -1193,8 +1261,12 @@ def skill_manage(
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
             f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
         result = handler({"name": name, **args})
-        if action in {"create", "delete"}:  # tree shape changed: no index may outlive it
-            _invalidate_skill_index()
+        if action in {"create", "delete"} and isinstance(result, dict) and result.get("success"):
+            target = result.get("path") or (_pre["path"] if _pre else None)
+            _invalidate_skill_index(Path(target) if target else None)
+            # A topology mutation changes the post-ledger target (create) or removes it
+            # (delete). Do not let the pre-mutation binding escape into post-capture.
+            _SKILL_OPERATION_TARGETS.get().pop(name, None)
         if isinstance(result, str):
             return result  # tool_error JSON for argument-shape problems (patch)
         if result.get("success"):
