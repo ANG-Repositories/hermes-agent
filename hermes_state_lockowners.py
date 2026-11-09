@@ -139,9 +139,9 @@ _WATCHDOG_TICK_S = 0.5
 _HISTORY_NAME = "history.jsonl"
 # Cross-process guard for rotate+append (Prism 8e1b5c4107a7): _publish_lock serializes threads of ONE
 # process only, so two processes could both see a full file and the second rotation would clobber the
-# generation the first just archived. Bounded wait; on contention the record is appended WITHOUT
-# rotating (a single O_APPEND write is already safe across processes), so a writer never blocks long
-# and an archived generation is never overwritten. Never matches _LEDGER_NAME_RE, so never pruned.
+# generation the first just archived. Serialize every append with one nonblocking attempt;
+# otherwise drop diagnostics. No unlocked growth or retry wait.
+# Never matches _LEDGER_NAME_RE, so never pruned.
 _HISTORY_LOCK_NAME = "history.lock"
 _HISTORY_MAX_BYTES = 4 * 1024 * 1024
 # A writer that has waited this long for the write lock logs the holder on its own side.
@@ -433,7 +433,8 @@ def _open_history_lock(name: str, *, dir_fd: Optional[int] = None) -> Optional[i
             return os.open(name, os.O_RDWR | os.O_CREAT, 0o600)
         return os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     except OSError:
-        logger.debug("state.db lock-holder history.lock unusable; appending without rotation", exc_info=True)
+        with contextlib.suppress(Exception):
+            logger.debug("state.db lock-holder history.lock unusable; dropping record", exc_info=True)
         return None
 
 
@@ -501,7 +502,8 @@ def _append_history(hold: dict, fields: dict) -> None:
         finally:
             os.close(fd)
     except Exception:
-        logger.debug("state.db lock-holder history append failed", exc_info=True)
+        with contextlib.suppress(Exception):
+            logger.debug("state.db lock-holder history append failed", exc_info=True)
 
 
 def ledger_history(db_path, start: float, end: float) -> List[dict]:

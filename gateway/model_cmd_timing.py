@@ -3,7 +3,7 @@
 An idle-session ``/m opus-d`` took ~79 s on 2026-11-09 while ``switch_model()`` alone took 0.09 s warm
 and 3.6 s cold; nothing said where the rest went. The handler marks each stage boundary with
 :func:`phase` (one line per boundary, so the long handler body is not re-indented); the time from one
-boundary to the next belongs to the earlier phase, and the open phase closes when the command returns::
+boundary to the next belongs to the earlier phase; the final phase includes adapter delivery::
 
     PHASE=model_cmd session=<key> outcome=ok lock_wait_s=0.000 config_s=0.002 normalize_s=0.001 ...
         record_s=4.210 record_get_session_s=0.020 record_update_model_s=4.100 ... total_s=4.300
