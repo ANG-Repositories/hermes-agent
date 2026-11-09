@@ -735,7 +735,7 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
             rows = conn.execute(
                 f"SELECT e.id, e.task_id, e.kind, e.payload, e.run_id, e.created_at, "
                 f"{actor} AS actor_sid, {actor_profile} AS actor_profile, "
-                f"t.session_id AS home_sid, t.title, t.body, "
+                f"t.session_id AS home_sid, t.title, t.body, t.boomerang_wake, "
                 f"t.result FROM task_events e JOIN tasks t ON t.id = e.task_id "
                 f"WHERE e.id > ? AND e.kind IN ({marks}) ORDER BY e.id LIMIT ?",
                 (cursor, *SCAN_KINDS, SCAN_LIMIT),
@@ -810,6 +810,12 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
             "event_ts": r["created_at"], "payload": payload if isinstance(payload, dict) else None}
     if kind == "blocked":
         trig = classify_block(payload)
+        if trig is None and "boomerang_wake" in r.keys() and r["boomerang_wake"]:
+            # Admission only: the boomerang classifier still owns the disposition.
+            from gateway.kanban_boomerang_wake import enabled
+
+            if enabled():
+                trig = "blocked_assess"
         if trig is None:
             return None
         item.update(trigger=trig, reason=_clip((payload or {}).get("reason")))

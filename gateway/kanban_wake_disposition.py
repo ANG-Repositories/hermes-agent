@@ -110,12 +110,11 @@ def _pr_state(c: _Ctx) -> str:
 
 # THE table. Ordered by tier; the first matching row wins. Every ``auto`` row names a mode.
 _TABLE: tuple = (
-    # Tier 1 — card tags beat every kind row.
+    # Restricted cards may be diagnosed, never auto-authorized by that diagnosis.
+    _Row(1, "blocked_assess", lambda c: c.kind == "blocked", AUTO, MODE_FORK),
+    # Tier 1 — card tags beat other kind rows.
     _Row(1, "card_tag_surface", lambda c: bool(c.tags & SURFACE_TAGS), SURFACE),
     # Tier 2 — judgment kinds.
-    _Row(2, "blocked_needs_input",
-         lambda c: c.kind == "blocked" and str(c.payload.get("kind") or "") == "needs_input", SURFACE),
-    _Row(2, "blocked", lambda c: c.kind == "blocked", SURFACE),
     _Row(2, "block_loop_detected", lambda c: c.kind == "block_loop_detected", SURFACE),
     # Tier 3 — a mechanical own-repo handback: every open Prism key is answered in the
     # handback text, so posting those lines, the coverage and the enqueue is not a verdict
