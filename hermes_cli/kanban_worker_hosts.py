@@ -383,12 +383,9 @@ def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subproces
     """Copy the local ``workspace`` to the same path on ``host`` (rsync -a over the pool ssh options); raise on any
     failure. Never deletes on the target: an existing remote file of the same name is overwritten, others stay."""
     src = workspace.rstrip("/") or "/"
-    proc = runner(_ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {shlex.quote(src)}"),
-                  capture_output=True, text=True, encoding="utf-8", errors="replace",
-                  timeout=_PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
-    if getattr(proc, "returncode", 1) != 0:
-        raise RuntimeError(f"carry to {host.name}: mkdir {src} failed: "
-                           f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+    # The same mkdir every placed run gets (mode 0770, board-root probe); the copy below runs inside the
+    # reservation take() booked for this card on this host, so it places no work of its own.
+    prepare_remote_workspace(host, src, runner)
     ssh = _ssh_argv(host, "")[:-2]  # the ssh options, without target and command
     proc = runner(["rsync", "-a", "-e", " ".join(shlex.quote(a) for a in ssh), f"{src}/",
                    f"{host.target}:{src}/"],
