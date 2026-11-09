@@ -206,6 +206,79 @@ def test_memory_pressure_rising_while_the_lock_is_handed_back_stops_the_tick(
         assert res.memory_pressure == "critical"
 
 
+def _successor_in_window(db_path: Path, task_id: str) -> int:
+    """While the tick has the lock handed back, another actor ends the tick's run and starts a successor run on
+    the SAME card (block + unblock + an admit's claim). Returns the successor's run id."""
+    with kbc._dispatch_tick_lock(db_path) as held:
+        assert held, "the tick kept the lock through its launch"
+        with kbc.connect() as other:
+            assert kb.block_task(other, task_id, reason="retry", kind="transient")
+            assert kb.unblock_task(other, task_id)
+            if _status(other, task_id) != "ready":
+                other.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+            succ = kb.claim_task(other, task_id)
+            assert succ is not None
+            other.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
+            return int(succ.current_run_id)
+
+
+def _assert_successor_untouched(conn, task_id: str, succ_run: int) -> None:
+    row = conn.execute("SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?",
+                       (task_id,)).fetchone()
+    assert (row[0], row[1]) == ("running", succ_run), "the old launch reset the successor run"
+    assert row[2] is not None and row[3] == 424242, "the old launch cleared the successor's claim/pid"
+    run = conn.execute("SELECT ended_at FROM task_runs WHERE id=?", (succ_run,)).fetchone()
+    assert run[0] is None, "the old launch closed the successor run"
+
+
+def test_a_failing_spawn_never_ends_a_successor_run_started_while_the_lock_was_handed_back(
+        kanban_home, all_assignees_spawnable):
+    """Prism d4e9bf031486 / 09fab0fa405f: the spawn raises after a successor run claimed the card in the
+    released window. The failure is fenced to the run that launched; the successor keeps its claim and pid."""
+    db_path = kb.kanban_db_path(board="default")
+    succ = {}
+
+    def spawn(task, workspace):
+        succ["run"] = _successor_in_window(db_path, task.id)
+        raise RuntimeError("spawn blew up after the window")
+
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="A", assignee="alpha")
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        _assert_successor_untouched(conn, a, succ["run"])
+
+
+@pytest.mark.parametrize("failure", ["error", "unavailable", "resolves"])
+def test_workspace_resolution_never_touches_a_successor_run(
+        kanban_home, all_assignees_spawnable, monkeypatch, failure):
+    """Same window, workspace phase: a resolve that fails (any error, WorkspaceUnavailable) or succeeds after a
+    successor claimed the card never resets the successor, never writes the card's workspace, never spawns."""
+    from hermes_cli import kanban_db_workspace as kbw
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    db_path = kb.kanban_db_path(board="default")
+    succ = {}
+    spawned = []
+    real_resolve = kbw.resolve_workspace
+
+    def resolve(task, board=None):
+        real_resolve(task, board=board)
+        succ["run"] = _successor_in_window(db_path, task.id)
+        if failure == "error":
+            raise RuntimeError("clone failed")
+        if failure == "unavailable":
+            raise WorkspaceUnavailable("workspaces_root_unmounted: test")
+        return kanban_home / "stale-launch-ws"
+
+    monkeypatch.setattr(kbw, "resolve_workspace", resolve)
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="A", assignee="alpha")
+        kbd.dispatch_once(conn, spawn_fn=lambda t, w: spawned.append(t.id))
+        _assert_successor_untouched(conn, a, succ["run"])
+        assert spawned == []
+        ws = conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (a,)).fetchone()[0]
+        assert ws != str(kanban_home / "stale-launch-ws"), "the old launch wrote the successor's workspace"
+
+
 def test_narrow_lock_config_reader():
     assert kbd.narrow_lock_enabled({}) is True
     assert kbd.narrow_lock_enabled({"dispatch": {"narrow_lock": True}}) is True
