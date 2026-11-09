@@ -257,3 +257,50 @@ def run_from_env() -> dict:
     except Exception:  # noqa: BLE001 -- a round-start draft must never stop a worker
         _log.warning("round draft at worker start failed", exc_info=True)
         return {}
+
+
+def finalize_on_review(conn, task_id: str, metadata) -> dict:
+    """Round end for a DIRECT ``request_review`` handback (Prism 1c13b5bb5159).
+
+    Under ``review_policy=all``, and for milestone cards, the handback never reaches ``complete_task``'s
+    freshness gate, so its round draft would stay draft with only draft-skipped CI. Flip the card's own
+    handoff PRs that carry an unconsumed round mark, through the same :func:`kanban_pr_freshness.check`
+    ownership proof and one-shot consumption. Never arms. Fail-open: a flip it cannot prove leaves the
+    draft for an operator ready and records ``round_draft_finalize_failed``; the review still proceeds.
+    """
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_pr_freshness as _fresh
+    if not enabled():
+        return {}
+    marks = mark_records(conn, task_id)
+    live = {str(k).lower() for k, v in marks.items() if isinstance(v, dict) and not v.get("consumed")}
+    refs = [r for r in _fresh.handoff_refs(metadata) if f"{r.repo}#{r.number}".lower() in live]
+    if not refs:
+        return {}
+
+    def _record(flipped):
+        if flipped:
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
+
+    def _consume(key):
+        with _kb.write_txn(conn):
+            current = mark_records(conn, task_id).get(key)
+            if current != marks.get(key) or not current or current.get("consumed"):
+                raise ValueError("round draft mark already consumed or replaced")
+            consumed = dict(current, consumed=True)
+            _kb._append_event(conn, task_id, "round_draft_marked", {"marked": {key: consumed}})
+            marks[key] = consumed
+
+    try:
+        out = _fresh.check(refs, task_id=task_id, allow_arm=False,
+                           armable={f"{r.repo}#{r.number}" for r in refs}, flipped=flip_records(conn, task_id),
+                           round_runs=card_run_ids(conn, task_id), marked=dict(marks), consume=_consume)
+    except _fresh.DraftPrError as err:
+        _record(err.flipped)
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "round_draft_finalize_failed", {"prs": err.prs})
+        _log.warning("round draft: review handback left %s draft for operator ready", err.prs)
+        return {"failed": err.prs}
+    _record(out.get("draft_flipped_at"))
+    return out

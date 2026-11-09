@@ -316,3 +316,52 @@ def test_ready_carries_owner_card_to_ace_gate(tmp_path, monkeypatch):
     assert fr.ace_gate_ready("o/r", 1, task_id=CARD) == 0
     assert fr.ace_gate_ready("o/r", 1) == 0
     assert [c["env"]["KANBAN_ROUND_DRAFT_CARD"] for c in calls] == [CARD, ""]
+
+
+@pytest.mark.parametrize("summary, readied", [("Fix complete", True), ("FAIL: close gate not met", False)])
+def test_direct_review_handoff_readies_marked_round_draft(tmp_path, monkeypatch, summary, readied):
+    """Prism 1c13b5bb5159: review_policy=all goes through request_review(), never complete_task's freshness
+    gate; a positive handback still flips the round draft ready once, a negative one leaves it draft."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("KANBAN_ROUND_DRAFT", raising=False)
+    monkeypatch.setattr(op, "FLEET_OWNERS", {"o"})
+    monkeypatch.setattr(fr, "worker_draft_repos", lambda: {"o/r"})
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "all")
+    monkeypatch.setattr(kb, "_enforce_branch_base", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "_enforce_handback_head", lambda *a, **kw: None)
+    state = {"draft": True}
+    ready_calls = []
+
+    def gh(path, *a):
+        if "/pulls/" in path:
+            return {"state": "open", "draft": state["draft"], "head": {"sha": SHA, "ref": "worker/" + tid}}
+        if "/timeline?" in path:
+            return {"pages": [[{"id": 8, "event": "convert_to_draft", "actor": {"id": 7}}]]}
+        return None
+
+    def ready(repo, number):
+        ready_calls.append((repo, number))
+        state["draft"] = False
+        return 0
+
+    monkeypatch.setattr(fr, "_default_gh", lambda: gh)
+    monkeypatch.setattr(fr, "_default_ready", lambda: ready)
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="direct review round", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.get_task(conn, tid).current_run_id
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_draft_flipped", {"flipped": {"o/r#1": {"head": SHA, "at": 1}}})
+            kb._append_event(conn, tid, "round_draft_marked", {"marked": {"o/r#1": {
+                "run": str(run), "head": SHA, "at": 2, "actor_id": 7, "transition_id": 8}}})
+        meta = {"pr_url": "https://github.com/o/r/pull/1"}
+        assert kb.request_review(conn, tid, summary=summary, metadata=meta, reviewer="argus",
+                                 expected_run_id=run)
+        assert kb.get_task(conn, tid).status == "review"
+        assert bool(rd.mark_records(conn, tid)["o/r#1"].get("consumed")) is readied
+    assert ready_calls == ([("o/r", 1)] if readied else [])
+    assert state["draft"] is (not readied)

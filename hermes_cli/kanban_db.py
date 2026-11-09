@@ -14999,6 +14999,12 @@ def request_review(
         _enforce_branch_base(conn, _bb_task, metadata)
         if expected_run_id is not None:
             _enforce_handback_head(conn, task_id, summary=summary, metadata=metadata)
+            # Round end (t_c418eebc, Prism 1c13b5bb5159): this path skips complete_task's freshness gate, so
+            # flip the card's own round draft ready here; a negative-result handback stays draft.
+            from hermes_cli.kanban_negative_result import negative_result_match
+            if _neg_result is None and negative_result_match(summary, metadata) is None:
+                from hermes_cli.kanban_round_draft import finalize_on_review
+                finalize_on_review(conn, task_id, metadata)
 
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
