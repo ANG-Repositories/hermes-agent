@@ -1190,8 +1190,12 @@ def _state(conn, task_id):
     return (json.loads(row[0]), row[1], json.loads(row[2]) if row[2] else None) if row else ({}, None, None)
 
 
-def record_baseline(conn, task_id, workspace):
-    """Record once, before dispatch; retries must not reset the task's base."""
+def record_baseline(conn, task_id, workspace, *, run_id=None):
+    """Record once, before dispatch; retries must not reset the task's base.
+
+    ``run_id``: write only while that run still owns the card (same transaction), else raise
+    ``ClaimLost`` (Prism c08a3c9d1616, t_89e3e083): a successor run must not inherit this launch's base.
+    """
     from hermes_cli.kanban_delegations_board import conn_is_delegations
 
     if conn_is_delegations(conn):
@@ -1218,6 +1222,11 @@ def record_baseline(conn, task_id, workspace):
             bases[key] = head.stdout.decode().strip() if head.returncode == 0 else None
         _warn_borrowed_from_workspace(repo, key, workspace)
     with kb.write_txn(conn):
+        if run_id is not None and conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (task_id, int(run_id)),
+        ).fetchone() is None:
+            raise kb.ClaimLost(f"{task_id}: run {run_id} no longer owns the card")
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
             "ON CONFLICT(task_id) DO NOTHING",
