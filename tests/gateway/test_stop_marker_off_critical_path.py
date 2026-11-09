@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import threading
 import time
@@ -340,3 +341,178 @@ def test_db_close_is_skipped_while_a_marker_write_is_live(monkeypatch, live):
         assert closed is (not live), steps
     finally:
         loop.close()
+
+
+# --- Prism r2 (round 2 on #165) repros ------------------------------------------------------
+
+
+def test_older_clear_keeps_a_newer_stops_intent_across_a_crash(tmp_path, monkeypatch):
+    """Prism r2 P1 2839625d4dbd: a clear at generation 10 runs after the generation-11 /stop
+    wrote its intent but before that stop's marker raised the fence. The clear must not delete
+    the newer stop's only durable record; a crash then must still find the session stopped."""
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    entry = store.get_or_create_session(_source())
+    key = entry.session_key
+    assert store.mark_resume_pending(key, "shutdown_timeout")
+    path = store.write_user_stop_intent(key, entry.session_id, boot_id="b1", generation=11)
+    store.clear_user_stopped(key, generation=10)  # the queued older resume lands now
+    assert path.exists(), "an older clear deleted a newer /stop's intent"
+    # SIGKILL before the generation-11 marker commits: the next boot reads only the disk.
+    reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    revived = reloaded.get_or_create_session(_source())
+    assert revived.user_stopped_at is not None
+    assert revived.resume_pending is False
+    # A clear at the stop's generation or newer does retire it (negative control).
+    store.clear_user_stopped(key, generation=11)
+    assert not path.exists()
+    db.close()
+
+
+def test_clear_retires_an_intent_left_by_a_previous_process(tmp_path, monkeypatch):
+    """Run generations restart with the process: an intent written by a previous process is
+    superseded by any clear in this one, whatever its generation number."""
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    old = runner.session_store
+    entry = old.get_or_create_session(_source())
+    path = old.write_user_stop_intent(entry.session_key, entry.session_id, generation=500)
+    fresh = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    assert fresh.get_or_create_session(_source()).user_stopped_at is not None  # applied at load
+    fresh.clear_user_stopped(entry.session_key, generation=3)
+    assert not path.exists()
+    db.close()
+
+
+def _fail_dir_fsync(monkeypatch, directory):
+    import errno
+    import os as _os
+    real_fsync = _os.fsync
+    target = None
+
+    def _fsync(fd):
+        nonlocal target
+        if target is None and directory.exists():
+            target = _os.stat(directory).st_ino
+        st = _os.fstat(fd)
+        import stat as _stat
+        if _stat.S_ISDIR(st.st_mode) and st.st_ino == target:
+            raise OSError(errno.EIO, "injected EIO on intent dir fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(_os, "fsync", _fsync)
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_intent_dir_fsync_falls_back_to_waiting_for_the_marker(
+    tmp_path, monkeypatch, caplog,
+):
+    """Prism r2 P1 0cb938c88f46: a directory fsync failure means the intent's rename is not
+    durable. The writer must raise (and leave no intent), and /stop must wait for the marker
+    write as before #165 instead of acking on an unconfirmed intent."""
+    monkeypatch.delenv("HERMES_RESUME_INTERRUPTED_TURNS", raising=False)
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    entry = store.get_or_create_session(_source())
+    key = entry.session_key
+    _seed(db, entry, _MID_TOOL_TAIL)
+    intents = tmp_path / "sessions" / "user_stop_intents"
+    intents.mkdir(parents=True, exist_ok=True)
+    _fail_dir_fsync(monkeypatch, intents)
+    with pytest.raises(OSError):
+        store.write_user_stop_intent(key, entry.session_id)
+    assert not list(intents.glob("*.json")), "an unconfirmed intent was left behind"
+
+    runner._running_agents[key] = _HungAgent()
+    _warm_up()
+    writer = _OtherWriter(store, "store_lock", 1.5)
+    writer.start()
+    assert writer.held.wait(2.0)
+    caplog.set_level(logging.INFO)
+    t0 = time.monotonic()
+    await runner._busy_stop_command(MessageEvent(text="/stop", source=_source(), user_id="u1"),
+                                    key, _source())
+    ack_s = time.monotonic() - t0
+    print(f"[t_41843f70] dir-fsync EIO: /stop ack {ack_s:.3f}s (waited for the marker)")
+    stages = [m for m in caplog.messages if "PHASE=stop_stages" in m]
+    assert stages and "intent=0" in stages[-1] and "marker_deferred=0" in stages[-1], stages
+    assert ack_s >= 1.0, "acked before the marker write landed with no durable intent"
+    # The marker is on disk at ack time.
+    reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    assert reloaded.get_or_create_session(_source()).user_stopped_at is not None
+    writer.join(5.0)
+    db.close()
+
+
+def test_pending_stop_does_not_block_a_new_session_or_a_resumed_turn(tmp_path, monkeypatch):
+    """Prism r2 P1 ed0ce609a190: a pending /stop receipt belongs to the session and generation
+    it was taken for. /new (another session on the key) and a turn the user resumed at a newer
+    generation must still be resume-markable while the old write is in flight."""
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    entry = store.get_or_create_session(_source())
+    key, sid_a = entry.session_key, entry.session_id
+    store.note_user_stop_pending(key, sid_a, 5)
+    assert store.mark_resume_pending(key, "restart_interrupted") is False  # same session: refused
+
+    # /new: the key now routes to session B; A's write is still pending.
+    store._entries[key] = dataclasses.replace(store._entries[key], session_id="sess-b")
+    assert store.user_stop_pending(key) is True
+    assert store.mark_resume_pending(key, "restart_interrupted") is True
+    store._entries[key].resume_pending = False
+    assert store.suspend_recently_active(max_age_seconds=3600) == 1
+
+    # Back on session A: the user spoke again at generation 6, fencing the stop out.
+    store._entries[key] = dataclasses.replace(store._entries[key], session_id=sid_a,
+                                              resume_pending=False)
+    assert store.mark_resume_pending(key, "restart_interrupted") is False
+    store.clear_user_stopped(key, generation=6)
+    assert store.mark_resume_pending(key, "restart_interrupted") is True
+    store.release_user_stop_pending(key, sid_a, 5)
+    assert not store.user_stop_pending(key)
+    db.close()
+
+
+def test_fallback_routing_load_keeps_the_intent_and_applies_it_after_reconcile(
+    tmp_path, monkeypatch,
+):
+    """Prism r2 P1 f8d11269d797: state.db routes K -> B (resume_pending) while sessions.json
+    still says K -> A. A boot whose state.db routing read fails loads the fallback; the stop
+    intent for B must survive that load and be applied once the authoritative rows merge."""
+    import hermes_state as _hs
+
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    entry = store.get_or_create_session(_source())
+    key, sid_b = entry.session_key, entry.session_id
+    assert store.mark_resume_pending(key, "shutdown_timeout")
+    store.drain_sessions_json_writes(timeout=5.0)
+    stale = dict(store._entries[key].to_dict(), session_id="sess-a-predecessor",
+                 resume_pending=False)
+    (tmp_path / "sessions" / "sessions.json").write_text(json.dumps({key: stale}), encoding="utf-8")
+    path = store.write_user_stop_intent(key, sid_b, boot_id="b1")
+
+    real_load = _hs.SessionDB.load_gateway_routing_entries
+    state = {"fail": True}
+
+    def _load(self, *a, **k):
+        if state["fail"]:
+            raise OSError("injected state.db routing read failure")
+        return real_load(self, *a, **k)
+
+    monkeypatch.setattr(_hs.SessionDB, "load_gateway_routing_entries", _load)
+    reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    with reloaded._lock:
+        reloaded._ensure_loaded_locked()
+        assert reloaded._routing_db_loaded is False  # fallback-only load
+        assert reloaded._entries[key].session_id == "sess-a-predecessor"
+    assert path.exists(), "the fallback load deleted the only durable stop evidence"
+
+    state["fail"] = False
+    with reloaded._lock:
+        reloaded._ensure_loaded_locked()  # reconciles with the authoritative rows
+        revived = reloaded._entries[key]
+        assert reloaded._routing_db_loaded is True
+        assert revived.session_id == sid_b
+        assert revived.user_stopped_at is not None, "the acked /stop was lost after reconcile"
+        assert revived.resume_pending is False
+    db.close()
