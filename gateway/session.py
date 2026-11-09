@@ -2501,7 +2501,7 @@ class SessionStore(
         for path in directory.glob(f"{self._user_stop_intent_prefix(session_key)}.*.json"):
             if generation is not None:
                 try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
+                    data = json.loads(path.read_text(encoding="utf-8-sig"))
                     if data.get("session_key") != session_key:
                         continue  # prefix collision: another key's intent
                     stop_generation = (data.get("generation")
@@ -2545,7 +2545,7 @@ class SessionStore(
             if str(path) in applied:
                 continue
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
                 key = data["session_key"]
                 session_id = data.get("session_id")
             except Exception:
