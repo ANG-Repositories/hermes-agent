@@ -1086,7 +1086,7 @@ def handback_row(entry: dict, result: dict, *, turn_text: Optional[str] = None) 
         "home_sid": entry.get("home_sid") or "", "title": entry.get("title"), "kind": entry.get("kind"),
         "event_ts": entry.get("event_ts"), "event_id": entry.get("event_id"),
         "assignee": entry.get("assignee"), "pr": entry.get("pr"),
-        "claim_key": entry.get("key"), "parts": parts,
+        "claim_key": entry.get("key"), "parts": parts, "action": result.get("action"),
         "line": f"boomerang handled {entry['task_id']} ({row}): {summary}", "turn": turn_text,
         "attempts": 0, "created_at": _time.time()}
 
@@ -1155,17 +1155,22 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
         done = set()
     left = [p for p in row.get("parts") or [] if p not in done]
     sent = 0
+    # Prism 0c2f7d571cd9: only a surface goes stale; a write receipt (land/complete/...) always delivers.
+    # A legacy row has no action: a turn part marks it as a surface (handback_row sets turn for surfaces only).
+    action = row.get("action")
+    guarded = action == "surface" or (action is None and row.get("turn") is not None)
     for part in list(left):
-        # Recover original cursors for rows persisted before the guard was introduced.
-        claim = await asyncio.to_thread(state.get_claim, row.get("claim_key") or "") or {}
-        guard_entry = {**claim, **entry}
-        for field in ("event_id", "assignee", "pr"):
-            if guard_entry.get(field) is None:
-                guard_entry[field] = claim.get(field)
-        why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one")
-        if why:
-            await asyncio.to_thread(state.drop_handback, delegation_id)
-            return sent
+        if guarded:
+            # Recover original cursors for rows persisted before the guard was introduced.
+            claim = await asyncio.to_thread(state.get_claim, row.get("claim_key") or "") or {}
+            guard_entry = {**claim, **entry}
+            for field in ("event_id", "assignee", "pr"):
+                if guard_entry.get(field) is None:
+                    guard_entry[field] = claim.get(field)
+            why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one")
+            if why:
+                await asyncio.to_thread(state.drop_handback, delegation_id)
+                return sent
         if part == PART_TURN:
             ok = await resurface(runner, entry, row.get("turn"))
         else:

@@ -213,6 +213,31 @@ def test_stale_surface_timeline(env, arm, phase, author):
         assert bool(result.get("surface")) != blocked
 
 
+@pytest.mark.parametrize("action,turn,delivered", [("land_inherited", None, True), ("complete", None, True),
+                                                    ("surface", "old handback", False)])
+def test_stale_guard_spares_write_receipts(env, action, turn, delivered):
+    """Prism 0c2f7d571cd9: a land/complete receipt naming a now-merged PR (owner commented after) is
+    still delivered; only a surface handback is refused as stale."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "review_deadman", "{}", 1793845000))
+    entry = _claimed_entry(env, tid, row="review_deadman", kind="review_deadman")
+    state = ah.BoomerangWakeState()
+    ah.enqueue_handback(entry, {"summary": "landed", "action": action}, state=state, turn_text=turn)
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "apollo", "owner acted", 1793844766))
+    sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
+    lines = [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
+    assert (sent, bool(lines)) == ((1, True) if delivered else (0, False))
+    assert state.handbacks() == {}
+
+
 @pytest.mark.parametrize("author", ["boomerang-wake", "kanban-dispatcher", "unverified:default", "human:other"])
 @pytest.mark.parametrize("body", ["owner acted", "release: deployed", "deadman-hold: waiting"])
 def test_stale_surface_ignores_non_owner_comments(env, author, body):
