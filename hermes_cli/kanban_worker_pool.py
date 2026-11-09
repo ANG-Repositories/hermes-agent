@@ -989,7 +989,11 @@ def studio_pin_reasons(caps) -> Optional[frozenset]:
     Studio-only access word ``control-plane-read``. None (= every Studio pin is honoured, the pre-t_e604c0f9
     behaviour) when the capability layer is off this tick, its map is absent or malformed, or the Studio row
     lists nothing: an unreadable vocabulary must not move Studio work."""
-    cmap = getattr(caps, "cmap", None)
+    return studio_map_reasons(getattr(caps, "cmap", None))
+
+
+def studio_map_reasons(cmap) -> Optional[frozenset]:
+    """:func:`studio_pin_reasons` from a ``CapabilityMap`` (``kanban create`` has no tick)."""
     if cmap is None or not getattr(cmap, "valid", False):
         return None
     from hermes_cli import kanban_host_capabilities as _khc
@@ -1056,6 +1060,26 @@ def studio_last_resort(fleet_dir: Path) -> bool:
     on = val is not False
     _last_resort_cache[str(path)] = (mtime, on)
     return on
+
+
+def mint_studio_pin_note(body: Optional[str], fleet_dir: Path) -> Optional[str]:
+    """``kanban create``'s line for a bare ``host: studio`` the dispatcher will drop (t_e604c0f9), else None. The
+    same predicate as dispatch: the kill switch, the capability map's Studio row, the card's ``requires:`` words."""
+    try:
+        if not studio_last_resort(fleet_dir):
+            return None
+        pin, _ignored = resolve_pin(body, known_host_ids(fleet_dir), pin_aliases(fleet_dir))
+        if pin != PIN_STUDIO:
+            return None
+        from hermes_cli import kanban_host_capabilities as _khc
+        reasons = studio_map_reasons(_khc.load_map(fleet_dir))
+    except Exception:
+        return None
+    if reasons is None or studio_pin_justified(body, reasons):
+        return None
+    return ("`host: studio` will be DROPPED at dispatch: no `requires:` line names a reason the Studio serves "
+            f"({', '.join(sorted(reasons))}); FWA places this card like any other. Add the requires: line if "
+            "it must run on the Studio.")
 
 
 def _studio_words() -> frozenset:
