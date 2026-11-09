@@ -143,6 +143,9 @@ def _card_with_files(conn, body=None):
     Path(path).mkdir(parents=True, exist_ok=True)
     (Path(path) / "notes.md").write_text("prior run's work\n")
     kbw.set_workspace_path(conn, tid, str(path))
+    # Steady state: the carry scan runs off the routing pass (t_3489445d), so a card is carried from the tick
+    # after its directory was scanned. Warm the cache the way that scan would.
+    kwh.carry_size_ok(str(path))
     return tid, str(path)
 
 
@@ -309,7 +312,7 @@ def test_local_files_kill_switch_keeps_the_old_pin(kanban_home, carried):
 
 
 def test_local_files_too_big_to_carry_keeps_the_old_pin(kanban_home, carried, monkeypatch):
-    monkeypatch.setattr(kwh, "carry_size_ok", lambda path: False)
+    monkeypatch.setattr(kwh, "carry_size_known", lambda path, **kw: False)
     with kb.connect_closing() as conn:
         tid, _ = _card_with_files(conn)
         assert _route(conn, tid, None) == (("local", None), "local_files", False)
