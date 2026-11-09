@@ -573,6 +573,8 @@ class TurnRunner:
         # "still inside <tool> for Nm" line held as the LAST progress line while one call runs long.
         inflight_line: Optional[str] = None
         inflight_painted_at: float = float("-inf")
+        inflight_name: Optional[str] = None
+        inflight_since: float = 0.0   # monotonic start of the call the notice describes
 
     def _fresh_progress_lines(self, st) -> list:
         return [st.wake_head] if st.wake_head and st.can_edit else []
@@ -700,6 +702,19 @@ class TurnRunner:
             return True
         return False
 
+    def _retire_inflight_line(self, st) -> bool:
+        """The long call ended: remove its "still inside" line. If that leaves the bubble with nothing
+        but its header, put a "done" line in its place: _flush_progress_edit skips an empty buffer, so a
+        bare removal would leave the stale notice on screen (Prism 9c6bdb4bcd34). True when changed."""
+        name, since = st.inflight_name, st.inflight_since
+        if not self._drop_inflight_line(st):
+            return False
+        st.inflight_name = None
+        if len(st.progress_lines) <= len(self._fresh_progress_lines(st)) and name:
+            from gateway.inflight_tool_status import format_duration
+            st.progress_lines.append(f"✓ {name} done ({format_duration(max(0.0, time.monotonic() - since))})")
+        return True
+
     def _inflight_notice_threshold(self) -> float:
         from gateway.inflight_tool_status import DEFAULT_INFLIGHT_NOTICE_SECONDS
         ctx = self._ctx
@@ -722,7 +737,7 @@ class TurnRunner:
         threshold = self._inflight_notice_threshold()
         cur = inflight_tool(agent)
         if threshold <= 0 or cur is None or cur[1] < threshold:
-            if self._drop_inflight_line(st):
+            if self._retire_inflight_line(st):
                 await self._flush_progress_edit(st)
             return
         now = time.monotonic()
@@ -734,6 +749,7 @@ class TurnRunner:
         self._drop_inflight_line(st)
         st.progress_lines.append(line)
         st.inflight_line, st.inflight_painted_at = line, now
+        st.inflight_name, st.inflight_since = cur[0], now - cur[1]
         await self._progress_send_or_edit(st, line)
 
     async def _flush_progress_edit(self, st) -> None:
@@ -743,6 +759,7 @@ class TurnRunner:
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
+        self._retire_inflight_line(st)   # the turn ended: no "still inside" line may outlive it
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
@@ -843,8 +860,14 @@ class TurnRunner:
                 last_edit_ts = time.monotonic()
                 await self._progress_restore_typing(st)
             except queue.Empty:
-                await self._paint_inflight_notice(st)
-                await asyncio.sleep(0.3)
+                # A cancel raised in here would not reach the sibling CancelledError clause below, so the
+                # drain (and the notice's removal) would be skipped (Prism 3e31f1099cb9): catch it here too.
+                try:
+                    await self._paint_inflight_notice(st)
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    await self._drain_progress_on_cancel(st)
+                    return
             except asyncio.CancelledError:
                 await self._drain_progress_on_cancel(st)
                 return

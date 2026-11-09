@@ -234,6 +234,58 @@ async def test_bubble_short_call_or_knob_off_paints_nothing(monkeypatch, elapsed
     assert st.progress_lines == ['🔀 delegate_task: "3 tasks"']
 
 
+@pytest.mark.asyncio
+async def test_bubble_holding_only_the_notice_is_not_left_stale(monkeypatch):
+    """Prism 9c6bdb4bcd34: the notice painted into an EMPTY bubble; when the call ends, removing it empties
+    the buffer and _flush_progress_edit skips empty buffers, so the notice used to stay on screen."""
+    agent = _parent("terminal", 400, now=time.time())
+    tr, st, adapter, clock = _bubble(monkeypatch, agent)
+    st.progress_lines = []
+    await tr._paint_inflight_notice(st)
+    assert adapter.edits[-1]["content"].startswith("⏳ still inside terminal for 6m")
+
+    clock.t += 5
+    agent._current_tool = None
+    await tr._paint_inflight_notice(st)
+    final = adapter.edits[-1]["content"]
+    assert "still inside" not in final, final
+    assert final.startswith("✓ terminal done ("), final
+
+
+class _AsyncioCancelOnSleep:
+    """asyncio stand-in whose sleep() raises CancelledError: the turn ending during the 0.3 s idle wait."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    async def sleep(self, *_a, **_k):
+        raise self._real.CancelledError()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_idle_sleep_still_retires_the_notice(monkeypatch):
+    """Prism 3e31f1099cb9: a cancel raised inside the `except queue.Empty` block skipped the sibling
+    CancelledError clause, so the drain never ran and the notice outlived the turn."""
+    import asyncio as real_asyncio
+
+    import gateway.run_turn_runner as rtr
+
+    agent = _parent("terminal", 400, now=time.time())
+    tr, st, adapter, clock = _bubble(monkeypatch, agent)
+    monkeypatch.setattr(rtr, "asyncio", _AsyncioCancelOnSleep(real_asyncio))
+    seeded = tr._progress_edit_state
+    monkeypatch.setattr(tr, "_progress_edit_state", lambda _a: st)   # the loop uses the seeded bubble
+    assert seeded is not None
+
+    await tr.send_progress_messages()   # must return, not propagate the cancel
+
+    final = adapter.edits[-1]["content"]
+    assert "still inside" not in final, final
+
+
 # ── the real heartbeat loop (gateway/run_turn.py::_run_agent_notify_long_running) ──────────────
 
 async def _one_heartbeat(monkeypatch, agent, activity):
