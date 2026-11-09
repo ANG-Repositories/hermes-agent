@@ -22,7 +22,6 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.delenv("HERMES_KANBAN_MINT_CAP", raising=False)
     kb.init_db()
     return home
 
