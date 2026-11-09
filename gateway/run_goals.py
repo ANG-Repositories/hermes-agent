@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import dataclasses
+import functools
 import logging
 import time
 from contextlib import nullcontext, suppress
@@ -792,12 +793,65 @@ class GatewayGoalsMixin:
 
         while self._running:
             try:
-                for _profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
+                scopes = await _resolve_handoff_watch_scopes(self)
+                for _profile_name, profile_home in scopes:
                     async with _scope(profile_home):
                         await self._goal_idle_wake_scan()
+                if self._goal_orphan_gc_due():
+                    await self._goal_orphan_gc(scopes, _scope)
             except Exception as exc:
                 logger.debug("goal idle-wake watcher error: %s", exc)
             await asyncio.sleep(interval)
+
+    # Hourly orphan GC (t_92fc3ff0) rides this watcher: no thread, no launchd job.
+    _GOAL_ORPHAN_GC_INTERVAL_S = 3600.0
+
+    def _goal_orphan_gc_due(self) -> bool:
+        """At most once per ``_GOAL_ORPHAN_GC_INTERVAL_S`` (monotonic); the first tick runs."""
+        now = time.monotonic()
+        last = getattr(self, "_goal_orphan_gc_last", None)
+        if last is not None and now - last < self._GOAL_ORPHAN_GC_INTERVAL_S:
+            return False
+        self._goal_orphan_gc_last = now
+        return True
+
+    async def _goal_orphan_gc(self, scopes, scope_cm) -> dict:
+        """Retire (``orphaned``) active goals/loops whose session id no routed key holds and that
+        were idle >= ``goals.orphan_gc_days`` (default 7; 0 = off; read under each profile's scope). Routing is the gateway-wide
+        store, so a goal routed under ANY served profile is kept; each profile's own store is
+        reaped under its scope. One INFO line per run, never a page."""
+        from hermes_cli.goals import DEFAULT_ORPHAN_GC_DAYS, reap_orphaned_goals_and_loops
+
+        totals = {"scanned": 0, "orphaned": 0, "loops": 0}
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return totals
+        entries = await self._run_in_executor_with_context(store.list_sessions)
+        routed = {e.session_id for e in entries if getattr(e, "session_id", None)}
+        lookup = getattr(store, "lookup_by_session_id", None)
+
+        def _is_routed_now(sid: str) -> bool:
+            # Re-read inside each retiring write: a /resume or topic rebind that routes the session
+            # after the snapshot above keeps its goal/loop. No lookup -> trust the snapshot.
+            return sid in routed if lookup is None else lookup(sid) is not None
+
+        ran = False
+        for _profile_name, profile_home in scopes:
+            async with scope_cm(profile_home):
+                # Read per scope: each profile's own goals.orphan_gc_days governs its own store.
+                gc_days = self._goal_int_setting("orphan_gc_days", DEFAULT_ORPHAN_GC_DAYS)
+                if gc_days <= 0:
+                    continue
+                await self._warm_goals_session_db("goal orphan gc")
+                counts = await self._run_in_executor_with_context(
+                    functools.partial(reap_orphaned_goals_and_loops, routed, gc_days=gc_days,
+                                      is_routed=_is_routed_now))
+            ran = True
+            for k in totals:
+                totals[k] += counts.get(k, 0)
+        if ran:
+            logger.info("goal-gc: scanned=%d orphaned=%d loops=%d", totals["scanned"], totals["orphaned"], totals["loops"])
+        return totals
 
     async def _goal_idle_wake_scan(self) -> None:
         from hermes_cli.goals import (

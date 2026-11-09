@@ -1735,5 +1735,38 @@
     "surfaces": [
       "gateway"
     ]
+  },
+  {
+    "feature": "goal/loop orphan GC: a reset rotation (/new, /reset, suspended auto-reset, compression-exhausted reset) retires the replaced session's ACTIVE /goal and /loop as 'superseded', and an hourly reaper on the goal idle-wake watcher retires active rows that no routed key holds and that were idle >= goals.orphan_gc_days (default 7, 0 = off) as 'orphaned'; retire never deletes (/goal resume restores)",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_new_reset_retires_the_replaced_goal_and_loop",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_suspended_auto_reset_retires_the_replaced_goal",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_reset_never_touches_a_non_active_goal",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_orphaned_ids_pure_contract",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_reaper_retires_only_unrouted_and_idle",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_reaper_disabled_at_zero_days",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_orphaned_goal_and_loop_round_trip_through_resume",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_goal_routed_only_under_a_secondary_profile_is_kept",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_config_zero_disables_the_gateway_pass",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_gc_runs_at_most_once_per_hour",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_idle_wake_watcher_runs_the_gc"
+    ],
+    "paths": [
+      "gateway/session_recovery.py",
+      "gateway/run_goals.py",
+      "hermes_cli/goals.py",
+      "hermes_cli/loops.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "Studio 2026-11-08 17:56 PT: 205 active goals, 190 on session ids no routing key pointed at (187 older than 7 days, oldest 2026-05-12); they never woke anyone but every 15 s idle-wake scan reloaded them. Apollo hand-cleared 187; nothing stopped regrowth. Ace 18:05 PT asked for GC that a fork update cannot drop. Card t_92fc3ff0. Upstream PR shape: retire in SessionStore's reset transition + reaper beside the goal idle-wake watcher.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "discord",
+      "telegram"
+    ]
   }
 ]

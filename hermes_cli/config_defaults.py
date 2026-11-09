@@ -1672,6 +1672,9 @@ DEFAULT_CONFIG = {
         # chat) and that the user did not author queues no continuation; the idle check-in is the
         # next nudge. True restores a continuation after every judged-continue turn.
         "nudge_on_read_only_turns": False,
+        # Gateway: once an hour, an ACTIVE goal/loop whose session no routed key holds and that
+        # was idle this many days is retired as ``orphaned`` (/goal resume restores). 0 = off.
+        "orphan_gc_days": 7,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
