@@ -140,6 +140,34 @@ def test_own_create_invalidates_shadowed_index(tmp_path):
         assert smt._find_skill("dup")["path"] == local / "cat" / "dup"
 
 
+def test_mutating_call_sees_external_local_override_within_ttl(tmp_path):
+    """Prism b31279330fb5: another process creates a local override of a cached external skill.
+    Hit validation cannot see it (the external path is still valid), so a mutating skill_manage
+    call must drop the index before its first lookup instead of waiting out the TTL."""
+    local, ext = tmp_path / "skills", tmp_path / "shared" / "devops"
+    _mk(ext, "dup")
+    with _roots(local, ext), patch("tools.skill_manager_tool.HERMES_HOME", tmp_path), \
+         patch("tools.skill_manager_tool._apply_skill_write_gate", return_value=None):
+        assert smt._find_skill("dup")["path"] == ext / "dup"   # cached: external only
+        d = _mk(local, "cat/dup")                                # external process, no generation bump
+        (d / "SKILL.md").write_text(
+            "---\nname: dup\ndescription: Use when testing. Does a thing.\n---\n\n# Dup\n\nold line\n",
+            encoding="utf-8")
+        ext_before = (ext / "dup" / "SKILL.md").read_text(encoding="utf-8")
+        seen = []
+        real_find = smt._find_skill
+
+        def spy(name):
+            r = real_find(name)
+            seen.append(r["path"] if r else None)
+            return r
+
+        with patch("tools.skill_manager_tool._find_skill", side_effect=spy):
+            smt.skill_manage(action="patch", name="dup", old_string="old line", new_string="new line")
+        assert seen and all(p == local / "cat" / "dup" for p in seen), seen
+        assert (ext / "dup" / "SKILL.md").read_text(encoding="utf-8") == ext_before
+
+
 def test_ttl_bounds_shadow_staleness(tmp_path):
     local, ext = tmp_path / "skills", tmp_path / "shared" / "devops"
     _mk(ext, "dup")

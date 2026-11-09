@@ -1152,6 +1152,10 @@ def skill_manage(
     session_id: str = None, operations=None, justification: str = None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
+    # A valid cached external hit cannot reveal a newly created local override.
+    # Refresh before guards, approval targeting, or batch snapshots choose a mutation
+    # target; all subsequent lookups in this call share the rebuilt index.
+    _invalidate_skill_index()
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
