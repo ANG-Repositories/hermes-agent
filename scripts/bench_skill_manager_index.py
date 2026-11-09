@@ -24,11 +24,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline', type=Path, required=True)
     args = parser.parse_args()
-    tree = ast.parse(args.baseline.read_text(encoding='utf-8'))
+    tree = ast.parse(args.baseline.read_text(encoding='utf-8-sig'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_find_skill')
     scope = dict(vars(smt))
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(args.baseline), 'exec'), scope)
     original_find = scope['_find_skill']
+    dispatch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'skill_manage')
+    dispatch.decorator_list = []
+    exec(compile(ast.Module(body=[dispatch], type_ignores=[]), str(args.baseline), 'exec'), scope)
+    original_dispatch = scope['skill_manage']
     with tempfile.TemporaryDirectory(prefix='skill-index-bench-') as td:
         home = Path(td)
         root = home / 'skills'
@@ -49,9 +53,13 @@ def main():
              patch.object(smt, '_maybe_debounced_sync_push'):
             # Load the same lazy imports for BOTH cases outside the measurement.
             for label in ('before', 'after'):
-                target.write_text(target.read_text(encoding='utf-8').replace('new line', 'old line'),
+                target.write_text(target.read_text(encoding='utf-8-sig').replace('new line', 'old line'),
                                   encoding='utf-8')
-                call = smt.skill_manage.__wrapped__ if label == 'before' else smt.skill_manage
+                call = original_dispatch if label == 'before' else smt.skill_manage
+                # Baseline dispatch shares patched side-effect seams, but keeps its actual
+                # pre-index entrypoint (no extra eager lookup introduced by this PR).
+                scope.update({k: v for k, v in vars(smt).items()
+                              if k not in {'_find_skill', 'skill_manage'}})
                 finder = original_find if label == 'before' else smt._find_skill
                 with patch.object(smt, '_find_skill', finder):
                     counter = 0
