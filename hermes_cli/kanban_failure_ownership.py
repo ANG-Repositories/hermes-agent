@@ -390,9 +390,11 @@ def _reduce(conn,key_id,obs_id,obs):
 
 def _create_owner(conn,card,producer):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_boomerang_default as kbd
     kb.check_mint_cap(conn,producer)
     if not isinstance(card,PreparedCard):
         raise ValueError('prepared card required')
+    boomerang_wake, boomerang_source = kbd.resolve(None)
     tid = kb._new_task_id()
     now = int(time.time())
     # Uncommitted guard row is visible only to this connection; SQLite's write
@@ -405,10 +407,12 @@ def _create_owner(conn,card,producer):
             'status':'ready','created_by':producer,'created_at':now,
             'workspace_kind':'scratch','session_id':card.session_id,'tenant':card.tenant,
             'completion_contract':'local-only',
+            'boomerang_wake':1 if boomerang_wake else 0,
         })
     finally:
         conn.execute('DELETE FROM failure_write_context WHERE singleton=1')
-    kb._append_event(conn,tid,'created',{'assignee':card.assignee,'status':'ready','failure_authority':PROTOCOL})
+    kb._append_event(conn,tid,'created',{'assignee':card.assignee,'status':'ready','failure_authority':PROTOCOL,
+                                         'boomerang_wake':bool(boomerang_wake),'boomerang_wake_source':boomerang_source})
     return tid
 
 

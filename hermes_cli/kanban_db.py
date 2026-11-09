@@ -6476,7 +6476,11 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    from hermes_cli import kanban_boomerang_default as _kbd
     from hermes_cli import kanban_mint_lint as _mint_lint
+
+    # Every producer gets the boomerang default here; an explicit value is kept as given.
+    boomerang_wake, boomerang_source = _kbd.resolve(boomerang_wake)
 
     if until is not None:
         until = validate_wake_at(until)
@@ -6924,7 +6928,7 @@ def create_task(
                     'completion_contract': completion_contract,
                     'brain': brain,
                     'workspace_of': workspace_of,
-                    'boomerang_wake': None if boomerang_wake is None else (1 if boomerang_wake else 0),
+                    'boomerang_wake': 1 if boomerang_wake else 0,
                     'signature': signature,
                     'next_eligible_at': int(until) if until is not None else None,
                 })
@@ -6934,8 +6938,8 @@ def create_task(
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
-                if boomerang_wake is not None:   # mirror into the legacy column (Prism 921e843952a6)
-                    write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
+                # mirror into the legacy column (Prism 921e843952a6)
+                write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
                 from hermes_cli import kanban_continuation as _kcont_create
                 if continues:
                     _kcont_create.transfer_workspace(conn, continues, task_id)
@@ -6968,7 +6972,8 @@ def create_task(
                         "provider_override": provider_override,
                         "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
-                        **({"boomerang_wake": bool(boomerang_wake)} if boomerang_wake is not None else {}),
+                        "boomerang_wake": bool(boomerang_wake),
+                        "boomerang_wake_source": boomerang_source,
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),

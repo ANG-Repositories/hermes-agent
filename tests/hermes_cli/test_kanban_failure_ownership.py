@@ -489,3 +489,19 @@ def test_proof_entrypoint_real_execution(tmp_path,arm):
     summary=json.loads((root/'summary.json').read_text())
     assert summary['exit_code']==0 and summary['pid']>0
     print(json.dumps(summary))
+
+
+@pytest.mark.parametrize('policy', [True, False])
+def test_owner_card_boomerang_wake_follows_policy(board, monkeypatch, policy):
+    """A failure-owner card is a card producer too: never a NULL wake level (t_c24b1cc7)."""
+    from hermes_cli import kanban_boomerang_default as kbd
+    monkeypatch.setattr(kbd, 'policy_default', lambda: policy)
+    enroll(board)
+    first = admit(board, observation())
+    assert first.action == 'REPAIR'
+    stored = board.execute('SELECT boomerang_wake FROM tasks WHERE id=?', (first.card_id,)).fetchone()[0]
+    assert stored == (1 if policy else 0)
+    payload = json.loads(board.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (first.card_id,)).fetchone()[0])
+    assert payload['boomerang_wake'] is policy
+    assert payload['boomerang_wake_source'] == kbd.SOURCE_DEFAULT

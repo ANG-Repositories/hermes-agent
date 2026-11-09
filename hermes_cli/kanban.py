@@ -1064,7 +1064,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
-                boomerang_wake=boomerang,
+                # Only the caller's own choice; create_task applies the default and records which.
+                boomerang_wake=getattr(args, "boomerang_wake", None),
                 initial_status=getattr(args, "initial_status", "running"),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
@@ -1095,6 +1096,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 explicit_home=(task.session_id or "" if getattr(args, "session", None) is not None
                                else None),
                 home_fallback=bool(boomerang) and not is_dispatcher_owned_worker_context())
+            from hermes_cli.kanban_boomerang_default import wake_route
+            route = wake_route(conn, task_id)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1115,7 +1118,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         # t_d59f722a: the home the card was BORN with, so a loader can assert it.
-        _print_json(dict(_task_to_dict(task), home=("unhomed" if task.unhomed else task.session_id)))
+        _print_json(dict(_task_to_dict(task), home=("unhomed" if task.unhomed else task.session_id),
+                         wake_route=route))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
         if auto_added:
@@ -1128,6 +1132,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 "Subscribed the calling session for finish notifications "
                 "(kanban.cli_auto_subscribe)."
             )
+        if route.get("note"):
+            print(f"\n⚠  {task_id}: {route['note']}", file=sys.stderr)
         if dup_warning:
             similar = ", ".join(
                 f"{d['id']} ({d['score']:.2f})" for d in dup_warning.get("duplicates", [])
