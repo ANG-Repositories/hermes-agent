@@ -9,7 +9,9 @@ Ace 2026-11-08 17:05: fleet work goes to every other machine first. The real
 4. a card whose persisted workspace is its OWN Studio ``.worktrees/<id>``
    (t_5e8801d8: ``rule=workspace_kind``, then 30+ min in ``local_full``)
    ports to a pool host when that tree is clean and its branch is on origin,
-   and stays local when it is dirty, ahead of origin, or the knob is off.
+   and stays local when it is dirty, ahead of origin, or the shared setting is
+   off (``host_preference`` in fleet/placement-policy.json: no key, kanban
+   switch off, or env FLEET_LAST_RESORT_HOSTS empty).
 """
 
 from __future__ import annotations
@@ -26,6 +28,16 @@ from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import kanban_worktree_port as kwt
 
 SLUG = "ANG-Ventures/hermes-agent"
+HOST_PREF = {"order": ["ci-box", "nas-fleet", "ace-ai", "ace-media", "mac-studio"],
+             "last_resort": ["mac-studio"], "consumers": {"kanban": "on", "ci": "on"}}
+
+
+def _write_policy(fleet: Path, host_preference=HOST_PREF) -> None:
+    """A schema-1 policy carrying (or not) the shared ``host_preference`` key."""
+    doc = {"schema": 1, "hosts": {"mac-studio": {"class": "studio-source", "targets": False}}}
+    if host_preference is not None:
+        doc["host_preference"] = host_preference
+    (fleet / "placement-policy.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
@@ -33,7 +45,7 @@ def _no_real_spawn(monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("real spawn in gate test")
     monkeypatch.setattr(kbd, "_default_spawn", boom)
-    monkeypatch.delenv(kwt.STUDIO_LAST_RESORT_ENV, raising=False)
+    monkeypatch.delenv("FLEET_LAST_RESORT_HOSTS", raising=False)
 
 
 @pytest.fixture
@@ -134,6 +146,7 @@ def studio_tree(home, tmp_path, monkeypatch):
     (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 1, "repos": {
         SLUG: {"mirror": "/srv/ci/git-mirrors/hermes-agent.git", "hosts": ["ci-box"]}}}),
         encoding="utf-8")
+    _write_policy(fleet)
     clones = []
     monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
                         clones.append((host.name, ws, branch)))
@@ -187,27 +200,36 @@ def test_a_studio_worktree_with_studio_only_work_stays_local(studio_tree, damage
     assert route == "local" and rule == "workspace_kind"
 
 
-@pytest.mark.parametrize("how", ["env", "config"])
-def test_knob_off_keeps_the_studio_worktree_local(studio_tree, monkeypatch, how):
+@pytest.mark.parametrize("how", ["no_key", "switch_off", "env_empty", "env_other_host"])
+def test_shared_setting_off_keeps_the_studio_worktree_local(studio_tree, home, monkeypatch, how):
     tid, *_ = studio_tree
-    if how == "env":
-        monkeypatch.setenv(kwt.STUDIO_LAST_RESORT_ENV, "0")
+    if how == "no_key":
+        _write_policy(home / "fleet", None)
+    elif how == "switch_off":
+        _write_policy(home / "fleet", {**HOST_PREF, "consumers": {"kanban": "off", "ci": "on"}})
+    elif how == "env_empty":
+        monkeypatch.setenv("FLEET_LAST_RESORT_HOSTS", "")
     else:
-        monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"studio_last_resort": False}})
+        monkeypatch.setenv("FLEET_LAST_RESORT_HOSTS", "nas-fleet")
     (route, _arg), rule = _route(tid)
     assert route == "local" and rule == "workspace_kind"
 
 
-@pytest.mark.parametrize("env, cfg, want", [
-    (None, None, True), (None, {}, True),
-    (None, {"placement": {"studio_last_resort": False}}, False),
-    (None, {"placement": {"studio_last_resort": "off"}}, False),
-    ("0", None, False), ("false", {"placement": {"studio_last_resort": True}}, False),
-    ("1", {"placement": {"studio_last_resort": False}}, True),
+@pytest.mark.parametrize("hp, env, want", [
+    (None, None, False),
+    (HOST_PREF, None, True),
+    ({**HOST_PREF, "consumers": {"kanban": "off"}}, None, False),
+    ({**HOST_PREF, "consumers": {"ci": "on"}}, None, False),
+    ({**HOST_PREF, "last_resort": ["Mac-Studio"]}, None, True),
+    (HOST_PREF, "", False),
+    (HOST_PREF, "nas-fleet,mac-studio", True),
+    (None, "mac-studio", False),
 ])
-def test_studio_last_resort_knob(monkeypatch, env, cfg, want):
+def test_vendored_reader_follows_the_shared_key(tmp_path, monkeypatch, hp, env, want):
+    from hermes_cli import placement_policy as ppol
     if env is None:
-        monkeypatch.delenv(kwt.STUDIO_LAST_RESORT_ENV, raising=False)
+        monkeypatch.delenv("FLEET_LAST_RESORT_HOSTS", raising=False)
     else:
-        monkeypatch.setenv(kwt.STUDIO_LAST_RESORT_ENV, env)
-    assert kwt.studio_last_resort(cfg) is want
+        monkeypatch.setenv("FLEET_LAST_RESORT_HOSTS", env)
+    _write_policy(tmp_path, hp)
+    assert ppol.load(tmp_path).is_last_resort(kwp.STUDIO_HOST) is want

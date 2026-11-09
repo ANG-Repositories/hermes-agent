@@ -93,28 +93,6 @@ def origin_slug(repo: Path, runner: Callable = subprocess.run) -> Optional[str]:
     return slug
 
 
-STUDIO_LAST_RESORT_ENV = "KANBAN_STUDIO_LAST_RESORT"
-_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
-
-
-def studio_last_resort(kanban_cfg=None) -> bool:
-    """``kanban.placement.studio_last_resort`` (default True), env
-    ``KANBAN_STUDIO_LAST_RESORT`` wins (t_c2fce87e). True lets a card's own
-    Studio ``.worktrees/<id>`` port to a pool host when it is clean and every
-    commit is on origin; False restores the old rule (that tree keeps the
-    card on the Studio). The pool-first ORDER for portable cards is not this
-    knob: ``placement_default`` is remote-only by ruling (t_82b4db80)."""
-    import os
-    env = (os.environ.get(STUDIO_LAST_RESORT_ENV) or "").strip().lower()
-    if env:
-        return env not in _FALSE_WORDS
-    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, dict) else None
-    val = pl.get("studio_last_resort") if isinstance(pl, dict) else None
-    if isinstance(val, str):
-        return val.strip().lower() not in _FALSE_WORDS
-    return True if val is None else bool(val)
-
-
 def _clean_on_branch(tree: Path, branch: str, runner: Callable) -> bool:
     """``tree`` is checked out on ``branch`` with nothing uncommitted or
     untracked (ignored files excepted): a clone of the pushed branch loses
@@ -145,7 +123,8 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     that exists locally with commits origin does not have (or no origin ref
     at all), since the clone could not start from them (Prism 044612a3554e).
 
-    ``allow_studio_tree`` (:func:`studio_last_resort`, t_c2fce87e): the
+    ``allow_studio_tree`` (the Studio is a ``host_preference`` last-resort host
+    for kanban in ``fleet/placement-policy.json``, t_c2fce87e): the
     card's OWN ``<repo>/.worktrees/<id>`` (persisted path or found under the
     anchor) no longer pins it to the Studio when that tree is on the card's
     branch, clean, and the branch is fully on origin (the check below). Any
