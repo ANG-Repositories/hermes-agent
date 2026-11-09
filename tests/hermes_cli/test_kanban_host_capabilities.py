@@ -190,15 +190,20 @@ def test_body_sniff_pins_and_comments(home, fleet, monkeypatch):
 
 # -- 4: overrides and the rule order (F3) ----------------------------------------
 
+@pytest.mark.parametrize("cap,body", [
+    ("browser-session", "add these to the cart on :9222"),
+    # The live case (t_2a81d813): studio-state carries ``"soft": false`` in the map.
+    ("studio-state", "scripts/fleet-merge.sh must refuse when queue detection is unreadable"),
+])
 @pytest.mark.parametrize("override", ["host: any", "requires: none", ""])
-def test_held_body_sniff_rechecked_next_tick(home, fleet, monkeypatch, override):
+def test_held_body_sniff_rechecked_next_tick(home, fleet, monkeypatch, override, cap, body):
     _mode(monkeypatch)
+    held = f"studio_affinity:requires:{cap}"
     with kb.connect_closing() as conn:
-        body = "add these to the cart on :9222"
         tid = _card(conn, body=body)
         res, spawned = _tick(conn)
         assert spawned == []
-        assert res.placement_waits[tid] == "studio_affinity:requires:browser-session"
+        assert res.placement_waits[tid] == held
         conn.execute("UPDATE tasks SET body=? WHERE id=?", (override + "\n" + body, tid))
         conn.commit()
     # Reopen the DB to exclude in-memory routing state from the proof.
@@ -216,7 +221,7 @@ def test_held_body_sniff_rechecked_next_tick(home, fleet, monkeypatch, override)
             assert _comments(conn, tid, prefix="auto-pin released:") == released
         else:
             assert spawned == []
-            assert res.placement_waits[tid] == "studio_affinity:requires:browser-session"
+            assert res.placement_waits[tid] == held
 
 
 def test_body_sniff_overridden_by_host_any(home, fleet, monkeypatch):
