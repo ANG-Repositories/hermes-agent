@@ -328,6 +328,77 @@ def local_workspace_has_content(path: Optional[str]) -> bool:
         return True
 
 
+# local_files continuity overflow (t_e604c0f9): a card whose Studio scratch dir holds files runs on the Studio while
+# its gate admits; when it does not, the dir is carried to the chosen pool host (same path) and the card runs there.
+# The bounds keep the in-tick scan and copy short; they are a cost bound, not a capacity count: a bigger dir keeps
+# the old rule (Studio or wait).
+CARRY_MAX_BYTES = 1024 ** 3
+CARRY_MAX_ENTRIES = 20000
+CARRY_TIMEOUT_SECONDS = 300
+CARRY_SCAN_TTL_SECONDS = 300
+CARRIED_EVENT = "workspace_carried"
+_carry_scan_cache: Dict[str, tuple] = {}
+
+
+def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
+                  max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None) -> bool:
+    """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed). Any scan
+    error is False (the card keeps the old rule). Cached per path for ``CARRY_SCAN_TTL_SECONDS``: the dispatcher
+    asks every tick."""
+    import time as _time
+    if not path:
+        return False
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        root = canon(path)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    t = _time.monotonic() if now is None else now
+    hit = _carry_scan_cache.get(root)
+    if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
+        return hit[1]
+    total = entries = 0
+    ok = True
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
+            for name in (*dirnames, *filenames):
+                entries += 1
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+                if entries > max_entries or total > max_bytes:
+                    ok = False
+                    break
+            if not ok:
+                break
+    except OSError:
+        ok = False
+    _carry_scan_cache[root] = (t, ok)
+    return ok
+
+
+def _raise(exc: OSError) -> None:
+    raise exc
+
+
+def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subprocess.run) -> None:
+    """Copy the local ``workspace`` to the same path on ``host`` (rsync -a over the pool ssh options); raise on any
+    failure. Never deletes on the target: an existing remote file of the same name is overwritten, others stay."""
+    src = workspace.rstrip("/") or "/"
+    proc = runner(_ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {shlex.quote(src)}"),
+                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  timeout=_PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
+    if getattr(proc, "returncode", 1) != 0:
+        raise RuntimeError(f"carry to {host.name}: mkdir {src} failed: "
+                           f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+    ssh = _ssh_argv(host, "")[:-2]  # the ssh options, without target and command
+    proc = runner(["rsync", "-a", "-e", " ".join(shlex.quote(a) for a in ssh), f"{src}/",
+                   f"{host.target}:{src}/"],
+                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
+    if getattr(proc, "returncode", 1) != 0:
+        raise RuntimeError(f"carry to {host.name}: rsync {src} rc={getattr(proc, 'returncode', '?')}: "
+                           f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+
+
 def remote_workspace_has_content(placement_raw: Optional[str],
                                  runner: Callable = subprocess.run) -> bool:
     """True unless the placed host PROVES this run's workspace empty or absent.

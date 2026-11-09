@@ -983,6 +983,81 @@ def resolve_pin(body: Optional[str], known_hosts: Iterable[str],
     return None, ignored
 
 
+def studio_pin_reasons(caps) -> Optional[frozenset]:
+    """The ``requires:`` words that justify a ``host: studio`` pin (t_e604c0f9): every capability the capability
+    map's Studio row serves (browser-session, studio-state, control-plane, docker identity-only, ...) plus the
+    Studio-only access word ``control-plane-read``. None (= every Studio pin is honoured, the pre-t_e604c0f9
+    behaviour) when the capability layer is off this tick, its map is absent or malformed, or the Studio row
+    lists nothing: an unreadable vocabulary must not move Studio work."""
+    cmap = getattr(caps, "cmap", None)
+    if cmap is None or not getattr(cmap, "valid", False):
+        return None
+    from hermes_cli import kanban_host_capabilities as _khc
+    studio = (getattr(cmap, "hosts", None) or {}).get(_khc.STUDIO_ROW)
+    if not studio:
+        return None
+    return frozenset(studio) | {_reasons.ACCESS_CONTROL_PLANE_READ}
+
+
+def studio_pin_justified(body: Optional[str], reasons: Optional[frozenset]) -> bool:
+    """Does the card's ``requires:`` line name a reason the Studio pin needs? ``reasons`` None = always."""
+    if reasons is None:
+        return True
+    from hermes_cli import kanban_host_capabilities as _khc
+    return any(w in reasons for w in _khc.declared_words(body))
+
+
+def effective_pin(body: Optional[str], known_hosts: Iterable[str],
+                  aliases: Optional[Mapping[str, str]] = None,
+                  studio_reasons: Optional[frozenset] = None) -> Tuple[Optional[str], Optional[str], bool]:
+    """:func:`resolve_pin` plus the Studio last-resort rule (Ace 2026-11-08 16:38, t_e604c0f9): a bare
+    ``host: studio`` line with no ``requires:`` reason the Studio serves is DROPPED (not a pin, not an unknown
+    word: the card is placed by FWA like any unpinned card). ``(pin, ignored, dropped)``."""
+    pin, ignored = resolve_pin(body, known_hosts, aliases)
+    if pin == PIN_STUDIO and not studio_pin_justified(body, studio_reasons):
+        return None, None, True
+    return pin, ignored, False
+
+
+def note_dropped_studio_pin(card_id: str) -> None:
+    """One INFO per card per 5 minutes for a dropped bare ``host: studio`` pin."""
+    now = time.monotonic()
+    key = f"studio-pin:{card_id}"
+    last = _ignored_pin_warned.get(key)
+    if last is None or now - last >= IGNORED_PIN_WARN_SECONDS:
+        _ignored_pin_warned[key] = now
+        _log.info("kanban pool: card %s: bare `host: studio` dropped (no requires: reason the Studio serves); "
+                  "placed by FWA", card_id)
+
+
+# The Studio's kanban consumer row in config/fleet-hosts.json (t_e604c0f9): ``last_resort`` false is the kill switch
+# for the three Studio-last-resort rules (bare host: studio dropped, local_files continuity only while the Studio
+# has room, else carried to a pool host). Absent / unreadable / anything but ``false`` = on.
+STUDIO_TABLE_ID = STUDIO_HOST
+STUDIO_LAST_RESORT_KEY = "last_resort"
+_last_resort_cache: Dict[str, Tuple[float, bool]] = {}
+
+
+def studio_last_resort(fleet_dir: Path) -> bool:
+    """``hosts.mac-studio.consumers.kanban.last_resort`` (default true), cached on the file's mtime."""
+    path = Path(fleet_dir).parent / "config" / FLEET_HOSTS_FILE
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return True
+    hit = _last_resort_cache.get(str(path))
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    try:
+        row = (((_read_json(path) or {}).get("hosts") or {}).get(STUDIO_TABLE_ID) or {})
+        val = ((row.get("consumers") or {}).get("kanban") or {}).get(STUDIO_LAST_RESORT_KEY, True)
+    except (OSError, ValueError, AttributeError):
+        val = True
+    on = val is not False
+    _last_resort_cache[str(path)] = (mtime, on)
+    return on
+
+
 def _studio_words() -> frozenset:
     """Words for the dispatcher's own machine: the constants plus the live
     ``socket.gethostname()`` short form, lower-cased."""
@@ -1113,7 +1188,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              targets: Optional[Mapping[str, str]] = None,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
              body_signals: bool = True,
-             worktree_hosts: Optional[Tuple[str, ...]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+             worktree_hosts: Optional[Tuple[str, ...]] = None,
+             studio_reasons: Optional[frozenset] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1149,6 +1225,11 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     hosts holding a git mirror of a ``worktree`` card's repo. Non-empty, the
     card is judged like a scratch card (the dispatcher clones it on the
     chosen host); a pin to a host outside that set keeps it local.
+
+    ``studio_reasons`` (t_e604c0f9, :func:`studio_pin_reasons`): a ``host:
+    studio`` pin holds only when the card's ``requires:`` line names one of
+    them; a bare one is dropped and the card is judged unpinned. None = every
+    Studio pin holds (kill switch, or no capability map this tick).
     """
     kind = workspace_kind or "scratch"
     if kind != "scratch" and not (kind == "worktree" and worktree_hosts):
@@ -1181,7 +1262,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     access = access_bound_for(body, pool)
     if access is not None:
         return False, _reasons.access_bound(access), None
-    pin, ignored = resolve_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None))
+    pin, ignored, _dropped = effective_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None),
+                                           studio_reasons)
     if bind_rule:
         # The bind is the pin; a body pin may only agree with it (spec §5).
         if pin not in (None, PIN_ANY, bind_host.lower()):
