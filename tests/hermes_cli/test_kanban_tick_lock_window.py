@@ -279,6 +279,36 @@ def test_workspace_resolution_never_touches_a_successor_run(
         assert ws != str(kanban_home / "stale-launch-ws"), "the old launch wrote the successor's workspace"
 
 
+def test_baseline_write_after_the_fenced_update_never_lands_on_a_successor_run(
+        kanban_home, all_assignees_spawnable, monkeypatch):
+    """Prism c08a3c9d1616 (t_89e3e083): R1's fenced workspace UPDATE commits, R2 claims the card, then R1's
+    survivor baseline write runs. It is fenced to R1 too: no baseline row for R2's card, R2 untouched, the
+    launch is recorded spawn_aborted and nothing spawns."""
+    from hermes_cli import kanban_db_workspace as kbw
+    db_path = kb.kanban_db_path(board="default")
+    succ = {}
+    spawned = []
+    real_set = kbw._set_task_column
+
+    def set_then_lose_claim(conn, task_id, column, value, run_id=None):
+        real_set(conn, task_id, column, value, run_id)
+        if column == "workspace_path" and run_id is not None and "run" not in succ:
+            succ["r1"] = run_id
+            succ["run"] = _successor_in_window(db_path, task_id)
+
+    monkeypatch.setattr(kbw, "_set_task_column", set_then_lose_claim)
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="A", assignee="alpha")
+        kbd.dispatch_once(conn, spawn_fn=lambda t, w: spawned.append(t.id))
+        _assert_successor_untouched(conn, a, succ["run"])
+        assert spawned == []
+        row = conn.execute("SELECT bases FROM task_workspace_survivors WHERE task_id=?", (a,)).fetchone()
+        assert row is None, f"the old launch recorded its baseline on the successor's card: {row[0]}"
+        aborted = conn.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind='spawn_aborted'",
+                               (a,)).fetchall()
+        assert [r[0] for r in aborted] == [succ["r1"]]
+
+
 def test_narrow_lock_config_reader():
     assert kbd.narrow_lock_enabled({}) is True
     assert kbd.narrow_lock_enabled({"dispatch": {"narrow_lock": True}}) is True
