@@ -101,7 +101,9 @@ def test_rolled_back_hold_counts_the_whole_hold_as_callback(db):
     assert "commit_s" not in row and row["callback_s"] == row["held_s"] and row["callback_cpu_s"] is not None, row
 
 
-def test_history_is_bounded_to_one_rotation(db, monkeypatch):
+@pytest.mark.parametrize("portable", [False, True])
+def test_history_is_bounded_to_one_rotation(db, monkeypatch, portable):
+    monkeypatch.setattr(lockowners, "_DIR_FD_OK", not portable)
     monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 600)
     for _ in range(12):
         _sleeping_write(db, 0.0)
