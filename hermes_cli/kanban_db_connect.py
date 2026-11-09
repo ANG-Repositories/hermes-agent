@@ -197,7 +197,7 @@ def _dispatch_tick_lock(db_path: Path):
     lock is the defense-in-depth that prevents two dispatchers from ever writing concurrently *regardless of
     how the second one got there*.
     """
-    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    lock_path = _tick_lock_path(db_path)
     handle = None
     acquired = False
     try:
@@ -212,24 +212,21 @@ def _dispatch_tick_lock(db_path: Path):
         # a no-op so a probe failure never blocks dispatch.
         acquired = True
         handle = None
+    state = None
     try:
         if acquired and handle is not None:
-            try:
-                # Keep byte zero for msvcrt; never replace/unlink a lock inode.
-                handle.truncate(1)
-                handle.write(_kb.json.dumps({
-                    "pid": _kb.os.getpid(),
-                    "monotonic": time.monotonic(),
-                    "acquire_site": "hermes_cli.kanban_db:_dispatch_tick_lock",
-                }).encode("utf-8"))
-                handle.flush()
-            except OSError:
-                _kb._log.debug("Could not stamp board dispatch lock", exc_info=True)
+            _stamp_tick_lock(handle)
+            state = _HeldTickLock(handle)
+            _HELD_TICK_LOCKS[str(lock_path)] = state
         yield acquired
     finally:
+        if state is not None and _HELD_TICK_LOCKS.get(str(lock_path)) is state:
+            del _HELD_TICK_LOCKS[str(lock_path)]
         if handle is not None:
             try:
-                if acquired:
+                # A TickLockWindow left released (an exception between release and hold): the flock is
+                # not ours, and the stamp on the shared file is the current holder's. Leave both alone.
+                if acquired and (state is None or state.held):
                     try:
                         handle.truncate(1)
                         handle.flush()
@@ -240,6 +237,140 @@ def _dispatch_tick_lock(db_path: Path):
                 pass
             finally:
                 handle.close()
+
+
+def _tick_lock_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".dispatch.lock")
+
+
+def _stamp_tick_lock(handle) -> None:
+    try:
+        # Keep byte zero for msvcrt; never replace/unlink a lock inode.
+        handle.truncate(1)
+        handle.write(_kb.json.dumps({
+            "pid": _kb.os.getpid(),
+            "monotonic": time.monotonic(),
+            "acquire_site": "hermes_cli.kanban_db:_dispatch_tick_lock",
+        }).encode("utf-8"))
+        handle.flush()
+    except OSError:
+        _kb._log.debug("Could not stamp board dispatch lock", exc_info=True)
+
+
+class _HeldTickLock:
+    """The open lock file of a tick lock THIS process acquired; ``held`` is False while a
+    :class:`TickLockWindow` has handed it back."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.held = True
+
+
+# lock path -> the holder state, while this process holds that board's tick lock.
+_HELD_TICK_LOCKS: dict = {}
+
+
+class TickLockWindow:
+    """Hand the board's tick lock back during slow per-card work, and time every phase (t_f60f502f).
+
+    Measured 2026-11-08 on the Studio: a tick held ``.dispatch.lock`` for 60-300 s, almost all of it
+    after the claim (workspace resolve, worktree / pool clone, the spawn), so ``kanban admit`` was
+    refused for minutes. The work after a claim writes only the claimed run, every write ownership-
+    checked (``record_placement``, ``_claim_still_held``); SQLite serializes the writes themselves.
+    So the tick decides and claims under the lock, :meth:`release` hands it back for that work, and
+    :meth:`hold` takes it again before the next decision. A launcher that dies while released leaves a
+    claimed run with no pid: the crash reaper skips it (``worker_pid IS NOT NULL``) and the claim TTL
+    reclaims it.
+
+    ``enabled=False`` (``kanban.dispatch.narrow_lock: false``) or no lock held by this process (the
+    unguarded fallback, a test lock): release/hold are no-ops, timing still runs. :meth:`mark` books
+    the wall time since the previous mark to ``phase`` (held) and ``phase.unlocked`` (released).
+    """
+
+    WARN_EVERY_S = 60.0
+    POLL_S = 0.05
+
+    def __init__(self, db_path: Optional[Path] = None, *, enabled: bool = True, clock=time.monotonic):
+        self._db_path = db_path
+        self._state = (_HELD_TICK_LOCKS.get(str(_tick_lock_path(db_path)))
+                       if enabled and db_path is not None else None)
+        self._clock = clock
+        now = clock()
+        self._held_since: Optional[float] = now
+        self._released_since: Optional[float] = None
+        self._held_s = 0.0
+        self._unlocked_s = 0.0
+        self._mark_at = now
+        self._mark_unlocked = 0.0
+        self.windows = 0
+        self.phases: dict = {}
+
+    @property
+    def released(self) -> bool:
+        return self._released_since is not None
+
+    def release(self) -> None:
+        if self._state is None or self.released:
+            return
+        now = self._clock()
+        try:
+            self._state.handle.truncate(1)
+            self._state.handle.flush()
+        except OSError:
+            _kb._log.debug("Could not clear board dispatch lock stamp", exc_info=True)
+        _unlock(self._state.handle)
+        self._state.held = False
+        self._held_s += now - self._held_since
+        self._held_since, self._released_since = None, now
+        self.windows += 1
+
+    @property
+    def active(self) -> bool:
+        """True when :meth:`release` really hands the board lock back (narrow_lock on, lock held here)."""
+        return self._state is not None
+
+    def hold(self) -> bool:
+        """Take the lock back, waiting as long as it takes: every holder now keeps it only for decisions.
+        True when it was handed back, i.e. the board may have moved since this tick last read it."""
+        if not self.released:
+            return False
+        start = self._clock()
+        warn_at = start + self.WARN_EVERY_S
+        while True:
+            try:
+                if _try_lock_nb(self._state.handle):
+                    break
+            except OSError:
+                pass
+            now = self._clock()
+            if now >= warn_at:
+                _kb._log.warning("kanban tick lock: re-taking %s, waited %.0fs (holder %s)",
+                                 self._db_path, now - start, _kb._read_dispatch_lock_holder(self._db_path))
+                warn_at = now + self.WARN_EVERY_S
+            time.sleep(self.POLL_S)
+        self._state.held = True
+        _stamp_tick_lock(self._state.handle)
+        now = self._clock()
+        self._unlocked_s += now - self._released_since
+        self._held_since, self._released_since = now, None
+        return True
+
+    def held_s(self) -> float:
+        now = self._clock()
+        return self._held_s + (now - self._held_since if self._held_since is not None else 0.0)
+
+    def _unlocked_total(self, now: float) -> float:
+        return self._unlocked_s + (now - self._released_since if self._released_since is not None else 0.0)
+
+    def mark(self, phase: str) -> None:
+        now = self._clock()
+        unlocked = self._unlocked_total(now)
+        spent, off = now - self._mark_at, unlocked - self._mark_unlocked
+        if spent - off > 0:
+            self.phases[phase] = self.phases.get(phase, 0.0) + (spent - off)
+        if off > 0:
+            self.phases[phase + ".unlocked"] = self.phases.get(phase + ".unlocked", 0.0) + off
+        self._mark_at, self._mark_unlocked = now, unlocked
 
 # Periodic explicit WAL checkpoint from the dispatcher tick: a passive
 # autocheckpoint can be starved on a busy multi-process board (any open reader

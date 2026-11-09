@@ -988,6 +988,18 @@ def _site_triggers():
         m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: _release(task.id))
         return "studio", "twin", "did not spawn"
 
+    def workspace_claim_lost(m, ctx):
+        # t_f60f502f: the tick resolved the workspace with the board lock handed back and a successor run took
+        # the card meanwhile; the run-fenced workspace write refuses and the launch stops before any spawn.
+        from hermes_cli import kanban_db_workspace as kbw
+
+        def lost(conn, task_id, path, *, run_id=None):
+            _release(task_id)
+            raise kb.ClaimLost("run no longer owns the card")
+        m.setattr(kbw, "set_workspace_path", lost)
+        m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: None)
+        return "studio", "twin", "did not spawn"
+
     def _join(m, ctx):
         def gate(conn, rows, result, rr, dry_run, *a, **k):
             for r in rows:
@@ -1127,6 +1139,7 @@ def _site_triggers():
         "continue: except WorkspaceUnavailable (try: _kb._validate_workspace_admission)": workspace_unavailable,
         "continue: except Exception (try: _kb._validate_workspace_admission)": workspace_error,
         "continue: not _kb._claim_still_held(conn, claimed)": claim_lost_before,
+        "continue: except _kb.ClaimLost (try: _kb._validate_workspace_admission)": workspace_claim_lost,
         "continue: _btok is not None": join_refused,
         "continue: _btok is None and (not _kb._claim_still_held(conn, claimed))": join_claim_lost,
         "fail: except Exception (try: result.browser_joins.get)": launch,
@@ -1206,3 +1219,54 @@ def test_admit_returns_the_dispatchers_own_refusal_at_every_site(board, monkeypa
                                         **ka._tick_knobs(cfg), **ctx.get("tick_kw", {}))
             assert b not in [s[0] for s in res.spawned], (site, res.spawned)
             assert _norm(str(got.value), a) == _norm(f"{b}: {ka.refusal_from(res, b)}", b), site
+
+
+@pytest.mark.parametrize("narrow", [True, False])
+def test_admit_gets_in_while_a_tick_is_stuck_in_a_spawn(board, monkeypatch, narrow):
+    """t_f60f502f: on 2026-11-08 a gateway tick held the board lock through minutes of spawns and
+    `kanban admit` was refused 18 times ("board tick lock busy for 30s"). A tick blocked in a spawn
+    (the spawn waits up to 60 s here) now has the lock handed back, so admit gets in through its own
+    floor and launch while that spawn is still running. Kill switch (kanban.dispatch.narrow_lock:
+    false), the control: the tick keeps the lock and admit is refused."""
+    import threading
+
+    _hot_local(monkeypatch, load1=10.0)            # floor admits: load1 10 < 64 x 1.5, mem 100 GB
+    monkeypatch.setattr(ka, "_LOCK_WAIT_SECONDS", 3.0)
+    if not narrow:
+        monkeypatch.setattr(kbd, "narrow_lock_enabled", lambda kanban_cfg=None: False)
+    a = _card()
+    in_spawn, release = threading.Event(), threading.Event()
+
+    def slow_spawn(task, workspace, *, board=None, placement=None):
+        in_spawn.set()
+        release.wait(60)
+        return 4242
+
+    out: dict = {}
+
+    def tick():
+        with kb.connect_closing() as conn:
+            out["tick"] = kbd.dispatch_once(conn, spawn_fn=slow_spawn)
+
+    worker = threading.Thread(target=tick)
+    worker.start()
+    try:
+        assert in_spawn.wait(60), "the tick never reached its spawn"
+        b = _card()                                 # created after the tick read its ready rows
+        SPAWNS.clear()
+        try:
+            got = ka.admit(b, "studio", "t_f60f502f concurrent admit", kanban_cfg={}, spawn_fn=_spawn)
+        except ka.AdmitRefused as exc:
+            got = exc
+        tick_still_in_spawn = worker.is_alive() and not release.is_set()
+    finally:
+        release.set()
+        worker.join(60)
+    assert tick_still_in_spawn
+    assert [s[0] for s in out["tick"].spawned] == [a]
+    if narrow:
+        assert not isinstance(got, Exception), got
+        assert got["task_id"] == b and SPAWNS == [(b, None)]
+    else:
+        assert isinstance(got, ka.AdmitRefused) and "board tick lock held for 3s" in str(got)
+        assert SPAWNS == [] and _status(b) == "ready"

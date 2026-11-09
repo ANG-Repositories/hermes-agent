@@ -17897,22 +17897,29 @@ def release_workspace_refusal_pages(conn, event_ids) -> None:
         )
 
 
-def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
-    """Undo a claim when the mount changes during the claim/resolve window."""
+def _release_claim_for_workspace_refusal(conn, task_id, result, reason, *, expected_run_id=None):
+    """Undo a claim when the mount changes during the claim/resolve window.
+
+    ``expected_run_id``: only that run's claim is undone, checked in the write transaction; a successor run that
+    claimed the card while the tick had the board lock handed back is left alone and False is returned
+    (t_f60f502f, Prism d4e9bf031486)."""
     task = get_task(conn, task_id)
     if task is None:
-        return
-    if not any(item[0] == task_id for item in result.workspace_refused):
-        result.workspace_refused.append((task_id, reason))
+        return False
     stranded = bool(task.workspace_path) and reason.startswith((
         "stranded_by_mount_loss:", "workspaces_root_unmounted:",
     ))
-    if stranded and task_id not in result.stranded_by_mount_loss:
-        result.stranded_by_mount_loss.append(task_id)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
+        if expected_run_id is not None and (row is None or row["status"] != "running"
+                                            or row["current_run_id"] != int(expected_run_id)):
+            return False
+        if not any(item[0] == task_id for item in result.workspace_refused):
+            result.workspace_refused.append((task_id, reason))
+        if stranded and task_id not in result.stranded_by_mount_loss:
+            result.stranded_by_mount_loss.append(task_id)
         run_id = row["current_run_id"] if row else None
         retry_status = _retry_status_for_run(conn, task_id, run_id)
         conn.execute(
@@ -17930,6 +17937,7 @@ def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
             "stranded_by_mount_loss" if stranded else "workspace_refused",
             _stranded_event_payload(reason), run_id=closed_run_id,
         )
+    return True
 
 
 @_home_session_guarded("set-model")
@@ -20951,6 +20959,10 @@ def _pool_in_flight(conn: sqlite3.Connection) -> dict[str, int]:
         if isinstance(pool, str) and pool:
             counts[pool] = counts.get(pool, 0) + 1
     return counts
+
+
+class ClaimLost(RuntimeError):
+    """A run-fenced write found the card owned by another run (t_f60f502f): the launch that issued it stops."""
 
 
 def _claim_still_held(conn: sqlite3.Connection, task: "Task") -> bool:

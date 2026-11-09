@@ -322,8 +322,12 @@ def convert(conn, task, workspace: str, branch: str, *, host: str, slug: str,
     """Persist the port: the card is now a scratch card at ``workspace``."""
     from hermes_cli import kanban_db as _kb
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET workspace_kind='scratch', workspace_path=?, branch_name=? "
-                     "WHERE id=?", (workspace, branch, task.id))
+        # Fenced to the launching run: the tick has the board lock handed back here (t_f60f502f).
+        cur = conn.execute("UPDATE tasks SET workspace_kind='scratch', workspace_path=?, branch_name=? "
+                           "WHERE id=? AND status='running' AND current_run_id IS ?",
+                           (workspace, branch, task.id, task.current_run_id))
+        if cur.rowcount == 0:
+            raise _kb.ClaimLost(f"{task.id}: run {task.current_run_id} no longer owns the card")
         _kb._append_event(conn, task.id, PORTED_EVENT,
                           {"host": host, "repo": slug, "mirror": mirror, "branch": branch,
                            "workspace": workspace}, run_id=task.current_run_id)
