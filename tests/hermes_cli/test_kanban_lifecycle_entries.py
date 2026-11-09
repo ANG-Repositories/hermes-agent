@@ -5,12 +5,60 @@ from pathlib import Path
 
 import pytest
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_lifecycle_guards import install
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
     with kb.connect_closing(tmp_path / "kanban.db") as db:
         yield db
+
+
+def test_current_guard_install_is_read_only_across_connections(conn):
+    conn.commit()
+    with sqlite3.connect(conn.execute("PRAGMA database_list").fetchone()[2]) as fresh:
+        statements = []
+        fresh.set_trace_callback(statements.append)
+        fresh.execute("PRAGMA query_only=ON")
+        install(fresh)
+        assert not any(sql.lstrip().upper().startswith(("CREATE", "DROP", "ALTER"))
+                       for sql in statements)
+        assert not fresh.in_transaction
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed", "create_denied"])
+def test_guard_install_repairs_definitions_without_committing(conn, damage):
+    expected = dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'"))
+    names = [name for name in expected if name.startswith((
+        "tasks_scheduled_wake_", "tasks_review_handoff", "tasks_human_ready_"))]
+    conn.commit()
+    conn.execute("BEGIN")
+    for name in names:
+        conn.execute(f'DROP TRIGGER "{name}"')
+        if damage != "missing":
+            conn.execute(f'CREATE TRIGGER "{name}" AFTER INSERT ON tasks BEGIN SELECT 1; END')
+    damaged = dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'"))
+    if damage == "create_denied":
+        conn.set_authorizer(lambda action, *args: sqlite3.SQLITE_DENY
+                            if action == sqlite3.SQLITE_CREATE_TRIGGER else sqlite3.SQLITE_OK)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                install(conn)
+        finally:
+            conn.set_authorizer(None)
+        assert dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")) == damaged
+    else:
+        install(conn)
+        assert dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")) == expected
+        statements = []
+        conn.set_trace_callback(statements.append)
+        install(conn)
+        conn.set_trace_callback(None)
+        assert not any(sql.lstrip().upper().startswith(("CREATE", "DROP", "ALTER"))
+                       for sql in statements)
+    assert conn.in_transaction
+    conn.rollback()
+    assert dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")) == expected
 
 
 @pytest.mark.parametrize("current_run", [False, True])

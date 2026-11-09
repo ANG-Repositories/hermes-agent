@@ -10,13 +10,32 @@ def has_event_gate(body: str | None) -> bool:
 
 
 def install(conn: sqlite3.Connection) -> None:
+    installed = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'"))
+    changed = {name: sql for name, sql in _trigger_definitions().items()
+               if installed.get(name) != sql}
+    if not changed:
+        return
+    # DDL must not commit the caller's transaction or leave a partial upgrade.
+    conn.execute("SAVEPOINT lifecycle_guards_install")
+    try:
+        for name, sql in changed.items():
+            conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+            conn.execute(sql)
+    except BaseException:
+        conn.execute("ROLLBACK TO lifecycle_guards_install")
+        conn.execute("RELEASE lifecycle_guards_install")
+        raise
+    conn.execute("RELEASE lifecycle_guards_install")
+
+
+def _trigger_definitions() -> dict[str, str]:
+    definitions = {}
     # Existing legacy rows remain readable/repairable. Only entering scheduled,
     # or clearing an existing wake, is rejected; unrelated edits stay possible.
     for operation in ("INSERT", "UPDATE OF status, next_eligible_at, body"):
         name = "insert" if operation == "INSERT" else "update"
-        conn.execute(f"DROP TRIGGER IF EXISTS tasks_scheduled_wake_{name}")
-        conn.execute(f"""
-            CREATE TRIGGER IF NOT EXISTS tasks_scheduled_wake_{name}
+        definitions[f"tasks_scheduled_wake_{name}"] = f"""
+            CREATE TRIGGER tasks_scheduled_wake_{name}
             BEFORE {operation} ON tasks
             WHEN NEW.status = 'scheduled' AND NEW.next_eligible_at IS NULL
               AND NOT EXISTS (
@@ -34,9 +53,9 @@ def install(conn: sqlite3.Connection) -> None:
             BEGIN
                 SELECT RAISE(ABORT, 'scheduled needs a wake time');
             END
-        """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS tasks_review_handoff_insert
+        """.strip()
+    definitions["tasks_review_handoff_insert"] = """
+        CREATE TRIGGER tasks_review_handoff_insert
         AFTER INSERT ON tasks
         WHEN NEW.status = 'review'
         BEGIN
@@ -46,9 +65,8 @@ def install(conn: sqlite3.Connection) -> None:
                 'reviewer', NEW.assignee, 'source', 'lifecycle_entry_repair'),
                 CAST(strftime('%s','now') AS INTEGER));
         END
-    """)
-    conn.execute("DROP TRIGGER IF EXISTS tasks_review_handoff")
-    conn.execute("""
+    """.strip()
+    definitions["tasks_review_handoff"] = """
         CREATE TRIGGER tasks_review_handoff
         AFTER UPDATE OF status ON tasks
         WHEN NEW.status = 'review' AND OLD.status != 'review'
@@ -72,11 +90,11 @@ def install(conn: sqlite3.Connection) -> None:
                 'reviewer', NEW.assignee, 'source', 'lifecycle_entry_repair'),
                 CAST(strftime('%s','now') AS INTEGER));
         END
-    """)
+    """.strip()
     for operation in ("INSERT", "UPDATE OF status, assignee"):
         name = "insert" if operation == "INSERT" else "update"
-        conn.execute(f"""
-            CREATE TRIGGER IF NOT EXISTS tasks_human_ready_{name}
+        definitions[f"tasks_human_ready_{name}"] = f"""
+            CREATE TRIGGER tasks_human_ready_{name}
             AFTER {operation} ON tasks
             WHEN NEW.status = 'ready'
               AND (NEW.assignee = 'human' OR NEW.assignee LIKE 'human:%')
@@ -89,4 +107,5 @@ def install(conn: sqlite3.Connection) -> None:
                 WHERE NOT EXISTS (SELECT 1 FROM task_events
                     WHERE task_id=NEW.id AND kind='needs_operator');
             END
-        """)
+        """.strip()
+    return definitions
