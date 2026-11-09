@@ -988,6 +988,18 @@ def _site_triggers():
         m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: _release(task.id))
         return "studio", "twin", "did not spawn"
 
+    def workspace_claim_lost(m, ctx):
+        # t_f60f502f: the tick resolved the workspace with the board lock handed back and a successor run took
+        # the card meanwhile; the run-fenced workspace write refuses and the launch stops before any spawn.
+        from hermes_cli import kanban_db_workspace as kbw
+
+        def lost(conn, task_id, path, *, run_id=None):
+            _release(task_id)
+            raise kb.ClaimLost("run no longer owns the card")
+        m.setattr(kbw, "set_workspace_path", lost)
+        m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: None)
+        return "studio", "twin", "did not spawn"
+
     def _join(m, ctx):
         def gate(conn, rows, result, rr, dry_run, *a, **k):
             for r in rows:
@@ -1127,6 +1139,7 @@ def _site_triggers():
         "continue: except WorkspaceUnavailable (try: _kb._validate_workspace_admission)": workspace_unavailable,
         "continue: except Exception (try: _kb._validate_workspace_admission)": workspace_error,
         "continue: not _kb._claim_still_held(conn, claimed)": claim_lost_before,
+        "continue: except _kb.ClaimLost (try: _kb._validate_workspace_admission)": workspace_claim_lost,
         "continue: _btok is not None": join_refused,
         "continue: _btok is None and (not _kb._claim_still_held(conn, claimed))": join_claim_lost,
         "fail: except Exception (try: result.browser_joins.get)": launch,

@@ -8052,12 +8052,12 @@ def _dispatch_once_locked(
             )
             if auto is None:    # a successor run owns the card now: not this launch's to fail
                 _kb._abort_lost_claim_spawn(conn, claimed, None)
-                continue
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
             continue
         _lw.mark("workspace")
         if not _kb._claim_still_held(conn, claimed):
@@ -8227,12 +8227,12 @@ def _dispatch_once_locked(
             )
             if auto is None:    # a successor run owns the card now (t_f60f502f, Prism 09fab0fa405f)
                 _kb._abort_lost_claim_spawn(conn, claimed, _launch.pid if _launch.launched else None)
-                continue
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
 
     _lw.mark("decide")
     if not _admit:
@@ -8483,12 +8483,12 @@ def _dispatch_once_locked(
             )
             if auto is None:    # a successor run owns the card now: not this launch's to fail
                 _kb._abort_lost_claim_spawn(conn, claimed, None)
-                continue
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there; fenced to the claimed run (t_f60f502f).
         try:
@@ -8605,12 +8605,12 @@ def _dispatch_once_locked(
             )
             if auto is None:    # a successor run owns the card now (t_f60f502f, Prism 09fab0fa405f)
                 _kb._abort_lost_claim_spawn(conn, claimed, _review_launch.pid if _review_launch.launched else None)
-                continue
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
     _lw.mark("review_decide")
     _lw.hold()
     if not dry_run:
