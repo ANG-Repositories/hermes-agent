@@ -27,6 +27,14 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_debug(*args, **kwargs) -> None:
+    """A broken logging handler must not replace a write's result or original error."""
+    try:
+        logger.debug(*args, **kwargs)
+    except Exception:
+        pass
+
 # sqlite/src/os_unix.c: UNIX_SHM_BASE = (22 + SQLITE_SHM_NLOCK) * 4 = 120; WAL lock i sits at BASE + i.
 _SHM_LOCK_NAMES = {
     120: "WAL write",
@@ -200,7 +208,7 @@ def _open_ledger(ledger: str, *, create: bool) -> Optional[int]:
     st = os.fstat(fd)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:  # windows-footgun: ok — POSIX only (_DIR_FD_OK)
         os.close(fd)
-        logger.debug("state.db lock-holder ledger %s skipped: not a private dir owned by this user", ledger)
+        _safe_debug("state.db lock-holder ledger %s skipped: not a private dir owned by this user", ledger)
         return None
     return fd
 
@@ -248,7 +256,7 @@ def _write_record(hold: dict, **fields) -> None:
         finally:
             os.close(fd)
     except Exception:
-        logger.debug("state.db lock-holder ledger write failed", exc_info=True)
+        _safe_debug("state.db lock-holder ledger write failed", exc_info=True)
 
 
 def _record(hold: dict, fields: dict) -> dict:
@@ -310,10 +318,10 @@ def hold_started(db_path, op: str) -> Optional[int]:
                     _Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
                     _watchdog_running, _watchdog_pid = True, os.getpid()
                 except Exception:  # RuntimeError("can't start new thread"): no "holding" marks this time
-                    logger.debug("state.db lock-holder watchdog did not start", exc_info=True)
+                    _safe_debug("state.db lock-holder watchdog did not start", exc_info=True)
         return token
     except Exception:
-        logger.debug("state.db lock-holder ledger registration failed", exc_info=True)
+        _safe_debug("state.db lock-holder ledger registration failed", exc_info=True)
         return None
 
 
@@ -334,7 +342,7 @@ def hold_committing(token: Optional[int]) -> None:
         if republish:
             _publish_holding(hold)
     except Exception:
-        logger.debug("state.db lock-holder commit mark failed", exc_info=True)  # never breaks the write
+        _safe_debug("state.db lock-holder commit mark failed", exc_info=True)  # never breaks the write
 
 
 def _thread_cpu() -> Optional[float]:
@@ -434,7 +442,7 @@ def _open_history_lock(name: str, *, dir_fd: Optional[int] = None) -> Optional[i
         return os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     except OSError:
         with contextlib.suppress(Exception):
-            logger.debug("state.db lock-holder history.lock unusable; dropping record", exc_info=True)
+            _safe_debug("state.db lock-holder history.lock unusable; dropping record", exc_info=True)
         return None
 
 
@@ -503,7 +511,7 @@ def _append_history(hold: dict, fields: dict) -> None:
             os.close(fd)
     except Exception:
         with contextlib.suppress(Exception):
-            logger.debug("state.db lock-holder history append failed", exc_info=True)
+            _safe_debug("state.db lock-holder history append failed", exc_info=True)
 
 
 def ledger_history(db_path, start: float, end: float) -> List[dict]:
@@ -518,10 +526,10 @@ def ledger_history(db_path, start: float, end: float) -> List[dict]:
         return out
     for name in (_HISTORY_NAME + ".1", _HISTORY_NAME):
         try:
-            with open(os.path.join(ledger, name), encoding="utf-8") as handle:
+            with open(os.path.join(ledger, name), "rb") as handle:
                 for raw in handle:
                     try:
-                        rec = json.loads(raw)
+                        rec = json.loads(raw.decode("utf-8"))
                         if not isinstance(rec, dict):
                             continue
                         since = float(rec["since"])
@@ -601,7 +609,7 @@ def describe_write_lock_holders(db_path, window_s: float) -> str:
         # housekeeping thread's handle) holds the lock as surely as another process does.
         lines += [line for line in recent_ledger_holders(db_path, window_s) if line not in lines]
     except Exception:
-        logger.debug("state.db lock-holder ledger read failed", exc_info=True)
+        _safe_debug("state.db lock-holder ledger read failed", exc_info=True)
     if lines:
         return " | ".join(lines)
     if not sys.platform.startswith("linux"):
@@ -621,7 +629,7 @@ def log_write_lock_waiter(db_path, waited_s: float, *, lock: str) -> str:
                        waited_s, lock, Path(db_path).name, os.getpid(), detail)
         return detail
     except Exception:
-        logger.debug("state.db waiter-side attribution failed", exc_info=True)
+        _safe_debug("state.db waiter-side attribution failed", exc_info=True)
         return ""
 
 
@@ -629,7 +637,8 @@ def log_write_lock_holders(db_path, patience_s: float) -> str:
     """One WARNING naming the write-lock holders at the moment a writer gave up waiting; returns the detail."""
     detail = describe_write_lock_holders(db_path, patience_s + 5.0)
     _last_timeout[os.path.realpath(os.fspath(db_path))] = (time.time(), detail)
-    logger.warning(
-        "state.db write lock unavailable for %.0fs (%s): %s", patience_s, Path(db_path).name, detail
-    )
+    with contextlib.suppress(Exception):
+        logger.warning(
+            "state.db write lock unavailable for %.0fs (%s): %s", patience_s, Path(db_path).name, detail
+        )
     return detail

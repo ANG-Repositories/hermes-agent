@@ -364,6 +364,61 @@ def test_history_skips_non_object_json(tmp_path):
     assert lockowners.ledger_history(tmp_path / "db", 0, 10) == [{"since": 1, "held_s": 2}]
 
 
+@pytest.mark.parametrize("phase", ["start", "commit", "waiter"])
+@pytest.mark.parametrize("callback_raises", [False, True])
+def test_clock_and_logging_failures_never_change_write_result(db, monkeypatch, phase, callback_raises):
+    from types import SimpleNamespace
+
+    class RaisingHandler(logging.Handler):
+        def emit(self, record):
+            raise RuntimeError("logging handler failed")
+
+    def broken_clock():
+        raise RuntimeError("diagnostic clock failed")
+
+    clock = SimpleNamespace(monotonic=broken_clock, time=broken_clock, thread_time=broken_clock)
+    original = ValueError("original callback error")
+    handler = RaisingHandler()
+    monkeypatch.setattr(lockowners.logger, "level", logging.DEBUG)
+    lockowners.logger.addHandler(handler)
+    try:
+        if phase == "start":
+            monkeypatch.setattr(lockowners, "time", clock)
+
+        def callback(conn):
+            conn.execute("INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+                         ("fault-injection", "committed"))
+            if phase in ("commit", "waiter"):
+                monkeypatch.setattr(lockowners, "time", clock)
+            if phase == "waiter":
+                assert lockowners.log_write_lock_waiter(db.db_path, 12.0, lock="sqlite") == ""
+            if callback_raises:
+                raise original
+            return "callback result"
+
+        if callback_raises:
+            with pytest.raises(ValueError) as caught:
+                db._execute_write(callback)
+            assert caught.value is original
+        else:
+            assert db._execute_write(callback) == "callback result"
+        assert db.get_meta("fault-injection") == (None if callback_raises else "committed")
+    finally:
+        lockowners.logger.removeHandler(handler)
+
+
+def test_history_skips_invalid_utf8_in_both_generations(tmp_path):
+    db_path = tmp_path / "db"
+    ledger = Path(lockowners._ledger_dir(db_path))
+    ledger.mkdir(mode=0o700)
+    for name, since in (("history.jsonl.1", 1), ("history.jsonl", 4)):
+        (ledger / name).write_bytes(
+            b'\xff\n' + json.dumps({"since": since, "held_s": 2}).encode() + b'\n{"since": "\xff"}\n'
+        )
+    assert lockowners.ledger_history(db_path, 0, 10) == [
+        {"since": 1, "held_s": 2}, {"since": 4, "held_s": 2}]
+
+
 def test_waiter_attribution_fails_open(db, monkeypatch):
     def _broken(*_a, **_k):
         raise RuntimeError("ledger unreadable")
