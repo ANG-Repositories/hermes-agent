@@ -6457,10 +6457,8 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
-    # K6: a delegations-board card is the process container of a delegate_task call already made (and
-    # bounded by delegation.max_concurrent_children), not a minted work item: the mint cap and the
-    # ruling-citation lint over its goal-derived title do not apply (t_49e02567: 191 refusals pushed
-    # background units in-process, where a gateway restart killed them).
+    # A delegations-board card contains an already-admitted delegate_task call, not a new work item.
+    # Its goal-derived title may quote a ruling without minting a ruling-bearing task.
     container_card = _kdb.conn_is_delegations(conn)
     if not container_card:
         from hermes_cli.kanban_ruling_citation import validate_fields
