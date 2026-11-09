@@ -180,7 +180,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             served_subs_json TEXT,
             attribution TEXT,
             terminal_error TEXT,
-            reasoning_effort TEXT
+            reasoning_effort TEXT,
+            placement_host TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -551,7 +552,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # `reasoning_effort` (t_09a1e42a): the resolved effort label the turn ran
     # at (`xhigh`, `none`, ...), distinct from the `reasoning` TOKEN count.
     # NULL on rows written before the column existed.
-    for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort"):
+    # `placement_host` (t_c9fc6c9f): the box that ran a kanban worker's tools
+    # (pool host name, or `studio-local`); NULL for non-worker turns and for
+    # rows written before the column existed.
+    for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort",
+                 "placement_host"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
@@ -920,6 +925,7 @@ _INSERT_TURN_COLUMNS = (
     "terminal_error",
     "lane_family", "vendor", "served_provider",
     "reasoning_effort",
+    "placement_host",
 )
 
 _INSERT_TURN_SQL = (
@@ -1138,6 +1144,9 @@ def insert_turn(
                     *_route_columns(record.provider, record.model),
                     (str(record.reasoning_effort).strip() or None)
                     if record.reasoning_effort is not None
+                    else None,
+                    (str(record.placement_host).strip() or None)
+                    if record.placement_host is not None
                     else None,
                 ),
             )

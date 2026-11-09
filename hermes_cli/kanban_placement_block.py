@@ -42,6 +42,26 @@ PLACEMENT_REASON_RE = re.compile(
     r"(?:mac[- ]?)?studio|spilled to|placed on (?:ci-box|ace-ai|ace-media)|landed on (?:ci-box|ace-ai|ace-media)")
 # Sentence punctuation is not part of a host id ("host: studio." / "host: ace-ai,").
 _REASON_PIN_RE = re.compile(r"\bhost:[ \t]*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)", re.IGNORECASE)
+# t_dde97120: the verdict for a scratch card whose block is "repo path missing on the pool host". The cure
+# is a task-private clone on whatever host runs it next, so the card goes back in the queue UNPINNED
+# (t_02e30922 was pinned to the Studio for a /Users/<u>/Projects path and never spilled again).
+CLONE_CURE = "clone"
+# A home-absolute path the worker says is absent. Paths under the live home tree (~/.hermes) are Studio
+# state, not a repo a clone recreates, so they never match.
+_MISSING_WORD = (r"(?:does not exist|doesn't exist|no such file or directory|is missing|is absent|"
+                 r"not found|exists\s*=\s*false)")
+_HOME_PATH = r"(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/(?!\.hermes\b)[\w.-]+"
+_MISSING_REPO_PATH_RE = re.compile(rf"{_HOME_PATH}[^\n]{{0,80}}?\b{_MISSING_WORD}", re.IGNORECASE)
+_LIVE_TREE_RE = re.compile(r"(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.hermes\b")
+
+
+def _missing_repo_path_only(reason: str, body: Optional[str]) -> bool:
+    """True when the block's only complaint is a home-absolute path absent on the pool host, and neither
+    the reason nor the body names a Studio-only resource the capability map lists (CARD_NEEDS)."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    if not _MISSING_REPO_PATH_RE.search(reason or "") or _LIVE_TREE_RE.search(reason or ""):
+        return False
+    return not _kwp.card_needs(reason) and not _kwp.card_needs(body)
 
 
 def _reason_pin(reason: str, pool) -> Optional[str]:
@@ -60,11 +80,14 @@ def _reason_pin(reason: str, pool) -> Optional[str]:
 
 
 def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], body: Optional[str],
-             pool, rerouted_before: bool, assignee: Optional[str] = None) -> Optional[Tuple[str, str]]:
-    """``("reroute", host)``, ``("unroutable", why)`` or None (not a placement block).
+             pool, rerouted_before: bool, assignee: Optional[str] = None,
+             workspace_kind: Optional[str] = None) -> Optional[Tuple[str, Optional[str]]]:
+    """``("reroute", host)``, ``("clone", None)``, ``("unroutable", why)`` or None (not a placement block).
 
     ``placed_host`` is the pool host of the blocked run's ``worker_placed`` event (None = local run).
-    ``host`` is ``studio`` or an enabled pool host id."""
+    ``host`` is ``studio`` or an enabled pool host id. ``clone`` (:data:`CLONE_CURE`): an unpinned
+    scratch card that blocked only because a home-absolute repo path is absent on the pool host goes
+    back in the queue with no pin and a comment telling the next run to clone (t_dde97120)."""
     from hermes_cli import kanban_worker_pool as _kwp
     if kind != "capability":
         return None
@@ -81,6 +104,9 @@ def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], bo
     if want in (None, _kwp.PIN_STUDIO, _kwp.PIN_ANY):
         if placed_host is None and card_pin == _kwp.PIN_STUDIO:
             return None                      # already ran on the Studio: a real capability block
+        if (placed_host is not None and card_pin is None and workspace_kind == "scratch"
+                and _missing_repo_path_only(reason, body)):
+            return CLONE_CURE, None          # t_dde97120: requeue unpinned; the next run clones
         return "reroute", _kwp.PIN_STUDIO
     if card_pin == _kwp.PIN_STUDIO:
         return "unroutable", f"operator pin host:studio conflicts with the reason's host:{want}; not overridden"
@@ -99,7 +125,7 @@ def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], bo
 
 def _latest_blocks(conn) -> list:
     return conn.execute(
-        "SELECT t.id, t.body, t.status, t.assignee, b.payload AS blk, b.run_id, b.created_at AS blocked_at, "
+        "SELECT t.id, t.body, t.status, t.assignee, t.workspace_kind, b.payload AS blk, b.run_id, b.created_at AS blocked_at, "
         "(SELECT p.payload FROM task_events p WHERE p.run_id = b.run_id AND p.kind = ? "
         " ORDER BY p.id DESC LIMIT 1) AS placed, "
         "EXISTS(SELECT 1 FROM task_events r WHERE r.task_id = t.id AND r.kind = ?) AS rerouted, "
@@ -130,11 +156,27 @@ def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None) -> Tuple[
         placed_host = _json(row["placed"]).get("host") if row["placed"] else None
         verdict = classify(kind=blk.get("kind"), reason=str(blk.get("reason") or ""), placed_host=placed_host,
                            body=row["body"], pool=pool, rerouted_before=bool(row["rerouted"]),
-                           assignee=row["assignee"])
+                           assignee=row["assignee"], workspace_kind=row["workspace_kind"])
         if verdict is None:
             continue
         action, arg = verdict
         tid = row["id"]
+        if action == CLONE_CURE and row["status"] == "blocked" \
+                and now - int(row["blocked_at"] or now) <= REROUTE_MAX_AGE_SECONDS:
+            note = (f"placement re-route: run {row['run_id']} ran on {placed_host} and blocked kind=capability "
+                    f"on a home-absolute repo path that host does not have. That path names the repo, not a "
+                    f"host: the next run makes a task-private clone in its scratch workspace, so this card "
+                    f"is back in the queue with NO host pin (t_dde97120). Once only: a second capability "
+                    f"block pages #alerts instead. Reason was: {str(blk.get('reason') or '')[:300]}")
+            if not _kb.unblock_task(conn, tid, comment=(AUTHOR, note, None, None)):
+                continue
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, tid, REROUTED_EVENT, {"from_host": placed_host, "to_host": None,
+                                                              "cure": CLONE_CURE, "run_id": row["run_id"]})
+            rerouted.append((tid, CLONE_CURE))
+            continue
+        if action == CLONE_CURE:
+            action = "reroute"               # triage / too old: the same escalation as a pin re-route
         if action == "reroute" and row["status"] != "blocked":
             # The unblock-loop breaker already sent it to triage (a 2nd same-kind block): a human's card.
             action, arg = "unroutable", "in triage after a repeated capability block"

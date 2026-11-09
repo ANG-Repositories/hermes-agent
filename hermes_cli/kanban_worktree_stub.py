@@ -39,7 +39,7 @@ def _gitfile_target(stub: Path) -> tuple[str, Path | None]:
         return f"{dot_git} is a directory, not a gitfile", None
     if not dot_git.exists():
         return f"{stub} has no .git", None
-    text = dot_git.read_text(errors="replace").strip()
+    text = dot_git.read_text(encoding="utf-8-sig", errors="replace").strip()
     if not text.startswith("gitdir:"):
         return f"{dot_git} is not a gitfile ({text[:80]!r})", None
     admin = Path(_resolve(stub, text[len("gitdir:"):].strip()))
@@ -52,8 +52,8 @@ def _registered_admin_dirs(repo_root: Path, stub: Path) -> list[Path]:
     out = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "--path-format=absolute",
          "--git-common-dir"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=30,
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=30,
+        text=True, encoding="utf-8", errors="replace",
     )
     if out.returncode != 0:
         raise OSError(f"cannot resolve the common git dir of {repo_root}")
@@ -62,7 +62,7 @@ def _registered_admin_dirs(repo_root: Path, stub: Path) -> list[Path]:
     found = []
     for admin in sorted(admin_root.glob("*")) if admin_root.is_dir() else []:
         try:
-            pointed = (admin / "gitdir").read_text().strip()
+            pointed = (admin / "gitdir").read_text(encoding="utf-8-sig").strip()
         except FileNotFoundError:
             continue
         if _resolve(admin, pointed) == want:  # `--relative-paths` entries too

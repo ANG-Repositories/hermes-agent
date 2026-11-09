@@ -6,12 +6,16 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 """
 from __future__ import annotations
 import contextlib
+import functools
 import hashlib
+import json
+import os
 import random
 import re
 import secrets
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -40,6 +44,15 @@ _CORRUPT_BACKUP_RETENTION = 10
 # then proceed without the lock (in-process _INIT_LOCK + idempotent init backstop).
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
+
+# Cross-process healthy verdict: ``_INITIALIZED_PATHS`` is per-process, so every
+# fresh CLI/worker process re-ran a full integrity_check (~2-3 s on a 740 MB
+# board) under the init lock and queued the rest behind it (t_5e8801d8). A clean
+# check leaves ``<db>.integrity-ok`` bound to the file (see _db_fingerprint);
+# it is trusted for the TTL only. Env override (seconds, 0 disables), env-only like
+# the busy timeout so connect() never loads config.yaml.
+_INTEGRITY_STAMP_TTL_ENV = "HERMES_KANBAN_INTEGRITY_STAMP_TTL_SECONDS"
+_INTEGRITY_STAMP_TTL_SECONDS = 900
 
 
 def _resolve_busy_timeout_ms() -> int:
@@ -526,6 +539,93 @@ def _probe_for_corruption(resolved: Path) -> tuple[Optional[list[str]], Optional
     return messages, f"integrity_check returned {messages[0] if messages else '<no row>'!r}"
 
 
+def _integrity_stamp_path(resolved: Path) -> Path:
+    return resolved.with_name(resolved.name + ".integrity-ok")
+
+
+@functools.lru_cache(maxsize=1)
+def _boot_id() -> str:
+    """Per-boot id (Linux ``boot_id``, macOS ``kern.bootsessionuuid``); ``""``
+    when unknown. Not a boot time: a clock step moves that."""
+    with contextlib.suppress(OSError):
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8-sig").strip()
+    if sys.platform == "darwin":
+        with contextlib.suppress(OSError, AttributeError):
+            import ctypes
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            buf, size = ctypes.create_string_buffer(64), ctypes.c_size_t(64)
+            if libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0:
+                return buf.value.decode("ascii", "ignore").strip()
+    return ""
+
+
+def _db_fingerprint(resolved: Path) -> Optional[dict]:
+    """What a stamp is bound to. ``stat`` only: opening the DB file outside
+    SQLite would drop this process's POSIX locks on it.
+
+    The inode alone trusts a same-inode rewrite (Prism ed5edb9798ea), and the
+    mtime cannot be used: checkpoints move it every few seconds on a live
+    board. So: ``boot`` invalidates across a power loss / panic (the torn-page
+    case), ``birth`` (where the OS has it) across delete-and-recreate inode
+    reuse, and ``size`` is a floor checked by the reader: SQLite only shrinks
+    the file on VACUUM, while a copy of an older backup over the same inode
+    usually does."""
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return None
+    return {
+        "dev": st.st_dev,
+        "ino": st.st_ino,
+        "birth": getattr(st, "st_birthtime", None),
+        "boot": _boot_id(),
+        "size": st.st_size,
+    }
+
+
+def _integrity_stamp_is_fresh(resolved: Path, fingerprint: Optional[dict]) -> bool:
+    """True iff the stamp names this exact file in this boot, the file has not
+    shrunk below the checked size, and the stamp is younger than the TTL.
+    Missing/unreadable/malformed/foreign/expired/future stamps are False."""
+    ttl = _kb._env_int(_INTEGRITY_STAMP_TTL_ENV, _INTEGRITY_STAMP_TTL_SECONDS, minimum=0)
+    if ttl <= 0 or fingerprint is None:
+        return False
+    try:
+        data = json.loads(_integrity_stamp_path(resolved).read_text(encoding="utf-8-sig"))
+        same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth", "boot"))
+        not_shrunk = fingerprint["size"] >= int(data["size"])
+        age = time.time() - float(data["checked_at"])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+    return same_file and not_shrunk and 0 <= age < ttl
+
+
+def _write_integrity_stamp(resolved: Path, fingerprint: Optional[dict], checked_at: float) -> None:
+    """Record a clean verdict for ``fingerprint`` (taken before the check);
+    skipped if the file was swapped during the check. Best effort: a failed
+    write only costs the next process a full check."""
+    if fingerprint is None:
+        return
+    after = _db_fingerprint(resolved)
+    if after is None or any(after[key] != fingerprint[key] for key in ("dev", "ino", "birth")):
+        return
+    stamp = _integrity_stamp_path(resolved)
+    tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps({**fingerprint, "checked_at": checked_at}), encoding="utf-8")
+        os.replace(tmp, stamp)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _drop_integrity_stamp(resolved: Path) -> None:
+    with contextlib.suppress(OSError):
+        _integrity_stamp_path(resolved).unlink()
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
@@ -536,8 +636,10 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     the file + sidecars and raise :class:`KanbanDbCorruptError` so callers
     never recreate the schema on top of a damaged DB. ``OperationalError``
     (lock/busy) is NOT corruption and propagates raw (no spurious backup).
-    No-op for missing / zero-byte files and paths already proven healthy this
-    process. All writes are confined to the resolved path's parent.
+    No-op for missing / zero-byte files, paths already proven healthy this
+    process, and a fresh ``<db>.integrity-ok`` stamp for this exact file
+    (another process's clean verdict within the TTL). All writes are confined
+    to the resolved path's parent.
     """
     try:
         resolved = path.resolve()
@@ -545,9 +647,15 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if _missing_or_empty(resolved) or str(resolved) in _INITIALIZED_PATHS:
         return
+    fingerprint = _db_fingerprint(resolved)
+    if _integrity_stamp_is_fresh(resolved, fingerprint):
+        return
+    checked_at = time.time()
     messages, reason = _probe_for_corruption(resolved)
     if reason is None:
+        _write_integrity_stamp(resolved, fingerprint, checked_at)
         return
+    _drop_integrity_stamp(resolved)
     # Quarantine FIRST — both the repair and fail-closed paths preserve the
     # pre-touch bytes before anything mutates the file.
     backup = _backup_corrupt_db(resolved)
@@ -637,6 +745,7 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
         if reason is None:
             return RepairResult(status="ok", db_path=resolved, messages=messages)
 
+        _drop_integrity_stamp(resolved)
         # Quarantine FIRST — identical policy to the connect-time guard.
         backup = _backup_corrupt_db(resolved)
         index_names = _repairable_index_names(messages)
@@ -835,6 +944,10 @@ def connect(
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _kb._ensure_status_audit(conn)
+                from hermes_cli.kanban_failure_ownership import migrate
+                migrate(conn)
+                from hermes_cli.kanban_lifecycle_guards import install
+                install(conn)
                 _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 
@@ -946,6 +1059,7 @@ _RENAMED_TASK_COLUMNS = (
 # NULL / 0 defaults below reproduce the behaviour existing rows had before the
 # column existed.
 _LATER_TASK_COLUMNS = (
+    ("asap", "asap INTEGER NOT NULL DEFAULT 0"),
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),
@@ -976,6 +1090,10 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Failure signature an automated minter passes (t_mint-dedup, Ace 2026-11-05): the idempotency key minus its
+    # per-occurrence sha/epoch. The signature resolver in create_task reuses the open/recent card for it and trips
+    # the flap breaker after N no-code closes. NULL = not an automated mint (humans, legacy rows): resolver inert.
+    ("signature", "signature TEXT"),
 )
 _NOTIFY_SUB_COLUMNS = (
     ("last_ping_event_id", "last_ping_event_id INTEGER NOT NULL DEFAULT 0"),
@@ -1051,6 +1169,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # init on legacy boards before the ALTER TABLE pass runs. ``IF NOT EXISTS``
     # keeps re-running here cheap and correct on fresh DBs.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_signature_created ON tasks(signature, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")

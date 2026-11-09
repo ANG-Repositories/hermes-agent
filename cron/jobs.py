@@ -4161,22 +4161,23 @@ def _apply_a_lane_default_fallback(job: Dict[str, Any]) -> None:
     ``_require_known_job_route`` does."""
     provider = str(job.get("provider") or "").strip().lower()
     model = job.get("model")
-    if (job.get("no_agent") or not model or not _A_LANE_RE.fullmatch(provider)
+    from cron.lanes import job_lane
+
+    if (job_lane(job) == "script" or not model or not _A_LANE_RE.fullmatch(provider)
             or job.get("fallback") or "allow_cross_provider_fallback" in job):
         return
     from hermes_cli.model_registry import resolve
 
     chain = []
-    # ``rung``, not ``lane``: a provider rung, not a cron script/agent lane (cron/lanes.py, I1 lint).
-    for rung in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
+    for lane in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
         try:
-            ok = resolve(rung, model, resolve_aliases=False).ok
+            ok = resolve(lane, model, resolve_aliases=False).ok
         except Exception:
             ok = True
         if ok:
-            chain.append({"provider": rung, "model": model})
+            chain.append({"provider": lane, "model": model})
         else:
-            logger.warning("cron create: A-lane default fallback skips %s (does not serve %s)", rung, model)
+            logger.warning("cron create: A-lane default fallback skips %s (does not serve %s)", lane, model)
     if chain:
         job["fallback"] = chain
         job["allow_cross_provider_fallback"] = True

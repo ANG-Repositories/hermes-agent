@@ -123,7 +123,8 @@ def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     assert [h.name for h in hosts] == ["ace-ai", "ace-media"] and warnings == []
     cfg = kwp.read_pool(tmp_path)
     assert cfg.disabled == ("ci-box",) and "ci-box" in cfg.hosts
-    assert all(h.ssh_user == "kanbanw" and h.slots == 4 for h in hosts)
+    # t_b20850d2: a legacy kanban-worker count is membership only, never capacity
+    assert all(h.ssh_user == "kanbanw" and h.slots is None for h in hosts)
 
 
 def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
@@ -147,8 +148,8 @@ def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_ro
         "ace-media": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"},
     }}
     _write_pool(tmp_path, roles=roles)
-    assert kwp.parse_roles(roles) == {"ace-ai": ({"kanban-worker": 4}, "draining"),
-                                      "ace-media": ({"kanban-worker": 4}, "active")}
+    assert kwp.parse_roles(roles) == {"ace-ai": ({"kanban-worker": None}, "draining"),
+                                      "ace-media": ({"kanban-worker": None}, "active")}
     hosts, _ = kwp.load_pool(tmp_path, kanban_cfg={})
     assert {h.name: h.state for h in hosts}.get("ace-media") == "active"
     roles["hosts"]["ace-media"]["note"] = "x"
@@ -165,8 +166,10 @@ def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path)
     assert kwp.parse_roles(doc({"ci-runner": {}})) == {"a": ({"ci-runner": None}, "active")}
     assert kwp.parse_roles(doc({"ci-runner": {"slots": 3}})) == {"a": ({"ci-runner": 3}, "active")}
     assert kwp.parse_roles(doc({"kanban-worker": {}})) == {"a": ({"kanban-worker": None}, "active")}
+    # review-worker is membership only since hermes-home#9338 (t_e85e77b7).
+    assert kwp.parse_roles(doc({"review-worker": {}})) == {"a": ({"review-worker": None}, "active")}
     with pytest.raises(kwp.PoolError, match=r'must be \{"slots": N\}'):
-        kwp.parse_roles(doc({"review-worker": {}}))
+        kwp.parse_roles(doc({"other-role": {}}))
     with pytest.raises(kwp.PoolError, match="ci-runner must be"):
         kwp.parse_roles(doc({"ci-runner": {"slots": 3, "x": 1}}))
     with pytest.raises(kwp.PoolError, match="slots must be 1..64"):
@@ -179,7 +182,7 @@ def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path)
     cfg = kwp.read_pool(tmp_path, kanban_cfg={})
     assert cfg.refused is None
     assert sorted(h.name for h in cfg.pool_hosts) == ["ace-ai", "ace-media"]
-    assert {h.slots for h in cfg.pool_hosts} == {4}
+    assert {h.slots for h in cfg.pool_hosts} == {None}       # t_b20850d2: the legacy count is not read
 
 
 def _studio_registered(fleet: Path, policy_hosts=None):
@@ -213,7 +216,7 @@ def test_targets_false_host_is_dropped_and_never_gets_a_slot(tmp_path, policy_ho
     assert any("mac-studio" in w and "targets:false" in w for w in cfg.warnings)
     p = kwp.plan(list(cfg.pool_hosts), {}, probe=lambda h: (0.0, 16), config=cfg)
     taken = [p.take("alpha") for _ in range(8)]
-    assert [h.name for h in taken] == ["ace-ai"] * 4 + ["ace-media"] * 4
+    assert {h.name for h in taken} <= {"ace-ai", "ace-media"}     # no count: the dropped host never takes one
     assert "mac-studio" not in p.slots
     assert p.take("alpha", pin="mac-studio") is None and p.refusal == "pin_host_dropped"
 
@@ -281,10 +284,77 @@ def test_probe_host_one_ssh_call_parses_or_fails_closed():
     assert kwp.probe_host(_host(), runner=runner) == (3.1, 16)
     argv, timeout = calls[0]
     assert len(calls) == 1 and timeout == 8
-    assert "ConnectTimeout=4" in argv and argv[-1] == "cat /proc/loadavg; getconf _NPROCESSORS_ONLN"
+    assert "ConnectTimeout=4" in argv and "@@hermes-probe-v1" in argv[-1]
     assert argv[-2] == "kanbanw@ace-ai"
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(255, "")) is None
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(0, "garbage")) is None
+
+
+def test_probe_stale_mux_retries_direct_not_unreachable():
+    """t_64342f07: the muxed probe failed on a stale ControlMaster / cold
+    handshake while the host answered ssh; one direct retry must read it."""
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append((argv, kw["timeout"]))
+        if "ControlPath=none" not in argv:
+            p = _Proc(255, "")
+            p.stderr = "mux_client_request_session: read from master failed: Broken pipe"
+            return p
+        return _Proc(0, "3.10 2.00 1.00 1/200 99\n16\n")
+
+    assert kwp.probe_host(_host(), runner=runner) == (3.1, 16)
+    assert len(calls) == 2
+    direct, timeout = calls[1]
+    assert "ControlMaster=no" in direct and "ConnectTimeout=10" in direct
+    assert timeout == kwp.DIRECT_PROBE_TIMEOUT_SECONDS
+
+
+def test_probe_failure_keeps_last_sample_then_unreachable_never_sticky():
+    mem = kwp.ProbeMemory()
+    ok = lambda a, **k: _Proc(0, "3.10 2.00 1.00 1/200 99\n16\n")
+
+    def down(argv, **kw):
+        raise kwp.subprocess.TimeoutExpired(argv, kw["timeout"])
+
+    h = _host()
+    assert kwp.probe_host(h, runner=ok, memory=mem, now=1000.0) == (3.1, 16)
+    assert kwp.probe_note(h, mem) == ""
+    for i in range(kwp.PROBE_GRACE_FAILS):
+        assert kwp.probe_host(h, runner=down, memory=mem, now=1060.0 + i) == (3.1, 16)
+    note = kwp.probe_note(h, mem)
+    assert "reusing last sample" in note and "timeout after" in note and "ssh probe kanbanw@ace-ai" in note
+    assert kwp.probe_host(h, runner=down, memory=mem, now=1200.0) is None
+    note = kwp.probe_note(h, mem)
+    assert f"failed {kwp.PROBE_GRACE_FAILS + 1}x" in note and "last tried" in note and "last ok" in note
+    assert "reusing" not in note
+    # Not sticky: the next good probe clears it.
+    assert kwp.probe_host(h, runner=ok, memory=mem, now=1260.0) == (3.1, 16)
+    assert kwp.probe_note(h, mem) == ""
+
+
+def test_probe_grace_expires_by_age():
+    mem = kwp.ProbeMemory()
+    h = _host()
+    kwp.probe_host(h, runner=lambda a, **k: _Proc(0, "1 1 1 1/1 1\n8\n"), memory=mem, now=0.0)
+    assert kwp.probe_host(h, runner=lambda a, **k: _Proc(255, ""), memory=mem,
+                          now=kwp.PROBE_GRACE_SECONDS + 1.0) is None
+
+
+def test_plan_unreachable_reason_names_probe_error(monkeypatch, tmp_path):
+    mem = kwp.ProbeMemory()
+    monkeypatch.setattr(kwp, "_PROBE_MEMORY", mem)
+    h = _host(slots=4)
+
+    def probe(host):
+        return kwp.probe_host(host, runner=lambda a, **k: _Proc(255, ""), memory=mem)
+
+    from hermes_cli import placement_policy as pp
+    signal = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=tmp_path, clock=lambda: 1.0)
+    p = kwp.plan([h], {}, probe=probe, signal=signal)
+    why = p.detail["ace-ai"]["pressure"]
+    assert why.startswith("host unreachable (ssh probe kanbanw@ace-ai failed 1x (mux: ssh rc=255; direct: ssh rc=255)")
+    assert "pool_unavailable (ace-ai: host unreachable (ssh probe" in p.full_reason()
 
 
 def _cgroup_ssh(argv, **kw):
@@ -293,7 +363,13 @@ def _cgroup_ssh(argv, **kw):
     each core-count command the way the real host did as kanbanw."""
     cmd = argv[-1]
     load = "12.00 9.00 7.00 1/900 99"  # ordinary ace-ai load1, under 0.8 x 24
-    if "; getconf _NPROCESSORS_ONLN" in cmd:
+    if "SC_NPROCESSORS_ONLN" in cmd:
+        import json
+        return _Proc(0, "@@hermes-probe-v1\n" + json.dumps({
+            "schema": 1, "load1": 12.0, "load5": 9.0, "ncpu": 24,
+            "remote_now": 1791200100, "pressure_text": "{}",
+        }) + "\n")
+    if "os.cpu_count()" in cmd:
         ncpu = "24"
     elif "; nproc" in cmd:
         ncpu = "8"
@@ -581,10 +657,10 @@ def test_human_review_lane_rows_are_dropped_before_routing(kanban_home, monkeypa
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         kinds = [r[0] for r in conn.execute(
             "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (review,))]
-    assert review in res.skipped_nonspawnable
+    assert review not in res.skipped_nonspawnable
     assert review not in res.placement_waits
     assert all(e["task_id"] != review for e in res.routes)
-    assert kinds.count("skipped_nonspawnable") == 1
+    assert kinds.count("needs_operator") == 1
     assert (work, "ace-ai") in spawned
 
 
@@ -992,6 +1068,7 @@ def test_daemon_places_through_the_gateway_plan(kanban_home, monkeypatch):
     monkeypatch.setattr(_config, "load_config", lambda: {"kanban": V01})
     monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None: (1.0, 16))
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (146.0, 90.0))
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.99, object()))  # local saturated
     captured: dict = {}
     stop = threading.Event()
 
@@ -1004,7 +1081,7 @@ def test_daemon_places_through_the_gateway_plan(kanban_home, monkeypatch):
                    load_gate=klg.LoadGate({}, ncpu=32))
     plan = captured["spillover"]
     assert captured["spawn_limit"] == 0 and isinstance(plan, kwp.SpilloverPlan)
-    assert list(plan.hosts) == ["ace-ai", "ace-media"] and plan.budget == 8
+    assert list(plan.hosts) == ["ace-ai", "ace-media"] and plan.budget == 2 * kwp.UNCOUNTED_TICK_FREE
 
 
 def test_cli_dispatch_places_a_pin_through_the_gateway_plan(kanban_home, monkeypatch):
@@ -2113,7 +2190,7 @@ def test_admitting_band_plans_the_pool_for_a_bare_ready_card(kanban_home):
         _make(conn, 1, body="build the thing")
     gate, b = _admitting_builder(kanban_home / "fleet", V01)
     plan = b.plan_pool([{"slug": "default"}], {})
-    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False and plan.budget == 8
+    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False and plan.budget == 2 * kwp.UNCOUNTED_TICK_FREE
     # Remote-first (#2148, t_82b4db80): overflow off plans the same card too.
     gate, b = _admitting_builder(kanban_home / "fleet", {**V01, "worker_pool": {"overflow": False}})
     plan = b.plan_pool([{"slug": "default"}], {})

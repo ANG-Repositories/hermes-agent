@@ -1962,6 +1962,12 @@ def _build_child_agent(
     # Boomerang v2 (spec §5.1, D-2/D-16): "fork"|"branch"|"summary"|None. None keeps
     # inherit_context's v1 meaning (true -> "summary"), so existing callers are unchanged.
     inherit_mode: Optional[str] = None,
+    # The batch's live delegation id, when known at build time: only attributes the
+    # ``boomerang.fork_ineligible`` line to its batch (fork-fan RC-8).
+    delegation_id: Optional[str] = None,
+    inherit_parent_route: bool = False,
+    explicit_child_route: bool = False,
+    parent_route_snapshot: Any = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -2028,13 +2034,25 @@ def _build_child_agent(
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
         model=model or getattr(parent_agent, "model", None), toolsets=child_toolsets, session_ref=child_session_ref,
     )
-    rt = _resolve_child_runtime(
+    rt = {} if inherit_parent_route else _resolve_child_runtime(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
+    if inherit_parent_route:
+        from agent.route_snapshot import snapshot_parent
+        route_parent = parent_route_snapshot or snapshot_parent(parent_agent)
+        _call_args["parent_route_snapshot"] = route_parent
+        rt = _resolve_child_runtime(
+            route_parent, delegation_cfg, route_parent.api_key, model=None, override_provider=None,
+            override_base_url=None, override_api_key=None, override_api_mode=None,
+            override_acp_command=None, override_acp_args=None, routing_cfg={},
+        )
+        rt["fallback_model"] = copy.deepcopy(getattr(route_parent, "_fallback_chain", []))
+        override_request_overrides = copy.deepcopy(getattr(route_parent, "request_overrides", {}) or {})
+        override_provider = None
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -2047,16 +2065,18 @@ def _build_child_agent(
     mode = None if materialized_prefill_messages is not None else _fork.resolve_inherit_mode(inherit_context, inherit_mode)
     if mode == "fork":
         # A fork FORCES the parent's lane/model/thinking/overrides, ignoring delegation.model/provider.
-        _fork_rt = _fork.build_fork_runtime(_resolve_child_runtime(
+        _fork_rt = _fork.build_fork_runtime(rt if inherit_parent_route else _resolve_child_runtime(
             parent_agent, delegation_cfg, parent_api_key, model=None, override_provider=None,
             override_base_url=None, override_api_key=None, override_api_mode=None,
             override_acp_command=None, override_acp_args=None, routing_cfg=routing_cfg,
-        ), parent_agent)
+        ), route_parent if inherit_parent_route else parent_agent)
         _ok, _reason = _fork.fork_eligible(parent_agent, _fork_rt, delegation_cfg)
-        if _ok:
+        if _ok and not explicit_child_route:
             rt = _fork_rt
         else:
-            _fork.log_ineligible(_reason, parent_agent)
+            if explicit_child_route:
+                _reason = "explicit_child_route"
+            _fork.log_ineligible(_reason, parent_agent, delegation_id=delegation_id, task_index=task_index)
             mode = "summary"
     # ── Boomerang context inheritance (spec v0.8 D-4 / P0.3) ────────────
     # When inherit_context is set, fold the PARENT's conversation history into
@@ -2103,7 +2123,7 @@ def _build_child_agent(
         "request_overrides": request_overrides,
     }
     if mode == "fork":
-        _prefix_kwargs = _fork.fork_constructor_overrides(parent_agent)
+        _prefix_kwargs = _fork.fork_constructor_overrides(route_parent if inherit_parent_route else parent_agent)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
         try:
@@ -2130,14 +2150,39 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._boomerang_route_source = ("live-parent" if inherit_parent_route else
+                                     "explicit-child" if explicit_child_route else "delegation-default")
+    child._boomerang_route_provenance = (
+        "session-rehydrated" if inherit_parent_route
+        and getattr(parent_agent, "_boomerang_route_source", None) == "session-rehydrated"
+        else child._boomerang_route_source
+    )
+    child._boomerang_parent_route = {
+            "source": "parent", "model": rt["model"],
+            "provider": rt.get("requested_provider") or rt["provider"], "api_mode": rt["api_mode"],
+            "base_url": rt.get("base_url"),
+            "fallback_chain": copy.deepcopy(rt["fallback_model"]),
+            "request_overrides": copy.deepcopy(request_overrides),
+            "routing_filters": {key: copy.deepcopy(rt.get(key)) for key in (
+                "providers_allowed", "providers_ignored", "providers_order", "provider_sort",
+                "provider_require_parameters", "provider_data_collection")},
+        }
     child._context_inherited = context_inherited
+    logger.info(
+        "boomerang.route delegation=%s owner=%s child=%s requested=%s effective=%s source=%s provider=%s model=%s fallbacks=%d disabled=%s",
+        delegation_id or "-", parent_sid or "-", getattr(child, "session_id", "-"),
+        inherit_mode or ("summary" if inherit_context else "none"), mode or "none",
+        child._boomerang_route_provenance, rt.get("requested_provider") or rt.get("provider"),
+        rt.get("model"), len(rt.get("fallback_model") or []), not bool(rt.get("fallback_model")),
+    )
     if mode == "fork":
         # _apply_child_cache_ttl and _regate_inherited_child_tier are SKIPPED: both rewrite request bytes.
         _fork.apply_fork_overlay(child, parent_agent)
         _parent_fp = _fork.request_fingerprint(parent_agent)
         _diff = [k for k, v in _fork.request_fingerprint(child).items() if v != _parent_fp[k]]
         if _diff:
-            _fork.log_ineligible("same_request_params:" + ",".join(_diff), parent_agent)
+            _fork.log_ineligible("same_request_params:" + ",".join(_diff), parent_agent,
+                                delegation_id=delegation_id, task_index=task_index)
             with _quiet("fork downgrade: child close failed", exc_info=True):
                 _teardown(child, "fork downgrade before first run")
             if child_session_db is not None and not getattr(child, "_owns_session_db", False):
@@ -2146,6 +2191,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
         _arm_first_request_pin(child, parent_agent, "fork")
+        child._fork_rebuild_args = {**_call_args, "inherit_mode": "summary", "inherit_context": True}
         child._context_inherited = "fork"
         child._boomerang_fork_log_pending = True   # one `boomerang.fork served_by=…` line
     else:
@@ -2745,6 +2791,12 @@ def _run_single_child(
                 _child_future, child, child_timeout, hung_seconds
             )
         except Exception as _timeout_exc:
+            from tools.delegate_tool_fork import ForkPinRefused, log_ineligible
+            if isinstance(_timeout_exc, ForkPinRefused):
+                log_ineligible("pin_refused", parent_agent, task_index=task_index,
+                               delegation_id=getattr(child, "_delegation_id", None))
+                # Fail through normal teardown: replacing this child here would leave
+                # the dispatcher's stop closures and child list owning the old agent.
             # Timed out ≠ dead. A child still working (it made API calls or
             # has live descendants) keeps running; report TIMED_OUT_RUNNING
             # with live handles so the caller waits/steers instead of
@@ -3535,6 +3587,52 @@ def _regate_inherited_child_tier(child, parent_agent, explicit_tier_overrides) -
 
 
 # ── fork: durable background spec + restart recovery (t_1191e078 #1104; gateway/run.py caller) ──
+def _durable_intent_expected(cfg: Dict[str, Any]) -> bool:
+    """True when a background unit dispatched now would carry restart-durable intent (a routable
+    gateway session with resume_on_restart on), so its admission also needs a durable registry slot.
+
+    Fails CLOSED: when the session context cannot be read, durability is assumed required, so the
+    spec build re-reads it, fails, and the unit is refused rather than started process-local
+    (Prism 3f3a2c174875: a lookup error must not downgrade a restart-safe unit to a losable one)."""
+    if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
+        return False
+    try:
+        from gateway.session_context import get_session_env
+
+        source_name = get_session_env("HERMES_SESSION_SOURCE", "")
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        logger.warning("delegate_task: session context unreadable; treating background unit as durable", exc_info=True)
+        return True
+    return source_name != "tui" and bool(platform)
+
+
+def _background_not_started(dispatch: Dict[str, Any], goals: List[str], children=()) -> str:
+    """The tool result for a background delegation that was REFUSED: nothing ran, nothing will.
+
+    Built children (a refusal after construction) are closed unrun. The parent's turn returns now;
+    it never joins the work synchronously in place of the refused background unit."""
+    for _c in children:
+        with _quiet("background refusal: child close failed", exc_info=True):
+            _teardown(_c, "background_rejected")
+    reason = dispatch.get("reason") or "rejected"
+    logger.warning("delegate_task: background admission refused (reason=%s, %d task(s)); nothing started",
+                   reason, len(goals))
+    return json.dumps({
+        "status": "rejected",
+        "mode": "background",
+        "reason": reason,
+        "started": False,
+        "count": len(goals),
+        "goals": goals,
+        "error": dispatch.get("error") or "background delegation was not admitted",
+        "note": (
+            "No subagent was started and none will run for this call. Retry later, pass "
+            "background=false to run it in this turn, or do the work yourself."
+        ),
+    }, ensure_ascii=False)
+
+
 def _build_durable_background_spec(
     *,
     task_list: List[Dict[str, Any]],
@@ -3559,22 +3657,23 @@ def _build_durable_background_spec(
     """Build the non-secret restart intent for a routable gateway session. Call-level inputs that
     delegate_task applies outside ``task_list`` (top-level ``images`` / ``output_schema`` / ``skills``)
     are written into each persisted task: reconstruction rebuilds the children from the tasks alone."""
-    if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
+    if not _durable_intent_expected(cfg):
         return None, None
     try:
         from gateway.session_context import get_session_env
 
-        source_name = get_session_env("HERMES_SESSION_SOURCE", "")
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        if source_name == "tui" or not platform:
-            return None, None
         profile = get_session_env("HERMES_SESSION_PROFILE", "") or "default"
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_name = get_session_env("HERMES_SESSION_USER_NAME", "") or None
-    except Exception:
-        return None, None
+    except Exception as exc:
+        # Durable intent was expected (above), so a context we cannot read is a refusal, never a
+        # silent downgrade to a process-local unit (Prism 3f3a2c174875).
+        raise RuntimeError("session context unreadable for durable intent") from exc
+    if not platform:
+        raise RuntimeError("session context has no platform for durable intent")
 
     from gateway.status import get_current_boot_id
     from tools.async_delegation_store import persistable_fallback_chain, persistable_fallback_policy
@@ -3604,6 +3703,18 @@ def _build_durable_background_spec(
             children and index < len(children)) else None
         if children and index < len(children) and (_mode is not None or _built_prefill is not None):
             persisted["materialized_prefill_messages"] = copy.deepcopy(_built_prefill)
+        if children and index < len(children):
+            built = children[index]
+            persisted["route_source"] = getattr(built, "_boomerang_route_source", "delegation-default")
+            if isinstance(getattr(built, "_boomerang_parent_route", None), dict):
+                from tools.delegate_tool_routing import persist_route
+                persisted["parent_route"] = persist_route(built)
+                task_routing_cfg = cfg if routing_cfg is None else routing_cfg
+                if (persisted["route_source"] != "live-parent" and task_routing_cfg.get("base_url")):
+                    persisted["credential_ref"] = {"source": "delegation_config"}
+                else:
+                    persisted["credential_ref"] = {"source": "provider",
+                        "provider": persisted["parent_route"]["provider"]}
         if task_images and index < len(task_images) and task_images[index]:
             persisted["images"] = list(task_images[index])
         if task_schemas and index < len(task_schemas) and task_schemas[index] is not None:
@@ -3696,6 +3807,14 @@ def _build_durable_background_spec(
         # Symbolic lookup data only. Credential bytes are re-resolved on resume.
         "credential_ref": credential_ref,
     }
+    if children and getattr(children[0], "_boomerang_route_source", None) == "live-parent":
+        from tools.delegate_tool_routing import persist_route
+        selected_route = persist_route(children[0])
+        execution.update(model=selected_route["model"], provider=selected_route["provider"],
+                         api_mode=selected_route["api_mode"],
+                         fallback_chain=copy.deepcopy(selected_route["fallback_chain"]))
+        execution["credential_ref"] = {"source": "provider", "provider": selected_route["provider"],
+                                       "inherited_route": True, "model_pinned": False}
     return {
         "profile": profile,
         "source": {
@@ -3821,6 +3940,7 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                delegation_id=live_deleg_id,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -3991,6 +4111,7 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    current_delegation_cfg = cfg
     if _recovery_spec:
         # Recovery reuses this same live adapter but pins the effective,
         # non-secret settings captured before the original executor submit.
@@ -4071,7 +4192,14 @@ def delegate_task(
     # (upstream c47bf78d68): ``routing_cfg`` rides into _build_child_agent.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        from tools.delegate_tool_fork import resolve_inherit_mode
+        _routing_tasks = tasks if isinstance(tasks, list) and tasks else [
+            {"inherit_context": inherit_context, "inherit_mode": inherit_mode}]
+        _only_parent_routes = not (model or provider or credentials_cfg is not None) and all(
+            (resolve_inherit_mode(t.get("inherit_context", inherit_context), t.get("inherit_mode", inherit_mode))
+             and (not _recovery_spec or t.get("route_source") not in ("explicit-child", "delegation-default")))
+            for t in _routing_tasks if isinstance(t, dict))
+        creds = _resolve_delegation_credentials({} if _only_parent_routes else routing_cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
     if _recovery_spec and not model and _inherited_route and _model_pinned:
@@ -4175,6 +4303,77 @@ def delegate_task(
     if _budget_err:
         return tool_error(_budget_err)
 
+    # Capture the ORIGINATING session's wake target BEFORE any child agent is
+    # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
+    # set_current_session_id(child.session_id), which clobbers the
+    # HERMES_SESSION_ID ContextVar and os.environ with the subagent's internal
+    # id before the background-dispatch code below would read it. The
+    # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
+    # api_server) is untouched by child construction, so read it here and
+    # thread it through the dispatch.
+    from tools.async_delegation import _current_origin_session_id
+
+    _origin_wake_sid = _current_origin_session_id()
+    try:
+        from gateway.session_context import get_session_env
+
+        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+    except Exception:
+        _origin_ui_session_id = ""
+    _origin_owner_transport, _origin_owner_session_record = (
+        _capture_gateway_steer_authority(_origin_ui_session_id)
+    )
+
+    if background:
+        # Finite sessions cannot route a detached subagent result back to the
+        # agent after their turn/process ends. This includes stateless HTTP
+        # requests (#10760) and one-shot Kanban workers (#63169). Fall back to
+        # SYNCHRONOUS execution so the result returns in this same turn instead
+        # of handing out a handle with no durable consumer (requirement of the
+        # caller, not a fallback: an admission refusal below never runs inline).
+        # Finite chat (-Q/--oneshot/non-TTY stdio, HERMES_SINGLE_QUERY_SESSION=1) owns no later turn to
+        # consume a detached result; its lifecycle marker forces the inline join even when a
+        # wake-capable session id is bound (upstream 49ef015ca3).
+        _finite = False
+        try:
+            from gateway.session_context import async_delivery_supported, get_session_env
+            _finite = get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1"
+            _async_ok = (not _finite) and async_delivery_supported()
+        except Exception:
+            _async_ok = True
+
+        _wake_sid = ""
+        if not _async_ok and not _finite:
+            # The adapter itself cannot push, but if a raw session id is
+            # bound (the API server always binds one — see
+            # ApiServerAdapter._bind_api_server_session), gateway.wake can
+            # still reach the session by self-POSTing /v1/chat/completions
+            # with that id in X-Hermes-Session-Id once the batch completes.
+            # Only fall back to forced-sync execution when there is truly no
+            # session id to wake. Uses the origin captured before child
+            # construction (see _origin_wake_sid above) — reading
+            # HERMES_SESSION_ID here would return the subagent's internal id.
+            _wake_sid = _origin_wake_sid
+            if _wake_sid:
+                logger.info(
+                    "delegate_task: async delivery unsupported on this "
+                    "session, but a session id is bound (%s) — dispatching "
+                    "in the background and waking the session via self-post "
+                    "when it completes instead of forcing synchronous "
+                    "execution.",
+                    _wake_sid,
+                )
+                _async_ok = True
+        if _async_ok:
+            # Admission BEFORE any child is built: a refusal costs zero child sessions and returns
+            # now. A background call never degrades into a synchronous join of the same work.
+            from tools.async_delegation import preflight_admission
+
+            _refusal = preflight_admission(
+                max_async_children=_get_max_async_children(), durable=_durable_intent_expected(cfg))
+            if _refusal is not None:
+                return _background_not_started(_refusal, [t["goal"] for t in task_list])
+
     overall_start = time.monotonic()
     results = []
 
@@ -4210,27 +4409,6 @@ def delegate_task(
         else None
     )
 
-    # Capture the ORIGINATING session's wake target BEFORE any child agent is
-    # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
-    # set_current_session_id(child.session_id), which clobbers the
-    # HERMES_SESSION_ID ContextVar and os.environ with the subagent's internal
-    # id before the background-dispatch code below would read it. The
-    # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
-    # api_server) is untouched by child construction, so read it here and
-    # thread it through the dispatch.
-    from tools.async_delegation import _current_origin_session_id
-
-    _origin_wake_sid = _current_origin_session_id()
-    try:
-        from gateway.session_context import get_session_env
-
-        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
-    except Exception:
-        _origin_ui_session_id = ""
-    _origin_owner_transport, _origin_owner_session_record = (
-        _capture_gateway_steer_authority(_origin_ui_session_id)
-    )
-
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
@@ -4250,6 +4428,24 @@ def delegate_task(
 
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
+            from tools.delegate_tool_fork import resolve_inherit_mode
+            _task_inherits_route = bool(resolve_inherit_mode(
+                t.get("inherit_context", inherit_context), t.get("inherit_mode", inherit_mode),
+            )) and not (model or provider or credentials_cfg is not None)
+            if _recovery_spec and t.get("route_source") in ("explicit-child", "delegation-default"):
+                _task_inherits_route = False
+            _route_parent = parent_agent
+            if _recovery_spec and _task_inherits_route and "parent_route" not in t:
+                if not isinstance(recovery_execution.get("fallback_chain"), list):
+                    raise ValueError("boomerang routing-unavailable: legacy record has unresolved parent fallback policy")
+            if _recovery_spec and t.get("parent_route") is not None:
+                from tools.delegate_tool_routing import recover_route_parent
+                task_credential_ref = t.get("credential_ref")
+                if task_credential_ref is None and t.get("route_source") != "live-parent":
+                    task_credential_ref = recovery_execution.get("credential_ref")
+                _route_parent = recover_route_parent(parent_agent, t["parent_route"],
+                    credential_ref=task_credential_ref, delegation_cfg=current_delegation_cfg)
+                _task_inherits_route = True
             child = _build_child_preserving_parent_tools(
                 task_index=i,
                 goal=t["goal"],
@@ -4260,7 +4456,7 @@ def delegate_task(
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
-                parent_agent=parent_agent,
+                parent_agent=_route_parent,
                 override_provider=creds["provider"],
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
@@ -4286,6 +4482,9 @@ def delegate_task(
                     else None
                 ),
                 skills=(t.get("skills") if "skills" in t else skills),
+                delegation_id=live_deleg_id,
+                inherit_parent_route=_task_inherits_route,
+                explicit_child_route=bool(model or provider or credentials_cfg is not None),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -4582,46 +4781,6 @@ def delegate_task(
         )
         from tools.approval import get_current_session_key
 
-        # Finite sessions cannot route a detached subagent result back to the
-        # agent after their turn/process ends. This includes stateless HTTP
-        # requests (#10760) and one-shot Kanban workers (#63169). Fall back to
-        # SYNCHRONOUS execution so the result returns in this same turn instead
-        # of handing out a handle with no durable consumer. Mirrors the
-        # pool-at-capacity inline fallback below.
-        # Finite chat (-Q/--oneshot/non-TTY stdio, HERMES_SINGLE_QUERY_SESSION=1) owns no later turn to
-        # consume a detached result; its lifecycle marker forces the inline join even when a
-        # wake-capable session id is bound (upstream 49ef015ca3).
-        _finite = False
-        try:
-            from gateway.session_context import async_delivery_supported, get_session_env
-            _finite = get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1"
-            _async_ok = (not _finite) and async_delivery_supported()
-        except Exception:
-            _async_ok = True
-
-        _wake_sid = ""
-        if not _async_ok and not _finite:
-            # The adapter itself cannot push, but if a raw session id is
-            # bound (the API server always binds one — see
-            # ApiServerAdapter._bind_api_server_session), gateway.wake can
-            # still reach the session by self-POSTing /v1/chat/completions
-            # with that id in X-Hermes-Session-Id once the batch completes.
-            # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
-            _wake_sid = _origin_wake_sid
-            if _wake_sid:
-                logger.info(
-                    "delegate_task: async delivery unsupported on this "
-                    "session, but a session id is bound (%s) — dispatching "
-                    "in the background and waking the session via self-post "
-                    "when it completes instead of forcing synchronous "
-                    "execution.",
-                    _wake_sid,
-                )
-                _async_ok = True
-
         if not _async_ok:
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
@@ -4765,18 +4924,11 @@ def delegate_task(
                 routing_cfg=routing_cfg,
             )
         except Exception as exc:
-            logger.error(
-                "delegate_task: durable restart intent unavailable (%s); "
-                "running synchronously rather than launching untracked work",
-                exc,
-            )
-            _sync_result = _execute_and_aggregate()
-            if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "Restart-safe background persistence was unavailable, so "
-                    "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
-                )
-            return json.dumps(_sync_result, ensure_ascii=False)
+            logger.error("delegate_task: durable restart intent unavailable (%s); refusing the background unit", exc)
+            return _background_not_started(
+                {"reason": "durable_intent_error",
+                 "error": f"restart-safe background persistence unavailable: {type(exc).__name__}"},
+                _goals, _child_agents)
         # Kanban runtime (docs/dev/delegate-background-on-kanban-runtime.md §5.1-5.2): an eligible durable
         # unit runs as one card on the internal ``delegations`` board, in its own process. The allowlist
         # fails closed: any condition not positively true keeps today's in-process unit (I6).
@@ -4855,19 +5007,6 @@ def delegate_task(
                               and getattr(live_writers[_ti], "path", None) is not None},
         )
 
-        if (
-            _durable_spec is not None
-            and dispatch.get("status") == "rejected"
-            and dispatch.get("reason") in {"registry_cap", "registry_error"}
-        ):
-            _sync_result = _execute_and_aggregate()
-            if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "Restart-safe background persistence was unavailable, so "
-                    "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
-                )
-            return json.dumps(_sync_result, ensure_ascii=False)
-
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
@@ -4902,12 +5041,12 @@ def delegate_task(
             if _kanban is not None and _runtime in (None, KANBAN_SPAWNED_RUNTIME):
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
-                    "steer/list are not available for it; /stop still cancels it.")
+                    "steer/list are not available for it; /stop does not cancel it (delegate_task action='stop' does).")
             elif _detached is not None:
                 payload["detached"] = True
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
-                    "steer/list are not available for it; /stop still cancels it."
+                    "steer/list are not available for it; /stop does not cancel it (delegate_task action='stop' does)."
                 )
             elif any(isinstance(s, str) and s for s in _sids):
                 payload["subagent_ids"] = _sids
@@ -4928,15 +5067,8 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
-        )
-        _cap_result = _execute_and_aggregate()
+        # Refused (pool at capacity, registry full/unreadable, schedule failure, retiring backend): the
+        # built children never ran. Close them and tell the model the truth; never join them inline.
         _fallback_event_id = dispatch.get("fallback_event_id")
         if _fallback_event_id:
             from tools.async_delegation import acknowledge_outbox_event
@@ -4944,18 +5076,10 @@ def delegate_task(
             acknowledge_outbox_event(
                 _fallback_event_id,
                 outcome="dropped",
-                reason="fallback_ran",
+                reason="not_started",
                 profile_home=dispatch.get("_registry_profile_home") or None,
             )
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        return _background_not_started(dispatch, _goals, _child_agents)
 
     # ----- Synchronous path -----
     # A recovered async unit (_recovery_spec) delivers only via its own
@@ -5013,8 +5137,9 @@ _DESCRIPTION_HEAD = (
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
     "- Tasks needing user interaction -> subagents cannot ask questions\n"
-    "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /stop, /new, "
-    "or process exit halts running subagents (whole tree); each returns an 'interrupted' completion with partial output.\n\n"
+    "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /new or "
+    "process exit halts running subagents (whole tree), /stop halts only this turn's synchronous ones; each returns "
+    "an 'interrupted' completion with partial output.\n\n"
     "RULES:\n"
     "- Children know nothing of this conversation: pass everything needed via 'context', including any required "
     "output language, tone, or style (e.g. \"respond in Chinese\").\n"

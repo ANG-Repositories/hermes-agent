@@ -26,7 +26,22 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_load_gate as klg
+from hermes_cli.fleet_placement import admission as ad
 from hermes_cli.kanban_load_gate import LoadGate
+
+
+@pytest.fixture(autouse=True)
+def _util_ctx(monkeypatch):
+    """Hermetic utilization inputs: memory free, no ceiling, no PSI, no fleet demand (t_b20850d2: the gate is
+    admit_class only, so a test that wants "the host has room" says so with cpu_busy, not with load1)."""
+    monkeypatch.setattr(klg, "utilization_context", lambda: {
+        "host": "mac-studio", "ceiling": None, "ceiling_reason": "",
+        "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), "limits": ad.Limits(mem_reserve_gb=0.0),
+        "mem_available_gb": 400.0, "mem_total_gb": 512.0})
+    monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
+                                                    "psi_io_some10": 0.0})
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
 
 
 @pytest.fixture
@@ -40,7 +55,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _gate(**cfg) -> LoadGate:
-    return LoadGate({"pause_above": 64, **cfg}, 32)
+    return LoadGate(dict(cfg), 32)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +74,7 @@ def test_proc_gate_pauses_at_fraction_even_with_low_load_and_idle_cpu():
 
 def test_proc_gate_admits_below_fraction():
     g = _gate()
-    allowance, reason = g.admit(7.5, load5=7.0, now=0, procs=1450, proc_limit=10666)
+    allowance, reason = g.admit(7.5, load5=7.0, now=0, cpu_busy=0.1, procs=1450, proc_limit=10666)
     assert reason is None and allowance and allowance > 0
     assert g.state == "admitting"
     assert g.host_recovered()
@@ -67,37 +82,37 @@ def test_proc_gate_admits_below_fraction():
 
 def test_proc_gate_hysteresis_holds_until_resume_fraction():
     g = _gate()
-    g.admit(7.0, now=0, procs=8600, proc_limit=10666)
+    g.admit(7.0, now=0, cpu_busy=0.1, procs=8600, proc_limit=10666)
     # 0.70 of the limit: under the pause bar but over the 0.65 resume bar.
-    allowance, _ = g.admit(7.0, now=60, procs=7466, proc_limit=10666)
+    allowance, _ = g.admit(7.0, now=60, cpu_busy=0.1, procs=7466, proc_limit=10666)
     assert allowance == 0 and g.state == "proc_paused"
-    allowance, reason = g.admit(7.0, now=120, procs=1448, proc_limit=10666)
+    allowance, reason = g.admit(7.0, now=120, cpu_busy=0.1, procs=1448, proc_limit=10666)
     assert reason is None and allowance > 0 and g.state == "admitting"
 
 
 @pytest.mark.parametrize("procs,limit", [(None, 10666), (9000, None), (9000, 0)])
 def test_proc_gate_fails_open_when_unmeasurable(procs, limit):
     g = _gate()
-    allowance, reason = g.admit(7.0, now=0, procs=procs, proc_limit=limit)
+    allowance, reason = g.admit(7.0, now=0, cpu_busy=0.1, procs=procs, proc_limit=limit)
     assert reason is None and allowance > 0
 
 
 def test_proc_gate_holds_a_pause_through_an_unreadable_tick():
     g = _gate()
-    g.admit(7.0, now=0, procs=9000, proc_limit=10666)
-    allowance, reason = g.admit(7.0, now=60, procs=None, proc_limit=None)
+    g.admit(7.0, now=0, cpu_busy=0.1, procs=9000, proc_limit=10666)
+    allowance, reason = g.admit(7.0, now=60, cpu_busy=0.1, procs=None, proc_limit=None)
     assert allowance == 0 and g.state == "proc_paused" and reason
 
 
 def test_proc_limit_config_override_wins():
     g = _gate(proc_limit=1000)
-    allowance, _ = g.admit(7.0, now=0, procs=900, proc_limit=10666)
+    allowance, _ = g.admit(7.0, now=0, cpu_busy=0.1, procs=900, proc_limit=10666)
     assert allowance == 0 and g.state == "proc_paused"
 
 
 def test_proc_pause_is_a_loud_line_and_in_snapshot(caplog):
     g = _gate()
-    g.admit(7.0, now=0, procs=9000, proc_limit=10666)
+    g.admit(7.0, now=0, cpu_busy=0.1, procs=9000, proc_limit=10666)
     with caplog.at_level(logging.INFO):
         g.log_tick(logging.getLogger("t"), now=0)
     rec = [r for r in caplog.records if "proc_paused" in r.getMessage()]
@@ -107,10 +122,10 @@ def test_proc_pause_is_a_loud_line_and_in_snapshot(caplog):
     assert snap["procs"] == 9000 and snap["proc_limit"] == 10666
 
 
-def test_load_pause_still_blocks_host_recovered():
+def test_saturation_still_blocks_host_recovered():
     g = _gate()
-    g.admit(80.0, load5=80.0, now=0, procs=1400, proc_limit=10666)
-    assert g.state == "paused" and not g.host_recovered()
+    g.admit(80.0, load5=80.0, now=0, cpu_busy=0.99, procs=1400, proc_limit=10666)
+    assert g.state == "saturated" and not g.host_recovered()
 
 
 def test_sample_user_procs_reads_this_host():
@@ -130,7 +145,8 @@ def _blocked(conn, reason, kind="transient", age=600):
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     assert kb.claim_task(conn, tid, claimer="worker") is not None
-    assert kb.block_task(conn, tid, reason=reason, kind=kind)
+    predicate = "\nunblock_when: ruling:host-recovery" if kind is None else ""
+    assert kb.block_task(conn, tid, reason=reason + predicate, kind=kind)
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE task_events SET created_at = created_at - ? "
@@ -211,14 +227,14 @@ def test_dispatcher_requeue_runs_only_when_gate_admits(kanban_home):
         tid = _blocked(conn, EAGAIN_REASON)
 
     g = _gate()
-    g.admit(7.0, now=0, procs=9000, proc_limit=10666)
+    g.admit(7.0, now=0, cpu_busy=0.1, procs=9000, proc_limit=10666)
     note = kw._host_recovery_note(g)
     assert note is None
     with kb.connect_closing() as conn:
         assert kw._requeue_host_transient_on(conn, "default", note) == []
         assert kb.get_task(conn, tid).status == "blocked"
 
-    g.admit(7.0, now=60, procs=1448, proc_limit=10666)
+    g.admit(7.0, now=60, cpu_busy=0.1, procs=1448, proc_limit=10666)
     note = kw._host_recovery_note(g)
     assert note and "procs=1448/10666" in note
     with kb.connect_closing() as conn:

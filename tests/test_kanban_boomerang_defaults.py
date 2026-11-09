@@ -1,6 +1,7 @@
 """Default subscriptions and quiet, single-line boomerang handbacks."""
 import asyncio
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,13 @@ import pytest
 from gateway import kanban_boomerang_wake as bw
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_notify as kbn
+
+
+@pytest.fixture(autouse=True)
+def owner_scope(monkeypatch):
+    from gateway import kanban_owner_wake as ow
+    home = SimpleNamespace(origin=SimpleNamespace(chat_id="42", platform="discord"))
+    monkeypatch.setattr(ow, "resolve_owner", lambda *a: home)
 
 
 @pytest.mark.parametrize("configured,explicit,worker,expected", [
@@ -55,7 +63,8 @@ def _runner(outcomes, sent):
         if o:
             sent.append(text)
         return SendResult(success=bool(o), error=None if o else "injected")
-    return SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send))
+    return SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send),
+                           _async_profile_scope_for_source=lambda source: nullcontext())
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -150,8 +159,9 @@ def test_surface_with_failed_resurface_is_retried_by_the_tick(tmp_path, monkeypa
 
 @pytest.mark.parametrize("cli_auto_subscribe", [False, True])
 def test_cli_create_boomerang_follows_cli_auto_subscribe(tmp_path, monkeypatch, cli_auto_subscribe):
-    """Shape test (5), Prism 1aec29b63c57: scripts/cron drive the CLI, so the boomerang default
-    applies to a CLI create only when kanban.cli_auto_subscribe is on, identity or not."""
+    """Shape test (5), Prism 1aec29b63c57: scripts/cron drive the CLI, so a CLI create
+    SUBSCRIBES its chat only when kanban.cli_auto_subscribe is on. The card level is the
+    creation default either way (t_c24b1cc7)."""
     import re
     from pathlib import Path
     from hermes_cli import kanban as kc
@@ -176,7 +186,7 @@ def test_cli_create_boomerang_follows_cli_auto_subscribe(tmp_path, monkeypatch, 
     out = kc.run_slash('--board default create "cli scratch" --assignee worker1')
     tid = re.search(r"Created\s+(t_[0-9a-f]+)\b", out).group(1)
     with kb.connect_closing() as conn:
-        assert bool(kb.get_task(conn, tid).boomerang_wake) is cli_auto_subscribe
+        assert kb.get_task(conn, tid).boomerang_wake is True
         assert bool(kbn.list_notify_subs(conn, tid)) is cli_auto_subscribe
 
 

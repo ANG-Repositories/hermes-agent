@@ -33,6 +33,7 @@ OWNER_WAKE_TRIGGER_EVENTS = {
     ow.TRIGGER_RED_HANDBACK: [("review_requested", {"own_repo": True, "pr_state": "red"})],
     ow.TRIGGER_WOKE_NONSPAWNABLE: [("skipped_nonspawnable", {"assignee": "apollo"})],
     ow.TRIGGER_REVIEW_DEADMAN: [("review_deadman", {"waiting_min": 25})],
+    ow.TRIGGER_MECHANICAL_WAKE: [("mechanical_wake", {"source": "detached-run", "text": "rc=1"})],
 }
 
 PLAIN = {"id": "t_1", "title": "plain card", "body": "do the thing"}
@@ -47,10 +48,11 @@ EXPECTED = {
     # kind: verdict on a plain card, first occurrence, for a payload with no review fields
     "completed": AUTO, "changes_requested": AUTO,
     "crashed": AUTO, "timed_out": AUTO, "gave_up": AUTO, "stalled": AUTO,
-    "blocked": SURFACE, "block_loop_detected": SURFACE,
+    "blocked": AUTO, "block_loop_detected": SURFACE,
     "review_requested": SURFACE,   # no own_repo/pr_state -> upstream row -> surface
     "reclaimed": SURFACE, "skipped_nonspawnable": SURFACE,
     "review_deadman": AUTO,   # t_1e0ffee4: the deadman's tier-1 event -> the attended-read child
+    "mechanical_wake": AUTO,   # t_6a70430e: a producer's mechanical wake -> the acknowledge/surface child
 }
 
 
@@ -75,7 +77,7 @@ def test_every_kind_x_payload_returns_a_known_verdict(kind, payload):
     d = classify(kind, payload, PLAIN, retries=0)
     assert d.verdict in (AUTO, SURFACE, NONE)
     assert (d.mode is not None) == (d.verdict == AUTO)
-    if kind == "blocked" or kind == "block_loop_detected":
+    if kind == "block_loop_detected":
         assert d.verdict == SURFACE
     if d.verdict == NONE:
         assert kind == "review_requested" and payload["own_repo"] is True
@@ -85,7 +87,7 @@ def test_every_kind_x_payload_returns_a_known_verdict(kind, payload):
 def test_every_owner_wake_reason_is_dispositioned(trigger):
     for kind, payload in OWNER_WAKE_TRIGGER_EVENTS[trigger]:
         verdict = wake_disposition(kind, payload, PLAIN, retries=0)
-        if trigger in (ow.TRIGGER_NEEDS_INPUT, ow.TRIGGER_PRECONDITION, ow.TRIGGER_WOKE_NONSPAWNABLE):
+        if kind != "blocked" and trigger in (ow.TRIGGER_NEEDS_INPUT, ow.TRIGGER_PRECONDITION, ow.TRIGGER_WOKE_NONSPAWNABLE):
             assert verdict == SURFACE, (trigger, kind)
         else:
             assert verdict == AUTO, (trigger, kind)
@@ -94,9 +96,9 @@ def test_every_owner_wake_reason_is_dispositioned(trigger):
 @pytest.mark.parametrize("payload_extra", [{}, {"reason": "x"}, {"own_repo": True, "pr_state": "red"}])
 @pytest.mark.parametrize("retries", [0, 1, 5])
 @pytest.mark.parametrize("card", [PLAIN, {"title": "t", "body": "boomerang_wake: on"}, None])
-def test_needs_input_surfaces_always(payload_extra, retries, card):
+def test_needs_input_is_assessed(payload_extra, retries, card):
     payload = {"kind": "needs_input", **payload_extra}
-    assert wake_disposition("blocked", payload, card, retries=retries) == SURFACE
+    assert wake_disposition("blocked", payload, card, retries=retries) == AUTO
 
 
 @pytest.mark.parametrize("kind", ["status", "heartbeat", "unblocked", "archived", "brand_new_kind", ""])
@@ -235,3 +237,9 @@ def test_review_deadman_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
     d = classify("review_deadman", {"waiting_min": 25}, PLAIN)
     assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "review_deadman")
     assert classify("review_deadman", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE
+
+
+def test_mechanical_wake_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
+    d = classify("mechanical_wake", {"source": "detached-run"}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "mechanical_wake")
+    assert classify("mechanical_wake", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE

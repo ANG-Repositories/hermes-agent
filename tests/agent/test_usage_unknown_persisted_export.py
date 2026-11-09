@@ -337,7 +337,8 @@ def _loop_accumulate(agent, names):
         usage = normalize_usage(
             WIRES[name] if name in WIRES else MEASURED, api_mode="chat_completions"
         )
-        # #2538 (t_9f190074) commits the relay-billed reading: the seam reads billed_usage/billed_flags.
+        # The seam bills from ``billed_usage``/``billed_flags`` (#2538); with no relay or MoA
+        # adjustment the bill IS the canonical usage.
         exec(code, {"agent": agent, "billed_usage": usage,
                     "billed_flags": _flags(usage), "setattr": setattr})
         agent.session_prompt_tokens += usage.prompt_tokens

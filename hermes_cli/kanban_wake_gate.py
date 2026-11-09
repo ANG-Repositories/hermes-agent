@@ -13,16 +13,19 @@ for one EVENT when either is true at delivery time:
   instance is fed ``os.getloadavg()``, so the band applies here too: it trips
   above ``pause_above`` and clears only below ``resume_below``, and does not
   flap at the bar.
-* lane headroom: the waker profile's model lane is out of capacity
-  (``kanban_provider_health.capped_provider``, the probe the dispatcher uses
-  before a spawn: relay ``eligible_count`` / box ``five_hour`` rejection).
+* lane headroom: the waker profile's primary AND its configured fallback
+  chain have no capacity (``kanban_provider_health.capped_provider`` and
+  ``available_profile_fallback``). This is an admission check, not a route
+  override: the normal agent resolver still owns credentials, context,
+  explicit pins and runtime failover policy.
 
 The subscription row is never changed. Config: ``kanban.wake_load_gate``
-(``enabled``, ``pause_above``, ``resume_below``, ``lane_headroom``,
-``sample_seconds``); unset thresholds inherit ``dispatch_load_gate``. With no
-``pause_above`` configured in either block the HOST half is off: the
-dispatcher's ncpu fallback is a spawn heuristic, not a measured band, and on
-a 4-core box it would silence every wake whenever load1 > 4.
+(``enabled``, ``host_axis``, ``cpu_pause``, ``pause_above``, ``resume_below``,
+``lane_headroom``, ``sample_seconds``). Nothing is inherited from
+``dispatch_load_gate`` (t_b20850d2: its load/CPU keys are gone). On the
+``load1`` axis with no ``pause_above`` the HOST half is off: an ncpu fallback
+is not a measured band, and on a 4-core box it would silence every wake
+whenever load1 > 4.
 
 State is written to ``<kanban_home>/wake_gate.json`` on every transition and
 summary so ``hermes kanban notify-status`` can show the live mode.
@@ -53,7 +56,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
-from hermes_cli.kanban_load_gate import LoadGate, _denom, sample_cpu_busy
+from hermes_cli.kanban_load_gate import _denom, sample_cpu_busy
 
 _log = logging.getLogger(__name__)
 
@@ -68,22 +71,27 @@ LANE_CACHE_SECONDS = 60.0
 def _merged_cfg(config: Optional[dict]) -> dict:
     kanban = (config or {}).get("kanban") if isinstance(config, dict) else None
     kanban = kanban if isinstance(kanban, dict) else {}
-    dispatch = kanban.get("dispatch_load_gate")
-    dispatch = dispatch if isinstance(dispatch, dict) else {}
     own = kanban.get("wake_load_gate")
     own = own if isinstance(own, dict) else {}
-    merged = {
+    return {
         "enabled": own.get("enabled", True),
-        "pause_above": own.get("pause_above") or dispatch.get("pause_above"),
-        "resume_below": own.get("resume_below") or dispatch.get("resume_below"),
-        "load5_floor": own.get("load5_floor", dispatch.get("load5_floor", True)),
+        "pause_above": own.get("pause_above"),
+        "resume_below": own.get("resume_below"),
+        "load5_floor": own.get("load5_floor", True),
         "lane_headroom": own.get("lane_headroom", True),
         "sample_seconds": own.get("sample_seconds", DEFAULT_SAMPLE_SECONDS),
         "host_axis": own.get("host_axis", "cpu"),
-        "cpu_pause": own.get("cpu_pause") or dispatch.get("cpu_pause") or DEFAULT_CPU_PAUSE,
+        "cpu_pause": own.get("cpu_pause") or DEFAULT_CPU_PAUSE,
         "cpu_max_interval": own.get("cpu_max_interval", DEFAULT_CPU_MAX_INTERVAL),
     }
-    return merged
+
+
+def _pos(value) -> Optional[float]:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
 
 
 class WakeGate:
@@ -102,10 +110,19 @@ class WakeGate:
     ) -> None:
         cfg = _merged_cfg(config)
         self.enabled = bool(cfg["enabled"])
-        self.host_gate = self.enabled and cfg["pause_above"] is not None
         self.lane_headroom = bool(cfg["lane_headroom"])
         axis = str(cfg["host_axis"]).strip().lower()
         self.host_axis = axis if axis in HOST_AXES else "cpu"
+        self.ncpu = max(1, int(ncpu or os.cpu_count() or 1))
+        # load1 band (kill switch host_axis: load1): its own hysteresis, trip above / clear below
+        self._pause_above = _pos(cfg["pause_above"])
+        resume = _pos(cfg["resume_below"])
+        if self._pause_above is not None and (resume is None or resume >= self._pause_above):
+            resume = 0.75 * self._pause_above
+        self._resume_below = resume
+        self.load5_floor = bool(cfg["load5_floor"])
+        self._load_paused = False
+        self.host_gate = self.enabled and (self.host_axis == "cpu" or self._pause_above is not None)
         try:
             self.cpu_pause = float(cfg["cpu_pause"])
         except (TypeError, ValueError):
@@ -127,15 +144,6 @@ class WakeGate:
         # next sample can use it and the CPU axis never trips (Prism 6360f05606ba).
         # Floor it at twice the sampling cadence.
         self.cpu_max_interval = max(self.cpu_max_interval, 2.0 * self.sample_seconds)
-        self._gate = LoadGate(
-            {
-                "enabled": self.host_gate,
-                "pause_above": cfg["pause_above"],
-                "resume_below": cfg["resume_below"],
-                "load5_floor": cfg["load5_floor"],
-            },
-            ncpu or os.cpu_count() or 1,
-        )
         self._loadavg = loadavg
         self._lane_probe = lane_probe or _default_lane_probe
         self._dispatcher_state = dispatcher_state or _default_dispatcher_state
@@ -147,12 +155,24 @@ class WakeGate:
         self._last_written: Optional[str] = None
 
     @property
-    def pause_above(self) -> float:
-        return self._gate.pause_above
+    def pause_above(self) -> Optional[float]:
+        return self._pause_above
 
     @property
-    def resume_below(self) -> float:
-        return self._gate.resume_below
+    def resume_below(self) -> Optional[float]:
+        return self._resume_below
+
+    def _update_load_band(self) -> None:
+        """load1 hysteresis: trip above pause_above, clear below resume_below (and, with
+        load5_floor, only once load5 is under pause_above too)."""
+        if self._pause_above is None or self.load1 is None:
+            return
+        if self._load_paused:
+            load5_ok = not self.load5_floor or self.load5 is None or self.load5 < self._pause_above
+            if self.load1 < self._resume_below and load5_ok:
+                self._load_paused = False
+        elif self.load1 > self._pause_above:
+            self._load_paused = True
 
     # -- host load ---------------------------------------------------------
     def host_contended(self, now: Optional[float] = None) -> Optional[str]:
@@ -172,8 +192,7 @@ class WakeGate:
             except (OSError, TypeError, ValueError, IndexError):
                 self.load1 = self.load5 = None
             self._sampled_at = now
-            if self.load1 is not None:
-                self._gate.update(self.load1, self.load5)
+            self._update_load_band()
             if self.host_axis == "cpu":
                 # Busy is an average over [prev, now]. Wakes can be hours apart, and an
                 # hours-long average says nothing about the CPU right now: a baseline
@@ -200,8 +219,8 @@ class WakeGate:
                 load = f" (load1 {self.load1:.0f})" if self.load1 is not None else ""
                 return f"host cpu {self.cpu_busy * 100:.0f}% busy{load}"
             return None
-        if self._gate.paused:
-            shown = self.load1 if self.load1 is not None else self.pause_above
+        if self._load_paused:
+            shown = self.load1 if self.load1 is not None else self._pause_above
             return f"host load {shown:.0f}"
         return None
 
@@ -260,7 +279,7 @@ class WakeGate:
         elif self.host_axis == "cpu":
             mode = "notify" if self._cpu_saturated() else "wake"
         else:
-            mode = "notify" if self._gate.paused else "wake"
+            mode = "notify" if self._load_paused else "wake"
         return {
             "mode": mode,
             "host_axis": self.host_axis,
@@ -296,10 +315,10 @@ class WakeGate:
             if self._last_written is not None:
                 _log.info(
                     "kanban wake gate: mode %s -> %s (axis=%s, cpu_busy=%s, cpu_pause=%.2f, "
-                    "load1=%s, pause_above=%.0f, resume_below=%.0f; load %s tasks / %s)",
+                    "load1=%s, pause_above=%s, resume_below=%s; load %s tasks / %s)",
                     self._last_written, snap["mode"], self.host_axis, snap["cpu_busy"],
                     self.cpu_pause, snap["load1"],
-                    self.pause_above, self.resume_below, snap["load1"], _denom(self._gate.ncpu),
+                    self.pause_above, self.resume_below, snap["load1"], _denom(self.ncpu),
                 )
             self._last_written = snap["mode"]
 
@@ -309,17 +328,47 @@ def _default_lane_probe(profile: str) -> Optional[str]:
     from hermes_cli import kanban_provider_health as _ph
 
     task = SimpleNamespace(assignee=profile, model_override=None, provider_override=None)
-    capped = _ph.capped_provider(
-        task,
-        _ph.configured_probes(),
-        {},
-        min_eligible=_ph.configured_min_eligible(),
-        pool_urls=_ph.configured_pool_health_urls(),
-        box_health=_ph.configured_box_health(),
-    )
+    # Admission is for the profile's complete authorized route, not just its
+    # primary. Leave execution to the normal agent resolver/failover machinery:
+    # installing this health-check selection as a /model override would lose
+    # endpoint/key/context options and overwrite explicit session preferences.
+    probes = _ph.configured_probes()
+    cache: dict = {}
+    kwargs = {
+        "min_eligible": _ph.configured_min_eligible(),
+        "pool_urls": _ph.configured_pool_health_urls(),
+        "box_health": _ph.configured_box_health(),
+    }
+    capped = _ph.capped_provider(task, probes, cache, **kwargs)
     if not capped:
         return None
-    return f"lane {capped.get('provider') or '?'} capped"
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import get_routing_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from tui_gateway.launch_profile_policy import launch_secret_scope
+
+    home = Path(resolve_profile_env(profile))
+    home_token = set_hermes_home_override(home)
+    try:
+        # Derived sources need the owner's credentials. Only the launch home
+        # may inherit its frozen env-only injection; secondary homes stay isolated.
+        if home.resolve() == get_routing_process_hermes_home().resolve():
+            secrets = launch_secret_scope(home)
+        else:
+            secrets = build_profile_secret_scope(home)
+        secret_token = set_secret_scope(secrets, profile_home=str(home))
+        try:
+            fallback = _ph.available_profile_fallback(task, probes, cache, **kwargs)
+        finally:
+            reset_secret_scope(secret_token)
+    finally:
+        reset_hermes_home_override(home_token)
+    if fallback is not None:
+        _log.info("wake admission: primary %s capped; configured fallback %s/%s has headroom; "
+                  "execution retains normal route resolution", capped.get("provider"),
+                  fallback[1], fallback[0])
+        return None
+    return f"lane {capped.get('provider') or '?'} capped; no configured fallback has headroom"
 
 
 def _default_dispatcher_state() -> Optional[dict]:

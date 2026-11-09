@@ -67,8 +67,7 @@ def _runner(adapter, load, tmp_path, *, dispatcher=None):
     runner._kanban_sub_fail_counts = {}
     runner._kanban_dispatcher_lock_handle = object()
     runner._kanban_wake_gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                    "wake_load_gate": {"host_axis": "load1"}}},
+        {"kanban": {"wake_load_gate": {"pause_above": 64, "resume_below": 48, "host_axis": "load1"}}},
         ncpu=32, loadavg=lambda: (load, load, load), lane_probe=lambda p: None,
         dispatcher_state=dispatcher or FakeDispatcher("admitting"),
         state_file=tmp_path / "wake_gate.json",
@@ -135,7 +134,7 @@ def test_worker_owner_wake_still_downgrades_on_load1(board, monkeypatch):
                              session_id="agent:main:telegram:dm:chat-1")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
                           chat_type="dm", delivery_mode="notify+wake")
-        kb.block_task(conn, tid, reason="need a decision")
+        kb.block_task(conn, tid, reason="need a decision", kind="needs_input")
     finally:
         conn.close()
     adapter = RecordingAdapter()

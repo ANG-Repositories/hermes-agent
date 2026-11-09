@@ -10,7 +10,7 @@ import pytest
 from ruamel.yaml import YAML
 
 from tests.ci.desktop_release_roles import DOWNLOADABLE_DISPATCHES, gate, needs_of
-from tests.ci.public_workflow_triggers import self_triggers_live
+from tests.ci.public_workflow_allowlist import assert_dispatch_only, self_start_allowed
 
 ROOT = Path(__file__).resolve().parents[2]
 R2_ENV = {"CLOUDFLARE_R2_ACCOUNT_ID", "CLOUDFLARE_R2_ACCESS_KEY_ID", "CLOUDFLARE_R2_SECRET_ACCESS_KEY", "CLOUDFLARE_R2_BUCKET"}
@@ -47,9 +47,11 @@ def test_archive_reader_accepts_bom_without_changing_pin_authority(tmp_path):
 def test_archive_gate_uses_bootstrap_python_and_trusted_exact_revision():
     workflow = load("archive-inputs.yml")
     assert not {"pull_request", "pull_request_target"} & workflow["on"].keys()
-    assert "workflow_dispatch" in workflow["on"]
-    if self_triggers_live("archive-inputs.yml", workflow["on"]):
-        assert "push" in workflow["on"]
+    if self_start_allowed("archive-inputs.yml"):
+        assert "workflow_dispatch" in workflow["on"] and "push" in workflow["on"]
+    else:
+        assert "workflow_dispatch" in workflow["on"]
+        assert_dispatch_only(workflow["on"], "archive-inputs.yml")
     job = workflow["jobs"]["archive-inputs"]
     assert job["environment"] == "release-signing"
     assert R2_ENV <= job["env"].keys()
@@ -92,8 +94,10 @@ def test_scheduled_and_main_r2_consumers_skip_without_credentials():
     assert r2_steps and all(needs_r2_credentials(s) for s in r2_steps)
 
     termux = load("termux-verify.yml")
-    if self_triggers_live("termux-verify.yml", termux["on"]):
+    if self_start_allowed("termux-verify.yml"):
         assert termux["on"]["push"]["branches"] == ["main"] and "pull_request" in termux["on"]
+    else:
+        assert_dispatch_only(termux["on"], "termux-verify.yml")
     native = termux["jobs"]["native-runtime"]
     probe = termux["jobs"][native["needs"]]
     assert probe["environment"] == "release-signing"

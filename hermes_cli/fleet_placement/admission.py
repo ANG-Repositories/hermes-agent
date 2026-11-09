@@ -236,6 +236,14 @@ class Priority:
     order: tuple = DEFAULT_ORDER       # highest first; a class not named here ranks below every named one
     line: float = HOST_LINE            # cpu_busy_max for every class
     holdback_units: int = DEFAULT_HOLDBACK_UNITS
+    priority_mode: str = "spawn-only"
+    demand_max_age_s: float = 120.0
+    door_window_units: int = 2
+    door_hold_max_s: float = 900.0
+    verdict_trust_cpu: float = 2.0
+    asap_max_units_per_host: int = 2
+    preempt_budget_per_tick: int = 0
+    classes: Mapping = dataclasses.field(default_factory=dict)
 
     def rank(self, workload: str) -> int:
         try:
@@ -245,11 +253,120 @@ class Priority:
 
 
 @dataclasses.dataclass(frozen=True)
+class WaitingUnit:
+    at: float
+    need: Estimate
+    asap: bool = False
+    id: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class DoorVerdict:
+    admittable: int
+    binding: str
+    deficit_cpu: float
+    at: float
+
+
+@dataclasses.dataclass(frozen=True)
+class Plan:
+    start: int
+    shed: int
+    reason: str
+    stuck: tuple = ()  # caller logs each (workload, arrival) once; decision remains pure
+
+
+@dataclasses.dataclass(frozen=True)
 class Demand:
     """Queued (not yet started) work of one class that could run on this host, and one unit's estimate there."""
     workload: str
     queued: int
     unit: Estimate
+    waiting: tuple = ()
+    verdict: Optional[DoorVerdict] = None
+    at: Optional[float] = None
+
+
+def plan(workload: str, host: str, sample: Mapping, my_units: int, door: Iterable[Demand],
+         registry: Priority, leases: Iterable[Lease] = (), *, need: Estimate, now: float,
+         own_cpu: float = 0.0, limits: Limits = Limits(), slice_mem: Optional[SliceMem] = None,
+         asap: bool = False, settle_s: float = DEFAULT_SETTLE_S) -> Plan:
+    """Pure host-door decision. my_units is requested STARTS, own_cpu is current consumer CPU.
+
+    No consumer-side arrival/rank logic is needed. spawn-only preserves admit_class, including
+    its refusal reason. growth is the per-class opt-out. Returned stuck identities are log events.
+    """
+    if not isinstance(my_units, int) or isinstance(my_units, bool) or my_units < 0:
+        raise ValueError("my_units must be a nonnegative integer")
+    if not _num(own_cpu) or own_cpu < 0 or not _num(now):
+        raise ValueError("finite now and nonnegative own_cpu required")
+    door, leases = list(door), list(leases)
+    mode = registry.priority_mode
+    if registry.classes.get(workload, {}).get("yield_on") == "growth":
+        mode = "spawn-only"
+    held, earlier, stuck = [], [], []
+    if mode in ("fcfs", "classes"):
+        candidates = []
+        for d in door:
+            if d.at is None or not _num(d.at) or abs(now - d.at) > registry.demand_max_age_s:
+                continue
+            v = d.verdict
+            if v is None or not _num(v.at) or abs(now - v.at) > registry.demand_max_age_s:
+                continue
+            for u in sorted(d.waiting, key=lambda u: (not u.asap, u.at, u.id))[:registry.door_window_units]:
+                at = min(u.at, now)
+                if now - at > 7 * 86400:
+                    continue
+                if now - at > registry.door_hold_max_s:
+                    stuck.append((d.workload, at))
+                    continue
+                candidates.append((d, dataclasses.replace(u, at=at)))
+        def key(d, u):
+            urgent = u.asap
+            rank = registry.rank(d.workload)
+            if mode == "classes":
+                step = registry.classes.get(d.workload, {}).get("age_step_s", 0)
+                if step and now - u.at >= step:
+                    rank = max(0, rank - 1)
+                return (0 if urgent else 1, rank, u.at, u.id, d.workload)
+            return (0 if urgent else 1, u.at, rank, u.id, d.workload)
+
+        mine = [key(d, u) for d, u in candidates if d.workload == workload]
+        if not mine:
+            urgent = asap
+            mine = [(0 if urgent else 1, now, registry.rank(workload), "", workload) if mode == "fcfs"
+                    else (0 if urgent else 1, registry.rank(workload), now, "", workload)]
+        for d, u in candidates:
+            if d.workload == workload or key(d, u) >= min(mine):
+                continue
+            if not (d.verdict.admittable >= 1 or d.verdict.binding in CPU_AXES):
+                continue
+            earlier.append((d, u))
+            held.append(Lease(host, d.workload, u.need, math.inf, holdback=True))
+    if earlier:
+        return Plan(0, 0, f"door:{earlier[0][0].workload} unit waiting since {earlier[0][1].at}", tuple(stuck))
+    limit = my_units
+    if mode in ("fcfs", "classes"):
+        # A batch never jumps a competitor that arrived between this workload's units (t_430834ff): start only
+        # this workload's door units that precede the next competing unit the door would hold for.
+        rivals = [key(d, u) for d, u in candidates if d.workload != workload
+                  and (d.verdict.admittable >= 1 or d.verdict.binding in CPU_AXES)]
+        own = [key(d, u) for d, u in candidates if d.workload == workload]
+        if rivals and own:
+            limit = min(my_units, max(1, sum(1 for k in own if k < min(rivals))))
+    start, reason = 0, ""
+    for i in range(1, limit + 1):
+        total = Estimate(need.cpus * i, need.ram_gb * i, need.gpu_mib * i)
+        v = admit_class(sample, workload, total, leases, demand=door if mode == "spawn-only" else (),
+                        priority=registry, limits=limits, host=host, slice_mem=slice_mem, settle_s=settle_s)
+        reason = v.reason
+        if not v.ok:
+            break
+        start = i
+    return Plan(start, 0, reason, tuple(stuck))
+
+
+CPU_AXES = frozenset(("cpu", "psi_cpu_some10", "psi_cpu_some60"))
 
 
 def holdback(workload: str, demand: Iterable[Demand], priority: Priority, host: str) -> List[Lease]:

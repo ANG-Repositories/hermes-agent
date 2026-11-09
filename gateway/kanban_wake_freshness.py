@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Iterable, Optional
 
@@ -24,6 +25,78 @@ STILL_NEWS_KINDS = frozenset({"completed", "archived"})
 # MessageEvent.metadata key: [{board, task_id, kinds, event_ts, text}, ...].
 META_KEY = "kanban_wake_cards"
 GONE = "gone"
+OBLIGATION_META_KEY = "kanban_wake_obligations"
+_OBLIGATION_HEADER = re.compile(
+    r"\[obligations\] card (t_[0-9a-f]+) has (\d+) open decision\(s\); claim one to hold it:")
+_OBLIGATION_ROW = re.compile(
+    r"- (ob_[0-9a-f]+) \([^\n]*\): [\s\S]*?\n"
+    r"  claim: hermes kanban --board (\S+) obligation claim \1")
+
+
+def obligation_wake(text: str, *, now: Optional[float] = None) -> tuple[str, dict]:
+    """Stamp the control wake before it can wait in an adapter queue.
+
+    Parse only the reconciler's complete wire format; arbitrary text/merged human
+    messages must never be discarded because they happen to mention an obligation.
+    """
+    header, sep, body = text.partition("\n")
+    match = _OBLIGATION_HEADER.fullmatch(header)
+    if not match or not sep:
+        return text, {}
+    rows = list(_OBLIGATION_ROW.finditer(body))
+    if not rows or len(rows) != int(match[2]) or "\n".join(r[0] for r in rows) != body:
+        return text, {}
+    sent_at = time.time() if now is None else now
+    header += f" [sent-at={sent_at:.3f}]"
+    tagged = header + "\n" + body
+    return tagged, {OBLIGATION_META_KEY: {
+        "task_id": match[1], "sent_at": sent_at, "header": header,
+        "text": tagged, "rows": [
+            {"id": r[1], "board": r[2], "text": r[0]} for r in rows],
+    }}
+
+
+def filter_obligations(event: Any, *, now: Optional[float] = None) -> bool:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_work_obligations import OPEN_STATES, post_logs
+
+    meta = (getattr(event, "metadata", None) or {}).get(OBLIGATION_META_KEY)
+    if not meta or event.text != meta["text"]:
+        return False
+    if not meta["rows"]:
+        return True
+    live, removed = [], []
+    for row in meta["rows"]:
+        try:
+            conn = kb.connect_readonly(board=row["board"])
+            try:
+                current = conn.execute("SELECT state FROM obligations WHERE id = ? AND task_id = ?",
+                                       (row["id"], meta["task_id"])).fetchone()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("obligation wake freshness: cannot read %s (%s); keeping it", row["id"], exc)
+            live.append(row)
+            continue
+        if current and current[0] in OPEN_STATES:
+            live.append(row)
+        else:
+            removed.append(row)
+    if not removed:
+        return False
+    delivered_at = time.time() if now is None else now
+    receipt = (f"[obligations] stale wake {'suppressed' if not live else 'narrowed'} "
+               f"card={meta['task_id']} rows={','.join(r['id'] for r in removed)} "
+               f"sent-at={meta['sent_at']:.3f} delivered-at={delivered_at:.3f}")
+    logger.info("%s", receipt)
+    post_logs(receipt)
+    meta["rows"] = live
+    if not live:
+        return True
+    header = re.sub(r"has \d+ open decision", f"has {len(live)} open decision", meta["header"], count=1)
+    event.text = header + "\n" + "\n".join(r["text"] for r in live)
+    meta.update(header=header, text=event.text)
+    return False
 
 
 def is_stale(status: Optional[str], kind: str) -> bool:
@@ -68,6 +141,8 @@ def filter_event(event: Any, *, now: Optional[float] = None) -> bool:
     stale. Leaves the event alone when it carries no card metadata or when its
     text no longer equals the rendered cards (a human message merged into it).
     """
+    if filter_obligations(event, now=now):
+        return True
     cards = (getattr(event, "metadata", None) or {}).get(META_KEY)
     if not cards or not isinstance(cards, list):
         return False
@@ -100,6 +175,7 @@ def filter_event(event: Any, *, now: Optional[float] = None) -> bool:
 
 async def drop_stale(event: Any) -> bool:
     """Async wrapper for :func:`filter_event` (the status reads run off the loop)."""
-    if not (getattr(event, "metadata", None) or {}).get(META_KEY):
+    metadata = getattr(event, "metadata", None) or {}
+    if not (metadata.get(META_KEY) or metadata.get(OBLIGATION_META_KEY)):
         return False
     return await asyncio.to_thread(filter_event, event)

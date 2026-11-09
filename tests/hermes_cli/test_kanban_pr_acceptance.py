@@ -39,9 +39,14 @@ def github(tmp_path, monkeypatch):
                     self.end_headers()
                     self.wfile.write(b'{"message": "Resource not accessible by integration"}')
                     return
-                value = {"name": "main", "protection": state.get("protection") or {"required_status_checks": {
-                    "checks": [{"context": "required", "app_id": state.get("app_id", 1)}],
-                    "contexts": ["required"]}}}
+                value = {"name": "main", "protected": state.get("protected", True),
+                         "protection": state.get("protection") or {"required_status_checks": {
+                             "checks": [{"context": "required", "app_id": state.get("app_id", 1)}],
+                             "contexts": ["required"]}}}
+                if state.get("omit_protection"):
+                    del value["protection"]
+                if state.get("omit_protected"):
+                    del value["protected"]
             elif "/issues/" in self.path and self.path.split("?")[0].endswith("/comments"):
                 value = [state.get("comments", [])]
             elif "/rules/branches/" in self.path:
@@ -111,6 +116,44 @@ def github(tmp_path, monkeypatch):
         thread.join()
 
 
+@pytest.mark.platforms("posix")
+def test_no_required_checks_resolves_to_recorded_local_only(github):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["protection"] = {"required_status_checks": {}}
+    github["protected"] = False
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "local-only"
+    assert receipt["detail"] == "no repository-required checks: local-only"
+    assert receipt["required"] == []
+    assert receipt["head_sha"] == "a" * 40
+    assert not any("/check-runs" in p for p in github["requests"])
+
+
+def test_protected_branch_with_unreadable_checks_fails_closed(github):
+    # Prism 3dda6c19e7d5 repro: {"name": "main", "protected": true} with no `protection` body and empty rulesets
+    # must NOT resolve to local-only.
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["omit_protection"] = True
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] != "local-only"
+    assert "read branch protection" in receipt["detail"]
+    assert not any("/check-runs" in p for p in github["requests"])
+
+
+def test_branch_without_protected_flag_or_protection_fails_closed(github):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["omit_protection"] = True
+    github["omit_protected"] = True
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] != "local-only"
+
+
 @pytest.mark.platforms("linux")
 def test_pr_completion_requires_current_required_evidence(github):
     with connect() as conn:
@@ -154,7 +197,7 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             run_id = owner.current_run_id
             def reclaim():
                 with connect() as rival:
-                    assert kb.block_task(rival, tid, reason="Reassigned during acceptance")
+                    assert kb.block_task(rival, tid, reason="Reassigned during acceptance", kind="needs_input")
                     assert kb.unblock_task(rival, tid)
                     github["replacement"] = kb.claim_task(rival, tid).current_run_id
             github.update(conclusion=conclusion, race=reclaim)
@@ -292,7 +335,11 @@ def test_human_review_lane_reads_with_the_ambient_login(tmp_path, monkeypatch, a
     kb.init_db()
     with connect() as conn:
         tid = kb.create_task(conn, title="review-lane", completion_contract="acme/repo",
-                             assignee=assignee)
+                             assignee="implementer")
+        assert kb.claim_task(conn, tid) is not None
+        # Keep a real implementation run when handing the card to the human lane.
+        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (assignee, tid))
+        conn.commit()
         kb.complete_task(conn, tid, result="done",
                          metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(

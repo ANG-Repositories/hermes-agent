@@ -94,7 +94,7 @@ async def _one_tick(monkeypatch, runner):
 
 
 def _card(conn, *, chat=CHAT):
-    tid = kb.create_task(conn, title="self close", assignee="worker", session_id=HOME_SID)
+    tid = kb.create_task(conn, boomerang_wake=False, title="self close", assignee="worker", session_id=HOME_SID)
     kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat, chat_type="group",
                        user_id="u1", delivery_mode="notify+wake")
     return tid
@@ -230,7 +230,7 @@ def test_receipt_failure_keeps_the_event_deliverable(board, monkeypatch):
 
 
 def _thread_card(conn, *, chat=THREAD, thread=THREAD):
-    tid = kb.create_task(conn, title="thread self close", assignee="worker", session_id=THREAD_SID)
+    tid = kb.create_task(conn, boomerang_wake=False, title="thread self close", assignee="worker", session_id=THREAD_SID)
     kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat, thread_id=thread,
                        chat_type="thread", user_id="u1", delivery_mode="notify+wake")
     return tid
@@ -295,3 +295,73 @@ def test_thread_home_close_still_reaches_a_foreign_thread_subscriber(board, monk
         assert _events(conn, tid, ns.EVENT_KIND) == []
     finally:
         conn.close()
+
+
+# --- t_fa08b93d: operator-homed cards (``--home operator``) -------------------
+OP_HOME = "operator:apollo"
+OP_SID = "20261106_113450_09aa5a58"
+
+
+def _operator_card(conn):
+    tid = kb.create_task(conn, boomerang_wake=False, title="operator-homed", assignee="worker", session_id=OP_HOME)
+    kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT, chat_type="group",
+                       user_id="u1", delivery_mode="notify+wake")
+    return tid
+
+
+def test_operator_homed_self_block_is_withheld_as_own_echo(board, monkeypatch):
+    """An operator's own block on an operator-homed card: no wake, one own-echo receipt.
+    Before the fix the home resolved to ``operator-home`` (no chat), so is_own_echo was
+    never asked and every block woke the chat it was typed in (6/6 on 2026-11-06)."""
+    conn = kbc.connect()
+    try:
+        tid = _operator_card(conn)
+        with kb.mutation_actor(session_ids=[OP_SID], profile="default", surface="gateway"):
+            assert kb.block_task(conn, tid, reason="waiting on Ace", kind="needs_input") is True
+        assert _events(conn, tid, "blocked")[0].actor_profile == "default"
+    finally:
+        conn.close()
+    adapter = Adapter()
+    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
+    assert adapter.handled == [], adapter.handled        # no wake turn
+    conn = kbc.connect()
+    try:
+        receipts = _events(conn, tid, ns.EVENT_KIND)
+        assert len(receipts) == 1
+        assert receipts[0].payload["reason"] == ns.REASON_OWN_ECHO
+        assert receipts[0].payload["path"] == "notifier-wake"
+    finally:
+        conn.close()
+
+
+def test_operator_homed_worker_block_still_wakes(board, monkeypatch):
+    conn = kbc.connect()
+    try:
+        tid = _operator_card(conn)
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        with kb.mutation_actor(session_ids=["20261106_000001_worker"], profile="worker", surface="worker"):
+            assert kb.block_task(conn, tid, reason="need creds", expected_run_id=run_id, kind="needs_input") is True
+    finally:
+        conn.close()
+    adapter = Adapter()
+    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
+    assert len(adapter.handled) == 1
+    conn = kbc.connect()
+    try:
+        assert _events(conn, tid, ns.EVENT_KIND) == []
+    finally:
+        conn.close()
+
+
+def test_operator_own_echo_predicate():
+    ev = {"kind": "blocked", "actor_profile": "default", "actor_session_id": OP_SID}
+    assert ns.is_operator_own_echo(ev, OP_HOME, "default") is True
+    assert ns.is_operator_own_echo(ev, "operator:aegis", "default") is False   # another operator's card
+    assert ns.is_operator_own_echo(ev, OP_HOME, "aegis") is False              # another operator's chat
+    assert ns.is_operator_own_echo(ev, HOME_SID, "default") is False           # chat-homed: is_own_echo's job
+    assert ns.is_operator_own_echo({**ev, "actor_profile": "worker"}, OP_HOME, "default") is False
+    assert ns.is_operator_own_echo({**ev, "actor_profile": None}, OP_HOME, "default") is False
+    assert ns.is_operator_own_echo({**ev, "kind": "completed"}, OP_HOME, "default") is False
+    for kind in ("archived", "changes_requested", "review_requested"):
+        assert ns.is_operator_own_echo({**ev, "kind": kind}, OP_HOME, "default") is True

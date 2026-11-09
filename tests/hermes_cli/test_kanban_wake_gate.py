@@ -1,19 +1,18 @@
 """Wake -> notify downgrade under measured contention (t_74bf5296).
 
 Ace 13:40: "Wake is really nice as well, except if we have resource
-contention. In that case, we want to turn Wake off." The band is the
-dispatcher's (pause_above 64 / resume_below 48 on the Studio), with
-hysteresis, and it applies per EVENT, never to the subscription.
+contention. In that case, we want to turn Wake off." The host half is measured
+CPU busy (t_0e52c7ab); the load1 band (kill switch) is the wake gate's own
+(t_b20850d2: nothing inherits from dispatch_load_gate). Hysteresis, per EVENT,
+never the subscription.
 """
 from __future__ import annotations
 
 from hermes_cli.kanban_wake_gate import WakeGate, read_state
 
 # The load1 band (kill switch ``host_axis: load1``); the default axis is cpu (t_0e52c7ab).
-CFG = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                  "wake_load_gate": {"host_axis": "load1"}}}
-CPU_CFG = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "resume_below": 24,
-                                             "cpu_pause": 0.90}}}
+CFG = {"kanban": {"wake_load_gate": {"pause_above": 64, "resume_below": 48, "host_axis": "load1"}}}
+CPU_CFG = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90}}}
 
 
 class Load:
@@ -40,9 +39,19 @@ def _gate(load, tmp_path, cfg=CFG, lane=lambda p: None, cpu=None):
                     state_file=tmp_path / "wake_gate.json")
 
 
-def test_inherits_the_dispatch_band(tmp_path):
+def test_load1_band_is_the_wake_gates_own(tmp_path):
     g = _gate(Load(1), tmp_path)
     assert (g.pause_above, g.resume_below) == (64, 48)
+
+
+def test_dispatch_load_gate_keys_are_not_inherited(tmp_path):
+    """t_b20850d2: dispatch_load_gate's load/CPU keys are gone; a leftover one never drives the wake gate."""
+    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48, "cpu_pause": 0.50},
+                      "wake_load_gate": {"host_axis": "load1"}}}
+    g = _gate(Load(500), tmp_path, cfg=cfg)
+    assert g.pause_above is None and g.downgrade_reason(None, now=0) is None
+    g2 = _gate(Load(1), tmp_path, cfg={"kanban": {"dispatch_load_gate": {"cpu_pause": 0.50}}}, cpu=Cpu(0.60))
+    assert g2.cpu_pause == 0.90 and g2.downgrade_reason(None, now=0) is None
 
 
 def test_downgrade_fires_above_the_gate_and_not_below(tmp_path):
@@ -94,25 +103,22 @@ def test_lane_probe_error_fails_open_toward_wake(tmp_path):
 
 
 def test_disabled_gate_never_downgrades(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                      "wake_load_gate": {"enabled": False}}}
+    cfg = {"kanban": {"wake_load_gate": {"enabled": False, "pause_above": 64, "resume_below": 48}}}
     g = _gate(Load(200), tmp_path, cfg=cfg, lane=lambda p: "capped")
     assert g.downgrade_reason("athena", now=0) is None
 
 
-def test_no_configured_band_means_no_host_downgrade(tmp_path):
-    """The ncpu fallback is not a measured band: no pause_above, no host gate."""
-    g = _gate(Load(500), tmp_path, cfg={"kanban": {}})
+def test_no_configured_band_means_no_host_downgrade_on_the_load1_axis(tmp_path):
+    """The ncpu fallback is not a measured band: on the load1 axis, no pause_above = no host gate."""
+    g = _gate(Load(500), tmp_path, cfg={"kanban": {"wake_load_gate": {"host_axis": "load1"}}})
     assert g.downgrade_reason(None, now=0) is None
     assert g.snapshot()["mode"] == "off"
 
 
-def test_wake_gate_block_overrides_dispatch_band(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
-                      "wake_load_gate": {"pause_above": 20, "resume_below": 10,
-                                         "host_axis": "load1"}}}
-    g = _gate(Load(25), tmp_path, cfg=cfg)
-    assert g.downgrade_reason(None, now=0) == "host load 25"
+def test_cpu_axis_is_on_with_no_config_at_all(tmp_path):
+    """The default axis needs no band: an empty kanban block still downgrades at cpu_pause 0.90."""
+    g = _gate(Load(1), tmp_path, cfg={"kanban": {}}, cpu=Cpu(0.95))
+    assert g.downgrade_reason(None, now=0) == "host cpu 95% busy (load1 1)"
 
 
 # -- cpu axis (default; t_0e52c7ab, Ace 2026-10-18 22:22) ----------------------
@@ -151,18 +157,16 @@ def test_unreadable_cpu_sample_fails_open_toward_wake(tmp_path):
     assert g2.downgrade_reason(None, now=0) is None
 
 
-def test_cpu_pause_inherits_dispatch_and_wake_block_overrides(tmp_path):
+def test_cpu_pause_default_and_wake_block_overrides(tmp_path):
     assert _gate(Load(1), tmp_path, cfg=CPU_CFG).cpu_pause == 0.90
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
-                      "wake_load_gate": {"cpu_pause": 0.80}}}
+    cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.80}}}
     g = _gate(Load(1), tmp_path, cfg=cfg, cpu=Cpu(0.85))
     assert g.cpu_pause == 0.80
     assert g.downgrade_reason(None, now=0) == "host cpu 85% busy (load1 1)"
 
 
 def test_load1_kill_switch_restores_the_band(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "resume_below": 24},
-                      "wake_load_gate": {"host_axis": "load1"}}}
+    cfg = {"kanban": {"wake_load_gate": {"pause_above": 32, "resume_below": 24, "host_axis": "load1"}}}
     g = _gate(Load(172), tmp_path, cfg=cfg, cpu=Cpu(0.10))
     assert g.downgrade_reason(None, now=0) == "host load 172"
 
@@ -237,17 +241,157 @@ def test_raising_cpu_sampler_does_not_refresh_the_baseline_age(tmp_path):
 
 def test_max_interval_below_sample_cadence_still_trips(tmp_path):
     """Prism 6360f05606ba: cpu_max_interval < sample_seconds must not disable the CPU axis."""
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
-                      "wake_load_gate": {"cpu_max_interval": 1}}}
+    cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90, "cpu_max_interval": 1}}}
     g = _gate(Load(1), tmp_path, cfg=cfg, cpu=CpuDelta(0.95))
     assert g.cpu_max_interval >= 2 * g.sample_seconds
     results = [g.downgrade_reason(None, now=t) for t in range(1000, 1046)]
     assert any(r and r.startswith("host cpu 95%") for r in results)
 
 
+def test_fallback_admission_binds_owner_scope_and_restores_caller(tmp_path, monkeypatch):
+    """Derived sources must see the wake owner's secrets, never the caller's."""
+    from agent import secret_scope
+    from hermes_cli import fallback_config, kanban_provider_health as health, profiles
+    from hermes_cli.kanban_wake_gate import _default_lane_probe
+    from hermes_constants import get_hermes_home
+
+    homes = {}
+    for profile in ("owner-a", "owner-b"):
+        home = tmp_path / profile
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n  provider: zai\n  default: glm-5.1\n"
+            "fallback_providers:\n  - source: wake-scope-test\n")
+        (home / ".env").write_text(f"WAKE_TEST_SECRET={profile}\n")
+        homes[profile] = home
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(homes[p]))
+    monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
+    monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
+    monkeypatch.setattr(health, "configured_box_health", lambda: False)
+    monkeypatch.setattr(health, "_fetch", lambda *a: {"eligible_count": 0})
+    seen = []
+
+    def source(entry):
+        owner = secret_scope.get_secret("WAKE_TEST_SECRET")
+        seen.append((owner, get_hermes_home(), secret_scope.current_secret_scope_home()))
+        return [{"provider": "deepseek", "model": "deepseek-v4-flash"}] if owner else []
+
+    monkeypatch.setitem(fallback_config._CHAIN_SOURCES, "wake-scope-test", source)
+    multiplex = secret_scope.set_multiplex_context(True)
+    caller = secret_scope.set_secret_scope({"WAKE_TEST_SECRET": "foreign"}, profile_home="foreign")
+    original_home = get_hermes_home()
+    try:
+        for profile in ("owner-a", "owner-b", "owner-a"):
+            assert _default_lane_probe(profile) is None
+            assert secret_scope.get_secret("WAKE_TEST_SECRET") == "foreign"
+            assert secret_scope.current_secret_scope_home() == "foreign"
+            assert get_hermes_home() == original_home
+        assert seen == [(p, homes[p], str(homes[p])) for p in ("owner-a", "owner-b", "owner-a")]
+    finally:
+        secret_scope.reset_secret_scope(caller)
+        secret_scope.reset_multiplex_context(multiplex)
+
+
+def test_fallback_admission_preserves_frozen_launch_credentials(tmp_path, monkeypatch):
+    from agent import secret_scope
+    from hermes_cli import fallback_config, kanban_provider_health as health, profiles
+    from hermes_cli.kanban_wake_gate import _default_lane_probe
+    from tui_gateway import launch_profile_policy
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "config.yaml").write_text(
+        "model:\n  provider: zai\n  default: glm-5.1\n"
+        "fallback_providers:\n  - source: wake-launch-test\n")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("WAKE_LAUNCH_SECRET", "injected-at-launch")
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(launch))
+    monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
+    monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
+    monkeypatch.setattr(health, "configured_box_health", lambda: False)
+    monkeypatch.setattr(health, "_fetch", lambda *a: {"eligible_count": 0})
+    launch_profile_policy.capture_launch_env()
+    monkeypatch.setenv("WAKE_LAUNCH_SECRET", "poisoned-after-launch")
+    seen = []
+
+    def source(entry):
+        seen.append(secret_scope.get_secret("WAKE_LAUNCH_SECRET"))
+        return [{"provider": "deepseek", "model": "deepseek-v4-flash"}] if seen[-1] else []
+
+    monkeypatch.setitem(fallback_config._CHAIN_SOURCES, "wake-launch-test", source)
+    multiplex = secret_scope.set_multiplex_context(True)
+    caller = secret_scope.set_secret_scope(None)
+    try:
+        assert _default_lane_probe("default") is None
+        assert seen == ["injected-at-launch"]
+        assert secret_scope.current_secret_scope() is None
+    finally:
+        secret_scope.reset_secret_scope(caller)
+        secret_scope.reset_multiplex_context(multiplex)
+
+
+def test_fallback_admission_pinned_launch_ignores_secondary_env_mirror(tmp_path, monkeypatch):
+    """A mirrored served home must not inherit the pinned launch's frozen secrets."""
+    import os
+
+    import hermes_constants
+    from agent import secret_scope
+    from hermes_cli import fallback_config, kanban_provider_health as health, profiles
+    from hermes_cli.kanban_wake_gate import _default_lane_probe
+    from tui_gateway import launch_profile_policy
+
+    launch, secondary = tmp_path / "launch", tmp_path / "secondary"
+    launch.mkdir()
+    secondary.mkdir()
+    (secondary / "config.yaml").write_text(
+        "model:\n  provider: zai\n  default: glm-5.1\n"
+        "fallback_providers:\n  - source: wake-pinned-test\n")
+    (secondary / ".env").write_text("WAKE_SECONDARY_SECRET=file-only\n")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("WAKE_PINNED_SECRET", "launch-only-synthetic")
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    # Preserve any embedding host pin when monkeypatch restores this test's state.
+    monkeypatch.setattr(hermes_constants, "_PINNED_PROCESS_HERMES_HOME", None)
+    hermes_constants.pin_process_hermes_home(launch)
+    launch_profile_policy.capture_launch_env()
+    monkeypatch.setenv("HERMES_HOME", str(secondary))
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(secondary))
+    monkeypatch.setattr(health, "configured_probes", lambda: {"zai": "https://primary.invalid"})
+    monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
+    monkeypatch.setattr(health, "configured_box_health", lambda: False)
+    monkeypatch.setattr(health, "_fetch", lambda *a: {"eligible_count": 0})
+    seen = []
+
+    def source(entry):
+        seen.append((secret_scope.get_secret("WAKE_PINNED_SECRET"),
+                     secret_scope.get_secret("WAKE_SECONDARY_SECRET"),
+                     hermes_constants.get_hermes_home(),
+                     secret_scope.current_secret_scope_home()))
+        return []
+
+    monkeypatch.setitem(fallback_config._CHAIN_SOURCES, "wake-pinned-test", source)
+    multiplex = secret_scope.set_multiplex_context(True)
+    caller = secret_scope.set_secret_scope(
+        {"WAKE_PINNED_SECRET": "caller-synthetic"}, profile_home="caller")
+    home_token = hermes_constants.set_hermes_home_override(launch)
+    try:
+        assert hermes_constants.get_routing_process_hermes_home() == launch
+        assert _default_lane_probe("secondary").startswith("lane zai capped;")
+        assert seen == [(None, "file-only", secondary, str(secondary))]
+        assert secret_scope.get_secret("WAKE_PINNED_SECRET") == "caller-synthetic"
+        assert secret_scope.current_secret_scope_home() == "caller"
+        assert hermes_constants.get_hermes_home() == launch
+        assert os.environ["HERMES_HOME"] == str(secondary)
+        assert hermes_constants.get_routing_process_hermes_home() == launch
+    finally:
+        hermes_constants.reset_hermes_home_override(home_token)
+        secret_scope.reset_secret_scope(caller)
+        secret_scope.reset_multiplex_context(multiplex)
+
+
 def test_cpu_max_interval_is_configurable(tmp_path):
-    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
-                      "wake_load_gate": {"cpu_max_interval": 30}}}
+    cfg = {"kanban": {"wake_load_gate": {"cpu_pause": 0.90, "cpu_max_interval": 30}}}
     cpu = CpuDelta(0.95)
     g = _gate(Load(1), tmp_path, cfg=cfg, cpu=cpu)
     g.downgrade_reason(None, now=0)
