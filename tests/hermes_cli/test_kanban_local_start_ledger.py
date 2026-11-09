@@ -192,6 +192,41 @@ def test_loadgate_fails_closed_on_an_unreadable_shared_ledger(home, monkeypatch)
     assert a == 0 and "shared ledger unreadable" in why, why
 
 
+def test_loadgate_default_clock_does_not_double_book_a_settled_foreign_lease(home, monkeypatch):
+    """Prism c-79e25e334a28b343: admit_now() samples on time.monotonic() while a shared-ledger lease is dated on the
+    wall clock. A Prism review admitted an hour ago is already inside cpu_busy; read on mismatched clocks it looked
+    newer than the sample and was counted a second time (0.85 + 2/32 + 1/32 > 0.90: saturated:cpu)."""
+    monkeypatch.setenv("PLACEMENT_HOME", str(home))
+    placement.reserve("mac-studio", "prism", placement.Footprint(ram_gb=4, threads=2), ttl_s=7200, job_id="pr#1",
+                      path=home / placement.RESERVATIONS_REL, now=time.time() - 3600)
+    assert len(klg.shared_leases("mac-studio")) == 1
+    g = _studio_gate(monkeypatch)
+    monkeypatch.setattr(klg, "sample_loadavg", lambda: (5.0, 5.0))
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.85, object()))
+    monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
+    a, why = g.admit_now(running=0)                               # production clock: now = time.monotonic()
+    assert a == 1 and why is None, (a, why)
+
+
+def test_loadgate_admission_and_book_local_read_the_same_table(home, tmp_path, monkeypatch):
+    """Prism c-8f2dec23b3afdc11: the LoadGate's admission (utilization_context) and book_local read ONE host table, the
+    fleet root's. A ``local`` host defined only in the board-home table is resolved by neither (no admission on a row
+    the start could not book); defined at the fleet root, both resolve it and the start books there."""
+    no_local = json.loads(json.dumps(TABLE))
+    no_local["hosts"]["mac-studio"]["aliases"] = ["studio"]
+    fleet = tmp_path / "fleet-root"
+    (fleet / "config").mkdir(parents=True)
+    (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(no_local), encoding="utf-8")
+    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    assert kh.table_path(home).is_file()                          # board home: mac-studio carries the local alias
+    assert klg.utilization_context()["host"] == "local" and klg.utilization_context()["ceiling"] is None
+    assert kh.book_local("t_x#1", None) is None
+    (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
+    assert klg.utilization_context()["host"] == "mac-studio"
+    rid = kh.book_local("t_x#2", None)
+    assert rid and [r["host"] for r in _ledger(fleet)] == ["mac-studio"] and _ledger(home) == []
+
+
 def test_unmeasured_cpu_busy_refuses_closed(home, monkeypatch):
     """Card item 2: ``(load N tasks / ..., not read)`` names load1 as NOT READ by admission (display only); the axis
     admission reads is cpu_busy. A tick with cpu_busy unmeasured refuses, never a load1-only admit."""

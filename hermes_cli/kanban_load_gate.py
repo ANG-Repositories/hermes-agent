@@ -129,6 +129,7 @@ tick, then ``record_spawns(n, now=)`` with what was actually spawned.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -367,7 +368,11 @@ class LoadGate:
         try:
             # t_02aa6d86 (doctrine rule 15): every OTHER consumer's lease on this host (Prism, test-gate, CI) is load
             # this gate's ramp never saw; an unreadable shared ledger fails closed, never as "nothing booked"
-            leases += shared_leases(ctx["host"])
+            # Lease.at is wall-clock; ``now`` is the gate's clock (time.monotonic() in admit_now): re-date each lease by
+            # its age, as GateTickBuilder.seed_out_of_tick does, or a settled lease reads newer than the sample and is
+            # counted on top of the cpu_busy that already holds it (Prism c-79e25e334a28b343)
+            wall = time.time()
+            leases += [dataclasses.replace(le, at=now - max(0.0, wall - le.at)) for le in shared_leases(ctx["host"])]
         except Exception as exc:
             why = f"utilization: shared ledger unreadable ({type(exc).__name__}: {exc}); refusing, fail closed"
             self.state, self.allowance, self.last_reason = "saturated", 0, why
