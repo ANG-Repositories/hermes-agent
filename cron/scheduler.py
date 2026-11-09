@@ -1051,6 +1051,9 @@ def _inflight_home_path(home_key: str) -> Path:
 # ids so host-wide consumers (shutdown drain, idle-exit, metrics) see the union across profiles.
 _running_job_ids: set = set()
 _running_fire_owners: dict[tuple, dict[object, tuple[Optional[str], Path]]] = {}
+# execution token -> executions.db row id of that run; the shutdown sweep stamps it on a one-shot's
+# replay marker (cron/shutdown_replay.py).
+_running_execution_ids: dict[object, str] = {}
 # Parent gateway threads synchronously waiting on restart-safe scope workers.
 # Shutdown must not misclassify these as ownerless in-process runs: the tool
 # process sweep cannot reach the worker's transient scope.
@@ -1618,8 +1621,14 @@ def mark_running_jobs_interrupted(
     *,
     only_owners: Optional[set] = None,
     lock_timeout: Optional[float] = None,
+    replay_marker: bool = False,
 ) -> list:
     """Best-effort: mark every in-flight cron job interrupted; returns the job IDs marked.
+
+    ``replay_marker`` (gateway stop only, t_b5c315bb): a one-shot agent run still in flight
+    gets a ``replay_pending`` marker instead of the terminal interrupted write, so the next
+    boot fires it exactly once (``cron/shutdown_replay.py``). Recurring and script-lane jobs,
+    and a run whose marker is refused, keep the plain interrupted mark below.
 
     Called by the gateway shutdown path immediately after it force-kills
     tool subprocesses (``process_registry.kill_all()``). A job whose tool
@@ -1659,6 +1668,7 @@ def mark_running_jobs_interrupted(
     """
     with _running_lock:
         restart_safe_waiters = set(_restart_safe_waiter_job_ids)
+        execution_ids = dict(_running_execution_ids)
         active_fires = [
             (token, key, owner, profile_home)
             for key, executions in _running_fire_owners.items()
@@ -1697,6 +1707,15 @@ def mark_running_jobs_interrupted(
             continue
         try:
             with use_cron_store(profile_home):
+                if replay_marker:
+                    from cron.shutdown_replay import mark_replay_pending
+
+                    if mark_replay_pending(
+                        job_id, fire_owner=fire_owner, run_id=execution_ids.get(_token),
+                        lock_timeout=lock_timeout,
+                    ):
+                        marked.append(job_id)
+                        continue
                 if mark_job_run(
                     job_id,
                     False,
@@ -4166,6 +4185,7 @@ def run_one_job(
     with _running_lock:
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
+        _running_execution_ids[execution_token] = execution_id
     try:
         with self_removal_delivery_scope(job["id"]):
             return _run_with_fire_claim_heartbeat(
@@ -4201,6 +4221,7 @@ def run_one_job(
                     "Job '%s': restart re-queue failed: %s", job["id"], e,
                 )
         with _running_lock:
+            _running_execution_ids.pop(execution_token, None)
             executions = _running_fire_owners.get(_fire_key)
             if executions is not None:
                 executions.pop(execution_token, None)
@@ -4481,9 +4502,14 @@ def _save_compose_deliver(
         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
 
-def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
+def _finish_interrupted_run(
+    job: dict, execution_id: str, delivery_error: Optional[str], *, delivered: bool = False,
+) -> None:
     """Shutdown already wrote last_status, so mark_job_run is skipped (a second call would skip a
-    fire or auto-delete the job); an unsent notice is recorded via update_job instead."""
+    fire or auto-delete the job); an unsent notice is recorded via update_job instead.
+    ``delivered``: the result left before the interrupt landed. The row then carries a distinct
+    error, so a one-shot replay marker reads it as terminal and does not re-run delivered work."""
+    from cron.shutdown_replay import INTERRUPTED_AFTER_DELIVERY_ERROR, INTERRUPTED_ERROR
     if delivery_error:
         try:
             # The gateway shutdown already wrote last_status for this run, so mark_job_run is skipped below
@@ -4498,7 +4524,7 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
     finish_execution(
         execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+        error=INTERRUPTED_AFTER_DELIVERY_ERROR if delivered else INTERRUPTED_ERROR)
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
@@ -4654,6 +4680,15 @@ def _run_one_job_body(
     delivery_attempted = False
     delivery_error = None
 
+    def _finish_if_interrupted(delivered: bool) -> bool:
+        """The shutdown sweep sets the interrupt flag BEFORE its replay marker releases the
+        fire claim, so an ownership loss seen while the flag is set was caused by the stop:
+        record the interruption, not 'ownership lost', or the marker reads it as terminal."""
+        if not _consume_interrupted_flag(job["id"], execution_token):
+            return False
+        _finish_interrupted_run(job, execution_id, delivery_error, delivered=delivered)
+        return True
+
     _fire_scope_tokens = None
     _terminal_scope_token = None
     try:
@@ -4739,7 +4774,8 @@ def _run_one_job_body(
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            if not _finish_if_interrupted(delivered=False):
+                _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
         if shutdown_refused and record_shutdown_skip(job, fire_owner, execution_id):
@@ -4771,7 +4807,8 @@ def _run_one_job_body(
 
         if d.side_effect_ownership_lost:
             # The claim died inside a side-effect fence: the side effect did NOT complete.
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            if not _finish_if_interrupted(delivered=False):
+                _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
         # Empty final_response is a soft failure so last_status is not "ok".
@@ -4796,11 +4833,17 @@ def _run_one_job_body(
                         "Job '%s': transport cancellation arrived before terminal completion; "
                         "recording the interrupted run",
                         job["id"])
-                _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+                if not _finish_if_interrupted(
+                        delivered=bool(d.delivery_attempted and not d.delivery_error)):
+                    _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
                 return True
 
-        if _consume_interrupted_flag(job["id"], execution_token):
-            _finish_interrupted_run(job, execution_id, delivery_error)
+        # A flag alone is advisory: the sweep may have timed out without persisting.
+        # After delivery, the owner-fenced terminal write is authoritative.
+        if _consume_interrupted_flag(job["id"], execution_token) and fire_owner is None:
+            _finish_interrupted_run(
+                job, execution_id, delivery_error,
+                delivered=bool(d.delivery_attempted and not d.delivery_error))
             return True
 
         return _finish_completed_run(d, fire_owner, execution_id)
@@ -4834,9 +4877,12 @@ def _run_one_job_body(
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
                 job, _err_text, adapters=adapters, loop=loop)
+        interrupted = False
+        marked = False
         try:
+            interrupted = _consume_interrupted_flag(job["id"], execution_token)
             if (
-                not _consume_interrupted_flag(job["id"], execution_token)
+                (not interrupted or fire_owner is not None)
                 and not self_removal_delivery_allowed(job["id"])  # no record left to mark
             ):
                 mark_kwargs = {}
@@ -4844,10 +4890,17 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
-                mark_job_run(job["id"], False, _err_text, **mark_kwargs)
+                marked = mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
+        if interrupted and not marked:
+            # The stop's cancel surfaced as this exception: record the interruption, which a
+            # one-shot replay marker reads as "not an outcome" (t_b5c315bb).
+            from cron.shutdown_replay import INTERRUPTED_AFTER_DELIVERY_ERROR, INTERRUPTED_ERROR
+
+            _err_text = (INTERRUPTED_AFTER_DELIVERY_ERROR if delivery_attempted and not delivery_error
+                         else INTERRUPTED_ERROR)
         try:
             finish_execution(
                 execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)

@@ -423,7 +423,7 @@ class ScriptRunner:
         self._recovered.add(key)
         try:
             with _profile_cron_scope(home):
-                InProcessCronScheduler().recover_interrupted()
+                InProcessCronScheduler().recover_interrupted(replay_pass=False)
         except Exception:
             logger.error("script runner startup recovery failed for %s", home, exc_info=True)
 
