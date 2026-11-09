@@ -17,6 +17,7 @@ import subprocess
 from typing import List, Optional, Tuple
 
 from tools.file_operations_common import LintResult
+from tools.spawn_nofork import run_nofork
 
 SHELL_EXTS = frozenset({'.sh', '.bash'})
 
@@ -154,9 +155,10 @@ def _parse_check(content: str, dialect: str) -> Tuple[Optional[bool], str]:
         return None, "bash not available: parse check skipped"
     argv = [exe, "--posix", "-n"] if dialect == "sh" else [exe, "-n"]
     try:
-        proc = subprocess.run(
-            argv, input=content.encode("utf-8", "surrogateescape"), capture_output=True,
-            timeout=10, env={"LC_ALL": "C"})
+        # run_nofork: subprocess.run's close_fds=True forks the whole gateway (t_afc525a2).
+        proc = run_nofork(
+            argv, input=content.encode("utf-8", "surrogateescape"), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, env={"LC_ALL": "C"})
     except subprocess.TimeoutExpired:
         return None, f"bash -n ({label}) timed out: parse check skipped"
     except OSError as exc:

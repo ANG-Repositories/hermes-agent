@@ -28,9 +28,14 @@ from tools.environments.local_env_policy import (  # noqa: F401 — _HERMES_PROV
     strip_profile_gate_env)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
+from tools.spawn_nofork import spawn_popen
 
 
 _IS_WINDOWS = platform.system() == "Windows"
+# POSIX spawn trampoline: $1 is the cwd, the rest is bash's argv. /bin/sh reads no startup
+# file when non-interactive (bash invoked as sh included), so nothing runs twice.
+_POSIX_SH = "/bin/sh"
+_CD_THEN_EXEC = 'cd -- "$1" || exit 126; shift; exec "$@"'
 
 logger = logging.getLogger(__name__)
 
@@ -1040,12 +1045,19 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+        popen_kwargs = dict(
+            text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL)
+        if _IS_WINDOWS:
+            proc = subprocess.Popen(args, start_new_session=True, cwd=self.cwd,
+                                    creationflags=windows_hide_flags(), **popen_kwargs)
+        else:
+            # cwd= / start_new_session= make Popen fork the whole gateway under the GIL
+            # (t_afc525a2). posix_spawn has no chdir, so /bin/sh cds and execs bash: same pid,
+            # same argv for bash, and the login profile still starts in self.cwd.
+            proc = spawn_popen([_POSIX_SH, "-c", _CD_THEN_EXEC, "sh", self.cwd, *args],
+                               new_session=True, **popen_kwargs)
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
