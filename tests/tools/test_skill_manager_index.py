@@ -220,6 +220,7 @@ def test_skill_manage_patch_walks_at_most_once(tmp_path):
     with _roots(local), patch("tools.skill_manager_tool.HERMES_HOME", tmp_path), \
          patch("tools.skill_manager_tool._apply_skill_write_gate", return_value=None), \
          _count_walks() as walks, \
+         patch.object(smt, "_build_skill_index", wraps=smt._build_skill_index) as builds, \
          patch.object(smt, "_find_skill_indexed", wraps=smt._find_skill_indexed) as resolve:
         out = smt.skill_manage(action="patch", name="alpha", old_string="old line", new_string="new line")
         assert '"success": true' in out, out
@@ -229,6 +230,26 @@ def test_skill_manage_patch_walks_at_most_once(tmp_path):
         assert '"success": true' in out, out
         assert len(walks) == 1, walks
         assert resolve.call_count == 2  # exactly one resolution per public operation
+        assert builds.call_count == 1  # atomic same-path replacement never rebuilds
+
+
+def test_restored_category_permissions_reselect_local_override(tmp_path):
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("requires permission enforcement for a non-root process")
+    local, external = tmp_path / "skills", tmp_path / "external"
+    local_skill = _mk(local, "category/alpha")
+    external_skill = _mk(external, "alpha")
+    category = local_skill.parent
+    category.chmod(0)
+    try:
+        with _roots(local, external):
+            assert smt._find_skill("alpha")["path"] == external_skill
+            category.chmod(0o755)
+            assert smt._find_skill("alpha")["path"] == local_skill
+    finally:
+        category.chmod(0o755)
 
 
 def test_thread_invalidation_discards_inflight_build(tmp_path):

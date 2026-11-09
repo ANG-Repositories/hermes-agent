@@ -424,7 +424,7 @@ def _index_tree_unchanged(index):
     for path, (stamp, shape) in index["directories"].items():
         current = _directory_stamp(path)
         if current != stamp:
-            if _directory_shape(path) != shape:
+            if shape is None or _directory_shape(path) != shape:
                 return False
             # Atomic content replacement changes directory mtime, not discovery topology.
             index["directories"][path] = (current, shape)
@@ -462,6 +462,11 @@ def _build_skill_index(roots: List[Path]) -> Dict[str, Any]:
                        and not ("SKILL.md" in files and d in SKILL_SUPPORT_DIRS)]
             directories[directory] = (_directory_stamp(directory),
                                       (tuple(sorted(dirs)), "SKILL.md" in files))
+            # os.walk does not yield unreadable children. Watch their metadata too:
+            # chmod can restore a higher-precedence local skill without changing its parent.
+            for child in dirs:
+                path = directory / child
+                directories[path] = (_directory_stamp(path), _directory_shape(path))
         if not skills_dir.exists():
             continue
         for skill_dir in _iter_skill_dirs(skills_dir):

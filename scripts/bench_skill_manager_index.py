@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # SCHEDULE: manual (fixture benchmark invoked by implementer/reviewer)
-"""Fixture-only public skill_manage benchmark; pass pre-index source via --baseline."""
+"""Fixture-only public skill_manage benchmark; pass pre-index source via --baseline.
+
+Both versions run identical real patch/guard/atomic-write dispatch. Approval staging, sync,
+ledger, lifecycle telemetry and cross-profile diagnostics are isolated from the host. Cold
+means a cold path index, not cold Python imports. Walk counts are the deterministic gate;
+wall times include filesystem writes and are not a production latency estimate.
+"""
 import argparse
 import ast
 import json
@@ -18,7 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline', type=Path, required=True)
     args = parser.parse_args()
-    tree = ast.parse(args.baseline.read_text())
+    tree = ast.parse(args.baseline.read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_find_skill')
     scope = dict(vars(smt))
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(args.baseline), 'exec'), scope)
@@ -30,18 +36,21 @@ def main():
             directory = root / f'cat{i % 40}' / f'skill-{i}'
             directory.mkdir(parents=True)
             (directory / 'SKILL.md').write_text(
-                f'---\nname: skill-{i}\ndescription: Use when testing. Does a thing.\n---\n\n# Skill\n\nold line\n')
+                f'---\nname: skill-{i}\ndescription: Use when testing. Does a thing.\n---\n\n# Skill\n\nold line\n',
+                encoding='utf-8')
+        # Use the last discovered target, independent of filesystem directory ordering.
+        target = list(smt._iter_skill_dirs(root))[-1] / 'SKILL.md'
         with patch.object(smt, 'HERMES_HOME', home), patch.object(smt, 'SKILLS_DIR', root), \
              patch('agent.skill_utils.get_all_skills_dirs', return_value=[root]), \
              patch.object(smt, '_apply_skill_write_gate', return_value=None), \
              patch.object(smt, '_find_skill_in_other_profiles', return_value=[]), \
+             patch('tools.skill_ledger.ledger_enabled', return_value=False), \
+             patch('tools.skill_usage._emit_skill_lifecycle'), \
              patch.object(smt, '_maybe_debounced_sync_push'):
+            # Load the same lazy imports for BOTH cases outside the measurement.
             for label in ('before', 'after'):
-                target = root / 'cat39/skill-1999/SKILL.md'
-                target.write_text(target.read_text().replace('new line', 'old line'))
-                smt._invalidate_skill_index()
-                # Pre-index public dispatch had no operation binding. Reuse the actual original
-                # finder in every downstream caller, not a synthetic timing approximation.
+                target.write_text(target.read_text(encoding='utf-8').replace('new line', 'old line'),
+                                  encoding='utf-8')
                 call = smt.skill_manage.__wrapped__ if label == 'before' else smt.skill_manage
                 finder = original_find if label == 'before' else smt._find_skill
                 with patch.object(smt, '_find_skill', finder):
@@ -52,22 +61,37 @@ def main():
                         old, new = ('old line', 'new line') if counter % 2 == 0 else ('new line', 'old line')
                         if not missing:
                             counter += 1
-                        return json.loads(call(action='patch', name='absent' if missing else 'skill-1999',
+                        return json.loads(call(action='patch', name='absent' if missing else target.parent.name,
                                                old_string=old, new_string=new))
-                    t = time.perf_counter()
-                    first = invoke()
-                    assert first['success'], first
-                    cold = time.perf_counter() - t
-                    t = time.perf_counter()
-                    for _ in range(20):
+
+                    assert invoke()['success']
+                    smt._invalidate_skill_index()
+                    real_walk = smt._iter_skill_dirs
+                    with patch.object(smt, '_iter_skill_dirs', wraps=real_walk) as walks, \
+                         patch.object(smt, '_build_skill_index', wraps=smt._build_skill_index) as builds:
+                        if label == 'before':
+                            original_find.__globals__['_iter_skill_dirs'] = walks
+                        t = time.perf_counter()
                         assert invoke()['success']
-                    warm = (time.perf_counter() - t) / 20
-                    t = time.perf_counter()
-                    for _ in range(20):
-                        assert not invoke(True)['success']
-                    negative = (time.perf_counter() - t) / 20
-                    print(json.dumps(dict(version=label, skills=2000, cold_ms=cold * 1000,
-                                          repeated_ms=warm * 1000, negative_ms=negative * 1000)))
+                        cold = time.perf_counter() - t
+                        cold_walks = walks.call_count
+                        t = time.perf_counter()
+                        for _ in range(20):
+                            assert invoke()['success']
+                        warm = (time.perf_counter() - t) / 20
+                        warm_walks = walks.call_count - cold_walks
+                        t = time.perf_counter()
+                        for _ in range(20):
+                            assert not invoke(True)['success']
+                        negative = (time.perf_counter() - t) / 20
+                        negative_walks = walks.call_count - cold_walks - warm_walks
+                        if label == 'after':
+                            assert cold_walks == 1 and warm_walks == negative_walks == 0
+                            assert builds.call_count == 1
+                        print(json.dumps(dict(version=label, skills=2000, cold_ms=cold * 1000,
+                                              repeated_ms=warm * 1000, negative_ms=negative * 1000,
+                                              cold_walks=cold_walks, repeated_walks=warm_walks,
+                                              negative_walks=negative_walks, builds=builds.call_count)))
 
 
 if __name__ == '__main__':
