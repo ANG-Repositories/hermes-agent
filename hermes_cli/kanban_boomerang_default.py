@@ -1,7 +1,8 @@
 """Boomerang wake is decided at card birth, for every producer (Ace msg1569101606384050286).
 
-Every task row is written by :func:`kanban_db.create_task` or a triage-decomposition insert
-(``kanban_db_graph``), so this is the one place a card's ``boomerang_wake`` is settled. An
+Every task row is written by :func:`kanban_db.create_task`, a triage-decomposition insert
+(``kanban_db_graph``) or a failure-owner mint (``kanban_failure_ownership._create_owner``), and
+each settles ``boomerang_wake`` through :func:`resolve`, so this is the one rule. An
 explicit value from the caller (``--no-boomerang-wake``, ``boomerang_wake: false``) is stored
 as given; an unset value takes ``kanban.auto_subscribe_boomerang`` (default True). The card
 column is the only setting: there is no second opt-in elsewhere.
