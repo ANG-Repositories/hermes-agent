@@ -3905,8 +3905,8 @@ class GatewaySlashCommandsMixin(
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
-            # Explicit route beats an automatic one: read + close the fallback
-            # episode BEFORE the in-place swap resets the live flags.
+            # Capture fallback lineage BEFORE the in-place swap resets live flags;
+            # reply-first switches close its durable episode after delivery.
             _fallback_closures = [] if _defer is not None else None
             _fb_cleared = await asyncio.to_thread(
                 self._clear_fallback_for_user_route,
