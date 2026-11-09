@@ -4887,6 +4887,11 @@ class GatewayTurnMixin:
                 _heartbeat_text = f"{turn_ctx.wake_progress_header}\n{_heartbeat_text}"
             try:
                 _notify_res = None
+                # Re-resolve per tick: a mid-turn reconnect installs a NEW adapter object and the one captured
+                # at turn start answers "Session is closed" for the rest of the turn (t_8783804a). Same
+                # message id, so the heartbeat line keeps being edited in place on the live adapter.
+                with suppress(Exception):
+                    _notify_adapter = self._delivery_adapter_for(source) or _notify_adapter
                 if _heartbeat_msg_id:
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)

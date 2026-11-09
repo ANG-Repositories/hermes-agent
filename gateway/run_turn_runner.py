@@ -575,6 +575,10 @@ class TurnRunner:
         inflight_painted_at: float = float("-inf")
         inflight_name: Optional[str] = None
         inflight_since: float = 0.0   # monotonic start of the call the notice describes
+        # A delivery failed on a dead/superseded adapter: repaint the bubble once a live one is back.
+        repaint_pending: bool = False
+        # The original bubble could not be edited after a reconnect and was re-posted (at most once).
+        recreated_after_reconnect: bool = False
 
     def _fresh_progress_lines(self, st) -> list:
         return [st.wake_head] if st.wake_head and st.can_edit else []
@@ -605,6 +609,56 @@ class TurnRunner:
         )
         st.progress_lines = self._fresh_progress_lines(st)
         return st
+
+    def _live_progress_adapter(self):
+        """The adapter registered for this chat RIGHT NOW (None mid-reconnect). Never raises."""
+        try:
+            return self._runner._delivery_adapter_for(self._ctx.source)
+        except Exception:
+            return None
+
+    def _progress_transport_stale(self, st) -> bool:
+        """True when ``st.adapter`` is dead or superseded (t_8783804a): a failure through it says nothing
+        about the message, so it must not disable editing. Discord's liveness probe closes the session and
+        the reconnect watcher installs a NEW adapter object; the old one answers "Session is closed"."""
+        if getattr(st.adapter, "has_fatal_error", False) is True:
+            return True
+        live = self._live_progress_adapter()
+        # Superseded = the registry no longer holds it AND it is down; identity alone is not proof of death.
+        return live is None or (live is not st.adapter and getattr(st.adapter, "is_connected", True) is False)
+
+    async def _rebind_progress_adapter(self, st) -> None:
+        """After a mid-turn reconnect, move the bubble onto the live adapter and repaint the SAME message;
+        re-post it once if the original can no longer be edited (t_8783804a)."""
+        live = self._live_progress_adapter()
+        if (live is not None and live is not st.adapter and getattr(live, "has_fatal_error", False) is not True
+                and (st.repaint_pending or self._progress_transport_stale(st))):
+            logger.info("[%s] Progress bubble re-bound to the reconnected adapter (message %s)",
+                        getattr(live, "name", "?"), st.progress_msg_id)
+            st.adapter = live
+            st._edit_accepts_metadata = bool(self._ctx._progress_metadata) and _accepts_keyword(
+                live.edit_message, "metadata")
+            st.repaint_pending = True
+        if not st.repaint_pending or self._progress_transport_stale(st):
+            return
+        if not (st.can_edit and st.progress_msg_id is not None and st.progress_lines):
+            st.repaint_pending = False
+            return
+        text = self._progress_text(st.progress_lines)
+        result = await self._edit_progress_message(st, st.progress_msg_id, text)
+        if result.success:
+            st.repaint_pending = False
+            return
+        if getattr(result, "retryable", False) or self._progress_transport_stale(st):
+            return  # still transient: next tick retries
+        st.repaint_pending = False
+        if st.recreated_after_reconnect:
+            st.can_edit = False
+            return
+        st.recreated_after_reconnect = True
+        sent = await self._send_progress_text(st, text)
+        if sent.success and sent.message_id:
+            st.progress_msg_id = sent.message_id
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
@@ -655,6 +709,9 @@ class TurnRunner:
             if not result.success:
                 if getattr(result, "retryable", False):
                     logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
+                    return True
+                if self._progress_transport_stale(st):
+                    st.repaint_pending = True   # dead adapter, not a dead message (t_8783804a)
                     return True
                 st.can_edit = False
                 # Fall back to the existing non-edit behavior.
@@ -796,6 +853,13 @@ class TurnRunner:
             if getattr(result, "retryable", False):
                 logger.debug("[%s] Transient edit failure — keeping can_edit=True", st.adapter.name)
                 return False
+            if self._progress_transport_stale(st):
+                # "Session is closed" from a dead/superseded adapter: the message is fine, the transport
+                # is not. Keep editing; _rebind_progress_adapter repaints once the live adapter is back.
+                logger.info("[%s] Progress edit failed on a dead adapter (%s) — repaint after reconnect",
+                            st.adapter.name, getattr(result, "error", ""))
+                st.repaint_pending = True
+                return False
             if any(w in (getattr(result, "error", "") or "").lower() for w in ("flood", "retry after")):
                 logger.info("[%s] Progress edit flood control, backing off", st.adapter.name)
             else:
@@ -864,6 +928,7 @@ class TurnRunner:
                 # drain (and the notice's removal) would be skipped (Prism 3e31f1099cb9). Drain, then let the
                 # cancel propagate exactly as before: callers await the task and expect CancelledError.
                 try:
+                    await self._rebind_progress_adapter(st)
                     await self._paint_inflight_notice(st)
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
