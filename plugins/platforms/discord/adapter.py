@@ -2529,7 +2529,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             else:
                 load = None
                 with suppress(Exception):
-                    load = round(os.getloadavg()[0], 1)
+                    load = round(os.getloadavg()[0], 1)  # admission-lint: not-a-decider log context only, gates nothing
                 logger.error(
                     "[%s] No PHASE=event_loop_blocked during this unhealthy streak (no single call held the "
                     "loop >= 10 s); load1=%s ncpu=%s — suspect host CPU starvation or a slow Gateway ACK, "
