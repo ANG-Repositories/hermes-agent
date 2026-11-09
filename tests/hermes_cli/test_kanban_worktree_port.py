@@ -120,6 +120,48 @@ def test_other_repo_does_not_port(kanban_home, anchor):
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2))[0] == "local"
 
 
+def test_read_mirrors_per_host_override_and_old_shape(tmp_path):
+    mbp = "/Users/Shared/git-mirrors/hermes-home-mirror.git"
+    (tmp_path / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 1, "repos": {
+        SLUG: {"mirror": "/srv/ci/git-mirrors/hermes-home-mirror.git", "hosts": ["ci-box", "mbp-2026"],
+               "mirrors": {"MBP-2026": mbp}},
+        "ANG-Ventures/hermes-agent": {"mirror": "/srv/ci/git-mirrors/hermes-mirror.git", "hosts": ["ci-box"]},
+        "ANG-Ventures/bad": {"mirror": "/srv/x.git", "hosts": ["ci-box"], "mirrors": {"mbp-2026": "rel/x.git"}},
+        "ANG-Ventures/bad2": {"mirror": "/srv/x.git", "hosts": ["ci-box"], "mirrors": ["mbp-2026"]},
+    }}))
+    got = kwt.read_mirrors(tmp_path)
+    assert got[SLUG.lower()] == ("/srv/ci/git-mirrors/hermes-home-mirror.git", ("ci-box", "mbp-2026"),
+                                 {"mbp-2026": mbp})
+    # Old shape: no override, every host reads ``mirror``.
+    assert got["ang-ventures/hermes-agent"] == ("/srv/ci/git-mirrors/hermes-mirror.git", ("ci-box",), {})
+    # A malformed override fails the row closed.
+    assert "ang-ventures/bad" not in got and "ang-ventures/bad2" not in got
+    port = (SLUG, *got[SLUG.lower()])
+    assert kwt.mirror_for(port, "mbp-2026") == mbp
+    assert kwt.mirror_for(port, "ci-box") == "/srv/ci/git-mirrors/hermes-home-mirror.git"
+    assert kwt.mirror_for(port[:3], "mbp-2026") == "/srv/ci/git-mirrors/hermes-home-mirror.git"
+
+
+def test_ported_clone_uses_the_placed_hosts_mirror(kanban_home, anchor, monkeypatch):
+    mbp = "/Users/Shared/git-mirrors/hermes-home-mirror.git"
+    fleet = kanban_home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 1, "repos": {
+        SLUG: {"mirror": "/srv/ci/git-mirrors/hermes-home-mirror.git", "hosts": ["ace-ai"],
+               "mirrors": {"ace-ai": mbp}}}}))
+    calls = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
+                        calls.append((host.name, mirror)))
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                          (tid, kwt.PORTED_EVENT)).fetchone()
+    assert (tid, "ace-ai") in spawned
+    assert calls == [("ace-ai", mbp)]
+    assert json.loads(ev[0])["mirror"] == mbp
+
+
 def test_malformed_mirrors_file_ports_nothing(tmp_path):
     (tmp_path / kwt.MIRRORS_FILE).write_text("{not json")
     assert kwt.read_mirrors(tmp_path) == {}

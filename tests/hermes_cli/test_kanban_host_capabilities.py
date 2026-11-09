@@ -204,8 +204,13 @@ def test_held_body_sniff_rechecked_next_tick(home, fleet, monkeypatch, override,
         res, spawned = _tick(conn)
         assert spawned == []
         assert res.placement_waits[tid] == held
-        conn.execute("UPDATE tasks SET body=? WHERE id=?", (override + "\n" + body, tid))
-        conn.commit()
+        from hermes_cli import kanban_placement_view as pv
+        assert not any("body edited" in line for line in pv.format_task(pv.task_block(conn, tid)))
+        kb.edit_task(conn, tid, body=override + "\n" + body)
+        # Before the next routing tick the view says the hold predates the edit.
+        view = pv.format_task(pv.task_block(conn, tid))
+        assert any(line.startswith(f"  held: {held}") for line in view), view
+        assert any("body edited after this hold" in line for line in view), view
     # Reopen the DB to exclude in-memory routing state from the proof.
     with kb.connect_closing() as conn:
         res, spawned = _tick(conn)

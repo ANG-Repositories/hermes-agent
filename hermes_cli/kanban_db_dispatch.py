@@ -7898,10 +7898,11 @@ def _dispatch_once_locked(
                 resolved_branch_name = (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
                 claimed.workspace_kind, claimed.workspace_path = "scratch", None
                 workspace = _kbw.resolve_workspace(claimed, board=board)
-                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_port[1],
+                _wt_mirror = _kwt.mirror_for(_wt_port, placed_host.name)
+                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_mirror,
                                    resolved_branch_name)
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
-                             host=placed_host.name, slug=_wt_port[0], mirror=_wt_port[1])
+                             host=placed_host.name, slug=_wt_port[0], mirror=_wt_mirror)
             elif claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
