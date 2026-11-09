@@ -1665,9 +1665,13 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
     return on_card
 
 
-#: Archive attempts on a held launch's card before it is blocked instead, and the pause between them.
+#: Archive attempts on a held launch's card once it is parked, the pause between them, and how long the park waits for
+#: the board's dispatch lock (spawn_now's own wait).
 _HELD_ARCHIVE_TRIES = 3
 _HELD_ARCHIVE_RETRY_SECONDS = 0.5
+_HELD_PARK_LOCK_WAIT_SECONDS = 30.0
+#: Passes over a card the park re-reads after a state change it made (a stopped runner) or lost (a claim).
+_HELD_PARK_PASSES = 3
 
 
 def _local_hold_reason() -> Optional[str]:
@@ -1696,35 +1700,79 @@ def _held_card_status(task_id: str) -> Optional[str]:
 
 
 def _park_held_card(task_id: str, why: str) -> str:
-    """Make a held launch's card durably un-dispatchable: archived (retried), else blocked naming the hold.
-    Returns the failure-text suffix: ``""`` when archived."""
+    """Make a held launch's card durably un-dispatchable, in ONE step under the board's dispatch lock (the lock
+    spawn_now and a tick take, so park and dispatch are serialized; Prism c-e276793faf9cd84a). Park FIRST: a ready
+    card is blocked naming the hold (a ready-and-unclaimed compare-and-set, so it never relabels a running card); a
+    card found running has its runner stopped (the identity-checked reclaim kill) and is then parked. Only then is
+    the archive tried (bounded retries). Returns the failure-text suffix: ``""`` when archived with nothing stopped."""
+    from hermes_cli import kanban_db_connect as _kbc
     from tools import async_delegation_kanban as _akb
 
-    for attempt in range(_HELD_ARCHIVE_TRIES):
-        status = _held_card_status(task_id)
-        if status == "archived":
-            return ""
-        if status == "blocked":
-            return f"; card {task_id} is blocked"
-        if _akb._archive_quietly(task_id):
-            return ""
-        if attempt + 1 < _HELD_ARCHIVE_TRIES:
-            time.sleep(_HELD_ARCHIVE_RETRY_SECONDS)
     kb = _akb._kb()
+    deadline = time.monotonic() + _HELD_PARK_LOCK_WAIT_SECONDS
+    while True:
+        with _kbc._dispatch_tick_lock(kb.kanban_db_path(board=_akb._board())) as locked:
+            if locked or time.monotonic() >= deadline:
+                if not locked:
+                    # The block is still a compare-and-set on ready+unclaimed: a claim that wins is re-read as
+                    # running and stopped, never relabelled.
+                    logger.warning("async_delegation_kanban_park_unlocked task_id=%s", task_id)
+                return _park_held_card_locked(task_id, why)
+        time.sleep(0.2)
+
+
+def _park_held_card_locked(task_id: str, why: str) -> str:
+    from tools import async_delegation_kanban as _akb
+
+    kb = _akb._kb()
+    reason = f"delegation launch refused on a held host: {why}"
+    stopped = unstoppable = False
+    status = None
     try:
         with kb.connect_closing(board=_akb._board()) as conn:
-            if kb.block_task(conn, task_id, kind="capability",
-                             reason=f"delegation launch refused on a held host; archive failed: {why}"):
-                logger.warning("async_delegation_kanban_held_card_blocked task_id=%s", task_id)
-                return f"; card {task_id} could not be archived and is blocked"
+            for _ in range(_HELD_PARK_PASSES):
+                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                status = row["status"] if row is not None else None
+                if status == "running":
+                    # A runner started before the lock: stop it the way a cancel does (identity-checked kill, the
+                    # claim released), then park it on the next pass. Never block_task a running card: that
+                    # clears worker_pid and leaves the worker running.
+                    if kb.reclaim_task(conn, task_id, reason=reason):
+                        stopped = True
+                        logger.warning("async_delegation_kanban_held_card_runner_stopped task_id=%s", task_id)
+                        continue
+                    unstoppable = True
+                    break
+                if status == "ready" and kb.block_task(conn, task_id, kind="capability", reason=reason,
+                                                       require_unclaimed_ready=True):
+                    status = "blocked"
+                    logger.warning("async_delegation_kanban_held_card_blocked task_id=%s", task_id)
+                    break
+                if status != "ready":
+                    break
     except Exception:
-        logger.warning("async_delegation_kanban_block_failed task_id=%s", task_id, exc_info=True)
-    final = _held_card_status(task_id)
-    if final in ("archived", "blocked"):
-        return f"; card {task_id} is {final}"
-    logger.error("async_delegation_kanban_held_card_unparked task_id=%s", task_id)
-    return (f"; card {task_id} could not be archived or blocked (its runner finds no running attempt; "
-            "the card-end watcher drains it)")
+        logger.warning("async_delegation_kanban_park_failed task_id=%s", task_id, exc_info=True)
+    note = f"; card {task_id} was running; its runner was stopped" if stopped else ""
+    if status != "archived":
+        # Parked first; now the archive (it also stops a runner the reclaim could not prove dead).
+        for attempt in range(_HELD_ARCHIVE_TRIES):
+            if _akb._archive_quietly(task_id):
+                status = "archived"
+                break
+            if attempt + 1 < _HELD_ARCHIVE_TRIES:
+                time.sleep(_HELD_ARCHIVE_RETRY_SECONDS)
+        else:
+            status = _held_card_status(task_id)
+    if status == "archived":
+        return note
+    if status == "blocked":
+        return f"{note}; card {task_id} could not be archived and is blocked"
+    if unstoppable and status == "running":
+        logger.error("async_delegation_kanban_held_card_runner_unstopped task_id=%s", task_id)
+        return f"{note}; card {task_id} is running and its runner could not be stopped or archived"
+    logger.error("async_delegation_kanban_held_card_unparked task_id=%s status=%s", task_id, status)
+    return (f"{note}; card {task_id} could not be archived or blocked (status {status}; its runner finds no "
+            "running attempt; the card-end watcher drains it)")
 
 
 #: ``runtime`` delegate_task reports for a unit whose card spawned.

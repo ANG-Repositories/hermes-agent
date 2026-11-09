@@ -1628,6 +1628,7 @@ def test_dispatch_lock_contention_never_falls_back_on_a_held_host(monkeypatch, t
 
     real_spawn_now = kbd.spawn_now
     monkeypatch.setattr(kbd._kbc, "_dispatch_tick_lock", _busy)
+    monkeypatch.setattr(ad, "_HELD_PARK_LOCK_WAIT_SECONDS", 0.0)    # the lock is busy forever here: park unlocked
     monkeypatch.setattr(kbd, "spawn_now", lambda conn, task_id, **kw: real_spawn_now(
         conn, task_id, lock_wait_seconds=0, **kw))
     handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
