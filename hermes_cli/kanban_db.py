@@ -9281,11 +9281,14 @@ def _append_event(
     if kind == "review_requested":
         # A raw-entry trigger supplies provisional provenance before the normal
         # handoff writer has finished. Finalize that row rather than publish two
-        # handoffs (and two notifications) for the same entry.
+        # handoffs (and two notifications) for the same entry. Only a row that
+        # is still the card's NEWEST event belongs to this entry: an older
+        # provisional row is a previous episode's handoff, and rewriting it
+        # would erase this episode (t_7296326e).
         provisional = conn.execute(
             "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_requested' "
             "AND json_valid(payload) AND json_extract(payload,'$.source')='lifecycle_entry_repair' "
-            "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested')",
+            "AND id=(SELECT max(id) FROM task_events WHERE task_id=?)",
             (task_id, task_id),
         ).fetchone()
         if provisional is not None:
