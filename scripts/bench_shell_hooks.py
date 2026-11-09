@@ -185,7 +185,7 @@ def main() -> int:
                 s.close()
         result = {"hooks": len(scripts), "hook_bytes": sum(os.path.getsize(s) for s in scripts),
                   "python": a.python, "before": a.before, "after": str(a.after),
-                  "load1_end": round(os.getloadavg()[0], 1), "ncpu": os.cpu_count()}
+                  "load1_end": round(os.getloadavg()[0], 1), "ncpu": os.cpu_count()}  # admission-lint: not-a-decider bench telemetry only
         for side, s in sides.items():
             result[side] = _stats(s, names)
         b, f = result["before"], result["after"]
