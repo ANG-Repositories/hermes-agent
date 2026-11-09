@@ -4304,17 +4304,23 @@ class GatewaySlashCommandsMixin(
     ) -> Optional[str]:
         """Durable half of a reply-first /model switch (t_2ab07928), run after the confirmation
         was delivered. The in-memory override, eviction and one-turn bookkeeping already ran on
-        the loop. Every phase re-checks that this switch is still the session's latest (``seq``),
-        right before it writes and again after any await, so a superseded switch never writes over
-        a newer one (state.db, store or config.yaml). ``done`` records completed phases on the job:
-        a drain cancelled mid-job resumes after them and never repeats a config.yaml write.
-        Returns the failure text for the follow-up line, or None."""
+        the loop. Session persistence re-checks that this switch is still the session's latest
+        (``seq``); global config intent is independent of later session-only picks. ``done`` records
+        completed phases and failures on the job, so a cancelled drain resumes without replaying
+        config.yaml writes or losing a warning. Returns failure text for the follow-up, or None."""
         from gateway import slash_commands_model as _model_mixin
 
         def latest() -> bool:
             return self._model_override_seq(session_key) == seq
 
-        failures: list = []
+        # Keep failures on the job along with completed phases: cancellation can resume this
+        # function after a failed config/DB phase, and must not erase its visible warning.
+        failures = [item[1] for item in done if isinstance(item, tuple) and item[0] == "failure"]
+
+        def failed(message):
+            failures.append(message)
+            done.add(("failure", message))
+
         _sess_db = getattr(self, "_session_db", None)
         if "db" not in done and _sess_db is not None and latest():
             try:
@@ -4328,23 +4334,21 @@ class GatewaySlashCommandsMixin(
                     )
             except Exception as exc:
                 logger.warning("Failed to persist model switch to DB: %s", exc)
-                failures.append(f"session database not updated ({exc})")
+                failed(f"session database not updated ({exc})")
         done.add("db")
 
-        global_error: Optional[str] = None
         if persist_global and "config" not in done:
-            if latest():
-                try:
-                    async with self._model_config_write_lock():
-                        # Re-checked under the lock: a newer switch may have landed while we waited.
-                        if latest():
-                            await _model_mixin._persist_model_switch_to_config(result, config_path)
-                            done.add("config_written")
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
-                    global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
+            # Global intent is independent of this session's latest override. A later
+            # session-only pick must not discard the confirmed global default change.
+            try:
+                async with self._model_config_write_lock():
+                    await _model_mixin._persist_model_switch_to_config(result, config_path)
+                    done.add("config_written")
+            except Exception as e:
+                logger.warning("Failed to persist model switch: %s", e)
+                failed(t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__))
             done.add("config")
-        drop_override = (persist_global and global_error is None and "config_written" in done
+        drop_override = (persist_global and "config_written" in done
                          and self._channel_override_for(event_source) is None)
 
         if "store" not in done:
@@ -4352,6 +4356,18 @@ class GatewaySlashCommandsMixin(
             # lock); the seq is re-read at that boundary, after the config await (Prism 9ea56997a2df).
             if latest():
                 try:
+                    # Save the selected identity before removing a redundant global override.
+                    # If cleanup fails, restart must restore this pick, never the old identity.
+                    if drop_override and "fallback_saved" not in done:
+                        await self._persist_session_model_override(
+                            session_key, override, require_persistence=True, persist_only=True,
+                        )
+                        if latest() and not one_turn:
+                            await self.async_session_store.set_model_override(session_key, override)
+                        done.add("fallback_saved")
+                    if not latest():
+                        done.add("store")
+                        return "; ".join(failures) or None
                     await self._persist_session_model_override(
                         session_key, None if drop_override else override,
                         require_persistence=True, persist_only=True,
@@ -4362,18 +4378,16 @@ class GatewaySlashCommandsMixin(
                 except Exception as exc:
                     if drop_override:
                         logger.warning("Failed to clear persisted session model override: %s", exc)
-                        global_error = t("gateway.model.err_stale_override", error=exc)
+                        failed(t("gateway.model.err_stale_override", error=exc))
                     else:
                         logger.warning("Failed to persist session model override: %s", exc)
-                        failures.append(f"session override not saved ({exc})")
+                        failed(f"session override not saved ({exc})")
                 else:
                     if drop_override and latest():
                         # NOTE(P3b/RC-2): the persisted identity was cleared through the single door
                         # above (persist_only); this is its in-memory half, still this switch's own.
                         self._session_model_overrides.pop(session_key, None)
             done.add("store")
-        if global_error is not None:
-            failures.insert(0, global_error)
         return "; ".join(failures) or None
 
     async def _announce_model_switch(

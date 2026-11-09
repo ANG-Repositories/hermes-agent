@@ -361,3 +361,63 @@ def test_telegram_dm_commands_share_one_switch_lock(tmp_path, monkeypatch):
     lobby = _source()
     threaded = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", thread_id="42")
     assert h.runner._model_switch_lock_key(lobby) == h.runner._model_switch_lock_key(threaded)
+
+
+@pytest.mark.asyncio
+async def test_session_switch_does_not_discard_queued_global_intent(tmp_path, monkeypatch):
+    h = _Harness(tmp_path, monkeypatch)
+    await h.adapter.handle_message(_ev("/model model-A --global"))
+    await asyncio.wait_for(h.db.entered.wait(), 5)
+    await h.adapter.handle_message(_ev("/model model-B"))
+    await _wait_for(lambda: h.sent_with(_switched("model-B")), "second confirmation")
+    h.db.release.set()
+    await _drained(h)
+    assert yaml.safe_load(h.cfg_path.read_text())["model"]["default"] == "model-A"
+    assert h.runner.session_store.get_model_override(h.key())["model"] == "model-B"
+
+
+@pytest.mark.asyncio
+async def test_failed_global_cleanup_keeps_new_identity_persisted(tmp_path, monkeypatch):
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    await h.adapter.handle_message(_ev("/model model-B"))
+    await _drained(h)
+    real_clear = h.runner.session_store.clear_model_route_override
+
+    def fail_clear(key):
+        raise OSError("clear failed")
+
+    monkeypatch.setattr(h.runner.session_store, "clear_model_route_override", fail_clear)
+    await h.adapter.handle_message(_ev("/model model-A --global"))
+    await _drained(h)
+    assert h.sent_with(FOLLOWUP)
+    entry = h.runner.session_store.entry_for(h.key())
+    assert entry.model_override_identity["model"] == "model-A"
+    assert h.runner.session_store.get_model_override(h.key())["model"] == "model-A"
+    monkeypatch.setattr(h.runner.session_store, "clear_model_route_override", real_clear)
+
+
+@pytest.mark.asyncio
+async def test_config_failure_survives_cancelled_drain(tmp_path, monkeypatch):
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_persist = h.runner._persist_session_model_override
+
+    async def fail_config(result, config_path):
+        raise OSError("config disk full")
+
+    async def held_persist(key, override, **kw):
+        if kw.get("persist_only"):
+            entered.set()
+            await release.wait()
+        return await real_persist(key, override, **kw)
+
+    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", fail_config)
+    h.runner._persist_session_model_override = held_persist
+    await h.adapter.handle_message(_ev("/model model-A --global"))
+    await asyncio.wait_for(entered.wait(), 5)
+    await h.adapter.cancel_session_processing(h.key())
+    release.set()
+    await _drained(h)
+    assert any("config disk full" in line for line in h.sent_with(FOLLOWUP))
