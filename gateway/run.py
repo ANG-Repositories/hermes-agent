@@ -2356,6 +2356,19 @@ from gateway.run_turn_runner import TurnRunner
 logger = logging.getLogger(__name__)
 
 
+def _describe_state_db_write_lock_holders(store: Any, window_s: float) -> str:
+    """Executor job: who held the routing store's state.db write lock in the last ``window_s``.
+
+    Resolves the DB handle here, off the event loop: ``SessionStore._routing_db`` can take the
+    store's lock (t_41843f70; tests/gateway/test_no_agent_construction_on_event_loop.py).
+    """
+    db_path = getattr(getattr(store, "_routing_db", None), "db_path", None)
+    if not db_path:
+        return "holder unknown: no routing state.db"
+    from hermes_state_lockowners import describe_write_lock_holders
+    return describe_write_lock_holders(db_path, window_s)
+
+
 def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
     """Call ``fn``; return None on any Exception (debug-logged via ``debug_msg`` ``%s`` if given)."""
     try:
@@ -7872,18 +7885,9 @@ class GatewayRunner(
         delays the /stop ack; never raises.
         """
         try:
-            db_path = getattr(self.session_store._routing_db, "db_path", None)  # noqa: SLF001
-        except Exception:
-            db_path = None
-        if not db_path:
-            return
-
-        def _describe() -> str:
-            from hermes_state_lockowners import describe_write_lock_holders
-            return describe_write_lock_holders(db_path, waited + 5.0)
-
-        try:
-            future = asyncio.get_running_loop().run_in_executor(None, _describe)
+            future = asyncio.get_running_loop().run_in_executor(
+                None, _describe_state_db_write_lock_holders, getattr(self, "session_store", None),
+                waited + 5.0)
         except Exception:
             return
 
