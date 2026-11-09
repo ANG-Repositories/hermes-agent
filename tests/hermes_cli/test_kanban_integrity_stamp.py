@@ -115,27 +115,61 @@ def test_inode_change_reruns_full_check(tmp_path):
     assert _spawn_connects(db, 1, tmp_path) == 1
 
 
-def test_same_inode_restore_of_older_copy_reruns_full_check(tmp_path):
-    """Prism ed5edb9798ea: ``cp backup kanban.db`` keeps the inode."""
-    db = tmp_path / "kanban.db"
-    _seed(db)
-    backup = tmp_path / "backup.db"
-    shutil.copyfile(db, backup)
+def _corrupt_bytes(size: int) -> bytes:
+    header = b"SQLite format 3\x00" + b"\x10\x00\x02\x02\x00\x40\x20\x20"
+    header += b"\x00\x00\x00\x0c\x00\x00\x23\x46\x00\x00\x00\x00"
+    return (header.ljust(100, b"\x00") + b"not a page \x00\x01" * (size // 13 + 1))[:size]
+
+
+def _grow_and_stamp(db: Path, tmp_path: Path) -> int:
+    """Grow the board past its seed size, then leave a fresh stamp for the
+    grown file written by a real fresh process. Returns the grown size."""
     with kbc.connect_closing(db_path=db) as conn:
         conn.execute("CREATE TABLE filler(x BLOB)")
         conn.executemany("INSERT INTO filler VALUES (zeroblob(4096))", [()] * 256)
         conn.commit()
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     kb._INITIALIZED_PATHS.discard(str(db.resolve()))
-    assert _spawn_connects(db, 1, tmp_path) <= 1
+    _stamp(db).unlink(missing_ok=True)  # drop the stamp this process wrote
+    assert _spawn_connects(db, 1, tmp_path) == 1
     assert _stamp(db).exists()
+    return db.stat().st_size
+
+
+def _rewrite_in_place(db: Path, data: bytes) -> None:
     inode = db.stat().st_ino
     for sidecar in ("-wal", "-shm"):
         Path(str(db) + sidecar).unlink(missing_ok=True)
-    shutil.copyfile(backup, db)  # truncate + rewrite in place
+    with db.open("r+b") as fh:  # truncate + rewrite: same inode, like `cp x kanban.db`
+        fh.truncate(0)
+        fh.write(data)
     assert db.stat().st_ino == inode
 
+
+def test_same_inode_restore_of_older_copy_reruns_full_check(tmp_path):
+    """Prism ed5edb9798ea: ``cp backup kanban.db`` keeps the inode."""
+    db = tmp_path / "kanban.db"
+    _seed(db)
+    backup = (tmp_path / "backup.db")
+    shutil.copyfile(db, backup)
+    _grow_and_stamp(db, tmp_path)
+    _rewrite_in_place(db, backup.read_bytes())
+
     assert _spawn_connects(db, 1, tmp_path) == 1
+
+
+def test_db_corrupted_in_place_under_fresh_stamp_quarantines(tmp_path):
+    """Prism ed5edb9798ea: a damaged file on the SAME inode under a fresh
+    stamp must still reach the full check and be quarantined."""
+    db = tmp_path / "kanban.db"
+    _seed(db)
+    grown = _grow_and_stamp(db, tmp_path)
+    _rewrite_in_place(db, _corrupt_bytes(grown // 2))
+    kb._INITIALIZED_PATHS.discard(str(db.resolve()))
+
+    with pytest.raises(kbc.KanbanDbCorruptError):
+        kbc.connect(db_path=db)
+    assert list(tmp_path.glob("kanban.db.corrupt.*.bak"))
 
 
 def test_stamp_from_another_boot_reruns_full_check(tmp_path):
@@ -174,10 +208,8 @@ def test_corrupt_db_quarantines_despite_fresh_stamp_from_other_inode(tmp_path):
     _seed(db)
     assert _spawn_connects(db, 1, tmp_path) <= 1
     assert _stamp(db).exists()
-    header = b"SQLite format 3\x00" + b"\x10\x00\x02\x02\x00\x40\x20\x20"
-    header += b"\x00\x00\x00\x0c\x00\x00\x23\x46\x00\x00\x00\x00"
     corrupt = tmp_path / "corrupt.tmp"
-    corrupt.write_bytes(header.ljust(100, b"\x00") + b"not a page \x00\x01" * 256)
+    corrupt.write_bytes(_corrupt_bytes(100 + 13 * 256))
     for sidecar in ("-wal", "-shm"):
         Path(str(db) + sidecar).unlink(missing_ok=True)
     os.replace(corrupt, db)

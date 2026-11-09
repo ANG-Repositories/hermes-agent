@@ -548,7 +548,7 @@ def _boot_id() -> str:
     """Per-boot id (Linux ``boot_id``, macOS ``kern.bootsessionuuid``); ``""``
     when unknown. Not a boot time: a clock step moves that."""
     with contextlib.suppress(OSError):
-        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8-sig").strip()
     if sys.platform == "darwin":
         with contextlib.suppress(OSError, AttributeError):
             import ctypes
@@ -593,7 +593,7 @@ def _integrity_stamp_is_fresh(resolved: Path, fingerprint: Optional[dict]) -> bo
     if ttl <= 0 or fingerprint is None:
         return False
     try:
-        data = json.loads(_integrity_stamp_path(resolved).read_text())
+        data = json.loads(_integrity_stamp_path(resolved).read_text(encoding="utf-8-sig"))
         same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth", "boot"))
         not_shrunk = fingerprint["size"] >= int(data["size"])
         age = time.time() - float(data["checked_at"])
@@ -614,7 +614,7 @@ def _write_integrity_stamp(resolved: Path, fingerprint: Optional[dict], checked_
     stamp = _integrity_stamp_path(resolved)
     tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(json.dumps({**fingerprint, "checked_at": checked_at}))
+        tmp.write_text(json.dumps({**fingerprint, "checked_at": checked_at}), encoding="utf-8")
         os.replace(tmp, stamp)
     except OSError:
         with contextlib.suppress(OSError):
