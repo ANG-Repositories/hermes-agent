@@ -40,6 +40,12 @@ def home(tmp_path, monkeypatch):
     ad._reset_for_tests()
     monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
     akb.set_dispatcher_active(False)
+    # The tests below pin the kill switch (background_kanban_fallback: in_process); the default detached
+    # fallback is covered by the ``detached_fallback`` tests at the end of this file (t_49e02567).
+    from tools import delegate_tool_config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "_get_kanban_launch_fallback", lambda: "in_process")
+    monkeypatch.setattr(ad, "_KANBAN_LAUNCH_RETRY_DELAYS", ())
     yield root
     akb.set_dispatcher_active(False)
     ad._reset_for_tests()
@@ -1729,3 +1735,75 @@ def test_pause_hold_refusal_stops_a_runner_found_running_under_the_lock(monkeypa
     terminal = json.dumps([e for e in rec["outbox"] if e.get("type") == "async_delegation"])
     assert f"card {task_id} was running; its runner was stopped" in terminal, terminal
     assert rec["state"] == "failed" and calls == [] and not akb._fenced_launch(task_id)
+
+
+# ── detached fallback (t_49e02567): a failed card spawn never runs the unit in the gateway ──────────
+
+
+@pytest.fixture
+def detached_fallback(monkeypatch):
+    """The default ``background_kanban_fallback: detached``; the detached child is recorded, not spawned."""
+    from tools import delegate_detached as dd
+    from tools import delegate_tool_config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "_get_kanban_launch_fallback", lambda: "detached")
+    monkeypatch.setattr(dd, "spawn_mode", lambda: "scoped")
+    seen = []
+
+    def _fake_detached(delegation_id, attempt_id, profile_home, *, continuation, live_delegation_id,
+                       fallback_runner, on_spawned=None):
+        seen.append({"attempt_id": attempt_id, "record": _record(delegation_id), "fallback": fallback_runner})
+        return {"results": [{"task_index": 0, "status": "completed", "summary": "detached result"}],
+                "total_duration_seconds": 0.1}, None
+
+    monkeypatch.setattr(ad, "_run_detached_unit", _fake_detached)
+    return seen
+
+
+def test_default_fallback_runs_a_failed_spawn_as_a_detached_child(monkeypatch, tmp_path, detached_fallback):
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    did = handle["delegation_id"]
+    assert calls == [], "the in-process runner never runs"
+    assert len(detached_fallback) == 1
+    seen = detached_fallback[0]
+    assert seen["fallback"] is ad._refuse_in_process
+    assert seen["record"]["execution"]["detached"] is True, "the next boot adopts the child"
+    assert seen["record"]["attempt"]["generation"] == 1 and seen["attempt_id"] == seen["record"]["attempt"]["attempt_id"]
+    assert ad.kanban_launch_runtime(did, timeout=0) == "detached (kanban spawn failed: OSError)"
+    assert _record(did)["state"] == "done"
+
+
+def test_refuse_in_process_raises():
+    with pytest.raises(RuntimeError, match="no in-process fallback"):
+        ad._refuse_in_process()
+
+
+def test_host_that_cannot_detach_errors_instead_of_running_in_process(monkeypatch, tmp_path, detached_fallback):
+    from tools import delegate_detached as dd
+
+    monkeypatch.setattr(dd, "spawn_mode", lambda: "degraded")
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    did = handle["delegation_id"]
+    assert calls == [] and detached_fallback == []
+    rec = _record(did)
+    assert rec["state"] == "failed" and rec["attempt"]["generation"] == 0
+    assert ad.kanban_launch_runtime(did, timeout=0) == "none (kanban spawn failed: OSError; not run)"
+
+
+def test_transient_launch_error_is_retried_before_leaving_kanban(monkeypatch, tmp_path, spawner, detached_fallback):
+    real = akb.launch_unit
+    tries = []
+
+    def _flaky(**kw):
+        tries.append(1)
+        if len(tries) == 1:
+            return {"ok": False, "error": "TimeoutError: timed out acquiring async-delegations.lock",
+                    "task_id": None, "fenced": True}
+        return real(**kw)
+
+    monkeypatch.setattr(akb, "launch_unit", _flaky)
+    monkeypatch.setattr(ad, "_KANBAN_LAUNCH_RETRY_DELAYS", (0.0, 0.0))
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    assert len(tries) == 2 and calls == [] and detached_fallback == []
+    assert ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME

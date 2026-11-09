@@ -124,6 +124,14 @@ def _get_background_runtime() -> str:
     value = str(_cfg().get("background_runtime") or "in_process").strip().lower()
     return "kanban" if value == "kanban" else "in_process"
 
+def _get_kanban_launch_fallback() -> str:
+    """delegation.background_kanban_fallback: where a kanban-eligible background unit runs when its card
+    cannot be spawned (t_49e02567). ``"detached"`` (default) runs it as a detached child process that
+    survives a gateway restart, and never inside the gateway: a host that cannot detach gets an error
+    delivered instead. ``"in_process"`` is the kill switch restoring the gateway-thread fallback."""
+    value = str(_cfg().get("background_kanban_fallback") or "detached").strip().lower()
+    return "in_process" if value == "in_process" else "detached"
+
 def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one
