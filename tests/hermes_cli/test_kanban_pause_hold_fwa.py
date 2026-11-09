@@ -805,3 +805,56 @@ def test_held_portable_destination_is_filtered_case_insensitively(home, monkeypa
         res, spawned = _tick(conn, plan)
         assert {(t, "ace-ai") for t in tids} <= set(spawned), (spawned, res.placement_waits)
         assert not any(t in res.placement_waits for t in tids), res.placement_waits
+
+
+# -- round 6 (Prism round 4 @ 13b1957d: b622dcc4adae / 5afa560835bc) ------------------------------------------------
+
+def _label_card(holds_out, tid):
+    return next(c for c in holds_out["cards"] if c["task_id"] == tid)
+
+
+def _dest_label(conn, home, monkeypatch, body, origin):
+    """A card the destination fence waited (a live hold on ci-box, the dispatcher's own host); its label is open."""
+    _local_is(monkeypatch, "ci-box")
+    tid = kb.create_task(conn, title="dest", assignee="alpha", body=body)
+    _set(conn, tid, status="ready", origin_host=origin)
+    hold = _hold(home)
+    res, _spawned = _tick(conn, _plan())
+    assert "stage=destination" in res.placement_waits.get(tid, ""), res.placement_waits
+    return tid, hold
+
+
+@pytest.mark.parametrize("body,origin", [
+    pytest.param("do the thing", None, id="origin-less-local"),
+    pytest.param("host: ci-box\ndo the thing", "ace-ai", id="body-pin-unheld-origin"),
+])
+def test_destination_label_reads_live_in_placement_holds(home, monkeypatch, body, origin):
+    """b622dcc4adae / 5afa560835bc: a pause_hold label written by a destination fence is LIVE while that destination
+    is held, even though decide(origin) holds nothing; it reads stale once the hold is gone."""
+    with kb.connect_closing() as conn:
+        tid, hold = _dest_label(conn, home, monkeypatch, body, origin)
+        card = _label_card(kph.holds(conn), tid)
+        assert card["live"] is True and card["now"] is not None, card
+        assert "stage=destination" in card["now"][1], card
+        hold.unlink()
+        card = _label_card(kph.holds(conn), tid)
+        assert card["live"] is False and card["now"] is None, card
+
+
+def test_live_destination_label_is_not_cleared_as_stale(home, monkeypatch):
+    """The stale-label sweep uses the same liveness: a destination label stays while its host is held (a tick that
+    did not route the card again must not end it), and is cleared once the hold is gone."""
+    with kb.connect_closing() as conn:
+        tid, hold = _dest_label(conn, home, monkeypatch, "do the thing", None)
+        empty = type("R", (), {"placement_waits": {}})()
+        assert kph.clear_stale_labels(conn, empty, False, {}) == []
+        hold.unlink()
+        assert kph.clear_stale_labels(conn, empty, False, {}) == [tid]
+
+
+def test_destination_label_liveness_is_off_under_the_kill_switch(home, monkeypatch):
+    """Dormant == identical: under ``pause_hold_source: manifest`` no fwa destination holds, so the label is stale."""
+    with kb.connect_closing() as conn:
+        tid, _hold_path = _dest_label(conn, home, monkeypatch, "do the thing", None)
+        _source(monkeypatch, "manifest")
+        assert _label_card(kph.holds(conn), tid)["live"] is False
