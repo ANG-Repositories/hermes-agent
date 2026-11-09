@@ -143,7 +143,6 @@ _HISTORY_NAME = "history.jsonl"
 # rotating (a single O_APPEND write is already safe across processes), so a writer never blocks long
 # and an archived generation is never overwritten. Never matches _LEDGER_NAME_RE, so never pruned.
 _HISTORY_LOCK_NAME = "history.lock"
-_HISTORY_LOCK_WAIT_S = 0.2
 _HISTORY_MAX_BYTES = 4 * 1024 * 1024
 # A writer that has waited this long for the write lock logs the holder on its own side.
 WAITER_ATTRIBUTION_S = 10.0
@@ -380,6 +379,14 @@ def _phase_suffix(rec: dict, now: float, *, released: bool) -> str:
 
 
 def hold_ended(token: Optional[int]) -> None:
+    """Best-effort telemetry: no diagnostic failure may escape transaction cleanup."""
+    try:
+        _hold_ended(token)
+    except Exception:
+        pass
+
+
+def _hold_ended(token: Optional[int]) -> None:
     """Close a hold; one of >= _HOLD_RECORD_MIN_S is written to the ledger with its duration."""
     if token is None:
         return
@@ -419,9 +426,8 @@ def _try_lock_fd(lock_fd: int) -> bool:
 
 
 def _open_history_lock(name: str, *, dir_fd: Optional[int] = None) -> Optional[int]:
-    """fd of history.lock, or None when it cannot be opened (a directory or symlink planted under that
-    name, EACCES). None means "rotate nothing, still append" (Prism acdf6a446932): the lock guards only
-    rotation, so an unusable lock file must never cost the record itself."""
+    """fd of history.lock, or None when unusable. Drop diagnostics on failure: every
+    append needs the rotation lock to preserve the hard byte bound."""
     try:
         if dir_fd is None:
             return os.open(name, os.O_RDWR | os.O_CREAT, 0o600)
@@ -432,23 +438,18 @@ def _open_history_lock(name: str, *, dir_fd: Optional[int] = None) -> Optional[i
 
 
 def _acquire_history_lock(lock_fd: int) -> bool:
-    """True once the cross-process history lock is held; False after _HISTORY_LOCK_WAIT_S."""
-    deadline = time.monotonic() + _HISTORY_LOCK_WAIT_S
-    while True:
-        try:
-            if _try_lock_fd(lock_fd):
-                return True
-        except OSError:
-            return False
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.01)
+    """One immediate attempt. Contended diagnostics are dropped, never waited for."""
+    try:
+        return _try_lock_fd(lock_fd)
+    except Exception:
+        return False
 
 
 def _append_history(hold: dict, fields: dict) -> None:
     """Append one released hold to <ledger>/history.jsonl, rotating at _HISTORY_MAX_BYTES.
     Callers hold _publish_lock (threads of this process); rotate+append also holds the cross-process
-    history.lock, and rotation is skipped when that lock is busy. Never raises. Runs after
+    history.lock. Busy/unusable locks and oversized records are dropped, never retried or
+    appended unlocked. Never raises. Runs after
     _write_record, which resolved the ledger."""
     try:
         ledger = hold.get("ledger")
@@ -461,10 +462,13 @@ def _append_history(hold: dict, fields: dict) -> None:
             path = os.path.join(ledger, _HISTORY_NAME)
             lock_fd = _open_history_lock(os.path.join(ledger, _HISTORY_LOCK_NAME))
             try:
-                if lock_fd is not None and _acquire_history_lock(lock_fd):  # released by the close below
-                    with contextlib.suppress(OSError):
-                        if os.path.getsize(path) + len(line) > _HISTORY_MAX_BYTES:
-                            os.replace(path, path + ".1")
+                if lock_fd is None or not _acquire_history_lock(lock_fd):
+                    return  # drop: unlocked appends would defeat rotation and the byte bound
+                if len(line) > _HISTORY_MAX_BYTES:
+                    return
+                with contextlib.suppress(FileNotFoundError):
+                    if os.path.getsize(path) + len(line) > _HISTORY_MAX_BYTES:
+                        os.replace(path, path + ".1")
                 with open(path, "ab") as handle:
                     handle.write(line)
             finally:
@@ -477,12 +481,14 @@ def _append_history(hold: dict, fields: dict) -> None:
         try:
             lock_fd = _open_history_lock(_HISTORY_LOCK_NAME, dir_fd=fd)
             try:
-                if lock_fd is not None and _acquire_history_lock(lock_fd):  # released by the close below
-                    # Size check under the lock: a peer that rotated first left a small file here.
-                    with contextlib.suppress(FileNotFoundError):
-                        st = os.stat(_HISTORY_NAME, dir_fd=fd, follow_symlinks=False)
-                        if stat.S_ISREG(st.st_mode) and st.st_size + len(line) > _HISTORY_MAX_BYTES:
-                            os.replace(_HISTORY_NAME, _HISTORY_NAME + ".1", src_dir_fd=fd, dst_dir_fd=fd)
+                if lock_fd is None or not _acquire_history_lock(lock_fd):
+                    return  # drop, never append without serialized size check/rotation
+                if len(line) > _HISTORY_MAX_BYTES:
+                    return
+                with contextlib.suppress(FileNotFoundError):
+                    st = os.stat(_HISTORY_NAME, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISREG(st.st_mode) and st.st_size + len(line) > _HISTORY_MAX_BYTES:
+                        os.replace(_HISTORY_NAME, _HISTORY_NAME + ".1", src_dir_fd=fd, dst_dir_fd=fd)
                 out = os.open(_HISTORY_NAME, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600,
                               dir_fd=fd)
                 try:
@@ -501,8 +507,11 @@ def _append_history(hold: dict, fields: dict) -> None:
 def ledger_history(db_path, start: float, end: float) -> List[dict]:
     """Recorded holds (any pid) that overlapped the wall-clock window [start, end], oldest first.
     Reads history.jsonl.1 then history.jsonl; malformed lines are skipped. Never raises."""
-    ledger = _ledger_dir(db_path)
     out: List[dict] = []
+    try:
+        ledger = _ledger_dir(db_path)
+    except Exception:
+        return out
     if os.path.islink(ledger):
         return out
     for name in (_HISTORY_NAME + ".1", _HISTORY_NAME):
@@ -511,6 +520,8 @@ def ledger_history(db_path, start: float, end: float) -> List[dict]:
                 for raw in handle:
                     try:
                         rec = json.loads(raw)
+                        if not isinstance(rec, dict):
+                            continue
                         since = float(rec["since"])
                         released = float(rec.get("released_at") or since + float(rec.get("held_s") or 0.0))
                     except (ValueError, KeyError, TypeError):

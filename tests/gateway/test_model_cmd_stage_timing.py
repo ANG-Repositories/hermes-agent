@@ -1,21 +1,14 @@
-"""``/model`` per-stage timing line (t_7fe48f0b).
-
-2026-11-09: an idle-session ``/m opus-d`` took ~79 s and ``switch_model()`` alone 0.09-3.6 s; nothing
-said where the rest went. These drive the REAL ``_handle_model_command`` (the live fork override in
-gateway/slash_commands.py) with a mocked switch pipeline and pin: exactly one ``PHASE=model_cmd`` INFO
-line per command, every field present, the ``record_*`` split naming the slow store call, the
-runner-wide lock wait, and fail-open telemetry.
-"""
-
+"""Typed /model timing through the real adapter delivery path."""
 import asyncio
 import logging
 import re
-
-import pytest
 from unittest.mock import AsyncMock
 
+import pytest
 from gateway import model_cmd_timing as mct
 from tests.gateway.test_model_command_context_offload import _event, _runner_with_store
+from tests.gateway.test_baseexception_turn_notify import _ProbeAdapter
+from gateway.session import build_session_key
 
 
 def _phase_lines(caplog):
@@ -29,12 +22,71 @@ def _fields(line):
 @pytest.fixture
 def runner(tmp_path, monkeypatch):
     r = _runner_with_store(tmp_path, monkeypatch)
-
-    async def _slow_override(*_a, **_k):
-        await asyncio.sleep(0.25)  # the slow store write the split must name
-
-    r._async_session_store.set_model_override = AsyncMock(side_effect=_slow_override)
+    async def slow_override(*args, **kwargs):
+        await asyncio.sleep(0.25)
+    r._async_session_store.set_model_override = AsyncMock(side_effect=slow_override)
     return r
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", ["ok", "error", "cancelled"])
+async def test_public_delivery_clock_includes_blocked_send(runner, caplog, monkeypatch, result):
+    adapter = _ProbeAdapter()
+    entered, release = asyncio.Event(), asyncio.Event()
+    clock = [100.0]
+    # Only the timing module's clock is virtual; adapter and event loop remain real.
+    from types import SimpleNamespace
+    monkeypatch.setattr(mct, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    real_send = adapter.send
+
+    async def send(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        if result == "error":
+            raise RuntimeError("send fixture failed")
+        return await real_send(*args, **kwargs)
+
+    adapter.send = send
+    adapter._notify_turn_error = AsyncMock(return_value=None)
+    adapter.set_message_handler(runner._handle_model_command)
+    event = _event("/model gpt-5.5")
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        task = asyncio.create_task(adapter._process_message_background(event, build_session_key(event.source)))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            assert not _phase_lines(caplog), "clock ended before the adapter send"
+            clock[0] += 30
+            if result == "cancelled":
+                task.cancel()
+            release.set()
+            if result == "cancelled":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                await task
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    lines = _phase_lines(caplog)
+    assert len(lines) == 1, lines
+    fields = _fields(lines[0])
+    assert float(fields["confirm_s"]) >= 30
+    assert float(fields["total_s"]) >= 30
+    assert fields["outcome"] == result
+    print(lines[0])
+
+
+@pytest.mark.asyncio
+async def test_handler_error_is_logged_and_propagates(runner, caplog, monkeypatch):
+    def boom(*args):
+        raise RuntimeError("normalize failed")
+    monkeypatch.setattr(runner, "_normalize_source_for_session_key", boom, raising=False)
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        with pytest.raises(RuntimeError, match="normalize failed"):
+            await runner._handle_model_command(_event("/model gpt-5.5"))
+    assert _fields(_phase_lines(caplog)[0])["outcome"] == "error"
 
 
 @pytest.mark.asyncio
@@ -115,3 +167,13 @@ def test_phase_and_span_outside_a_command_are_noops_and_finish_logs_once(caplog)
         mct.finish(timing)
     lines = _phase_lines(caplog)
     assert len(lines) == 1 and _fields(lines[0])["durable_config_s"] != "-", lines
+
+def test_span_clock_failure_preserves_body(monkeypatch):
+    def boom():
+        raise RuntimeError("clock failed")
+    monkeypatch.setattr(mct.time, "monotonic", boom)
+    with mct.span("durable_config"):
+        pass
+    with pytest.raises(ValueError, match="body"):
+        with mct.span("durable_config"):
+            raise ValueError("body")

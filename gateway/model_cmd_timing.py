@@ -117,16 +117,44 @@ def annotate(*, session: Optional[str] = None) -> None:
 def span(name: str) -> Iterator[None]:
     """Record the wall time of the ``with`` body (awaits included) as nested span *name*. Exceptions
     from the body propagate unchanged; the timing itself never raises."""
-    t0 = time.monotonic()
+    try:
+        t0 = time.monotonic()
+    except Exception:
+        t0 = None
     try:
         yield
     finally:
         try:
             timing = _current.get()
-            if timing is not None and not timing.finished:
+            if t0 is not None and timing is not None and not timing.finished:
                 timing.spans[name] = timing.spans.get(name, 0.0) + max(time.monotonic() - t0, 0.0)
         except Exception:
             pass
+
+
+def handler_finished(event, timing, exc: Optional[BaseException]) -> None:
+    """Keep the command clock open through the adapter's owned delivery callback.
+
+    Direct callers have no adapter delivery and finish at handler return. The event carries
+    the timer rather than a task-local lookup: routed handlers may run in another context.
+    """
+    try:
+        if exc is not None or not getattr(event, "_model_cmd_delivery", None):
+            finish(timing, outcome_for(exc))
+            return
+        event._model_cmd_timing = timing
+        adapter, key = event._model_cmd_delivery
+        adapter.register_post_delivery_callback(key, lambda: delivery_finished(event))
+    except Exception:
+        finish(timing, outcome_for(exc))
+
+
+def delivery_finished(event, outcome: str = "ok") -> None:
+    """Idempotent across the ordinary callback and exceptional adapter cleanup."""
+    try:
+        finish(getattr(event, "_model_cmd_timing", None), outcome)
+    except Exception:
+        pass
 
 
 def outcome_for(exc: Optional[BaseException]) -> str:

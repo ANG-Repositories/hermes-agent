@@ -136,7 +136,6 @@ def test_concurrent_rotation_never_clobbers_the_archived_generation(tmp_path, mo
     # Cap sized so the pre-filled file is over it but A's and B's records fit together after ONE
     # rotation: any second rotation is then the race, not the cap.
     monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 600)
-    monkeypatch.setattr(lockowners, "_HISTORY_LOCK_WAIT_S", 5.0)
     full = b"".join(b'{"since": 1.0, "op": "archived", "n": %02d}\n' % i for i in range(16))
     assert len(full) > 600
     (ledger / "history.jsonl").write_bytes(full)
@@ -165,18 +164,16 @@ def test_concurrent_rotation_never_clobbers_the_archived_generation(tmp_path, mo
 
     assert (ledger / "history.jsonl.1").read_bytes() == full, "the archived generation was overwritten"
     current = (ledger / "history.jsonl").read_text(encoding="utf-8")
-    assert '"writer_a"' in current and '"writer_b"' in current, current
+    assert '"writer_a"' in current and '"writer_b"' not in current, current
 
 
-def test_busy_history_lock_appends_without_rotating(tmp_path, monkeypatch):
-    """When another writer holds history.lock past the bounded wait, the record is still appended and the
-    file is NOT rotated, so nothing archived can be lost and the write path never waits long."""
+def test_busy_history_lock_drops_without_rotating(tmp_path, monkeypatch):
+    """A busy history lock drops the diagnostic without rotating or growing the file."""
     import fcntl
 
     ledger = tmp_path / "state.db.lockholders"
     ledger.mkdir(mode=0o700)
     monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 100)
-    monkeypatch.setattr(lockowners, "_HISTORY_LOCK_WAIT_S", 0.05)
     full = b"x" * 150 + b"\n"
     (ledger / "history.jsonl").write_bytes(full)
     peer = os.open(str(ledger / "history.lock"), os.O_RDWR | os.O_CREAT, 0o600)
@@ -189,12 +186,11 @@ def test_busy_history_lock_appends_without_rotating(tmp_path, monkeypatch):
         os.close(peer)
     assert not (ledger / "history.jsonl.1").exists()
     data = (ledger / "history.jsonl").read_bytes()
-    assert data.startswith(full) and b'"contended"' in data
+    assert data == full
 
 
-def test_unusable_history_lock_still_appends_and_never_rotates(tmp_path, monkeypatch):
-    """Prism acdf6a446932: a directory planted as history.lock must not drop records. The lock only
-    guards rotation, so the record is appended and the full file is left unrotated."""
+def test_unusable_history_lock_drops_and_never_rotates(tmp_path, monkeypatch):
+    """An unusable history lock drops diagnostics; it must not permit unbounded appends."""
     ledger = tmp_path / "state.db.lockholders"
     ledger.mkdir(mode=0o700)
     (ledger / "history.lock").mkdir()
@@ -203,7 +199,7 @@ def test_unusable_history_lock_still_appends_and_never_rotates(tmp_path, monkeyp
     (ledger / "history.jsonl").write_bytes(full)
     lockowners._append_history(_fake_hold(ledger, 1, "release"), {"held_s": 3.0, "state": "released"})
     data = (ledger / "history.jsonl").read_bytes()
-    assert data.startswith(full) and b'"release"' in data, data
+    assert data == full
     assert not (ledger / "history.jsonl.1").exists()
 
 
@@ -318,6 +314,52 @@ def test_writer_wait_timer_start_failure_does_not_fail_write(db, monkeypatch):
     monkeypatch.setattr(sessiondb_mod.threading, "Timer", broken_timer)
     db.set_meta("timer-failure", "write survived")
     assert db.get_meta("timer-failure") == "write survived"
+
+
+@pytest.mark.parametrize("portable", [False, True])
+def test_history_contention_is_one_try_no_sleep_and_bounded(tmp_path, monkeypatch, portable):
+    ledger = tmp_path / "ledger"
+    ledger.mkdir(mode=0o700)
+    monkeypatch.setattr(lockowners, "_DIR_FD_OK", not portable)
+    monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 600)
+    calls = []
+    monkeypatch.setattr(lockowners, "_try_lock_fd", lambda fd: calls.append(fd) or False)
+    def no_sleep(*args):
+        pytest.fail("history telemetry slept under the writer mutex")
+    monkeypatch.setattr(lockowners.time, "sleep", no_sleep)
+    for i in range(20):
+        lockowners._append_history(_fake_hold(ledger, i, "busy"), {"held_s": 1})
+    assert len(calls) == 20
+    assert not (ledger / "history.jsonl").exists()
+
+
+@pytest.mark.parametrize("portable", [False, True])
+def test_unusable_history_lock_drops_instead_of_unbounded_append(tmp_path, monkeypatch, portable):
+    ledger = tmp_path / "ledger"
+    ledger.mkdir(mode=0o700)
+    (ledger / "history.lock").mkdir()
+    monkeypatch.setattr(lockowners, "_DIR_FD_OK", not portable)
+    monkeypatch.setattr(lockowners, "_HISTORY_MAX_BYTES", 600)
+    for i in range(20):
+        lockowners._append_history(_fake_hold(ledger, i, "unusable"), {"held_s": 1})
+    assert not (ledger / "history.jsonl").exists()
+
+
+def test_hold_end_clock_failure_does_not_fail_write(db, monkeypatch):
+    real = lockowners.time.monotonic
+    def callback(conn):
+        monkeypatch.setattr(lockowners.time, "monotonic", lambda: (_ for _ in ()).throw(RuntimeError("clock")))
+    try:
+        db._execute_write(callback)
+    finally:
+        monkeypatch.setattr(lockowners.time, "monotonic", real)
+
+
+def test_history_skips_non_object_json(tmp_path):
+    ledger = Path(lockowners._ledger_dir(tmp_path / "db"))
+    ledger.mkdir(mode=0o700)
+    (ledger / "history.jsonl").write_text('[]\nnull\n1\n{"since": 1, "held_s": 2}\n')
+    assert lockowners.ledger_history(tmp_path / "db", 0, 10) == [{"since": 1, "held_s": 2}]
 
 
 def test_waiter_attribution_fails_open(db, monkeypatch):

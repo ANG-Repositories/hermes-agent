@@ -541,7 +541,7 @@ class GatewayModelCommandsMixin:
             exc = e
             raise
         finally:
-            _mct.finish(timing, _mct.outcome_for(exc))
+            _mct.handler_finished(event, timing, exc)
 
     async def _handle_model_command_locked(self, event: MessageEvent) -> Optional[str]:
         from gateway.run import _hermes_home
