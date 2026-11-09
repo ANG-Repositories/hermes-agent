@@ -2073,6 +2073,9 @@ class GatewayShutdownMixin:
         self._clear_plugin_message_injector()
         self._draining = True
         self._mark_api_runs_shutdown_requested()
+        # Pending registry claims have no transcript to resume. Preserve their
+        # original input before a stuck claim can consume the shutdown leash.
+        await self._preserve_pending_session_claims()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):
@@ -2348,6 +2351,7 @@ class GatewayShutdownMixin:
     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
         from gateway.run import GatewayRunner
+        await self._preserve_pending_session_claims()
         for _task in list(self._background_tasks):
             # _restart_task awaits _stop_task: cancelling it would tunnel into _stop_impl and skip _shutdown_event.set().
             if _task is self._stop_task or _task is self._restart_task:
@@ -2357,6 +2361,14 @@ class GatewayShutdownMixin:
         # CancelledError into this _stop_impl and skip _shutdown_event.set() / _exit_code = 75 (#12875). It
         # self-terminates anyway.
         self._background_tasks.clear()
+        # Acquisitions own their worker until it returns, even when cancelled.
+        # Join them before draining the durable releases they may enqueue.
+        _claims = tuple(getattr(self, "_active_session_claim_tasks", ()))
+        for _claim in _claims:
+            _claim.cancel()
+        if _claims:
+            await asyncio.gather(*_claims, return_exceptions=True)
+        await self._drain_active_session_releases()
         ctx.api_live = self._active_api_run_count()
         # Fork: sweep follow-ups still parked in adapter queues into the restart spool before the
         # adapters (and their queues) die with the process.
@@ -2369,6 +2381,7 @@ class GatewayShutdownMixin:
         self.adapters.clear()
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
+        await self._drain_active_session_releases()
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
         # Off-loop (fork): each payload ends in an unbounded os.replace inside the timed shutdown path.
         # Pass the LIVE view with drain=True rather than a dict() copy: the offload's await is a window in

@@ -27,6 +27,10 @@ class TurnState:
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
+    # True from the moment /stop (or /new) starts tearing this turn down until the slot is released.
+    # The slot is freed only at the END of that teardown (durable marker write, adapter interrupt),
+    # so a command the busy path would reject waits on this instead of bouncing.
+    stopping: bool = False
     # Last INFO log of PHASE=lease_flush_queued. Not reset by clear(): the slot clears BEFORE the
     # flush it debounces, and the requeue back-off re-queues the same wake about once a second.
     flush_log_ts: float = 0.0
@@ -39,6 +43,7 @@ class TurnState:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
         self.agent = self.lease = self.event = self.ctx = None
         self.started_ts = self.busy_ack_ts = 0.0
+        self.stopping = False
 
 
 @dataclass

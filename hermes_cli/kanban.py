@@ -1457,6 +1457,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = [pid for pid, _kind in parent_links]
         children = [cid for cid, _kind in child_links]
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        from hermes_cli.kanban_diagnostics import compute_task_diagnostics
+        diagnostics = compute_task_diagnostics(task, events, runs)
         # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived. Read AFTER the
         # live comments and runs, deduped by id, so a move committing in between cannot empty the history.
         from hermes_cli import kanban_archive_read as kar
@@ -1492,6 +1494,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "level": level,
             "latest_summary": latest_summary,
+            "diagnostics": [d.to_dict() for d in diagnostics],
             "workspace_refusal": refusal,
             "held_repo": held,
             "parents": parents, "children": children,
@@ -1519,6 +1522,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
+    for diagnostic in diagnostics:
+        field("integrity", f"{diagnostic.kind}: {diagnostic.detail}")
     field("status", task.status + (f"  [{_fmt_refusal(refusal)}]" if refusal else "")
           + (f"  [{kb.format_deferred_until(task.next_eligible_at)}]"
              if task.status == "scheduled" and task.block_kind == "deferred" else ""))

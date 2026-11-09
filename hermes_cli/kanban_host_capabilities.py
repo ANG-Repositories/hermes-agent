@@ -131,6 +131,9 @@ class CapabilityMap:
     # only (``hosts.studio.studio_tier: {cap: "identity-only"}``, §3.4): an
     # unpinned card needing one waits for an advertising pool host.
     identity_only: frozenset = frozenset()
+    # Read-only per-host transport observations. Missing/malformed legs fail closed;
+    # advertising a browser daemon is not proof that an identity lease is reachable.
+    browser_remote: Mapping[str, Mapping[str, bool]] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
@@ -377,6 +380,10 @@ def map_from_bytes(map_bytes: Optional[bytes], index_bytes: Optional[bytes], *,
     return CapabilityMap(capabilities=names, sniff=sniff, hosts=hosts, index=index,
                          error=error, index_error=index_error, soft=soft,
                          identity_only=identity_only,
+                         browser_remote={h.lower(): (row["browser_remote"]
+                                                     if isinstance(row["browser_remote"], dict) else {})
+                                         for h, row in (doc["hosts"].items() if error is None else ())
+                                         if "browser_remote" in row},
                          index_unverified=unverified if index_error is None else None)
 
 
@@ -512,6 +519,31 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
     return reqs, none
 
 
+def browser_remote_refusal(record: Any) -> Optional[str]:
+    """P3 contract: HTTPS data plane AND SSH control plane, strict booleans.
+
+    The reachability producer owns probing; placement never opens network
+    connections per card. An absent observation is not an admission grant.
+    """
+    record = record if isinstance(record, Mapping) else {}
+    for leg in ("front_door", "ssh"):
+        if record.get(leg) is not True:
+            return "BROWSER_REMOTE_UNREACHABLE:" + leg
+    return None
+
+
+def _host_caps(ctx: CapabilityTick, host: str) -> frozenset:
+    caps = ctx.cmap.hosts.get(host, frozenset())
+    record = ctx.cmap.browser_remote.get(host)
+    if ctx.cmap.browser_remote:
+        # Once remote probing is enabled, an unobserved host is not a grant.
+        # Failed legs also veto stale/static browser advertisements.
+        if browser_remote_refusal(record) is None:
+            return caps | {"browser-session"}
+        return caps - {"browser-session"}
+    return caps
+
+
 def _satisfied(cap: str, ctx: CapabilityTick, pin_host: Optional[str]) -> bool:
     """A pinned card asks only its pin host. An unpinned one asks every known
     pool host: ``take()`` is not capability-aware until Phase 4, so a
@@ -522,7 +554,7 @@ def _satisfied(cap: str, ctx: CapabilityTick, pin_host: Optional[str]) -> bool:
     hosts = (pin_host.lower(),) if pin_host else ctx.pool_hosts
     if not hosts:
         return False
-    return all(cap in ctx.cmap.hosts.get(h, frozenset()) for h in hosts)
+    return all(cap in _host_caps(ctx, h) for h in hosts)
 
 
 def _first(reqs: List[Requirement]) -> Optional[Requirement]:
@@ -546,7 +578,8 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     # when the whole pool advertises it (spec v0.3 §3.4).
     live = [r for r in reqs if ctx.mode_of(r.cap) != OFF and (
         not _satisfied(r.cap, ctx, pin_host)
-        or (pin_host is None and r.cap in ctx.cmap.identity_only))]
+        or (pin_host is None and (r.cap in ctx.cmap.identity_only
+                                 or (r.cap == "browser-session" and ctx.cmap.browser_remote))))]
     enforced = [r for r in live if ctx.mode_of(r.cap) == ENFORCE]
     ignored: Tuple[Requirement, ...] = ()
     if ctx.body_mode == ADVISORY and pin_host is None:
@@ -554,7 +587,7 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         # no pool host advertises it) would hold the card at host=none forever
         # (t_640a4ea0: "docker run" held 3 cards 9.5 h). It is advice, not a pin.
         ignored = tuple(r for r in enforced if r.matched_by == BODY and r.cap in ctx.cmap.identity_only
-                        and not any(r.cap in ctx.cmap.hosts.get(h, frozenset()) for h in ctx.pool_hosts))
+                        and not any(r.cap in _host_caps(ctx, h) for h in ctx.pool_hosts))
         enforced = [r for r in enforced if r not in ignored]
     warned = [r for r in live if ctx.mode_of(r.cap) == WARN]
     hard = _first([r for r in enforced if r.strength == HARD])
@@ -565,7 +598,7 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     binding = [r for r in enforced if r.strength == HARD] if any_pin else enforced
     if binding and pin_host is None and not any(r.unknown for r in binding):
         needed = {r.cap for r in binding}
-        servers = tuple(h for h in ctx.pool_hosts if needed <= ctx.cmap.hosts.get(h, frozenset()))
+        servers = tuple(h for h in ctx.pool_hosts if needed <= _host_caps(ctx, h))
         if servers:
             # Some pool host advertises everything the card needs: portable,
             # placed on those hosts only (t_90887924, AC-5 "host X").
@@ -584,6 +617,9 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         enforced=tuple(enforced),
         observed=_first(warned),
         body_ignored=ignored,
+        wait=(browser_remote_refusal(ctx.cmap.browser_remote.get(pin_host.lower()))
+              if pin_host and ctx.cmap.browser_remote
+              and any(r.cap == "browser-session" for r in binding) else None),
     )
 
 

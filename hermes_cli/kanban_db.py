@@ -6267,6 +6267,21 @@ def _workspace_of_copy(conn: sqlite3.Connection, of: str, kind: Optional[str],
     return of_kind, of_path
 
 
+def _insert_task_row(conn, fields):
+    """SQL-only insertion shared by legacy create and prevalidated authority create.
+
+    Caller owns the transaction and validation. No hooks or network here.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError('task insert requires write transaction')
+    columns = tuple(fields)
+    allowed = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+    if not columns or not set(columns) <= allowed:
+        raise ValueError('unknown task column')
+    conn.execute('INSERT INTO tasks (' + ','.join(columns) + ') VALUES (' +
+                 ','.join('?' for _ in columns) + ')', tuple(fields.values()))
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -6870,53 +6885,39 @@ def create_task(
                         "(tool: i_mean_blocks) if the parent closing really is the gate.",
                         time_gate_hit or "",
                     )
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        reasoning_effort, pin_sub_reason, pin_sub_fallback,
-                        goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, boomerang_wake, signature, next_eligible_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        title.strip(),
-                        body,
-                        assignee,
-                        task_status,
-                        priority,
-                        created_by,
-                        now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
-                        project_id,
-                        tenant,
-                        idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        int(max_retries) if max_retries is not None else None,
-                        model_override,
-                        provider_override,
-                        reasoning_effort,
-                        pin_sub_reason,
-                        1 if (pin_sub_reason and pin_sub_fallback) else 0,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
-                        session_id,
-                        completion_contract,
-                        brain,
-                        workspace_of,
-                        None if boomerang_wake is None else (1 if boomerang_wake else 0),
-                        signature,
-                        int(until) if until is not None else None,
-                    ),
-                )
+                _insert_task_row(conn, {
+                    'id': task_id,
+                    'title': title.strip(),
+                    'body': body,
+                    'assignee': assignee,
+                    'status': task_status,
+                    'priority': priority,
+                    'created_by': created_by,
+                    'created_at': now,
+                    'workspace_kind': workspace_kind,
+                    'workspace_path': workspace_path,
+                    'branch_name': branch_name,
+                    'project_id': project_id,
+                    'tenant': tenant,
+                    'idempotency_key': idempotency_key,
+                    'max_runtime_seconds': int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                    'skills': json.dumps(skills_list) if skills_list is not None else None,
+                    'max_retries': int(max_retries) if max_retries is not None else None,
+                    'model_override': model_override,
+                    'provider_override': provider_override,
+                    'reasoning_effort': reasoning_effort,
+                    'pin_sub_reason': pin_sub_reason,
+                    'pin_sub_fallback': 1 if (pin_sub_reason and pin_sub_fallback) else 0,
+                    'goal_mode': 1 if goal_mode else 0,
+                    'goal_max_turns': int(goal_max_turns) if goal_max_turns is not None else None,
+                    'session_id': session_id,
+                    'completion_contract': completion_contract,
+                    'brain': brain,
+                    'workspace_of': workspace_of,
+                    'boomerang_wake': None if boomerang_wake is None else (1 if boomerang_wake else 0),
+                    'signature': signature,
+                    'next_eligible_at': int(until) if until is not None else None,
+                })
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links "
@@ -9739,6 +9740,9 @@ def _claim_and_open_run(
     a card whose origin host is paused (fleet pause layer 2, t_133d6efd)."""
     from hermes_cli.kanban_pause_hold import refuse_if_held
     refuse_if_held(conn, task_id)
+    from hermes_cli.kanban_failure_ownership import recheck_for_claim
+    if recheck_for_claim(conn, task_id).action != 'claim':
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -10386,6 +10390,9 @@ def _open_review_run(
     if spawns and not operator_claim:
         from hermes_cli.kanban_pause_hold import refuse_if_held
         refuse_if_held(conn, task_id)
+        from hermes_cli.kanban_failure_ownership import recheck_for_claim
+        if recheck_for_claim(conn, task_id).action != 'claim':
+            return None
     cur = conn.execute(
         """
         UPDATE tasks
@@ -12103,11 +12110,17 @@ def complete_task(
                     with write_txn(conn):
                         _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
 
+            # The card's Intent block into its own PR bodies before the ready flip (t_deee5435);
+            # None when KANBAN_PR_INTENT/KANBAN_HANDOFF_PR_INTENT=0. Never raises.
+            from hermes_cli import kanban_pr_intent as _intent
+            intent_fn = _intent.applier_for_task(conn, task_id, summary, metadata)
+
             def _freshness_gate(refs, allow_arm):
                 try:
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
+                        intent=intent_fn,
                     )
                 except _fresh.DraftPrError as draft_err:
                     _record_flips(draft_err.flipped)
@@ -16158,6 +16171,20 @@ def reopen_task(
     # where the review-card closer completes it on REST merged=true.
     review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
+        if _task_status(conn, task_id) != "done":
+            return False, f"task {task_id} changed state concurrently; retry"
+        candidate_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
+            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if to_status == "review":
+            from hermes_cli.kanban_review_handoff import record_reopened_candidate
+            try:
+                record_reopened_candidate(conn, task_id, actor=actor, reviewer=review_assignee,
+                                          reason=reason, run_id=int(candidate_run["id"]) if candidate_run else None)
+            except ValueError as exc:
+                return False, str(exc)
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
@@ -16179,12 +16206,7 @@ def reopen_task(
                 "previous_path": dead_scratch,
                 "survivor_baseline": _reset_survivor_baseline(conn, task_id),
             })
-        run_id = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
-            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        voided_run = int(run_id["id"]) if run_id else None
+        voided_run = int(candidate_run["id"]) if candidate_run else None
         if voided_run is not None:
             conn.execute(
                 "UPDATE task_runs SET outcome = 'voided' WHERE id = ?",
