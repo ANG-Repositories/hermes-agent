@@ -554,7 +554,7 @@ def test_a_scheduled_card_woken_inside_dispatch_gets_the_plan(home, remote):
     places it on the pool; t_82b4db80: a retired `local` value changes nothing."""
     with kb.connect_closing() as conn:
         (tid,) = _cards(conn, PORTABLE)
-        assert kb.schedule_task(conn, tid, reason="later")
+        assert kb.schedule_task(conn, tid, reason="later", wake_at=2_000_000_000)
         conn.execute("UPDATE tasks SET next_eligible_at = ? WHERE id = ?", (int(time.time()) - 5, tid))
         conn.commit()
         assert conn.execute("SELECT count(*) FROM tasks WHERE status='ready'").fetchone()[0] == 0

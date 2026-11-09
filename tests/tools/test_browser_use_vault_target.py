@@ -9,13 +9,10 @@ from tools import browser_use_cli as bu
 from tools import browser_vault_tool as vault
 
 
-def test_browser_use_origin_probe_does_not_search_other_tabs(monkeypatch):
-    calls = []
-    supervisor = SimpleNamespace(focus_page=lambda *a, **kw: calls.append(a) or {"ok": True})
-    monkeypatch.setattr(bu, "is_browser_use_cli_mode", lambda: True)
-    monkeypatch.setattr(vault, "_ensure_supervisor", lambda tid: supervisor)
-    assert vault._focus_bound_origin("task", "https://appleid.apple.com", "login") is None
-    assert calls == []
+def test_browser_use_origin_probe_does_not_search_other_tabs():
+    # Origin-based tab search is gone entirely: the leased target (or bound document) owns the page.
+    assert not hasattr(vault, "_focus_bound_origin")
+    assert not hasattr(vault, "_TAB_PROBES")
 
 
 @pytest.fixture
@@ -79,7 +76,8 @@ def test_redirect_reports_origin_mismatch_before_secret_read(target_route, monke
     result = json.loads(vault._handle_vault_fill({"handle": "synthetic"}, task_id="task"))
     assert result["error_type"] == "origin_mismatch"
     assert "https://idmsa.apple.com" in result["error"]
-    assert [tid for _, tid in calls] == ["login-tab"]
+    # Witness pin + origin read, both on the leased target and nothing else.
+    assert {tid for _, tid in calls} == {"login-tab"}
 
 
 @pytest.mark.parametrize("initial_route", ["remote", "absent"])

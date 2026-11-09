@@ -763,6 +763,7 @@ gateway:
     reject_model: "Agent is running — wait or /stop first, then switch models."
     reject_codex_runtime: "Agent is running — wait or /stop first, then change runtime."
     reject_moa: "Agent is running — wait or /stop first, then run /moa."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ Gateway {action} — queued for the next turn after it comes back."
     drain_rejected: "⏳ Gateway is {action} and is not accepting another turn right now."
     drain_rejected_new_work: "⏳ Gateway is {action} and is not accepting new work right now."

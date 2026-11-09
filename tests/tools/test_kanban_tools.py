@@ -463,7 +463,7 @@ def test_goal_complete_operator_judge_500_fails_open_with_event(monkeypatch, tmp
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -1172,7 +1172,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
-        kb.block_task(conn, tid, reason="waiting")
+        kb.block_task(conn, tid, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 
@@ -1423,7 +1423,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kbc.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
+        kb.block_task(conn, other, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 

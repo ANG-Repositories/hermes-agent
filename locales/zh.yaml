@@ -754,6 +754,7 @@ gateway:
     reject_model: "代理正在运行——请等待或先执行 /stop，再切换模型。"
     reject_codex_runtime: "代理正在运行——请等待或先执行 /stop，再更改运行时。"
     reject_moa: "代理正在运行——请等待或先执行 /stop，再运行 /moa。"
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ 网关{action}——已排队，恢复后的下一回合处理。"
     drain_rejected: "⏳ 网关{action}，目前不接受新的回合。"
     drain_rejected_new_work: "⏳ 网关{action}，目前不接受新任务。"

@@ -171,6 +171,111 @@ def _writes(tid) -> tuple:
     return ev, cm
 
 
+# --- t_47580e49: stale handback timeline -------------------------------------------------------
+
+@pytest.mark.parametrize("author", ["apollo", "human:apollo"])
+@pytest.mark.parametrize("phase", ["verdict", "delivery", "legacy_delivery"])
+@pytest.mark.parametrize("arm", ["newer_comment", "release", "hold", "merged", "open", "disabled"])
+def test_stale_surface_timeline(env, arm, phase, author):
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "review_deadman", "{}", 1793845000))
+    entry = _claimed_entry(env, tid, row="review_deadman", kind="review_deadman")
+    state = ah.BoomerangWakeState()
+    if phase != "verdict":
+        # Persist while fresh, then change the board/PR before draining (restart race).
+        ah.enqueue_handback(entry, {"summary": "ready"}, state=state, turn_text="old handback")
+        if phase == "legacy_delivery":
+            did, pending = next(iter(state.handbacks().items()))
+            for field in ("event_id", "assignee", "pr"):
+                pending.pop(field)
+            state.drop_handback(did)
+            state.put_handback(did, pending)
+    env["health"][(REPO, 71)] = {"state": "merged" if arm == "merged" else "open"}
+    if arm in {"newer_comment", "release", "hold", "disabled"}:
+        body = {"release": "close-on: released", "hold": "deadman-hold: waiting"}.get(arm, "owner acted")
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                         (tid, author, body, 1793844766 if arm in {"newer_comment", "disabled"} else 1793839413))
+    if arm == "disabled":
+        env["monkeypatch"].setenv("BOOMERANG_STALE_GUARD", "0")
+    blocked = arm not in {"open", "disabled"}
+    if phase != "verdict":
+        sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
+        assert sent == (0 if blocked else 2)
+        assert bool(env["adapter"].handled) != blocked
+        assert state.handbacks() == {}
+    else:
+        result = ah.execute_verdict(entry, _verdict(entry, "surface"))
+        assert bool(result.get("stale")) == blocked
+        assert bool(result.get("surface")) != blocked
+
+
+@pytest.mark.parametrize("action,turn,delivered", [("land_inherited", None, True), ("complete", None, True),
+                                                    ("surface", "old handback", False)])
+def test_stale_guard_spares_write_receipts(env, action, turn, delivered):
+    """Prism 0c2f7d571cd9: a land/complete receipt naming a now-merged PR (owner commented after) is
+    still delivered; only a surface handback is refused as stale."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "review_deadman", "{}", 1793845000))
+    entry = _claimed_entry(env, tid, row="review_deadman", kind="review_deadman")
+    state = ah.BoomerangWakeState()
+    ah.enqueue_handback(entry, {"summary": "landed", "action": action}, state=state, turn_text=turn)
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "apollo", "owner acted", 1793844766))
+    sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
+    lines = [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
+    assert (sent, bool(lines)) == ((1, True) if delivered else (0, False))
+    assert state.handbacks() == {}
+
+
+@pytest.mark.parametrize("author", ["boomerang-wake", "kanban-dispatcher", "unverified:default", "human:other"])
+@pytest.mark.parametrize("body", ["owner acted", "release: deployed", "deadman-hold: waiting"])
+def test_stale_surface_ignores_non_owner_comments(env, author, body):
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, author, body, 1793844766))
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested")
+    env["health"][(REPO, 71)] = {"state": "open"}
+    assert ah.stale_surface_reason(entry) is None
+    if author != "human:other":
+        # Bot provenance is excluded even if persisted ownership accidentally matches it.
+        entry["assignee"] = author
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (author, tid))
+        assert ah.stale_surface_reason(entry) is None
+
+
+@pytest.mark.parametrize("assignee", ["apollo", "human:apollo"])
+def test_stale_surface_bot_comment_does_not_hide_owner_release(env, assignee):
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, tid))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "apollo", "release: deployed", 1793844766))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "boomerang-wake", "child finished", 1793845000))
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested")
+    assert ah.stale_surface_reason(entry) == "owner release/hold line"
+
+
 # --- wake-path dispatch -----------------------------------------------------------------------
 
 
@@ -354,7 +459,51 @@ def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
     _run(env, entry, "failed", "rate_limit")
     assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: child failed") for s in env["adapter"].sent)
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
-    assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "failed"
+
+
+def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):
+    """t_ce8bd439: the card left the claim-time status before the verdict ran. No origin-chat
+    line, one #logs line, the original wake still re-surfaces, outcome superseded."""
+    logs: list = []
+    env["monkeypatch"].setattr(ah, "post_logs", logs.append)
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        assert kb.reopen_task(conn, tid, actor="ci-sendback", reason="CI red")[0]
+    _run(env, entry, "completed", _verdict(entry, "complete"))
+    assert env["adapter"].sent == [], env["adapter"].sent
+    assert logs == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
+                    f"original wake re-delivered"], logs
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
+    assert claim["reason"] == "state moved" and claim["resurface_delivered"] is True
+
+
+def test_card_moved_with_no_live_home_keeps_one_plain_chat_line(env):
+    """Prism c-4e2273b5aa3cb68a: a supersede whose wake cannot be re-delivered (no live home) must
+    not vanish. One plain (non-⚠️) origin-chat line says so; no #logs 're-delivered' claim."""
+    logs: list = []
+    env["monkeypatch"].setattr(ah, "post_logs", logs.append)
+    # The home resolves (dispatch proceeds) but is not a live chat origin, the exact condition under
+    # which resurface() cannot re-deliver the wake.
+    env["monkeypatch"].setattr(ow, "is_chat_origin", lambda *_a, **_k: False)
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        assert kb.reopen_task(conn, tid, actor="ci-sendback", reason="CI red")[0]
+    _run(env, entry, "completed", _verdict(entry, "complete"))
+    assert env["adapter"].sent == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
+                                   f"no live home session, so the original wake was NOT re-delivered"], \
+        env["adapter"].sent
+    assert logs == [], logs
+    assert env["adapter"].handled == []
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
 
 
 def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
@@ -1215,3 +1364,26 @@ def test_db_parent_sends_the_configured_gateway_model(monkeypatch):
     ah._db_parent(runner, home)
     assert seen["model"] == "fallback-model" and "_fallback_notice" not in seen
 
+
+
+
+# --- t_3151f3fd: a routed review_deadman on a boomerang card is ONE child, routed to the recipient ------------------
+def test_routed_review_deadman_on_boomerang_card_is_one_child_routed_to_the_recipient(env):
+    other = "1502228850338435153"
+    rcpt = env["runner"].session_store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id=other, chat_type="group", user_id=HUMAN))
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "review_deadman", {
+            "by": "kanban-review-deadman", "waiting_min": 25, "episode": 1, "cycle": 0,
+            "recipient_route": "alerts-home", "recipient_session_key": rcpt.session_key,
+            "recipient_chat": other, "recipient_profile": "default"})
+    turns = _tick(env)
+    assert turns == [], [t.text for t in turns]
+    assert len(env["dispatched"]) == 1, env["dispatched"]
+    d = env["dispatched"][0]
+    assert d["row"] == "review_deadman" and d["path"] == "owner-wake"
+    assert str(d["route"]["chat_id"]) == other, d["route"]
+    env["runner"]._kanban_owner_wake_state.last_wake.clear()
+    _tick(env)
+    assert len(env["dispatched"]) == 1, "an active child: no second dispatch"

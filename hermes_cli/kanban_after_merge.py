@@ -121,7 +121,7 @@ def release_merged_edges(
 ) -> list[tuple[str, str]]:
     """Rewrite every ``after-merge`` edge whose parent's recorded fleet PRs all
     read MERGED to ``derived-from``; return the released ``(parent, child)``
-    pairs. An OPEN (draft or not), CLOSED or unreadable PR keeps the gate, open
+    pairs. An OPEN (draft or not) or unreadable PR keeps the gate, open
     parent or done one alike. A parent with no recorded PR is left to
     :func:`release_prless_closed_parents`. Lookups happen before the short
     write txn, which re-reads the parent's PR set and skips any parent whose
@@ -147,6 +147,7 @@ def release_merged_edges(
     now = time.time() if now is None else now
     budget = [max(0, int(max_lookups))]
     merged_prs: dict[str, list[str]] = {}
+    closed_prs: dict[str, tuple[list[str], list[str]]] = {}
     parents = sorted(dict.fromkeys(e["parent_id"] for e in edges),
                      key=lambda pid: (_LAST_CHECKED.get(pid, 0.0), pid))
     for parent_id in parents:
@@ -158,14 +159,33 @@ def release_merged_edges(
         _LAST_CHECKED[parent_id] = now
         # No short-circuit: every ref is read, so the cache fills evenly.
         states = [_state(r, query_fn, now, budget) for r in refs]
+        closed = [str(r) for r, state in zip(refs, states) if state == "CLOSED"]
+        if closed:
+            closed_prs[parent_id] = ([str(r) for r in refs], closed)
         if all(st == "MERGED" for st in states):
             merged_prs[parent_id] = [str(r) for r in refs]
     released: list[tuple[str, str]] = []
-    if not merged_prs:
+    if not merged_prs and not closed_prs:
         return released
     with kb.write_txn(conn):
         for edge in edges:
             parent_id, child_id = edge["parent_id"], edge["child_id"]
+            if parent_id in closed_prs:
+                recorded, closed = closed_prs[parent_id]
+                if [str(r) for r in _fleet_refs(conn, parent_id)] != recorded:
+                    continue
+                reason = (f"prerequisite {', '.join(closed)} closed unmerged: "
+                          "name a replacement PR or waive")
+                cur = conn.execute(
+                    "UPDATE tasks SET status='triage', result=? WHERE id=? "
+                    "AND status IN ('todo', 'ready') AND EXISTS ("
+                    "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=? AND kind=?)",
+                    (reason, child_id, parent_id, child_id, kb.LINK_KIND_AFTER_MERGE),
+                )
+                if cur.rowcount:
+                    kb._append_event(conn, child_id, "after_merge_prerequisite_closed",
+                                     {"parent": parent_id, "prs": closed, "reason": reason})
+                continue
             if parent_id not in merged_prs:
                 continue
             # The lookups ran outside the txn: a parent that recorded a new PR,

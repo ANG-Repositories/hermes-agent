@@ -107,6 +107,8 @@ def test_missing_review_handoff_is_an_integrity_finding(board, monkeypatch, caps
     tid = kb.create_task(board, title="legacy malformed review", assignee="dev")
     with kb.write_txn(board):
         board.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        # Model pre-guard corruption; current entry writers repair the handoff.
+        board.execute("DELETE FROM task_events WHERE task_id=? AND kind='review_requested'", (tid,))
     task = kb.get_task(board, tid)
     findings = compute_task_diagnostics(task, kb.list_events(board, tid), [])
     assert any(d.kind == "review_missing_handoff" for d in findings)

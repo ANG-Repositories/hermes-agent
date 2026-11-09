@@ -4424,6 +4424,15 @@ class SpawnNowError(RuntimeError):
     """:func:`spawn_now` did not start a worker; the card's state says why."""
 
 
+class SpawnNowPaused(SpawnNowError):
+    """:func:`spawn_now` refused by a pause hold (a policy refusal, not a launch failure): the caller must not run
+    the unit some other way on the same held host (Prism 0f110d29ad76). ``reason`` is the ``pause_hold (...)`` text."""
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 _SPAWN_NOW_LOCK_WAIT_SECONDS = 30.0
 
 
@@ -4464,10 +4473,15 @@ def spawn_now(
 def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spawn_fn) -> int:
     from hermes_cli import kanban_pause_hold as _kph
 
+    # The immediate path always starts LOCALLY: the dispatcher's own host is the destination, so the same local
+    # fence as a tick's local start applies before any run opens (Prism b256ef26919e). Off under the kill switch.
+    _local_wait = _kph.local_destination_wait({})
+    if _local_wait is not None:
+        raise SpawnNowPaused(f"{task_id}: pause hold: {_local_wait}", _local_wait)
     try:
         claimed = _kb.claim_task(conn, task_id)
     except _kph.PauseHeld as exc:
-        raise SpawnNowError(f"{task_id}: pause hold: {exc.reason}") from exc
+        raise SpawnNowPaused(f"{task_id}: pause hold: {exc.reason}", str(exc.reason)) from exc
     if claimed is None:
         raise SpawnNowError(f"{task_id}: not claimable (not ready, or already claimed)")
     from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
@@ -5194,9 +5208,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     wt_hosts = None
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
+        from hermes_cli import placement_policy as _ppol
+        fleet = _kb.kanban_home() / "fleet"
         port = _kwt.port_for(row["id"], row["workspace_path"],
-                             _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet",
-                             branch=_kb._row_get(row, "branch_name"))
+                             _kwt.board_default_workdir(board), fleet,
+                             branch=_kb._row_get(row, "branch_name"),
+                             allow_studio_tree=_ppol.load(fleet).is_last_resort(_kwp.STUDIO_HOST))
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -6183,6 +6200,10 @@ def _dispatch_once_locked(
     # One clock read for the whole tick so every card in this pass sees the
     # same TTL and a window cannot expire halfway through a batch.
     _tick_now = int(time.time())
+    if not dry_run and not _admit:
+        from hermes_cli.kanban_no_worker import record_stranded
+
+        record_stranded(conn, now=_tick_now)
     if not dry_run:
         # Retire elapsed windows first: the rows are deleted, so each expiry
         # is reported exactly once and the routing below can never read a
@@ -6670,6 +6691,24 @@ def _dispatch_once_locked(
                                      lane="review", planned=spillover is not None, entry=entry,
                                      pins_out=_review_pause_pins,
                                      pool=spillover.config if spillover is not None else None, caps=_caps)
+        # FWA destination fence BEFORE any review reservation (Prism 34935fb58782): a review that cannot start
+        # this tick must not hold budget ahead of ready rows (``_review_ahead``) or a pool admission
+        # (``review_pool_reserve``). Only rows held on EVERY route they could take are dropped here; a review whose
+        # route is decided in the loop (continuation origin vs local) keeps the in-loop check below.
+        _kept_reviews = []
+        for _rrow in review_rows:
+            if _rrow["id"] in _review_pause_pins:
+                _rwhy = _kph.destination_wait(_review_pause_pins[_rrow["id"]], _pause_cache)
+            elif _rrow["origin_host"] and _kcont_lost.mode(_root_kanban_cfg()) == "enforce":
+                _rwhy = _kph.destination_wait(_rrow["origin_host"], _pause_cache)
+                _rwhy = _rwhy if _rwhy is not None and _kph.local_destination_wait(_pause_cache) is not None else None
+            else:
+                _rwhy = _kph.local_destination_wait(_pause_cache)
+            if _rwhy is not None:
+                result.placement_waits[_rrow["id"]] = _rwhy
+                continue
+            _kept_reviews.append(_rrow)
+        review_rows = _kept_reviews
     if not dry_run and not _admit and _door.enabled():
         try:
             _waiting = _priority.waiting_by_host(
@@ -7559,6 +7598,21 @@ def _dispatch_once_locked(
             if route == "portable":
                 _only, _job = _portable_only(conn, row, row_assignee, spillover, _caps, _cap_only,
                                              _worktree_ports.get(row["id"]))
+            # FWA destination fence (Prism 71b4b90b5c73): a live fwa hold on lane kanban closes a host to NEW work
+            # whatever the card's origin. A pin to it waits; a portable pick skips it.
+            _held_dest = _kph.held_destinations(list(spillover.hosts), _pause_cache)
+            _pin_dest = force_host if _forced_remote else (route_arg if route in ("pin", "origin") else None)
+            _pin_held = next((w for h, w in _held_dest.items() if _pin_dest and h.lower() == str(_pin_dest).lower()),
+                             None)
+            if _pin_held is not None:
+                result.placement_waits[row["id"]] = _pin_held
+                continue
+            if _held_dest and route == "portable":
+                # Case-insensitive, as take() matches (Prism 96dd675bda52): reach keys are lower-cased, pool names
+                # keep their configured case.
+                _held_low = {str(h).lower() for h in _held_dest}
+                _only = [h for h in (_only if _only is not None else spillover.hosts)
+                         if str(h).lower() not in _held_low]
             _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
             # Scorer-backed takes (pins included) book a reservation for this card.
             _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
@@ -7591,6 +7645,11 @@ def _dispatch_once_locked(
                 if not _last_resort_allowed(route, local_free, _cap_only, spillover):
                     result.placement_waits[row["id"]] = _refusal
                     continue
+            _dest_wait = _kph.destination_wait(placed_host.name, _pause_cache) if placed_host is not None else None
+            if _dest_wait is not None:                     # belt: the chosen host is re-checked before any start
+                spillover.release(placed_host, _rid)
+                result.placement_waits[row["id"]] = _dest_wait
+                continue
             # Layer 0b (t_ecfd5591, F14): never spawn a card whose ATTACHED skills need
             # an enforced capability the chosen host lacks (a stale route's belt).
             _gap = _attached_skill_gap(row, placed_host.name, _caps) if placed_host is not None else None
@@ -7602,6 +7661,13 @@ def _dispatch_once_locked(
                     with _kbc.write_txn(conn):
                         _kb._append_event(conn, row["id"], "placement_gate_refused",
                                           {"layer": "0b", "host": placed_host.name, "cap": _gap})
+                continue
+        if placed_host is None:
+            # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
+            # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
+            _local_wait = _kph.local_destination_wait(_pause_cache)
+            if _local_wait is not None:
+                result.placement_waits[row["id"]] = _local_wait
                 continue
         if _take_refusal is not None and placed_host is None:
             result.take_refusals[row["id"]] = _take_refusal
@@ -8052,6 +8118,11 @@ def _dispatch_once_locked(
         if _kb._card_skills_refused(conn, row["id"], row["assignee"], result, dry_run=dry_run):
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
+            continue
+        _dest_wait = (_kph.destination_wait(_review_origin_host.name, _pause_cache) if _review_origin_host is not None
+                      else _kph.local_destination_wait(_pause_cache))
+        if _dest_wait is not None:                         # FWA destination fence, review lane (fe6a1ad69c44)
+            result.placement_waits[row['id']] = _dest_wait
             continue
         if _review_origin_host is not None:
             _review_origin_host = spillover.take(row['assignee'], pin=_review_origin_host.name)

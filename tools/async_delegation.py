@@ -1326,12 +1326,33 @@ def _envelope_status(result: Dict[str, Any]) -> str:
     return _batch_status(result) if has_results else _single_status(result)
 
 
+def preflight_admission(*, max_async_children: int, durable: bool) -> Optional[Dict[str, Any]]:
+    """Would a background unit be admitted right now? None, or a ``rejected`` dispatch result.
+
+    delegate_task calls this BEFORE it builds any child: a refusal costs zero child sessions. It does
+    not reserve anything; ``_dispatch_admitted`` re-checks both under its own lock."""
+    with _records_lock:
+        active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values()
+                        if r.get("status") in _ACTIVE_STATES}
+    if len(active_slots) >= max_async_children:
+        return {"status": "rejected", "reason": "pool_capacity",
+                "error": f"Async delegation capacity reached ({max_async_children} running)."}
+    if durable:
+        rejection = _store.admission_refusal(profile_home=_registry_path().parent.parent,
+                                             max_records=_MAX_REGISTRY_RECORDS)
+        if rejection is not None:
+            return {"status": "rejected", "reason": rejection,
+                    "error": "Durable async delegation registry unavailable."}
+    return None
+
+
 def _dispatch(**kwargs) -> Dict[str, Any]:
     from hermes_cli.backend_retirement import retirement
 
     with retirement.work() as admitted:
         if not admitted:
-            return {"status": "rejected", "error": "backend is retiring; reconnect to continue"}
+            return {"status": "rejected", "reason": "backend_retiring",
+                    "error": "backend is retiring; reconnect to continue"}
         return _dispatch_admitted(**kwargs)
 
 
@@ -1393,7 +1414,7 @@ def _dispatch_admitted(
     with _records_lock:
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
-            return {"status": "rejected", "error": capacity_error}
+            return {"status": "rejected", "reason": "pool_capacity", "error": capacity_error}
         if durable_spec is not None:
             profile_home = _registry_path().parent.parent
             durable, rejection = _store.persist_dispatch(
@@ -1411,7 +1432,7 @@ def _dispatch_admitted(
                 return {
                     "status": "rejected",
                     "reason": rejection,
-                    "error": "Durable async delegation registry unavailable; run synchronously.",
+                    "error": "Durable async delegation registry unavailable.",
                 }
             record["attempt_id"] = durable["attempt"]["attempt_id"]
             record["owner_boot_id"] = current_boot_id or ""
@@ -1637,6 +1658,13 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         return True
     logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
                    delegation_id, old_attempt, launched.get("error"))
+    if launched.get("paused"):
+        # A live FWA hold closed this host to new work (Prism 0f110d29ad76): running the unit in-process or
+        # detached here would start it on the held host anyway. Nothing runs; the delegation ends naming the hold.
+        _akb.release_launch_fence(launched.get("task_id"))
+        _note_kanban_launch(delegation_id, "none (kanban pause hold; not run)")
+        raise RuntimeError(f"background unit not started: {launched['paused']}; no in-process fallback "
+                           "while the host is held")
     error_class = str(launched.get("error") or "").split(":", 1)[0] or "unknown"
     try:
         on_card = _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home)
