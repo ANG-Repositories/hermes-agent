@@ -138,6 +138,21 @@ def test_local_oversized_magic_prefixed_script_fails_closed_without_env_execute(
     assert env.calls == []
 
 
+def test_local_fifo_script_fails_closed_without_blocking_or_env_execute(tmp_path, local_env):
+    # A FIFO in place of a script must neither hang the guard (no writer ever opens it)
+    # nor be silently skipped: the walk refuses non-regular files and the scan fails closed.
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("no FIFOs on this platform")
+    fifo = tmp_path / "pipe.sh"
+    os.mkfifo(fifo)
+    env = local_env
+    started = time.monotonic()
+    blocked = _block(f"bash {fifo}", env, cwd=str(tmp_path))
+    assert time.monotonic() - started < 10
+    assert blocked is not None and "could not scan" in json.loads(blocked)["error"]
+    assert env.calls == []
+
+
 def test_local_nested_relative_unsafe_script_is_blocked(tmp_path, local_env):
     inner = _write(tmp_path / "proj" / "lib" / "inner.sh", f"#!/bin/bash\n{RESTART}\n")
     _write(tmp_path / "proj" / "run.sh", "#!/bin/bash\nbash ./lib/inner.sh\n")
