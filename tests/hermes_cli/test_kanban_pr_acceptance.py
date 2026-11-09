@@ -808,3 +808,107 @@ def test_operator_lane_negatives_stay_missing(github, tmp_path, case):
     receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
     assert receipt["ok"] is False, receipt
     assert receipt["classification"] == "missing", receipt
+
+
+# --- t_d6b1d123: a PR merged outside fleet-merge (admin override) gets its attribution from
+# fleet-merge --record-only, which by design never posts the status. Measured on home#10037
+# @65c464bf: merged_by ang-fleet-interactive[bot], record-only ledger row gate_kind retroactive,
+# operator_coverage APPROVE at the head on the land-request row, same bot posted the comment.
+
+def _retroactive(tmp_path, *, gate_kind="retroactive", action="record-only", by="apollo", lane="operator",
+                 approve=True, approve_head=_HEAD, approve_by="apollo/operator", ledger_head=_HEAD,
+                 ledger_repo="acme/repo", author="ang-fleet-interactive[bot]", comment_by="apollo",
+                 comment_lane="operator", statuses=None, extra_check=False):
+    cfg = tmp_path / "home" / "config" / "operator-approvers.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"approvers": ["apollo", "apollo/operator"], "operator_logins": ["Kyzcreig"]}),
+                   encoding="utf-8")
+    ledger = tmp_path / "home" / "state" / "merge-ledger.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    rows = [{"repo": ledger_repo, "pr": 7, "head": ledger_head, "by": by, "lane": lane, "gate": "RETROACTIVE",
+             "gate_kind": gate_kind, "action": action, "status_state": "not-posted", "attempt_id": "retro1"}]
+    if approve:
+        rows.append({"event": "land-request", "repo": ledger_repo, "pr": 7, "review_head_sha": approve_head,
+                     "status": "STALE", "operator_coverage": {"verdict": "APPROVE", "head_sha": approve_head,
+                                                              "by": approve_by}})
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    checks = [{"context": _ATTR, "app_id": 5078363}] + ([{"context": "ci", "app_id": 1}] if extra_check else [])
+    body = f"\U0001f916 merged-by: {comment_by} \u00b7 lane: {comment_lane} \u00b7 gate: RETROACTIVE \u00b7 why: x"
+    return {"conclusion": "success", "head": _HEAD, "missing": True, "pr_state": "MERGED",
+            "merged_by": "ang-fleet-interactive[bot]", "statuses": statuses or [], "apps": {},
+            "protection": {"required_status_checks": {"checks": checks, "contexts": [c["context"] for c in checks]}},
+            "comments": [{"id": 88, "user": {"login": author}, "body": body,
+                          "html_url": "https://github.com/acme/repo/pull/7#c88"}]}
+
+
+@pytest.mark.platforms("posix")
+def test_retroactive_record_only_attribution_on_merged_reviewed_head_is_accepted(github, tmp_path):
+    """RED on main ('missing'): the home#10037 shape (t_d6b1d123) closes on its retroactive record."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(_retroactive(tmp_path))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True and receipt["classification"] == "success", receipt
+    check = receipt["checks"][0]
+    assert check["classification"] == "waived"
+    retro = check["retroactive_attribution"]
+    assert retro["kind"] == "retroactive-record-only" and retro["comment_id"] == 88
+    assert retro["ledger_attempt_id"] == "retro1" and retro["approve_by"] == "apollo/operator"
+
+
+@pytest.mark.platforms("posix")
+def test_retroactive_card_completes_through_complete_task(github, tmp_path):
+    github.update(_retroactive(tmp_path))
+    with connect() as conn:
+        tid = kb.create_task(conn, title="admin merged, recorded", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status == "done"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("case", ["open_pr", "no_record", "not_retroactive", "record_other_head", "record_not_approver",
+                                  "record_bad_lane", "record_other_repo", "no_approve", "approve_other_head",
+                                  "approve_not_approver", "comment_by_other", "comment_other_agent", "no_comment",
+                                  "attribution_failed", "other_check_missing"])
+def test_retroactive_negatives_stay_refused(github, tmp_path, case):
+    from hermes_cli import kanban_pr_acceptance as acc
+    kw = {}
+    if case == "no_record":
+        kw["action"] = "merge"
+    elif case == "not_retroactive":
+        kw["gate_kind"] = "override"
+    elif case == "record_other_head":
+        kw["ledger_head"] = "c" * 40
+    elif case == "record_not_approver":
+        kw["by"] = "mallory"
+        kw["comment_by"] = "mallory"
+    elif case == "record_bad_lane":
+        kw.update(lane="worker", comment_lane="worker")
+    elif case == "record_other_repo":
+        kw["ledger_repo"] = "acme/other"
+    elif case == "no_approve":
+        kw["approve"] = False
+    elif case == "approve_other_head":
+        kw["approve_head"] = "c" * 40
+    elif case == "approve_not_approver":
+        kw["approve_by"] = "mallory"
+    elif case == "comment_by_other":
+        kw["author"] = "mallory"
+    elif case == "comment_other_agent":
+        kw["comment_by"] = "aegis/breakglass-ops"
+    elif case == "attribution_failed":    # a real failed attribution is never overridden by a record
+        kw["statuses"] = [{"id": 5, "context": _ATTR, "state": "failure", "target_url": None,
+                           "description": "refused", "creator": {"login": "ang-fleet-lander[bot]", "type": "Bot"}}]
+    elif case == "other_check_missing":    # only attribution is satisfied, never CI
+        kw["extra_check"] = True
+    state = _retroactive(tmp_path, **kw)
+    if case == "open_pr":
+        state["pr_state"] = "OPEN"
+    if case == "no_comment":
+        state["comments"] = []
+    if case == "attribution_failed":
+        state["apps"] = {"ang-fleet-lander": 5078363}
+    github.update(state)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False, receipt
+    assert receipt["classification"] == ("failure" if case == "attribution_failed" else "missing"), receipt
