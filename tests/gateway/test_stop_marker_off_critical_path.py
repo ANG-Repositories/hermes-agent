@@ -552,7 +552,7 @@ def test_intent_write_completes_a_short_write_and_fails_on_no_progress(tmp_path,
     real_write = _os.write
     monkeypatch.setattr(_os, "write", lambda fd, data: real_write(fd, bytes(data[:16])))
     path = store.write_user_stop_intent(entry.session_key, entry.session_id, generation=7)
-    data = json.loads(path.read_text(encoding="utf-8"))  # truncated JSON before the fix
+    data = json.loads(path.read_text(encoding="utf-8-sig"))  # truncated JSON before the fix
     assert data["session_id"] == entry.session_id and data["generation"] == 7
 
     monkeypatch.setattr(_os, "write", lambda fd, data: 0)
