@@ -148,9 +148,11 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     if not raw:
         return None
     p = Path(raw).expanduser()
-    target = worktree_target_anchor(p, task_id)
+    # <repo>/.worktrees/<id> not made yet: the repo is the anchor (t_e604c0f9). Only under the same switch as
+    # the own-tree port: with host_preference off a concrete target keeps today's Studio pin (Prism 7eba47409a75).
+    target = worktree_target_anchor(p, task_id) if allow_studio_tree else None
     if target is not None:
-        p = target  # <repo>/.worktrees/<id> not made yet: the repo is the anchor (t_e604c0f9)
+        p = target
     if not p.is_absolute() or not p.is_dir():
         return None
     top = _git_toplevel(p)
@@ -222,8 +224,17 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
     """``kanban create`` half of t_e604c0f9: ``(workspace_path, note)``. A ``worktree:<repo>/.worktrees/<x>``
     target that does not exist yet, on a repo with a row in ``kanban-worktree-mirrors.json``, is rewritten to the
     anchor form ``worktree:<repo>`` (the dispatcher can then port it: FWA places it and the worktree is built on
-    the chosen host). ``note`` says what happened, or why the card stays Studio-local; None for non-worktree cards."""
+    the chosen host). ``note`` says what happened, or why the card stays Studio-local; None for non-worktree cards
+    and whenever the host_preference switch (t_c2fce87e) does not make the Studio a last resort: then ``kanban
+    create`` stores and prints exactly what it did before (Prism 7eba47409a75)."""
     if workspace_kind != "worktree" or not workspace_path:
+        return workspace_path, None
+    try:
+        from hermes_cli import placement_policy as _ppol
+        from hermes_cli.kanban_worker_pool import STUDIO_HOST
+        if not _ppol.load(Path(fleet_dir)).is_last_resort(STUDIO_HOST):
+            return workspace_path, None
+    except Exception:
         return workspace_path, None
     from hermes_cli.kanban_db_workspace import _git_toplevel
     p = Path(workspace_path).expanduser()

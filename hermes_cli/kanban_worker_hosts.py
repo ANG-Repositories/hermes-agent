@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 from typing import Callable, Dict, Mapping, MutableMapping, Optional
@@ -337,16 +338,49 @@ CARRY_MAX_ENTRIES = 20000
 CARRY_TIMEOUT_SECONDS = 300
 CARRY_SCAN_TTL_SECONDS = 300
 CARRIED_EVENT = "workspace_carried"
+# portable() bind rule of a carried card: once carried, every later run binds to the host holding the copy
+# (custody, independent of placement.continuation); the Studio original is never run against or carried again.
+CARRY_BIND_RULE = "workspace_carry"
 _carry_scan_cache: Dict[str, tuple] = {}
+# The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
+# and ``--protect-args`` is not portable across them (Prism a39b11fdf16d). So a carried path is limited to a
+# charset no shell interprets: absolute, components of [A-Za-z0-9._@+-], no empty / . / .. component, none
+# starting with '-'. Anything else is not carried (the card keeps the old local_files rule).
+_CARRY_COMPONENT_RE = re.compile(r"[A-Za-z0-9_@+.][A-Za-z0-9._@+-]*")
+
+
+def carry_path_safe(path: Optional[str]) -> bool:
+    """True when ``path`` may be named on a remote rsync command line verbatim (see ``_CARRY_COMPONENT_RE``)."""
+    if not isinstance(path, str) or not path.startswith("/"):
+        return False
+    parts = path.rstrip("/").split("/")[1:]
+    return bool(parts) and all(p not in (".", "..") and _CARRY_COMPONENT_RE.fullmatch(p) for p in parts)
+
+
+def carried_host(conn, task_id: str, workspace_path: Optional[str]) -> Optional[str]:
+    """The pool host holding this card's carried workspace, or None. The newest carry event counts, and only while
+    the card still points at that workspace (an operator who re-pointed it has moved it on)."""
+    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+                       (task_id, CARRIED_EVENT)).fetchone()
+    if row is None:
+        return None
+    try:
+        doc = json.loads(row[0] or "{}")
+    except (TypeError, ValueError):
+        return None
+    host = doc.get("host")
+    if not isinstance(host, str) or not host or doc.get("workspace") != workspace_path:
+        return None
+    return host.lower()
 
 
 def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                   max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None) -> bool:
-    """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed). Any scan
-    error is False (the card keeps the old rule). Cached per path for ``CARRY_SCAN_TTL_SECONDS``: the dispatcher
-    asks every tick."""
+    """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed) and its
+    path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path for
+    ``CARRY_SCAN_TTL_SECONDS``: the dispatcher asks every tick."""
     import time as _time
-    if not path:
+    if not path or not carry_path_safe(path):
         return False
     try:
         from hermes_cli.kanban_db_workspace import canon
@@ -383,11 +417,13 @@ def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subproces
     """Copy the local ``workspace`` to the same path on ``host`` (rsync -a over the pool ssh options); raise on any
     failure. Never deletes on the target: an existing remote file of the same name is overwritten, others stay."""
     src = workspace.rstrip("/") or "/"
+    if not carry_path_safe(src):
+        raise RuntimeError(f"carry to {host.name}: refused, {src!r} is not a shell-inert path")
     # The same mkdir every placed run gets (mode 0770, board-root probe); the copy below runs inside the
     # reservation take() booked for this card on this host, so it places no work of its own.
     prepare_remote_workspace(host, src, runner)
     ssh = _ssh_argv(host, "")[:-2]  # the ssh options, without target and command
-    proc = runner(["rsync", "-a", "-e", " ".join(shlex.quote(a) for a in ssh), f"{src}/",
+    proc = runner(["rsync", "-a", "-e", " ".join(shlex.quote(a) for a in ssh), "--", f"{src}/",
                    f"{host.target}:{src}/"],
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)

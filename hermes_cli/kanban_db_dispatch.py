@@ -5188,6 +5188,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _ported = _kwt.ported_host(conn, row["id"], row["workspace_path"])
         if _ported:
             bind = (_kwt.PORT_BIND_RULE, row["id"], _ported)
+        else:
+            # A carried local_files card's real workspace is the copy on the host it was carried to
+            # (t_e604c0f9, Prism 86a85c6c299a / 6c03238719d2): every rerun binds there, whatever
+            # placement.continuation or the host_preference switch say. The Studio original is stale from the
+            # carry on: no local run against it, no second carry over the remote work; an absent host waits.
+            _carried = _kb._kwh.carried_host(conn, row["id"], row["workspace_path"])
+            if _carried:
+                bind = (_kb._kwh.CARRY_BIND_RULE, row["id"], _carried)
     # An unassigned card is routed as the assignee the loop will give it.
     assignee = row["assignee"] or default_assignee
     allowlisted = bool(assignee) and assignee in tuple(plan.config.profiles or ())
@@ -6762,7 +6770,8 @@ def _dispatch_once_locked(
                 [*ready_rows, *review_rows], spillover, routes=row_route, local_host="local", board=board,
                 default_assignee=default_assignee, conn=conn, caps=_caps,
                 cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports,
-                local_budget=local_budget, browser_joins=result.browser_joins)
+                local_budget=local_budget, browser_joins=result.browser_joins,
+                continuity=_carry_rows)
             _priority.publish_waiting(conn, _waiting, verdicts=_priority.verdicts_for_plan(spillover))
         except Exception as exc:
             _kb._log.warning("kanban door publication failed (starts remain fail-closed): %s", exc)
@@ -7812,8 +7821,10 @@ def _dispatch_once_locked(
                     # failure (claim released, reservation refunded), never an empty-dir run.
                     _kb._kwh.carry_workspace(placed_host, str(workspace))
                     with _kbc.write_txn(conn):
+                        # "workspace" is the card's stored path, the key carried_host() binds on.
                         _kb._append_event(conn, claimed.id, _kb._kwh.CARRIED_EVENT,
-                                          {"host": placed_host.name, "workspace": str(workspace)},
+                                          {"host": placed_host.name, "workspace": claimed.workspace_path,
+                                           "path": str(workspace)},
                                           run_id=claimed.current_run_id)
             if protected is not None:
                 validate_mount(

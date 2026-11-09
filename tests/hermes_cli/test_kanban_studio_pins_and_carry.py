@@ -172,7 +172,120 @@ def test_local_files_is_carried_to_the_pool_when_the_studio_is_full(kanban_home,
                           (tid, kwh.CARRIED_EVENT)).fetchone()
     assert (tid, "ace-ai") in spawned
     assert carried == [("ace-ai", path)]
-    assert json.loads(ev[0]) == {"host": "ace-ai", "workspace": path}
+    assert json.loads(ev[0]) == {"host": "ace-ai", "workspace": path, "path": path}
+
+
+# -- Prism 86a85c6c299a / 6c03238719d2: a carried card is bound to the host holding the copy -------------------
+
+@pytest.mark.parametrize("continuation_on_studio_room", [True, False])
+def test_a_carried_card_reruns_on_the_carry_host_never_on_the_stale_studio_copy(kanban_home, carried,
+                                                                              continuation_on_studio_room):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="saturated:cpu")
+        assert carried == [("ace-ai", path)]
+        # the run ends; the card is ready again (retry / requeue) with the Studio copy still present
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?", (tid,))
+        conn.commit()
+        route, rule, carry = _route(conn, tid, None)
+        assert route == ("pin", "ace-ai") and rule.startswith("bind_host:ace-ai") and not carry, (route, rule)
+        kw = {"spawn_limit": 2} if continuation_on_studio_room else {"spawn_limit": 0, "spawn_paused": "x"}
+        _res, spawned = _tick(conn, spillover=_plan(free=2), **kw)
+    assert (tid, "ace-ai") in spawned and (tid, None) not in spawned
+    assert carried == [("ace-ai", path)]  # never carried a second time over the remote work
+
+
+def test_a_carried_card_whose_host_is_gone_waits_never_runs_local(kanban_home, carried):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        kb._append_event(conn, tid, kwh.CARRIED_EVENT, {"host": "ace-ai", "workspace": path, "path": path})
+        conn.commit()
+        plan = _plan(free=2)
+        plan.config = plan.config.__class__(**{**plan.config.__dict__, "profiles": ()})  # no host takes alpha
+        route, _rule, _ = _route(conn, tid, None, plan)
+    assert route[0] in ("wait", "pin") and route != ("local", None)
+
+
+def test_a_repointed_carried_card_is_unbound(kanban_home, carried):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        kb._append_event(conn, tid, kwh.CARRIED_EVENT, {"host": "ace-ai", "workspace": "/elsewhere"})
+        conn.commit()
+        assert kwh.carried_host(conn, tid, path) is None
+
+
+# -- Prism e8e4061341d6: one remote-first predicate for the spawn loop and the door publisher ------------------
+
+def test_door_publisher_waits_a_continuity_row_where_the_spawn_loop_starts_it(kanban_home):
+    from hermes_cli.kanban_priority import waiting_by_host
+    plan = _plan(free=2)
+    plan.default_remote = True
+    cards = [{"id": "lf", "assignee": "alpha", "asap": False}, {"id": "p", "assignee": "alpha", "asap": False}]
+    routes = {"lf": ("portable", None), "p": ("portable", None)}
+    w = waiting_by_host(cards, plan, routes=routes, local_host="studio", continuity={"lf": True})
+    assert [c["id"] for c in w["studio"]] == ["lf"]
+    assert all(c["id"] != "p" for c in w["studio"])
+    assert kbd._portable_goes_remote(True, None, plan, continuity=True) is False
+    assert kbd._portable_goes_remote(True, None, plan) is True
+
+
+# -- Prism a39b11fdf16d (P0): nothing caller-controlled reaches a remote shell unquoted ------------------------
+
+HOSTILE = ["/tmp/carry;touch /tmp/carry-pwn;#", "/tmp/w; rm -rf ~", "/tmp/$(touch /tmp/pwn)", "/tmp/`id`",
+           "/tmp/a b", "/tmp/-rf", "/tmp/../etc", "/tmp/x\nid", "relative/path", "/tmp/a|b", "/tmp/a&b"]
+
+
+@pytest.mark.parametrize("path", HOSTILE)
+def test_carry_refuses_a_shell_active_path_before_any_remote_command(path):
+    calls = []
+    host = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=1, capacity_pct=0.8,
+                        absence="required", profiles=("alpha",), state="active", enabled=True, priority=0)
+    assert not kwh.carry_path_safe(path)
+    kwh._carry_scan_cache.clear()
+    assert not kwh.carry_size_ok(path)
+    with pytest.raises(RuntimeError, match="shell-inert"):
+        kwh.carry_workspace(host, path, runner=lambda argv, **kw: calls.append(argv))
+    assert calls == []
+
+
+def test_carry_path_safe_admits_real_workspace_paths():
+    assert kwh.carry_path_safe("/Volumes/fleet-scratch/workspaces/default/t_e604c0f9")
+    assert kwh.carry_path_safe("/home/kanbanw/.hermes/kanban/boards/x-y/workspaces/t_1/")
+
+
+def test_mkdir_quotes_hostile_paths():
+    """prepare_remote_workspace (the other remote command in this diff) shlex-quotes the path."""
+    import shlex as _sh
+    calls = []
+
+    class P:
+        returncode, stderr = 0, ""
+    host = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=1, capacity_pct=0.8,
+                        absence="required", profiles=("alpha",), state="active", enabled=True, priority=0)
+    for path in HOSTILE[:4]:
+        kwh.prepare_remote_workspace(host, path, runner=lambda argv, **kw: (calls.append(argv), P())[1])
+        assert f"-- {_sh.quote(path)} " in calls[-1][-1]
+
+
+# -- Prism 7eba47409a75: the kill switch restores the old worktree-target pin and the old create output --------
+
+def test_kill_switch_keeps_a_not_yet_made_worktrees_target_local(kanban_home, anchor):
+    _mirrors(kanban_home)
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid = _wt_card(conn, anchor)
+        rules: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules)[0] == "local"
+    assert rules[tid] == "workspace_kind"
+    assert kwt.anchor_repo(tid, str(anchor / ".worktrees" / tid), None) is None
+
+
+def test_kill_switch_leaves_kanban_create_byte_for_byte(kanban_home, anchor):
+    _mirrors(kanban_home)
+    _kill_switch(kanban_home, False)
+    target = str(anchor / ".worktrees" / "fix-lint")
+    assert kwt.mint_rewrite("worktree", target, kanban_home / "fleet") == (target, None)
+    assert kwt.mint_rewrite("worktree", str(anchor), kanban_home / "fleet") == (str(anchor), None)
 
 
 def test_local_files_carry_failure_is_a_spawn_failure_never_an_empty_dir_run(kanban_home, monkeypatch):
