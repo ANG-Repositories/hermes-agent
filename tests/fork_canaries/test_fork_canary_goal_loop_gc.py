@@ -172,6 +172,8 @@ def test_reaper_retires_only_unrouted_and_idle(tmp_path):
         g = _goal(db, "old-unrouted")
         assert g.status == "orphaned" and "orphan-gc" in g.paused_reason
         assert time.strftime("%Y-%m-%d", time.localtime(now)) in g.paused_reason
+        # RED-proof (M21): in hermes_cli/goals.py::reap_orphaned_goals_and_loops (~line 1072) delete
+        # `scanned[prefix] = written[1]` -> the loop's sibling fence sees our own goal write and keeps it.
         assert _loop(db, "old-unrouted").status == "orphaned"
         # RED-proof (M3): in hermes_cli/goals.py::_goal_loop_session_activity (~line 943) replace
         # `activity[sid] = max(activity[sid], ...)` with `pass` -> "cli-recent" is reaped.
@@ -198,10 +200,14 @@ class _HookAfterScanDB:
     for another writer landing between scan and retire. No sleeps."""
 
     def __init__(self, db, hook):
-        self._db, self._hook, self.fired = db, hook, 0
+        self._db, self._hook, self.fired, self.writes = db, hook, 0, 0
 
     def __getattr__(self, name):
         return getattr(self._db, name)
+
+    def _execute_write(self, *args, **kwargs):  # counts the reaper's retiring transactions
+        self.writes += 1
+        return self._db._execute_write(*args, **kwargs)
 
     def _read_all(self, *args, **kwargs):
         rows = self._db._read_all(*args, **kwargs)
@@ -259,16 +265,18 @@ def test_reaper_keeps_a_session_that_turned_live_after_the_scan(tmp_path, monkey
 
         assert hooked.fired == 1  # the interleaving really ran between scan and retire
         # RED-proof, all in hermes_cli/goals.py:
-        # (M13) message/heartbeat: in _retire_if_still_orphaned (~line 1006) delete the
+        # (M13) message/heartbeat: in _retire_if_still_orphaned (~line 1007) delete the
         #   `if srow is not None and float(srow[0] or 0.0) > cutoff: return None` session recheck.
         # (M10) goal-turn/goal-subgoal/goal-gate/goal-contract/loop-rearm: in _retire_if_still_orphaned
         #   (~line 993) drop `or raw != scanned.get(prefix)` (the scanned-row fence on the retired row).
         # (M19) goal-subgoal: in _retire_if_still_orphaned (~line 1000) delete the sibling fence
         #   `if sibling != scanned[p]: return None` -> the loop is retired beside the edited goal.
-        # (M15) route: in reap_orphaned_goals_and_loops (~line 1061) delete the pre-write
-        #   `if live_routed(sid): continue`.
+        # (M15) route: in reap_orphaned_goals_and_loops (~line 1062) delete the pre-write
+        #   `if live_routed(sid): continue` -> the row is retired, then given back (visible flip).
         assert counts["orphaned"] == 0 and counts["loops"] == 0
         assert _goal(db, "s").status == "active" and _loop(db, "s").status == "active"
+        if event == "route":  # routed before the write: no retiring write at all, not retire-then-undo
+            assert hooked.writes == 0
     finally:
         db.close()
 
@@ -286,7 +294,7 @@ def test_sibling_loop_resumed_after_the_scan_keeps_the_goal(tmp_path, monkeypatc
         hooked = _HookAfterScanDB(db, lambda: loops.LoopManager("s").resume())
         counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=hooked)
         assert hooked.fired == 1
-        # RED-proof (M20): in hermes_cli/goals.py::_retire_if_still_orphaned (~line 1003) delete
+        # RED-proof (M20): in hermes_cli/goals.py::_retire_if_still_orphaned (~line 1004) delete
         # `if last is not None and last > cutoff: return None` (the unscanned-sibling clock check).
         assert counts["orphaned"] == 0
         assert _goal(db, "s").status == "active" and _loop(db, "s").status == "active"
@@ -312,7 +320,7 @@ def test_routing_is_never_read_while_the_db_write_lock_is_held(tmp_path):
         _put_loop(db, "s", age_days=9, now=now)
         counts = goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db, is_routed=_is_routed)
         assert counts == {"scanned": 1, "orphaned": 1, "loops": 1} and calls
-        # RED-proof (M18): in hermes_cli/goals.py::reap_orphaned_goals_and_loops (~line 1063) wrap
+        # RED-proof (M18): in hermes_cli/goals.py::reap_orphaned_goals_and_loops (~line 1064) wrap
         # `retire` so it calls live_routed(sid) (routing read back inside the write txn, the round-2 shape).
         assert held == []
     finally:
@@ -364,7 +372,7 @@ def test_activity_heartbeat_protects_a_resumed_cli_session(tmp_path):
         _put_goal(db, "s", age_days=8, now=now)
         _session_row(db, "s", last_active=now - 8 * DAY)
         db.touch_session_activity("s", ts=now)
-        # RED-proof (M14): in hermes_cli/goals.py::_orphan_gc_session_activity_sql (~line 924)
+        # RED-proof (M14): in hermes_cli/goals.py::_orphan_gc_session_activity_sql (~line 918)
         # return the pre-fix expression (started_at / effective_last_active / messages, no
         # last_activity_at) -> the live goal is orphaned.
         assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, now=now, db=db)["orphaned"] == 0
@@ -384,7 +392,7 @@ def test_resumed_loop_is_not_reaped_before_its_first_tick(tmp_path, monkeypatch,
         assert loops.LoopManager("s").resume() is not None
         assert _loop(db, "s").status == "active"
         # RED-proof (M11): drop "next_due_at" from the loop clocks in
-        # hermes_cli/goals.py::_ORPHAN_GC_ROW_CLOCKS (~line 912) -> the resumed loop is re-orphaned.
+        # hermes_cli/goals.py::_ORPHAN_GC_ROW_CLOCKS (~line 914) -> the resumed loop is re-orphaned.
         assert goals.reap_orphaned_goals_and_loops(set(), gc_days=7, db=db)["loops"] == 0
         assert _loop(db, "s").status == "active"
     finally:
