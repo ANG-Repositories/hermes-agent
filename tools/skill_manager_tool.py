@@ -393,12 +393,81 @@ def _iter_skill_dirs(root: Path):
             yield skill_md.parent
 
 
+# Name -> skill-dir index for _find_skill. A full walk (_iter_skill_dirs over every root) costs
+# ~1.7k SKILL.md plus their support trees and showed as ~10% of gateway GIL samples, because one
+# skill_manage call resolves the same name up to four times. The index is rebuilt by ONE walk and
+# is never trusted blindly:
+#   * every hit is re-validated (SKILL.md still a file, not excluded) -> an external delete/move
+#     forces a rebuild on the very next lookup of that name;
+#   * every miss rebuilds once before answering None -> an external create is seen immediately;
+#   * a rebuild also happens after _SKILL_INDEX_TTL_SECONDS (bounds the one case validation cannot
+#     see: a NEW same-named skill appearing EARLIER in scan order) and after any skill_manage
+#     mutation in this process (generation bump).
+# Key = the ordered root list, so a config change to external_dirs or a profile switch is a new index.
+_SKILL_INDEX_TTL_SECONDS = 30.0
+_SKILL_INDEX_LOCK = threading.Lock()
+_SKILL_INDEX: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+_SKILL_INDEX_GENERATION = 0
+
+
+def _invalidate_skill_index() -> None:
+    """Drop every cached index (called after this process mutates a skill tree)."""
+    global _SKILL_INDEX_GENERATION
+    with _SKILL_INDEX_LOCK:
+        _SKILL_INDEX_GENERATION += 1
+        _SKILL_INDEX.clear()
+
+
+def _build_skill_index(roots: List[Path]) -> Dict[str, Any]:
+    """One walk over ``roots`` in precedence order -> ordered dirs + first-wins name map. The
+    generation is read BEFORE the walk, so a mutation that lands mid-walk voids the build."""
+    gen = _SKILL_INDEX_GENERATION
+    ordered: List[Path] = []
+    by_name: Dict[str, Path] = {}
+    for skills_dir in roots:
+        if not skills_dir.exists():
+            continue
+        for skill_dir in _iter_skill_dirs(skills_dir):
+            ordered.append(skill_dir)
+            by_name.setdefault(skill_dir.name, skill_dir)
+    return {"ordered": ordered, "by_name": by_name, "by_rel": {}, "gen": gen}
+
+
+def _skill_index_lookup(index: Dict[str, Any], name: str, local_root: Optional[Path]) -> Optional[Path]:
+    """Same first-match order as the original walk. A bare name matches a dir by its name; a
+    categorized name (has a separator, so it can never equal a dir name) matches the first dir
+    whose resolved POSIX path relative to ``local_root`` equals it."""
+    if local_root is None:
+        return index["by_name"].get(name)
+    by_rel = index["by_rel"].get(str(local_root))
+    if by_rel is None:  # resolved lazily, once per index build, only for categorized lookups
+        by_rel = {}
+        for skill_dir in index["ordered"]:
+            with suppress(OSError, RuntimeError, ValueError):
+                resolved = skill_dir.resolve()
+                if resolved.is_relative_to(local_root):
+                    by_rel.setdefault(resolved.relative_to(local_root).as_posix(), skill_dir)
+        index["by_rel"][str(local_root)] = by_rel
+    return by_rel.get(name)
+
+
+def _skill_dir_still_valid(skill_dir: Path) -> bool:
+    from agent.skill_utils import is_excluded_skill_path
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        return skill_md.is_file() and not is_excluded_skill_path(skill_md)
+    except OSError:
+        return False
+
+
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
     categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
-    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs)."""
+    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs).
+    Served from the validated index above; a miss or a stale hit costs exactly one re-walk."""
+    import time
     from agent.skill_utils import get_all_skills_dirs
     local_root = None
     if "/" in name or "\\" in name:
@@ -409,18 +478,27 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
                 "skills dir resolve failed; categorized lookups fall back to the unresolved path",
                 exc_info=True)
             local_root = _skills_dir()
-    for skills_dir in get_all_skills_dirs():
-        if not skills_dir.exists():
-            continue
-        for skill_dir in _iter_skill_dirs(skills_dir):
-            if skill_dir.name == name:
-                return {"path": skill_dir}
-            if local_root is not None:
-                resolved = skill_dir.resolve()
-                if (resolved.is_relative_to(local_root)
-                        and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
-                    return {"path": skill_dir}
-    return None
+    roots = list(get_all_skills_dirs())
+    key = tuple(str(r) for r in roots)
+    now = time.monotonic()
+    with _SKILL_INDEX_LOCK:
+        cached = _SKILL_INDEX.get(key)
+    fresh = (cached is not None and cached["gen"] == _SKILL_INDEX_GENERATION
+             and now - cached["built_at"] < _SKILL_INDEX_TTL_SECONDS)
+    if fresh:
+        hit = _skill_index_lookup(cached, name, local_root)
+        if hit is not None and _skill_dir_still_valid(hit):
+            return {"path": hit}
+    # Miss, stale hit, expired or absent index: one walk, then answer from it.
+    index = _build_skill_index(roots)
+    index["built_at"] = now
+    with _SKILL_INDEX_LOCK:
+        if index["gen"] == _SKILL_INDEX_GENERATION:  # never publish a build that raced a mutation
+            if key not in _SKILL_INDEX and len(_SKILL_INDEX) >= 16:  # one per profile root-set
+                _SKILL_INDEX.clear()
+            _SKILL_INDEX[key] = index
+    hit = _skill_index_lookup(index, name, local_root)
+    return {"path": hit} if hit is not None else None
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -1111,6 +1189,8 @@ def skill_manage(
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
             f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
         result = handler({"name": name, **args})
+        if action in {"create", "delete"}:  # tree shape changed: no index may outlive it
+            _invalidate_skill_index()
         if isinstance(result, str):
             return result  # tool_error JSON for argument-shape problems (patch)
         if result.get("success"):
