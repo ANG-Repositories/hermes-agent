@@ -1108,7 +1108,7 @@ def _studio_words() -> frozenset:
     return _STUDIO_PIN_WORDS | ({short} if short else set())
 
 
-def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
+def pin_aliases(fleet_dir: Path, *, strict: bool = False) -> Dict[str, str]:
     """``{alias: canonical pin}`` from the registry (t_cb2b888d), the ONE
     alias source. For every host the pool files know (:func:`known_host_ids`)
     and every ``ci-hosts.json`` row: the id, its ``ssh_alias`` and
@@ -1118,11 +1118,14 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
     A row with ``transport: local`` is the Studio (``studio``). A row that is
     neither a known pool host nor local adds nothing. An alias two hosts
     claim is dropped (ambiguous: it stays unknown, never guesses). Matching
-    is case-insensitive. Unreadable files add nothing."""
-    known = set(known_host_ids(fleet_dir))
+    is case-insensitive. Unreadable files add nothing unless strict=True,
+    used by pause enforcement to reject incomplete pin vocabularies."""
+    known = set(known_host_ids(fleet_dir, strict=strict))
     try:
         ci = _read_json(Path(fleet_dir) / CI_HOSTS_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         ci = None
     claims: Dict[str, set] = {}
 
@@ -1151,6 +1154,8 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
     try:
         table = _read_json(Path(fleet_dir).parent / "config" / FLEET_HOSTS_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         table = None
     rows = table.get("hosts") if isinstance(table, dict) else None
     for hid, row in (rows.items() if isinstance(rows, dict) else ()):
@@ -1191,19 +1196,24 @@ def note_ignored_pin(card_id: str, word: str) -> None:
                      card_id, word)
 
 
-def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
+def known_host_ids(fleet_dir: Path, *, strict: bool = False) -> Tuple[str, ...]:
     """Every host id the pool files name (roles hosts with the kanban-worker
     role, sidecar rows, priority), read WITHOUT validation: a disabled or
     refused pool still knows its hosts, so a real pin stays fail-closed
-    while prose never becomes one. Unreadable files name nothing."""
+    while prose never becomes one. Unreadable files name nothing unless
+    strict=True, which propagates registry I/O and JSON errors."""
     out: List[str] = []
     try:
         roles = _read_json(Path(fleet_dir) / ROLES_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         roles = None
     try:
         side = _read_json(Path(fleet_dir) / SIDECAR_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         side = None
     if isinstance(roles, dict) and isinstance(roles.get("hosts"), dict):
         for hid, row in roles["hosts"].items():

@@ -5234,6 +5234,29 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
     return _only, _job
 
 
+def _reroute_off_held_origin(conn, row, host: str, pause_cache: Optional[dict], *, dry_run: bool = False):
+    """Preserve a populated origin unless a verified transfer can replace it.
+
+    origin_route reaches here only for retained remote state. The ordinary
+    scratch allocator cannot carry that host's files; a local path/port check
+    would inspect the dispatcher's different filesystem. Until a source-aware
+    transfer exists, keep the origin and hold this card only. Empty origins
+    already fall through origin_route after positive state-loss proof.
+    """
+    from hermes_cli import kanban_pause_hold as _kph
+    cache = {} if pause_cache is None else pause_cache
+    if _kph.follows_origin() or not _kph.enabled():
+        return ("origin", host)
+    why = _kph.destination_wait(host, cache)
+    try:
+        pinned = _kph.pinned_to(row["body"], host, cache) if why else False
+    except Exception:
+        return "wait", f"continuity_hold (origin_host_paused:{host} pin_registry_unreadable)"
+    if why is None or pinned:
+        return ("origin", host)
+    return "wait", f"continuity_hold (origin_host_paused:{host} source_workspace_transfer_unavailable)"
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5248,6 +5271,7 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                worktree_out: Optional[dict] = None,
                board: Optional[str] = None,
                carry_out: Optional[dict] = None,
+               pause_cache: Optional[dict] = None,
                carry_budget=None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
@@ -5278,6 +5302,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         states=getattr(plan, "continuation_states", {}), caps=caps,
         dry_run=getattr(plan, "continuation_dry_run", False),
     )
+    if _origin is not None and _origin[0] == "origin":
+        _origin = _reroute_off_held_origin(conn, row, _origin[1], pause_cache,
+                                           dry_run=getattr(plan, "continuation_dry_run", False))
     if _origin is not None:
         return _origin
 
@@ -6801,7 +6828,8 @@ def _dispatch_once_locked(
                                          access_out=result.access_contradictions,
                                          binds=_binds, held=_pause_held,
                                          worktree_out=_worktree_ports, board=board,
-                                         carry_out=_carry_rows, carry_budget=_carry_budget)
+                                         carry_out=_carry_rows, pause_cache=_pause_cache,
+                                         carry_budget=_carry_budget)
                      for r in ready_rows}
         result.route_ms += (time.monotonic() - _route_t0) * 1000.0
         result.carry_scan_ms += _carry_budget.spent_s * 1000.0
