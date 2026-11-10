@@ -348,6 +348,25 @@ _suppress_mouse_residue_early()
 
 _startup_fast.ensure_project_root_on_path()
 
+# ``hermes --run-module <mod> [args]``: the store launcher's verb, also served by the venv console
+# script. Service hooks (systemd ExecStop/ExecStopPost, the launchd stderr wrapper) persist it, and a
+# unit repointed at ``<checkout>/venv/bin/hermes`` (ACE-AI single-venv contract) used to fail every
+# stop with "'gateway.systemd_stop_mark' is not a `hermes` command" (t_d9e5d1c2). Before profile
+# resolution and heavy imports, exactly as ``_launchers._launcher_script`` does it.
+if sys.argv[1:2] == ["--run-module"]:
+    import runpy
+
+    if len(sys.argv) < 3:
+        sys.exit("hermes: --run-module needs a module")
+    _run_module_name = sys.argv.pop(2)
+    del sys.argv[1]
+    if not os.environ.get("HERMES_HOME"):
+        from hermes_constants import get_default_hermes_root
+
+        os.environ["HERMES_HOME"] = str(get_default_hermes_root())
+    runpy.run_module(_run_module_name, run_name="__main__", alter_sys=True)
+    sys.exit(0)
+
 # ``hermes --version`` is answered before config/logging imports.
 if _startup_fast.try_fast_version():
     raise SystemExit(0)
