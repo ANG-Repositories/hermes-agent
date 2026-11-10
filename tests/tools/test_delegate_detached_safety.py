@@ -35,7 +35,12 @@ DEAD_BOOT = "2147483646:1.0"
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
+    from tools import file_state
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # _child_main runs in THIS process here and sets the process-wide FORCE_CROSS_PROCESS (#154,
+    # right for the real child process); restore it so a later test sees the knobs, not the leak.
+    monkeypatch.setattr(file_state, "FORCE_CROSS_PROCESS", file_state.FORCE_CROSS_PROCESS)
     ad._reset_for_tests()
     _drain()
     spawned: list = []
