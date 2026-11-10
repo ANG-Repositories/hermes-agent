@@ -171,6 +171,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    call_model_selected,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -4733,14 +4734,20 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _picker_switch(self, query, chat_id: str, model_id: str, provider_slug: str, callback) -> None:
         """Perform the model switch, render the result, and drop the picker state."""
         switch_failed = False
+
+        async def _render(text):  # the confirmation renders before the gateway saves the switch
+            await self._edit_result_text(query, text)
+            await query.answer(text=_toast("platform.telegram.picker.switched"))
+
         try:
-            result_text = await callback(chat_id, model_id, provider_slug)
+            result_text, rendered = await call_model_selected(callback, chat_id, model_id, provider_slug, _render)
         except Exception as exc:
             logger.error("Model picker switch failed: %s", exc)
-            result_text = t("platform.telegram.picker.switch_error", error=str(exc))
+            result_text, rendered = t("platform.telegram.picker.switch_error", error=str(exc)), False
             switch_failed = True
-        await self._edit_result_text(query, result_text)
-        await query.answer(text=_toast("platform.telegram.picker.switch_failed" if switch_failed else "platform.telegram.picker.switched"))
+        if not rendered:
+            await self._edit_result_text(query, result_text)
+            await query.answer(text=_toast("platform.telegram.picker.switch_failed" if switch_failed else "platform.telegram.picker.switched"))
         self._model_picker_state.pop(chat_id, None)
 
     @staticmethod

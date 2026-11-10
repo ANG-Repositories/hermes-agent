@@ -293,14 +293,49 @@ def test_rb_host_change_is_a_new_hold(kanban_home, monkeypatch):
 
 
 def test_rb_flapping_is_capped_at_one_row(kanban_home, monkeypatch):
-    """A->B->A->B... inside one window: A, B, one ``flapping``, then nothing."""
+    """A->B->A(x2)->B(x2)... inside one window: A, B, one ``flapping``, then nothing. Each return is
+    sustained for two samples, so the hysteresis (t_dde97120) lets it count."""
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1)
-        for reason in ("pool_full", "local_full") * 5:
+        _hold(conn, monkeypatch, tid, "pool_full")
+        for reason in ("local_full", "local_full", "pool_full", "pool_full") * 3:
             _hold(conn, monkeypatch, tid, reason)
         evs = _events(conn, tid, "placement_wait")
         assert [e["code"] for e in evs] == ["pool_full", "local_full", "flapping"]
         assert evs[2]["detail"] == "local_full|pool_full"
+
+
+def test_single_sample_alternation_is_not_a_flap(kanban_home, monkeypatch):
+    """t_dde97120 hysteresis: a host that alternates eligible/ineligible every tick never sustains a
+    return for two consecutive samples, so the card keeps its rows and never reads ``flapping``.
+    Red on main: pool_full, local_full, flapping."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1)
+        for reason in ("pool_full", "local_full") * 5:
+            _hold(conn, monkeypatch, tid, reason)
+        assert [e["code"] for e in _events(conn, tid, "placement_wait")] == ["pool_full", "local_full"]
+
+
+def test_pacing_cap_is_not_a_distinct_reason_in_the_flap_key(kanban_home, monkeypatch):
+    """t_dde97120: ``total:max_new`` is a per-tick pacing cap, not a host verdict. The t_02e30922
+    sequence local_full, total:max_new, local_full, ... writes ONE local_full row, never
+    ``flapping (total:max_new|local_full)`` (96 of 163 held cards at 21:41 on 11-06). Red on main."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1)
+        for reason in ("local_full", "total:max_new", "local_full", "local_full", "total:max_new") * 3:
+            _hold(conn, monkeypatch, tid, reason)
+        evs = _events(conn, tid, "placement_wait")
+        assert [e["code"] for e in evs] == ["local_full"]
+
+
+def test_pacing_cap_alone_is_still_recorded(kanban_home, monkeypatch):
+    """With no verdict row in the episode, a pacing hold is the only reason there is: it is written."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1)
+        _hold(conn, monkeypatch, tid, "total:max_new")
+        _hold(conn, monkeypatch, tid, "total:max_new")
+        _hold(conn, monkeypatch, tid, "local_full")
+        assert [e["code"] for e in _events(conn, tid, "placement_wait")] == ["total:max_new", "local_full"]
 
 
 def test_rg_one_read_per_tick_and_no_txn_when_nothing_to_write(kanban_home, monkeypatch):
@@ -481,6 +516,21 @@ def test_ac17_admitting_pins_only_holds_portable_local_full(kanban_home):
         assert spawned == [(pin, "ace-ai")]
         assert res.placement_waits == {port: "local_full"}
         assert [e["code"] for e in _events(conn, port, "placement_wait")] == ["local_full"]
+
+
+def test_saturated_studio_sends_portable_to_free_pool_host(kanban_home):
+    """t_4a046fb0: a saturated Studio (band spilling, allowance 0, NOT paused)
+    must not hold a portable card ``local_full`` while a pool host is free; only
+    the Studio-bound card waits on the Studio's own gate."""
+    plan = _plan(free=2, band="spilling")
+    assert plan.pins_only is False
+    with kb.connect_closing() as conn:
+        (port,) = _make(conn, 1, body="host: any", priority=2)
+        (studio,) = _make(conn, 1, body="host: studio", priority=1)
+        res, spawned = _tick(conn, spillover=plan, spawn_limit=0)
+        assert spawned == [(port, "ace-ai")]
+        assert [e["route"] for e in _events(conn, port, "placement")] == ["remote-policy"]
+        assert res.placement_waits == {studio: "local_full"}
 
 
 # -- AC-19 ----------------------------------------------------------------------

@@ -56,7 +56,11 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # hostname, so on a pool host (ace-ai) `local` would otherwise BE that host.
     import socket
     monkeypatch.setattr(socket, "gethostname", lambda: LOCAL_NAME)
+    monkeypatch.setattr(socket, "getfqdn", lambda name="": name)   # the local fence's FQDN read: no resolver
     kb.init_db()
+    # The placement table (mem_reserve_gb, threads) is this test's, never the host's:
+    # fleet_root() honours PLACEMENT_HOME first, and test-gate exports the live root (t_2105a835).
+    monkeypatch.setenv("PLACEMENT_HOME", str(kb.kanban_home()))
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "apollo", raising=False)
@@ -106,7 +110,8 @@ def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64, cpu_busy=0.99)
 
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (load1, load1))
     monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (cpu_busy, None))
-    monkeypatch.setattr(klg, "sample_psi", lambda: {})
+    monkeypatch.setattr(klg, "sample_psi", lambda: {
+        "psi_cpu_some10": 0.0, "psi_mem_some10": 0.0, "psi_io_some10": 0.0})
     monkeypatch.setattr(klg, "utilization_context", lambda: {
         "host": "mac-studio", "ceiling": None, "ceiling_reason": "",
         "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), "limits": ad.Limits(),
@@ -283,8 +288,10 @@ def test_admit_refuses_a_draining_pool_host(board, monkeypatch):
     assert _status(tid) == "ready"
 
 
-def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
+def test_a_stale_remote_pressure_sample_is_unmeasured_memory(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))   # no table: never the host's (t_2105a835)
 
     sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0,
                             pressure_text=json.dumps({"at": 1000.0, "mem_available_gb": 100.0}))
@@ -293,6 +300,27 @@ def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
                              placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
     assert m.mem_available_gb is None and "unmeasured" in ka.floor_refusal(m)
+
+
+@pytest.fixture
+def inherited_placement_home(tmp_path, monkeypatch):
+    """A PLACEMENT_HOME exported by the venue (test-gate exports ~/.hermes) whose table is unreadable."""
+    from hermes_cli.fleet_placement import placement as pl
+
+    venue = tmp_path / "venue-fleet-root"
+    (venue / pl.TABLE_REL).parent.mkdir(parents=True)
+    (venue / pl.TABLE_REL).write_text("{not json")
+    monkeypatch.setenv("PLACEMENT_HOME", str(venue))
+    return venue
+
+
+def test_an_inherited_placement_home_never_reaches_the_admit_floor(inherited_placement_home, board, monkeypatch):
+    """t_2105a835: the venue's placement table leaked a 128 GB reserve / NaN into every admit test."""
+    from hermes_cli.fleet_placement import placement as pl
+
+    assert pl.fleet_root() == kb.kanban_home()
+    _hot_local(monkeypatch, load1=10.0)
+    assert ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)["pid"] == 4242
 
 
 def test_an_unreadable_local_placement_table_refuses_instead_of_a_zero_reserve(board, monkeypatch):
@@ -730,8 +758,14 @@ def _site_triggers():
 
     def human_lane(m, ctx):
         upd("UPDATE tasks SET assignee='human:apollo' WHERE id=?", ctx)
+        with kb.connect_closing() as conn:
+            for tid in ctx["tids"]:
+                task = kb.get_task(conn, tid)
+                assert task is not None and task.status == "todo"
         m.setattr(profiles, "profile_exists", lambda name: not str(name).startswith("human"))
-        return "studio", "twin", "not a spawnable profile"
+        # The lifecycle entry guard parks human assignments before dispatch.
+        # admit reports its ready-only precondition; the tick never sees the row.
+        return "studio", "admit", "status is todo"
 
     def pause_pre(m, ctx):
         m.setattr(kph, "held_routes", lambda rows, cache: {r["id"]: ("wait", "pause_hold (test)") for r in rows})
@@ -876,6 +910,42 @@ def _site_triggers():
         ctx["measure_remote_fn"] = _remote()
         return "ace-ai", "admit", "requires:gpu\\+layer0b:ace-ai"
 
+    def _fwa_hold(host):
+        """A live fwa hold record on lane kanban for ``host`` (FWA SPEC §5.1, §5.4a time end), under the kanban home."""
+        import time as _time
+        now = int(_time.time())
+        d = kb.kanban_home() / "state" / "fwa" / "holds" / host
+        d.mkdir(parents=True, exist_ok=True)
+        hid = f"20261108T000000Z-{host}-admit001"
+        (d / f"{hid}.json").write_text(json.dumps({
+            "schema": 1, "id": hid, "host": host, "kind": "pause", "lanes": ["kanban"], "owner": "card:t_x",
+            "drive": True, "by": "apollo", "card": "t_x", "reason": "admit site", "since": now - 60,
+            "until": now + 3600, "end": {"kind": "time", "until": now + 3600}}))
+
+    def fwa_pin_held(m, ctx):
+        # A `host:` pin to a host a live fwa kanban hold closes: the destination fence waits it before take().
+        upd("UPDATE tasks SET body='host: ace-ai' WHERE id=?", ctx)
+        _fwa_hold("ace-ai")
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "twin", "pause_hold \\(ace-ai:fwa:.*stage=destination\\)"
+
+    def fwa_dest_belt(m, ctx):
+        # The pre-take fence misses (held_destinations sees nothing), take() returns the held host anyway:
+        # the post-take belt re-checks the CHOSEN host and waits the card, releasing the reservation. Kind `admit`
+        # like layer0b: only admit's forced take places on ace-ai here (the tick's take has no remote pressure).
+        _fwa_hold("ace-ai")
+        m.setattr(kph, "held_destinations", lambda names, cache: {})
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "admit", "pause_hold \\(ace-ai:fwa:.*stage=destination\\)"
+
+    def fwa_local_held(m, ctx):
+        # A local start on a dispatcher host a live fwa kanban hold closes (Prism fe6a1ad69c44). The tick's own
+        # local gate is left open so its twin also routes local and meets the same fence.
+        _hot_local(m, load1=1.0, cpu_busy=0.05)
+        _fwa_hold(LOCAL_NAME)
+        ctx["plan"] = None
+        return "studio", "twin", f"pause_hold \\({LOCAL_NAME}:fwa:.*stage=destination\\)"
+
     def claim(m, ctx):
         m.setattr(kb, "claim_task", lambda conn, task_id, **k: None)
         return "studio", "twin", "did not spawn"
@@ -916,6 +986,18 @@ def _site_triggers():
     def claim_lost_before(m, ctx):
         m.setattr(kb, "_claim_still_held", lambda conn, task: False)
         m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: _release(task.id))
+        return "studio", "twin", "did not spawn"
+
+    def workspace_claim_lost(m, ctx):
+        # t_f60f502f: the tick resolved the workspace with the board lock handed back and a successor run took
+        # the card meanwhile; the run-fenced workspace write refuses and the launch stops before any spawn.
+        from hermes_cli import kanban_db_workspace as kbw
+
+        def lost(conn, task_id, path, *, run_id=None):
+            _release(task_id)
+            raise kb.ClaimLost("run no longer owns the card")
+        m.setattr(kbw, "set_workspace_path", lost)
+        m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: None)
         return "studio", "twin", "did not spawn"
 
     def _join(m, ctx):
@@ -959,6 +1041,21 @@ def _site_triggers():
         m.setattr(kbd, "_stop_own_spawn", lambda proc, grace=5.0: None)
         ctx["launched"] = True                               # spawned, then the claim was gone
         return "studio", "twin", "did not spawn"
+
+    def door_held(m, ctx):
+        # The pair door answers queued_behind at launch: the claim returns, no process starts.
+        from hermes_cli import kanban_priority_door as kpd
+        ctx["admitted"] = True                               # the override event precedes the launch
+        m.setattr(kpd, "spawn", lambda *a, **k: (_ for _ in ()).throw(kpd.DoorHeld("queued_behind (test)")))
+        return "studio", "twin", "held: queued_behind \\(test\\)"
+
+    def door_hold(m, ctx):
+        # Door mode with a latched config fault / transport backoff: the tick starts nothing.
+        from hermes_cli import kanban_priority_door as kpd
+        from hermes_cli import kanban_priority_faults as kpf
+        m.setattr(kpd, "enabled", lambda: True)
+        m.setattr(kpf, "hold_reason", lambda: "door latched (test)")
+        return "studio", "twin", "total:door_hold"
 
     # HOST ADMISSION: the one axis admit turns off. The tick refuses, admit spawns.
     def load_gate_paused(m, ctx):
@@ -1032,6 +1129,9 @@ def _site_triggers():
         "fail: except Exception (try: admit_floor)": floor_error,
         "continue: _only is not None and force_host.lower() not in {h.lower() for h in _only}": reach,
         "continue: _forced_remote": forced_take,
+        "continue: _pin_held is not None": fwa_pin_held,
+        "continue: _dest_wait is not None": fwa_dest_belt,
+        "continue: _local_wait is not None": fwa_local_held,
         "continue: _gap is not None": layer0b,
         "continue: claimed is None": claim,
         "fail: except _kph.PauseHeld (try: _kb.claim_task)": claim_pause,
@@ -1039,9 +1139,12 @@ def _site_triggers():
         "continue: except WorkspaceUnavailable (try: _kb._validate_workspace_admission)": workspace_unavailable,
         "continue: except Exception (try: _kb._validate_workspace_admission)": workspace_error,
         "continue: not _kb._claim_still_held(conn, claimed)": claim_lost_before,
+        "continue: except _kb.ClaimLost (try: _kb._validate_workspace_admission)": workspace_claim_lost,
         "continue: _btok is not None": join_refused,
         "continue: _btok is None and (not _kb._claim_still_held(conn, claimed))": join_claim_lost,
         "fail: except Exception (try: result.browser_joins.get)": launch,
+        "fail: except DoorHeld (try: result.browser_joins.get)": door_held,
+        "return: _door_hold": door_hold,
         "continue: outcome == _LAUNCH_NOT_OWNED": launch_not_owned,
         "continue: outcome == _LAUNCH_CLAIM_LOST": launch_claim_lost,
         "return: (spillover is None or spillover.budget <= 0) and (not route_first)": load_gate_paused,
@@ -1116,3 +1219,54 @@ def test_admit_returns_the_dispatchers_own_refusal_at_every_site(board, monkeypa
                                         **ka._tick_knobs(cfg), **ctx.get("tick_kw", {}))
             assert b not in [s[0] for s in res.spawned], (site, res.spawned)
             assert _norm(str(got.value), a) == _norm(f"{b}: {ka.refusal_from(res, b)}", b), site
+
+
+@pytest.mark.parametrize("narrow", [True, False])
+def test_admit_gets_in_while_a_tick_is_stuck_in_a_spawn(board, monkeypatch, narrow):
+    """t_f60f502f: on 2026-11-08 a gateway tick held the board lock through minutes of spawns and
+    `kanban admit` was refused 18 times ("board tick lock busy for 30s"). A tick blocked in a spawn
+    (the spawn waits up to 60 s here) now has the lock handed back, so admit gets in through its own
+    floor and launch while that spawn is still running. Kill switch (kanban.dispatch.narrow_lock:
+    false), the control: the tick keeps the lock and admit is refused."""
+    import threading
+
+    _hot_local(monkeypatch, load1=10.0)            # floor admits: load1 10 < 64 x 1.5, mem 100 GB
+    monkeypatch.setattr(ka, "_LOCK_WAIT_SECONDS", 3.0)
+    if not narrow:
+        monkeypatch.setattr(kbd, "narrow_lock_enabled", lambda kanban_cfg=None: False)
+    a = _card()
+    in_spawn, release = threading.Event(), threading.Event()
+
+    def slow_spawn(task, workspace, *, board=None, placement=None):
+        in_spawn.set()
+        release.wait(60)
+        return 4242
+
+    out: dict = {}
+
+    def tick():
+        with kb.connect_closing() as conn:
+            out["tick"] = kbd.dispatch_once(conn, spawn_fn=slow_spawn)
+
+    worker = threading.Thread(target=tick)
+    worker.start()
+    try:
+        assert in_spawn.wait(60), "the tick never reached its spawn"
+        b = _card()                                 # created after the tick read its ready rows
+        SPAWNS.clear()
+        try:
+            got = ka.admit(b, "studio", "t_f60f502f concurrent admit", kanban_cfg={}, spawn_fn=_spawn)
+        except ka.AdmitRefused as exc:
+            got = exc
+        tick_still_in_spawn = worker.is_alive() and not release.is_set()
+    finally:
+        release.set()
+        worker.join(60)
+    assert tick_still_in_spawn
+    assert [s[0] for s in out["tick"].spawned] == [a]
+    if narrow:
+        assert not isinstance(got, Exception), got
+        assert got["task_id"] == b and SPAWNS == [(b, None)]
+    else:
+        assert isinstance(got, ka.AdmitRefused) and "board tick lock held for 3s" in str(got)
+        assert SPAWNS == [] and _status(b) == "ready"

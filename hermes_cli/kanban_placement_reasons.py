@@ -167,6 +167,10 @@ TOTAL_MAX_IN_PROGRESS = "max_in_progress"
 TOTAL_MEMORY_CRITICAL = "memory_critical"
 TOTAL_MAX_NEW = "max_new"
 TOTAL_MEMORY_ELEVATED = "memory_elevated"
+# Per-tick PACING caps, not host verdicts (t_dde97120): a card held by one of these this tick is still
+# held for its last verdict reason, so the code never counts as a distinct reason in the wait dedup /
+# flap key. At 21:41 on 11-06, 96 of 163 held cards read ``flapping (total:max_new|local_full)``.
+PACING_CODES = frozenset({f"{TOTAL}:{TOTAL_MAX_NEW}"})
 
 # The record of every spawn, both routes (spec §4.1); its ``route`` values
 # live in kanban_db_dispatch (``_ROUTE_*``): routes are not hold reasons.

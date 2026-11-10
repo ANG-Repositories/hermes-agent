@@ -5,12 +5,14 @@ payload conversion and credentials live in ``agent/anthropic_{endpoints,message_
 credentials}.py``; import them from there."""
 
 from pm import install_hint
+import importlib
 import logging
 import math
 import os
 import re
 import shutil
 import subprocess
+import time
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
@@ -40,22 +42,41 @@ _anthropic_sdk: Any = ...
 # Why the lazy install did not make the SDK importable. A completed install that needs a restart
 # (PM activates a new dependency environment only at boot) must not be reported as "install it".
 _anthropic_install_error: Optional[Exception] = None
+# Only success is cached for the process: a miss re-tries at most every _SDK_RETRY_S, never through
+# ensure_import (no repeated install, lazy-install policy untouched). The retry first adopts the
+# currently selected PM dependency generation (pm.environments_adopt; installs nothing, refuses when
+# a loaded module would change), so `hermes pm install --extra anthropic` run by the operator after
+# the miss reaches the live gateway without a restart (2026-11-07 Agora: the committed generation
+# lacked anthropic and every turn raised ImportError from the cached None).
+_SDK_RETRY_S = 30.0
+_anthropic_sdk_retry_at = 0.0
 
 
 def _get_anthropic_sdk():
     """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
-    global _anthropic_sdk, _anthropic_install_error
+    global _anthropic_sdk, _anthropic_install_error, _anthropic_sdk_retry_at
     if _anthropic_sdk is ...:
         try:
             from pm import ensure_import
             ensure_import("anthropic")
         except Exception as exc:  # the import below decides; exc explains a miss
             _anthropic_install_error = exc
+    elif _anthropic_sdk is not None or time.monotonic() < _anthropic_sdk_retry_at:
+        return _anthropic_sdk
+    else:
         try:
-            import anthropic as _sdk
-            _anthropic_sdk = _sdk
-        except ImportError:
-            _anthropic_sdk = None
+            from pm.environments_adopt import adopt_selected
+            from pm.paths import repo_root
+            adopt_selected(repo_root())
+        except Exception as exc:  # the import below decides
+            logger.debug("anthropic SDK retry: generation adopt failed: %s", exc)
+    try:
+        importlib.invalidate_caches()  # a package that appeared since the last miss is found
+        import anthropic as _sdk
+        _anthropic_sdk = _sdk
+    except ImportError:
+        _anthropic_sdk = None
+        _anthropic_sdk_retry_at = time.monotonic() + _SDK_RETRY_S
     return _anthropic_sdk
 
 
@@ -147,6 +168,7 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = (
 # (and by tests) with the OpenRouter/Portal ``claude-opus-5.5`` spelling.
 _OPUS_5_5_FAMILY_SUBSTRINGS = (
     "claude-opus-5-5", "claude-opus-5.5",
+    "claude-fable-5-2", "claude-fable-5.2",
     "claude-fable-5-1", "claude-fable-5.1",
     "claude-mythos-5-1", "claude-mythos-5.1",
 )
@@ -210,7 +232,7 @@ def _model_matches(model: str, substrings) -> bool:
 # ``claude-fable`` = Mythos-class named models (1M context); ``minimax`` is a third-party
 # Anthropic-compatible endpoint; DashScope enforces ``qwen3`` max_tokens in [1, 65536].
 _ANTHROPIC_OUTPUT_LIMITS = {
-    "claude-fable": 128_000, "claude-sonnet-5": 128_000, "claude-haiku-5-5": 128_000, "claude-opus-4-8": 128_000,
+    "claude-fable": 128_000, "claude-fable-5-2": 128_000, "claude-sonnet-5": 128_000, "claude-haiku-5-5": 128_000, "claude-opus-4-8": 128_000,
     "claude-opus-4-7": 128_000, "claude-opus-4-6": 128_000, "claude-sonnet-4-6": 64_000,
     "claude-opus-4-5": 64_000, "claude-sonnet-4-5": 64_000, "claude-haiku-4-5": 64_000,
     "claude-opus-4": 32_000, "claude-sonnet-4": 64_000, "claude-3-7-sonnet": 128_000,

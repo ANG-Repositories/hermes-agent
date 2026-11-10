@@ -2402,7 +2402,7 @@ def release(reservation_id: str, *, path=None, now: Optional[float] = None, admi
         if actual is not None:
             src = actual_source or "none"
             for r in doc["rows"]:
-                if r.get("id") == reservation_id and (r.get("consumer"), src) not in ACTUAL_SOURCES:
+                if r.get("id") == reservation_id and (str(r.get("consumer", "")).split("@", 1)[0], src) not in ACTUAL_SOURCES:
                     raise ActualRefused(f"actual_source {src} cannot measure host {r.get('host')} "
                                         f"for consumer {r.get('consumer')}")
         live, lines = _prune(doc["rows"], now)

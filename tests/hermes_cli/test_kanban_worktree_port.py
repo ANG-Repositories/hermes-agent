@@ -13,7 +13,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import kanban_worktree_port as kwt
 
-from tests.hermes_cli.test_kanban_worker_pool import _plan, _tick, kanban_home  # noqa: F401
+from tests.hermes_cli.test_kanban_worker_pool import _host, _plan, _tick, kanban_home  # noqa: F401
 
 SLUG = "ANG-Ventures/hermes-home"
 
@@ -48,12 +48,20 @@ def _row(conn, tid):
     return conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
 
 
-def test_worktree_card_without_a_mirror_row_stays_local(kanban_home, anchor):
+def test_worktree_card_without_a_mirror_row_stays_local(kanban_home, anchor, monkeypatch):
+    monkeypatch.setenv(kwt.DERIVED_ENV, "0")  # the hand list (kill switch, t_1d2c5939)
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
         rules: dict = {}
-        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules)[0] == "local"
+        route, reason = kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules)
+        assert route == "local"
+        assert "worktree is Studio-only" in reason
+        assert "kanban-worktree-mirrors.json" in reason
+        assert "clean pushed" in reason
         assert rules[tid] == "workspace_kind"
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        assert spawned == []
+        assert res.placement_waits[tid] == reason
 
 
 def test_worktree_card_with_a_mirror_is_portable_and_clones_on_the_host(
@@ -89,7 +97,8 @@ def test_worktree_card_with_a_mirror_is_portable_and_clones_on_the_host(
         assert rules[tid].startswith("bind_host:ace-ai")
 
 
-def test_worktree_card_pinned_to_a_host_without_the_mirror_stays_local(kanban_home, anchor):
+def test_worktree_card_pinned_to_a_host_without_the_mirror_stays_local(kanban_home, anchor, monkeypatch):
+    monkeypatch.setenv(kwt.DERIVED_ENV, "0")  # the hand list (kill switch, t_1d2c5939)
     _mirrors(kanban_home, hosts=("ace-media",))
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor, body="host: ace-ai")
@@ -106,11 +115,54 @@ def test_a_prior_local_worktree_keeps_the_card_local(kanban_home, anchor):
         assert rules[tid] == "workspace_kind"
 
 
-def test_other_repo_does_not_port(kanban_home, anchor):
+def test_other_repo_does_not_port(kanban_home, anchor, monkeypatch):
+    monkeypatch.setenv(kwt.DERIVED_ENV, "0")  # the hand list (kill switch, t_1d2c5939)
     _mirrors(kanban_home, slug="ANG-Ventures/something-else")
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2))[0] == "local"
+
+
+def test_read_mirrors_per_host_override_and_old_shape(tmp_path):
+    mbp = "/Users/Shared/git-mirrors/hermes-home-mirror.git"
+    (tmp_path / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 1, "repos": {
+        SLUG: {"mirror": "/srv/ci/git-mirrors/hermes-home-mirror.git", "hosts": ["ci-box", "mbp-2026"],
+               "mirrors": {"MBP-2026": mbp}},
+        "ANG-Ventures/hermes-agent": {"mirror": "/srv/ci/git-mirrors/hermes-mirror.git", "hosts": ["ci-box"]},
+        "ANG-Ventures/bad": {"mirror": "/srv/x.git", "hosts": ["ci-box"], "mirrors": {"mbp-2026": "rel/x.git"}},
+        "ANG-Ventures/bad2": {"mirror": "/srv/x.git", "hosts": ["ci-box"], "mirrors": ["mbp-2026"]},
+    }}))
+    got = kwt.read_mirrors(tmp_path)
+    assert got[SLUG.lower()] == ("/srv/ci/git-mirrors/hermes-home-mirror.git", ("ci-box", "mbp-2026"),
+                                 {"mbp-2026": mbp})
+    # Old shape: no override, every host reads ``mirror``.
+    assert got["ang-ventures/hermes-agent"] == ("/srv/ci/git-mirrors/hermes-mirror.git", ("ci-box",), {})
+    # A malformed override fails the row closed.
+    assert "ang-ventures/bad" not in got and "ang-ventures/bad2" not in got
+    port = (SLUG, *got[SLUG.lower()])
+    assert kwt.mirror_for(port, "mbp-2026") == mbp
+    assert kwt.mirror_for(port, "ci-box") == "/srv/ci/git-mirrors/hermes-home-mirror.git"
+    assert kwt.mirror_for(port[:3], "mbp-2026") == "/srv/ci/git-mirrors/hermes-home-mirror.git"
+
+
+def test_ported_clone_uses_the_placed_hosts_mirror(kanban_home, anchor, monkeypatch):
+    mbp = "/Users/Shared/git-mirrors/hermes-home-mirror.git"
+    fleet = kanban_home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 1, "repos": {
+        SLUG: {"mirror": "/srv/ci/git-mirrors/hermes-home-mirror.git", "hosts": ["ace-ai"],
+               "mirrors": {"ace-ai": mbp}}}}))
+    calls = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
+                        calls.append((host.name, mirror)))
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                          (tid, kwt.PORTED_EVENT)).fetchone()
+    assert (tid, "ace-ai") in spawned
+    assert calls == [("ace-ai", mbp)]
+    assert json.loads(ev[0])["mirror"] == mbp
 
 
 def test_malformed_mirrors_file_ports_nothing(tmp_path):
@@ -261,3 +313,240 @@ def test_a_local_branch_ahead_of_origin_keeps_the_card_local(kanban_home, anchor
     assert kwt.anchor_repo("t_x", str(anchor), None, "only-here") is None
     # no local branch at all: the clone makes it, portable
     assert kwt.anchor_repo("t_x", str(anchor), None, "wt/t_x") == anchor.resolve()
+
+
+# ---- derived mode (t_1d2c5939): every repo, every pool host, push-then-port ----
+
+def _origin_with_push(anchor, tmp_path):
+    """Local fetch repository; tests can install a distinct pushurl to exercise it."""
+    bare = tmp_path / "pushed.git"
+    _git("init", "-q", "--bare", str(bare), cwd=tmp_path)
+    _git("remote", "set-url", "origin", str(bare), cwd=anchor)
+    return bare
+
+
+def _ref(repo, ref):
+    proc = subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify", ref],
+                          capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def test_derived_an_unlisted_repo_ports_to_every_pool_host(kanban_home, anchor, monkeypatch):
+    """No mirrors file, a repo no hand list ever named: portable, every pool host, default mirror path."""
+    _git("remote", "set-url", "origin", "https://github.com/ANG-Ventures/claude-apx.git", cwd=anchor)
+    kwt._origin_cache.clear()
+    assert not (kanban_home / "fleet" / kwt.MIRRORS_FILE).exists()
+    calls = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
+                        calls.append((host.name, slug, mirror, branch)))
+    plan = _plan(hosts=[_host("ace-ai", slots=2), _host("ace-media", slots=2)])
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), plan, worktree_out=out) == ("portable", None)
+        slug, mirror, hosts, per_host, push = out[tid]
+        assert slug == "ANG-Ventures/claude-apx" and set(hosts) == {"ace-ai", "ace-media"}
+        assert mirror == "~/.hermes/mirrors/ANG-Ventures/claude-apx.git" and push is None
+        _res, spawned = _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="test")
+        row = _row(conn, tid)
+    assert len(spawned) == 1 and spawned[0][1] in ("ace-ai", "ace-media")
+    assert calls == [(spawned[0][1], "ANG-Ventures/claude-apx",
+                      "~/.hermes/mirrors/ANG-Ventures/claude-apx.git", f"wt/{tid}")]
+    assert row["workspace_kind"] == "scratch"
+
+
+def test_derived_schema1_rows_are_mirror_paths_and_hosts_are_ignored(kanban_home, anchor):
+    _mirrors(kanban_home, hosts=("ace-media",))  # the old row lists only ace-media
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor, body="host: ace-ai")
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("pin", "ace-ai")
+    assert out[tid][1] == "/srv/ci/git-mirrors/hermes-home-mirror.git" and out[tid][2] == ("ace-ai",)
+
+
+def test_derived_overrides_exclude_and_per_host_paths(tmp_path):
+    (tmp_path / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "exclude": ["acme/Secret"],
+        "mirror_paths": {SLUG: {"*": "/srv/m.git", "mbp-2026": "/Users/Shared/m.git"},
+                         "acme/plain": "~/m/plain.git"}}))
+    why: list = []
+    assert kwt.derived_route("ACME/secret", tmp_path, ("ci-box",), why) is None and why == ["excluded"]
+    assert kwt.derived_route(SLUG, tmp_path, ("ci-box", "MBP-2026")) == (
+        "/srv/m.git", ("ci-box", "mbp-2026"), {"mbp-2026": "/Users/Shared/m.git"})
+    assert kwt.derived_route("acme/plain", tmp_path, ("ci-box",))[0] == "~/m/plain.git"
+    why = []
+    assert kwt.derived_route("acme/x", tmp_path, (), why) is None and why == ["no_pool_host"]
+    # A hand list cannot come back through schema 2: a malformed file ports nothing (fail closed).
+    for bad in ({"schema": 2, "exclude": "acme/x"}, {"schema": 2, "mirror_paths": {SLUG: "rel/x.git"}},
+                {"schema": 3}):
+        (tmp_path / kwt.MIRRORS_FILE).write_text(json.dumps(bad))
+        why = []
+        assert kwt.derived_route(SLUG, tmp_path, ("ci-box",), why) is None
+        assert why == ["overrides_file_malformed"]
+    (tmp_path / kwt.MIRRORS_FILE).write_text("{not json")
+    assert kwt.derived_route(SLUG, tmp_path, ("ci-box",)) is None
+
+
+def test_derived_excluded_repo_stays_local_named(kanban_home, anchor):
+    fleet = kanban_home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "exclude": [SLUG]}))
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2)) == (
+            "local", "not_portable:workspace_kind:excluded")
+
+
+def test_kill_switch_file_or_env_restores_the_hand_list(kanban_home, anchor, monkeypatch):
+    fleet = kanban_home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    assert kwt.derived_enabled(fleet)
+    (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "derived": False}))
+    assert not kwt.derived_enabled(fleet)
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2))[0] == "portable"
+    (fleet / kwt.MIRRORS_FILE).unlink()
+    monkeypatch.setenv(kwt.DERIVED_ENV, "0")
+    assert not kwt.derived_enabled(fleet)
+
+
+def test_derived_unpushed_commits_are_pushed_then_ported(kanban_home, anchor, tmp_path, monkeypatch):
+    """A card branch with commits origin never saw: pushed (lease: must not exist) BEFORE the clone."""
+    bare = _origin_with_push(anchor, tmp_path)
+    monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: SLUG)
+    _commit(anchor, "base")
+    order = []
+    real_push = kwt.push_card_branch
+    monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=subprocess.run:
+                        (order.append("push"), real_push(push))[1])
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
+                        order.append(("clone", host.name, branch)))
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        _git("branch", f"wt/{tid}", cwd=anchor)
+        _git("checkout", "-q", f"wt/{tid}", cwd=anchor)
+        _commit(anchor, "studio-only")
+        _git("checkout", "-q", "main", cwd=anchor)
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
+        assert out[tid][4] == (str(anchor.resolve()), f"wt/{tid}", "", _ref(anchor, f"wt/{tid}"))
+        _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert (tid, "ace-ai") in spawned
+    assert order == ["push", ("clone", "ace-ai", f"wt/{tid}")]
+    assert _ref(bare, f"refs/heads/wt/{tid}") == _ref(anchor, f"refs/heads/wt/{tid}") != ""
+
+
+def test_push_lease_refuses_a_branch_moved_on_origin(anchor, tmp_path):
+    bare = _origin_with_push(anchor, tmp_path)
+    _commit(anchor, "base")
+    _git("push", "-q", "origin", "main:refs/heads/feature", cwd=anchor)  # someone else made it
+    theirs = _ref(bare, "refs/heads/feature")
+    _git("branch", "feature", cwd=anchor)
+    _commit(anchor, "ours")
+    _git("branch", "-f", "feature", "HEAD", cwd=anchor)
+    # the routing saw no origin ref (""): origin's feature appeared since, so the lease refuses
+    with pytest.raises(RuntimeError, match="before the port failed"):
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "feature")))
+    assert _ref(bare, "refs/heads/feature") == theirs
+
+
+def test_derived_dirty_own_tree_stays_local_named(kanban_home, anchor, monkeypatch):
+    """The only remaining local-only worktree case: the card's own Studio tree has uncommitted work."""
+    _commit(anchor, "base")
+    monkeypatch.setattr(kbd, "_studio_last_resort", lambda fleet_dir: True)
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        wt = anchor / ".worktrees" / tid
+        _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+        (wt / "scratch.txt").write_text("uncommitted")
+        rules: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules) == (
+            "local", "not_portable:workspace_kind:unpushed_dirty_tree")
+        assert rules[tid] == "workspace_kind"
+        # committed (still unpushed): portable, with a push
+        _git("add", "scratch.txt", cwd=wt)
+        _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c", cwd=wt)
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
+        assert out[tid][4][1:] == (f"wt/{tid}", "", _ref(wt, "HEAD"))
+
+
+def test_derived_diverged_branch_stays_local_and_ahead_branch_pushes(anchor):
+    _commit(anchor, "base")
+    base = _ref(anchor, "HEAD")
+    _git("branch", "feature", cwd=anchor)
+    _git("update-ref", "refs/remotes/origin/feature", "HEAD", cwd=anchor)
+    _git("checkout", "-q", "feature", cwd=anchor)
+    _commit(anchor, "studio-only")
+    _git("checkout", "-q", "main", cwd=anchor)
+    # ahead only (fast-forward): pushed with the lease pinned to origin's sha
+    assert kwt.assess("t_x", str(anchor), None, "feature", push_ok=True) == (
+        anchor.resolve(), (str(anchor.resolve()), "feature", base, _ref(anchor, "feature")))
+    # the hand-list semantics are unchanged: local
+    assert kwt.anchor_repo("t_x", str(anchor), None, "feature") is None
+    # origin moved to a commit the Studio lacks: a push would drop it, so local, named
+    _commit(anchor, "origin-only")
+    _git("update-ref", "refs/remotes/origin/feature", "main", cwd=anchor)
+    why: list = []
+    assert kwt.assess("t_x", str(anchor), None, "feature", push_ok=True, why=why) == (None, None)
+    assert why == ["diverged_from_origin"]
+
+
+def test_push_uses_assessed_sha_despite_branch_reset_and_ignores_pushurl(anchor, tmp_path):
+    bare = _origin_with_push(anchor, tmp_path)
+    _commit(anchor, "parent")
+    parent = _ref(anchor, "HEAD")
+    _commit(anchor, "remote")
+    _git("push", "-q", "origin", "main:refs/heads/feature", cwd=anchor)
+    remote = _ref(anchor, "HEAD")
+    _git("checkout", "-q", "-b", "feature", cwd=anchor)
+    _commit(anchor, "assessed")
+    assessed = _ref(anchor, "HEAD")
+    _, push = kwt.assess("t_x", str(anchor), None, "feature", push_ok=True)
+    other = tmp_path / "wrong.git"
+    _git("init", "-q", "--bare", str(other), cwd=tmp_path)
+    _git("remote", "set-url", "--push", "origin", str(other), cwd=anchor)
+    _git("config", f"url.{other}.pushInsteadOf", str(bare), cwd=anchor)
+    _git("checkout", "-q", "main", cwd=anchor)
+    _git("branch", "-f", "feature", parent, cwd=anchor)
+    kwt.push_card_branch(push)
+    assert _ref(bare, "refs/heads/feature") == assessed != remote
+    assert not _ref(other, "refs/heads/feature")
+
+
+def test_assessment_checks_immutable_shas_when_branch_moves(anchor):
+    _commit(anchor, "base")
+    _git("branch", "feature", cwd=anchor)
+    _commit(anchor, "remote")
+    remote = _ref(anchor, "HEAD")
+    _git("update-ref", "refs/remotes/origin/feature", remote, cwd=anchor)
+    _git("checkout", "-q", "feature", cwd=anchor)
+    _commit(anchor, "divergent")
+    divergent = _ref(anchor, "HEAD")
+    def racing_runner(argv, **kwargs):
+        if "rev-list" in argv:
+            _git("update-ref", "refs/heads/feature", remote, cwd=anchor)
+        return subprocess.run(argv, **kwargs)
+    why = []
+    assert kwt.assess("t_x", str(anchor), None, "feature", runner=racing_runner,
+                      push_ok=True, why=why) == (None, None)
+    assert why == ["diverged_from_origin"]
+    assert divergent != remote
+
+
+def test_clone_script_expands_a_home_relative_mirror(tmp_path):
+    origin, mirror = _origin_with_feature(tmp_path)
+    home = tmp_path / "home"
+    (home / ".hermes" / "mirrors" / "acme").mkdir(parents=True)
+    subprocess.run(["git", "clone", "-q", "--mirror", str(origin),
+                    str(home / ".hermes" / "mirrors" / "acme" / "r.git")], check=True)
+    ws = tmp_path / "ws"
+    sc = kwt.clone_script(str(ws), "acme/r", "~/.hermes/mirrors/acme/r.git", "feature", url=str(origin))
+    import os
+    env = dict(os.environ, HOME=str(home))
+    assert subprocess.run(["sh", "-c", sc], env=env).returncode == 0
+    assert (ws / "f").read_text() == "feature"
+    # absent mirror: --reference-if-able, a plain clone, never a refusal
+    ws2 = tmp_path / "ws2"
+    sc2 = kwt.clone_script(str(ws2), "acme/r", "~/.hermes/mirrors/acme/none.git", "feature", url=str(origin))
+    assert subprocess.run(["sh", "-c", sc2], env=env).returncode == 0

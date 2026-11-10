@@ -297,13 +297,19 @@ class SessionGatewayMixin:
             self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
-    def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = "") -> None:
+    def save_gateway_routing_entry(
+        self, session_key: str, entry_json: str, *, scope: str = "", timings: Optional[dict] = None,
+    ) -> None:
         """Upsert one gateway routing entry (session_key -> SessionEntry JSON); ``scope``
         namespaces the index per sessions_dir so two stores never share routing state."""
         if not session_key or not entry_json:
             return
         def _do(conn):
+            started = time.monotonic() if timings is not None else None
             self._assert_unique_gateway_routes(conn, {session_key: entry_json}, scope)
+            if timings is not None:
+                checked = time.monotonic()
+                timings["route_check_s"] = checked - started
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -312,7 +318,9 @@ class SessionGatewayMixin:
                        updated_at = excluded.updated_at""",
                 (scope, session_key, entry_json, time.time()),
             )
-        self._execute_write(_do)
+            if timings is not None:
+                timings["route_sql_s"] = time.monotonic() - checked
+        self._execute_write(_do, timings=timings)
 
     def replace_gateway_routing_entries(
         self, entries: Dict[str, str], *, scope: str = "", retired_keys=(),

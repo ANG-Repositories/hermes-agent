@@ -1190,8 +1190,12 @@ def _state(conn, task_id):
     return (json.loads(row[0]), row[1], json.loads(row[2]) if row[2] else None) if row else ({}, None, None)
 
 
-def record_baseline(conn, task_id, workspace):
-    """Record once, before dispatch; retries must not reset the task's base."""
+def record_baseline(conn, task_id, workspace, *, run_id=None):
+    """Record once, before dispatch; retries must not reset the task's base.
+
+    ``run_id``: write only while that run still owns the card (same transaction), else raise
+    ``ClaimLost`` (Prism c08a3c9d1616, t_89e3e083): a successor run must not inherit this launch's base.
+    """
     from hermes_cli.kanban_delegations_board import conn_is_delegations
 
     if conn_is_delegations(conn):
@@ -1218,6 +1222,11 @@ def record_baseline(conn, task_id, workspace):
             bases[key] = head.stdout.decode().strip() if head.returncode == 0 else None
         _warn_borrowed_from_workspace(repo, key, workspace)
     with kb.write_txn(conn):
+        if run_id is not None and conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (task_id, int(run_id)),
+        ).fetchone() is None:
+            raise kb.ClaimLost(f"{task_id}: run {run_id} no longer owns the card")
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
             "ON CONFLICT(task_id) DO NOTHING",
@@ -3968,10 +3977,10 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
                 raise SurvivorUnavailable("survivor_unavailable: reclaim held (needs a local scratch tree "
                                           "and a task connection)")
             workspace = Path(path).expanduser().resolve(strict=True)
-            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):  # noqa: root-equality -- equality refuses deletion too
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             kanban_reclaim.verify_unchanged(workspace, reclaimed)
-            shutil.rmtree(workspace)
+            shutil.rmtree(workspace)  # noqa: gate-dominance -- caller gates liveness; verify_unchanged above gates reclaim proof
             kanban_reclaim.record(conn, task_id, reclaimed)
             return True
         if remote_host is not None:
@@ -4007,7 +4016,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             ):
                 raise SurvivorUnavailable("survivor_unavailable: no task connection or durable ref")
         else:
-            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):  # noqa: root-equality -- equality refuses deletion too
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             preserve(conn, task_id, cleanup=True, workspace=workspace)
             push_unpushed_survivor(conn, task_id, workspace)
@@ -4036,7 +4045,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             if result.returncode:
                 raise SurvivorUnavailable("survivor_unavailable: git refused workspace removal")
         else:
-            shutil.rmtree(workspace)
+            shutil.rmtree(workspace)  # noqa: gate-dominance -- caller gates liveness; branches above refuse missing survivor proof
         return True
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: removal failed"

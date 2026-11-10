@@ -2356,6 +2356,19 @@ from gateway.run_turn_runner import TurnRunner
 logger = logging.getLogger(__name__)
 
 
+def _describe_state_db_write_lock_holders(store: Any, window_s: float) -> str:
+    """Executor job: who held the routing store's state.db write lock in the last ``window_s``.
+
+    Resolves the DB handle here, off the event loop: ``SessionStore._routing_db`` can take the
+    store's lock (t_41843f70; tests/gateway/test_no_agent_construction_on_event_loop.py).
+    """
+    db_path = getattr(getattr(store, "_routing_db", None), "db_path", None)
+    if not db_path:
+        return "holder unknown: no routing state.db"
+    from hermes_state_lockowners import describe_write_lock_holders
+    return describe_write_lock_holders(db_path, window_s)
+
+
 def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
     """Call ``fn``; return None on any Exception (debug-logged via ``debug_msg`` ``%s`` if given)."""
     try:
@@ -7836,7 +7849,74 @@ class GatewayRunner(
 
         return model, provider, api_mode
 
-    async def _mark_user_stopped(self, session_key: str) -> bool:
+    async def _mark_user_stopped_staged(
+        self, session_key: str, *, expected_session_id: Optional[str] = None,
+    ) -> str:
+        """Await ``_mark_user_stopped``; return its sub-stages as a ``PHASE=stop_stages`` fragment.
+
+        The marker is on disk before /stop acks (boot-gate ruling, see ``_mark_user_stopped``).
+        The write is bound to the session_id this stop saw, so a ``/new`` that lands first is
+        never marked. ``lock_s`` / ``save_lock_s`` / ``upsert_s`` / ``fallback_s`` name the wait
+        when a write is slow (t_41843f70).
+        """
+        from agent.interrupt_compat import _accepts_keyword
+        store = getattr(self, "session_store", None)
+        try:
+            session_id = expected_session_id or getattr(store._entries.get(session_key), "session_id", None)  # noqa: SLF001
+        except Exception:
+            session_id = None
+        timings: dict = {}
+        _mark = self._mark_user_stopped
+        _kwargs: dict = {}
+        if _accepts_keyword(_mark, "timings"):
+            _kwargs["timings"] = timings
+        if session_id and _accepts_keyword(_mark, "expected_session_id"):
+            _kwargs["expected_session_id"] = session_id
+        await _mark(session_key, **_kwargs)
+        return self._render_user_stop_timings(timings)
+
+    # A marker write slower than this names the state.db write-lock holder it waited behind.
+    _USER_STOP_SLOW_S = 1.0
+
+    def _log_user_stop_lock_holders(self, session_key: str, waited: float) -> None:
+        """Log who held state.db's write lock during a slow user_stopped write (t_41843f70).
+
+        A slow write may wait behind another transaction, execute slowly itself, or stall in its
+        own commit. ``describe_write_lock_holders`` (/proc/locks + the holder ledger, holds >= 2 s)
+        supplies context, not proof of a foreign holder. Runs after the write landed, so it never
+        delays the /stop ack; never raises.
+        """
+        try:
+            future = asyncio.get_running_loop().run_in_executor(
+                None, _describe_state_db_write_lock_holders, getattr(self, "session_store", None),
+                waited + 5.0)
+        except Exception:
+            return
+
+        def _done(fut: "asyncio.Future") -> None:
+            if fut.cancelled():
+                return
+            if fut.exception() is not None:
+                logger.debug("user_stopped lock-holder lookup failed for %s", session_key,
+                             exc_info=fut.exception())
+                return
+            logger.warning("PHASE=user_stopped_slow key=%s waited=%.2fs holders=%s",
+                           session_key, waited, fut.result())
+
+        future.add_done_callback(_done)
+
+    @staticmethod
+    def _render_user_stop_timings(timings: dict) -> str:
+        keys = ("rowid_s", "store_s", "lock_s", "save_lock_s", "upsert_s",
+                "wait_s", "exec_s", "commit_s", "route_check_s", "route_sql_s", "fallback_s", "other_s")
+        return " ".join(
+            f"{k}={timings[k]:.3f}" if isinstance(timings.get(k), (int, float)) else f"{k}=-"
+            for k in keys)
+
+    async def _mark_user_stopped(
+        self, session_key: str, *, generation: Optional[int] = None,
+        timings: Optional[dict] = None, expected_session_id: Optional[str] = None,
+    ) -> bool:
         """Durably record that ``session_key``'s turn was ended by ``/stop``.
 
         The rowid stamped here is the session's newest persisted message at
@@ -7852,18 +7932,27 @@ class GatewayRunner(
         """
         last_message_id: Optional[int] = None
         # Claimed before any await: a resume racing this write is compared against it.
-        generation = self._current_session_run_generation(session_key)
+        if generation is None:
+            generation = self._current_session_run_generation(session_key)
+        timings = timings if timings is not None else {}
         entry = None
         try:
             entry = self.session_store._entries.get(session_key)  # noqa: SLF001
         except Exception:
             entry = None
-        session_id = getattr(entry, "session_id", None)
+        # The write is bound to the session /stop saw (``expected_session_id``), never to
+        # whatever the key routes to by the time the write runs.
+        session_id = expected_session_id or getattr(entry, "session_id", None)
+        _t0 = time.monotonic()
         if self._session_db is not None and session_id:
             try:
+                # Newest row only (same filter, ORDER BY id DESC LIMIT 1 on the session index): the
+                # full transcript load this replaced scaled with session size on the /stop path.
                 rows = await self._session_db.get_messages(
                     session_id,
                     preserve_unparseable_tool_calls=True,
+                    latest=True,
+                    limit=1,
                 )
                 for row in reversed(rows or []):
                     if not isinstance(row, dict):
@@ -7876,24 +7965,40 @@ class GatewayRunner(
                 logger.debug(
                     "user_stopped rowid lookup failed for %s", session_key, exc_info=True
                 )
+        _t1 = time.monotonic()
         boot_id = None
         try:
             boot_id = self._current_boot_id()
         except Exception:
             boot_id = None
-        marked = await self.async_session_store.mark_user_stopped(
-            session_key,
-            boot_id=boot_id,
-            last_message_id=last_message_id,
-            generation=generation,
-        )
+        _bind = {"expected_session_id": session_id} if session_id else {}
+        try:
+            marked = await self.async_session_store.mark_user_stopped(
+                session_key,
+                boot_id=boot_id,
+                last_message_id=last_message_id,
+                generation=generation,
+                timings=timings,
+                **_bind,
+            )
+        finally:
+            # store_s = executor queue + lock_s + save_lock_s + upsert_s (+ fallback_s); other_s is
+            # the remainder (thread-pool queue and in-memory work), so the wait is attributable.
+            timings["rowid_s"] = _t1 - _t0
+            timings["store_s"] = time.monotonic() - _t1
+            timings["other_s"] = max(0.0, timings["store_s"] - sum(
+                float(timings.get(k) or 0.0) for k in ("lock_s", "save_lock_s", "upsert_s", "fallback_s")))
         logger.info(
-            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s",
+            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s %s",
             session_key,
             boot_id,
             last_message_id,
             marked,
+            self._render_user_stop_timings(timings),
         )
+        _waited = float(timings.get("store_s") or 0.0)
+        if _waited >= self._USER_STOP_SLOW_S:
+            self._log_user_stop_lock_holders(session_key, _waited)
         return bool(marked)
 
     @staticmethod
@@ -7956,6 +8061,7 @@ class GatewayRunner(
         override: Optional[dict],
         *,
         require_persistence: bool = False,
+        persist_only: bool = False,
     ) -> None:
         """Single door for setting/clearing a session-scoped /model override (P3b/RC-2).
 
@@ -7963,6 +8069,11 @@ class GatewayRunner(
         SessionEntry (config-backed-only per RC-4) AND saves. Manual /new and
         /reset copy persisted identity directly; /model reset and automatic cleanup
         use this user-action door.
+
+        ``persist_only``: the in-memory half already ran on the loop
+        (:meth:`_apply_session_model_override_in_memory`, the reply-first /model path,
+        t_2ab07928); write only the durable half and leave the in-memory map alone, so a
+        later switch's in-memory value is never overwritten from a worker thread.
         """
         if not session_key:
             return
@@ -7975,6 +8086,27 @@ class GatewayRunner(
                 if require_persistence:
                     raise
                 logger.debug("model-route clear persist skipped", exc_info=True)
+        if not persist_only:
+            self._apply_session_model_override_in_memory(session_key, override)
+        try:
+            store = getattr(self, "session_store", None)
+            entry = store.entry_for(session_key) if store is not None else None
+            if entry is not None and override is not None:
+                entry.model_override_identity = (
+                    self._model_override_is_persistable(override)
+                )
+                entry._model_override_identity_invalid = False
+                store.persist()
+        except Exception:
+            if persist_only and require_persistence:
+                raise
+            logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
+
+    def _apply_session_model_override_in_memory(
+        self, session_key: str, override: Optional[dict]
+    ) -> None:
+        """In-memory half of the single door: the override map the next turn reads.
+        Sync and I/O-free, so the reply-first /model path runs it on the loop."""
         # Stamp "the user changed the override target this turn" for the NEXT
         # turn's pre-run recovery announce: the shared recovery_should_announce
         # predicate suppresses the manual /model re-target (or clear) transition
@@ -7986,23 +8118,14 @@ class GatewayRunner(
             self._override_target_just_changed = {}
         self._override_target_just_changed[session_key] = True
         if override is None:
+            # NOTE(P3b/RC-2): the in-memory half of the single door (_set_session_model_override),
+            # split out so the reply-first /model path can run it on the loop (t_2ab07928).
             self._session_model_overrides.pop(session_key, None)
         else:
             self._session_model_overrides[session_key] = dict(override)
         unavailable = getattr(self, "_session_model_override_unavailable", None)
         if unavailable is not None:
             unavailable.discard(session_key)
-        try:
-            store = getattr(self, "session_store", None)
-            entry = store.entry_for(session_key) if store is not None else None
-            if entry is not None and override is not None:
-                entry.model_override_identity = (
-                    self._model_override_is_persistable(override)
-                )
-                entry._model_override_identity_invalid = False
-                store.persist()
-        except Exception:
-            logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
 
     def _sweep_restart_initiated_breadcrumbs(self) -> int:
         """Prune breadcrumb files from a prior boot or past the TTL (D-8).
@@ -8756,6 +8879,7 @@ class GatewayRunner(
         override: Optional[dict],
         *,
         require_persistence: bool = False,
+        persist_only: bool = False,
     ) -> None:
         """Run :meth:`_set_session_model_override` off the loop, serialized per
         session in issue order (C5 #36, PR #970).
@@ -8777,6 +8901,7 @@ class GatewayRunner(
                 session_key,
                 override,
                 require_persistence=require_persistence,
+                **({"persist_only": True} if persist_only else {}),
             ))
             cancelled = False
             while True:

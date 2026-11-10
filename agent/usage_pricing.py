@@ -778,6 +778,27 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         cache_read_cost_per_million_above=Decimal("0.20"),
         cache_write_cost_per_million_above=Decimal("5.00"),
     ),
+    # ── OpenAI GPT-6.1 Terra ─────────────────────────────────────────────
+    # Rates from models.dev api.json openai.models["gpt-6.1-terra"].cost (read 2026-11-06):
+    # $1 / $5 / $0.05 cache read / $1.25 cache write; above 272K prompt tokens (whole
+    # request): $2 / $7.50 / $0.10 / $2.50. NOT the gpt-5.6-terra row ($2/$12).
+    (
+        "openai",
+        "gpt-6.1-terra",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.00"),
+        output_cost_per_million=Decimal("5.00"),
+        cache_read_cost_per_million=Decimal("0.05"),
+        cache_write_cost_per_million=Decimal("1.25"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+        pricing_version="openai-gpt-6.1-terra-2026-11",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("2.00"),
+        output_cost_per_million_above=Decimal("7.50"),
+        cache_read_cost_per_million_above=Decimal("0.10"),
+        cache_write_cost_per_million_above=Decimal("2.50"),
+    ),
     # Source: https://developers.openai.com/api/docs/models/gpt-6-luna
     (
         "openai",
@@ -1007,6 +1028,24 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://www.anthropic.com/claude/fable",
         pricing_version="anthropic-pricing-2026-09",
+    ),
+    # ── Anthropic Claude Fable 5.2 ───────────────────────────────────────
+    # Launched 2026-11-09. Repriced DOWN from Fable 5.1: $8/$40 per MTok,
+    # cache read $0.20, cache write $10.00, no context tiers. Values from
+    # models.dev (anthropic.models.claude-fable-5-2.cost, fetched 2026-11-09),
+    # NOT inferred from the 5.1 row. Subscription relays price NOTIONAL via
+    # is_notional_anthropic_provider(); this entry supplies the metered rate.
+    (
+        "anthropic",
+        "claude-fable-5-2",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("8.00"),
+        output_cost_per_million=Decimal("40.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("10.00"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="anthropic-pricing-2026-11",
     ),
     # ── Anthropic Claude Sonnet 5 ────────────────────────────────────────
     # Launched 2026-06-30. Introductory pricing ($2/$10 per MTok) runs
@@ -2040,11 +2079,11 @@ _ANTHROPIC_FAST_MODE_PRICING: Dict[str, PricingEntry] = {
     for _model in _models
 }
 
-# GPT-6 Sol/Luna/6.1 Sol: the "-pro" high-effort variants bill at the base
+# GPT-6 Sol/Luna/6.1 Sol/6.1 Terra: the "-pro" high-effort variants bill at the base
 # tier's per-token rates (more tokens per task, not a higher rate), and the
 # Hermes-side "-900k" Codex picker variant is the same model with the suffix
 # stripped on the wire — alias both onto the base entry.
-for _base_6 in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"):
+for _base_6 in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"):
     _OFFICIAL_DOCS_PRICING[("openai", f"{_base_6}-pro")] = _OFFICIAL_DOCS_PRICING[
         ("openai", _base_6)
     ]

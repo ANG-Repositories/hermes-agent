@@ -26,6 +26,14 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 
+def _is_delegated_completion_target(row: dict) -> bool:
+    # Compression inherits provenance; a child continuation is still not a human owner.
+    config = row.get("model_config") or {}
+    if isinstance(config, str):
+        config = json.loads(config)
+    return row.get("source") == "tool" or bool(config.get("_delegate_from"))
+
+
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
@@ -87,6 +95,10 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
 _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease"})
+
+# A delegated session can briefly be awaiting ownership metadata. Its persisted start time
+# bounds that grace across watcher polls, rebuilt process events, and gateway restarts.
+_DELEGATED_COMPLETION_GRACE_SECONDS = 5 * 60
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -301,6 +313,9 @@ class GatewayNotificationsMixin:
                 "Async-delegation completion has unknown spawning session %s; "
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
+            return None
+        if _is_delegated_completion_target(pinned_row):
+            logger.warning("Refusing completion route pin to delegated session %s", pinned_session_id)
             return None
         target_session_id = pinned_session_id
         follows_compression = False
@@ -1269,7 +1284,8 @@ class GatewayNotificationsMixin:
                 source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
                 scope = _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
             deliver = lambda: deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, profile=served,
-                notification_category="diagnostic" if diagnostic_process_event(evt) else "result")  # noqa: E731
+                notification_category="diagnostic" if diagnostic_process_event(evt) else "result",
+                wake_kind="process")  # noqa: E731
         try:
             logger.info(info, raw_sid)
             async with scope:
@@ -1394,6 +1410,7 @@ class GatewayNotificationsMixin:
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
+                wake_kind="delegation" if evt.get("type") == "async_delegation" else "process",
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -1486,13 +1503,26 @@ class GatewayNotificationsMixin:
             return "retry"
         if parent is None:
             return "terminal"
+        end_reason = str(parent.get("end_reason") or "")
+        if parent.get("ended_at") and end_reason in _USER_BOUNDARY_END_REASONS:
+            return "terminal"
+        if _is_delegated_completion_target(parent):
+            # Never pin a human route to a child. An ended child cannot acquire ownership;
+            # a live one gets only a persisted, bounded grace (not a per-poll retry counter).
+            try:
+                age = time.time() - float(parent.get("started_at") or 0)
+            except (TypeError, ValueError):
+                age = _DELEGATED_COMPLETION_GRACE_SECONDS
+            if parent.get("ended_at") or not 0 <= age < _DELEGATED_COMPLETION_GRACE_SECONDS:
+                return "terminal"
+            logger.debug("Deferring completion for delegated origin %s; no human route ownership", parent_session_id)
+            return "retry"
         if not parent.get("ended_at"):
             return "deliver"
-        end_reason = str(parent.get("end_reason") or "")
         if end_reason != "compression":
             # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
             # ends stay routable and the resolver retargets. Boundary set shared with the resolver.
-            return "terminal" if end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
+            return "deliver"
         try:
             tip_session_id = await session_db.get_compression_tip(parent_session_id)
             if not tip_session_id or tip_session_id == parent_session_id:

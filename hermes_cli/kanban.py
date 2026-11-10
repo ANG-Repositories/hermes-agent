@@ -22,7 +22,8 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_lazy import Module, handler as _lazy_handler
+kbd = Module("hermes_cli.kanban_db_dispatch")
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
@@ -35,16 +36,17 @@ from hermes_cli.kanban_output import (
 # fields the handlers here render (FOLLOWUP: port into kanban_output, then import).
 from hermes_cli.kanban_admit import cmd_admit as _cmd_admit
 from hermes_cli.kanban_boards import _dispatch_boards
-from hermes_cli.kanban_ops import (
-    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
-    _cmd_reclaim_workspaces,
-)
+for _name in ("_cmd_daemon", "_kanban_config", "_cmd_dispatch", "_cmd_gc", "_cmd_repair",
+              "_cmd_tail", "_cmd_watch", "_cmd_reclaim_workspaces"):
+    globals()[_name] = _lazy_handler("hermes_cli.kanban_ops", _name)
 from hermes_cli import kanban_verb_input as kvi
 from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
-from hermes_cli.kanban_parser import create_default_priority
+from hermes_cli.kanban_parser import (
+    HUMAN_CREATED_BY, _LIVE_BAND_OPERATORS, create_default_priority, live_band_default,
+)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
@@ -378,7 +380,10 @@ def kanban_command(args: argparse.Namespace) -> int:
     if resolved and resolved != kb.PINNED_SLUG:
         board_scope = kb.scoped_current_board(resolved)
 
-    with board_scope:
+    from hermes_cli.kanban_read import is_read
+    read_only = is_read(args) and action not in ("list", "ls")
+    read_only = read_only and os.environ.get("HERMES_KANBAN_READ_ONLY", "1") != "0"
+    with board_scope, kbc.read_scope(read_only):
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
@@ -396,7 +401,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
-            kb.init_db()
+            if not read_only:
+                with kb.connect_closing():
+                    pass
         except Exception as exc:
             return _err(f"kanban: could not initialize database: {exc}")
 
@@ -464,6 +471,8 @@ def kanban_command(args: argparse.Namespace) -> int:
                 _lifecycle_target_ids(args), action, flags=gated_flags,
             ), actor_scope, event_actor_scope:
                 return int(handler(args) or 0)
+        except kbc.sqlite3.Error as exc:
+            return _err(f"kanban: could not read database: {exc}" if read_only else f"kanban: database error: {exc}")
         except (ValueError, RuntimeError, PermissionError) as exc:
             # A survivor refusal carries its operator-only hint on the
             # exception, not in the persisted message, so render it HERE --
@@ -833,7 +842,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = False,
-                              explicit_home: Optional[str] = None) -> bool:
+                              explicit_home: Optional[str] = None,
+                              home_fallback: bool = False) -> bool:
     """Subscribe the originating chat to ``task_id`` when configured.
 
     Gated by ``kanban.cli_auto_subscribe`` (default False). ``hermes kanban
@@ -850,7 +860,9 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
     ``tasks.boomerang_wake``).
 
     ``explicit_home`` (the ``--session`` value, t_ea40ff83): a home that is not the
-    caller's own subscribes the HOME's chat, never the caller's.
+    caller's own subscribes the HOME's chat, never the caller's. ``home_fallback``
+    (operator callers): with no gateway identity in env, a routable explicit home is
+    subscribed directly (Ace 2026-11-06: boomerang wake is the default for homed cards).
 
     Returns True when a subscription row was written. Never raises — a
     notification bookkeeping failure must not fail the create.
@@ -867,6 +879,7 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
             wake=True if boomerang_wake else None,
             explicit_home=(None if explicit_home is None
                            else (explicit_home, _caller_session_id())),
+            home_fallback=home_fallback,
         )
     except Exception:
         return False
@@ -923,6 +936,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: {exc}", 2)
     if branch_name and ws_kind != "worktree":
         return _err("kanban: --branch is only valid with --workspace worktree", 2)
+    # Studio last resort (t_e604c0f9): a portable worktree target is rewritten to its anchor form, and the
+    # placement notes (rewrite, why a worktree stays Studio-local) are printed after the create.
+    _placement_notes: list = []
+    try:
+        from hermes_cli import kanban_worktree_port as _kwt
+        ws_path, _wt_note = _kwt.mint_rewrite(ws_kind, ws_path, kb.kanban_home() / "fleet")
+        if _wt_note:
+            _placement_notes.append(_wt_note)
+    except Exception:
+        pass
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -994,29 +1017,50 @@ def _cmd_create(args: argparse.Namespace) -> int:
     try:
         with kb.connect_closing() as conn:
             from hermes_cli.config import cfg_get as _cfg_get, load_config as _load_config
-            from tools.kanban_tools import _auto_boomerang, _auto_wake, _resolve_notify_target
+            from tools.kanban_tools import (_auto_boomerang, _auto_wake, _resolve_notify_target,
+                                            routable_home_target)
             # Scripts and cron drive the CLI: the boomerang default only follows a CLI create
-            # that kanban.cli_auto_subscribe (default False) would subscribe (Prism 1aec29b63c57).
+            # that kanban.cli_auto_subscribe (default False) would subscribe (Prism 1aec29b63c57),
+            # OR one that names an explicit --session whose home has a routable chat (Ace
+            # 2026-11-06: the card's home gets boomerang wake by default, env or not).
+            _explicit_sid = (_resolve_session_flag(args.session)
+                             if getattr(args, "session", None) is not None else None)
             boomerang = _auto_boomerang(
                 getattr(args, "boomerang_wake", None),
                 worker=is_dispatcher_owned_worker_context(),
                 subscribed=bool(_cfg_get(_load_config(), "kanban", "cli_auto_subscribe", default=False)
                                 and _auto_wake(None)
-                                and _resolve_notify_target(require_platform_identity=True)))
+                                and _resolve_notify_target(require_platform_identity=True))
+                or bool(_explicit_sid and routable_home_target(_explicit_sid) is not None))
+            _author = args.created_by or _profile_author()
+            _default_priority = None
+            if args.priority is None:  # live band for a person/operator create (t_febbdb61)
+                _priority_author = args.created_by or (
+                    _author if _author == "default" or _author in _LIVE_BAND_OPERATORS else HUMAN_CREATED_BY)
+                # argparse's historical default is "user"; preserve that persisted author,
+                # but retain the verified profile (root alias or any allowlisted operator) for
+                # eligibility (Prism 99f2e8531865).
+                if _priority_author == HUMAN_CREATED_BY:
+                    _verified = _profile_author()
+                    if _verified == "default" or _verified in _LIVE_BAND_OPERATORS:
+                        _priority_author = _verified
+                _default_priority = live_band_default(conn, _priority_author)
+                if _default_priority is None:
+                    _default_priority = create_default_priority(args.created_by)
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
                 title=args.title,
                 body=args.body,
                 assignee=args.assignee,
-                created_by=args.created_by or _profile_author(),
+                created_by=_author,
                 workspace_kind=ws_kind,
                 workspace_path=ws_path,
                 branch_name=branch_name,
                 project_id=getattr(args, "project", None),
                 tenant=args.tenant,
                 priority=(args.priority if args.priority is not None
-                          else create_default_priority(args.created_by)),
+                          else _default_priority),
                 parents=tuple(args.parent or ()),
                 parents_kind=getattr(args, "parent_kind", None),
                 continues=getattr(args, "continues", None),
@@ -1040,7 +1084,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
-                boomerang_wake=boomerang,
+                # Only the caller's own choice; create_task applies the default and records which.
+                boomerang_wake=getattr(args, "boomerang_wake", None),
                 initial_status=getattr(args, "initial_status", "running"),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
@@ -1069,7 +1114,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             auto_subscribed = _maybe_cli_auto_subscribe(
                 conn, task_id, boomerang_wake=bool(boomerang),
                 explicit_home=(task.session_id or "" if getattr(args, "session", None) is not None
-                               else None))
+                               else None),
+                home_fallback=bool(boomerang) and not is_dispatcher_owned_worker_context())
+            from hermes_cli.kanban_boomerang_default import wake_route
+            route = wake_route(conn, task_id)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1090,7 +1138,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         # t_d59f722a: the home the card was BORN with, so a loader can assert it.
-        _print_json(dict(_task_to_dict(task), home=("unhomed" if task.unhomed else task.session_id)))
+        _print_json(dict(_task_to_dict(task), home=("unhomed" if task.unhomed else task.session_id),
+                         wake_route=route))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
         if auto_added:
@@ -1103,14 +1152,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 "Subscribed the calling session for finish notifications "
                 "(kanban.cli_auto_subscribe)."
             )
+        if route.get("note"):
+            print(f"\n⚠  {task_id}: {route['note']}", file=sys.stderr)
         if dup_warning:
             similar = ", ".join(
                 f"{d['id']} ({d['score']:.2f})" for d in dup_warning.get("duplicates", [])
             )
             print(f"\n⚠  similar card(s) created in the last 24h: {similar}", file=sys.stderr)
+        from hermes_cli.kanban_host_capabilities import declared_words
+        if ("studio-state" not in declared_words(getattr(args, "body", None))
+                and "studio-state" in declared_words(task.body)):
+            print(f"placement: {task_id}: auto-derived requires: studio-state from CARD_NEEDS", file=sys.stderr)
         scope_warning = kb.inferred_scope_warning(task.body)
         if scope_warning:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
+        for _note in _placement_notes:
+            print(f"placement: {task_id}: {_note}", file=sys.stderr)
 
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
@@ -1184,12 +1241,21 @@ def _cmd_list(args: argparse.Namespace) -> int:
         args.session = None
     else:
         home_session_ids = None
+    if not kb.kanban_db_path().exists():
+        # A fresh board has no tasks; a read must not initialize it just to
+        # produce the same empty listing. Delegated callers retain their fence.
+        from agent.delegation_context import kanban_path_is_fenced
+        if not kanban_path_is_fenced(kb.kanban_db_path()):
+            if not _json_out(args, []):
+                print("(no matching tasks)")
+            return 0
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
         # A delegate_task child's connection is read-only; promotion is a
         # status mutation, so it lists the board as-is (the dispatcher promotes).
-        if not kb._is_delegated_child():
+        # Promotion belongs to the dispatcher, not a read verb holding a writer lock.
+        if not kb._is_delegated_child() and not kbc._READ_ONLY.get():
             kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
@@ -1446,6 +1512,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = [pid for pid, _kind in parent_links]
         children = [cid for cid, _kind in child_links]
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        from hermes_cli.kanban_diagnostics import compute_task_diagnostics
+        diagnostics = compute_task_diagnostics(task, events, runs)
         # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived. Read AFTER the
         # live comments and runs, deduped by id, so a move committing in between cannot empty the history.
         from hermes_cli import kanban_archive_read as kar
@@ -1481,6 +1549,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "level": level,
             "latest_summary": latest_summary,
+            "diagnostics": [d.to_dict() for d in diagnostics],
             "workspace_refusal": refusal,
             "held_repo": held,
             "parents": parents, "children": children,
@@ -1508,6 +1577,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
+    for diagnostic in diagnostics:
+        field("integrity", f"{diagnostic.kind}: {diagnostic.detail}")
     field("status", task.status + (f"  [{_fmt_refusal(refusal)}]" if refusal else "")
           + (f"  [{kb.format_deferred_until(task.next_eligible_at)}]"
              if task.status == "scheduled" and task.block_kind == "deferred" else ""))
@@ -1544,11 +1615,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
     else:
-        cfg_val = _kanban_config().get("failure_limit")
-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+        from hermes_cli.config import load_config
+        try:
+            cfg_val = (load_config().get("kanban") or {}).get("failure_limit")
+        except Exception:
+            cfg_val = None
+        from hermes_cli.kanban_dispatch_defaults import DEFAULT_FAILURE_LIMIT
+        if cfg_val is not None and int(cfg_val) != DEFAULT_FAILURE_LIMIT:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
         else:
-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+            print(f"  max-retries: {DEFAULT_FAILURE_LIMIT} (default)")
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
@@ -2784,6 +2860,48 @@ def _cmd_placement(args: argparse.Namespace) -> int:
     return 0 if not rep["errors"] else 1
 
 
+def _cmd_placement_holds(args: argparse.Namespace) -> int:
+    """``placement-holds [--clear ID]`` (t_0c5a95ab): host manifests + pause_hold-labelled cards, live or stale."""
+    from hermes_cli import kanban_pause_hold as kph
+    clear = getattr(args, "clear", None)
+    with kb.connect_closing() as conn:
+        if clear:
+            who = getattr(args, "operator", None) or os.environ.get("USER") or "operator"
+            if not kph.clear_card(conn, clear, who):
+                return _err(f"placement-holds: {clear} has no open pause_hold label")
+            print(f"cleared the pause_hold label on {clear} (a live hold comes back on the next tick)")
+            return 0
+        rep = kph.holds(conn)
+    if getattr(args, "json", False):
+        _print_json(rep)
+        return 0
+    if not rep["hosts"]:
+        print("hosts: no fleet-pause state")
+    for host, h in rep["hosts"].items():
+        state = "HOLDS" if h["holds"] else "no hold"
+        line = f"{host}: {state} {h.get('manifest') or '-'} {h['why']}"
+        if h.get("driver_pid") is not None:
+            line += f" driver pid {h['driver_pid']} {'alive' if h.get('driver_alive') else 'dead'}"
+        print(line)
+        if h.get("pins_owed"):
+            print(f"  resume pins owed: {' '.join(h['pins_owed'])}"
+                  + (" (conflicting pins released: past grace)" if h.get("pin_conflict_expired") else ""))
+    for host, rows in (rep.get("fwa") or {}).items():
+        for f in rows:
+            state = "HOLDS kanban" if f["holds_kanban"] else "no kanban hold"
+            if f.get("unreadable"):
+                print(f"{host}: fwa {state} unreadable hold file {f['file']}")
+                continue
+            print(f"{host}: fwa {state} {f['kind'] or 'pause'}:{f['id']} lanes {','.join(f['lanes'])} by "
+                  f"{f.get('by') or f.get('owner') or '?'} until {f['until']}: {f.get('reason') or ''}")
+    for c in rep["cards"]:
+        print(f"{c['task_id']}: {'LIVE' if c['live'] else 'STALE'} label {c['label']} "
+              f"(origin {c['origin_host'] or '-'}; now {c['now'] or 'not held'})")
+    if not rep["cards"]:
+        print("cards: none labelled pause_hold")
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -3560,13 +3678,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     add_skills = list(getattr(args, "skills", None) or [])
     clear_skills = bool(getattr(args, "clear_skills", False))
     do_skills = bool(add_skills) or clear_skills
+    asap_arg = getattr(args, "asap", None)
     boomerang_arg = getattr(args, "boomerang_wake", None)
 
     if result is None and (summary is not None or raw_meta is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     if (not do_result and not do_fields and not do_model and not do_session
             and no_worker is None and new_priority is None and page is None and not do_skills
-            and boomerang_arg is None):
+            and boomerang_arg is None and asap_arg is None):
         return _err(
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
             "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
@@ -3574,6 +3693,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
     rc = 0
     with kbc.connect_closing() as conn:
+        if asap_arg is not None:
+            from hermes_cli.kanban_priority import set_asap
+            try:
+                if not set_asap(conn, args.task_id, asap_arg):
+                    return _err(f"cannot edit {args.task_id} (unknown id)")
+            except PermissionError as exc:
+                return _err(str(exc))
+            print(f"{args.task_id}: ASAP {'on' if asap_arg else 'off'}")
         if new_priority is not None and not _set_priority(conn, args.task_id, new_priority):
             return 1
         if no_worker is not None:
@@ -3679,6 +3806,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     failed: list[str] = []
     with kbc.connect_closing() as conn:
+        if reason:
+            kb._validate_comment_args(author, f"BLOCKED: {reason}", conn=conn)
         for tid in ids:
             # Provenance before the transition: blocking ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
@@ -3754,6 +3883,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        if reason:
+            kb._validate_comment_args(author, f"SCHEDULED: {reason}", conn=conn)
         for tid in ids:
             current = kb.get_task(conn, tid)
             # An already-scheduled card only gets its wake time (re)set; the
@@ -3762,6 +3893,11 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 current is not None and current.status == "scheduled"
                 and wake_at is not None
             )
+            from hermes_cli.kanban_lifecycle_guards import has_event_gate
+            if wake_at is None and not (current and has_event_gate(current.body)):
+                failed.append(tid)
+                print(f"cannot schedule {tid}: needs --at, --now or unblock_when: event:<name>", file=sys.stderr)
+                continue
             # Provenance before the transition: scheduling ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
 
@@ -3780,6 +3916,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                wake_at=wake_at,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
@@ -4033,7 +4170,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         ) + str(kb.redact_review_value(reason))
         if worker_run is None:
             # Before any write: the human-lane mirror comment lands after the transition (t_ebc8eb87).
-            check_close_on_comment(_profile_author(), sendback_body)
+            kb._validate_comment_args(_profile_author(), sendback_body, conn=conn)
         if operator is not None and worker_run is not None:
             # A dispatched reviewer run always carries full coverage.
             print(
@@ -5145,6 +5282,7 @@ _HANDLERS = {
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "placement": _cmd_placement,
+    "placement-holds": _cmd_placement_holds,
     "link": _cmd_link, "rehome": _cmd_rehome, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,

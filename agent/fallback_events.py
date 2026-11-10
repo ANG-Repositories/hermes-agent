@@ -1047,8 +1047,25 @@ def stash_api_error(agent: Any, api_error: BaseException,
             msg = str(error_context.get("message") or "")
         if not msg:
             msg = str(api_error)
+        # Notice-only reset evidence, never the harness's sticky cooldown.
+        from agent.agent_runtime_helpers import extract_api_error_context
+        from agent.credential_pool import _parse_absolute_timestamp
+
+        quota_reset_at = None
+        if isinstance(api_error, Exception):
+            try:
+                quota_reset_at = _parse_absolute_timestamp(
+                    extract_api_error_context(api_error).get("reset_at"))
+                if quota_reset_at is not None:
+                    # Reject malformed/non-finite/out-of-range upstream timestamps.
+                    import datetime
+
+                    datetime.datetime.fromtimestamp(quota_reset_at, datetime.timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                quota_reset_at = None
         agent._pending_fallback_error = {
             "at": time.monotonic(),
+            "quota_reset_at": quota_reset_at,
             "status": status_code if isinstance(status_code, int) else None,
             "text": msg[:2000],
             "headers": {k: v for k, v in headers.items()
@@ -1428,6 +1445,8 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         # t_a8dc8b21: a non-relay provider's own error text and, for
         # OpenRouter, whose limit tripped. In memory for the notice only
         # (not ledger columns); the rendered notice_text carries it.
+        if pending and pending.get("quota_reset_at") is not None:
+            row["quota_reset_at"] = pending["quota_reset_at"]  # notice only
         p_msg, p_scope = provider_error_detail(from_provider, body, headers, status)
         if p_msg and not row.get("provider_message"):
             row["provider_message"] = p_msg

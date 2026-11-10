@@ -54,6 +54,8 @@ from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
 
+logger = logging.getLogger(__name__)
+
 ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 ROLES_FILE = "fleet-roles.json"
@@ -62,7 +64,9 @@ SIDECAR_FILE = "kanban-pool.json"
 # until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
 # kanban-worker joined (t_c834e0d8, bug class A: admission is measured use, never
 # a count): ``{}`` parses to ``PoolHost.slots = None``; a legacy count stays a ceiling.  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
-COUNT_FREE_ROLES = frozenset({"ci-runner", ROLE})
+# review-worker joined (t_e85e77b7): hermes-home #9338 made every Prism member row
+# ``{}``; refusing it refused the whole pool (``refused:roles``) and nothing spilled.
+COUNT_FREE_ROLES = frozenset({"ci-runner", "review-worker", ROLE})
 # A count-free kanban host's free slots for ONE plan (t_c834e0d8). A per-tick  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # stand-in so ``plan.slots`` / ``budget`` / load_gate.json stay finite ints; it is  (slots-vocab: allow legacy fleet-roles slots key, kept as a ceiling (#2458))
 # not a concurrency count (running workers are not subtracted). Measured
@@ -382,8 +386,19 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     except (OSError, ValueError) as exc:
         return PoolConfig(warnings=(f"kanban pool: unreadable pool file: {exc}",),
                           refused="unreadable")
+    warnings: List[str] = []
     try:
-        roles = parse_roles(roles_doc) if roles_doc is not None else {}
+        roles = {}
+        if roles_doc is not None:
+            # Validate the envelope strictly before isolating individual host rows.
+            if not isinstance(roles_doc, dict) or not isinstance(roles_doc.get("hosts"), dict):
+                parse_roles(roles_doc)  # raises the canonical structural error
+            parse_roles({**roles_doc, "hosts": {}})
+            for hid, row in roles_doc["hosts"].items():
+                try:
+                    roles.update(parse_roles({**roles_doc, "hosts": {hid: row}}))
+                except PoolError as exc:
+                    warnings.append(f"kanban pool: {exc} (host dropped)")
     except PoolError as exc:
         return PoolConfig(warnings=(f"kanban pool: roles refused: {exc}",), refused="roles")
     with_role = {h for h, (r, _s) in roles.items() if ROLE in r}
@@ -400,7 +415,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             f"{ROLE} role in {ROLES_FILE}, so nothing spills (register hosts with "
             "`fleet-host kanban-enable`)",))
     if sidecar is None:
-        return PoolConfig(warnings=tuple(
+        return PoolConfig(warnings=tuple(warnings) + tuple(
             f"kanban pool: {h} has a {ROLE} role but {SIDECAR_FILE} is absent (host dropped)"
             for h in sorted(with_role)))
     errs = validate_sidecar(sidecar)
@@ -418,7 +433,6 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         # sidecar keeps it on the Studio, so a new profile never lands Studio-bound.
         gprofiles = derived_profiles(fleet_dir.parent / "profiles", sidecar["studio_only"])
     gcap = float(sidecar.get("capacity_pct", DEFAULT_CAPACITY))
-    warnings: List[str] = []
     hosts: List[PoolHost] = []
     disabled: List[str] = []
     policy = _policy.load(fleet_dir)
@@ -842,11 +856,23 @@ def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iter
 # the whole ssh-root trigger (Q9 recommendation (a)); a root-only verb list
 # would be a lint, never a rule. control-plane-read binds on a PATH-shaped
 # mention only (Momus pass 2 R-F): "the kanban.db schema" is prose, while
-# ``~/.hermes/kanban.db`` or ``fleet/kanban-pool.json`` is a file the work opens.
+# ``~/.hermes/kanban.db`` or ``~/.hermes/fleet/kanban-pool.json`` is a file the work opens.
 _SUDO_RE = re.compile(r"(?<![\w-])sudo(?![\w-])")
 _CONTROL_PLANE_PATH_RE = re.compile(
-    r"(?:^|(?<=[\s`'\"(=:,]))(?:~|\.\.?|[\w.@*${}-]+)?(?:/[\w.@*${}-]+)*/"
+    r"(?:^|(?<=[\s`'\"(=:,]))((?:~|\.\.?|[\w.@*${}-]+)?(?:/[\w.@*${}-]+)*)/"
     r"(kanban\.db|gateway\.log|load_gate\.json|kanban-pool\.json)(?![\w-])")
+# Only a LIVE path binds (t_e7c03f48): rooted at ``~``, an env var (``$HOME``, ``$HERMES_HOME``) or ``/``,
+# dot-relative (``./``, ``../``, ``.hermes/``), or under the live ``state/`` / ``logs/`` dirs. A repo-relative
+# path (``fleet/kanban-pool.json``, ``scripts/...``, ``tests/...``, a PR file list) names the TRACKED copy a PR
+# edits, which every pool host has in its clone: t_e32e34f0 was held Studio-only for editing it.
+_LIVE_CONTROL_PLANE_DIRS = frozenset({"state", "logs"})
+
+
+def _live_control_plane_path(prefix: str) -> bool:
+    """True when the directory part of a matched control-plane path names the live file, not a repo copy."""
+    if not prefix or prefix[0] in "~$/.":
+        return True
+    return prefix.split("/", 1)[0] in _LIVE_CONTROL_PLANE_DIRS
 
 
 def _sudo_before_break(remote: str) -> bool:
@@ -886,9 +912,10 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
     known ssh host, a ``host:<pin>`` line is never a target. ``<host>`` is the
     canonical pin of the alias when ``canon`` names one (``ci`` -> ``ci-box``).
 
-    ``control-plane-read``: a path-shaped mention of kanban.db, gateway.log,
-    load_gate.json or kanban-pool.json, or an explicit
-    ``requires: control-plane-read`` line. A bare word never binds.
+    ``control-plane-read``: a LIVE path-shaped mention of kanban.db, gateway.log,
+    load_gate.json or kanban-pool.json (:func:`_live_control_plane_path`), or an
+    explicit ``requires: control-plane-read`` line. A bare word never binds, nor
+    does a repo-relative path (``fleet/kanban-pool.json``).
     """
     from hermes_cli import kanban_host_capabilities as _khc
     alias_set = {a.lower() for a in (aliases or ()) if a}
@@ -916,7 +943,8 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
             at = re.search(rf"(?<![\w.-]){re.escape(target)}(?![\w-])", rest)
             if at and _sudo_before_break(rest[at.end():]):
                 return _reasons.ssh_root(canon.get(w, w))
-        if not cp_read and _CONTROL_PLANE_PATH_RE.search(line):
+        if not cp_read and any(_live_control_plane_path(m.group(1))
+                               for m in _CONTROL_PLANE_PATH_RE.finditer(line)):
             cp_read = True
     if cp_read or _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
         return _reasons.ACCESS_CONTROL_PLANE_READ
@@ -979,6 +1007,96 @@ def resolve_pin(body: Optional[str], known_hosts: Iterable[str],
     return None, ignored
 
 
+def studio_pin_reasons(caps) -> Optional[frozenset]:
+    """The ``requires:`` words that justify a ``host: studio`` pin (t_e604c0f9): every capability the capability
+    map's Studio row serves (browser-session, studio-state, control-plane, docker identity-only, ...) plus the
+    Studio-only access word ``control-plane-read``. None (= every Studio pin is honoured, the pre-t_e604c0f9
+    behaviour) when the capability layer is off this tick, its map is absent or malformed, or the Studio row
+    lists nothing: an unreadable vocabulary must not move Studio work."""
+    return studio_map_reasons(getattr(caps, "cmap", None))
+
+
+def studio_map_reasons(cmap) -> Optional[frozenset]:
+    """:func:`studio_pin_reasons` from a ``CapabilityMap`` (``kanban create`` has no tick)."""
+    if cmap is None or not getattr(cmap, "valid", False):
+        return None
+    from hermes_cli import kanban_host_capabilities as _khc
+    studio = (getattr(cmap, "hosts", None) or {}).get(_khc.STUDIO_ROW)
+    if not studio:
+        return None
+    return frozenset(studio) | {_reasons.ACCESS_CONTROL_PLANE_READ}
+
+
+def studio_pin_justified(body: Optional[str], reasons: Optional[frozenset]) -> bool:
+    """Does the card's ``requires:`` line name a reason the Studio pin needs? ``reasons`` None = always."""
+    if reasons is None:
+        return True
+    from hermes_cli import kanban_host_capabilities as _khc
+    return any(w in reasons for w in _khc.declared_words(body))
+
+
+def skills_need_studio(skills: Optional[Iterable[Any]], cmap, reasons: Optional[frozenset]) -> bool:
+    """Does an ATTACHED skill need a capability the Studio row serves (Prism f5bbe97bc028)? The capability index
+    maps skill -> capabilities (identity-only docker included), and the verdict enforces those; a `host: studio`
+    pin such a card carries is justified even with no ``requires:`` line. False when the map or index is
+    unreadable (``reasons`` is then None anyway, or the index cannot say)."""
+    if not reasons or cmap is None or getattr(cmap, "index_error", None) is not None:
+        return False
+    from hermes_cli import kanban_host_capabilities as _khc
+    index = getattr(cmap, "index", None) or {}
+    return any(c in reasons for s in (skills or ()) if isinstance(s, str)
+               for c in index.get(_khc.skill_key(s), ()))
+
+
+def effective_pin(body: Optional[str], known_hosts: Iterable[str],
+                  aliases: Optional[Mapping[str, str]] = None,
+                  studio_reasons: Optional[frozenset] = None) -> Tuple[Optional[str], Optional[str], bool]:
+    """:func:`resolve_pin` plus the Studio last-resort rule (Ace 2026-11-08 16:38, t_e604c0f9): a bare
+    ``host: studio`` line with no ``requires:`` reason the Studio serves is DROPPED (not a pin, not an unknown
+    word: the card is placed by FWA like any unpinned card). ``(pin, ignored, dropped)``."""
+    pin, ignored = resolve_pin(body, known_hosts, aliases)
+    if pin == PIN_STUDIO and not studio_pin_justified(body, studio_reasons):
+        return None, None, True
+    return pin, ignored, False
+
+
+def note_dropped_studio_pin(card_id: str) -> None:
+    """One WARNING per card per 5 minutes for a dropped bare ``host: studio`` pin."""
+    now = time.monotonic()
+    key = f"studio-pin:{card_id}"
+    last = _ignored_pin_warned.get(key)
+    if last is None or now - last >= IGNORED_PIN_WARN_SECONDS:
+        _ignored_pin_warned[key] = now
+        _log.warning("kanban pool: card %s: bare `host: studio` dropped (no requires: reason the Studio serves); "
+                  "placed by FWA", card_id)
+
+
+def mint_studio_pin_note(body: Optional[str], fleet_dir: Path,
+                         skills: Optional[Iterable[Any]] = None) -> Optional[str]:
+    """``kanban create``'s line for a bare ``host: studio`` the dispatcher will drop (t_e604c0f9), else None. The
+    same predicate as dispatch: the host_preference switch (t_c2fce87e), the capability map's Studio row, the
+    card's ``requires:`` words."""
+    try:
+        from hermes_cli import placement_policy as _ppol
+        if not _ppol.load(fleet_dir).is_last_resort(STUDIO_HOST):
+            return None
+        pin, _ignored = resolve_pin(body, known_host_ids(fleet_dir), pin_aliases(fleet_dir))
+        if pin != PIN_STUDIO:
+            return None
+        from hermes_cli import kanban_host_capabilities as _khc
+        cmap = _khc.load_map(fleet_dir)
+        reasons = studio_map_reasons(cmap)
+        if skills_need_studio(skills, cmap, reasons):
+            return None
+    except Exception:
+        return None
+    if reasons is None or studio_pin_justified(body, reasons):
+        return None
+    return ("`host: studio` will be DROPPED at dispatch: no `requires:` line names a reason the Studio serves "
+            f"({', '.join(sorted(reasons))}); FWA places this card like any other. Add the requires: line if "
+            "it must run on the Studio.")
+
+
 def _studio_words() -> frozenset:
     """Words for the dispatcher's own machine: the constants plus the live
     ``socket.gethostname()`` short form, lower-cased."""
@@ -990,7 +1108,7 @@ def _studio_words() -> frozenset:
     return _STUDIO_PIN_WORDS | ({short} if short else set())
 
 
-def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
+def pin_aliases(fleet_dir: Path, *, strict: bool = False) -> Dict[str, str]:
     """``{alias: canonical pin}`` from the registry (t_cb2b888d), the ONE
     alias source. For every host the pool files know (:func:`known_host_ids`)
     and every ``ci-hosts.json`` row: the id, its ``ssh_alias`` and
@@ -1000,11 +1118,14 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
     A row with ``transport: local`` is the Studio (``studio``). A row that is
     neither a known pool host nor local adds nothing. An alias two hosts
     claim is dropped (ambiguous: it stays unknown, never guesses). Matching
-    is case-insensitive. Unreadable files add nothing."""
-    known = set(known_host_ids(fleet_dir))
+    is case-insensitive. Unreadable files add nothing unless strict=True,
+    used by pause enforcement to reject incomplete pin vocabularies."""
+    known = set(known_host_ids(fleet_dir, strict=strict))
     try:
         ci = _read_json(Path(fleet_dir) / CI_HOSTS_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         ci = None
     claims: Dict[str, set] = {}
 
@@ -1033,6 +1154,8 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
     try:
         table = _read_json(Path(fleet_dir).parent / "config" / FLEET_HOSTS_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         table = None
     rows = table.get("hosts") if isinstance(table, dict) else None
     for hid, row in (rows.items() if isinstance(rows, dict) else ()):
@@ -1073,19 +1196,24 @@ def note_ignored_pin(card_id: str, word: str) -> None:
                      card_id, word)
 
 
-def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
+def known_host_ids(fleet_dir: Path, *, strict: bool = False) -> Tuple[str, ...]:
     """Every host id the pool files name (roles hosts with the kanban-worker
     role, sidecar rows, priority), read WITHOUT validation: a disabled or
     refused pool still knows its hosts, so a real pin stays fail-closed
-    while prose never becomes one. Unreadable files name nothing."""
+    while prose never becomes one. Unreadable files name nothing unless
+    strict=True, which propagates registry I/O and JSON errors."""
     out: List[str] = []
     try:
         roles = _read_json(Path(fleet_dir) / ROLES_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         roles = None
     try:
         side = _read_json(Path(fleet_dir) / SIDECAR_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         side = None
     if isinstance(roles, dict) and isinstance(roles.get("hosts"), dict):
         for hid, row in roles["hosts"].items():
@@ -1109,7 +1237,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              targets: Optional[Mapping[str, str]] = None,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
              body_signals: bool = True,
-             worktree_hosts: Optional[Tuple[str, ...]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+             worktree_hosts: Optional[Tuple[str, ...]] = None,
+             studio_reasons: Optional[frozenset] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1145,6 +1274,11 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     hosts holding a git mirror of a ``worktree`` card's repo. Non-empty, the
     card is judged like a scratch card (the dispatcher clones it on the
     chosen host); a pin to a host outside that set keeps it local.
+
+    ``studio_reasons`` (t_e604c0f9, :func:`studio_pin_reasons`): a ``host:
+    studio`` pin holds only when the card's ``requires:`` line names one of
+    them; a bare one is dropped and the card is judged unpinned. None = every
+    Studio pin holds (kill switch, or no capability map this tick).
     """
     kind = workspace_kind or "scratch"
     if kind != "scratch" and not (kind == "worktree" and worktree_hosts):
@@ -1177,7 +1311,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     access = access_bound_for(body, pool)
     if access is not None:
         return False, _reasons.access_bound(access), None
-    pin, ignored = resolve_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None))
+    pin, ignored, _dropped = effective_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None),
+                                           studio_reasons)
     if bind_rule:
         # The bind is the pin; a body pin may only agree with it (spec §5).
         if pin not in (None, PIN_ANY, bind_host.lower()):
@@ -1201,6 +1336,15 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
             return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
             return False, _reasons.HOST_REACH, None
+    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals)
+    if need_hosts is not None:
+        if pin not in (None, PIN_ANY) and pin not in need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
+        # `host: any` returns below before soft_rule/studio_affinity, so it is checked here. An unpinned card
+        # is not: it must still reach soft_rule first (an identity-only capability wait, AC-5), and
+        # studio_affinity enforces its needs after that (Prism ed96eb421c9c).
+        if pin == PIN_ANY and not need_hosts:
+            return False, STUDIO_NEEDS_RULE, None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:
@@ -1427,19 +1571,37 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
     tail = f"; {_boards_cmd(workspaces_root)}" if workspaces_root else ""
     if workspace_paths:
         tail += f"; {_states_cmd(workspace_paths)}"
-    if pressure_path is None:
-        return f"cat /proc/loadavg; {_NCPU_CMD}{tail}"
     import shlex
-    # ONE round-trip (RC9): the age is remote_now - at, both from this host.
-    return (f"cat /proc/loadavg; {_NCPU_CMD}; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
-            f"{tail}")
+    # Python's native APIs work on Linux and Darwin. A single JSON envelope
+    # prevents missing commands/files from shifting CPU/clock/pressure fields.
+    script = (
+        "import json,os,sys,time\n"
+        "load=os.getloadavg()\n"  # admission-lint: not-a-decider remote telemetry capture only; admission occurs in the shared predicate
+        "pressure=''\n"
+        "if len(sys.argv)>1:\n"
+        " path=sys.argv[1]\n"
+        " if sys.platform=='darwin' and path=='/var/lib/placement/host-pressure.json':\n"
+        "  path=os.path.expanduser('~/.local/share/placement/host-pressure.json')\n"
+        " try:\n"
+        "  with open(path, encoding='utf-8-sig', errors='replace') as f: pressure=f.read()\n"
+        " except OSError: pass\n"
+        "print('@@hermes-probe-v1')\n"
+        "print(json.dumps(dict(schema=1,load1=load[0],load5=load[1],"
+        "ncpu=os.sysconf('SC_NPROCESSORS_ONLN'),remote_now=time.time(),pressure_text=pressure)))\n"
+    )
+    args = " " + shlex.quote(pressure_path) if pressure_path is not None else ""
+    return f"python3 -c {shlex.quote(script)}{args}{tail}"
 
 
-def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
-               pressure_path: Optional[str] = None,
-               workspaces_root: Optional[str] = None,
-               workspace_paths: Sequence[str] = ()) -> Union[None, Tuple[float, int], HostSample]:
-    """``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
+def _probe_once(h: PoolHost, runner: Callable, *,
+                pressure_path: Optional[str] = None,
+                workspaces_root: Optional[str] = None,
+                workspace_paths: Sequence[str] = (),
+                direct: bool = False):
+    """One ssh round-trip: ``(result, error)``; ``error`` names why ``result``
+    is None. ``direct`` bypasses any ControlMaster mux (t_64342f07).
+
+    ``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
     With ``pressure_path`` the same call also returns the remote clock and
     the pressure file as a :class:`HostSample`. With ``workspaces_root`` it
     also lists the boards the host can host (``HostSample.boards``,
@@ -1447,27 +1609,36 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     With ``workspace_paths`` the same call reports each path's state
     (``HostSample.workspace_states``, t_8bfdcc07) and a changed host key
     raises :class:`HostKeyChanged` instead of reading as plain unreachable."""
+    argv = _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root, workspace_paths))
+    timeout = PROBE_TIMEOUT_SECONDS
+    if direct:
+        argv = argv[:1] + list(DIRECT_PROBE_SSH_OPTS) + argv[1:]
+        timeout = DIRECT_PROBE_TIMEOUT_SECONDS
     try:
         proc = runner(
-            _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root, workspace_paths)),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, stdin=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if getattr(proc, "returncode", 1) != 0:
-        err = (getattr(proc, "stderr", "") or "").lower()
-        if workspace_paths and getattr(proc, "returncode", 1) == 255 and (
+    except subprocess.TimeoutExpired:
+        return None, f"timeout after {timeout}s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:160]
+    rc = getattr(proc, "returncode", 1)
+    if rc != 0:
+        raw = (getattr(proc, "stderr", "") or "").strip()
+        err = raw.lower()
+        if workspace_paths and rc == 255 and (
                 "host key verification failed" in err
                 or "remote host identification has changed" in err):
             raise HostKeyChanged(h.name)
-        return None
+        last = raw.splitlines()[-1].strip() if raw else ""
+        return None, f"ssh rc={rc}" + (f": {last[:120]}" if last else "")
     out = proc.stdout or ""
     states: Optional[Dict[str, str]] = None
     if workspace_paths:
         out, sep, listed = out.partition(STATES_MARKER + "\n")
         if not sep:
-            return None  # the state list never printed: fail closed
+            return None, "probe output missing workspace states"  # fail closed
         states = {}
         try:
             got = json.loads(listed.strip().split("\n")[0] or "null")
@@ -1482,20 +1653,41 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     if workspaces_root:
         out, sep, listed = out.partition(BOARDS_MARKER + "\n")
         if not sep:
-            return None  # the board list never printed: fail closed
+            return None, "probe output missing board list"  # fail closed
         boards = frozenset(b.strip() for b in listed.split("\n") if b.strip())
+    if out.startswith("@@hermes-probe-v1\n"):
+        import math
+        try:
+            doc = json.loads(out.split("\n", 1)[1])
+            if doc.get("schema") != 1:
+                raise ValueError("schema")
+            load1, load5 = doc["load1"], doc["load5"]
+            ncpu, remote_now = doc["ncpu"], doc["remote_now"]
+            if (type(ncpu) is not int or ncpu <= 0
+                    or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0
+                           for v in (load1, load5, remote_now))
+                    or not isinstance(doc["pressure_text"], str)):
+                raise ValueError("axes")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, "invalid structured probe output"
+        if pressure_path is None and boards is None and states is None:
+            return (load1, ncpu), ""
+        return HostSample(load1, ncpu, remote_now, doc["pressure_text"], boards,
+                          load5=load5, workspace_states=states), ""
+    # Compatibility for cached/injected legacy probes. New commands always
+    # emit the versioned envelope; never interpret a damaged envelope as lines.
     lines = out.split("\n")
     try:
         load1 = float(lines[0].split()[0])
         ncpu = int(lines[1].strip())
     except (IndexError, ValueError):
-        return None
+        return None, "unparseable probe output"
     if ncpu <= 0:
-        return None
+        return None, f"bad ncpu {ncpu}"
     if pressure_path is None:
         if boards is None and states is None:
-            return (load1, ncpu)
-        return HostSample(load1, ncpu, boards=boards, workspace_states=states)
+            return (load1, ncpu), ""
+        return HostSample(load1, ncpu, boards=boards, workspace_states=states), ""
     try:
         remote_now: Optional[float] = float(lines[2].strip())
     except (IndexError, ValueError):
@@ -1505,7 +1697,133 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     except (IndexError, ValueError):
         load5 = None
     return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards,
-                      load5=load5, workspace_states=states)
+                      load5=load5, workspace_states=states), ""
+
+
+
+# -- probe failure vs host down (t_64342f07) ----------------------------------
+# 2026-11-06: 31 ready cards waited ``pool_unavailable (ci-box: host
+# unreachable; ace-media: host unreachable)`` while both hosts answered ssh in
+# <2 s. The probe rides the ~/.ssh/config ControlMaster mux; a stale master
+# (ace-media, after a reboot) or a cold handshake on a loaded box (ci-box,
+# 39 s) failed every tick. So: a failed muxed probe is retried ONCE on a direct
+# connection (no mux, longer handshake budget), and a host that answered
+# recently keeps its last sample for PROBE_GRACE_FAILS ticks before it reads
+# unreachable. Nothing is sticky: every tick probes again, and the unreachable
+# reason names the probe, its error and when it was last tried / last answered.
+DIRECT_PROBE_SSH_OPTS = ("-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=10")
+DIRECT_PROBE_TIMEOUT_SECONDS = 15
+PROBE_GRACE_FAILS = 3
+PROBE_GRACE_SECONDS = 900
+_REAL_RUN = subprocess.run
+
+
+@dataclass
+class _ProbeRecord:
+    last_ok_at: Optional[float] = None
+    last_sample: Any = None
+    fails: int = 0
+    last_error: str = ""
+    last_tried_at: Optional[float] = None
+    reused: bool = False
+
+
+class ProbeMemory:
+    """Per-host probe outcomes, in-process (like ``_board_faults``): the
+    gateway is the one long-lived prober, and a restart re-probes."""
+
+    def __init__(self) -> None:
+        self._rows: Dict[str, _ProbeRecord] = {}
+
+    def row(self, h: PoolHost) -> _ProbeRecord:
+        return self._rows.setdefault(f"{h.target}:{h.ssh_port}", _ProbeRecord())
+
+    def get(self, h: PoolHost) -> Optional[_ProbeRecord]:
+        return self._rows.get(f"{h.target}:{h.ssh_port}")
+
+    def clear(self) -> None:
+        self._rows.clear()
+
+
+_PROBE_MEMORY = ProbeMemory()
+
+
+def _hhmmss(t: Optional[float]) -> str:
+    return "never" if t is None else time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def probe_note(h: PoolHost, memory: Optional[ProbeMemory] = None) -> str:
+    """One line for a placement_wait detail: which probe, which error, when
+    last tried and when the host last answered. "" when the last probe was
+    clean."""
+    rec = (memory or _PROBE_MEMORY).get(h)
+    if rec is None or rec.fails == 0:
+        return ""
+    head = (f"ssh probe {h.target} failed {rec.fails}x ({rec.last_error}), "
+            f"last tried {_hhmmss(rec.last_tried_at)}, last ok {_hhmmss(rec.last_ok_at)}")
+    return head + (", reusing last sample" if rec.reused else "")
+
+
+def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
+               pressure_path: Optional[str] = None,
+               workspaces_root: Optional[str] = None,
+               workspace_paths: Sequence[str] = (),
+               memory: Optional[ProbeMemory] = None,
+               now: Optional[float] = None) -> Union[None, Tuple[float, int], HostSample]:
+    """The sample from :func:`_probe_once`, or None (fail closed).
+
+    A failed probe is retried once on a direct (un-muxed) connection, so a
+    stale ControlMaster or a slow handshake is not read as a dead host. A
+    host whose last answer is under ``PROBE_GRACE_FAILS`` failures and
+    ``PROBE_GRACE_SECONDS`` old keeps that sample (load/pressure only: the
+    workspace states are dropped, so continuation reads ``unknown``).
+    ``memory`` defaults to the process-wide record only for the real
+    ``subprocess.run`` runner, so injected runners stay hermetic."""
+    if memory is None and runner is _REAL_RUN:
+        memory = _PROBE_MEMORY
+    kw = dict(pressure_path=pressure_path, workspaces_root=workspaces_root,
+              workspace_paths=workspace_paths)
+    got, err = _probe_once(h, runner, **kw)
+    if got is None:
+        direct, derr = _probe_once(h, runner, direct=True, **kw)
+        if direct is not None:
+            got, err = direct, ""
+            if runner is _REAL_RUN:
+                _drop_stale_master(h)
+        else:
+            err = f"mux: {err}; direct: {derr}"
+    if memory is None:
+        return got
+    rec = memory.row(h)
+    rec.last_tried_at = time.time() if now is None else now
+    if got is not None:
+        rec.last_ok_at, rec.last_sample = rec.last_tried_at, got
+        rec.fails, rec.last_error, rec.reused = 0, "", False
+        return got
+    rec.fails += 1
+    rec.last_error = err
+    rec.reused = (rec.last_sample is not None and rec.last_ok_at is not None
+                  and rec.fails <= PROBE_GRACE_FAILS
+                  and rec.last_tried_at - rec.last_ok_at <= PROBE_GRACE_SECONDS)
+    logger.warning("kanban pool: %s", probe_note(h, memory))
+    if not rec.reused:
+        return None
+    last = rec.last_sample
+    if isinstance(last, HostSample) and last.workspace_states is not None:
+        import dataclasses
+        last = dataclasses.replace(last, workspace_states=None)
+    return last
+
+
+def _drop_stale_master(h: PoolHost) -> None:
+    """The muxed probe failed and a direct one answered: the ControlMaster is
+    stale (ace-media 2026-11-06). Ask it to exit so the next tick re-masters;
+    best effort, bounded."""
+    argv = ["ssh", "-O", "exit"] + (["-p", str(h.ssh_port)] if h.ssh_port != 22 else []) + [h.target]
+    try:
+        subprocess.run(argv, capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 # -- per-(host, board) workspace faults (t_9fb4d477) --------------------------
@@ -2178,7 +2496,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             row["load1"], row["ncpu"] = sample
             row["band"], row["why"] = BAND_UNKNOWN, "pressure not probed"
         elif free > 0:
-            row["band"], row["why"] = BAND_UNKNOWN, "host unreachable"
+            note = probe_note(h)
+            row["band"], row["why"] = BAND_UNKNOWN, "host unreachable" + (f" ({note})" if note else "")
         probed[h.name] = row
 
     # t_5d7e7171 (FWA-G): no second verdict. Under the ONE rule a host is never closed here on its band (each take

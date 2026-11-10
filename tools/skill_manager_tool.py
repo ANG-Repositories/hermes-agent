@@ -393,7 +393,7 @@ def _iter_skill_dirs(root: Path):
             yield skill_md.parent
 
 
-def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+def _discover_skill(name: str) -> Optional[Dict[str, Any]]:
     """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
@@ -421,6 +421,39 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
                         and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
                     return {"path": skill_dir}
     return None
+
+
+class _OperationMemo(dict):
+    """name -> discovery answer for ONE public skill_manage call, owned by the calling thread."""
+    __slots__ = ("thread", "closed")
+
+    def __init__(self):
+        super().__init__()
+        self.thread, self.closed = threading.get_ident(), False
+
+
+# A context copied into another thread (the sync-push Timer) carries the memo object along;
+# the owner/closed check keeps it from answering there or after its call has returned.
+_SKILL_OPERATION_MEMO = _ctxvars.ContextVar("skill_operation_memo", default=None)
+
+
+def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+    """``_discover_skill`` with a per-call memo: one public skill_manage call resolves a name in
+    preflight, ledger capture, the handler and post-capture. The memo is emptied on entering the
+    per-skill mutation lock (so nothing taken before the lock is reused under it), after the
+    handler (a mutation can change which copy wins for ANY name)
+    and never outlives the call, so no answer is reused across calls, threads or sessions."""
+    memo = _SKILL_OPERATION_MEMO.get()
+    if memo is None or memo.closed or memo.thread != threading.get_ident():
+        return _discover_skill(name)
+    if name not in memo:
+        memo[name] = _discover_skill(name)
+    return memo[name]
+
+
+def _clear_skill_memo() -> None:
+    if (memo := _SKILL_OPERATION_MEMO.get()) is not None:
+        memo.clear()
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -1067,6 +1100,25 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _maybe_debounced_sync_push(name)
 
 
+def _per_call_skill_memo(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def bound(*args, **kwargs):
+        if kwargs.get("operations") is not None:
+            return fn(*args, **kwargs)  # each batch op is its own flat call with its own memo
+        memo = _OperationMemo()
+        token = _SKILL_OPERATION_MEMO.set(memo)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            memo.closed = True
+            memo.clear()
+            _SKILL_OPERATION_MEMO.reset(token)
+    return bound
+
+
+@_per_call_skill_memo
 def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
@@ -1097,6 +1149,7 @@ def skill_manage(
     # to a helper: guards, ledger capture, patch matching, validation, rollback,
     # and the atomic replacement all belong to the same ownership window.
     with _skill_mutation_lock(name):
+        _clear_skill_memo()  # never reuse an answer taken before the lock (the preflight's)
         # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
         # destroys the whole package (consolidation may have re-homed support files first), so
         # complete it from the newest curator backup or a restore is hollow.
@@ -1111,6 +1164,7 @@ def skill_manage(
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
             f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
         result = handler({"name": name, **args})
+        _clear_skill_memo()  # the handler may have mutated: post-capture rediscovers
         if isinstance(result, str):
             return result  # tool_error JSON for argument-shape problems (patch)
         if result.get("success"):

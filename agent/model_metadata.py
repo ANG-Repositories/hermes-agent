@@ -427,12 +427,13 @@ _BEDROCK_PROBE_FAILURE_TTL_SECONDS = 300.0
 _BEDROCK_PROBE_FAILURE_CACHE: Dict[tuple, float] = {}
 # Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
 # and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
-# Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
+# Generation-5 ids are listed explicitly (fable-5-2, fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
 # longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
 # An IMMUTABLE ((id, window), ...) tuple, not dict rows: it is the FALLBACK hermes-home's
 # scripts/anthropic-limits-render.py --check certifies against config/anthropic-limits.json, and a tuple
 # cannot be changed after this line (hermes-home#7860, Prism f-ce7cb29c7df69f55 / f-bbf4d7c761341baa).
 ANTHROPIC_CONTEXT_FALLBACK: Tuple[Tuple[str, int], ...] = (
+    ("claude-fable-5-2", 1000000),
     ("claude-fable-5-1", 1000000),
     ("claude-fable-5", 1000000),
     ("claude-fable", 1000000),
@@ -462,6 +463,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Codex-OAuth-only and listed so "gpt-5" (400k) doesn't win.
     "gpt-6-astra": 1050000,  # also matches -pro (verified live on OpenRouter)
     "gpt-6.1-sol": 1050000,  # -pro too (OpenAI model page + OpenRouter live 2026-09-29)
+    "gpt-6.1-terra": 1050000,  # -pro too (models.dev limit.context 1,050,000; OpenRouter lists -pro, 2026-11-06)
     "gpt-6-sol": 1050000, "gpt-6-luna": 1050000,  # -pro too (OpenRouter live 2026-09-22)
     "gpt-5.6-luna": 1050000, "gpt-5.6-terra": 1050000, "gpt-5.6-sol": 1050000, "gpt-5.5": 1050000,
     "gpt-5.4-nano": 400000, "gpt-5.4-mini": 400000, "gpt-5.4": 1050000,
@@ -2030,6 +2032,8 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: Any) -> 
 # slugs). Fallback when the live probe fails; longest-key-first. gpt-5.3-codex-spark is listed so "gpt-5.3-codex" doesn't win.
 _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-6-astra": 272_000, "gpt-6.1-sol": 272_000, "gpt-6-sol": 272_000, "gpt-6-luna": 272_000,
+    # gpt-6.1-terra: the codex-sub catalog advertises context_window=500,000 (2026-11-06, client 0.162.1).
+    "gpt-6.1-terra": 500_000,
     "gpt-5.1-codex-max": 272_000, "gpt-5.1-codex-mini": 272_000, "gpt-5.3-codex": 272_000,
     "gpt-5.3-codex-spark": 128_000, "gpt-5.2-codex": 272_000, "gpt-5.4-mini": 272_000,
     "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000, "gpt-daybreak-blue-latest": 272_000,
@@ -2062,8 +2066,16 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     # 922,000 hard input ceiling (models.dev: 1,050,000 = 922,000 input + 128,000 output). 900K keeps
     # the >=11K margin rule. EXACT: no prefix, so -pro/-fast/other 6.1 descendants never inherit it.
     "gpt-6.1-sol": 900_000,
+    # GPT-6.1 Terra: codex-sub catalog context_window=500,000, max_context_window=872,000 (2026-11-06,
+    # client_version 0.162.1, all 3 accounts). Live request on chatgpt.com/backend-api/codex/responses:
+    # 832,408 input tokens accepted, needle recalled. EXACT, like the other gpt-6 tiers.
+    "gpt-6.1-terra": 872_000,
 }
 _CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000  # the only advertised value the bump may override
+# Slugs whose catalog advertises a NON-272K value that is still below the verified cap. Measured
+# 2026-11-06 (client_version 0.162.1): gpt-6.1-terra and gpt-6.1-sol both advertise 500K with
+# max_context_window 872K (terra accepted an 832,408-token request). The bump may override exactly that value.
+_CODEX_OAUTH_STALE_ADVERTISED_EXACT: Dict[str, int] = {"gpt-6.1-terra": 500_000, "gpt-6.1-sol": 500_000}
 CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"  # picker-only opt-in suffix; never sent on the wire
 # The ONLY bases eligible for ``-900k``: routable, live-verified. No family prefixing (it would synthesize
 # dead ``-pro`` variants); dated snapshots of the routable 5.6 bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
@@ -2073,6 +2085,7 @@ _CODEX_900K_ELIGIBLE_BASES = frozenset({
     *_CODEX_900K_SNAPSHOT_BASES, "gpt-5.4", "gpt-daybreak-blue-latest",
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",  # measured max_context_window 872,000
     "gpt-6.1-sol",  # measured ceiling 922,000 (2026-09-30 bisection)
+    "gpt-6.1-terra",  # catalog max_context_window 872,000; 832,408-token request OK (2026-11-06)
 })
 _CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -2360,7 +2373,8 @@ def _resolve_codex_oauth_context_length_with_source(model: str, access_token: st
         ``model.codex_context_policy`` (bare + ``-900k`` under ``large``; ``-900k`` only under
         ``advertised``), never above the catalog's own ``max_context_window`` when it publishes one (#105443)."""
         bumped = _verified_codex_ctx_for_slug(model_bare)
-        if bumped is not None and ctx == _CODEX_OAUTH_STALE_ADVERTISED_CTX:
+        stale = _CODEX_OAUTH_STALE_ADVERTISED_EXACT.get(lookup_bare.lower(), _CODEX_OAUTH_STALE_ADVERTISED_CTX)
+        if bumped is not None and ctx in (_CODEX_OAUTH_STALE_ADVERTISED_CTX, stale):
             bumped = min(bumped, catalog_max) if catalog_max else bumped
             logger.debug("Codex OAuth context for %s: advertised %d raised to live-verified %d", model_bare, ctx, bumped)
             return bumped, source

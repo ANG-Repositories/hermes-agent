@@ -187,6 +187,10 @@ A goal can carry its own interval (`GoalManager.set_checkin_minutes(n)`; `0` = o
 
 After a turn the user did not author (a kanban wake, a page, a worker result), the gateway queues the next continuation only if that turn had a side effect: at least one write-class tool call (a kanban create/comment/complete/block, a file write, a `git commit`/`push`, a `gh` mutation, a cron change, an unknown tool or shell command). A turn whose tool calls were all reads (`kanban_show`, `read_file`, `git status`, `gh pr view`, a `gh api` GET) or that made none (a NO_REPLY) still gets the judge's done/blocked/wait/budget verdicts, but no continuation; the idle check-in above is the next nudge, and the turn does not count against `max_turns`. A message from you always continues, and so does the goal's own continuation or check-in turn (the hold is for wakes and pages, not the loop's heartbeat). A held turn is never the last word: when no idle check-in can follow it (`checkin_minutes` 0 in config or on the goal, or the check-in budget spent), the continuation is queued anyway and the gateway log says `held: read-only turn, no check-in configured`. A turn during which the session was compacted counts as unknown and always continues, because the compacted transcript no longer shows where the turn began. The table lives in `hermes_cli/goal_turn_effects.py::TOOL_EFFECTS`; `goals.nudge_on_read_only_turns: true` restores a continuation after every judged-continue turn.
 
+### Failed turns pause the goal (gateway)
+
+When a gateway turn raises before the agent can answer (for example the model client cannot be built because a provider SDK is missing), the judge never sees the error notice. The goal pauses with reason `turn failed (<ErrorType>); fix the error, then /goal resume` and a `⏸ Goal paused — this turn failed …` notice follows the usual error reply. No synthetic continuation is queued, so a deterministic failure cannot turn into a stream of error messages. The pause is durable: fix the error, then `/goal resume` (or just send a message to retry the turn by hand).
+
 ### No-progress stop
 
 If `goals.no_progress_turns` (4) judged-continue turns in a row make no tool call (the agent is only answering the judge), the goal pauses with a `⏸ Goal paused — … without doing anything` notice. `/goal resume` continues it; `0` disables the check.
@@ -250,12 +254,18 @@ goals:
   # raise it for long-running refactors.
   max_turns: 20
   # Idle wakes for a quiet goal: first check-in after N minutes, then 2x, 4x.
-  # 0 turns idle wakes (and timed-park resumes) off in the gateway.
+  # 0 turns ordinary idle wakes (and timed-park resumes) off in the gateway.
+  # Incomplete-turn retry timers still wake at their deadline.
   checkin_minutes: 30
   # Check-ins between real events (a user message or a worker/process result).
   max_idle_checkins: 3
   # Pause after this many judged-continue turns in a row with no tool call (0 = off).
   no_progress_turns: 4
+  # Gateway: park after consecutive incomplete agent turns (minimum 1).
+  # Retry after 60s, then double up to 30 min; one notice per failure streak.
+  # A completed turn or human message resets the streak, not unrelated wait barriers.
+  # Failed turns skip gates/judging; resumable iteration-limit handoffs still count.
+  max_incomplete_turns: 3
   # true = queue a continuation even after a read-only / no-tool turn nobody asked for.
   nudge_on_read_only_turns: false
 ```

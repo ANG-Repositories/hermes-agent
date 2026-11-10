@@ -33,6 +33,29 @@ def _path_key(path: Path | str | None) -> str:
     """
     return unicodedata.normalize("NFC", str(path)) if path is not None else ""
 
+RUNTIME_TREE_WORKSPACE_ERROR = (
+    "workspace under the live runtime tree; use ~/.hermes/hermes-agent (fork/main)"
+)
+
+
+def refuse_runtime_tree_workspace(kind: Optional[str], path: Path | str | None) -> None:
+    """Refuse a ``dir``/``worktree`` workspace at or under the live runtime tree.
+
+    ``<hermes-root>/runtime/hermes-agent`` is the import path of every running
+    gateway; a worktree anchored there shares its refs and index dir, and a
+    worker cwd inside it is one mistake from a write into live code (10-16,
+    t_3b6e4e6b / t_91b6a4c4). Realpaths on both sides so a symlink cannot alias in.
+    """
+    if kind not in ("dir", "worktree") or not path:
+        return
+    from hermes_constants import get_default_hermes_root
+
+    runtime = (get_default_hermes_root() / "runtime" / "hermes-agent").resolve(strict=False)
+    target = Path(path).expanduser().resolve(strict=False)
+    if target == runtime or runtime in target.parents:
+        raise ValueError(RUNTIME_TREE_WORKSPACE_ERROR)
+
+
 def canon(path: Path | str) -> str:
     """THE canonical key of a workspace path (spec §2.4.1): ``~`` expanded,
     resolved without requiring existence, NFC. ``~/x`` on an unspawned card
@@ -789,7 +812,7 @@ def _maybe_emit_scratch_tip(
 # ---------------------------------------------------------------------------
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
-    out = _kb._git_out(path, "rev-parse", "--show-toplevel")
+    out = _kb._git_out(path, "rev-parse", "--show-toplevel", workspace_probe=True)
     if out is None:
         return None
     try:
@@ -936,6 +959,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 "--workspace worktree:<absolute-repo-path>."
             )
         anchor = Path(board_default).expanduser()
+        refuse_runtime_tree_workspace("worktree", anchor)
         if not anchor.is_absolute():
             raise ValueError(
                 f"board {board_slug!r} default_workdir {board_default!r} is not "
@@ -950,6 +974,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         return _anchored_worktree(repo_root, task.id, branch_name)
 
     requested = Path(task.workspace_path).expanduser()
+    refuse_runtime_tree_workspace("worktree", requested)
     if not requested.is_absolute():
         raise ValueError(
             f"task {task.id} has non-absolute worktree path "
@@ -1043,6 +1068,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         if not task.workspace_path:
             raise ValueError(f"task {task.id} has workspace_kind=dir but no workspace_path")
         p = Path(task.workspace_path).expanduser()
+        refuse_runtime_tree_workspace("dir", p)
         if not p.is_absolute():
             raise ValueError(
                 f"task {task.id} has non-absolute workspace_path "
@@ -1055,19 +1081,29 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     return p
 
 
-def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str) -> None:
+def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str,
+                     run_id: Optional[int] = None) -> None:
+    """``run_id``: write only while that run still owns the card (same transaction), else raise ClaimLost."""
     with _kb.write_txn(conn):
-        conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
+        if run_id is None:
+            conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
+            return
+        cur = conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ? AND status = 'running' "
+                           "AND current_run_id = ?", (value, task_id, int(run_id)))
+        if cur.rowcount == 0:
+            raise _kb.ClaimLost(f"{task_id}: run {run_id} no longer owns the card")
 
 
-def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
-    _set_task_column(conn, task_id, "workspace_path", str(path))
+def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str, *,
+                       run_id: Optional[int] = None) -> None:
+    _set_task_column(conn, task_id, "workspace_path", str(path), run_id)
     from hermes_cli.kanban_survivor import record_baseline
-    record_baseline(conn, task_id, path)
+    record_baseline(conn, task_id, path, run_id=run_id)   # fenced too: the lock is handed back (t_89e3e083)
 
 
-def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
-    _set_task_column(conn, task_id, "branch_name", str(branch_name))
+def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str, *,
+                    run_id: Optional[int] = None) -> None:
+    _set_task_column(conn, task_id, "branch_name", str(branch_name), run_id)
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.

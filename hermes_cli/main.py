@@ -3712,7 +3712,7 @@ def main():
 
     # Dependency recovery already ran before imports. Report any fleet restart
     # still owed by a previous update without restarting services here.
-    if "update" not in sys.argv[1:]:
+    if "update" not in sys.argv[1:] and _first_positional_argv() != "kanban":
         try:
             from hermes_cli.update_cmd_fleet import _warn_pending_fleet_restart_on_startup
 
@@ -3720,7 +3720,7 @@ def main():
         except Exception:
             pass
 
-    if _first_positional_argv() != "update":
+    if _first_positional_argv() not in {"update", "kanban"}:
         from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
         from pm.paths import install_root
         maybe_run_boot_bootstrap(install_root())

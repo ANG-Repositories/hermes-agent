@@ -129,6 +129,7 @@ tick, then ``record_spawns(n, now=)`` with what was actually spawned.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -364,6 +365,19 @@ class LoadGate:
                   "procs": self.procs, "maxproc": self.proc_limit, **sample_psi()}
         leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
                   for ts, n in self._ramp for _ in range(int(n))]
+        try:
+            # t_02aa6d86 (doctrine rule 15): every OTHER consumer's lease on this host (Prism, test-gate, CI) is load
+            # this gate's ramp never saw; an unreadable shared ledger fails closed, never as "nothing booked"
+            # Lease.at is wall-clock; ``now`` is the gate's clock (time.monotonic() in admit_now): re-date each lease by
+            # its age, as GateTickBuilder.seed_out_of_tick does, or a settled lease reads newer than the sample and is
+            # counted on top of the cpu_busy that already holds it (Prism c-79e25e334a28b343)
+            wall = time.time()
+            leases += [dataclasses.replace(le, at=now - max(0.0, wall - le.at)) for le in shared_leases(ctx["host"])]
+        except Exception as exc:
+            why = f"utilization: shared ledger unreadable ({type(exc).__name__}: {exc}); refusing, fail closed"
+            self.state, self.allowance, self.last_reason = "saturated", 0, why
+            self.band, self.spill_reason = "spilling", "utilization"
+            return 0, why
         allowance, verdict = 0, None
         # the worker slice's own memory cap (Linux kanbanw.slice; None elsewhere = host axis only, Prism 616c5f0203bd)
         slice_mem = _ad.read_slice_memory(classes=(UTIL_CLASS,))
@@ -742,6 +756,26 @@ def sample_psi(root: str = "/proc/pressure") -> dict:
 UNIFIED_WORKLOAD = "kanban"
 
 
+def shared_leases(host: str, root=None, now: Optional[float] = None) -> list:
+    """The shared reservation ledger's live leases on ``host`` booked by every consumer BUT kanban (t_02aa6d86,
+    doctrine rule 15): a Prism review, a test-gate run or a CI runner admitted on this host is load the gate must
+    count before its sample shows it. Kanban's own rows are left out: the gate's ramp already carries every local
+    kanban start (its own spawns plus GateTickBuilder.seed_out_of_tick), so they would be booked twice. A missing
+    ledger is empty; an unreadable one raises (the caller fails closed)."""
+    from hermes_cli.fleet_placement import placement as _pl
+
+    base = Path(root) if root is not None else _pl.fleet_root()
+    rpath = base / _pl.RESERVATIONS_REL
+    if not rpath.exists():
+        return []
+    try:
+        table = _pl.load_hosts(base / _pl.TABLE_REL)
+    except Exception:            # no table: the ledger's own host names, matched as written
+        table = None
+    return [le for le in _pl.ledger_leases(rpath, now=now, table=table)
+            if le.host == host and not str(le.job_class).startswith(UNIFIED_WORKLOAD)]
+
+
 def unified_admit(env: Optional[dict] = None) -> bool:
     """KANBAN_UNIFIED_ADMIT (t_3694ab3c): "0" = today's rule (admission.admit, the caller's own line); anything else =
     admission.admit_class("kanban") with the fleet priority + queued demand (admission_demand.unified)."""
@@ -770,25 +804,60 @@ def unified_inputs(host: str) -> "tuple[list, Any]":
 
 
 def publish_ready_demand(queued: int, root=None) -> Optional[str]:
-    """Kanban's queue for the ONE rule (t_3694ab3c): var/placement/demand/kanban.json, hosts null (a portable card
-    may run on any pool host or here). Unit = the table's kanban footprint (the prior work_estimate seeds from).
-    A demand file is advisory, so a failed write never stops the tick: it returns the error text (None = written)
-    for the caller to log, and the next tick writes again (Prism 8397e82995e1)."""
+    """Kanban's queue for the ONE rule (t_3694ab3c), published through allocd's pair door as kanban@<host> for
+    EVERY table host (hermes-home #9223 deleted the local writer): a portable card may run on any of them, which the
+    old ``hosts: null`` file said and the door's per-pair ``hosts`` union now says. Unit = the table's kanban
+    footprint (the prior work_estimate seeds from). Demand is advisory, so a failed publish never stops the tick: it
+    returns the error text (None = published) for the caller to log, and the next tick publishes again (Prism
+    8397e82995e1).
+
+    Fire-and-forget (fault-taxonomy ruling 2026-11-05): the whole call spends at most PUBLISH_BUDGET_S across every
+    host (a host left when the budget is gone is skipped, not waited for), never raises, and is counted in
+    PUBLISH_STATS (ok / failed / skipped hosts)."""
+    try:
+        return _publish_ready_demand(queued, root)
+    except Exception as exc:  # advisory: nothing here may fail the tick
+        PUBLISH_STATS["failed"] += 1
+        return f"{type(exc).__name__}: {exc}"
+
+
+PUBLISH_BUDGET_S = 1.0
+PUBLISH_STATS = {"ok": 0, "failed": 0, "skipped": 0}
+
+
+def _publish_ready_demand(queued, root):
+    import time as _time
+    from hermes_cli.fleet_placement import alloc_client as _ac
     from hermes_cli.fleet_placement import admission as _ad
-    from hermes_cli.fleet_placement import admission_demand as _dmd
     from hermes_cli.fleet_placement import placement as _pl
 
+    from hermes_cli import kanban_priority_door as door
+    if door.enabled():
+        return None  # routed publisher owns host-specific waiting and verdicts
     unit = _ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior")
     try:
         table = _pl.load_hosts(None if root is None else Path(root) / _pl.TABLE_REL)
         unit = _pl.need_of(table.footprint(UNIFIED_WORKLOAD))
-    except Exception:
-        pass
-    try:
-        _dmd.publish(UNIFIED_WORKLOAD, int(queued), unit, root=root)
     except Exception as exc:
+        PUBLISH_STATS["failed"] += 1
         return f"{type(exc).__name__}: {exc}"
-    return None
+    errors = []
+    deadline = _time.monotonic() + PUBLISH_BUDGET_S
+    for hid in sorted(table.hosts):
+        left = deadline - _time.monotonic()
+        if left <= 0.01:
+            PUBLISH_STATS["skipped"] += 1
+            errors.append(f"{hid}: skipped (publish budget {PUBLISH_BUDGET_S} s spent)")
+            continue
+        try:
+            _ac.publish_queue(UNIFIED_WORKLOAD, hid, int(queued),
+                              {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib},
+                              unified=unified_admit(), timeout=left)
+            PUBLISH_STATS["ok"] += 1
+        except Exception as exc:
+            PUBLISH_STATS["failed"] += 1
+            errors.append(f"{hid}: {type(exc).__name__}: {exc}")
+    return "; ".join(errors) or None
 
 
 def utilization_context() -> dict:

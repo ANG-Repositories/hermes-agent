@@ -105,6 +105,8 @@ def _kill_update_at(sb: I.Sandbox, phase: str) -> dict:
             "pending_at_kill": P.pending_marker(sb).exists(), "log": log.read_text(errors="replace")}
 
 
+@pytest.mark.slow_test(170, reason="a killed dependency update plus its recovery in the call: [stage] 133.5 s, "
+                                  "[publish] 79.4 s on ci-priv (workers=6), mirror run 41587306281")
 @pytest.mark.parametrize("phase", ["stage", "publish"])
 def test_sigkill_mid_dependency_update_recovers(home, provider, phase):
     sb = home["sb"]

@@ -55,7 +55,8 @@ def _args(**kw) -> argparse.Namespace:
 
 
 def _scheduled(conn, title="gated", parked_seconds_ago: int = 0) -> str:
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn, title=title, assignee="worker",
+                         body="unblock_when: event:readback")
     assert kb.schedule_task(conn, tid, reason="wait for #978 readback")
     if parked_seconds_ago:
         ts = int(time.time()) - parked_seconds_ago
@@ -114,7 +115,8 @@ def test_timed_scheduled_card_is_not_reported(kanban_home: Path) -> None:
 def test_lint_uses_latest_park_not_card_age(kanban_home: Path) -> None:
     """A card created long ago but parked 1h ago is fresh."""
     with kb.connect_closing() as conn:
-        tid = kb.create_task(conn, title="old card", assignee="worker")
+        tid = kb.create_task(conn, title="old card", assignee="worker",
+                             body="unblock_when: event:readback")
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET created_at=? WHERE id=?",
@@ -166,7 +168,8 @@ def test_future_wake_holds_until_due(kanban_home: Path) -> None:
 def test_wake_regates_on_open_parents(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker",
+                               body="unblock_when: event:readback")
         assert kb.schedule_task(conn, child, reason="x")
         assert kb.set_schedule_wake(conn, child, wake_at=int(time.time()), actor="op")[0]
         assert kb.wake_due_scheduled(conn) == [child]
@@ -205,7 +208,8 @@ def test_schedule_clears_stale_rate_limit_stamp(kanban_home: Path) -> None:
     ``schedule_elapsed`` event on the very next dispatcher tick.
     """
     with kb.connect_closing() as conn:
-        tid = kb.create_task(conn, title="rate-limited earlier", assignee="worker")
+        tid = kb.create_task(conn, title="rate-limited earlier", assignee="worker",
+                             body="unblock_when: event:readback")
         with kb.write_txn(conn):
             # What the rate-limited / infra-unavailable exit path leaves behind.
             conn.execute(

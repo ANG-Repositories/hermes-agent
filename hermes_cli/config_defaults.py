@@ -1003,7 +1003,7 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
-        "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
+        "goal_judge": _aux(60, fallback_chain=[], total_timeout=120),  # verdict chain; drafting uses ordinary aux routing
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
         "curator": _aux(600),
@@ -1656,6 +1656,9 @@ DEFAULT_CONFIG = {
         # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
         # Default "kanban" since option C P3 (t_3646c28e: drills + daedalus canary).
         "background_runtime": "kanban",
+        # A kanban-eligible unit whose card cannot spawn: "detached" runs it as a detached child process
+        # (survives a restart; never a gateway thread). "in_process" is the kill switch (t_49e02567).
+        "background_kanban_fallback": "detached",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -1672,6 +1675,9 @@ DEFAULT_CONFIG = {
         # chat) and that the user did not author queues no continuation; the idle check-in is the
         # next nudge. True restores a continuation after every judged-continue turn.
         "nudge_on_read_only_turns": False,
+        # Gateway: once an hour, an ACTIVE goal/loop whose session no routed key holds and that
+        # was idle this many days is retired as ``orphaned`` (/goal resume restores). 0 = off.
+        "orphan_gc_days": 7,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
@@ -2232,6 +2238,7 @@ DEFAULT_CONFIG = {
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "workspaces_root": None,
         "workspaces_root_require_mount": False,
+        "studio_pin_requires_reason": "notice",
         # Let the dispatcher itself clear a scratch card stranded by mount
         # loss (persisted path gone, root mounted + writable again) when the
         # lost tree provably held nothing: no worker ever spawned into it, or
@@ -2439,6 +2446,10 @@ DEFAULT_CONFIG = {
         # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
         # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).
         "admission": "legacy",
+        # A tick hands the board's dispatch lock back while it resolves workspaces and spawns, so
+        # `kanban admit` / a second dispatcher are not locked out for minutes (t_f60f502f). false =
+        # the tick holds the lock for its whole run, as before.
+        "dispatch": {"narrow_lock": True},
         "dispatch_load_gate": {
             "enabled": True,
             # A spawn younger than ramp_seconds is a lease candidate (admission settles it after
@@ -2632,7 +2643,7 @@ DEFAULT_CONFIG = {
         # session: notify+wake (Ace 2026-10-03, t_74bf5296). One waker per
         # card is enforced in the store; false = notify-only.
         "auto_subscribe_wake": True,
-        "auto_subscribe_boomerang": True,  # operator auto-subscriptions use a child by default
+        "auto_subscribe_boomerang": True,  # every new card's boomerang_wake level unless set explicitly
         # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
         # host_axis cpu (default): downgrade at cpu_pause (0.90) busy. host_axis
         # load1 (kill switch): the pause_above / resume_below band set HERE.

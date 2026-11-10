@@ -57,6 +57,21 @@
   }
  ],
  "sites": {
+  "hermes_cli/kanban_worktree_port.py::read_overrides::fold::slug::out[slug.lower()] = (val.get(\"*\"), {h.lower(): p for h, p in val.items() if h != \"*\"})": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; mirror override keys intentionally share GitHub identity semantics.",
+   "where": "hermes_cli/kanban_worktree_port.py:165 read_overrides"
+  },
+  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::if slug.lower() in exclude:": {
+   "verdict": "kept",
+   "why": "GitHub repository exclusions must cover case aliases of the same repository, not task or session identifiers.",
+   "where": "hermes_cli/kanban_worktree_port.py:178 derived_route"
+  },
+  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::default, per_host = paths.get(slug.lower(), (None, {}))": {
+   "verdict": "kept",
+   "why": "GitHub repository names are case-insensitive; match the normalized override map.",
+   "where": "hermes_cli/kanban_worktree_port.py:185 derived_route"
+  },
   "hermes_cli/kanban.py::_cmd_set_model::fold::model::clearing = args.model is None or str(args.model).lower() in {\"none\", \"-\", \"null\", \"\"}": {
    "verdict": "kept",
    "why": "sentinel-word detection on CLI input (`none`/`null`/`-` clears the pin); the model id itself is stored unfolded.",
@@ -547,10 +562,15 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_worktree_port.py:146 port_for"
   },
-  "hermes_cli/kanban_worktree_port.py::read_mirrors::fold::slug::out[slug.lower()] = (mirror, hs)": {
+  "hermes_cli/kanban_worktree_port.py::mint_rewrite::fold::slug::row = read_mirrors(fleet_dir).get(slug.lower()) if slug else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. Same lookup as port_for (t_e604c0f9 kanban create rewrite).",
+   "where": "hermes_cli/kanban_worktree_port.py:234 mint_rewrite"
+  },
+  "hermes_cli/kanban_worktree_port.py::read_mirrors::fold::slug::out[slug.lower()] = (mirror, hs, {h.lower(): p for h, p in per_host.items()})": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
-   "where": "hermes_cli/kanban_worktree_port.py:73 read_mirrors"
+   "where": "hermes_cli/kanban_worktree_port.py:81 read_mirrors"
   },
   "hermes_cli/kanban_db.py::complete_task::fold::repo::own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(": {
    "verdict": "kept",
@@ -596,6 +616,16 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and worker_draft_repos() folds its set the same way, so the folded repo IS the canonical key; byte-exact would miss a worker-draft repo written in another case.",
    "where": "hermes_cli/kanban_pr_freshness.py:309 _owns_draft"
+  },
+  "hermes_cli/kanban_pr_freshness.py::_unread_refuses::fold::repo::if ref.repo.casefold() not in worker_draft_repos():": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive, and worker_draft_repos() casefolds its set, so the casefolded repo is the canonical key (same as _owns_draft). A byte-exact compare would let an unreadable PR in a listed repo written in another case (o/r vs O/R) fail open, which is the hermes-home#8231 draft-to-review hole this refusal closes.",
+   "where": "hermes_cli/kanban_pr_freshness.py:457 _unread_refuses (t_5c6c67c5)"
+  },
+  "hermes_cli/kanban_round_draft.py::draft_at_round_start::fold::repo::if ref.repo.casefold() not in repos:": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and repos is worker_draft_repos(), folded the same way (same comparand as _owns_draft), so the folded repo IS the canonical key; byte-exact would skip a worker-draft repo written in another case.",
+   "where": "hermes_cli/kanban_round_draft.py:136 draft_at_round_start (round-start draft, t_c418eebc)"
   },
   "hermes_cli/kanban_sign_grants.py::operator_rows_with_live_grants::sql::author LIKE::for r in conn.execute(f\"SELECT {sel} FROM task_comments WHERE task_id = ? AND author LIKE ? ORDER BY id\",": {
    "verdict": "kept",

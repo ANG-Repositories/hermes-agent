@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
-DEFAULT_FAILURE_LIMIT = 2
+from hermes_cli.kanban_dispatch_defaults import DEFAULT_FAILURE_LIMIT
 
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -319,6 +319,12 @@ class DispatchResult:
     rows_routed: int = 0
     """Ready rows this tick's routing/spawn loop considered (pool plan or not).
     Read by the gateway's tick series (``gate-ticks.jsonl``), never by dispatch."""
+    route_ms: float = 0.0
+    """Wall ms of this tick's routing pass over the ready rows (t_915b8d2d; gate-ticks.jsonl)."""
+    carry_scan_ms: float = 0.0
+    """Wall ms of carry size walks inside ``route_ms`` (bounded by ``CARRY_TICK_SCAN_SECONDS``)."""
+    carry_scans_deferred: int = 0
+    """local_files rows whose carry walk was left to a later tick because the tick budget ran out."""
     portable_waiting: int = 0
     """Rows routed ``portable`` still in ``placement_waits`` at the end of the
     ready section (the I-0 query's input, spec v0.3 §3.6)."""
@@ -433,6 +439,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    lock_held_s: Optional[float] = None
+    """Seconds this tick held the board's dispatch lock (t_f60f502f); None when it never held it."""
+    tick_phases_s: dict = field(default_factory=dict)
+    """Wall seconds per tick phase (``TickLockWindow.mark``); ``<phase>.unlocked`` = spent with the
+    lock handed back (``kanban.dispatch.narrow_lock``)."""
     budget_paused: bool = False
     """True when this board spawned nothing because its rolling-window worker
     spend has reached ``kanban.budget.usd_per_24h``. Reclaim / promotion /
@@ -3044,7 +3055,7 @@ def _host_fault(exc: BaseException) -> Optional[dict]:
     so the card spills on the next tick instead of waiting."""
     from tools.process_registry import RestartSafeScopeUnavailable
 
-    if isinstance(exc, RestartSafeScopeUnavailable):
+    if isinstance(exc, (RestartSafeScopeUnavailable, LocalLedgerUnavailable)):
         return {}
     if isinstance(exc, _kb._kwh.RemoteWorkspaceUnavailable):
         _kb._kwh.note_board_fault(exc.host, exc.board, str(exc))
@@ -3383,6 +3394,29 @@ def _set_worker_pid(
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool
     with _kbc.write_txn(conn):
+        launching_run_id = run_id if run_id is not None else _kb._current_run_id(conn, task_id)
+        # Correlate even a late start with its launching run, never its successor.
+        from hermes_cli.kanban_priority_door import EVENT
+        authorization = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+            (task_id, launching_run_id, EVENT)).fetchone()
+        if authorization is not None:
+            import hashlib
+            grant = json.loads(authorization[0])
+            route = (placement or {}).get("route_class")
+            entry = (placement or {}).get("entry")
+            if entry == "spawn_now":
+                boundary = "forced"
+            elif route == "pin":
+                boundary = "pinned"
+            elif route == "local":
+                boundary = "local"
+            else:
+                boundary = "dispatch"
+            source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+            spawn_payload.update({k: grant[k] for k in ("host", "unit_id", "reservation_id")})
+            spawn_payload.update(consumer="kanban", process_id=int(pid), at=time.time(),
+                                 boundary=boundary, source_ref=f"sha256:{source}:_set_worker_pid")
         if run_id is not None:
             held = conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
@@ -4186,9 +4220,11 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    _prefetch_t0 = time.monotonic()
     pr_gate_prefetch = _kb._prefetch_pr_gates_for_tick(conn, dry_run=dry_run)
     if not dry_run:
         _release_after_merge_edges(conn)
+    _prefetch_s = time.monotonic() - _prefetch_t0
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
@@ -4226,6 +4262,8 @@ def dispatch_once(
             )
             _kb._log.warning("%s (board=%s)", _kb.format_dispatch_lock_skip(result.lock_holder), db_path)
         else:
+            window = _kbc.TickLockWindow(db_path, enabled=narrow_lock_enabled())
+            window.phases["pr_gate_prefetch.unlocked"] = _prefetch_s   # before the lock was taken
             result = _dispatch_once_locked(
                 conn,
                 spawn_fn=spawn_fn,
@@ -4247,11 +4285,15 @@ def dispatch_once(
                 spillover=spillover,
                 max_new=max_new,
                 entry=entry,
+                lock_window=window,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
+            window.hold()
             _kbc._maybe_checkpoint_wal(conn, db_path)
+            window.mark("checkpoint")
+            _note_tick_lock(result, window, board=board, entry=entry)
     # Outside the dispatch lock: stop resources (VM/container/unit) whose card finished
     # (t_2df204e5). Only the tick that held the lock sweeps; release_finished claims each resource in a
     # write txn before stopping it, so an overlapping sweep never stops the same one twice.
@@ -4265,8 +4307,30 @@ def dispatch_once(
     return result
 
 
+def narrow_lock_enabled(kanban_cfg: Optional[dict] = None) -> bool:
+    """``kanban.dispatch.narrow_lock`` (default true, t_f60f502f): a tick hands the board lock back while it
+    resolves workspaces and spawns (:class:`TickLockWindow`). ``false`` = the tick holds it throughout, as
+    before. Read from the ROOT config, like the other board knobs."""
+    cfg = _root_kanban_cfg() if kanban_cfg is None else kanban_cfg
+    sec = cfg.get("dispatch") if isinstance(cfg, dict) else None
+    return not (isinstance(sec, dict) and sec.get("narrow_lock") is False)
+
+
+def _note_tick_lock(result: "DispatchResult", window, *, board: Optional[str], entry: str) -> None:
+    """Record and log how long this tick held the board lock, per phase (t_f60f502f)."""
+    result.lock_held_s = round(window.held_s(), 3)
+    result.tick_phases_s = {k: round(v, 3) for k, v in sorted(window.phases.items())}
+    _kb._log.info("kanban tick lock: board=%s entry=%s held=%.2fs windows=%d phases=%s",
+                  board or "default", entry, result.lock_held_s, window.windows, result.tick_phases_s)
+
+
 def _release_finished_resources(conn: sqlite3.Connection, board: Optional[str]) -> None:
     """Best-effort: a failing sweep is logged and retried next tick, never breaks dispatch."""
+    try:
+        from hermes_cli.kanban_priority_door import maintain
+        maintain(conn)
+    except Exception as exc:
+        _kb._log.warning("kanban door lifecycle sweep failed: %s", exc)
     try:
         from hermes_cli import kanban_resources
 
@@ -4292,6 +4356,51 @@ class _LaunchState:
     proc: Optional[subprocess.Popen] = None
 
 
+class LocalLedgerUnavailable(RuntimeError):
+    """A LOCAL start could not book its lease on the shared ledger (t_02aa6d86): the worker is not started. A host
+    fault (``_host_fault``), never charged to the card."""
+
+
+LOCAL_LEDGER_ENV = "KANBAN_LOCAL_LEDGER"
+
+
+def local_ledger_enabled(env=None) -> bool:
+    """``KANBAN_LOCAL_LEDGER`` (default on): "0" = a local start books nothing (the pre-t_02aa6d86 behaviour)."""
+    env = os.environ if env is None else env
+    return str(env.get(LOCAL_LEDGER_ENV, "1")).strip() != "0"
+
+
+def _book_local_start(conn: sqlite3.Connection, claimed: Task) -> Optional[str]:
+    """Doctrine rule 15 (t_02aa6d86): a start the Studio's own LoadGate admitted still books its lease on the shared
+    ledger BEFORE launch, so Prism / test-gate / allocd admissions on this host see it the same tick. The lease is a
+    ``local_admitted`` run event carrying the reservation: ``_end_run`` releases it and ``renew_running`` renews it,
+    exactly like a pool run's ``worker_placed`` row. No table / no ``local`` host = nothing booked (None). An
+    unreadable ledger or a failed event write raises LocalLedgerUnavailable: the worker does not start."""
+    from hermes_cli import kanban_priority_door as door
+    if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
+        raise door.DoorHeld("run already authorized; reconcile original start")
+    if not local_ledger_enabled():
+        return None
+    from hermes_cli import kanban_headroom as _kh
+    from hermes_cli.fleet_placement import placement as _placement
+    unit = f"{claimed.id}#{claimed.current_run_id}"
+    try:
+        rid = _kh.book_local(unit, _placement.Job(profile=claimed.assignee or None))
+    except _placement.PlacementError as exc:
+        raise LocalLedgerUnavailable(f"local start not booked on the shared ledger: {exc}") from exc
+    if rid is None:
+        return None
+    try:
+        with _kbc.write_txn(conn):
+            _kb._append_event(conn, claimed.id, _kh.LOCAL_ADMITTED_EVENT,
+                              {"host": _kh.LOCAL_HOST_ALIAS, "unit": unit, _kh.RESERVATION_KEY: rid},
+                              run_id=claimed.current_run_id)
+    except Exception as exc:
+        _kh.release_local(rid)          # no event = nothing would ever release the row before its TTL
+        raise LocalLedgerUnavailable(f"local start lease {rid} not recorded on the run: {exc}") from exc
+    return rid
+
+
 def _launch_claimed(
     conn: sqlite3.Connection,
     claimed: Task,
@@ -4305,6 +4414,7 @@ def _launch_claimed(
     placement_record: Callable[[], dict],
     state: _LaunchState,
     after_launch: Optional[Callable[[Optional[int]], None]] = None,
+    reservation_id: Optional[str] = None,
 ) -> str:
     """Launch one claimed card's worker: fence the run, spawn, stamp the pid
     with its ``spawned`` + ``placement`` events, fire the spawned hook.
@@ -4316,9 +4426,16 @@ def _launch_claimed(
     from hermes_cli.kanban_continuation import record_placement
     from hermes_cli import kanban_placement_reasons as _pr
 
+    from hermes_cli import kanban_priority_door as door
+    if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
+        raise door.DoorHeld("run already authorized; reconcile original start")
     if not record_placement(conn, claimed.id, claimed.current_run_id, host):
         return _LAUNCH_NOT_OWNED
-    pid = spawn(claimed, workspace, **spawn_kwargs)
+    if host is None:
+        reservation_id = _book_local_start(conn, claimed)
+    from hermes_cli.kanban_priority_door import spawn as _priority_spawn
+    pid = _priority_spawn(conn, claimed, workspace, host=host, spawn=spawn,
+                          spawn_kwargs=spawn_kwargs, state=state, reservation_id=reservation_id)
     state.launched, state.pid = True, pid
     if after_launch is not None:
         after_launch(pid)
@@ -4416,6 +4533,15 @@ class SpawnNowError(RuntimeError):
     """:func:`spawn_now` did not start a worker; the card's state says why."""
 
 
+class SpawnNowPaused(SpawnNowError):
+    """:func:`spawn_now` refused by a pause hold (a policy refusal, not a launch failure): the caller must not run
+    the unit some other way on the same held host (Prism 0f110d29ad76). ``reason`` is the ``pause_hold (...)`` text."""
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 _SPAWN_NOW_LOCK_WAIT_SECONDS = 30.0
 
 
@@ -4456,10 +4582,15 @@ def spawn_now(
 def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spawn_fn) -> int:
     from hermes_cli import kanban_pause_hold as _kph
 
+    # The immediate path always starts LOCALLY: the dispatcher's own host is the destination, so the same local
+    # fence as a tick's local start applies before any run opens (Prism b256ef26919e). Off under the kill switch.
+    _local_wait = _kph.local_destination_wait({})
+    if _local_wait is not None:
+        raise SpawnNowPaused(f"{task_id}: pause hold: {_local_wait}", _local_wait)
     try:
         claimed = _kb.claim_task(conn, task_id)
     except _kph.PauseHeld as exc:
-        raise SpawnNowError(f"{task_id}: pause hold: {exc.reason}") from exc
+        raise SpawnNowPaused(f"{task_id}: pause hold: {exc.reason}", str(exc.reason)) from exc
     if claimed is None:
         raise SpawnNowError(f"{task_id}: not claimable (not ready, or already claimed)")
     from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
@@ -4481,6 +4612,7 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
     state = _LaunchState()
     if _accepts_kw(spawn, "on_popen"):
         kwargs["on_popen"] = lambda proc: setattr(state, "proc", proc)
+    from hermes_cli.kanban_priority_door import DoorHeld, defer
     try:
         outcome = _launch_claimed(
             conn, claimed, str(workspace), board=board, spawn=spawn, spawn_kwargs=kwargs,
@@ -4490,6 +4622,9 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
                 placed_host=None, plan=None, entry="spawn_now", gate={}, take_refusal=None,
             ),
         )
+    except DoorHeld as exc:
+        defer(conn, claimed, exc)
+        raise SpawnNowError(f"{task_id}: {exc}") from exc
     except Exception as exc:
         # Failed after the process started (pid/placement write, or the spawner raising after
         # it handed over its Popen): stop it before the run is ended, so a reported failure
@@ -4533,145 +4668,6 @@ def _pause_held_at_claim(conn, result, exc) -> None:
                      exc.task_id)
     result.placement_waits[exc.task_id] = exc.reason
     _kph.record_refusal(conn, exc)
-
-
-def _dispatch_lane_task(
-    conn: sqlite3.Connection,
-    row: sqlite3.Row,
-    assignee: str,
-    result: "DispatchResult",
-    *,
-    lane: str,
-    dry_run: bool,
-    ttl_seconds: Optional[int],
-    board: Optional[str],
-    failure_limit: int,
-    spawn_fn,
-    per_profile_cap: Optional[int],
-    per_profile_running: dict[str, int],
-) -> bool:
-    """Guard, claim, resolve the workspace and spawn one ready/review row.
-    Returns True when a spawn slot was consumed (real or ``dry_run``); every
-    skip is recorded on ``result``.
-    """
-    task_id = row["id"]
-    # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
-    # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
-    # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
-    # it by assigning a profile, and health telemetry suppresses "stuck" for it.
-    profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
-        result.skipped_nonspawnable.append(task_id)
-        # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
-        # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
-        # condition never expires on its own, so write it once: a repeat only when something
-        # else happened on the card since (reassign, comment) — not one row per tick forever,
-        # and not one row per foreign home per tick on a shared board (#101015).
-        if not dry_run:
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
-                    _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
-        return False
-    # Per-profile cap: one profile's local model / API quota / browser pool
-    # must not be overwhelmed by a fan-out even with global headroom.
-    if per_profile_cap is not None:
-        current = per_profile_running.get(assignee, 0)
-        if current >= per_profile_cap:
-            result.skipped_per_profile_capped.append((task_id, assignee, current))
-            return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
-    if guard_reason is not None:
-        result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
-        if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
-        return False
-
-    def _count_spawn(name: str) -> None:
-        # Later rows in this tick respect the per-profile cap; subsequent
-        # ticks re-query from the DB.
-        if per_profile_cap is not None and name:
-            per_profile_running[name] = per_profile_running.get(name, 0) + 1
-
-    if dry_run:
-        result.spawned.append((task_id, assignee, ""))
-        _count_spawn(assignee)
-        return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    from hermes_cli import kanban_pause_hold as _kph
-    try:
-        claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
-    except _kph.PauseHeld as exc:
-        _pause_held_at_claim(conn, result, exc)
-        return False
-    if claimed is None:
-        return False
-    try:
-        resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
-        else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
-    except Exception as exc:
-        from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
-        if isinstance(exc, WorkspaceUnavailable):  # a hold, never a charged failure
-            _kb._release_claim_for_workspace_refusal(conn, claimed.id, result, str(exc))
-            return False
-        if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    try:
-        from hermes_cli.kanban_continuation import record_placement
-        if not record_placement(conn, claimed.id, claimed.current_run_id, None):
-            return False
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
-        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-        _count_spawn(claimed.assignee)
-        return True
-    except Exception as exc:
-        # The host refused the spawn (no restart-safe scope, no workspace
-        # mount): nothing about the card ran, so it must not spend the card's
-        # retry budget (#114720, t_9fb4d477).
-        host_fault = _host_fault(exc)
-        infrastructure = host_fault is not None
-        if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure, run_metadata_extra=host_fault or None,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
 
 
 def _apply_default_assignee(
@@ -4735,9 +4731,14 @@ def _reroute_placement_blocks(conn, result) -> None:
     that has the capability (t_a32116ec). Never breaks a tick."""
     try:
         from hermes_cli import kanban_placement_block as _kpb
+        from hermes_cli import kanban_host_capabilities as _khc
         from hermes_cli import kanban_worker_pool as _kwp
-        pool = _kwp.read_pool(_kb.kanban_home() / "fleet")
-        result.placement_rerouted, result.placement_unroutable = _kpb.reroute_placement_blocks(conn, pool)
+        fleet = _kb.kanban_home() / "fleet"
+        pool = _kwp.read_pool(fleet)
+        # t_388c4ab2: the Studio pin it writes must carry a requires: word this map's Studio row serves.
+        reasons = _kwp.studio_map_reasons(_khc.load_map(fleet))
+        result.placement_rerouted, result.placement_unroutable = _kpb.reroute_placement_blocks(
+            conn, pool, studio_reasons=reasons)
     except Exception:
         _kb._log.warning("kanban dispatch: placement-block re-route failed", exc_info=True)
 
@@ -4937,6 +4938,13 @@ def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
     return hist, ends
 
 
+# Hysteresis state for _record_placement_waits (t_dde97120): ``{task_id: wait key}`` of a return to an
+# already-seen reason observed ONCE. Written on the second consecutive sample. Process-local by design: a
+# restart costs one extra tick of latency, never a wrong row. Bounded by a crude clear.
+_WAIT_RETURN_PENDING: dict = {}
+_WAIT_RETURN_PENDING_MAX = 20000
+
+
 def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
                             reached=(), local_binding: Optional[dict] = None) -> None:
     """One ``placement_wait`` task_event per held ready card
@@ -4995,16 +5003,32 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
                 host = _pr.named_hosts(code, detail)
             key = (code, route, host, _pr.keyed_detail(code, detail))
             episode = [h for h in hist.get(tid, ()) if h[0] > ends.get(tid, 0)]
+            # t_dde97120: a pacing cap is not a verdict. Once the episode has a verdict row, a pacing hold
+            # writes nothing, and the dedup / flap comparison runs over verdict rows only.
+            verdicts = [h for h in episode if _wait_key(h[2])[0] not in _pr.PACING_CODES]
+            if code in _pr.PACING_CODES and verdicts:
+                _WAIT_RETURN_PENDING.pop(tid, None)
+                continue
+            episode = verdicts or episode
             since = now
             if episode:
                 last_id, last_at, last = episode[0]
                 fresh = now - last_at < window
                 if _wait_key(last) == key:
+                    _WAIT_RETURN_PENDING.pop(tid, None)
                     if fresh:
                         continue
                     since = int(last.get("since") or last_at or now)
                 elif fresh:
                     recent = [_wait_key(p) for _i, at, p in episode if now - at < window]
+                    if key in recent[1:] and _WAIT_RETURN_PENDING.get(tid) != key:
+                        # Hysteresis: a RETURN to a reason already seen this window needs two
+                        # consecutive samples; one alternating tick is not a state change.
+                        _WAIT_RETURN_PENDING[tid] = key
+                        if len(_WAIT_RETURN_PENDING) > _WAIT_RETURN_PENDING_MAX:
+                            _WAIT_RETURN_PENDING.clear()
+                        continue
+                    _WAIT_RETURN_PENDING.pop(tid, None)
                     if key in recent[1:]:
                         # A->B->A inside the window: one ``flapping`` row,
                         # then quiet until the window passes.
@@ -5210,6 +5234,29 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
     return _only, _job
 
 
+def _reroute_off_held_origin(conn, row, host: str, pause_cache: Optional[dict], *, dry_run: bool = False):
+    """Preserve a populated origin unless a verified transfer can replace it.
+
+    origin_route reaches here only for retained remote state. The ordinary
+    scratch allocator cannot carry that host's files; a local path/port check
+    would inspect the dispatcher's different filesystem. Until a source-aware
+    transfer exists, keep the origin and hold this card only. Empty origins
+    already fall through origin_route after positive state-loss proof.
+    """
+    from hermes_cli import kanban_pause_hold as _kph
+    cache = {} if pause_cache is None else pause_cache
+    if _kph.follows_origin() or not _kph.enabled():
+        return ("origin", host)
+    why = _kph.destination_wait(host, cache)
+    try:
+        pinned = _kph.pinned_to(row["body"], host, cache) if why else False
+    except Exception:
+        return "wait", f"continuity_hold (origin_host_paused:{host} pin_registry_unreadable)"
+    if why is None or pinned:
+        return ("origin", host)
+    return "wait", f"continuity_hold (origin_host_paused:{host} source_workspace_transfer_unavailable)"
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5222,7 +5269,10 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                binds: Optional[dict] = None,
                held: Optional[dict] = None,
                worktree_out: Optional[dict] = None,
-               board: Optional[str] = None) -> "tuple[str, Optional[str]]":
+               board: Optional[str] = None,
+               carry_out: Optional[dict] = None,
+               pause_cache: Optional[dict] = None,
+               carry_budget=None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5252,6 +5302,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         states=getattr(plan, "continuation_states", {}), caps=caps,
         dry_run=getattr(plan, "continuation_dry_run", False),
     )
+    if _origin is not None and _origin[0] == "origin":
+        _origin = _reroute_off_held_origin(conn, row, _origin[1], pause_cache,
+                                           dry_run=getattr(plan, "continuation_dry_run", False))
     if _origin is not None:
         return _origin
 
@@ -5277,6 +5330,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _ported = _kwt.ported_host(conn, row["id"], row["workspace_path"])
         if _ported:
             bind = (_kwt.PORT_BIND_RULE, row["id"], _ported)
+        else:
+            # A carried local_files card's real workspace is the copy on the host it was carried to
+            # (t_e604c0f9, Prism 86a85c6c299a / 6c03238719d2): every rerun binds there, whatever
+            # placement.continuation or the host_preference switch say. The Studio original is stale from the
+            # carry on: no local run against it, no second carry over the remote work; an absent host waits.
+            _carried = _kb._kwh.carried_host(conn, row["id"], row["workspace_path"])
+            if _carried:
+                bind = (_kb._kwh.CARRY_BIND_RULE, row["id"], _carried)
     # An unassigned card is routed as the assignee the loop will give it.
     assignee = row["assignee"] or default_assignee
     allowlisted = bool(assignee) and assignee in tuple(plan.config.profiles or ())
@@ -5291,16 +5352,38 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
-    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or (),
-                                    getattr(plan.config, "pin_aliases", None))
+    # Studio last resort (t_e604c0f9 on top of t_c2fce87e's host_preference switch: fleet/placement-policy.json
+    # host_preference.consumers.kanban "on" + mac-studio in last_resort; off/absent = the old rules): a bare
+    # `host: studio` with no requires: reason the Studio serves is dropped, and local_files is continuity only.
+    _fleet_dir = _kb.kanban_home() / "fleet"
+    last_resort = _studio_last_resort(_fleet_dir)
+    studio_reasons = _kwp.studio_pin_reasons(caps) if last_resort else None
+    if _kwp.skills_need_studio(skills, getattr(caps, "cmap", None), studio_reasons):
+        # An attached skill needs a capability the Studio serves (identity-only docker included): its
+        # `host: studio` pin is justified, in this check and in portable() alike (Prism f5bbe97bc028).
+        studio_reasons = None
+    pin, ignored, pin_dropped = _kwp.effective_pin(row["body"], plan.config.hosts or (),
+                                                   getattr(plan.config, "pin_aliases", None), studio_reasons)
+    if pin_dropped:
+        _kwp.note_dropped_studio_pin(row["id"])
+        from hermes_cli.kanban_studio_pin import note_drop
+        try:
+            note_drop(conn, row["id"], studio_reasons)
+        except Exception as exc:  # a placement notice must never stop routing this tick
+            _kb._log.warning("kanban: placement notice for %s not written: %s", row["id"], exc)
     # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None
+    wt_why: list = []
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
+        # t_1d2c5939: derived mode ports any GitHub repo to every pool host (no hand list), pushing an
+        # unpushed card branch first; wt_why names why a card still stays local.
         port = _kwt.port_for(row["id"], row["workspace_path"],
-                             _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet",
-                             branch=_kb._row_get(row, "branch_name"))
+                             _kwt.board_default_workdir(board), _fleet_dir,
+                             branch=_kb._row_get(row, "branch_name"),
+                             allow_studio_tree=last_resort,
+                             pool_hosts=tuple(plan.config.hosts or ()), why=wt_why)
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -5308,24 +5391,51 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     verdict = None
     if caps is not None:
         from hermes_cli import kanban_host_capabilities as _khc
+        # A remote workspace binding is mandatory, just like a body host pin.
+        cap_pin = bind[2] if bind and bind[2] else pin
         verdict = _khc.evaluate(
             row["body"], skills, caps,
-            pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
-            any_pin=pin == _kwp.PIN_ANY)
+            pin_host=cap_pin if cap_pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
+            any_pin=cap_pin == _kwp.PIN_ANY)
         if verdict.body_ignored and caps_out is not None:
             # Advisory body pin no host may serve (t_640a4ea0): placed without it, recorded.
             caps_out.setdefault("body_ignored", {})[row["id"]] = verdict.body_ignored[0]
-    ok, rule, route_class = _kwp.portable(
+        if (verdict.wait or "").startswith("BROWSER_REMOTE_UNREACHABLE:"):
+            if caps_out is not None:
+                caps_out.setdefault("reasons", {})[row["id"]] = [verdict.wait]
+            return "wait", verdict.wait
+    _portable_kw = dict(
         workspace_kind=row["workspace_kind"], has_links=linked, workspace_bind=bind,
-        workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
-                               if scan else False),
         assignee=assignee, body=row["body"],
         skills=skills, pool=plan.config,
         native_command=native, manifest=manifest, targets=targets,
         requires=verdict.for_portable() if verdict is not None else None,
         body_signals=caps is None or caps.legacy_body,
-        worktree_hosts=wt_hosts,
+        worktree_hosts=wt_hosts, studio_reasons=studio_reasons,
     )
+    # Only content the remote cannot reproduce binds (t_e7c03f48): a clean, pushed checkout plus logs/patches does
+    # not. ``lf_detail`` names the first binding path for the reason; a placed run starts fresh on the pool host
+    # and the Studio directory is left as it is.
+    lf_detail = _kb._kwh.local_workspace_binding(row["workspace_path"]) if scan else None
+    if lf_detail is not None and _lf_noted.get(row["id"]) != lf_detail:
+        if len(_lf_noted) > 4096:
+            _lf_noted.clear()  # bound: a long-lived dispatcher sees every card id once
+        _lf_noted[row["id"]] = lf_detail
+        _kb._log.info("kanban dispatch: %s local_files: %s is not reproducible from the remote", row["id"],
+                      lf_detail)
+    ok, rule, route_class = _kwp.portable(workspace_has_content=lf_detail is not None, **_portable_kw)
+    carried = False
+    if not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None:
+        # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
+        # while the Studio has room. Every OTHER rule is judged as if the directory were empty; a card that is
+        # then portable runs locally when the local gate admits, else on a pool host with the directory carried
+        # there first (kanban_worker_hosts.carry_workspace). A card some other rule keeps local stays local_files.
+        # Cheapest check first: the size walk is the costly one and runs within the tick's budget (t_915b8d2d).
+        ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
+        if (ok2 and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])
+                and _kb._kwh.carry_size_ok(row["workspace_path"], budget=carry_budget)):
+            ok, rule, route_class, carried = ok2, rule2, class2, True
+            carry_out[row["id"]] = True
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
     if (verdict is not None and not ok and pin in (None, _kwp.PIN_ANY)
@@ -5371,7 +5481,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                 rules_out[row["id"]] = f"{_pr.BIND_HOST}:{bind[2]}({bind[0]})"
             return "pin", bind[2]
         if rules_out is not None:
-            rules_out[row["id"]] = _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY
+            rules_out[row["id"]] = (_pr.LOCAL_FILES if carried
+                                    else _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY)
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.PIN_UNKNOWN_HOST:
         # A host: line naming no host: never runs anywhere, named, parked
@@ -5437,9 +5548,45 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             # Name what it needs (t_aea826a9): ``studio_affinity:studio_needs(vault,skills_tree)``.
             return "local", f"studio_affinity:{rule}({','.join(sorted(_kwp.card_needs(row['body'])))})"
         return "local", f"studio_affinity:{rule}"
+    if rule == "workspace_kind" and (row["workspace_kind"] or "scratch") == "worktree":
+        # Linked worktrees reference the Studio's git common dir. Only the
+        # mirror-backed clone route above can safely move their baseline.
+        if wt_why:
+            # Derived mode (t_1d2c5939): the one named reason, e.g. unpushed_dirty_tree.
+            return "local", f"not_portable:workspace_kind:{wt_why[0]}"
+        return "local", ("not_portable:workspace_kind:worktree is Studio-only without a safe mirror-backed "
+                         "clone; fleet/kanban-worktree-mirrors.json must list the repo and destination "
+                         "host, and the source must be an eligible anchor or clean pushed card worktree")
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
+    if pin == _kwp.PIN_ANY and rule == _pr.LOCAL_FILES and lf_detail is not None:
+        return "local", f"{_pr.not_portable(rule)}({lf_detail})"
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
+
+
+# task id -> the local_files detail last logged for it (one INFO line per change, not per tick).
+_lf_noted: dict = {}
+_last_resort_cache: dict = {}
+
+
+def _studio_last_resort(fleet_dir) -> bool:
+    """``placement_policy.load(fleet).is_last_resort(mac-studio)`` (t_c2fce87e's ONE switch), re-read only when the
+    policy file's stat changes or the env override does: ``_route_row`` asks once per ready row per tick."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    from hermes_cli import placement_policy as _ppol
+    path = Path(fleet_dir) / _ppol.POLICY_FILE
+    try:
+        st = path.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = (str(path), stamp, os.environ.get(_ppol.LAST_RESORT_ENV))
+    hit = _last_resort_cache.get("v")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    val = _ppol.load(Path(fleet_dir)).is_last_resort(_kwp.STUDIO_HOST)
+    _last_resort_cache["v"] = (key, val)
+    return val
 
 
 _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body",
@@ -5961,6 +6108,16 @@ def _i0_counts(reason) -> bool:
 _I0_EXEMPT = frozenset({"unassigned", "per_profile_cap"})
 
 
+def _portable_goes_remote(local_free: bool, cap_only, plan, browser_joined: bool = False,
+                          continuity: bool = False) -> bool:
+    """Does a ``portable`` row ask the pool before a local slot? The ONE rule: the spawn loop and the door
+    publisher (kanban_priority.waiting_by_host) both call it, so a card waits where it would start (round 5,
+    Prism a51c53f3bd02). A browser-joined row keeps the host its join was cut for. A ``continuity`` row (its
+    files are in the Studio scratch dir, t_e604c0f9) keeps the Studio while the local gate admits."""
+    remote_first = bool(getattr(plan, "default_remote", False)) and not browser_joined and not continuity
+    return not local_free or bool(cap_only) or remote_first
+
+
 def _last_resort_allowed(route: str, local_free: bool, cap_only, plan) -> bool:
     """Spawn a pool-refused row locally this tick? Only a ``portable`` row
     under ``kanban.placement.default: remote`` with local allowance left and no
@@ -6061,7 +6218,7 @@ def _any_spawnable_review(
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
     Unavailable profile metadata retains the historic fail-open behavior. A
-    review row that :func:`_dispatch_lane_task` would refuse this tick — its
+    review row the review-lane spawn would refuse this tick — its
     assignee already at the per-profile cap, or respawn-guarded — cannot
     take budget ahead of a ready row, so it must not withhold capacity from an
     otherwise ready task (one such row would hold budget it can never use).
@@ -6098,7 +6255,7 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
-ADMISSION_EVENT = "admission_override"
+from hermes_cli.kanban_dispatch_defaults import ADMISSION_EVENT
 ADMIT_INELIGIBLE = "admit_host_ineligible"
 ADMIT_FLOOR = "admit_floor"  # the measured-danger floor refused (placement_waits prefix)
 _FORCE_LOCAL = "studio"  # kanban_worker_pool.PIN_STUDIO: the dispatcher's own host
@@ -6161,14 +6318,17 @@ def admit_once(
     while True:
         with _kbc._dispatch_tick_lock(db_path) as held:
             if held:
-                return _dispatch_once_locked(
+                window = _kbc.TickLockWindow(db_path, enabled=narrow_lock_enabled())
+                result = _dispatch_once_locked(
                     conn, spawn_fn=spawn_fn, board=board, max_spawn=max_spawn,
                     failure_limit=failure_limit, default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     spillover=spillover, entry="admit", only_task=task_id,
                     force_host=host, skip_host_admission=True, admission_event=admission_event,
-                    admit_floor=admit_floor,
+                    admit_floor=admit_floor, lock_window=window,
                 )
+                _note_tick_lock(result, window, board=board, entry="admit")
+                return result
         if time.monotonic() >= deadline:
             return DispatchResult(skipped_locked=True, lock_holder=_kb._read_dispatch_lock_holder(db_path))
         time.sleep(0.2)
@@ -6204,6 +6364,7 @@ def _dispatch_once_locked(
     skip_host_admission: bool = False,
     admission_event: Optional[dict] = None,
     admit_floor=None,
+    lock_window=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -6248,7 +6409,12 @@ def _dispatch_once_locked(
     brake, the pool host's band/slots). Every other gate below runs unchanged,
     so a gate added to this loop later binds admit too. The review lane and the
     post-loop wait bookkeeping are skipped.
+
+    ``lock_window`` (:class:`TickLockWindow`, t_f60f502f): the tick hands the board lock back between a
+    claim and the next decision (workspace resolve + spawn of that claimed run) and marks each phase.
+    None = a window that releases nothing (timing only).
     """
+    _lw = lock_window if lock_window is not None else _kbc.TickLockWindow(None, enabled=False)
     _admit = only_task is not None
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -6268,11 +6434,16 @@ def _dispatch_once_locked(
                 result.orphans_reaped = _kb.sweep_terminal_workspace_orphans(conn, board=board)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban orphan sweep failed: %s", exc)
+    _lw.mark("reap")
 
     # ---- lane-model overrides (board-level, time-boxed routing) ----
     # One clock read for the whole tick so every card in this pass sees the
     # same TTL and a window cannot expire halfway through a batch.
     _tick_now = int(time.time())
+    if not dry_run and not _admit:
+        from hermes_cli.kanban_no_worker import record_stranded
+
+        record_stranded(conn, now=_tick_now)
     if not dry_run:
         # Retire elapsed windows first: the rows are deleted, so each expiry
         # is reported exactly once and the routing below can never read a
@@ -6409,6 +6580,7 @@ def _dispatch_once_locked(
         result.stranded_by_triage = _kb.find_stranded_by_triage(conn)
         # Scheduled cards nothing will ever wake (no timed wake, parked > 24h).
         result.unwoken_scheduled = _kb.find_unwoken_scheduled(conn)
+    _lw.mark("reclaim_promote")
 
     # Fan-out brake: per-board rolling-window USD ceiling. Evaluated AFTER all
     # reclaim/promotion bookkeeping so a paused board stays accurate on the
@@ -6424,7 +6596,22 @@ def _dispatch_once_locked(
     # budget gate below records a ``total:<gate>`` hold on each ready row
     # before it returns, and a paused tick with no plan still routes.
     from hermes_cli import kanban_placement_reasons as _pr
-    route_first = _route_first_enabled()
+    from hermes_cli import kanban_priority_door as _priority_door
+    from hermes_cli import kanban_priority_faults as _door_faults
+    if not dry_run:
+        try:
+            _door_faults.check_registry()   # taxonomy class 1: absent registry = spawn-only, loud
+        except Exception as exc:
+            _kb._log.warning("kanban door: registry check failed (%s: %s)", type(exc).__name__, exc)
+    route_first = _route_first_enabled() or _priority_door.enabled()
+    if not dry_run and _priority_door.enabled():
+        # Taxonomy class 2 latch / class 3 backoff: claim nothing, call no door verb; runs already going are
+        # untouched (the lifecycle sweep still renews/releases them).
+        _door_hold = _door_faults.hold_reason()
+        if _door_hold:
+            _record_total_hold(conn, result, "door_hold", dry_run, only_task)
+            _kb._log.warning("kanban door: no starts this tick (%s)", _door_hold)
+            return result
     if not dry_run:
         try:
             from hermes_cli import kanban_budget as _kbudget
@@ -6589,7 +6776,7 @@ def _dispatch_once_locked(
             hosts={h.name for h in spillover.config.pool_hosts})
     ready_rows = conn.execute(
         "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker, priority, "
-        "origin_host, workspace_of, branch_name "
+        "origin_host, workspace_of, branch_name, asap "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL AND (? IS NULL OR id = ?) "
         "ORDER BY priority DESC, created_at ASC", (only_task, only_task),
     ).fetchall()
@@ -6611,6 +6798,7 @@ def _dispatch_once_locked(
     row_route: dict = {}
     row_rules: dict = {}  # task id -> portable() rule, for the placement record
     _worktree_ports: dict = {}  # worktree card -> (repo, mirror, hosts) (t_6d9e7d90)
+    _carry_rows: dict = {}  # local_files card -> True: local while the gate admits, else carried (t_e604c0f9)
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
     # ran the classifier on every one of them) and, of those, the ones the
     # spawn loop reached: the affinity event log reconciles against both.
@@ -6635,6 +6823,8 @@ def _dispatch_once_locked(
         _binds = _workspace_binds(conn, ready_rows, dry_run=dry_run)  # spec §2.4, per tick
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         spillover.continuation_dry_run = dry_run
+        _carry_budget = _kb._kwh.CarryScanBudget()
+        _route_t0 = time.monotonic()
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          _lineage, result.placement_affinity,
                                          unknown_out=result.unknown_pins,
@@ -6642,8 +6832,13 @@ def _dispatch_once_locked(
                                          rules_out=row_rules,
                                          access_out=result.access_contradictions,
                                          binds=_binds, held=_pause_held,
-                                         worktree_out=_worktree_ports, board=board)
+                                         worktree_out=_worktree_ports, board=board,
+                                         carry_out=_carry_rows, pause_cache=_pause_cache,
+                                         carry_budget=_carry_budget)
                      for r in ready_rows}
+        result.route_ms += (time.monotonic() - _route_t0) * 1000.0
+        result.carry_scan_ms += _carry_budget.spent_s * 1000.0
+        result.carry_scans_deferred += _carry_budget.deferred
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"origin": 0, "pin": 0, "wait": 1, "local": 1, "portable": 2}
@@ -6676,6 +6871,13 @@ def _dispatch_once_locked(
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
+        # A carried card's workspace is on its carry host (Prism fd679a4c5702): with no plan it waits there,
+        # never runs on the Studio's stale copy, whatever the host_preference switch says.
+        for _rid in _kb._kwh.carried_ids(conn, [r["id"] for r in ready_rows]):
+            _r = next(r for r in ready_rows if r["id"] == _rid)
+            if (_r["workspace_kind"] or "scratch") == "scratch" \
+                    and _kb._kwh.carried_host(conn, _rid, _r["workspace_path"]):
+                row_route.setdefault(_rid, ("wait", "pool_unavailable"))
         # Identity-only capabilities (docker) hold with or without a plan:
         # no plan is the normal admitting band, and an unpinned docker card
         # must not spawn locally there either (Prism b83b86d68a65 on #1902).
@@ -6719,6 +6921,9 @@ def _dispatch_once_locked(
                    pool=spillover.config if spillover is not None else None, caps=_caps)
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
     _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
+    # Publish before pressure-gated spawn budgets can hide hot-host demand.
+    from hermes_cli import kanban_priority as _priority
+    from hermes_cli import kanban_priority_door as _door
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.
@@ -6730,7 +6935,7 @@ def _dispatch_once_locked(
     if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee, no_worker, body, skills, workspace_path, workspace_kind, origin_host, "
-            "priority FROM tasks "
+            "priority, asap FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -6742,6 +6947,35 @@ def _dispatch_once_locked(
                                      lane="review", planned=spillover is not None, entry=entry,
                                      pins_out=_review_pause_pins,
                                      pool=spillover.config if spillover is not None else None, caps=_caps)
+        # FWA destination fence BEFORE any review reservation (Prism 34935fb58782): a review that cannot start
+        # this tick must not hold budget ahead of ready rows (``_review_ahead``) or a pool admission
+        # (``review_pool_reserve``). Only rows held on EVERY route they could take are dropped here; a review whose
+        # route is decided in the loop (continuation origin vs local) keeps the in-loop check below.
+        _kept_reviews = []
+        for _rrow in review_rows:
+            if _rrow["id"] in _review_pause_pins:
+                _rwhy = _kph.destination_wait(_review_pause_pins[_rrow["id"]], _pause_cache)
+            elif _rrow["origin_host"] and _kcont_lost.mode(_root_kanban_cfg()) == "enforce":
+                _rwhy = _kph.destination_wait(_rrow["origin_host"], _pause_cache)
+                _rwhy = _rwhy if _rwhy is not None and _kph.local_destination_wait(_pause_cache) is not None else None
+            else:
+                _rwhy = _kph.local_destination_wait(_pause_cache)
+            if _rwhy is not None:
+                result.placement_waits[_rrow["id"]] = _rwhy
+                continue
+            _kept_reviews.append(_rrow)
+        review_rows = _kept_reviews
+    if not dry_run and not _admit and _door.enabled():
+        try:
+            _waiting = _priority.waiting_by_host(
+                [*ready_rows, *review_rows], spillover, routes=row_route, local_host="local", board=board,
+                default_assignee=default_assignee, conn=conn, caps=_caps,
+                cap_only=_caps_out.get("only"), worktree_ports=_worktree_ports,
+                local_budget=local_budget, browser_joins=result.browser_joins,
+                continuity=_carry_rows)
+            _priority.publish_waiting(conn, _waiting, verdicts=_priority.verdicts_for_plan(spillover))
+        except Exception as exc:
+            _kb._log.warning("kanban door publication failed (starts remain fail-closed): %s", exc)
     # Review-lane fairness (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews. Priority settles
@@ -6768,15 +7002,20 @@ def _dispatch_once_locked(
         return _kb.resolve_per_profile_cap(_per_profile_spec, assignee)
 
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+
+    def _load_per_profile_running() -> None:
         from hermes_cli.kanban_terminal_pending import NOT_EXTENDED_LEASE_SQL
 
+        _per_profile_running.clear()
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             f"WHERE status = 'running' AND assignee IS NOT NULL AND {NOT_EXTENDED_LEASE_SQL} "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+
+    if _per_profile_cap is not None:
+        _load_per_profile_running()
     # One budget, one order (FWA-I, t_cd43f4ff, audit K8): no slot is held
     # back for the review lane. A spawnable review row at the same or a higher
     # priority than a ready row keeps its place ahead of it (a review finishes
@@ -6794,6 +7033,47 @@ def _dispatch_once_locked(
         )
     )
     local_spawned = 0
+    # Narrow lock (t_f60f502f, Prism 3c47847c9979): while the lock is handed back for a spawn, another
+    # dispatcher or `kanban admit` can claim, so every cap above is a snapshot of a board that has moved.
+    # Each re-take re-reads the board and tightens them before the next decision; a budget never grows
+    # inside a tick. ``spawned`` counts this tick's starts, which the running count already includes.
+    _running_at_release = 0
+
+    def _release_lock() -> None:
+        nonlocal _running_at_release
+        if _lw.active and not _lw.released:
+            _running_at_release = count_running_tasks(conn)
+        _lw.release()
+
+    def _hold_lock() -> None:
+        nonlocal spawn_budget, budget_gate, local_budget
+        if not _lw.hold():
+            return
+        running = count_running_tasks(conn)
+        caps = []
+        if max_spawn is not None:
+            caps.append((spawned + max(0, max_spawn - running), _pr.TOTAL_MAX_SPAWN))
+        if max_in_progress is not None:
+            room = max_in_progress - running - count_running_tasks_other_boards(board)
+            caps.append((spawned + max(0, room), _pr.TOTAL_MAX_IN_PROGRESS))
+        level = "unknown" if skip_host_admission else _memory_pressure_level()
+        if level == "critical":
+            result.memory_pressure = level
+            caps.append((spawned, _pr.TOTAL_MEMORY_CRITICAL))
+        elif level == "elevated":
+            result.memory_pressure = result.memory_pressure or level
+            caps.append((1, _pr.TOTAL_MEMORY_ELEVATED))
+        for cap, gate in caps:
+            if spawn_budget is None or cap < spawn_budget:
+                spawn_budget, budget_gate = cap, gate
+        # Starts by others in the window take this host's load-gate allowance too (conservative: a
+        # remote start by another dispatcher is charged as local).
+        others = running - _running_at_release
+        if local_budget is not None and others > 0:
+            local_budget = max(0, local_budget - others)
+        if _per_profile_cap is not None:
+            _load_per_profile_running()
+
     # Lazily populated only when a ready card reaches the point where it would
     # actually spawn. A queue containing only unassigned, capped, guarded, or
     # control-plane cards pays zero collision-scan queries on every idle tick.
@@ -7365,7 +7645,9 @@ def _dispatch_once_locked(
     # board (spec v0.3 I-0 per-board key, Momus pass 3 R1); capability-``only``
     # rows are excluded (they never take a local slot, §3.4).
     _portable_room: set = set()
+    _lw.mark("route")
     for row_index, row in enumerate(ready_rows):
+        _hold_lock()        # every decision below runs under the board lock (t_f60f502f)
         route, route_arg = row_route.get(row["id"], ("local", None))
         if record_only is not None:
             result.placement_waits[row["id"]] = (
@@ -7607,11 +7889,11 @@ def _dispatch_once_locked(
         # A browser join is cut for the host _browser_gate saw (the Studio for a
         # portable row): remote-first would move it and the lease refuses
         # BROWSER_JOIN_HOST_MOVED every tick, so a joined row keeps that host.
-        _remote_first = (getattr(spillover, "default_remote", False)
-                         and row["id"] not in result.browser_joins)
         _forced_remote = force_host is not None and force_host != _FORCE_LOCAL
-        if _forced_remote or (force_host is None and (route in ("pin", "origin") or (route == "portable" and (
-                not local_free or _cap_only or _remote_first)))):
+        if _forced_remote or (force_host is None and (route in ("pin", "origin") or (
+                route == "portable" and _portable_goes_remote(local_free, _cap_only, spillover,
+                                                              row["id"] in result.browser_joins,
+                                                              continuity=row["id"] in _carry_rows)))):
             # A refused take() NEVER falls through to a local spawn (I-11),
             # except a portable row under kanban.placement.default: remote,
             # which spawns locally as the LAST RESORT (spec v0.3 §3.1 step 2).
@@ -7622,6 +7904,21 @@ def _dispatch_once_locked(
             if route == "portable":
                 _only, _job = _portable_only(conn, row, row_assignee, spillover, _caps, _cap_only,
                                              _worktree_ports.get(row["id"]))
+            # FWA destination fence (Prism 71b4b90b5c73): a live fwa hold on lane kanban closes a host to NEW work
+            # whatever the card's origin. A pin to it waits; a portable pick skips it.
+            _held_dest = _kph.held_destinations(list(spillover.hosts), _pause_cache)
+            _pin_dest = force_host if _forced_remote else (route_arg if route in ("pin", "origin") else None)
+            _pin_held = next((w for h, w in _held_dest.items() if _pin_dest and h.lower() == str(_pin_dest).lower()),
+                             None)
+            if _pin_held is not None:
+                result.placement_waits[row["id"]] = _pin_held
+                continue
+            if _held_dest and route == "portable":
+                # Case-insensitive, as take() matches (Prism 96dd675bda52): reach keys are lower-cased, pool names
+                # keep their configured case.
+                _held_low = {str(h).lower() for h in _held_dest}
+                _only = [h for h in (_only if _only is not None else spillover.hosts)
+                         if str(h).lower() not in _held_low]
             _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
             # Scorer-backed takes (pins included) book a reservation for this card.
             _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
@@ -7654,6 +7951,11 @@ def _dispatch_once_locked(
                 if not _last_resort_allowed(route, local_free, _cap_only, spillover):
                     result.placement_waits[row["id"]] = _refusal
                     continue
+            _dest_wait = _kph.destination_wait(placed_host.name, _pause_cache) if placed_host is not None else None
+            if _dest_wait is not None:                     # belt: the chosen host is re-checked before any start
+                spillover.release(placed_host, _rid)
+                result.placement_waits[row["id"]] = _dest_wait
+                continue
             # Layer 0b (t_ecfd5591, F14): never spawn a card whose ATTACHED skills need
             # an enforced capability the chosen host lacks (a stale route's belt).
             _gap = _attached_skill_gap(row, placed_host.name, _caps) if placed_host is not None else None
@@ -7665,6 +7967,13 @@ def _dispatch_once_locked(
                     with _kbc.write_txn(conn):
                         _kb._append_event(conn, row["id"], "placement_gate_refused",
                                           {"layer": "0b", "host": placed_host.name, "cap": _gap})
+                continue
+        if placed_host is None:
+            # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
+            # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
+            _local_wait = _kph.local_destination_wait(_pause_cache)
+            if _local_wait is not None:
+                result.placement_waits[row["id"]] = _local_wait
                 continue
         if _take_refusal is not None and placed_host is None:
             result.take_refusals[row["id"]] = _take_refusal
@@ -7728,6 +8037,10 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        # Claimed and routed: what follows writes only this claimed run (workspace, clone, spawn), so
+        # the board lock goes back until the next row's decision (t_f60f502f, kanban.dispatch.narrow_lock).
+        _lw.mark("decide")
+        _release_lock()
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -7747,14 +8060,30 @@ def _dispatch_once_locked(
                 resolved_branch_name = (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
                 claimed.workspace_kind, claimed.workspace_path = "scratch", None
                 workspace = _kbw.resolve_workspace(claimed, board=board)
-                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_port[1],
+                _wt_mirror = _kwt.mirror_for(_wt_port, placed_host.name)
+                if len(_wt_port) > 4 and _wt_port[4] is not None:
+                    # Push-then-port (t_1d2c5939): committed work only the Studio has goes to origin first.
+                    _kwt.push_card_branch(_wt_port[4])
+                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_mirror,
                                    resolved_branch_name)
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
-                             host=placed_host.name, slug=_wt_port[0], mirror=_wt_port[1])
+                             host=placed_host.name, slug=_wt_port[0], mirror=_wt_mirror)
             elif claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
+                if placed_host is not None and claimed.id in _carry_rows and not dry_run:
+                    # local_files continuity overflow (t_e604c0f9): the Studio was full, so the card's
+                    # Studio scratch dir goes to the chosen host first, same path; a failure is a spawn
+                    # failure (claim released, reservation refunded), never an empty-dir run.
+                    _kb._kwh.carry_workspace(placed_host, str(workspace))
+                    with _kbc.write_txn(conn):
+                        # "workspace" = the stored path at carry time, "path" = the spelling persisted just
+                        # below; carried_host() binds on either (Prism 34bd0265a601).
+                        _kb._append_event(conn, claimed.id, _kb._kwh.CARRIED_EVENT,
+                                          {"host": placed_host.name, "workspace": claimed.workspace_path,
+                                           "path": str(workspace)},
+                                          run_id=claimed.current_run_id)
             if protected is not None:
                 validate_mount(
                     protected.root, expected_mount=protected.mount_path,
@@ -7763,14 +8092,22 @@ def _dispatch_once_locked(
                 validate_persisted(workspace)
             # Persist the resolved workspace path so the worker can cd there
             # (inside the guard: a failed write releases the claim).
-            _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+            # Every write below is fenced to the claimed run: the board lock is handed back (t_f60f502f).
+            _kbw.set_workspace_path(conn, claimed.id, str(workspace), run_id=claimed.current_run_id)
             if claimed.workspace_kind == "worktree":
-                _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+                _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+                                     run_id=claimed.current_run_id)
             _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        except _kb.ClaimLost:
+            _kb._abort_lost_claim_spawn(conn, claimed, None)
+            if placed_host is not None:
+                spillover.release(placed_host, _rid)  # nothing launched: refund
+            continue
         except WorkspaceUnavailable as exc:
-            _kb._release_claim_for_workspace_refusal(
-                conn, claimed.id, result, str(exc),
-            )
+            if not _kb._release_claim_for_workspace_refusal(
+                conn, claimed.id, result, str(exc), expected_run_id=claimed.current_run_id,
+            ):
+                _kb._abort_lost_claim_spawn(conn, claimed, None)
             if placed_host is not None:
                 spillover.release(placed_host, _rid)  # nothing launched: refund
             continue
@@ -7790,13 +8127,18 @@ def _dispatch_once_locked(
                 failure_limit=failure_limit,
                 force_trip=permanent is not None,
                 block_kind="capability" if permanent else None,
+                expected_run_id=claimed.current_run_id,
             )
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            if auto is None:    # a successor run owns the card now: not this launch's to fail
+                _kb._abort_lost_claim_spawn(conn, claimed, None)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
             continue
+        _lw.mark("workspace")
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
             if placed_host is not None:
@@ -7805,6 +8147,7 @@ def _dispatch_once_locked(
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         _launch = _LaunchState()  # .launched: a worker process exists (refund guard)
         _joined = None  # (join, lease env) once the s7 join took a lease for this claim
+        from hermes_cli.kanban_priority_door import DoorHeld, defer
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -7885,13 +8228,14 @@ def _dispatch_once_locked(
                 conn, claimed, str(workspace), board=board, spawn=_spawn,
                 spawn_kwargs=spawn_kwargs, host=placed_host.name if placed_host else None,
                 pool=admitted_routes.get(claimed.id), state=_launch,
-                after_launch=_after_launch,
+                after_launch=_after_launch, reservation_id=_rid,
                 placement_record=lambda: _placement_payload(
                     run_id=claimed.current_run_id, route=route, arg=route_arg,
                     rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
                     entry=entry, gate=tick_gate, take_refusal=_take_refusal,
                 ),
             )
+            _lw.mark("spawn")
             if outcome == _LAUNCH_NOT_OWNED:
                 # The run no longer owns the card: nothing launched, refund.
                 if _join is not None:
@@ -7928,9 +8272,18 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except DoorHeld as exc:
+            defer(conn, claimed, exc)
+            if placed_host is not None:
+                spillover.release(placed_host, _rid)
+            if _joined is not None:
+                _browser_release_joined(conn, claimed, *_joined, "door_held")
+            result.placement_waits[claimed.id] = str(exc)
         except Exception as exc:
             if placed_host is not None and not _launch.launched:
-                spillover.release(placed_host, _rid)  # pre-launch failure: refund
+                from hermes_cli.kanban_priority_door import reservation_owned
+                if not reservation_owned(conn, claimed.id, claimed.current_run_id):
+                    spillover.release(placed_host, _rid)  # door owns any upgraded row
             if _joined is not None and not _launch.launched:
                 _browser_release_joined(conn, claimed, *_joined, "spawn_failed")  # Prism d598b2a71104
             # A host that cannot place the worker (no restart-safe scope,
@@ -7949,13 +8302,20 @@ def _dispatch_once_locked(
                 outcome="spawn_failed", release_claim=True, end_run=True,
                 failure_limit=failure_limit, infrastructure=infrastructure,
                 run_metadata_extra=host_fault or None,
+                expected_run_id=claimed.current_run_id,
             )
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            if auto is None:    # a successor run owns the card now (t_f60f502f, Prism 09fab0fa405f)
+                _kb._abort_lost_claim_spawn(conn, claimed, _launch.pid if _launch.launched else None)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
 
+    _lw.mark("decide")
+    if not _admit:
+        _hold_lock()        # admit returns below: nothing after its one start needs the board lock
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete and not _admit)
     if _admit:
         return result
@@ -7977,6 +8337,10 @@ def _dispatch_once_locked(
     _record_placement_waits(
         conn, result, row_route, dry_run, _wait_reached,
         local_binding=_pr.local_full_binding(spawn_paused, local_budget, local_spawned))
+    # A pause_hold label the CURRENT manifest no longer backs is ended every live tick (t_0c5a95ab): a card this
+    # tick never routes (no_worker, human lane) would otherwise read "held by <old manifest>" forever.
+    if not _admit:
+        _kph.clear_stale_labels(conn, result, dry_run, _pause_cache)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
@@ -8028,7 +8392,9 @@ def _dispatch_once_locked(
     # review lane extra capacity. Same for the per-pool hold:
     # release it so reviewers are judged on the pool's real budget.
     review_pool_reserve.clear()
+    _lw.mark("post_loop")
     for row in review_rows:
+        _hold_lock()
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         _review_origin_host = None
@@ -8102,6 +8468,11 @@ def _dispatch_once_locked(
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
+        _dest_wait = (_kph.destination_wait(_review_origin_host.name, _pause_cache) if _review_origin_host is not None
+                      else _kph.local_destination_wait(_pause_cache))
+        if _dest_wait is not None:                         # FWA destination fence, review lane (fe6a1ad69c44)
+            result.placement_waits[row['id']] = _dest_wait
+            continue
         if _review_origin_host is not None:
             _review_origin_host = spillover.take(row['assignee'], pin=_review_origin_host.name)
             _review_rid = getattr(spillover, "last_reservation", None)
@@ -8143,6 +8514,8 @@ def _dispatch_once_locked(
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = fallback_route_source(review_route_source, fallback_selection)
+        _lw.mark("review_decide")
+        _release_lock()     # same as the ready lane: only this claimed run is written until the next row
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -8162,9 +8535,10 @@ def _dispatch_once_locked(
                 validate_target(protected.root, workspace)
                 validate_persisted(workspace)
         except WorkspaceUnavailable as exc:
-            _kb._release_claim_for_workspace_refusal(
-                conn, claimed.id, result, str(exc),
-            )
+            if not _kb._release_claim_for_workspace_refusal(
+                conn, claimed.id, result, str(exc), expected_run_id=claimed.current_run_id,
+            ):
+                _kb._abort_lost_claim_spawn(conn, claimed, None)
             if _review_origin_host is not None:
                 spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
@@ -8184,17 +8558,28 @@ def _dispatch_once_locked(
                 failure_limit=failure_limit,
                 force_trip=permanent is not None,
                 block_kind="capability" if permanent else None,
+                expected_run_id=claimed.current_run_id,
             )
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            if auto is None:    # a successor run owns the card now: not this launch's to fail
+                _kb._abort_lost_claim_spawn(conn, claimed, None)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        # Persist the resolved workspace path so the worker can cd there; fenced to the claimed run (t_f60f502f).
+        try:
+            _kbw.set_workspace_path(conn, claimed.id, str(workspace), run_id=claimed.current_run_id)
+            if claimed.workspace_kind == "worktree":
+                _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+                                     run_id=claimed.current_run_id)
+        except _kb.ClaimLost:
+            _kb._abort_lost_claim_spawn(conn, claimed, None)
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
+            continue
         _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
@@ -8204,12 +8589,15 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        _lw.mark("review_workspace")
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
             if _review_origin_host is not None:
                 spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _review_launch = _LaunchState()
+        from hermes_cli import kanban_priority_door as _review_door
         try:
             from hermes_cli.kanban_continuation import record_placement
             if not record_placement(conn, claimed.id, claimed.current_run_id,
@@ -8219,20 +8607,34 @@ def _dispatch_once_locked(
                 continue
             if _review_origin_host:
                 _kb._kwh.prepare_remote_workspace(_review_origin_host, str(workspace))
+            else:
+                _review_rid = _book_local_start(conn, claimed)
             import inspect
-            try:
-                sig = inspect.signature(_spawn)
+
+            def _review_spawn(task, path):
                 kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
-                if "board" in sig.parameters:
-                    kwargs['board'] = board
-                pid = _spawn(claimed, str(workspace), **kwargs)
-            except (TypeError, ValueError):
-                if _review_origin_host:
-                    raise
-                pid = _spawn(claimed, str(workspace))
+                try:
+                    sig = inspect.signature(_spawn)
+                except (TypeError, ValueError):
+                    if _review_origin_host:
+                        raise
+                else:
+                    if "board" in sig.parameters:
+                        kwargs['board'] = board
+                # Execution errors may follow process creation; never retry a spawn.
+                return _spawn(task, path, **kwargs)
+            # The review start is a start like any other (round 5, Prism 7851057bf109): one door authorization,
+            # upgraded in place from the booked pin reservation, before the worker exists.
+            pid = _review_door.spawn(conn, claimed, str(workspace),
+                                     host=_review_origin_host.name if _review_origin_host else None,
+                                     spawn=_review_spawn, spawn_kwargs={}, state=_review_launch,
+                                     reservation_id=_review_rid)
+            _review_launch.launched = True
+            _lw.mark("review_spawn")
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
+                placement={"route_class": "pin" if _review_origin_host else "local", "entry": "review"},
             ):
                 _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
                 continue
@@ -8251,7 +8653,17 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _review_door.DoorHeld as exc:
+            # No start was made: the claim goes back without penalty (or the card is blocked on a config fault),
+            # and the booked pin reservation is refunded, exactly as on the ready lane.
+            _review_door.defer(conn, claimed, exc)
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)
+            result.placement_waits[claimed.id] = str(exc)
         except Exception as exc:
+            if (_review_origin_host is not None and not _review_launch.launched
+                    and not _review_door.reservation_owned(conn, claimed.id, claimed.current_run_id)):
+                spillover.release(_review_origin_host, _review_rid)  # pre-launch failure; door owns an upgraded row
             # A host that cannot place the worker (no restart-safe scope,
             # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
             # the card's failure: the run is closed with ``infrastructure:
@@ -8268,12 +8680,18 @@ def _dispatch_once_locked(
                 outcome="spawn_failed", release_claim=True, end_run=True,
                 failure_limit=failure_limit, infrastructure=infrastructure,
                 run_metadata_extra=host_fault or None,
+                expected_run_id=claimed.current_run_id,
             )
-            # Record EVERY spawn failure (not just breaker trips) so a
-            # pre-circuit-breaker stall is visible to health telemetry.
-            result.spawn_failed.append(claimed.id)
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            if auto is None:    # a successor run owns the card now (t_f60f502f, Prism 09fab0fa405f)
+                _kb._abort_lost_claim_spawn(conn, claimed, _review_launch.pid if _review_launch.launched else None)
+            else:
+                # Record EVERY spawn failure (not just breaker trips) so a
+                # pre-circuit-breaker stall is visible to health telemetry.
+                result.spawn_failed.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+    _lw.mark("review_decide")
+    _lw.hold()
     if not dry_run:
         try:
             starved = find_priority_starved(conn, now=_tick_now)
@@ -8284,6 +8702,7 @@ def _dispatch_once_locked(
                 _notify_priority_starved(conn, board, starved)
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban priority-starvation check failed: %s", exc)
+    _lw.mark("tail")
     return result
 
 

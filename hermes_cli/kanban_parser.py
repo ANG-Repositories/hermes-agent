@@ -13,7 +13,7 @@ import os
 import sys
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_dispatch_defaults as kbd
 from hermes_cli import kanban_db_notify as kbn
 
 
@@ -177,6 +177,53 @@ def create_default_priority(created_by: str | None, origin: str | None = None) -
     if (created_by or HUMAN_CREATED_BY) != HUMAN_CREATED_BY:
         return 0
     return 0 if (origin or kb.classify_create_origin()) in _MINTER_ORIGINS else HUMAN_DEFAULT_PRIORITY
+
+
+# Live band (t_febbdb61, ruling:t_febbdb61-live-band-scope): a person's or an operator's create with no
+# --priority lands at the median priority of the cards spawned in the last 24 h (floor 100), so filed
+# work is not starved under incident minters at 300-410. Machine minters keep the bands above (<= 59).
+# KANBAN_LIVE_BAND=off restores the flat human default (100).
+LIVE_BAND_WINDOW_S = 86400
+_LIVE_BAND_OPERATORS = frozenset({"apollo", "daedalus", "daedalus-opus"})
+
+
+def live_priority_band(conn, *, now: int | None = None) -> int:
+    """Median ``tasks.priority`` over the ``spawned`` events of the last 24 h (one value per spawn, so the band
+    follows where the dispatcher's capacity actually went), floor 100."""
+    import statistics
+    import time
+    since = int(time.time() if now is None else now) - LIVE_BAND_WINDOW_S
+    rows = conn.execute(
+        "SELECT t.priority FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = 'spawned' AND e.created_at >= ?", (since,)).fetchall()
+    prios = [int(r[0] or 0) for r in rows]
+    return max(HUMAN_DEFAULT_PRIORITY, int(statistics.median(prios))) if prios else HUMAN_DEFAULT_PRIORITY
+
+
+def live_band_default(conn, author: str | None, origin: str | None = None) -> int | None:
+    """The live band for a no-``--priority`` create by a person (``user``, not a cron/worker/script process)
+    or a named operator profile (apollo, daedalus, daedalus-opus; never from a cron job), else None."""
+    off = ("0", "off", "false", "no")
+    if ((os.environ.get("KANBAN_PRIORITY_BANDS") or "").strip().lower() == "off"
+            or (os.environ.get("KANBAN_LIVE_BAND") or "").strip().lower() in off):
+        return None
+    from gateway.session_context import is_cron_session
+
+    # Task-local cron scope outranks process/profile identity, including root's alias.
+    if is_cron_session():
+        return None
+    author = "apollo" if author == "default" else author  # eligibility only; never rewrite the creator
+    origin = origin or kb.classify_create_origin()
+    if author == HUMAN_CREATED_BY:
+        eligible = origin not in _MINTER_ORIGINS
+    else:
+        eligible = author in _LIVE_BAND_OPERATORS and origin != kb.CREATE_ORIGIN_CRON
+    if not eligible:
+        return None
+    try:
+        return live_priority_band(conn)
+    except Exception:  # a band read must never fail the create
+        return HUMAN_DEFAULT_PRIORITY
 
 
 _CREATE_PRIORITY = _arg(
@@ -405,7 +452,7 @@ _SPECS = [
                   f"circuit breaker. Trip on the Nth failure — e.g. --max-retries 1 blocks on the "
                   f"first failure (no retries), --max-retries 3 allows two retries. Omit to use "
                   f"the dispatcher's kanban.failure_limit config (default "
-                  f"{kb.DEFAULT_FAILURE_LIMIT})."),
+                  f"{kbd.DEFAULT_FAILURE_LIMIT})."),
         _arg("--model", dest="model_override",
              help="Pin the worker to this model (passed as -m <model>) without "
                   "changing the profile's configured model. Combine with --provider "
@@ -442,7 +489,8 @@ _SPECS = [
              help="Subscription level 'boomerang wake': mechanical wakes on this card are "
                   "handled by a background boomerang child (the calling chat subscribes "
                   "--boomerang-wake). Defaults to kanban.auto_subscribe_boomerang "
-                   "for operator creates with a gateway origin."),
+                   "for operator creates with a gateway origin or a --session whose home "
+                   "has a routable chat."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -611,6 +659,12 @@ _SPECS = [
              help="Read this load_gate.json instead of <root>/load_gate.json"),
         _json_flag(help="Emit the dict the text is printed from"),
     ], help="Where cards run and why they wait (read-only; no probe)"),
+    _cmd("placement-holds", [
+        _arg("--clear", metavar="TASK_ID",
+             help="End this card's open pause_hold label now (a live hold is re-derived next tick)"),
+        _arg("--operator", default=None, help="Who clears it (recorded on the event)"),
+        _json_flag(help="Emit the dict the text is printed from"),
+    ], help="Fleet-pause holds: every host manifest (live or stale) and every card labelled pause_hold"),
     # rehome (t_808bc8e6)
     _cmd("rehome", [
         _arg("task_id"),
@@ -746,6 +800,12 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, metavar="N",
              help="Set the dispatch priority (higher first); records priority_set."),
+        _group(
+            _arg("--asap", action="store_const", const=True, dest="asap", default=None,
+                 help="Operator-only: send this card to the front of the host door"),
+            _arg("--no-asap", action="store_const", const=False, dest="asap",
+                 help="Clear this card's explicit urgency"),
+        ),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
         _arg("--model", dest="model_override", metavar="MODEL",

@@ -43,7 +43,7 @@ def kanban_home(tmp_path, monkeypatch):
 def _card(conn, *, session_id=HOME, assignee="worker-a", blocked=True):
     tid = kb.create_task(conn, title="card", assignee=assignee, session_id=session_id)
     if blocked:
-        assert kb.block_task(conn, tid, reason="needs input")
+        assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
     return tid
 
 
@@ -170,7 +170,7 @@ def test_explicit_session_stamps_origin_line_once(kanban_home):
 def test_unhomed_card_refused_for_chat_session_and_takeover_records_event(kanban_home):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="cron card", assignee="worker-a")
-        assert kb.block_task(conn, tid, reason="x")
+        assert kb.block_task(conn, tid, reason="x", kind="needs_input")
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo"):
             with pytest.raises(kb.ForeignSessionMutationError, match="UNHOMED"):
                 kb.unblock_task(conn, tid)
@@ -308,7 +308,7 @@ def test_cli_refused_status_verb_leaves_no_status_comment(kanban_home, monkeypat
     with kb.connect_closing() as conn:
         tid = _card(conn, session_id=HOME, blocked=blocked)
         before = _comments(conn, tid)
-    out = kc.run_slash(f"{verb} {tid} 'why not'")
+    out = kc.run_slash(_status_cmd(verb, tid))
     assert f"refused {verb}" in out, out
     with kb.connect_closing() as conn:
         assert _comments(conn, tid) == before
@@ -318,6 +318,10 @@ def _status_cmd(verb, tid):
     # unblock takes its reason as --reason; block/schedule take it positionally.
     if verb == "unblock":
         return f"unblock --reason 'why not' {tid}"
+    if verb == "schedule":
+        return f"schedule {tid} --at 2000000000 'why not'"
+    if verb == "block":
+        return f"block {tid} --kind needs_input 'why not'"
     return f"{verb} {tid} 'why not'"
 
 
@@ -385,7 +389,7 @@ def test_cli_schedule_wake_reset_on_scheduled_card_writes_comment(kanban_home, m
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     with kb.connect_closing() as conn:
         tid = _card(conn, session_id=HOME, blocked=False)
-        assert kb.schedule_task(conn, tid)
+        assert kb.schedule_task(conn, tid, wake_at=2_000_000_000)
     kc.run_slash(f"schedule {tid} --at 4102444800 'later'")
     with kb.connect_closing() as conn:
         assert _comments(conn, tid)[-1] == "SCHEDULED: later"
@@ -533,7 +537,7 @@ def _unlink(conn, tid):
 # (setup, mutation) for every newly guarded status writer. Each mutation is
 # first proven to CHANGE the card with no actor bound, so a refusal is real.
 _ROUND2 = {
-    "schedule": (_ready, lambda c, t: kb.schedule_task(c, t, reason="later")),
+    "schedule": (_ready, lambda c, t: kb.schedule_task(c, t, reason="later", wake_at=2_000_000_000)),
     "reopen": (_done, lambda c, t: kb.reopen_task(c, t, actor="apollo", reason="r")),
     "request-review": (_ready, lambda c, t: kb.request_review(
         c, t, summary="s", reviewer="argus", force=True)),
@@ -653,7 +657,7 @@ async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).status != "blocked"
 
     out = await GatewayRunner._handle_kanban_command(
-        home_runner, _slash_event(f"/kanban block {tid} 'mine to block'"))
+        home_runner, _slash_event(f"/kanban block {tid} --kind needs_input 'mine to block'"))
     assert "refused" not in out, out
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "blocked"

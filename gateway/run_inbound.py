@@ -45,6 +45,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Upper bound a busy-rejected slash command waits for an in-flight /stop to release the slot before
+# falling back to the "still finishing" reply. Live 2026-11-08 the release came 37 s after /stop.
+_STOP_SETTLE_WAIT_S = 120.0
+
 # Fork: chat id for the per-clip STT outcome lines (``stt: chat=<c> transcribed N chars in Ts`` /
 # ``stt FAILED: chat=<c> after Ts: <why>``), set by the inbound callers around transcription so the
 # lines pair with the ``[voice Ns]`` inbound line for log readers. Fork tests import it from
@@ -819,6 +823,33 @@ class GatewayInboundMixin:
             logger.debug("lease-flush queue gate failed for %s; dispatching", _quick_key, exc_info=True)
             return None
 
+    async def _hm_wait_for_stop_to_settle(self, event: "MessageEvent", _quick_key: str) -> None:
+        """/stop then /model (or any command the busy path would REJECT) in quick succession: wait,
+        bounded, for the stop to release the slot, so the command takes the idle path exactly as if
+        it had been sent after the stop finished. Commands the busy path already handles mid-run
+        (/stop, /new, /queue, /status, dispatch-policy commands) and plain text are untouched."""
+        state = self._peek_session_state(_quick_key)
+        if state is None or not getattr(state.turn, "stopping", False):
+            return
+        _cmd = event.get_command()
+        if not _cmd:
+            return
+        from hermes_cli.commands import resolve_command
+        cmd_def = resolve_command(_cmd)
+        if cmd_def is None or not self._busy_slash_would_reject(cmd_def):
+            return
+        started = time.monotonic()
+        deadline = started + _STOP_SETTLE_WAIT_S
+        while self._is_session_running(_quick_key) and time.monotonic() < deadline:
+            current = self._peek_session_state(_quick_key)
+            if current is None or not getattr(current.turn, "stopping", False):
+                break
+            await asyncio.sleep(0.05)
+        logger.info(
+            "PHASE=stop_settle_wait key=%s cmd=/%s waited=%.2fs released=%s",
+            _quick_key, cmd_def.name, time.monotonic() - started, not self._is_session_running(_quick_key),
+        )
+
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
@@ -1528,6 +1559,8 @@ class GatewayInboundMixin:
         if self._is_session_running(_quick_key):
             # Reads state.db (``_is_session_ended_in_db``) under the store lock: off the loop.
             await asyncio.to_thread(self._hm_evict_reaped_agent, _quick_key)
+        if self._is_session_running(_quick_key) and not is_internal:
+            await self._hm_wait_for_stop_to_settle(event, _quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
         # Flush window (t_d659b247): ``_run_agent``'s finally released the SLOT, but the previous
@@ -1579,18 +1612,14 @@ class GatewayInboundMixin:
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
+        _limit_message = self._active_session_limit_message(_quick_key)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             if _checkout_ticket is not None:
                 _checkout_ticket.release()
             return _limit_message
 
-        event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
-
         _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
@@ -1602,12 +1631,26 @@ class GatewayInboundMixin:
         if not hasattr(self, "_running_agent_tasks"):
             self._running_agent_tasks = {}  # self-heal for object.__new__ partials
         self._running_agent_tasks[_quick_key] = asyncio.current_task()
-        from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
-        start_reply_clock(source, internal=is_internal)
-        self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _active_session_lease = None
 
         try:
+            _active_session_lease, _limit_message = await self._claim_active_session_slot_off_loop(
+                _quick_key, source,
+            )
+            if not self._is_session_run_current(_quick_key, _run_generation):
+                if _active_session_lease is not None:
+                    self._release_active_session_lease(_active_session_lease)
+                raise asyncio.CancelledError
+            if _limit_message is not None:
+                return _limit_message
+            _claim_state.turn.lease = _active_session_lease
+            # Registry refusal must leave the orphan FIFO untouched.
+            event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+            _claim_state.turn.event = event
+            from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
+            start_reply_clock(source, internal=is_internal)
+            self._persist_active_agents()
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
@@ -1654,6 +1697,11 @@ class GatewayInboundMixin:
                 finally:
                     if _checkout_ticket is not None:
                         _checkout_ticket.release()
+                    if _active_session_lease is not None:
+                        # Runner-owned cleanup is joined at shutdown, not here:
+                        # delayed registry I/O must not hold the completed reply
+                        # outside the adapter's delivery/recovery lifecycle.
+                        self._release_active_session_lease(_active_session_lease)
 
     def _hm_lease_rejection_reply(self, event: "MessageEvent", source: SessionSource, _quick_key: str) -> str:
         """The fail-closed turn-lease rejection reply (``gateway.busy.another_turn_running``), after
@@ -2411,8 +2459,9 @@ class GatewayInboundMixin:
 
         await adapter.handle_message(MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
-            allow_gateway_control=False,
+            allow_gateway_control=False, wake_kind="plugin",
             metadata={
+                "wake_name": str(plugin_id or "")[:60],
                 "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,

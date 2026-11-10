@@ -447,6 +447,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     from gateway.kanban_watchers_common import _to_thread_process_service, _wake_downgrade_reason
     from gateway.kanban_watchers_notifier import _adapter_for_subscription
     from gateway.wake import adapter_supports_push, deliver_wake
+    from gateway.wake_kind import KANBAN, kanban_wake_sub, wake_meta
     from hermes_cli import kanban_db as kb
 
     state = getattr(runner, "_kanban_pending_wakes", None)
@@ -510,7 +511,9 @@ async def tick(runner: Any, *, now: Optional[float] = None,
                 )
                 await deliver_wake(
                     adapter, text=text, session_id=row.get("session_key") or "", source=source,
-                    metadata={_fresh.META_KEY: [_fresh.card_entry(
+                    wake_kind=KANBAN,
+                    metadata={**wake_meta(sub=kanban_wake_sub(row.get("kinds") or ()), card_id=task_id),
+                              _fresh.META_KEY: [_fresh.card_entry(
                         row.get("board") or None, task_id, row.get("kinds") or (),
                         row.get("event_ts"), text,
                     )]},
@@ -518,7 +521,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             else:
                 await deliver_wake(
                     adapter, text=text, session_id=row.get("session_key") or chat_id,
-                    profile=sub_profile,
+                    profile=sub_profile, wake_kind=KANBAN,
                 )
         except Exception as exc:
             logger.warning("kanban wake deferred-fire failed for %s on %s/%s: %s; kept for retry",

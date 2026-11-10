@@ -117,6 +117,133 @@ def _write_pool(fleet: Path, *, roles=None, sidecar=None):
     return sidecar
 
 
+@pytest.mark.parametrize("bad", [
+    {"roles": {}, "state": "active"},
+    {"roles": {"kanban-worker": {"slots": 0}}, "state": "active"},
+    {"roles": {"kanban-worker": {}}, "state": "invalid"},
+    None,
+])
+def test_reader_quarantines_invalid_role_host_not_whole_fleet(tmp_path, bad):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "ace-media": bad,
+        "studio-arm": {"roles": {}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+    assert any("ace-media" in w and "host dropped" in w for w in cfg.warnings)
+    assert any("studio-arm" in w and "non-empty" in w for w in cfg.warnings)
+    # Authoring validators remain strict; only the runtime read quarantines rows.
+    with pytest.raises(kwp.PoolError):
+        kwp.parse_roles(roles)
+
+
+@pytest.mark.parametrize("bad", [[], "kanban-worker", 7])
+def test_reader_drops_a_host_row_that_is_not_an_object(tmp_path, bad):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "ace-media": bad,
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+    assert any("ace-media" in w and "host dropped" in w for w in cfg.warnings)
+
+
+def test_reader_incident_shape_keeps_n_minus_one_hosts(tmp_path):
+    """2026-11-07 11:54: review-worker cut from every row left studio-arm ``roles: {}``
+    and the whole file was refused (pool=0). Only studio-arm may drop now."""
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}, "ci-runner": {}}, "state": "active"},
+        "ace-media": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "studio-arm": {"roles": {}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai", "ace-media"]
+    assert [w for w in cfg.warnings if "studio-arm" in w] == [
+        "kanban pool: fleet-roles.json: host studio-arm: roles must be a non-empty object (host dropped)"]
+
+
+def test_reader_envelope_errors_still_refuse_the_file(tmp_path):
+    _write_pool(tmp_path, roles={"schema": 2, "hosts": {}})
+    assert kwp.read_pool(tmp_path).refused == "roles"
+    _write_pool(tmp_path, roles={"schema": 1, "hosts": []})
+    assert kwp.read_pool(tmp_path).refused == "roles"
+
+
+def _pager_calls(tmp_path, monkeypatch, rc=0):
+    from gateway import kanban_gate_tick as gt
+    script = tmp_path / "scripts" / "lib" / "episode_pager.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.touch()
+    calls = []
+    monkeypatch.setattr(gt.subprocess, "run", lambda argv, **kw: (
+        calls.append((argv, kw)) or gt.subprocess.CompletedProcess(argv, rc, "paged", "")))
+    return gt, calls
+
+
+def test_all_hosts_malformed_is_zero_pool_and_pages_with_per_host_reason(tmp_path, monkeypatch):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {}, "state": "active"},
+        "ace-media": None,
+    }}
+    _write_pool(tmp_path / "fleet", roles=roles)
+    cfg = kwp.read_pool(tmp_path / "fleet")
+    assert cfg.refused is None and cfg.pool_hosts == ()
+    gt, calls = _pager_calls(tmp_path, monkeypatch)
+    assert gt.pool_health(tmp_path, cfg) is True
+    (argv, kw), = calls
+    assert argv[2:5] == ["page", "--producer", "kanban-pool-health"]
+    text = argv[argv.index("--text") + 1]
+    assert "0 usable hosts" in text and "ace-ai" in text and "ace-media" in text
+    assert argv[argv.index("--severity") + 1] == "notice"   # notice -> #logs
+    assert argv[argv.index("--via") + 1] == "fleet-alert"
+    assert kw["timeout"] == 10 and kw["stdin"] == gt.subprocess.DEVNULL
+
+
+def test_pool_health_pages_once_per_state_and_clears_on_recovery(tmp_path, monkeypatch):
+    gt, calls = _pager_calls(tmp_path, monkeypatch)
+    last = None
+    for cfg in (kwp.PoolConfig(), kwp.PoolConfig(refused="roles", warnings=("broken roles",)),
+                kwp.PoolConfig(pool_hosts=(_host(),)), kwp.PoolConfig(pool_hosts=(_host(),))):
+        last = gt.pool_health(tmp_path, cfg, last)
+    # bad, bad (same state: no spawn), healthy (clear), healthy (no spawn)
+    assert [argv[2] for argv, _ in calls] == ["page", "clear"]
+    assert last is False
+    assert all("pool-unavailable" in argv for argv, _ in calls)
+
+
+def test_pool_health_failed_send_retries_next_tick(tmp_path, monkeypatch):
+    gt, calls = _pager_calls(tmp_path, monkeypatch, rc=3)
+    last = gt.pool_health(tmp_path, kwp.PoolConfig())
+    assert last is None
+    gt.pool_health(tmp_path, kwp.PoolConfig(), last)
+    assert [argv[2] for argv, _ in calls] == ["page", "page"]
+
+
+def test_pool_health_noop_without_pager(tmp_path):
+    from gateway import kanban_gate_tick as gt
+    assert gt.pool_health(tmp_path, kwp.PoolConfig(), None) is None
+
+
+def test_idle_tick_still_pages_an_empty_pool(kanban_home, monkeypatch):
+    """A quiet board (no plan needed) must not hide pool=0 (t_c1c6eb0f)."""
+    _write_pool(kanban_home / "fleet", roles={"schema": 1, "hosts": {
+        "ace-ai": {"roles": {}, "state": "active"}}})
+    gt, calls = _pager_calls(kanban_home, monkeypatch)
+    gate, b = _admitting_builder(kanban_home / "fleet", V01)
+    assert b.plan_pool([{"slug": "default"}], {}) is None
+    assert gate.pool == {"planned": False, "reason": "not_needed"}
+    assert [argv[2] for argv, _ in calls] == ["page"]
+    b.plan_pool([{"slug": "default"}], {})        # throttled + same state: no second spawn
+    assert len(calls) == 1
+
+
 def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     _write_pool(tmp_path)
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
@@ -166,8 +293,10 @@ def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path)
     assert kwp.parse_roles(doc({"ci-runner": {}})) == {"a": ({"ci-runner": None}, "active")}
     assert kwp.parse_roles(doc({"ci-runner": {"slots": 3}})) == {"a": ({"ci-runner": 3}, "active")}
     assert kwp.parse_roles(doc({"kanban-worker": {}})) == {"a": ({"kanban-worker": None}, "active")}
+    # review-worker is membership only since hermes-home#9338 (t_e85e77b7).
+    assert kwp.parse_roles(doc({"review-worker": {}})) == {"a": ({"review-worker": None}, "active")}
     with pytest.raises(kwp.PoolError, match=r'must be \{"slots": N\}'):
-        kwp.parse_roles(doc({"review-worker": {}}))
+        kwp.parse_roles(doc({"other-role": {}}))
     with pytest.raises(kwp.PoolError, match="ci-runner must be"):
         kwp.parse_roles(doc({"ci-runner": {"slots": 3, "x": 1}}))
     with pytest.raises(kwp.PoolError, match="slots must be 1..64"):
@@ -282,10 +411,77 @@ def test_probe_host_one_ssh_call_parses_or_fails_closed():
     assert kwp.probe_host(_host(), runner=runner) == (3.1, 16)
     argv, timeout = calls[0]
     assert len(calls) == 1 and timeout == 8
-    assert "ConnectTimeout=4" in argv and argv[-1] == "cat /proc/loadavg; getconf _NPROCESSORS_ONLN"
+    assert "ConnectTimeout=4" in argv and "@@hermes-probe-v1" in argv[-1]
     assert argv[-2] == "kanbanw@ace-ai"
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(255, "")) is None
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(0, "garbage")) is None
+
+
+def test_probe_stale_mux_retries_direct_not_unreachable():
+    """t_64342f07: the muxed probe failed on a stale ControlMaster / cold
+    handshake while the host answered ssh; one direct retry must read it."""
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append((argv, kw["timeout"]))
+        if "ControlPath=none" not in argv:
+            p = _Proc(255, "")
+            p.stderr = "mux_client_request_session: read from master failed: Broken pipe"
+            return p
+        return _Proc(0, "3.10 2.00 1.00 1/200 99\n16\n")
+
+    assert kwp.probe_host(_host(), runner=runner) == (3.1, 16)
+    assert len(calls) == 2
+    direct, timeout = calls[1]
+    assert "ControlMaster=no" in direct and "ConnectTimeout=10" in direct
+    assert timeout == kwp.DIRECT_PROBE_TIMEOUT_SECONDS
+
+
+def test_probe_failure_keeps_last_sample_then_unreachable_never_sticky():
+    mem = kwp.ProbeMemory()
+    ok = lambda a, **k: _Proc(0, "3.10 2.00 1.00 1/200 99\n16\n")
+
+    def down(argv, **kw):
+        raise kwp.subprocess.TimeoutExpired(argv, kw["timeout"])
+
+    h = _host()
+    assert kwp.probe_host(h, runner=ok, memory=mem, now=1000.0) == (3.1, 16)
+    assert kwp.probe_note(h, mem) == ""
+    for i in range(kwp.PROBE_GRACE_FAILS):
+        assert kwp.probe_host(h, runner=down, memory=mem, now=1060.0 + i) == (3.1, 16)
+    note = kwp.probe_note(h, mem)
+    assert "reusing last sample" in note and "timeout after" in note and "ssh probe kanbanw@ace-ai" in note
+    assert kwp.probe_host(h, runner=down, memory=mem, now=1200.0) is None
+    note = kwp.probe_note(h, mem)
+    assert f"failed {kwp.PROBE_GRACE_FAILS + 1}x" in note and "last tried" in note and "last ok" in note
+    assert "reusing" not in note
+    # Not sticky: the next good probe clears it.
+    assert kwp.probe_host(h, runner=ok, memory=mem, now=1260.0) == (3.1, 16)
+    assert kwp.probe_note(h, mem) == ""
+
+
+def test_probe_grace_expires_by_age():
+    mem = kwp.ProbeMemory()
+    h = _host()
+    kwp.probe_host(h, runner=lambda a, **k: _Proc(0, "1 1 1 1/1 1\n8\n"), memory=mem, now=0.0)
+    assert kwp.probe_host(h, runner=lambda a, **k: _Proc(255, ""), memory=mem,
+                          now=kwp.PROBE_GRACE_SECONDS + 1.0) is None
+
+
+def test_plan_unreachable_reason_names_probe_error(monkeypatch, tmp_path):
+    mem = kwp.ProbeMemory()
+    monkeypatch.setattr(kwp, "_PROBE_MEMORY", mem)
+    h = _host(slots=4)
+
+    def probe(host):
+        return kwp.probe_host(host, runner=lambda a, **k: _Proc(255, ""), memory=mem)
+
+    from hermes_cli import placement_policy as pp
+    signal = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=tmp_path, clock=lambda: 1.0)
+    p = kwp.plan([h], {}, probe=probe, signal=signal)
+    why = p.detail["ace-ai"]["pressure"]
+    assert why.startswith("host unreachable (ssh probe kanbanw@ace-ai failed 1x (mux: ssh rc=255; direct: ssh rc=255)")
+    assert "pool_unavailable (ace-ai: host unreachable (ssh probe" in p.full_reason()
 
 
 def _cgroup_ssh(argv, **kw):
@@ -294,7 +490,13 @@ def _cgroup_ssh(argv, **kw):
     each core-count command the way the real host did as kanbanw."""
     cmd = argv[-1]
     load = "12.00 9.00 7.00 1/900 99"  # ordinary ace-ai load1, under 0.8 x 24
-    if "; getconf _NPROCESSORS_ONLN" in cmd:
+    if "SC_NPROCESSORS_ONLN" in cmd:
+        import json
+        return _Proc(0, "@@hermes-probe-v1\n" + json.dumps({
+            "schema": 1, "load1": 12.0, "load5": 9.0, "ncpu": 24,
+            "remote_now": 1791200100, "pressure_text": "{}",
+        }) + "\n")
+    if "os.cpu_count()" in cmd:
         ncpu = "24"
     elif "; nproc" in cmd:
         ncpu = "8"
@@ -582,10 +784,10 @@ def test_human_review_lane_rows_are_dropped_before_routing(kanban_home, monkeypa
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         kinds = [r[0] for r in conn.execute(
             "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (review,))]
-    assert review in res.skipped_nonspawnable
+    assert review not in res.skipped_nonspawnable
     assert review not in res.placement_waits
     assert all(e["task_id"] != review for e in res.routes)
-    assert kinds.count("skipped_nonspawnable") == 1
+    assert kinds.count("needs_operator") == 1
     assert (work, "ace-ai") in spawned
 
 
@@ -816,7 +1018,8 @@ def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
         conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), tid))
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
-    assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files"
+    # t_e7c03f48: the reason names the first path the remote cannot reproduce (split_reason keeps the code).
+    assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files(handoff.md)"
 
 
 # -- Prism round 1 (PR #1730) -----------------------------------------------

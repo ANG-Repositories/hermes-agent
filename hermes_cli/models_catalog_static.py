@@ -31,7 +31,8 @@ _OPENROUTER_DESCRIPTIONS = {
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     (mid, _OPENROUTER_DESCRIPTIONS.get(mid, "free" if mid.endswith(":free") else ""))
     for mid in (
-        "anthropic/claude-fable-5.1", "anthropic/claude-fable-5", "anthropic/claude-opus-5.5",
+        "anthropic/claude-fable-5.2", "anthropic/claude-fable-5.1", "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5.5",
         "anthropic/claude-opus-5.5-fast",  # fork #910: the dedicated fast SKU (OpenRouter-only)
         "anthropic/claude-opus-5", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.8-fast",
         "anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-5.5", "anthropic/claude-haiku-4.5",
@@ -170,8 +171,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Used by /model counts and provider_model_ids fallback when /v1/models is unavailable.
     "openai": list(_OPENAI_CHAT_MODELS),
     "openai-api": [
-        "gpt-6.1-sol", "gpt-6.1-sol-pro", "gpt-6-sol", "gpt-6-sol-pro", "gpt-6-luna", "gpt-6-luna-pro",
-        "gpt-5.6-sol", "gpt-5.6-sol-pro", "gpt-5.6-terra", "gpt-5.6-terra-pro", "gpt-5.6-luna",
+        "gpt-6.1-sol", "gpt-6.1-sol-pro", "gpt-6.1-terra", "gpt-6.1-terra-pro", "gpt-6-sol", "gpt-6-sol-pro",
+        "gpt-6-luna", "gpt-6-luna-pro", "gpt-5.6-sol", "gpt-5.6-sol-pro", "gpt-5.6-terra", "gpt-5.6-terra-pro", "gpt-5.6-luna",
         "gpt-5.6-luna-pro", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
         "gpt-5-mini", "gpt-5.3-codex", "gpt-4.1", "gpt-4o", "gpt-4o-mini",
     ],
@@ -213,7 +214,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "minimax-oauth": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
     "minimax-cn": list(_MINIMAX_MODELS),
     "anthropic": [
-        "claude-fable-5.1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5",
+        "claude-fable-5.2", "claude-fable-5.1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5",
         "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
         "claude-sonnet-4-6", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929",
         "claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-haiku-5-5", "claude-haiku-4-5-20251001",

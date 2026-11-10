@@ -292,6 +292,13 @@ os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 #: even with this block removed.
 HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
 
+# Runtime identity used to be warmed by the guard's eager state/auth imports.
+# Resolve it explicitly before tests install subprocess doubles; plugin metadata
+# must not run git through a fake meant for a player, worker, or updater child.
+from hermes_cli.version_info import get_version_info as _test_runtime_version
+_test_runtime_version()
+
+
 # ── Host-rendezvous isolation ───────────────────────────────────────────────
 # ``gateway/host_rendezvous.py`` publishes ONE record per role per OS USER, in
 # ``$HERMES_GATEWAY_LOCK_DIR`` else ``$XDG_STATE_HOME/hermes/gateway-locks`` —
@@ -375,6 +382,10 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     #     reach the live board through a pin or through a home nested under
     #     ~/.hermes. Tests of pin precedence opt out with ``kanban_pins``.
     monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    # fleet_placement resolves PLACEMENT_HOME before the kanban root; an inherited one
+    # (test-gate exported ~/.hermes) made tests rewrite the LIVE config/fleet-hosts.json
+    # (t_dbacd1f2). Tests of PLACEMENT_HOME precedence set it themselves.
+    monkeypatch.delenv("PLACEMENT_HOME", raising=False)
 
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
