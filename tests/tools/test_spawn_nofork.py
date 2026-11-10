@@ -1,17 +1,21 @@
-"""Terminal-tool spawns must not fork the gateway (t_afc525a2).
+"""Terminal-tool spawns must not fork the gateway where fork copies it (t_afc525a2).
 
 ``Popen(cwd=..., start_new_session=True)`` and the default ``close_fds=True`` send CPython
 to ``_posixsubprocess.fork_exec``, which on macOS forks the whole (6 GB) gateway with the
 GIL held. These tests make that path raise and require the terminal tool and the shell
 lint to keep working, with the same cwd / env / stdin / session / fd / timeout / group-kill
-semantics. Real subprocesses throughout: a mock cannot show group membership or fd
-inheritance. The GIL-hold numbers come from ``tests/tools/spawn_gil_bench.py``.
+semantics. The no-fork path is forced on every POSIX host (it is the production path on
+macOS only) so Linux CI exercises it too. Real subprocesses throughout: a mock cannot show
+group membership or fd inheritance. GIL-hold numbers: ``tests/tools/spawn_gil_bench.py``.
+Parity with plain Popen over hostile environments: ``test_spawn_parity.py``.
 """
 
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import sys
 import time
 
 import pytest
@@ -35,8 +39,14 @@ def posix_spawn_setsid_supported():
     return True
 
 
+@pytest.fixture
+def force_nofork(monkeypatch):
+    monkeypatch.setattr(nofork, "_FORK_COPIES_PARENT", True)
+    monkeypatch.delenv("HERMES_SPAWN_LEGACY", raising=False)
+
+
 @pytest.fixture(params=["native", "unsupported-setsid"])
-def no_fork_exec(monkeypatch, posix_spawn_setsid_supported, request, record_property):
+def no_fork_exec(monkeypatch, force_nofork, posix_spawn_setsid_supported, request, record_property):
     """Forbid forks except the required session-preserving setsid fallback.
 
     Run the same real-process semantics with setsid forced unavailable as well.
@@ -73,7 +83,10 @@ def no_fork_exec(monkeypatch, posix_spawn_setsid_supported, request, record_prop
         result = real_execute(self, *args, **kwargs)
         # Popen has now consumed the exec-error pipe. fork_exec returning alone
         # does not mean the child has reached setsid yet.
-        assert os.getpgid(self.pid) == os.getsid(self.pid) == self.pid
+        # Popen.__init__ passes the POSIX ABI positionally; start_new_session is
+        # args[21] (see nofork._popen_class parameters).
+        if kwargs.get("start_new_session", len(args) > 21 and args[21]):
+            assert os.getpgid(self.pid) == os.getsid(self.pid) == self.pid
         return result
 
     monkeypatch.setattr(subprocess.Popen, "_execute_child", checked_execute)
@@ -156,23 +169,22 @@ def test_timeout_returns_124_and_reaps_the_group(no_fork_exec, env, tmp_path):
     assert not _alive(grandchild)
 
 
-def test_missing_cwd_fails_inside_the_child_not_the_gateway(no_fork_exec, env, tmp_path):
-    import tools.environments.local as local
-    proc = nofork.spawn_popen([local._POSIX_SH, "-c", local._CD_THEN_EXEC, "sh",
-                               str(tmp_path / "gone"), "/bin/echo", "ran"],
-                              new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def test_missing_cwd_fails_inside_the_child_not_the_gateway(force_nofork, tmp_path):
+    proc = nofork.spawn_popen(["/bin/echo", "ran"], cwd=str(tmp_path / "gone"),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     out, _ = proc.communicate(timeout=10)
     assert proc.returncode == 126 and "ran" not in out
     assert "hermes: cannot enter working directory:" in out
 
 
-def test_inheritable_fds_are_not_passed_to_the_child(no_fork_exec, tmp_path):
+@pytest.mark.parametrize("new_session", [False, True])
+def test_inheritable_fds_are_not_passed_to_the_child(no_fork_exec, tmp_path, new_session):
     read_end, write_end = os.pipe()
     os.set_inheritable(write_end, True)  # a leak close_fds=True used to stop
     try:
         proc = nofork.spawn_popen(
             ["/bin/sh", "-c", f'[ -e /dev/fd/{write_end} ] && echo leaked || echo closed'],
-            new_session=True, stdout=subprocess.PIPE, text=True)
+            new_session=new_session, stdout=subprocess.PIPE, text=True)
         out, _ = proc.communicate(timeout=10)
     finally:
         os.close(read_end)
@@ -187,14 +199,53 @@ def test_parse_check_does_not_fork(no_fork_exec):
     assert ok is False and "syntax error" in msg
 
 
-def test_run_nofork_timeout_kills_child(no_fork_exec):
-    started = time.monotonic()
-    with pytest.raises(subprocess.TimeoutExpired):
-        nofork.run_nofork(["/bin/sleep", "30"], stdout=subprocess.PIPE, timeout=0.5)
-    assert time.monotonic() - started < 10
+def test_run_nofork_timeout_does_not_wait_for_descendants(no_fork_exec, monkeypatch, tmp_path):
+    """subprocess.run's POSIX contract: kill, wait, re-raise with the output so far.
+
+    A second communicate() would block until the backgrounded sleep closes the pipe.
+    """
+    marker = tmp_path / "bg.pid"
+    calls = []
+    real_communicate = subprocess.Popen.communicate
+
+    def counted(self, input=None, timeout=None):
+        calls.append(timeout)
+        return real_communicate(self, input, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", counted)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as info:
+            nofork.run_nofork(["/bin/sh", "-c", f"printf partial; sleep 60 & echo $! > '{marker}'; wait"],
+                              capture_output=True, timeout=1)
+        assert calls == [1], "communicate() must not run again after the timeout"
+        assert info.value.stdout == b"partial"
+    finally:
+        if marker.exists():
+            os.kill(int(marker.read_text()), signal.SIGKILL)
 
 
-def test_plain_popen_when_platform_lacks_setsid(monkeypatch):
+@pytest.mark.parametrize("new_session", [False, True])
+def test_launch_errors_raise_from_the_constructor(force_nofork, tmp_path, new_session):
+    plain = tmp_path / "not-executable"
+    plain.write_text("#!/bin/sh\necho ran\n")
+    with pytest.raises(FileNotFoundError):
+        nofork.spawn_popen([str(tmp_path / "missing")], new_session=new_session)
+    with pytest.raises(PermissionError):
+        nofork.spawn_popen([str(plain)], new_session=new_session)
+    with pytest.raises(PermissionError):
+        nofork.spawn_popen([str(tmp_path)], new_session=new_session)
+
+
+def test_only_platforms_whose_fork_copies_the_parent_avoid_popen(monkeypatch):
+    """Off macOS fork_exec does not copy the parent: the terminal tool is main's Popen."""
+    monkeypatch.delenv("HERMES_SPAWN_LEGACY", raising=False)
+    import importlib
+    importlib.reload(nofork)
+    assert nofork.eligible(["/bin/true"], {"cwd": "/"}) is (
+        sys.platform == "darwin" and hasattr(os, "posix_spawn"))
+
+
+def test_plain_popen_when_platform_lacks_setsid(force_nofork, monkeypatch):
     real = os.posix_spawn
 
     def no_setsid(*args, **kwargs):
@@ -227,16 +278,17 @@ def test_plain_popen_when_platform_lacks_setsid(monkeypatch):
         proc.wait(timeout=10)
 
 
-def test_ineligible_calls_keep_plain_popen_semantics(tmp_path):
+def test_ineligible_calls_keep_plain_popen_semantics(force_nofork, tmp_path):
+    assert not nofork.eligible(["/bin/sh"], {"pass_fds": ()})
     proc = nofork.spawn_popen(["/bin/sh", "-c", 'pwd -P; echo "$$ $(ps -o pgid= -p $$)"'], new_session=True,
-                              cwd=str(tmp_path), stdout=subprocess.PIPE, text=True)
+                              cwd=str(tmp_path), stdout=subprocess.PIPE, text=True, pass_fds=())
     out = proc.communicate(timeout=10)[0].split("\n")
     assert out[0] == os.path.realpath(tmp_path)
     pid, pgid = (int(x) for x in out[1].split())
     assert pid == pgid
 
 
-def test_legacy_env_switch_forces_plain_popen(monkeypatch):
+def test_legacy_env_switch_forces_plain_popen(force_nofork, monkeypatch):
     monkeypatch.setenv("HERMES_SPAWN_LEGACY", "1")
     assert not nofork.eligible(["/bin/true"], {})
     monkeypatch.delenv("HERMES_SPAWN_LEGACY")
@@ -255,6 +307,7 @@ def test_popen_function_import_and_execute(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "Popen", replacement)
     importlib.reload(nofork)
+    monkeypatch.setattr(nofork, "_FORK_COPIES_PARENT", True)
     importlib.reload(local)
     environment = local.LocalEnvironment(cwd=str(tmp_path), timeout=10)
     try:
@@ -265,14 +318,14 @@ def test_popen_function_import_and_execute(monkeypatch, tmp_path):
         environment.cleanup()
 
 
-def test_symlinked_cwd_is_physical(no_fork_exec, tmp_path):
+def test_symlinked_cwd_matches_plain_popen(no_fork_exec, tmp_path):
     real = tmp_path / "real"
     real.mkdir()
     link = tmp_path / "link"
     link.symlink_to(real, target_is_directory=True)
     environment = LocalEnvironment(cwd=str(link), timeout=10)
     try:
-        result = environment.execute('printf "%s\\n" "$PWD"')
+        result = environment.execute("pwd -P")
         assert result["returncode"] == 0 and result["output"].strip() == str(real.resolve())
     finally:
         environment.cleanup()
@@ -297,7 +350,7 @@ def test_late_inheritable_fd_is_closed(no_fork_exec, monkeypatch, tmp_path):
         os.close(secret)
 
 
-def test_explicit_standard_fd_keeps_new_session(tmp_path):
+def test_explicit_standard_fd_keeps_new_session(force_nofork, tmp_path):
     output = tmp_path / "session"
     proc = nofork.spawn_popen(
         ["/bin/sh", "-c", f'echo "$$" > "{output}"; sleep 30'],
@@ -310,19 +363,22 @@ def test_explicit_standard_fd_keeps_new_session(tmp_path):
 
 
 @pytest.mark.parametrize("disposition", ["SIG_DFL", "SIG_IGN"])
-def test_restore_signals_false_preserves_parent(monkeypatch, disposition):
-    import signal
-
+def test_child_signal_dispositions_match_popen(force_nofork, disposition):
+    """restore_signals=True is the only eligible value: SIGPIPE is default in the child
+    whatever the parent's disposition, as plain Popen leaves it."""
     old = signal.getsignal(signal.SIGPIPE)
     try:
         signal.signal(signal.SIGPIPE, getattr(signal, disposition))
-        monkeypatch.setattr(nofork, "_HAVE_CLOSEFROM", False)
-        result = nofork.run_nofork(
-            ["/bin/sh", "-c", "kill -PIPE $$; printf survived"],
-            restore_signals=False, capture_output=True)
-        assert result.returncode == (-signal.SIGPIPE if disposition == "SIG_DFL" else 0)
+        cmd = ["/bin/sh", "-c", "kill -PIPE $$; printf survived"]
+        result = nofork.run_nofork(cmd, capture_output=True)
+        plain = subprocess.run(cmd, capture_output=True)
+        assert result.returncode == plain.returncode == -signal.SIGPIPE
     finally:
         signal.signal(signal.SIGPIPE, old)
+
+
+def test_restore_signals_false_is_plain_popen(force_nofork):
+    assert not nofork.eligible(["/bin/true"], {"restore_signals": False})
 
 
 def test_exported_functions_preserved_without_overriding_cwd(no_fork_exec, env, tmp_path):

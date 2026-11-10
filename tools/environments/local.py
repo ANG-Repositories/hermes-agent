@@ -32,10 +32,6 @@ from tools.spawn_nofork import spawn_popen
 
 
 _IS_WINDOWS = platform.system() == "Windows"
-# POSIX spawn trampoline: $1 is cwd, the rest is the command argv.
-# Startup files run only in the real command, never in the trampoline.
-_POSIX_SH = "/system/bin/sh" if hasattr(sys, "getandroidapilevel") else "/bin/sh"
-_CD_THEN_EXEC = 'CDPATH= command cd -P -- "$1" || { printf "hermes: cannot enter working directory: %s\\n" "$1" >&2; exit 126; }; shift; command exec "$@"'
 
 logger = logging.getLogger(__name__)
 
@@ -1048,20 +1044,14 @@ class LocalEnvironment(BaseEnvironment):
         popen_kwargs = dict(
             text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL)
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL, cwd=self.cwd)
         if _IS_WINDOWS:
-            proc = subprocess.Popen(args, start_new_session=True, cwd=self.cwd,
+            proc = subprocess.Popen(args, start_new_session=True,
                                     creationflags=windows_hide_flags(), **popen_kwargs)
         else:
-            # cwd= / start_new_session= make Popen fork the whole gateway under the GIL
-            # (t_afc525a2). posix_spawn has no chdir, so a shell cds and execs bash: same pid,
-            # same argv for bash, and the login profile still starts in self.cwd.
-            # Privileged bash skips startup files and function imports but keeps
-            # exported functions in env for the real command (dash would strip them).
-            trampoline = ([_POSIX_SH] if hasattr(sys, "getandroidapilevel") else
-                          [args[0], "--noprofile", "--norc", "-p"])
-            proc = spawn_popen([*trampoline, "-c", _CD_THEN_EXEC, "sh", self.cwd, *args],
-                               new_session=True, **popen_kwargs)
+            # On macOS Popen(cwd=, start_new_session=) forks the whole gateway under the
+            # GIL (t_afc525a2); spawn_popen posix_spawns there and is plain Popen elsewhere.
+            proc = spawn_popen(args, new_session=True, **popen_kwargs)
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
