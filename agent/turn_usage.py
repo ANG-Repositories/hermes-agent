@@ -147,6 +147,11 @@ def record_response_usage(
     billed_aggregator = relay_billed_usage(getattr(response, "usage", None), aggregator_usage)
     billed_usage = billed_aggregator if _moa_ref_usage is None else billed_aggregator + _moa_ref_usage
     billed_flags = {key: bool(getattr(billed_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
+    # A multi-request bill sums several prompts; a context-tiered price is chosen per request, so the
+    # tier basis is the last request's own prompt (t_caa85ee7). None = the bill is one request.
+    _tier_prompt_tokens = (
+        None if billed_aggregator is aggregator_usage else int(aggregator_usage.prompt_tokens or 0)
+    )
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
     total_tokens = canonical_usage.total_tokens
@@ -308,10 +313,12 @@ def record_response_usage(
                 "cache_read_tokens": billed_usage.cache_read_tokens,
                 "cache_write_tokens": billed_usage.cache_write_tokens,
                 # The last request's own split: the finalizer's /context window decomposition
-                # reads these, never the multi-request bill above.
-                "context_input_tokens": usage_dict["input_tokens"],
-                "context_cache_read_tokens": usage_dict["cache_read_tokens"],
-                "context_cache_write_tokens": usage_dict["cache_write_tokens"],
+                # reads these, never the multi-request bill above. Pre-fold aggregator usage, like
+                # context_used: MoA advisor prompts are not in this window (t_caa85ee7).
+                "context_input_tokens": aggregator_usage.input_tokens,
+                "context_cache_read_tokens": aggregator_usage.cache_read_tokens,
+                "context_cache_write_tokens": aggregator_usage.cache_write_tokens,
+                "tier_prompt_tokens": _tier_prompt_tokens,
                 "latency_s": api_duration,
                 "composition": call_composition,
                 "provider": _route["provider"],
@@ -382,6 +389,7 @@ def record_response_usage(
                 _turn_call["pricing_calls"] = _loop._build_moa_pricing_calls(
                     _moa_ref_pricing_calls, billed_aggregator, aggregator_model=_agg_cost_model,
                     aggregator_provider=_agg_cost_provider, aggregator_base_url=_agg_cost_base_url,
+                    aggregator_tier_prompt_tokens=_tier_prompt_tokens,
                 )
                 # Ledger each physical advisor/aggregator call as a child of this composite call's
                 # virtual turn_api_calls row (card t_02323499).
@@ -399,6 +407,7 @@ def record_response_usage(
     cost_result = estimate_usage_cost(
         _agg_cost_model, billed_aggregator, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
+        tier_prompt_tokens=_tier_prompt_tokens,
     )
     _cost_status = _loop._session_cost_status_with_known_spend(
         _loop._moa_session_cost_status(cost_result, _moa_ref_pricing_calls, _moa_ref_cost),

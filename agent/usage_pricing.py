@@ -3367,7 +3367,10 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
+    tier_prompt_tokens: Optional[int] = None,
 ) -> CostResult:
+    """``tier_prompt_tokens``: the ONE request's prompt size that selects a context tier, when
+    ``usage`` bills several requests (a multi-request relay, t_caa85ee7); default ``usage.prompt_tokens``."""
     from providers import get_provider_profile
     profile = get_provider_profile(provider or '')
     reported = profile.get_usage_cost(model_name, usage) if profile else None
@@ -3404,7 +3407,8 @@ def estimate_usage_cost(
 
     # Whole-request context tier (e.g. Gemini Pro >200k prompts): above the
     # threshold the *_above rates apply to the entire request; None falls back.
-    above = entry.tier_threshold_tokens is not None and usage.prompt_tokens > entry.tier_threshold_tokens
+    _tier_basis = usage.prompt_tokens if tier_prompt_tokens is None else tier_prompt_tokens
+    above = entry.tier_threshold_tokens is not None and _tier_basis > entry.tier_threshold_tokens
     amount = _ZERO
     notes: list[str] = []
     parts: list[Decimal] = []
