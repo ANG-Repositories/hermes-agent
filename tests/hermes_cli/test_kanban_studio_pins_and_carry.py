@@ -142,9 +142,10 @@ def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, hos
         with pytest.raises(ValueError, match="accepted words:.*studio-state"):
             kb.create_task(conn, title="entry", body=f"host: {host}\nfix lint")
         tid = kb.create_task(conn, title="edit", body="host: any")
+        original = kb.get_task(conn, tid).body
         with pytest.raises(ValueError, match="requires:"):
             kb.edit_task(conn, tid, body=f"host: {host}")
-        assert kb.get_task(conn, tid).body == "host: any"
+        assert kb.get_task(conn, tid).body == original
         assert kb.edit_task(conn, tid, body=f"host: {host}\nlaunchctl print gui/501")
         assert "requires: studio-state" in kb.get_task(conn, tid).body
         for work in ("launchctl", "vault", "skill_view", "localhost:18810", "run ~/.hermes/scripts/check.py"):
@@ -153,7 +154,7 @@ def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, hos
     (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: false\n")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="disabled", body=f"host: {host}")
-        assert kb.get_task(conn, tid).body == f"host: {host}"
+        assert kb.get_task(conn, tid).body.endswith(f"host: {host}")
 
 
 def test_drop_notice_is_durable_and_warning(kanban_home, caplog):

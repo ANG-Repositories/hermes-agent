@@ -1152,6 +1152,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 f"{d['id']} ({d['score']:.2f})" for d in dup_warning.get("duplicates", [])
             )
             print(f"\n⚠  similar card(s) created in the last 24h: {similar}", file=sys.stderr)
+        if (task.body or "") != (getattr(args, "body", None) or "") and "requires: studio-state" in (task.body or ""):
+            print(f"placement: {task_id}: auto-derived requires: studio-state from CARD_NEEDS", file=sys.stderr)
         scope_warning = kb.inferred_scope_warning(task.body)
         if scope_warning:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)

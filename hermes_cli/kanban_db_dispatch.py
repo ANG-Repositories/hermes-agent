@@ -5332,6 +5332,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                                                    getattr(plan.config, "pin_aliases", None), studio_reasons)
     if pin_dropped:
         _kwp.note_dropped_studio_pin(row["id"])
+        from hermes_cli.kanban_studio_pin import note_drop
+        note_drop(conn, row["id"], studio_reasons)
     # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None

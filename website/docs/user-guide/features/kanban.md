@@ -1309,6 +1309,24 @@ To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `c
 
 The GUI is deliberately thin. Everything the plugin does is reachable from the CLI; the plugin just makes it comfortable for humans. Auto-assignment, budgets, governance gates, and org-chart views remain user-space — a router profile, another plugin, or a reuse of `tools/approval.py` — exactly as listed in the out-of-scope section of the design spec.
 
+## Studio placement pins
+
+A first-line `host: studio` or `host: mac-studio*` needs a `requires:` line
+naming a Studio-served capability. Create and body edits refuse an unjustified
+pin and list the accepted words from `fleet/host-capabilities.json` (the Studio
+row plus `control-plane-read`). Add `requires: studio-state` only when the task
+needs that state; otherwise remove the pin. When `CARD_NEEDS` already identifies
+Studio relay, launchd, Obsidian vault, skills tree or live Studio tree work, the
+entry path adds `requires: studio-state` and create reports the derivation.
+`kanban.studio_pin_requires_reason: false` disables this entry guard. An absent
+or invalid capability map retains the existing safe-local behavior.
+
+Legacy bare pins can still reach dispatch. The dispatcher logs their removal at
+WARNING (rate-limited per card) and persists one card comment beginning
+`[placement] bare host: studio dropped: add requires:`. Repeated ticks and
+restarts do not duplicate that comment. Placement policy and admission bands
+are unchanged.
+
 ## CLI command reference
 
 This is the surface **you** (or scripts, cron, the dashboard) use to drive the board. Workers running inside the dispatcher use the `kanban_*` [tool surface](#how-workers-interact-with-the-board) for the same operations — the CLI here and the tools there both route through `kanban_db`, so the two surfaces agree by construction.
