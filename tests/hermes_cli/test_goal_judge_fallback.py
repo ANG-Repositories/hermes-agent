@@ -391,7 +391,10 @@ def _slow_kill(monkeypatch, chain, delay):
 @pytest.mark.slow_test(120, reason='Real fresh-interpreter judge children on two sequential routes')
 @pytest.mark.parametrize('reap_delay', [0.0, 0.5, 2.0])
 def test_hung_primary_is_killed_and_sol_wins(tmp_path, monkeypatch, endpoint, caplog, reap_delay):
-    """Apollo 11-08 12:24-12:57: a timed-out primary's slow reap fenced every later rung (cleanup_pending)."""
+    """Apollo 11-08 12:24-12:57: a timed-out primary's slow reap fenced every later rung (cleanup_pending).
+
+    The primary times out on the chain's own 4 s clock whether or not its child got far enough to
+    reach the server, so only the reap and the next rung are under test, never child startup."""
     import logging
     import subprocess
     from hermes_cli import goal_judge_chain as chain
@@ -418,13 +421,16 @@ def test_hung_primary_is_killed_and_sol_wins(tmp_path, monkeypatch, endpoint, ca
     _slow_kill(monkeypatch, chain, reap_delay)
     caplog.set_level(logging.INFO, logger=chain.__name__)
     try:
-        result = goals.judge_goal('verify', 'evidence')
+        # The per-rung ceiling is the judge timeout; without it config `timeout` (the primary's 4 s)
+        # caps Sol too, and a slow interpreter start on a loaded runner eats the whole rung.
+        result = goals.judge_goal('verify', 'evidence', timeout=60)
     finally:
         release.set()
-    assert calls == ['primary', 'gpt-6.1-sol']
+    # The primary may or may not have reached the server before its deadline; Sol must have.
+    assert [m for m in calls if m != 'primary'] == ['gpt-6.1-sol']
     assert result[0] == 'done' and not result[2] and not result[4]
+    assert 'goal judge attempt failed: rung=0 provider=custom model=primary category=timeout' in caplog.text
     assert 'goal judge winner: rung=1 provider=custom model=gpt-6.1-sol served_model=gpt-6.1-sol' in caplog.text
-    assert 'category=timeout' in caplog.text
     # No leftover socket owner, and no fence left behind for the next judge of this home.
     assert [child.poll() is not None for child in children] == [True, True]
     assert str(home) not in chain._CLEANUPS
