@@ -167,3 +167,140 @@ def test_navigation_after_target_selection_is_atomically_refused(pages, monkeypa
     out = fill()
     assert not out["success"], out
     assert current.locator("input").input_value() == wrong.locator("input").input_value() == ""
+
+
+# ---------------------------------------------------------------------------
+# Same-origin iframe login (Apple idmsa: the sign-in widget is an iframe on the page's own origin)
+# ---------------------------------------------------------------------------
+
+_FRAME_PAGES = {
+    "https://site.example.test/top-frame": '<iframe id="aid" src="https://site.example.test/widget"></iframe>',
+    "https://site.example.test/top-both": ('<input type="password" name="toppw">'
+                                           '<iframe id="pay" src="https://pay.other.test/widget"></iframe>'),
+    "https://site.example.test/widget": ('<input autocomplete="username webauthn" id="account_name_text_field">'
+                                         '<input type="text" name="password_hint">'
+                                         '<input type="password" autocomplete="current-password" id="password_text_field">'),
+    "https://pay.other.test/widget": '<input type="password" name="xpw"><input autocomplete="cc-number" name="cc">',
+    "https://site.example.test/top-hidden-none": ('<input type="password" name="toppw">'
+                                                  '<iframe style="display:none" src="https://site.example.test/widget"></iframe>'),
+    "https://site.example.test/top-hidden-opacity": ('<input type="password" name="toppw">'
+                                                     '<iframe style="opacity:0" src="https://site.example.test/widget"></iframe>'),
+    "https://site.example.test/top-hidden-tiny": ('<input type="password" name="toppw">'
+                                                  '<iframe style="width:1px;height:1px;border:0" src="https://site.example.test/widget"></iframe>'),
+    "https://site.example.test/top-hidden-parent": ('<input type="password" name="toppw"><div style="visibility:hidden">'
+                                                    '<iframe src="https://site.example.test/widget"></iframe></div>'),
+}
+
+
+@pytest.fixture
+def frame_page():
+    sync_playwright = pytest.importorskip("playwright.sync_api").sync_playwright
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(args=["--site-per-process"])
+        context = browser.new_context()
+        context.route("https://**/*", lambda route: route.fulfill(
+            body=_FRAME_PAGES.get(route.request.url.split("?")[0], "<p>blank</p>"), content_type="text/html"))
+        try:
+            yield context.new_page()
+        finally:
+            browser.close()
+
+
+def _frame(page, url):
+    return next(f for f in page.frames if f.url == url)
+
+
+def _inspect_and_select(page, nonce="n0nce"):
+    from agent.vault_login_classifier import LoginControl, build_inspection_js, classify_login_control, select_password_fill
+    raw = json.loads(page.evaluate(build_inspection_js(nonce)))
+    classified = [c for c in (classify_login_control(LoginControl.from_dict(r)) for r in raw) if c]
+    return raw, select_password_fill(classified, "FIXTURE-PW")
+
+
+def _stamps(frame):
+    return frame.evaluate("document.querySelectorAll('[data-hermes-vault-slot],[data-hermes-vault-frame]').length")
+
+
+def test_same_origin_iframe_login_is_found_and_filled(frame_page):
+    from agent.vault_login_classifier import build_fill_js
+    frame_page.goto("https://site.example.test/top-frame")
+    widget = _frame(frame_page, "https://site.example.test/widget")
+    raw, fills = _inspect_and_select(frame_page)
+    assert {r["name"].strip() for r in raw} >= {"account_name_text_field", "password_text_field"}, raw
+    assert len(fills) == 1
+    out = json.loads(frame_page.evaluate(build_fill_js(fills, "https://site.example.test", nonce="n0nce")))
+    assert out == {"filled": 1}, out
+    assert widget.locator("#password_text_field").input_value() == "FIXTURE-PW"
+    assert widget.locator("#account_name_text_field").input_value() == ""
+    assert _stamps(frame_page.main_frame) == 0 and _stamps(widget) == 0
+
+
+def test_cross_origin_iframe_inputs_are_never_stamped_or_filled(frame_page):
+    from agent.vault_login_classifier import build_fill_js
+    frame_page.goto("https://site.example.test/top-both")
+    pay = _frame(frame_page, "https://pay.other.test/widget")
+    raw, fills = _inspect_and_select(frame_page)
+    assert [r["name"].strip() for r in raw] == ["toppw"], raw
+    assert _stamps(pay) == 0
+    # Even an index that would exist if the frame had been walked resolves to nothing.
+    every = [{"index": i, "token": "current-password", "value": "FIXTURE-PW"} for i in range(4)]
+    out = json.loads(frame_page.evaluate(build_fill_js(every, "https://site.example.test", nonce="n0nce")))
+    assert out == {"filled": 1}, out
+    assert pay.locator("input[name=xpw]").input_value() == ""
+    assert frame_page.locator("input[name=toppw]").input_value() == "FIXTURE-PW"
+
+
+def test_fill_refuses_when_the_inspected_frame_left_the_origin(frame_page):
+    from agent.vault_login_classifier import build_fill_js
+    frame_page.goto("https://site.example.test/top-frame")
+    _, fills = _inspect_and_select(frame_page)
+    assert fills
+    with frame_page.expect_event("framenavigated"):
+        frame_page.evaluate("document.getElementById('aid').src = 'https://pay.other.test/widget'")
+    pay = _frame(frame_page, "https://pay.other.test/widget")
+    pay.wait_for_load_state()
+    out = json.loads(frame_page.evaluate(build_fill_js(fills, "https://site.example.test", nonce="n0nce")))
+    assert out.get("refused") == "origin_changed", out
+    assert pay.locator("input[name=xpw]").input_value() == ""
+    assert _stamps(frame_page.main_frame) == 0
+
+
+def test_password_fill_in_a_frame_still_requires_type_password(frame_page):
+    from agent.vault_login_classifier import build_fill_js
+    frame_page.goto("https://site.example.test/top-frame")
+    widget = _frame(frame_page, "https://site.example.test/widget")
+    raw, _ = _inspect_and_select(frame_page)
+    text_idx = next(r["index"] for r in raw if r["name"].strip() == "password_hint")
+    fill = [{"index": text_idx, "token": "current-password", "value": "FIXTURE-PW"}]
+    out = json.loads(frame_page.evaluate(build_fill_js(fill, "https://site.example.test", nonce="n0nce")))
+    assert out == {"filled": 0}, out
+    assert widget.locator("input[name=password_hint]").input_value() == ""
+    assert _stamps(widget) == 0
+
+
+@pytest.mark.parametrize("path", ["top-hidden-none", "top-hidden-opacity", "top-hidden-tiny", "top-hidden-parent"])
+def test_hidden_same_origin_frame_is_never_stamped_or_filled(frame_page, path):
+    from agent.vault_login_classifier import build_fill_js
+    frame_page.goto(f"https://site.example.test/{path}")
+    widget = _frame(frame_page, "https://site.example.test/widget")
+    raw, fills = _inspect_and_select(frame_page)
+    assert [r["name"].strip() for r in raw] == ["toppw"], raw
+    assert _stamps(widget) == 0
+    every = [{"index": i, "token": "current-password", "value": "FIXTURE-PW"} for i in range(4)]
+    out = json.loads(frame_page.evaluate(build_fill_js(every, "https://site.example.test", nonce="n0nce")))
+    assert out == {"filled": 1}, out
+    assert widget.locator("#password_text_field").input_value() == ""
+    assert frame_page.locator("input[name=toppw]").input_value() == "FIXTURE-PW"
+
+
+def test_fill_refuses_when_the_inspected_frame_was_hidden(frame_page):
+    from agent.vault_login_classifier import build_fill_js
+    frame_page.goto("https://site.example.test/top-frame")
+    widget = _frame(frame_page, "https://site.example.test/widget")
+    _, fills = _inspect_and_select(frame_page)
+    assert fills
+    frame_page.evaluate("document.getElementById('aid').style.opacity = '0'")
+    out = json.loads(frame_page.evaluate(build_fill_js(fills, "https://site.example.test", nonce="n0nce")))
+    assert out == {"refused": "origin_changed", "found": "frame:hidden"}, out
+    assert widget.locator("#password_text_field").input_value() == ""
+    assert _stamps(frame_page.main_frame) == 0 and _stamps(widget) == 0
