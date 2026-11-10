@@ -159,6 +159,21 @@ def flush_before_selecting() -> None:
         sync()
 
 
+def _checkout_venv(project_root: Path) -> Path | None:
+    """External ownership applies only to this checkout's own interpreter."""
+    import sys
+
+    owned = os.environ.get("HERMES_CHECKOUT_VENV")
+    if owned:
+        root = Path(project_root).resolve()
+        environment = Path(owned).absolute()
+        if ((root / ".git").exists() and environment == root / "venv"
+                and Path(sys.prefix).absolute() == environment
+                and (environment / "pyvenv.cfg").is_file()):
+            return environment
+    return None
+
+
 def selected_venv(project_root: Path) -> Path:
     """Use the committed environment, or the original install before first sync.
 
@@ -168,17 +183,17 @@ def selected_venv(project_root: Path) -> Path:
     ``flush_before_selecting``, so the ``pyvenv.cfg`` probe below is a sanity
     check against a vanished tree, not the durability guarantee.
     """
-    return _recorded_venv(project_root) or base_venv(project_root)
+    return _checkout_venv(project_root) or _recorded_venv(project_root) or base_venv(project_root)
 
 
 def committed_venv(project_root: Path) -> Path | None:
     """The environment PM committed for this install (or a sealed payload's own), else ``None``.
 
-    Unlike ``selected_venv`` this never answers with the in-tree ``venv``/``.venv``: that tree
-    predates PM and is built for whichever interpreter created it, so loading it from PM's store
-    Python mixes ABIs (compiled modules vanish) and PM deletes it once a generation is committed.
+    An external checkout contract takes precedence only for its own interpreter.
+    Otherwise, unlike ``selected_venv``, this never falls back to an in-tree venv:
+    loading that tree from PM's store Python would mix ABIs.
     """
-    return _recorded_venv(project_root) or payload_venv(project_root)
+    return _checkout_venv(project_root) or _recorded_venv(project_root) or payload_venv(project_root)
 
 
 def _recorded_venv(project_root: Path) -> Path | None:
@@ -315,10 +330,8 @@ def activate_dependencies(project_root: Path) -> None:
     owned = os.environ.get("HERMES_CHECKOUT_VENV")
     if owned:
         root = Path(project_root).resolve()
-        environment = Path(owned).absolute()
-        if ((root / ".git").exists() and environment == root / "venv"
-                and Path(sys.prefix).absolute() == environment
-                and (environment / "pyvenv.cfg").is_file()):
+        environment = _checkout_venv(project_root)
+        if environment is not None:
             # A parent launcher's checkout root is as stale as its site-packages.
             selected = site_packages(environment)
             inherited = {Path(p).resolve() for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p}
