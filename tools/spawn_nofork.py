@@ -18,7 +18,6 @@ process (logged once).
 from __future__ import annotations
 
 import ctypes
-import fcntl
 import functools
 import logging
 import os
@@ -112,7 +111,7 @@ def _disable(reason: str) -> None:
 
 def _is_open(fd: int) -> bool:
     try:
-        fcntl.fcntl(fd, fcntl.F_GETFD)
+        os.fstat(fd)
     except OSError:
         return False
     return True

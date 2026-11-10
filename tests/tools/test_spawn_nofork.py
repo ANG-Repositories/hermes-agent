@@ -452,3 +452,23 @@ def test_run_input_and_conflicts(native):
     assert result.stdout == "piped"
     with pytest.raises(ValueError):
         nofork.run_nofork(["/bin/cat"], input="bad", stdin=subprocess.PIPE)
+
+
+def test_module_imports_without_fcntl(monkeypatch):
+    """Windows has no fcntl; local.py and the shell lint import this module at top level."""
+    import importlib
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    try:
+        importlib.reload(nofork)
+        assert not nofork._is_open(987654)
+        r, w = os.pipe()
+        try:
+            assert nofork._is_open(r)
+        finally:
+            os.close(r)
+            os.close(w)
+        assert not nofork._is_open(r)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(nofork)
