@@ -407,7 +407,7 @@ def _operator_hold(record, pr: dict) -> str:
             f"so someone else holds it; not flipped, not armed")
 
 
-def ace_gate_ready(repo: str, number: int, *, task_id: str = "") -> Optional[int]:
+def ace_gate_ready(repo: str, number: int) -> Optional[int]:
     """``scripts/ace_gate.py ready <repo> <n>`` (the only sanctioned un-draft). rc, or None if not run."""
     from hermes_constants import get_default_hermes_root
     script = get_default_hermes_root() / "scripts" / "ace_gate.py"
@@ -418,7 +418,6 @@ def ace_gate_ready(repo: str, number: int, *, task_id: str = "") -> Optional[int
             [sys.executable or "python3", str(script), "ready", repo, str(number)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             timeout=90, check=False,
-            env=dict(os.environ, KANBAN_ROUND_DRAFT_CARD=task_id),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _log.warning("handoff freshness: ace_gate ready %s#%s failed: %s", repo, number, exc)
@@ -464,8 +463,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
           flipped: Optional[dict] = None, evaluate: Optional[ArmFn] = None,
-          event_land: Optional[bool] = None, round_runs=None, marked=None, consume=None,
-          intent=None) -> dict:
+          event_land: Optional[bool] = None, intent=None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -488,16 +486,11 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     reads tier, Prism and review) and calls ``evaluate`` (default :func:`spawn_evaluate`, E6).
     Off: (c) is unchanged, ``spawn_arm`` and all.
 
-    ``round_runs``: this card's run ids; ``marked``: this card's persisted round-draft marks
-    (:func:`kanban_round_draft.mark_records`). A same-head draft whose persisted mark is by one of those runs
-    (:func:`kanban_round_draft.round_marked`, t_c418eebc) is the worker's own round draft, flipped like any own draft.
-
     ``intent`` (t_deee5435): ``(repo, number) -> status`` from :func:`kanban_pr_intent.applier`. It writes the
     card's Intent block into each OWN PR body (:func:`_owns_draft`, draft or not) after every refusal check and
     BEFORE the ready flip, so Prism starts on a body that carries the card's ask. Its status lands in
     ``entry["intent"]``; it never raises or refuses.
     """
-    from hermes_cli import kanban_round_draft as _rd
     report: dict = {"prs": {}, "checked_at": int(time.time())}
     # Never update-branch or arm a third-party PR (t_06dccfe3): the caller
     # already passes fleet refs only; this keeps the actuator safe on its own.
@@ -520,10 +513,6 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     evaluate = evaluate or spawn_evaluate
     ev_on = event_land_enabled() if event_land is None else event_land
     flip_records = {str(k).lower(): v for k, v in (flipped or {}).items() if isinstance(v, dict)}
-    # Normalize lookup only; consumption must address the exact persisted event key.
-    mark_keys = {str(k).lower(): k for k, v in (marked or {}).items()
-                 if _rd.enabled() and isinstance(v, dict) and not v.get("consumed")}
-    mark_records = {key: marked[original] for key, original in mark_keys.items()}
 
     views = []
     drafts = []
@@ -546,15 +535,6 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if pr.get("draft") is True:
             held = _operator_hold(flip_records.get(key.lower()), pr)
-            mark = mark_records.get(key.lower())
-            if mark is not None:
-                owned = (_rd.round_marked(mark, str(((pr.get("head") or {}).get("sha")) or ""),
-                                          flip_records.get(key.lower()), round_runs)
-                         and _rd.current_transition(mark, _rd.gh_snapshot if gh is gh_api else gh, ref.repo, ref.number)
-                         and consume is not None)
-                held = "" if owned else "round draft ownership unproved or consumed; leave draft for operator ready"
-            if held and mark is None:
-                held += "; no authenticated round transition"
             if held:
                 # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
                 entry["draft_held"] = held
@@ -597,20 +577,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         flipped_now: dict = {}
         for ref, key, pr, entry in own_drafts.values():
             at = int(time.time())  # BEFORE the flip: every post-ready run starts after it
-            if key.lower() in mark_records:
-                # Burn before the remote write: a crash or uncertain response must not reuse authority.
-                try:
-                    if consume is None:
-                        raise ValueError("round draft consumption unavailable")
-                    consume(mark_keys[key.lower()])
-                except Exception:
-                    _log.warning("round draft consumption failed for %s; operator ready required", key, exc_info=True)
-                    failed.append(key)
-                    continue
-            if ready is ace_gate_ready:
-                rc = ace_gate_ready(ref.repo, ref.number, task_id=task_id)
-            else:
-                rc = ready(ref.repo, ref.number) if ready is not None else None
+            rc = ready(ref.repo, ref.number) if ready is not None else None
             entry["draft_flip"] = f"ready via ace_gate.py (rc={rc})"
             if rc != 0:
                 failed.append(key)
