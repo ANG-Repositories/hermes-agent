@@ -269,6 +269,20 @@ def test_model_cap_notice_reaches_persisted_banner(_home, monkeypatch, headers, 
     assert ("upstream reset" in text) is reset_expected
 
 
+@pytest.mark.parametrize("err_head", [
+    "your account budget is capped",   # Prism 341f2b8e51c2 repro: account-wide, not model-specific
+    "this model's budget is capped",   # spec rev12 §4.8 pinned example: no model scope in the text
+])
+def test_unscoped_budget_cap_is_not_attributed_to_the_model(err_head):
+    from agent import fallback_policy as fp
+
+    row = {"trigger_class": "quota_model", "hop": "relay", "attempts": 1, "err_head": err_head,
+           "from_model": "m", "from_provider": "p"}
+    text = fp.format_cause_rider(row)
+    assert "model-specific" not in text and "for m via p" not in text, text
+    assert text.startswith("model budget capped at the relay"), text
+
+
 @pytest.mark.parametrize("msg,cls", [
     ("This request would exceed your account's rate limit", "rate_upstream"),
     ("upstream connect timed out", "conn"),
