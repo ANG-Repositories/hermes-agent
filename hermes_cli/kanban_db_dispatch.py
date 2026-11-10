@@ -7981,15 +7981,18 @@ def _dispatch_once_locked(
             if _local_wait is not None:
                 result.placement_waits[row["id"]] = _local_wait
                 continue
-        if (defer_pool_clone and not dry_run and placed_host is not None and row["id"] in _worktree_ports
+        if (not dry_run and placed_host is not None and row["id"] in _worktree_ports
                 and (row["workspace_kind"] or "scratch") == "worktree"):
-            # Pool-host clone off the tick (t_915b8d2d): start it in the background and claim the card once
-            # it has finished; until then the card waits and its slot goes back.
+            # Pool-host clone off the tick (t_915b8d2d): a gateway tick starts it in the background and claims
+            # the card once it has finished; until then the card waits and its slot goes back. Every tick,
+            # deferred or not, skips a card whose clone is pending anywhere (Prism d4847ef87c43).
             from hermes_cli import kanban_worktree_port as _kwt
             _ct0 = time.monotonic()
-            _ready = _kwt.clone_ready(*_pool_clone_job(
+            _ckey, _cjob, _clock = _pool_clone_job(
                 row["id"], row["branch_name"], placed_host, _worktree_ports[row["id"]],
-                _kb.workspaces_root(board=board) / row["id"]))
+                _kb.workspaces_root(board=board) / row["id"], board=board)
+            _ready = (_kwt.clone_ready(_ckey, _cjob, _clock) if defer_pool_clone
+                      else not _kwt.clone_busy(_ckey, _clock))
             result.clone_ms += (time.monotonic() - _ct0) * 1000.0
             if not _ready:
                 spillover.release(placed_host, _rid)
@@ -8081,12 +8084,12 @@ def _dispatch_once_locked(
                 claimed.workspace_kind, claimed.workspace_path = "scratch", None
                 workspace = _kbw.resolve_workspace(claimed, board=board)
                 _wt_mirror = _kwt.mirror_for(_wt_port, placed_host.name)
-                _ckey, _cjob = _pool_clone_job(claimed.id, resolved_branch_name, placed_host, _wt_port, workspace)
+                _ckey, _cjob, _clock = _pool_clone_job(claimed.id, resolved_branch_name, placed_host, _wt_port,
+                                                       workspace, board=board)
                 _ct0 = time.monotonic()
                 try:
                     # A finished background clone (gateway tick) is collected; a failed one raises here.
-                    if not _kwt.take_clone(_ckey):
-                        _cjob()
+                    _kwt.run_clone(_ckey, _cjob, _clock)
                 finally:
                     result.clone_ms += (time.monotonic() - _ct0) * 1000.0
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
@@ -9197,21 +9200,25 @@ def _run_started_at(task: Task, board: Optional[str]) -> int:
     return int(time.time())
 
 
-def _pool_clone_job(task_id: str, branch_name, host, wt_port, workspace) -> tuple:
-    """``(key, job)`` of a ported worktree's clone on ``host`` (t_915b8d2d): push-then-port (t_1d2c5939,
-    committed work only the Studio has goes to origin first), then the clone. The same key before the
-    claim (prefetch) and after it (collect)."""
+def _pool_clone_job(task_id: str, branch_name, host, wt_port, workspace, board: Optional[str] = None) -> tuple:
+    """``(key, job, lock_path)`` of a ported worktree's clone on ``host`` (t_915b8d2d): push-then-port
+    (t_1d2c5939, committed work only the Studio has goes to origin first), then the clone, pinned to the pushed
+    tip. The same key before the claim (prefetch) and after it (collect) while the tip is unchanged; the key
+    carries the push plan, so a moved tip never collects the old clone (Prism 3e2f8506c8ff). ``lock_path`` is
+    the per-workspace pending marker every dispatcher of the board sees (Prism d4847ef87c43)."""
     from hermes_cli import kanban_worktree_port as _kwt
     branch = (branch_name or "").strip() or f"wt/{task_id}"
     mirror = _kwt.mirror_for(wt_port, host.name)
     push = wt_port[4] if len(wt_port) > 4 else None
+    tip = push[3] if push is not None else None
 
     def job() -> None:
         if push is not None:
             _kwt.push_card_branch(push)
-        _kwt.clone_on_host(host, str(workspace), wt_port[0], mirror, branch)
+        _kwt.clone_on_host(host, str(workspace), wt_port[0], mirror, branch, **({"sha": tip} if tip else {}))
 
-    return _kwt.clone_key(task_id, host.name, str(workspace), wt_port[0], mirror, branch), job
+    key = _kwt.clone_key(task_id, host.name, str(workspace), wt_port[0], mirror, branch, push)
+    return key, job, _kwt.clone_lock_path(_kb.board_dir(board) / "clone-locks", key)
 
 
 def _default_spawn(

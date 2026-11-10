@@ -43,6 +43,7 @@ named ``unpushed_dirty_tree``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows: the in-process cache is the only pending marker
+    fcntl = None
 
 MIRRORS_FILE = "kanban-worktree-mirrors.json"
 DERIVED_ENV = "KANBAN_MIRROR_DERIVED"
@@ -491,7 +497,7 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
 
 
 def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
-                 url: Optional[str] = None) -> str:
+                 url: Optional[str] = None, sha: Optional[str] = None) -> str:
     """Remote sh: clone origin into the (empty) workspace, then put HEAD on
     ``branch`` and PROVE it (rc 4 otherwise). The mirror only accelerates the
     clone: ``--dissociate`` copies what was borrowed, so a later mirror prune
@@ -501,7 +507,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     "absent" (Prism 9b397aa5183d); else a new branch off origin/HEAD,
     --no-track. Re-run safe: an existing checkout of THIS origin finishes
     the checkout instead of returning early (Prism f43e48b43fc3). rc 3 = the
-    workspace holds something else (never overwritten)."""
+    workspace holds something else (never overwritten). ``sha`` (the pushed
+    tip, Prism 3e2f8506c8ff): a reused checkout behind it is fetched and
+    fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise)."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
     if mirror.startswith("~/"):
         # A derived per-host default (t_1d2c5939): the host's own $HOME, whatever user/OS it runs.
@@ -526,14 +534,17 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
         f"git checkout -q -b {b} --track origin/{b}; "
         f"else git checkout -q --no-track -b {b} origin/HEAD; fi; fi; "
         f"[ \"$(git branch --show-current)\" = {b} ] || exit 4"
+        + (f"; if [ \"$(git rev-parse HEAD)\" != {shlex.quote(sha)} ]; then "
+           f"{{ git fetch -q origin {b} && git merge -q --ff-only {shlex.quote(sha)}; }} || exit 5; fi; "
+           f"[ \"$(git rev-parse HEAD)\" = {shlex.quote(sha)} ] || exit 5" if sha else "")
     )
 
 
 def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
-                  runner: Callable = subprocess.run) -> None:
+                  runner: Callable = subprocess.run, sha: Optional[str] = None) -> None:
     """Run :func:`clone_script` on ``host`` (a ``PoolHost``); raise on failure."""
     from hermes_cli.kanban_worker_pool import _ssh_argv
-    proc = runner(_ssh_argv(host, clone_script(workspace, slug, mirror, branch)),
+    proc = runner(_ssh_argv(host, clone_script(workspace, slug, mirror, branch, sha=sha)),
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=CLONE_TIMEOUT_S, stdin=subprocess.DEVNULL)
     rc = getattr(proc, "returncode", 1)
@@ -549,6 +560,13 @@ def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
 # the claim release, spillover refund and failure accounting stay the existing exception path. Only the
 # long-lived gateway tick uses this (``defer_pool_clone``): a one-shot CLI process would exit with the clone
 # thread still running.
+#
+# Two guards (Prism 3e2f8506c8ff, d4847ef87c43). The key carries the push plan, i.e. the source tip sha: a tip
+# that moved after the prefetch is a new key, the stale result is dropped and never collected. The pending
+# clone is visible to EVERY dispatcher: a per-workspace flock (``clone_lock_path``) is taken in the tick before
+# the job is submitted and held until it finishes. Any tick, deferred or not, in any process, that finds it held
+# skips the card (:func:`clone_busy`), and the synchronous clone refuses to start under it
+# (:func:`run_clone`). The lock dies with its process, so a crashed dispatcher never strands the card.
 CLONE_PENDING = "clone_pending"
 CLONE_PREFETCH_WORKERS = 4
 CLONE_PREFETCH_TTL_S = 3600.0
@@ -557,14 +575,61 @@ _prefetch: Dict[tuple, tuple] = {}   # key -> (Future, started monotonic)
 _prefetch_pool: Optional[ThreadPoolExecutor] = None
 
 
-def clone_key(task_id: str, host_name: str, workspace: str, slug: str, mirror: str, branch: str) -> tuple:
-    return (task_id, host_name, str(workspace), slug, mirror, branch)
+def clone_key(task_id: str, host_name: str, workspace: str, slug: str, mirror: str, branch: str,
+              push: Optional[tuple] = None) -> tuple:
+    """``push`` = :func:`assess`'s push plan (repo, branch, origin sha, source tip sha) or None."""
+    return (task_id, host_name, str(workspace), slug, mirror, branch, tuple(push) if push else None)
 
 
-def clone_ready(key: tuple, job: Callable[[], None]) -> bool:
-    """True once ``job`` (push + clone for ``key``) has finished, ok or failed. On the first call it is started
-    on a small background pool and False is returned. While it runs this returns False. The caller collects
-    the outcome with :func:`take_clone`."""
+def clone_lock_path(lock_dir: Path, key: tuple) -> Path:
+    """The per-workspace pending marker: one file per (host, workspace), whatever the tip."""
+    return Path(lock_dir) / (hashlib.sha1(f"{key[1]}\0{key[2]}".encode()).hexdigest()[:24] + ".lock")
+
+
+def _try_lock(path: Path) -> Optional[int]:
+    """An fd holding ``path``'s exclusive flock, or None when another holder has it."""
+    if fcntl is None:
+        return -1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _unlock(fd: Optional[int]) -> None:
+    if fd is not None and fd >= 0:
+        try:
+            os.close(fd)   # closing the only fd releases the flock
+        except OSError:
+            pass
+
+
+def _same_workspace(a: tuple, b: tuple) -> bool:
+    return a[:3] == b[:3]
+
+
+def _drop_stale_locked(key: tuple) -> bool:
+    """Under ``_prefetch_lock``: forget finished entries of ``key``'s workspace under another key (the tip moved:
+    never collected). True while one of them still runs (a second writer must not start)."""
+    running = False
+    for k, (fut, _t0) in list(_prefetch.items()):
+        if k != key and _same_workspace(k, key):
+            if fut.done():
+                del _prefetch[k]
+            else:
+                running = True
+    return running
+
+
+def clone_ready(key: tuple, job: Callable[[], None], lock_path: Path) -> bool:
+    """True once ``job`` (push + clone for ``key``) has finished, ok or failed. On the first call it takes the
+    workspace lock, starts the job on a small background pool and returns False. While it runs, or while any
+    other clone of the same workspace runs (this process or another), this returns False. The caller collects
+    the outcome with :func:`run_clone`."""
     global _prefetch_pool
     now = time.monotonic()
     with _prefetch_lock:
@@ -572,25 +637,68 @@ def clone_ready(key: tuple, job: Callable[[], None]) -> bool:
             if fut.done() and now - t0 > CLONE_PREFETCH_TTL_S:
                 del _prefetch[k]    # finished, never collected (the card moved on): forget it
         entry = _prefetch.get(key)
-        if entry is None:
-            if _prefetch_pool is None:
-                _prefetch_pool = ThreadPoolExecutor(max_workers=CLONE_PREFETCH_WORKERS,
-                                                    thread_name_prefix="kanban-clone")
-            _prefetch[key] = (_prefetch_pool.submit(job), now)
+        if entry is not None:
+            return entry[0].done()
+        if _drop_stale_locked(key):
             return False
-        return entry[0].done()
+        fd = _try_lock(lock_path)
+        if fd is None:
+            return False            # another dispatcher's clone of this workspace is live
+        if _prefetch_pool is None:
+            _prefetch_pool = ThreadPoolExecutor(max_workers=CLONE_PREFETCH_WORKERS,
+                                                thread_name_prefix="kanban-clone")
+        try:
+            fut = _prefetch_pool.submit(job)
+        except BaseException:
+            _unlock(fd)
+            raise
+        fut.add_done_callback(lambda _f, _fd=fd: _unlock(_fd))
+        _prefetch[key] = (fut, now)
+        return False
+
+
+def clone_busy(key: tuple, lock_path: Path) -> bool:
+    """For a tick that clones synchronously: True while a clone of ``key``'s workspace is pending anywhere
+    (this process's cache, or the workspace lock held by another dispatcher)."""
+    with _prefetch_lock:
+        if any(_same_workspace(k, key) and not fut.done() for k, (fut, _t0) in _prefetch.items()):
+            return True
+    fd = _try_lock(lock_path)
+    if fd is None:
+        return True
+    _unlock(fd)
+    return False
 
 
 def take_clone(key: tuple) -> bool:
     """Collect a finished prefetched clone: True when it succeeded, False when none is recorded for ``key``
-    (the caller clones synchronously). Re-raises the clone's own exception when it failed."""
+    (the caller clones synchronously). Re-raises the clone's own exception when it failed. A finished clone of
+    the same workspace under another key (an older tip) is dropped, never collected."""
     with _prefetch_lock:
+        _drop_stale_locked(key)
         entry = _prefetch.get(key)
         if entry is None or not entry[0].done():
             return False
         del _prefetch[key]
     entry[0].result()
     return True
+
+
+def run_clone(key: tuple, job: Callable[[], None], lock_path: Path) -> None:
+    """The claim-time clone: collect the finished prefetch for ``key``, else run ``job`` under the workspace
+    lock. Refuses (raises) rather than start a second writer while another clone of the workspace is live."""
+    if take_clone(key):
+        return
+    with _prefetch_lock:
+        if any(_same_workspace(k, key) and not fut.done() for k, (fut, _t0) in _prefetch.items()):
+            raise RuntimeError(f"{CLONE_PENDING}: a clone of {key[2]} on {key[1]} is still running")
+    fd = _try_lock(lock_path)
+    if fd is None:
+        raise RuntimeError(f"{CLONE_PENDING}: another dispatcher holds the clone of {key[2]} on {key[1]}")
+    try:
+        job()
+    finally:
+        _unlock(fd)
 
 
 def convert(conn, task, workspace: str, branch: str, *, host: str, slug: str,
