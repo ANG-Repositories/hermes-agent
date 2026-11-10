@@ -462,7 +462,8 @@ class HoldStore:
         read-mark-write of a shared name is one step: without it a write computed
         from a read that predates a peer's write drops the peer's ``shared_with``."""
         self.consumers_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.consumers_dir / f".{_consumer_filename(name)}.lock", "a+b") as fh:
+        lock_path = self.consumers_dir / f".{_consumer_filename(name)}.lock"
+        with open(lock_path, "a+b") as fh:
             if fcntl is not None:
                 fcntl.flock(fh, fcntl.LOCK_EX)
             try:
