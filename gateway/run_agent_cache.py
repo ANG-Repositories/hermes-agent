@@ -684,6 +684,10 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return
         _stop_clock = _StopStageClock(invoke_timing)
+        # Bind before interrupt/hook work can change the routing owner.
+        store = getattr(self, "session_store", None)
+        stopped_session_id = getattr(
+            getattr(store, "_entries", {}).get(session_key), "session_id", None)
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
@@ -759,7 +763,11 @@ class GatewayAgentCacheMixin:
             # The marker is on disk before /stop acks; its sub-stages go on the stage line
             # (t_41843f70) so a slow write names its wait.
             try:
-                _stop_clock.note(await self._mark_user_stopped_staged(session_key))
+                _marker = self._mark_user_stopped_staged
+                _binding = {}
+                if stopped_session_id and _accepts_keyword(_marker, "expected_session_id"):
+                    _binding["expected_session_id"] = stopped_session_id
+                _stop_clock.note(await _marker(session_key, **_binding))
             except Exception:
                 logger.warning("Failed to persist user_stopped marker for stopped session %s",
                                session_key, exc_info=True)

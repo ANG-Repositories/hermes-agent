@@ -1,8 +1,8 @@
 """A slow /stop marker write names the state.db writer it waited behind (t_41843f70).
 
-Live 2026-11-08 21:41: ``PHASE=user_stopped store_s=12.748``. Measured locally, the marker UPSERT
-itself costs milliseconds; a multi-second wait is the time another writer held state.db's write lock
-(same SessionDB: its ``_lock`` serialises the whole transaction; another process: BEGIN IMMEDIATE).
+Live 2026-11-08 21:41: ``PHASE=user_stopped store_s=12.748``. A slow UPSERT may wait behind
+another writer, execute slowly itself, or stall in its own commit. The transaction timings
+separate these classes; the holder ledger adds context without establishing causation.
 The marker stays on disk before /stop acks (boot-gate ruling); these tests lock that the wait is
 attributed (``lock_s`` / ``save_lock_s`` / ``upsert_s``), that the holder is named, that the platform
 invoke lag reaches the stage line, and that the write is bound to the session /stop saw.
@@ -47,14 +47,14 @@ def _runner(tmp_path: Path, monkeypatch):
     return runner, db
 
 
-def _hold_write_lock(db: SessionDB, seconds: float) -> threading.Thread:
-    """Another writer on the SAME SessionDB holds the write transaction for ``seconds``."""
+def _hold_write_lock(db: SessionDB, release: threading.Event) -> threading.Thread:
+    """Hold until the measured marker operation releases us, with a teardown backstop."""
     started = threading.Event()
 
     def _holder():
         def fn(_conn):
             started.set()
-            time.sleep(seconds)
+            assert release.wait(10.0)
         db._execute_write(fn)
 
     th = threading.Thread(target=_holder, daemon=True)
@@ -84,11 +84,34 @@ async def test_slow_marker_write_is_attributed_and_still_durable_before_return(t
     runner, db = _runner(tmp_path, monkeypatch)
     entry = runner.session_store.get_or_create_session(_source())
     db.create_session(entry.session_id, "gateway", session_key=entry.session_key)
+    # Isolate the marker write: transcript reads on DELETE fallback also take
+    # the shared connection lock before reaching the marker under test.
+    runner._session_db = None
 
-    holder = _hold_write_lock(db, 2.5)
+    release = threading.Event()
+    holder = _hold_write_lock(db, release)
+    original_mark = runner.session_store.mark_user_stopped
+    marker_entered = threading.Event()
+
+    def mark(*args, **kwargs):
+        marker_entered.set()
+        return original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(runner.session_store, "mark_user_stopped", mark)
+
+    async def unblock():
+        assert await asyncio.to_thread(marker_entered.wait, 5.0)
+        await asyncio.sleep(2.5)
+        release.set()
+
+    unblocking = asyncio.create_task(unblock())
     with caplog.at_level(logging.INFO, logger="gateway.run"):
         t0 = time.monotonic()
-        assert await runner._mark_user_stopped(entry.session_key) is True
+        try:
+            assert await runner._mark_user_stopped(entry.session_key) is True
+        finally:
+            release.set()
+            await unblocking
         took = time.monotonic() - t0
         # Durable before return: a fresh store on the same files sees the marker.
         reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
@@ -102,6 +125,8 @@ async def test_slow_marker_write_is_attributed_and_still_durable_before_return(t
     # The wait is the state.db write lock (SessionDB._lock + BEGIN IMMEDIATE), which upsert_s
     # spans; the store's own locks were free.
     assert _field(line, "upsert_s") >= 2.0, line
+    assert _field(line, "wait_s") >= 2.0, line
+    assert _field(line, "exec_s") >= 0.0 and _field(line, "commit_s") >= 0.0, line
     assert _field(line, "lock_s") < 0.5 and _field(line, "save_lock_s") < 0.5, line
     assert "held the write lock" in slow, slow
 
@@ -134,6 +159,48 @@ async def test_marker_write_is_bound_to_the_session_stop_saw(tmp_path, monkeypat
 
     assert await runner._mark_user_stopped(entry.session_key, expected_session_id=entry.session_id) is True
     assert runner.session_store._entries[entry.session_key].user_stopped_at is not None
+
+
+@pytest.mark.asyncio
+async def test_idle_stop_does_not_mark_replacement_after_transcript_read(tmp_path, monkeypatch):
+    runner, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def read(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return [{"id": 42}]
+
+    monkeypatch.setattr(runner._session_db, "get_messages", read)
+    task = asyncio.create_task(runner._mark_user_stopped(entry.session_key))
+    await entered.wait()
+    entry.session_id = "replacement-session"
+    release.set()
+    assert await task is False
+    assert entry.user_stopped_at is None
+
+
+@pytest.mark.asyncio
+async def test_busy_stop_binds_before_interrupt_hook_await(tmp_path, monkeypatch):
+    runner, db = _runner(tmp_path, monkeypatch)
+    source = _source()
+    entry = runner.session_store.get_or_create_session(source)
+    runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
+    runner._session_db = None
+    agent = MagicMock()
+    agent.session_id = entry.session_id
+    runner._running_agents[entry.session_key] = agent
+
+    def hook(*args, **kwargs):
+        # Same interleaving as /new while an earlier hook/interrupt yields: the
+        # routing owner changes before the staged marker call starts.
+        entry.session_id = "replacement-session"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    await runner._interrupt_and_clear_session(
+        entry.session_key, source, interrupt_reason="stop", invalidation_reason="stop_command")
+    assert entry.user_stopped_at is None
 
 
 class _FakeAdapter:

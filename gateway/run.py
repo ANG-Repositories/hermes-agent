@@ -7849,7 +7849,9 @@ class GatewayRunner(
 
         return model, provider, api_mode
 
-    async def _mark_user_stopped_staged(self, session_key: str) -> str:
+    async def _mark_user_stopped_staged(
+        self, session_key: str, *, expected_session_id: Optional[str] = None,
+    ) -> str:
         """Await ``_mark_user_stopped``; return its sub-stages as a ``PHASE=stop_stages`` fragment.
 
         The marker is on disk before /stop acks (boot-gate ruling, see ``_mark_user_stopped``).
@@ -7860,7 +7862,7 @@ class GatewayRunner(
         from agent.interrupt_compat import _accepts_keyword
         store = getattr(self, "session_store", None)
         try:
-            session_id = getattr(store._entries.get(session_key), "session_id", None)  # noqa: SLF001
+            session_id = expected_session_id or getattr(store._entries.get(session_key), "session_id", None)  # noqa: SLF001
         except Exception:
             session_id = None
         timings: dict = {}
@@ -7879,9 +7881,9 @@ class GatewayRunner(
     def _log_user_stop_lock_holders(self, session_key: str, waited: float) -> None:
         """Log who held state.db's write lock during a slow user_stopped write (t_41843f70).
 
-        The marker UPSERT itself takes milliseconds; a multi-second ``upsert_s`` is a wait behind
-        another writer's transaction. ``describe_write_lock_holders`` (/proc/locks + the holder
-        ledger, holds >= 2 s) names it. Runs in the executor after the write landed, so it never
+        A slow write may wait behind another transaction, execute slowly itself, or stall in its
+        own commit. ``describe_write_lock_holders`` (/proc/locks + the holder ledger, holds >= 2 s)
+        supplies context, not proof of a foreign holder. Runs after the write landed, so it never
         delays the /stop ack; never raises.
         """
         try:
@@ -7905,7 +7907,8 @@ class GatewayRunner(
 
     @staticmethod
     def _render_user_stop_timings(timings: dict) -> str:
-        keys = ("rowid_s", "store_s", "lock_s", "save_lock_s", "upsert_s", "fallback_s", "other_s")
+        keys = ("rowid_s", "store_s", "lock_s", "save_lock_s", "upsert_s",
+                "wait_s", "exec_s", "commit_s", "route_check_s", "route_sql_s", "fallback_s", "other_s")
         return " ".join(
             f"{k}={timings[k]:.3f}" if isinstance(timings.get(k), (int, float)) else f"{k}=-"
             for k in keys)
@@ -7968,7 +7971,7 @@ class GatewayRunner(
             boot_id = self._current_boot_id()
         except Exception:
             boot_id = None
-        _bind = {"expected_session_id": expected_session_id} if expected_session_id else {}
+        _bind = {"expected_session_id": session_id} if session_id else {}
         try:
             marked = await self.async_session_store.mark_user_stopped(
                 session_key,
