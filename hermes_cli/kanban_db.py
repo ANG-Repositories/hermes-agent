@@ -16340,7 +16340,7 @@ def reopen_task(
 
 def _is_human_assignee(assignee: Optional[str]) -> bool:
     """Mirror of the tasks_human_ready_* trigger predicate."""
-    return bool(assignee) and (assignee == "human" or assignee.startswith("human:"))
+    return bool(assignee) and (assignee == "human" or assignee.lower().startswith("human:"))
 
 
 @_home_session_guarded("promote")
@@ -16410,6 +16410,9 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
+        actual_status = _task_status(conn, task_id)
+        if actual_status != "ready":
+            return False, f"task {task_id} remains {actual_status!r} after promotion"
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
 
     return True, None

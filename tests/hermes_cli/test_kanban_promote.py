@@ -158,13 +158,21 @@ def test_triage_resolve_on_terminal_card_is_a_refused_noop(conn, terminal):
 # operator could never close a human:* card. Promote must not claim a status the
 # card does not hold, and the operator must be able to close it from todo.
 
-def test_human_card_promote_never_reports_ready_and_operator_completes_from_todo(conn):
-    tid = kb.create_task(conn, title="operator card", assignee="human:apollo")
+@pytest.mark.parametrize("assignee", ["human", "human:apollo"])
+def test_human_card_promote_never_reports_ready_and_operator_completes_from_todo(
+    conn, capsys, assignee,
+):
+    tid = kb.create_task(conn, title="operator card", assignee=assignee)
     assert kb.get_task(conn, tid).status == "todo"  # trigger parked it
 
-    ok, err = kb.promote_task(conn, tid, actor="tester")
-    assert kb.get_task(conn, tid).status == ("ready" if ok else "todo")
-    assert not ok and "complete" in err
+    for dry_run in (True, False):
+        assert kb_cli._cmd_promote(_promote_ns(tid, dry_run=dry_run)) == 1
+        output = capsys.readouterr()
+        assert "-> ready" not in output.out
+        assert "human cards stay in 'todo'" in output.err
+        assert f"hermes kanban complete {tid}" in output.err
+        assert kb.get_task(conn, tid).status == "todo"
+    assert not any(e.kind == "promoted_manual" for e in kb.list_events(conn, tid))
 
     assert kb.complete_task(conn, tid, summary="shipped elsewhere")
     task = kb.get_task(conn, tid)
@@ -174,3 +182,18 @@ def test_human_card_promote_never_reports_ready_and_operator_completes_from_todo
         "ORDER BY id DESC LIMIT 1", (tid,),
     ).fetchone()
     assert tuple(audit) == ("todo", "done")
+
+
+def test_todo_completion_preserves_worker_parent_and_run_guards(conn):
+    worker = kb.create_task(conn, title="unstarted worker", assignee="setup")
+    conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (worker,))
+    assert not kb.complete_task(conn, worker, summary="not started")
+
+    parent = kb.create_task(conn, title="unfinished prerequisite", assignee="setup")
+    human = kb.create_task(conn, title="gated operator", assignee="human:apollo", parents=[parent])
+    assert not kb.complete_task(conn, human, summary="still gated")
+    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    assert not kb.complete_task(conn, human, summary="stale worker", expected_run_id=123)
+    assert kb.get_task(conn, human).status == "todo"
+    assert kb.complete_task(conn, human, summary="prerequisite complete")
+
