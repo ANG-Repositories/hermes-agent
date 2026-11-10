@@ -150,3 +150,27 @@ def test_triage_resolve_on_terminal_card_is_a_refused_noop(conn, terminal):
     assert "complete instead" not in err
     assert kb.get_task(conn, tid).status == terminal
     assert _event_count(conn, tid) == before
+
+
+# ---------------------------------------------------------------------------
+# t_8b654880: the tasks_human_ready_* triggers park a human card in 'todo', so
+# promote printed "-> ready" over a todo card and complete refused todo: an
+# operator could never close a human:* card. Promote must not claim a status the
+# card does not hold, and the operator must be able to close it from todo.
+
+def test_human_card_promote_never_reports_ready_and_operator_completes_from_todo(conn):
+    tid = kb.create_task(conn, title="operator card", assignee="human:apollo")
+    assert kb.get_task(conn, tid).status == "todo"  # trigger parked it
+
+    ok, err = kb.promote_task(conn, tid, actor="tester")
+    assert kb.get_task(conn, tid).status == ("ready" if ok else "todo")
+    assert not ok and "complete" in err
+
+    assert kb.complete_task(conn, tid, summary="shipped elsewhere")
+    task = kb.get_task(conn, tid)
+    assert task.status == "done"
+    audit = conn.execute(
+        "SELECT old_status, new_status FROM task_status_audit WHERE task_id=? "
+        "ORDER BY id DESC LIMIT 1", (tid,),
+    ).fetchone()
+    assert tuple(audit) == ("todo", "done")

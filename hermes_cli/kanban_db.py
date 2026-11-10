@@ -11938,6 +11938,14 @@ def complete_task(
     # An external close also takes a ``triage`` card: the external-wait card
     # parked there by a block loop is exactly what the verb exists to end.
     closable = ('running', 'ready', 'blocked', 'review') + (('triage',) if external else ())
+    # A human card can never leave ``todo`` by promotion (the tasks_human_ready_*
+    # triggers park it there), so the operator closes it from todo (t_8b654880).
+    human_todo = bool(
+        candidate is not None and expected_run_id is None
+        and candidate.status == 'todo' and _is_human_assignee(candidate.assignee)
+    )
+    if human_todo:
+        closable += ('todo',)
     if candidate is None or candidate.status not in closable:
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
@@ -12485,9 +12493,11 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND (status IN ('running', 'ready', 'blocked', 'review')
-                        OR (? AND status = 'triage'))
+                        OR (? AND status = 'triage')
+                        OR (? AND status = 'todo'
+                            AND (assignee = 'human' OR assignee LIKE 'human:%')))
                 """,
-                (result, now, task_id, bool(external)),
+                (result, now, task_id, bool(external), human_todo),
             )
         else:
             cur = conn.execute(
@@ -16328,6 +16338,11 @@ def reopen_task(
     return True, None
 
 
+def _is_human_assignee(assignee: Optional[str]) -> bool:
+    """Mirror of the tasks_human_ready_* trigger predicate."""
+    return bool(assignee) and (assignee == "human" or assignee.startswith("human:"))
+
+
 @_home_session_guarded("promote")
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
@@ -16352,6 +16367,18 @@ def promote_task(
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'{hint}"
+        )
+
+    # The tasks_human_ready_* triggers rewrite ready -> todo for a human card inside
+    # the same UPDATE, so a promotion would print success over a card still in todo
+    # (t_8b654880). Human cards are closed from todo by `complete`, not dispatched.
+    assignee = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+    if _is_human_assignee(assignee):
+        return False, (
+            f"task {task_id} is assigned to {assignee!r}; human cards stay in 'todo' "
+            f"(the dispatcher never claims them). Close it with "
+            f"`hermes kanban complete {task_id}`, or reassign it to a worker profile "
+            f"with `hermes kanban assign {task_id} <profile>` to dispatch it"
         )
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
@@ -23473,7 +23500,9 @@ def explain_complete_refusal(
         )
         state = "already done" if task.status == "done" else "archived (was done)" if task.completed_at else "archived"
         return f"{state} by {who} at {when}{outcome}"
-    if task.status not in ("running", "ready", "blocked", "review"):
+    if task.status not in ("running", "ready", "blocked", "review") and not (
+        task.status == "todo" and _is_human_assignee(task.assignee) and expected_run_id is None
+    ):
         return f"status is {task.status!r}; complete needs running/ready/blocked/review"
     if expected_run_id is not None and task.current_run_id != expected_run_id:
         return (
