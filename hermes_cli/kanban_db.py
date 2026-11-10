@@ -12494,10 +12494,9 @@ def complete_task(
                  WHERE id = ?
                    AND (status IN ('running', 'ready', 'blocked', 'review')
                         OR (? AND status = 'triage')
-                        OR (? AND status = 'todo'
-                            AND (assignee = 'human' OR assignee LIKE 'human:%')))
+                        OR (? AND status = 'todo' AND assignee = ?))
                 """,
-                (result, now, task_id, bool(external), human_todo),
+                (result, now, task_id, bool(external), human_todo, candidate.assignee),
             )
         else:
             cur = conn.execute(

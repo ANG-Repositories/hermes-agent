@@ -671,6 +671,16 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, pr) tuple IS the canonical PR identity for binding; byte-exact would let one PR fail to bind its own obligation.",
    "where": "hermes_cli/kanban_work_obligations.py:580 _identity"
+  },
+  "hermes_cli/kanban_db.py::_is_human_assignee::affix::assignee::return bool(assignee) and (assignee == \"human\" or assignee.lower().startswith(\"human:\"))": {
+   "verdict": "kept",
+   "why": "lane-KIND check mirroring the tasks_human_ready_* trigger predicate (kanban_lifecycle_guards.py: assignee = 'human' OR assignee LIKE 'human:%'; SQLite LIKE is ASCII case-insensitive), so promote refuses and complete accepts exactly the cards the trigger parks in todo. It never selects a row by identity; complete_task re-checks the row with byte-exact SQL assignee = ?.",
+   "where": "hermes_cli/kanban_db.py:16342 _is_human_assignee"
+  },
+  "hermes_cli/kanban_db.py::_is_human_assignee::fold::assignee::return bool(assignee) and (assignee == \"human\" or assignee.lower().startswith(\"human:\"))": {
+   "verdict": "kept",
+   "why": "lane-KIND check mirroring the tasks_human_ready_* trigger predicate (kanban_lifecycle_guards.py: assignee = 'human' OR assignee LIKE 'human:%'; SQLite LIKE is ASCII case-insensitive), so promote refuses and complete accepts exactly the cards the trigger parks in todo. It never selects a row by identity; complete_task re-checks the row with byte-exact SQL assignee = ?.",
+   "where": "hermes_cli/kanban_db.py:16342 _is_human_assignee"
   }
  }
 }
