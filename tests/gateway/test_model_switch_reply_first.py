@@ -6,7 +6,7 @@ writes were stalling, and a /model in another thread waited on the runner-wide s
 
 Now the switch is applied in memory, the confirmation is sent, and the durable writes run as the
 adapter's post-delivery callback inside the session task; the switch lock is per session, with one
-runner-wide lock left only around the ``--global`` config.yaml write (#100314).
+lock per config destination around the ``--global`` config.yaml write (#100314).
 
 Real ``BasePlatformAdapter`` session task + post-delivery callback + /stop path, real fork
 ``/model`` handler, real ``SessionStore``; the state.db write is an event-gated stand-in.
@@ -42,8 +42,7 @@ def _switched(model):
 
 
 async def _drained(h, timeout=5.0):
-    """Wait until the session's deferred jobs are committed and the session task is done; read the
-    store only after that (a concurrent read races the store creating its tables)."""
+    """Wait for the owning session task; no pending jobs outlive it."""
     await _wait_for(lambda: not any(not t.done() for t in list(h.adapter._session_tasks.values())),
                     "deferred writes to settle", timeout)
 
@@ -157,8 +156,7 @@ async def test_another_sessions_model_is_not_blocked_by_a_slow_switch(tmp_path, 
 
 @pytest.mark.asyncio
 async def test_same_session_switches_commit_in_issue_order(tmp_path, monkeypatch):
-    """A second /model while the first's deferred write is blocked replies at once, queues behind
-    it, and the writes land in issue order: memory, store and state.db all end on the later pick."""
+    """A second /model waits for the first save; memory, store and state.db end on the later pick."""
     h = _Harness(tmp_path, monkeypatch)
     await h.adapter.handle_message(_ev("/model model-A"))
     await _wait_for(lambda: h.sent_with(_switched("model-A")), "first confirmation")
@@ -484,6 +482,7 @@ async def test_stop_settles_started_worker_before_reset(tmp_path, monkeypatch, p
         reset = asyncio.create_task(h.adapter.handle_message(_ev("/model reset")))
         await asyncio.sleep(5.2)  # adapter may release guard, switch ownership MUST survive
         assert not reset.done(), "reset overtook the still-running executor write"
+        assert not h.turns, "queued message read a partially saved route after /stop"
         assert not h.sent_with("Model session override cleared")
         release.set()
         await asyncio.wait_for(stop, 10)

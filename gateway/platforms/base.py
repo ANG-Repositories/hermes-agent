@@ -5601,6 +5601,12 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
+            selection_lock = self.__dict__.get("_model_selection_locks", {}).get(session_key)
+            if selection_lock is not None:
+                # /stop may release the adapter guard after 5s while an executor write is still
+                # settling. Ordinary messages must not reconcile/read the half-saved route.
+                async with selection_lock:
+                    pass
             response = await self._message_handler(event)
             _handler_returned = time.monotonic()
             # A muted diagnostic wake ran for the session; its reply is not presented. The

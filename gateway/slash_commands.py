@@ -3920,58 +3920,6 @@ class GatewaySlashCommandsMixin(
 
         return await _finish_switch()
 
-    async def _commit_model_switch_durable(
-        self, result, *, session_key: str, source, config_path, persist_global: bool, one_turn: bool,
-    ) -> Optional[str]:
-        """Durable half of a committed /model switch (fork handler; mirrors upstream's
-        ``GatewayModelCommandsMixin._record_model_switch``): config write-through via the
-        ONE persist writer (#11576390), the #100314 redundant-override rule, the session-store
-        write-through (never for ``--once``, #29923) and the cache eviction.
-
-        Returns the warning for a ``--global`` switch whose config write or stale-override
-        cleanup failed (the switch then truthfully stays a session override), else ``None``.
-        """
-        from gateway import slash_commands_model as _model_mixin
-
-        global_error: Optional[str] = None
-        if persist_global:
-            try:
-                # Resolved through the module so tests/operators can patch the writer seam.
-                with _mct.span("durable_config"):
-                    await self._persist_ordered_model_config(result, config_path)
-            except Exception as e:
-                logger.warning("Failed to persist model switch: %s", e)
-                global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
-        # A --global switch has ONE durable authority: config.yaml. On success drop the session
-        # override (memory + store) — a redundant copy would shadow every later global change
-        # after a restart (#100314). Precedence is session > channel_overrides > config.yaml, so
-        # under a channel_overrides model the session override must stay.
-        if persist_global and global_error is None and self._channel_override_for(source) is None:
-            try:
-                # Fork single door (P3b/RC-2): clears the in-memory override AND the persisted
-                # identity off the loop; require_persistence surfaces a failed clear so the
-                # switch truthfully stays a session override (#100314).
-                with _mct.span("durable_clear_override"):
-                    await self._persist_session_model_override(
-                        session_key, None, require_persistence=True,
-                    )
-            except Exception as e:
-                logger.warning("Failed to clear persisted session model override: %s", e)
-                global_error = t("gateway.model.err_stale_override", error=e)
-        elif not one_turn:
-            # Non-secret write-through so the override survives a restart (api_key/api_mode are
-            # re-resolved on rehydration); a --once override must NOT outlive a restart (#29923).
-            try:
-                with _mct.span("durable_set_override"):
-                    await self.async_session_store.set_model_override(
-                        session_key, self._session_model_overrides[session_key],
-                    )
-            except Exception:
-                logger.debug("Failed to persist session model override", exc_info=True)
-        # Evict cached agent so the next turn builds fresh from the override.
-        self._evict_cached_agent(session_key)
-        return global_error
-
     async def _save_model_selection(
         self, result, *, session_key, source, event_source, config_path,
         persist_global, one_turn, override,

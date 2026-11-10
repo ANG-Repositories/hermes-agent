@@ -430,17 +430,14 @@ class GatewayModelCommandsMixin:
         owner = {"save": None, "transferred": False}
         token = _model_selection_owner.set(owner)
         adapter = self._delivery_adapter_for(source)
-        adapter_key = adapter._source_session_key(source) if adapter is not None else None
+        adapter_key = (adapter._source_session_key(source)
+                       if adapter is not None and hasattr(adapter, "_source_session_key") else None)
+        if adapter_key is not None:
+            adapter.__dict__.setdefault("_model_selection_locks", {})[adapter_key] = lock
         guard = None
         task = asyncio.current_task()
         try:
-            previous = getattr(adapter, "_session_tasks", {}).get(adapter_key)
-            if previous is not None and previous is not task and not previous.done():
-                # A just-finished save releases the switch lock before its adapter turn exits.
-                # Join that owner before claiming the callback turn; do not race queued messages.
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(previous)
-            if adapter is not None and adapter_key not in adapter._active_sessions:
+            if adapter_key is not None and adapter_key not in adapter._active_sessions:
                 guard = asyncio.Event()
                 adapter._active_sessions[adapter_key] = guard
                 adapter._track_session_task(adapter_key, task)
@@ -547,8 +544,6 @@ class GatewayModelCommandsMixin:
 
     async def _commit_model_switch_locked(self, result, ctx: _ModelSwitchContext, *, source, picker: bool) -> str:
         one_turn = False if picker else ctx.one_turn
-        # An inline commit lands after any reply-first write still queued for this session, so the
-        # older switch can never overwrite this one (Prism ea8bef1a2f75 / af86b8cbef02).
         error = self._switch_cached_agent_model(result, ctx, picker)
         if error is not None:
             return error
