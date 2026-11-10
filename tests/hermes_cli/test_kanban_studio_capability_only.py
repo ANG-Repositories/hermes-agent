@@ -192,3 +192,137 @@ def test_no_capability_map_leaves_the_rule_off(kanban_home, carried):
         rules: dict = {}
         route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), caps=None, rules_out=rules, carry_out={})
     assert route[0] != "wait" or not str(route[1]).startswith("studio_capability_only"), route
+
+
+# -- 1b. over the carry limit: carry everything but the git clones, re-clone those (operator 2026-11-10 15:3x) -----
+# t_b41d322b ran on the Studio under local_files with a 1.1 GB scratch dir (four repo clones), over CARRY_MAX_BYTES.
+
+def _clone_in(ws, name="repo", *, dirty=False, ahead=False):
+    import subprocess
+    from pathlib import Path
+    repo = Path(ws) / name
+    repo.mkdir()
+
+    def g(*a):
+        subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    (repo / "big.bin").write_bytes(b"x" * 20000)
+    g("add", "big.bin")
+    g("commit", "-q", "-m", "base")
+    g("remote", "add", "origin", "https://github.com/acme/widget.git")
+    g("update-ref", "refs/remotes/origin/main", "HEAD")
+    if ahead:
+        (repo / "more.txt").write_text("unpushed\n")
+        g("add", "more.txt")
+        g("commit", "-q", "-m", "unpushed")
+    if dirty:
+        (repo / "wip.txt").write_text("uncommitted\n")
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                         text=True).stdout.strip()
+    return sha
+
+
+@pytest.fixture
+def small_carry(monkeypatch):
+    """CARRY_MAX_BYTES scaled down: the 20 kB clone puts the dir over, notes.md alone fits."""
+    kwh._carry_scan_cache.clear()
+    kwh._carry_clone_cache.clear()
+    monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_bytes", 8192)
+    monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_bytes", 8192)
+
+
+def _route_carry(conn, tid):
+    carry, rules = {}, {}
+    route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), caps=_caps(), rules_out=rules, carry_out=carry,
+                           studio_out={})
+    return route, carry.get(tid)
+
+
+def test_over_limit_workspace_carries_without_its_clones(kanban_home, small_carry):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        sha = _clone_in(path)
+        assert not kwh.carry_size_ok(path)  # the plain carry refuses it, as for t_b41d322b
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait" and route[0] != "local", route
+    assert plan["exclude"] == ("repo",), plan
+    assert plan["clones"] == [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha, "push": None}]
+
+
+def test_over_limit_clone_with_unpushed_commits_is_pushed_first(kanban_home, small_carry):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        sha = _clone_in(path, ahead=True)
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait", route
+    push = plan["clones"][0]["push"]
+    assert push[1:] == ("main", push[2], sha) and push[2] and push[2] != sha, push
+
+
+def test_over_limit_with_a_dirty_clone_waits_named(kanban_home, small_carry):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path, dirty=True)
+        route, plan = _route_carry(conn, tid)
+    assert plan is None
+    assert route[0] == "wait" and route[1].startswith("studio_capability_only:local_files"), route
+    assert "clone repo cannot be rebuilt from origin: dirty_tree" in route[1], route
+
+
+def test_over_limit_without_clones_waits_named(kanban_home, small_carry):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        (__import__("pathlib").Path(path) / "blob.bin").write_bytes(b"y" * 20000)
+        route, plan = _route_carry(conn, tid)
+    assert plan is None and route[0] == "wait", route
+    assert "over the carry limit even without its git clones" in route[1], route
+
+
+def test_over_limit_spawn_carries_minus_clones_then_reclones_on_the_host(kanban_home, small_carry, monkeypatch):
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    calls = []
+    monkeypatch.setattr(kwh, "carry_workspace",
+                        lambda host, ws, runner=None, exclude=(): calls.append(("carry", host.name, ws, exclude)))
+    monkeypatch.setattr(kwh, "carry_clones",
+                        lambda host, ws, clones, fleet_dir, runner=None: calls.append(
+                            ("clone", host.name, ws, [c["rel"] for c in clones])))
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        sha = _clone_in(path)
+        plan = _plan(free=2)
+        plan.default_remote = True
+        _res, spawned = _tick(conn, spillover=plan, spawn_limit=2)
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                          (tid, kwh.CARRIED_EVENT)).fetchone()
+    assert (tid, "ace-ai") in spawned and (tid, None) not in spawned, spawned
+    assert calls == [("carry", "ace-ai", path, ("repo",)), ("clone", "ace-ai", path, ["repo"])], calls
+    assert json.loads(ev[0])["recloned"] == [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha}]
+
+
+def test_carry_workspace_excludes_the_clone_roots(kanban_home):
+    argvs = []
+
+    class _P:
+        returncode = 0
+        stdout = stderr = ""
+
+    def runner(argv, **_kw):
+        argvs.append(argv)
+        return _P()
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    host = _host()
+    kwh.carry_workspace(host, "/srv/ws/t_x", runner=runner, exclude=("repo", "sub/other"))
+    rsync = next(a for a in argvs if a[0] == "rsync")
+    assert "--exclude=/repo/" in rsync and "--exclude=/sub/other/" in rsync, rsync
+    assert rsync.index("--exclude=/repo/") < rsync.index("--"), rsync
+
+
+def test_kill_switch_keeps_the_over_limit_card_on_the_old_rule(kanban_home, small_carry):
+    _knob(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        route, plan = _route_carry(conn, tid)
+    assert plan is None and route[0] == "local", route

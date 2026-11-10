@@ -5345,6 +5345,22 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                                     board_default=_board_default_safe(board) if kind == "worktree" else None)
 
 
+def _carry_split_plan(workspace_path, carry_budget):
+    """``(plan, None)`` or ``(None, reason)`` for a workspace the plain carry refused (t_9965b8d5): the git clones
+    it holds are re-cloned on the pool host, everything else is carried. ``plan`` = ``{"exclude": rels,
+    "clones": [{rel, slug, branch, sha, push}]}``. The reason names what blocks it, for the wait line."""
+    clones = _kb._kwh.carry_split(workspace_path, budget=carry_budget)
+    if clones is None:
+        return None, "over the carry limit even without its git clones (or the census is deferred)"
+    recs = []
+    for rel in clones:
+        rec, why = _kb._kwh.assess_clone(os.path.join(workspace_path, rel))
+        if rec is None:
+            return None, f"over the carry limit; clone {rel} cannot be rebuilt from origin: {why}"
+        recs.append({"rel": rel, **rec})
+    return {"exclude": tuple(clones), "clones": recs}, None
+
+
 def _board_default_safe(board):
     try:
         from hermes_cli import kanban_worktree_port as _kwt
@@ -5528,6 +5544,7 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
                       lf_detail)
     ok, rule, route_class = _kwp.portable(workspace_has_content=lf_detail is not None, **_portable_kw)
     carried = False
+    why_split = None
     if not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None:
         # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
         # while the Studio has room. Every OTHER rule is judged as if the directory were empty; a card that is
@@ -5536,17 +5553,26 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         # Cheapest check first: the size walk is the costly one and runs within the tick's budget (t_915b8d2d).
         ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
         shared = ok2 and _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])
+        split = None
         if (ok2 and not shared
                 and _kb._kwh.carry_size_ok(row["workspace_path"], budget=carry_budget)):
             ok, rule, route_class, carried = ok2, rule2, class2, True
             carry_out[row["id"]] = True
-        elif studio_on and ok2:
+        elif studio_on and ok2 and not shared:
+            # t_9965b8d5 (operator 15:3x): over the carry limit, carry everything except the git clones and
+            # re-clone those on the pool host from origin, same branch and commit (push first, as the port does).
+            split, why_split = _carry_split_plan(row["workspace_path"], carry_budget)
+            if split is not None:
+                ok, rule, route_class, carried = ok2, rule2, class2, True
+                carry_out[row["id"]] = split
+        if studio_on and ok2 and not carried:
             # t_9965b8d5: files are no capability; a dir the carry cannot move this tick waits, named.
             if rules_out is not None:
                 rules_out[row["id"]] = rule
             return "wait", _ksc.wait_reason(rule, "workspace shared with another card" if shared else
-                                            f"carry refused or deferred: {lf_detail}", task_id=row["id"])
-        elif studio_on:
+                                            f"carry refused or deferred: {why_split or lf_detail}",
+                                            task_id=row["id"])
+        elif studio_on and not ok2:
             rule = rule2  # the files masked the rule that really keeps it home: that rule is judged
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
@@ -8218,13 +8244,22 @@ def _dispatch_once_locked(
                     # local_files continuity overflow (t_e604c0f9): the Studio was full, so the card's
                     # Studio scratch dir goes to the chosen host first, same path; a failure is a spawn
                     # failure (claim released, reservation refunded), never an empty-dir run.
-                    _kb._kwh.carry_workspace(placed_host, str(workspace))
+                    _split = _carry_rows.get(claimed.id)
+                    _split = _split if isinstance(_split, dict) else None
+                    _kb._kwh.carry_workspace(placed_host, str(workspace),
+                                             exclude=_split["exclude"] if _split else ())
+                    if _split:
+                        # t_9965b8d5: the clones the carry left out are rebuilt from origin, same branch + commit.
+                        _kb._kwh.carry_clones(placed_host, str(workspace), _split["clones"],
+                                              _kb.kanban_home() / "fleet")
                     with _kbc.write_txn(conn):
                         # "workspace" = the stored path at carry time, "path" = the spelling persisted just
                         # below; carried_host() binds on either (Prism 34bd0265a601).
                         _kb._append_event(conn, claimed.id, _kb._kwh.CARRIED_EVENT,
                                           {"host": placed_host.name, "workspace": claimed.workspace_path,
-                                           "path": str(workspace)},
+                                           "path": str(workspace),
+                                           **({"recloned": [{k: c[k] for k in ("rel", "slug", "branch", "sha")}
+                                                            for c in _split["clones"]]} if _split else {})},
                                           run_id=claimed.current_run_id)
             if protected is not None:
                 validate_mount(

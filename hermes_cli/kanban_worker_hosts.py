@@ -22,7 +22,7 @@ import os
 import re
 import shlex
 import subprocess
-from typing import Callable, Dict, Mapping, MutableMapping, Optional
+from typing import Callable, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
 
@@ -531,6 +531,7 @@ CARRIED_EVENT = "workspace_carried"
 # (custody, independent of placement.continuation); the Studio original is never run against or carried again.
 CARRY_BIND_RULE = "workspace_carry"
 _carry_scan_cache: Dict[tuple, tuple] = {}
+_carry_clone_cache: Dict[tuple, tuple] = {}  # skip_clones census key -> clone paths it skipped (t_9965b8d5)
 _carry_waiting: Dict[tuple, tuple] = {}  # cache key -> (budget generation first deferred, last asked); FIFO
 _carry_gen = 0
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
@@ -638,7 +639,7 @@ class CarryScanBudget:
 def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                   max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None,
                   budget: Optional[CarryScanBudget] = None,
-                  max_seconds: float = CARRY_SCAN_MAX_SECONDS) -> bool:
+                  max_seconds: float = CARRY_SCAN_MAX_SECONDS, skip_clones: bool = False) -> bool:
     """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed) and its
     path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path and
     limits for ``CARRY_SCAN_TTL_SECONDS`` from the END of the walk: the dispatcher asks every tick.
@@ -657,7 +658,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     except (OSError, RuntimeError, ValueError):
         return False
     clock = budget.clock if budget is not None else _time.monotonic
-    key = (root, max_bytes, max_entries)
+    key = (root, max_bytes, max_entries) + (("skip_clones",) if skip_clones else ())
     t = clock() if now is None else now
     hit = _carry_scan_cache.get(key)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
@@ -676,6 +677,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     # never recurse, including links to directories and dangling links.
     import stat
     pending = [root]
+    clones: List[str] = []
     try:
         while pending and ok:
             current = pending.pop()
@@ -691,6 +693,11 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                         ok = False
                         break
                     if stat.S_ISDIR(info.st_mode):
+                        if skip_clones and os.path.isdir(os.path.join(entry.path, ".git")) \
+                                and not os.path.islink(os.path.join(entry.path, ".git")):
+                            # t_9965b8d5: a git clone is re-cloned on the pool host, never copied or counted
+                            clones.append(os.path.relpath(entry.path, root))
+                            continue
                         pending.append(entry.path)
                     if entries % 256 == 0 and clock() >= stop:
                         ok, timed_out = False, True
@@ -709,14 +716,72 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     if timed_out:
         _log.info("carry census of %s refused: walk passed %.1fs at %d entries", root, max_seconds, entries)
     _carry_scan_cache[key] = (end if now is None else now, ok)
+    if skip_clones:
+        _carry_clone_cache[key] = tuple(sorted(clones)) if ok else ()
     return ok
+
+
+def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None,
+                max_bytes: int = CARRY_MAX_BYTES, max_entries: int = CARRY_MAX_ENTRIES) -> Optional[Tuple[str, ...]]:
+    """t_9965b8d5 (operator 2026-11-10 15:3x): a workspace over the carry limit is carried WITHOUT its git clones,
+    which the pool host re-clones from origin at the same branch and commit. Returns the clone paths (relative to
+    the workspace, non-empty) when everything else fits the limits, else None (nothing to split, still over, scan
+    refused or deferred). A clone path must be shell-inert like the workspace itself."""
+    if not carry_size_ok(path, budget=budget, max_bytes=max_bytes, max_entries=max_entries, skip_clones=True):
+        return None
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        root = canon(path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    clones = _carry_clone_cache.get((root, max_bytes, max_entries, "skip_clones"), ())
+    if not clones or not all(carry_path_safe(f"{str(root).rstrip('/')}/{c}") for c in clones):
+        return None
+    return clones
+
+
+def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional[dict], Optional[str]]:
+    """``(record, None)`` when the clone at ``repo`` can be rebuilt from origin on a pool host, else
+    ``(None, reason)``. The rules are the worktree port's (t_1d2c5939): a GitHub origin, on a branch, nothing
+    uncommitted or untracked, and a branch origin has or is behind (``push`` then carries the unpushed commits,
+    force-with-lease pinned to the origin sha seen here); a branch that diverged from origin is refused."""
+    from pathlib import Path as _P
+    from hermes_cli import kanban_worktree_port as _kwt
+
+    def _out(*args):
+        try:
+            proc = runner(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8",
+                          timeout=10, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (proc.stdout or "").strip() if getattr(proc, "returncode", 1) == 0 else None
+
+    slug = _kwt.origin_slug(_P(repo), runner)
+    if not slug:
+        return None, "origin_not_github"
+    branch = _out("branch", "--show-current")
+    if not branch:
+        return None, "detached_head"
+    if not _kwt._clean_on_branch(_P(repo), branch, runner):
+        return None, "dirty_tree"
+    local = _out("rev-parse", "-q", "--verify", f"refs/heads/{branch}")
+    if not local:
+        return None, "no_local_branch"
+    remote = _out("rev-parse", "-q", "--verify", f"refs/remotes/origin/{branch}") or ""
+    push = None
+    if remote != local:
+        if remote and _out("merge-base", "--is-ancestor", remote, local) is None:
+            return None, "diverged_from_origin"
+        push = (repo, branch, remote, local)
+    return {"slug": slug, "branch": branch, "sha": local, "push": push}, None
 
 
 def _raise(exc: OSError) -> None:
     raise exc
 
 
-def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subprocess.run) -> None:
+def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subprocess.run,
+                    exclude: Tuple[str, ...] = ()) -> None:
     """Copy the local ``workspace`` to the same path on ``host`` (rsync -a over the pool ssh options); raise on any
     failure. Never deletes on the target: an existing remote file of the same name is overwritten, others stay."""
     src = workspace.rstrip("/") or "/"
@@ -726,13 +791,41 @@ def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subproces
     # reservation take() booked for this card on this host, so it places no work of its own.
     prepare_remote_workspace(host, src, runner)
     ssh = _ssh_argv(host, "")[:-2]  # the ssh options, without target and command
-    proc = runner(["rsync", "-a", "-e", " ".join(shlex.quote(a) for a in ssh), "--", f"{src}/",
+    # ``exclude``: workspace-relative clone paths the host re-clones instead (t_9965b8d5), anchored at the root.
+    excl = [f"--exclude=/{rel.strip('/')}/" for rel in exclude]
+    proc = runner(["rsync", "-a", *excl, "-e", " ".join(shlex.quote(a) for a in ssh), "--", f"{src}/",
                    f"{host.target}:{src}/"],
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
     if getattr(proc, "returncode", 1) != 0:
         raise RuntimeError(f"carry to {host.name}: rsync {src} rc={getattr(proc, 'returncode', '?')}: "
                            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+
+
+def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run) -> None:
+    """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
+    pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
+    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
+    from hermes_cli import kanban_worktree_port as _kwt
+    from hermes_cli.kanban_worker_pool import _ssh_argv
+    for c in clones:
+        if c.get("push") is not None:
+            _kwt.push_card_branch(tuple(c["push"]), runner)
+        dest = f"{workspace.rstrip('/')}/{c['rel'].strip('/')}"
+        if not carry_path_safe(dest):
+            raise RuntimeError(f"carry to {host.name}: refused, clone path {dest!r} is not shell-inert")
+        route = _kwt.derived_route(c["slug"], fleet_dir, (host.name,))
+        mirror = _kwt.mirror_for((c["slug"], *route), host.name) if route else \
+            f"{_kwt.DERIVED_MIRROR_ROOT}/{c['slug']}.git"
+        _kwt.clone_on_host(host, dest, c["slug"], mirror, c["branch"], runner)
+        sha = shlex.quote(c["sha"])
+        proc = runner(_ssh_argv(host, f"cd {shlex.quote(dest)} && {{ [ \"$(git rev-parse HEAD)\" = {sha} ] || "
+                                      f"git reset -q --hard {sha}; }} && [ \"$(git rev-parse HEAD)\" = {sha} ]"),
+                      capture_output=True, text=True, encoding="utf-8", errors="replace",
+                      timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError(f"carry to {host.name}: clone {c['rel']} not at {c['sha'][:12]}: "
+                               f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
 
 
 def remote_workspace_has_content(placement_raw: Optional[str],
