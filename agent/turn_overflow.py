@@ -39,6 +39,10 @@ _RETRY_HINT = "   💡 Try /new to start a fresh conversation, or /compress to r
 # of the known window is not explained by the transcript; the rough estimator is ±30%, so a real
 # overflow (request ≈ window) never lands below half.
 _UNEXPLAINED_REJECTION_FRACTION = 0.5
+# The provider measured the overflow itself only when it quotes a token count ("233153 tokens")
+# or the comparison form ("233153 > 200000"). Any other digit run (request id, timestamp, port)
+# is not a measurement and must not turn an unexplained rejection into a session reset.
+_PROVIDER_MEASURED_COUNT_RE = re.compile(r"\d[\d,]{3,}\s*(?:input\s+)?tokens?\b|\d{4,}\s*>\s*\d{4,}", re.IGNORECASE)
 
 _GITHUB_MODELS_HINT = (
     "   💡 GitHub Models free tier (models.inference.ai.azure.com) caps every",
@@ -394,6 +398,7 @@ def _unexplained_rejection_kept(st: _Recovery, request_tokens: int, window: int)
             st.compression_attempts,
         ),
         compression_exhausted=False, reason=FailoverReason.server_error.value, retryable=True,
+        context_overflow=False,
     )
 
 
@@ -441,7 +446,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     unexplained = (
         new_ctx is None and isinstance(window, int) and window > 0
         and request_tokens < window * _UNEXPLAINED_REJECTION_FRACTION
-        and not re.search(r"\d{4,}", error_msg)
+        and not _PROVIDER_MEASURED_COUNT_RE.search(error_msg)
     )
     if explicit_context_rejection and unexplained:
         # A rejected request is an upper bound, not a measured model window. Keep
@@ -457,7 +462,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     if (
         is_local_endpoint(agent.base_url)
         and not explicit_context_rejection
-        and not re.search(r"\d{4,}", error_msg)
+        and not _PROVIDER_MEASURED_COUNT_RE.search(error_msg)
         and isinstance(window, int) and window > 0
         and request_tokens < window * _UNEXPLAINED_REJECTION_FRACTION
     ):
@@ -474,6 +479,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
                 "skipping compression: %s", agent.log_prefix, f"{request_tokens:,}", f"{window:,}", error_msg[:200],
             ),
             compression_exhausted=False, reason=FailoverReason.server_error.value, retryable=True,
+            context_overflow=False,
         )
 
     keep_session = explicit_context_rejection and unexplained

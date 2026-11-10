@@ -156,9 +156,55 @@ def test_explicit_rejection_below_the_window_that_cannot_shrink_keeps_the_sessio
     _assert_session_kept(verdict.result)
 
 
+@pytest.mark.parametrize("error", [
+    _RELAY_REJECTION + "; request_id=req_12345678",  # Prism be4e9c23bb2b: an id is not a token count
+    _RELAY_REJECTION + " at 2026-11-09T18:46:03Z",
+])
+def test_unrelated_digits_in_the_rejection_still_keep_the_session(error):
+    from unittest.mock import patch
+
+    with patch("agent.turn_overflow._Recovery.compress_scored_by_tokens", return_value=(None, False, 155_618)):
+        verdict, _ = _context_rejection(
+            155_618, window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider="claude-dtlr", error=error,
+        )
+    assert verdict.action == "return"
+    _assert_session_kept(verdict.result)
+
+
+@pytest.mark.parametrize("request_tokens", [155_400, 400_123])
+def test_kept_rejection_with_400_in_its_counts_is_not_read_as_overflow(request_tokens):
+    """Prism 82b3fd6acb0e: the copy prints ~155,400; the gateway's bare-"400" heuristic for long
+    sessions must not reclassify the session-keeping failure as a context overflow."""
+    from gateway.run_turn import is_context_overflow_failure_result
+
+    verdict, _ = _context_rejection(
+        request_tokens, window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider="claude-dtlr",
+        error=_RELAY_REJECTION, compression_attempts=1,
+    )
+    assert "400" in verdict.result["error"]
+    assert is_context_overflow_failure_result(verdict.result, history_len=3_000) is False
+
+
+def test_local_server_rejection_with_a_request_id_is_still_shared_slot_contention():
+    """The local-endpoint branch uses the same measured-count check: a request id is not a count."""
+    verdict, compressed = _context_rejection(3_000, error="HTTP 500: Context size has been exceeded. id=req_12345678")
+    assert not compressed and verdict.action == "return"
+    assert verdict.result["failure_retryable"] is True and "compression_exhausted" not in verdict.result
+
+
+def test_local_server_rejection_with_400_in_its_counts_is_not_read_as_overflow():
+    """Same class on main's sibling exit (local shared-slot rejection)."""
+    from gateway.run_turn import is_context_overflow_failure_result
+
+    verdict, compressed = _context_rejection(3_400)
+    assert not compressed and "400" in verdict.result["error"]
+    assert is_context_overflow_failure_result(verdict.result, history_len=3_000) is False
+
+
 @pytest.mark.parametrize("request_tokens,error", [
     (990_000, _RELAY_REJECTION),  # at the window: a genuine overflow
     (155_618, "context_length_exceeded: prompt is too long: 1200000 tokens > 1000000 maximum"),  # provider's own count
+    (155_618, "context_length_exceeded: prompt is too long: 233153 tokens > 200000"),  # comparison form
 ])
 def test_genuine_overflow_that_cannot_shrink_still_exhausts(request_tokens, error):
     from unittest.mock import patch

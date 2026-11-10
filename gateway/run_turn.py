@@ -107,6 +107,10 @@ def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> 
         return False
     if agent_result.get("compression_exhausted"):
         return True
+    # The agent's explicit verdict (agent/turn_overflow.py session-keeping exits) beats text
+    # matching: their copy prints token counts, and "155,400" must not read as an HTTP 400.
+    if agent_result.get("context_overflow") is False:
+        return False
     err = str(agent_result.get("error") or "").lower()
     return any(p in err for p in _CONTEXT_OVERFLOW_ERROR_PHRASES) or ("400" in err and history_len > 50)
 
