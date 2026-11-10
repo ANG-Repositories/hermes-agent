@@ -5314,8 +5314,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     rules = rules_out if rules_out is not None else {}
     aff = affinity_out if affinity_out is not None else {}
     route = _route_row_base(conn, row, plan, default_assignee, native_cache, linked_ids, lineage_mode, aff,
-                            unknown_out, caps, caps_out, rules, access_out, binds, held, worktree_out, board,
-                            carry_out, pause_cache, carry_budget, studio_on=studio_on)
+                            unknown_out, caps, caps_out, rules, access_out, binds, held=held,
+                            worktree_out=worktree_out, board=board, carry_out=carry_out, pause_cache=pause_cache,
+                            carry_budget=carry_budget, studio_on=studio_on)
     if not studio_on or route[0] != "local":
         return route
     tid = row["id"]
