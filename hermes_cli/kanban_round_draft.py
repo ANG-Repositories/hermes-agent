@@ -3,20 +3,23 @@
 Goal: one CI run per round, not one per push. The draft lane skips CI on draft PRs, so:
 
 * Round start (:func:`draft_at_round_start`, called once at worker boot, before the first turn and so before
-  any push): for each PR this card's earlier handback flipped ready (``handoff_draft_flipped`` events = the
-  receipt naming card + PR) that is still OPEN, ready and on a branch naming this card, run
-  ``gh pr ready --undo``, persist the mark on the card (``round_draft_marked`` event: ``{"o/r#n": {"run",
-  "head", "at"}}``, run id from the worker's own env) and post ``round-draft: drafted by worker run <id> at
-  <head>`` as a human-readable receipt only. A failure is logged and the run continues. Never retried.
+  any push): for the ONE PR whose head branch is the branch this run's workspace checks out, that this card's
+  earlier handback flipped ready (``handoff_draft_flipped`` events = the receipt naming card + PR) and that is
+  still OPEN and ready, persist the mark on the card FIRST (``round_draft_marked`` event: ``{"o/r#n": {"run",
+  "head", "at"}}``, run id from the worker's own env), then run ``gh pr ready --undo`` and post ``round-draft:
+  drafted by worker run <id> at <head>`` as a human-readable receipt only. No mark written = no draft
+  (t_d3da1a4e: a draft without its record strands the PR as somebody else's hold). A failed draft voids the
+  mark. A failure is logged and the run continues. Never retried.
 * Round end: the handback (:mod:`kanban_pr_freshness`) un-drafts once through ``ace_gate.py ready``. A draft at
   the recorded head is normally an operator hold; :func:`round_marked` lets the handback tell this worker-round
   draft from that hold, from the PERSISTED mark only (Prism 852b8897186d: a PR comment anyone can post is not
-  provenance).
+  provenance), and only at the head the mark was written for.
 * A run that dies mid-round leaves the marked draft; the next run of the same card sees a draft and does
   nothing (no second mark), and its handback adopts it through the same mark.
 
-Nothing else drafts for a round: the Prism findings-route only sends the card back. Kill switch
-``KANBAN_ROUND_DRAFT=0`` (no draft, no mark, the handback treats a same-head draft as a hold, as before).
+Nothing else drafts for a round: the Prism findings-route only sends the card back. OFF by default
+(t_d3da1a4e: 0 completed cycles in 2 days, one stranded draft per send-back round); ``KANBAN_ROUND_DRAFT=1``
+re-enables. Off = no draft, no mark, the handback treats a same-head draft as a hold.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ CommentFn = Callable[[str, int, str], bool]   # (repo, number, body) -> posted
 
 
 def enabled() -> bool:
-    return os.environ.get("KANBAN_ROUND_DRAFT", "1").strip() != "0"
+    return os.environ.get("KANBAN_ROUND_DRAFT", "0").strip() == "1"
 
 
 def mark_line(run_id, head: str) -> str:
@@ -77,56 +80,31 @@ def mark_records(conn, task_id: str) -> dict:
 
 
 def round_marked(mark, head: str, record, own_runs: Optional[Iterable] = None) -> bool:
-    """An unconsumed mark from an own run, not older than the last flip.
-    The authenticated transition (checked separately) survives WIP head changes; timestamps alone prove nothing.
-    Missing/malformed mark or record, or the kill switch -> False (the draft stays an operator hold)."""
+    """An unconsumed mark from an own run, written for THIS head, not older than the last flip.
+    Missing/malformed mark or record, or the switch off -> False (the draft stays an operator hold)."""
     if not enabled() or not head or not isinstance(mark, dict) or not isinstance(record, dict):
         return False
     if own_runs is None or str(mark.get("run") or "") not in {str(r) for r in own_runs}:
         return False
+    if mark.get("consumed") or str(mark.get("head") or "") != head:
+        return False
     try:
-        return not mark.get("consumed") and float(mark.get("at") or 0) >= float(record.get("at") or 0)
+        return float(mark.get("at") or 0) >= float(record.get("at") or 0)
     except (TypeError, ValueError):
         return False
 
 
 def gh_snapshot(path: str):
-    """Pinned REST reads; timeline pagination is complete before any ownership decision."""
-    timeline = "/timeline?" in path
-    argv = ["gh", "api", "--hostname", "github.com"]
-    if timeline:
-        argv += ["--paginate", "--slurp"]
-    if path == "graphql":
-        argv += ["-f", "query=query { viewer { databaseId } }"]
+    """Pinned, floor-bypassing REST read (GH_SHIM_FRESH: a 30 s cached copy is not the PR's state)."""
     try:
-        proc = subprocess.run(argv + [path], stdin=subprocess.DEVNULL, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", timeout=60,
-                              check=False, env=dict(os.environ, GH_HOST="github.com"))
+        proc = subprocess.run(["gh", "api", "--hostname", "github.com", path], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                              check=False, env=dict(os.environ, GH_HOST="github.com", GH_SHIM_FRESH="1"))
         if proc.returncode:
             return None
-        data = json.loads(proc.stdout)
-        return {"pages": data} if timeline else data
+        return json.loads(proc.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-
-
-def latest_transition(gh, repo: str, number: int):
-    data = gh(f"repos/{repo}/issues/{number}/timeline?per_page=100")
-    pages = data.get("pages") if isinstance(data, dict) else None
-    if not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
-        return None
-    events = [e for page in pages for e in page if isinstance(e, dict)
-              and e.get("event") in {"convert_to_draft", "ready_for_review"}]
-    return events[-1] if events else None
-
-
-def current_transition(mark, gh, repo: str, number: int) -> bool:
-    if not isinstance(mark, dict) or mark.get("consumed") or not mark.get("transition_id") or not mark.get("actor_id"):
-        return False
-    event = latest_transition(gh, repo, number)
-    return bool(event and event.get("event") == "convert_to_draft"
-                and event.get("id") == mark["transition_id"]
-                and (event.get("actor") or {}).get("id") == mark["actor_id"])
 
 
 def gh_draft(repo: str, number: int) -> bool:
@@ -158,17 +136,18 @@ def gh_comment(repo: str, number: int, body: str) -> bool:
     return proc.returncode == 0
 
 
-def draft_at_round_start(task_id: str, run_id, records: dict, *, gh=None, draft: Optional[DraftFn] = None,
-                         comment: Optional[CommentFn] = None,
+def draft_at_round_start(task_id: str, run_id, records: dict, *, branch: str = "", gh=None,
+                         draft: Optional[DraftFn] = None, comment: Optional[CommentFn] = None,
                          persist: Optional[Callable[[str, dict], None]] = None) -> dict:
-    """Draft this card's own ready PRs before the round's first push. Returns ``{"o/r#n": outcome}``.
+    """Draft the one PR on ``branch`` (the branch this run checks out). Returns ``{"o/r#n": outcome}``.
 
-    ``persist(key, {"run", "head", "at"})`` records the mark on the card right after a successful draft (the only
-    provenance :func:`round_marked` accepts). Never raises: every failure is logged and the run continues."""
+    ``persist(key, {"run", "head", "at"})`` records the mark on the card BEFORE the draft (the only provenance
+    :func:`round_marked` accepts); no ``persist``, or a raising one, means no draft. Never raises."""
     from hermes_cli import kanban_pr_freshness as fr
     from hermes_cli.kanban_open_pr import branch_names_card, extract_pr_refs, is_fleet_ref
     report: dict = {}
-    if not enabled() or not fr.enabled() or not fr.worker_draft_flip_enabled() or not task_id or not run_id or not records:
+    if (not enabled() or not fr.enabled() or not fr.worker_draft_flip_enabled() or not task_id or not run_id
+            or not records or not branch or persist is None):
         return report
     if gh is None:
         gh = None if os.environ.get("PYTEST_CURRENT_TEST") else gh_snapshot
@@ -191,50 +170,62 @@ def draft_at_round_start(task_id: str, run_id, records: dict, *, gh=None, draft:
             _log.warning("round draft: %s unreadable; round runs CI per push", key)
             continue
         head = str(((pr.get("head") or {}).get("sha")) or "")
+        head_ref = str(((pr.get("head") or {}).get("ref")) or "")
         if pr.get("state") != "open" or not head:
             report[key] = "skip: not open"
             continue
-        if not branch_names_card(str(((pr.get("head") or {}).get("ref")) or ""), task_id):
+        if head_ref != branch:
+            report[key] = "skip: not this run's branch"   # a sibling PR of the card is never touched
+            continue
+        if not branch_names_card(head_ref, task_id):
             report[key] = "skip: branch does not name this card"
             continue
         if pr.get("draft") is True:
             report[key] = "skip: already draft"   # a dead run's marked draft (adopted) or someone else's hold
             continue
-        identity = gh("graphql")
-        actor_id = (((identity or {}).get("data") or {}).get("viewer") or {}).get("databaseId") if isinstance(identity, dict) else None
-        before = latest_transition(gh, ref.repo, ref.number)
-        if not actor_id:
-            report[key] = "skip: authenticated actor unavailable; operator handback required"
+        mark = {"run": str(run_id), "head": head, "at": time.time()}
+        try:
+            persist(key, mark)
+        except Exception:  # noqa: BLE001 -- no record, no draft (t_d3da1a4e)
+            report[key] = "skip: mark not persisted; not drafted"
+            _log.warning("round draft: persisting mark for %s failed; not drafting", key, exc_info=True)
             continue
         if not draft(ref.repo, ref.number):
             report[key] = "draft failed (logged; round runs CI per push)"
-            continue
-        transition = latest_transition(gh, ref.repo, ref.number)
-        if (not transition or transition.get("event") != "convert_to_draft" or not transition.get("id")
-                or (before and transition.get("id") == before.get("id"))
-                or (transition.get("actor") or {}).get("id") != actor_id):
-            report[key] = "drafted; transition ownership unproved; operator handback required"
-            _log.warning("round draft: %s %s", key, report[key])
-            continue
-        if persist is not None:
             try:
-                persist(key, {"run": str(run_id), "head": head, "at": time.time(),
-                              "transition_id": transition["id"], "actor_id": actor_id})
-            except Exception:  # noqa: BLE001 -- unpersisted mark = the handback treats the draft as a hold
-                _log.warning("round draft: persisting mark for %s failed", key, exc_info=True)
+                persist(key, dict(mark, consumed=True))   # void: the mark must never adopt a later draft
+            except Exception:  # noqa: BLE001 -- an unvoided mark still needs this head + an own-run draft
+                _log.warning("round draft: voiding mark for %s failed", key, exc_info=True)
+            continue
         posted = comment(ref.repo, ref.number, mark_line(run_id, head))
-        report[key] = "drafted + marked" if posted else "drafted; mark failed"
+        report[key] = "drafted + marked" if posted else "drafted + marked; receipt comment failed"
         _log.info("round draft: %s %s at %s by run %s", key, report[key], head[:12], run_id)
     return report
 
 
-def run_from_env() -> dict:
-    """Worker boot entry: the dispatcher-owned worker drafts its card's PRs. Never raises."""
+def _workspace_branch() -> str:
+    ws = (os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+    if not ws:
+        return ""
     try:
+        proc = subprocess.run(["git", "-C", ws, "rev-parse", "--abbrev-ref", "HEAD"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    out = (proc.stdout or "").strip()
+    return "" if proc.returncode or out == "HEAD" else out
+
+
+def run_from_env() -> dict:
+    """Worker boot entry: the dispatcher-owned worker drafts its card's PR. Never raises."""
+    try:
+        if not enabled():
+            return {}
         from agent.delegation_context import owned_kanban_task
         task_id = owned_kanban_task()
         run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
-        if not task_id or not run_id.isdigit() or not enabled():
+        branch = _workspace_branch()
+        if not task_id or not run_id.isdigit() or not branch:
             return {}
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db as _kb
@@ -253,7 +244,7 @@ def run_from_env() -> dict:
                     _kb._append_event(conn, task_id, "round_draft_marked", {"marked": {key: mark}},
                                       run_id=int(run_id))
 
-        return draft_at_round_start(task_id, run_id, records, persist=persist)
+        return draft_at_round_start(task_id, run_id, records, branch=branch, persist=persist)
     except Exception:  # noqa: BLE001 -- a round-start draft must never stop a worker
         _log.warning("round draft at worker start failed", exc_info=True)
         return {}

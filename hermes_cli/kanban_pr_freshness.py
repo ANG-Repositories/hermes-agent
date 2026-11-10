@@ -547,14 +547,11 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         if pr.get("draft") is True:
             held = _operator_hold(flip_records.get(key.lower()), pr)
             mark = mark_records.get(key.lower())
-            if mark is not None:
-                owned = (_rd.round_marked(mark, str(((pr.get("head") or {}).get("sha")) or ""),
-                                          flip_records.get(key.lower()), round_runs)
-                         and _rd.current_transition(mark, _rd.gh_snapshot if gh is gh_api else gh, ref.repo, ref.number)
-                         and consume is not None)
-                held = "" if owned else "round draft ownership unproved or consumed; leave draft for operator ready"
-            if held and mark is None:
-                held += "; no authenticated round transition"
+            # t_d3da1a4e: the mark is written before the draft, for the head it drafted at; a same-head draft that
+            # carries an own-run mark is this card's round draft. Any other mark changes nothing.
+            if held and mark is not None and consume is not None and _rd.round_marked(
+                    mark, str(((pr.get("head") or {}).get("sha")) or ""), flip_records.get(key.lower()), round_runs):
+                held = ""
             if held:
                 # t_62389c4f: re-drafted by someone else after this card flipped it; the hold sticks.
                 entry["draft_held"] = held
