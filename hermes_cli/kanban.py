@@ -1241,6 +1241,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
         args.session = None
     else:
         home_session_ids = None
+    if not kb.kanban_db_path().exists():
+        # A fresh board has no tasks; a read must not initialize it just to
+        # produce the same empty listing. Delegated callers retain their fence.
+        from agent.delegation_context import kanban_path_is_fenced
+        if not kanban_path_is_fenced(kb.kanban_db_path()):
+            if not _json_out(args, []):
+                print("(no matching tasks)")
+            return 0
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.

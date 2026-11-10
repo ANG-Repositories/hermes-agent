@@ -1101,12 +1101,14 @@ def connect(
     # explicit ``db_path=`` too: a probe that hands connect() the live path
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
+    from agent.delegation_context import kanban_path_is_fenced
     if readonly or _READ_ONLY.get():
         _kb._refuse_noncanonical_board_path(path)
+        if kanban_path_is_fenced(path):
+            return _kb._connect_delegated_child(path)
         return _connect_readonly(path)
     _kb._assert_live_board_write_allowed(path)
     _kb._refuse_noncanonical_board_path(path)  # before the mkdir (t_1462ab0d)
-    from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(path):
         # Reads must not enter schema/backfill write transactions. Never create a
         # missing board or migrate on a descendant's behalf; the owner initializes it.
