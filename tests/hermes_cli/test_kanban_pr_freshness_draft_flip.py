@@ -323,6 +323,69 @@ def test_e2e_operator_redraft_survives_next_handback(board, monkeypatch):
     assert ready == [] and armed == []
 
 
+def test_e2e_legacy_round_draft_mark_does_not_lift_a_same_head_hold(board, monkeypatch):
+    """t_d3da1a4e: the round draft is removed. An old ``round_draft_marked`` event on the card is ignored, so a
+    same-head draft stays an operator hold even with a mark by this card's own run."""
+    ready, armed, tid_box = [], [], []
+    _wire(monkeypatch, lambda: f"daedalus/{tid_box[0]}-fix", ready, armed)
+    monkeypatch.setenv("KANBAN_ROUND_DRAFT", "1")
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        tid_box.append(tid)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_draft_flipped", {"flipped": RECORD})
+            kb._append_event(conn, tid, "round_draft_marked",
+                             {"marked": {"o/r#5": {"run": str(run), "head": HEAD, "at": FLIP_AT + 5}}}, run_id=run)
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}", metadata={"pr_url": PR_URL},
+                                expected_run_id=run)
+        assert _status(conn, tid) == "review"
+        assert "o/r#5" in kb.latest_run(conn, tid).metadata["handoff_freshness"]["draft_held"]
+    assert ready == [] and armed == []
+
+
+def test_worker_boot_never_changes_a_pr_draft_state(board, monkeypatch):
+    """t_d3da1a4e: a kanban worker boot issues no draft write, even for a PR this card flipped ready on its own
+    branch (the exact shape the removed round draft acted on)."""
+    import subprocess
+    import tools.kanban_tools as kt
+    from hermes_cli import cli_single_query as csq
+    from hermes_cli import kanban_placement_failfast as pff
+    monkeypatch.setenv("KANBAN_ROUND_DRAFT", "1")
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "handoff_draft_flipped", {"flipped": RECORD})
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run))
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(kt, "register_current_worker_from_env", lambda: True)
+    monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: tid)
+    monkeypatch.setattr(pff, "boot_check", lambda task, preloads=(): None)
+    gh_argv = []
+    real_run = subprocess.run
+
+    def fake_run(argv, *a, **kw):
+        if not (isinstance(argv, list) and argv and argv[0] == "gh"):
+            return real_run(argv, *a, **kw)
+        gh_argv.append(list(argv))
+        out = {"state": "open", "draft": False, "head": {"sha": HEAD, "ref": f"daedalus/{tid}-fix"}}
+        if "graphql" in argv:
+            out = {"data": {"viewer": {"databaseId": 1}}}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(out), "")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    class _Cli:
+        def start_preloaded_skills(self):
+            pass
+
+        def _claim_active_session(self, *_a, **_k):
+            return False  # stop the one-shot right after boot
+
+    with pytest.raises(SystemExit):
+        csq._run_single_query_mode(_Cli(), "do it", None, True, True)
+    assert gh_argv == [], gh_argv
+
+
 def test_e2e_held_draft_with_draft_ok_takes_the_override_path(board, monkeypatch):
     """Prism 400b19850a8f: an explicit --draft-ok on a held draft is the audited override, unchanged:
     the card completes (not routed to review) and completion_draft_override is written."""

@@ -12134,24 +12134,11 @@ def complete_task(
                 except (TypeError, ValueError, AttributeError):
                     continue
 
-            from hermes_cli.kanban_round_draft import card_run_ids, mark_records
-            _round_runs = card_run_ids(conn, task_id)  # t_c418eebc: whose round-draft marks count as own
-            _round_marks = mark_records(conn, task_id)  # kernel-persisted marks only (Prism 852b8897186d)
-
             def _record_flips(flipped):
                 if flipped:
                     flip_records.update(flipped)
                     with write_txn(conn):
                         _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
-
-            def _consume_round_mark(key):
-                with write_txn(conn):
-                    current = mark_records(conn, task_id).get(key)
-                    if current != _round_marks.get(key) or not current or current.get("consumed"):
-                        raise ValueError("round draft mark already consumed or replaced")
-                    consumed = dict(current, consumed=True)
-                    _append_event(conn, task_id, "round_draft_marked", {"marked": {key: consumed}})
-                    _round_marks[key] = consumed
 
             # The card's Intent block into its own PR bodies before the ready flip (t_deee5435);
             # None when KANBAN_PR_INTENT/KANBAN_HANDOFF_PR_INTENT=0. Never raises.
@@ -12163,7 +12150,6 @@ def complete_task(
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
-                        round_runs=_round_runs, marked=_round_marks, consume=_consume_round_mark,
                         intent=intent_fn,
                     )
                 except _fresh.DraftPrError as draft_err:
@@ -15076,12 +15062,6 @@ def request_review(
         _enforce_branch_base(conn, _bb_task, metadata)
         if expected_run_id is not None:
             _enforce_handback_head(conn, task_id, summary=summary, metadata=metadata)
-            # Round end (t_c418eebc, Prism 1c13b5bb5159): this path skips complete_task's freshness gate, so
-            # flip the card's own round draft ready here; a negative-result handback stays draft.
-            from hermes_cli.kanban_negative_result import negative_result_match
-            if _neg_result is None and negative_result_match(summary, metadata) is None:
-                from hermes_cli.kanban_round_draft import finalize_on_review
-                finalize_on_review(conn, task_id, metadata)
 
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
