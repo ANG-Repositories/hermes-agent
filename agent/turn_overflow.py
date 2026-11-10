@@ -411,8 +411,25 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     # Hermes assumes, and "wait and /retry" would fail identically forever; compress instead.
     window = agent.context_compressor.context_length
     request_tokens = st.request_tokens() + max(0, int(getattr(agent, "max_tokens", 0) or 0))
+    explicit_context_rejection = "context_length_exceeded" in error_msg.lower()
+    unexplained = (
+        new_ctx is None and isinstance(window, int) and window > 0
+        and request_tokens < window * _UNEXPLAINED_REJECTION_FRACTION
+    )
+    if explicit_context_rejection and unexplained:
+        # A rejected request is an upper bound, not a measured model window. Keep
+        # the observation in telemetry; never poison the authoritative metadata cache.
+        logger.warning(
+            "%sProvider context ceiling observation provider=%s model=%s base_url=%s "
+            "observed_rejected_request_tokens=%d believed_window=%d compression_attempts=%d",
+            agent.log_prefix, agent.provider, agent.model, agent.base_url,
+            request_tokens, window, st.compression_attempts,
+        )
+        if st.compression_attempts >= 1:
+            return st.fail_turn(site_copy("context_overflow", model=agent.model))
     if (
         is_local_endpoint(agent.base_url)
+        and not explicit_context_rejection
         and not re.search(r"\d{4,}", error_msg)
         and isinstance(window, int) and window > 0
         and request_tokens < window * _UNEXPLAINED_REJECTION_FRACTION

@@ -39,7 +39,8 @@ def test_overflow_exhaustion_is_non_retryable_context_overflow_with_slash_comman
 
 
 def _context_rejection(request_tokens: int, window: int = 65_536, error="HTTP 500: Context size has been exceeded.",
-                       base_url: str = "http://127.0.0.1:1234/v1"):
+                       base_url: str = "http://127.0.0.1:1234/v1", provider: str = "lmstudio",
+                       compression_attempts: int = 0):
     """Drive ``_recover_context_length`` with a provider "context exceeded" and a request the rough
     estimator prices at ``request_tokens`` against a ``window``-token model (no output cap)."""
     from unittest.mock import patch
@@ -48,10 +49,10 @@ def _context_rejection(request_tokens: int, window: int = 65_536, error="HTTP 50
     from agent.turn_retry_state import TurnRetryState
 
     st = _recovery()
-    st.compression_attempts = 0
+    st.compression_attempts = compression_attempts
     st.agent.max_tokens = None
     st.agent.context_compressor = SimpleNamespace(context_length=window)
-    st.agent.provider, st.agent.base_url, st.agent.tools = "lmstudio", base_url, None
+    st.agent.provider, st.agent.base_url, st.agent.tools = provider, base_url, None
     st.agent._buffer_vprint = st.agent._buffer_diagnostic_status = lambda *a, **k: None
     compressed = []
     st.agent._compress_context = lambda msgs, *a, **k: (compressed.append(1) or [{"role": "user", "content": "x"}], None)
@@ -96,6 +97,19 @@ def test_hosted_context_rejection_far_below_the_known_window_compresses():
         error="This model's maximum context length was exceeded. Please reduce the length of the messages.",
     )
     assert compressed and verdict.action == "break"
+
+
+@pytest.mark.parametrize("provider", ["claude-dtlr", "custom"])
+def test_loopback_relay_context_rejection_compresses_once(provider, caplog):
+    error = "context_length_exceeded: prompt is too long: the interactive session hit the model context limit; compact the history"
+    kwargs = dict(window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider=provider, error=error)
+    verdict, compressed = _context_rejection(155_618, **kwargs)
+    assert compressed and verdict.action == "break"
+    assert verdict.provider_overflow_recovery_pending
+    assert "155618" in caplog.text and "observed_rejected_request_tokens" in caplog.text
+    verdict, compressed = _context_rejection(155_618, compression_attempts=1, **kwargs)
+    assert not compressed and verdict.action == "return"
+    assert verdict.result["failure_reason"] == "context_overflow"
 
 
 def test_empty_response_exhaustion_has_one_text_everywhere():
