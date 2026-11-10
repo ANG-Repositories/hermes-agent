@@ -49,11 +49,13 @@ def test_build_moa_pricing_calls_appends_real_aggregator_after_advisors():
     # dropping the flags here is what let an unknown input get priced as 0.
     assert {k: calls[1][k] for k in expected_measured} == expected_measured
     assert set(calls[1]) == (
-        set(expected_measured) | set(USAGE_UNKNOWN_FIELDS) | {"tier_prompt_tokens"}
+        set(expected_measured) | set(USAGE_UNKNOWN_FIELDS)
+        | {"tier_prompt_tokens", "tier_last_usage", "tier_requests"}
     )
     assert all(calls[1][flag] is False for flag in USAGE_UNKNOWN_FIELDS)
     # Single-request bill: no per-request tier basis, pricing falls back to the usage.
     assert calls[1]["tier_prompt_tokens"] is None
+    assert calls[1]["tier_last_usage"] is None and calls[1]["tier_requests"] is None
     # The helper must not mutate the facade-owned pending list.
     assert len(advisor_calls) == 1
 
@@ -65,8 +67,13 @@ def test_build_moa_pricing_calls_appends_real_aggregator_after_advisors():
         aggregator_provider="openrouter",
         aggregator_base_url="https://openrouter.ai/api/v1",
         aggregator_tier_prompt_tokens=180_000,
+        aggregator_tier_last_usage={"input_tokens": 180_000, "cache_read_tokens": 0,
+                                    "cache_write_tokens": 0},
+        aggregator_tier_requests=2,
     )
     assert multi[1]["tier_prompt_tokens"] == 180_000
+    assert multi[1]["tier_last_usage"]["input_tokens"] == 180_000
+    assert multi[1]["tier_requests"] == 2
     assert {k: multi[1][k] for k in expected_measured} == expected_measured
 
 
