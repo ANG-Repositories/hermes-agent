@@ -500,3 +500,30 @@ async def test_stop_settles_started_worker_before_reset(tmp_path, monkeypatch, p
                 await asyncio.wait_for(task, 10)
         await _drained(h, 10)
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_picker_callback_owns_session_through_save_and_delivers_once(tmp_path, monkeypatch):
+    from tests.gateway.test_model_picker_persist import _FakePickerAdapter
+    h = _Harness(tmp_path, monkeypatch)
+    monkeypatch.setattr("hermes_cli.model_switch_providers.list_picker_providers",
+                        lambda **kw: [{"slug": "openrouter", "name": "OR", "models": ["model-B"]}])
+    monkeypatch.setattr(type(h.adapter), "send_model_picker", _FakePickerAdapter.send_model_picker, raising=False)
+    assert await h.runner._handle_model_command(_ev("/model --session")) is None
+    tap = asyncio.create_task(h.adapter.captured_callback("12345", "model-B", "openrouter"))
+    try:
+        await _wait_for(lambda: h.sent_with(_switched("model-B")), "picker confirmation before save")
+        await asyncio.wait_for(h.db.entered.wait(), 5)
+        await h.adapter.handle_message(_ev("during picker save"))
+        assert not h.turns
+        assert not tap.done()
+        h.db.release.set()
+        result = await asyncio.wait_for(tap, 5)
+        assert result.model_selection_delivered
+        await _wait_for(lambda: h.turns, "picker's queued message")
+        assert h.turns == [("during picker save", "model-B")]
+        assert len(h.sent_with(_switched("model-B"))) == 1
+    finally:
+        h.db.release.set()
+        await asyncio.wait_for(tap, 5)
+        await _drained(h)
