@@ -27,7 +27,7 @@ pytestmark = pytest.mark.platforms("posix")
 def posix_spawn_setsid_supported():
     """Probe the interpreter build, not its OS name or Python version."""
     try:
-        pid = os.posix_spawn("/bin/true", ["/bin/true"], os.environ, setsid=True)
+        pid = os.posix_spawn("/bin/sh", ["/bin/sh", "-c", "exit 0"], os.environ, setsid=True)
     except NotImplementedError:
         return False
     _, status = os.waitpid(pid, 0)
@@ -65,9 +65,18 @@ def no_fork_exec(monkeypatch, posix_spawn_setsid_supported, request, record_prop
             "fork_exec called: this spawn forks the whole parent under the GIL")
         pid = real_fork(*args, **kwargs)
         fallbacks += 1
-        assert os.getpgid(pid) == os.getsid(pid) == pid
         return pid
 
+    real_execute = subprocess.Popen._execute_child
+
+    def checked_execute(self, *args, **kwargs):
+        result = real_execute(self, *args, **kwargs)
+        # Popen has now consumed the exec-error pipe. fork_exec returning alone
+        # does not mean the child has reached setsid yet.
+        assert os.getpgid(self.pid) == os.getsid(self.pid) == self.pid
+        return result
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", checked_execute)
     monkeypatch.setattr(os, "posix_spawn", spawn)
     monkeypatch.setattr(_posixsubprocess, "fork_exec", checked_fork)
     if hasattr(subprocess, "_fork_exec"):  # 3.12+ binds it at import
@@ -136,8 +145,9 @@ def test_kill_process_takes_down_grandchildren(no_fork_exec, env):
 def test_timeout_returns_124_and_reaps_the_group(no_fork_exec, env, tmp_path):
     marker = tmp_path / "gc.pid"
     started = time.monotonic()
-    result = env.execute(f"sleep 300 & echo $! > '{marker}'; sleep 300", timeout=2)
+    result = env.execute(f"printf 'before-timeout\\377'; sleep 300 & echo $! > '{marker}'; sleep 300", timeout=2)
     assert result["returncode"] == 124, result
+    assert "before-timeout" in result["output"]
     assert time.monotonic() - started < 20
     grandchild = int(marker.read_text())
     deadline = time.monotonic() + 5
@@ -162,7 +172,7 @@ def test_inheritable_fds_are_not_passed_to_the_child(no_fork_exec, tmp_path):
     try:
         proc = nofork.spawn_popen(
             ["/bin/sh", "-c", f'[ -e /dev/fd/{write_end} ] && echo leaked || echo closed'],
-            stdout=subprocess.PIPE, text=True)
+            new_session=True, stdout=subprocess.PIPE, text=True)
         out, _ = proc.communicate(timeout=10)
     finally:
         os.close(read_end)
