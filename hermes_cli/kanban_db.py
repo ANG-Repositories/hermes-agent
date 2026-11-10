@@ -11948,7 +11948,7 @@ def complete_task(
     # An external close also takes a ``triage`` card: the external-wait card
     # parked there by a block loop is exactly what the verb exists to end.
     closable = ('running', 'ready', 'blocked', 'review') + (('triage',) if external else ())
-    if candidate is None or candidate.status not in closable:
+    if candidate is None or (candidate.status not in closable and not _operator_todo(candidate)):
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
@@ -12495,7 +12495,8 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND (status IN ('running', 'ready', 'blocked', 'review')
-                        OR (? AND status = 'triage'))
+                        OR (? AND status = 'triage')
+                        OR (status = 'todo' AND (assignee = 'human' OR assignee LIKE 'human:%')))
                 """,
                 (result, now, task_id, bool(external)),
             )
@@ -16342,6 +16343,17 @@ def reopen_task(
     return True, None
 
 
+def _operator_todo(task_or_status, assignee: Optional[str] = None) -> bool:
+    """A human-assigned card the lifecycle guard keeps in ``todo`` (tasks_human_ready_* triggers: a
+    ``human``/``human:*`` card is never ``ready``, because no worker may claim it). That is the operator's
+    working state, so ``complete`` accepts it like ``ready``; before this, every operator card was
+    uncloseable (``promote`` wrote ready, the trigger reverted it in the same statement, ``complete``
+    refused ``todo``: t_554b6dc1, 2026-11-10)."""
+    status = getattr(task_or_status, "status", task_or_status)
+    who = getattr(task_or_status, "assignee", assignee) or ""
+    return status == "todo" and (who == "human" or who.startswith("human:"))
+
+
 @_home_session_guarded("promote")
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
@@ -16357,6 +16369,14 @@ def promote_task(
         # Same wording as complete: a stale replayed script must read as a no-op.
         return False, f"{explain_complete_refusal(conn, task_id)}; nothing to promote"
 
+    _who = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if _who is not None and _operator_todo("todo", _who[0]) and cur_status == "todo":
+        return False, (
+            f"task {task_id} is assigned to {_who[0]}: an operator card stays 'todo' by design (no worker "
+            f"may claim it, the lifecycle guard reverts ready), so there is nothing to promote; close it "
+            f"with 'hermes kanban complete {task_id} ...' or hand it to a worker with "
+            f"'hermes kanban assign {task_id} <profile>'"
+        )
     if cur_status not in ("todo", "blocked"):
         hint = (
             f" (a scheduled card wakes with 'hermes kanban unblock {task_id}'"
@@ -23489,8 +23509,9 @@ def explain_complete_refusal(
         )
         state = "already done" if task.status == "done" else "archived (was done)" if task.completed_at else "archived"
         return f"{state} by {who} at {when}{outcome}"
-    if task.status not in ("running", "ready", "blocked", "review"):
-        return f"status is {task.status!r}; complete needs running/ready/blocked/review"
+    if task.status not in ("running", "ready", "blocked", "review") and not _operator_todo(task):
+        return (f"status is {task.status!r}; complete needs running/ready/blocked/review "
+                f"(or todo on a human-assigned operator card)")
     if expected_run_id is not None and task.current_run_id != expected_run_id:
         return (
             f"run {expected_run_id} is no longer the current run "
