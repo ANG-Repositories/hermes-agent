@@ -5333,7 +5333,10 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     if pin_dropped:
         _kwp.note_dropped_studio_pin(row["id"])
         from hermes_cli.kanban_studio_pin import note_drop
-        note_drop(conn, row["id"], studio_reasons)
+        try:
+            note_drop(conn, row["id"], studio_reasons)
+        except Exception as exc:  # a placement notice must never stop routing this tick
+            _kb._log.warning("kanban: placement notice for %s not written: %s", row["id"], exc)
     # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None

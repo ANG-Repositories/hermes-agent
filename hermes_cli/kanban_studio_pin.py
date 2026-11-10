@@ -55,9 +55,13 @@ def report_notices(conn, card_id, notices):
 def note_drop(conn, card_id, reasons):
     """Persist one notice per card, not one per dispatcher process or retry."""
     from hermes_cli import kanban_db as kb
+    exists = ("SELECT 1 FROM task_comments WHERE task_id=? AND substr(body,1,?)=? LIMIT 1",
+              (card_id, len(NOTICE_PREFIX), NOTICE_PREFIX))
+    # Dispatch re-routes dropped pins every tick: an existing notice must not cost the board's write lock.
+    if conn.execute(*exists).fetchone():
+        return
     with kb.write_txn(conn):
-        if conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND substr(body,1,?)=? LIMIT 1",
-                        (card_id, len(NOTICE_PREFIX), NOTICE_PREFIX)).fetchone():
+        if conn.execute(*exists).fetchone():
             return
         kb.add_comment(conn, card_id, "dispatcher",
                        NOTICE_PREFIX + ", ".join(sorted(reasons or ())))

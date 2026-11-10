@@ -16,6 +16,7 @@ fleet/placement-policy.json; off / absent = every old pin, exactly as before.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -232,6 +233,36 @@ def test_drop_notice_is_durable_and_warning(kanban_home, caplog):
         notices = conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
         assert sum(r[0].startswith("[placement] bare host: studio dropped: add requires:") for r in notices) == 1
     assert any(r.levelname == "WARNING" and "bare `host: studio` dropped" in r.message for r in caplog.records)
+
+
+def test_drop_notice_already_posted_takes_no_write_lock(kanban_home, monkeypatch):
+    """Every tick re-routes every dropped-pin card: once its notice exists, routing must not write."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", body="host: studio")
+        first = _route(conn, tid, _caps())
+        writes = []
+
+        def no_write(*a, **_k):
+            writes.append(a)
+            raise AssertionError("write_txn taken")
+        monkeypatch.setattr(kb, "write_txn", no_write)
+        assert _route(conn, tid, _caps()) == first
+    assert writes == []
+
+
+def test_drop_notice_failure_does_not_change_routing(kanban_home, monkeypatch, caplog):
+    """A placement notice must never stop dispatch: a raising note_drop leaves the route unchanged."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", body="host: studio")
+        expected = _route(conn, tid, _caps())
+        conn.execute("DELETE FROM task_comments WHERE task_id=?", (tid,))
+        conn.commit()
+
+        def boom(*_a, **_k):
+            raise sqlite3.OperationalError("database is locked")
+        monkeypatch.setattr(kb, "write_txn", boom)
+        assert _route(conn, tid, _caps()) == expected
+    assert any(r.levelname == "WARNING" and "placement notice" in r.message for r in caplog.records)
 
 
 # -- rule 2: local_files is continuity ------------------------------------------------------------------------
