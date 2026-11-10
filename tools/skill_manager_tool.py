@@ -409,15 +409,31 @@ def _directory_stamp(path):
         return None
 
 
+def _entry_is_dir(entry) -> bool:
+    try:
+        return entry.is_dir()
+    except OSError:
+        return False
+
+
 def _directory_shape(path):
+    """The ONE discovery shape of a directory, used by the builder, the certifier, the warm
+    validator and the hit check: its watched child directories in ENUMERATION order (first-match
+    discovery precedence follows it, so it is never sorted) and whether an entry named SKILL.md is
+    listed the same name match ``rglob("SKILL.md")`` makes (a dangling symlink counts). Support
+    dirs are pruned only when that SKILL.md exists, as ``is_skill_support_path`` decides."""
+    import os
     from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
     try:
-        skill = (path / "SKILL.md").is_file()
-        return (tuple(sorted(p.name for p in path.iterdir() if p.is_dir()
-                             and p.name not in EXCLUDED_SKILL_DIRS
-                             and not (skill and p.name in SKILL_SUPPORT_DIRS))), skill)
+        with os.scandir(path) as it:
+            entries = [(entry.name, _entry_is_dir(entry)) for entry in it]
     except OSError:
         return None
+    skill = any(name == "SKILL.md" for name, _ in entries)
+    prune_support = skill and os.path.exists(os.path.join(path, "SKILL.md"))
+    return (tuple(name for name, is_dir in entries if is_dir
+                  and name not in EXCLUDED_SKILL_DIRS
+                  and not (prune_support and name in SKILL_SUPPORT_DIRS)), skill)
 
 
 def _index_tree_unchanged(index, *, certify=False):
@@ -452,19 +468,20 @@ def _build_skill_index(roots: List[Path]) -> Dict[str, Any]:
     """One walk over ``roots`` in precedence order -> ordered dirs + first-wins name map. The
     generation is read BEFORE the walk, so a mutation that lands mid-walk voids the build."""
     import os
-    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
     gen = _SKILL_INDEX_GENERATION
     directories = {}
     ordered: List[Path] = []
     by_name: Dict[str, Path] = {}
     for skills_dir in roots:
         directories[skills_dir] = (_directory_stamp(skills_dir), _directory_shape(skills_dir))
-        for base, dirs, files in os.walk(skills_dir):
+        for base, dirs, _files in os.walk(skills_dir):
             directory = Path(base)
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS
-                       and not ("SKILL.md" in files and d in SKILL_SUPPORT_DIRS)]
-            directories[directory] = (_directory_stamp(directory),
-                                      (tuple(sorted(dirs)), "SKILL.md" in files))
+            # Stamp BEFORE listing: a change between them leaves a stale stamp, which forces a
+            # re-list on the next validation instead of certifying an old listing.
+            stamp = _directory_stamp(directory)
+            shape = _directory_shape(directory)
+            directories[directory] = (stamp, shape)
+            dirs[:] = list(shape[0]) if shape is not None else []
             # os.walk does not yield unreadable children. Watch their metadata too:
             # chmod can restore a higher-precedence local skill without changing its parent.
             for child in dirs:
@@ -499,11 +516,8 @@ def _skill_index_lookup(index: Dict[str, Any], name: str, local_root: Optional[P
 
 def _skill_dir_still_valid(skill_dir: Path) -> bool:
     from agent.skill_utils import is_excluded_skill_path
-    skill_md = skill_dir / "SKILL.md"
-    try:
-        return skill_md.is_file() and not is_excluded_skill_path(skill_md)
-    except OSError:
-        return False
+    shape = _directory_shape(skill_dir)
+    return shape is not None and shape[1] and not is_excluded_skill_path(skill_dir / "SKILL.md")
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
