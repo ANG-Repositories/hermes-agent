@@ -546,6 +546,9 @@ def test_r6_one_churning_subdir_fails_unrelated_lookups(tmp_path, cold):
     assert not errors, f'{len(errors)}/12 unrelated patches failed: {errors[:1]}'
 
 
+_CREATOR_JOIN_S = 60
+
+
 def test_r6_concurrent_creates_starve_lookups(tmp_path):
     """Generation fencing: any successful create/delete anywhere (another session, a curator
     batch) bumps the generation and voids an in-flight build. On a large tree with creates landing
@@ -562,10 +565,13 @@ def test_r6_concurrent_creates_starve_lookups(tmp_path):
                                             content='---\nname: tmp-r6-%d\ndescription: d\n---\n\n# x\n' % i))
             if not r.get('success'):
                 creator_errors.append(r.get('error'))
-            json.loads(smt.skill_manage(action='delete', name=f'tmp-r6-{i}'))
+            r = json.loads(smt.skill_manage(action='delete', name=f'tmp-r6-{i}'))
+            if not r.get('success'):
+                creator_errors.append(r.get('error'))
             i += 1
 
     errors, ok = [], 0
+    outlived_deadline = False
     with ExitStack() as stack:
         env(stack, tmp_path, root)
         lookup('sk0-0')
@@ -579,7 +585,12 @@ def test_r6_concurrent_creates_starve_lookups(tmp_path):
                     errors.append(r.get('error'))
         finally:
             stop.set()
-            t.join(timeout=60)
+            t.join(timeout=_CREATOR_JOIN_S)
+            outlived_deadline = t.is_alive()
+            # Keep the roots/home patches in place until the worker is gone, so a late
+            # create/delete never mutates a tree outside this test's isolation.
+            t.join()
+    assert not outlived_deadline, f'creator thread outlived the {_CREATOR_JOIN_S}s join deadline'
     print(f'\nR6 create-churn: ok={ok} errors={len(errors)} creator_errors={len(creator_errors)} '
           f'sample={(errors or creator_errors)[:1]}')
     assert not errors and not creator_errors, (errors[:1], creator_errors[:1])
