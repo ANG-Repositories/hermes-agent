@@ -151,6 +151,15 @@ def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, hos
         assert kb.get_task(conn, tid).body == original
         assert kb.edit_task(conn, tid, body=f"host: {host}\nlaunchctl print gui/501")
         assert "requires: studio-state" in kb.get_task(conn, tid).body
+        saved = kb.create_task(conn, title="saved", body=f"host: {host}\nrequires: studio-state\nfix lint")
+        stored = kb.get_task(conn, saved).body
+        assert stored.startswith("origin:")
+        bare = stored.replace("requires: studio-state\n", "")
+        with pytest.raises(ValueError, match="requires:"):
+            kb.edit_task(conn, saved, body=bare)
+        assert kb.get_task(conn, saved).body == stored
+        assert kb.edit_task(conn, saved, body=bare + "\nlaunchctl print gui/501")
+        assert "requires: studio-state" in kb.get_task(conn, saved).body
         for work in ("launchctl", "vault", "skill_view", "localhost:18810", "run ~/.hermes/scripts/check.py"):
             derived = kb.create_task(conn, title="derived", body=f"host: {host}\n{work}")
             assert "requires: studio-state" in kb.get_task(conn, derived).body

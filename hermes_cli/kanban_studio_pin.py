@@ -12,7 +12,9 @@ NOTICE_PREFIX = "[placement] bare host: studio dropped: add requires: "
 
 def prepare_body(body):
     """Validate against the dispatcher's vocabulary; unknown maps retain the existing safe-local behavior."""
-    if not body or not _FIRST_LINE.fullmatch(body.splitlines()[0]):
+    # Saved bodies carry provenance before the caller's placement directives.
+    content = pool.without_header_lines(body).lstrip("\r\n")
+    if not content or not _FIRST_LINE.fullmatch(content.splitlines()[0]):
         return body
     from hermes_cli.config import load_config
     if load_config().get("kanban", {}).get("studio_pin_requires_reason", True) is False:
@@ -39,8 +41,8 @@ def note_drop(conn, card_id, reasons):
     """Persist one notice per card, not one per dispatcher process or retry."""
     from hermes_cli import kanban_db as kb
     with kb.write_txn(conn):
-        if conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE ? LIMIT 1",
-                        (card_id, NOTICE_PREFIX + "%")).fetchone():
+        if conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND substr(body,1,?)=? LIMIT 1",
+                        (card_id, len(NOTICE_PREFIX), NOTICE_PREFIX)).fetchone():
             return
         kb.add_comment(conn, card_id, "dispatcher",
                        NOTICE_PREFIX + ", ".join(sorted(reasons or ())))
