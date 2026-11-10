@@ -332,3 +332,70 @@ async def test_user_closed_delegated_completion_is_terminal(tmp_path, monkeypatc
         assert claim.early_result is not False, "terminal must stop the watcher, not ask it to retry"
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", [True, False])
+@pytest.mark.parametrize("source", ["tool", "telegram"])
+async def test_delegated_origin_watcher_stops_once(
+    tmp_path, monkeypatch, caplog, ended, source,
+):
+    """The real process watcher must dispose a child-origin completion, not re-poll forever."""
+    import asyncio
+    import logging
+    import time
+    from types import SimpleNamespace
+
+    import gateway.run_notifications as notifications
+    import tools.process_registry as processes
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig())
+    route = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    entry = runner.session_store.get_or_create_session(route)
+    db = SessionDB(db_path=tmp_path / "fixture.db")
+    db.create_session("child", source=source, model_config={"_delegate_from": "nonhuman-parent"})
+    if ended:
+        db.end_session("child", "completed")
+    runner._session_db = AsyncSessionDB(db)
+    # Advance only notification time: no wall-clock wait and no changes to DB timestamps.
+    now = [db.get_session("child")["started_at"]]
+    monkeypatch.setattr(notifications, "time", SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic))
+    process = SimpleNamespace(
+        exited=True, output_buffer="done\n", exit_code=0, command="echo done",
+        started_at=now[0], parent_session_id="child",
+    )
+    registry = SimpleNamespace(get=MagicMock(return_value=process), is_completion_consumed=lambda sid: False)
+    monkeypatch.setattr(processes, "process_registry", registry)
+    runner._load_background_notifications_mode = lambda: "off"
+    runner._launching_turn_active = AsyncMock(return_value=False)
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    # Bypass only the coalescing delay; retain real watcher -> delivery -> preflight.
+    runner._enqueue_process_completion_notification = runner._deliver_completion_notification
+    polls = 0
+
+    async def tick(_interval):
+        nonlocal polls
+        polls += 1
+        assert polls <= 7, "delegated-origin completion retried past its five-minute budget"
+        now[0] += 60
+
+    monkeypatch.setattr(asyncio, "sleep", tick)
+    watcher = {"session_id": "proc_child", "check_interval": 60, "notify_on_complete": True,
+               "parent_session_id": "child", "agent_notify_mode": "all",
+               "session_key": entry.session_key, "platform": "telegram", "chat_id": "123", "chat_type": "dm"}
+    try:
+        with caplog.at_level(logging.WARNING, logger="gateway.run"):
+            await runner._run_process_watcher(watcher)
+        assert polls == (1 if ended else 5)
+        warnings = [r for r in caplog.records if r.name == "gateway.run" and r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "dropping notification" in warnings[0].getMessage()
+        runner._inject_watch_notification.assert_not_awaited()
+        assert runner.session_store.lookup_by_session_key("child") is None
+    finally:
+        db.close()

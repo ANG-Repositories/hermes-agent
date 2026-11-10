@@ -96,6 +96,10 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # home-channel notice appends the operator restart tail for every OTHER cause.
 _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease"})
 
+# A delegated session can briefly be awaiting ownership metadata. Its persisted start time
+# bounds that grace across watcher polls, rebuilt process events, and gateway restarts.
+_DELEGATED_COMPLETION_GRACE_SECONDS = 5 * 60
+
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
     "drop": ("drop_completion_delivery", "Could not drop durable completion claim"),
@@ -1503,7 +1507,15 @@ class GatewayNotificationsMixin:
         if parent.get("ended_at") and end_reason in _USER_BOUNDARY_END_REASONS:
             return "terminal"
         if _is_delegated_completion_target(parent):
-            logger.warning("Deferring completion for delegated origin %s; no human route ownership", parent_session_id)
+            # Never pin a human route to a child. An ended child cannot acquire ownership;
+            # a live one gets only a persisted, bounded grace (not a per-poll retry counter).
+            try:
+                age = time.time() - float(parent.get("started_at") or 0)
+            except (TypeError, ValueError):
+                age = _DELEGATED_COMPLETION_GRACE_SECONDS
+            if parent.get("ended_at") or not 0 <= age < _DELEGATED_COMPLETION_GRACE_SECONDS:
+                return "terminal"
+            logger.debug("Deferring completion for delegated origin %s; no human route ownership", parent_session_id)
             return "retry"
         if not parent.get("ended_at"):
             return "deliver"
