@@ -1,115 +1,107 @@
 #!/usr/bin/env python3
 # SCHEDULE: manual (fixture benchmark invoked by implementer/reviewer)
-"""Fixture-only public skill_manage benchmark; pass pre-index source via --baseline.
+"""Fixture-only skill_manage call-count benchmark: main's _find_skill vs the per-call memo.
 
-Both versions run identical real patch/guard/atomic-write dispatch. Approval staging, sync,
-ledger, lifecycle telemetry and cross-profile diagnostics are isolated from the host. Cold
-means a cold path index, not cold Python imports. Walk counts are the deterministic gate;
-wall times include filesystem writes and are not a production latency estimate.
+Builds 2,000 skills (40 categories, each skill with a references/ dir) in a temp home and runs
+the same six public operations under each arm. Both arms use the same dispatcher; the main arm
+binds main's ``_find_skill`` (tests/tools/review171_legacy_lookup.py), so they differ only by
+the memo. Counts are deterministic; thread CPU is indicative. Approval staging, sync push and
+the cross-profile scan are isolated on both arms. Not a production latency claim.
 """
-import argparse
-import ast
 import json
 import os
-from pathlib import Path
 import sys
 import tempfile
 import time
+import types
+from collections import Counter
+from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import tools.skill_manager_tool as smt
+import tools.skill_manager_tool as smt  # noqa: E402
+from tests.tools import review171_legacy_lookup as legacy  # noqa: E402
+
+_CONTENT = "---\nname: {n}\ndescription: Use when testing. Does a thing.\n---\n\n# x\n\nold line\n"
+_OPS = [
+    ("patch hit", dict(action="patch", name="sk17-21", old_string="old line", new_string="new line")),
+    ("patch miss", dict(action="patch", name="absent", old_string="a", new_string="b")),
+    ("create", dict(action="create", name="fresh", category="cat0", local=True,
+                    content=_CONTENT.format(n="fresh"))),
+    ("delete", dict(action="delete", name="fresh")),
+    ("write_file", dict(action="write_file", name="sk3-7", file_path="references/b.md", file_content="b")),
+    ("batch 3 patches", dict(action="patch", name="sk1-1", operations=[
+        {"action": "patch", "name": n, "old_string": "old line", "new_string": "new line"}
+        for n in ("sk1-1", "sk2-2", "sk4-4")])),
+]
+
+
+def _counting(stack, counts):
+    for mod, attr in [(os, "scandir"), (os, "stat"), (os, "lstat")]:
+        real = getattr(mod, attr)
+        real = getattr(real, "__wrapped__", real)  # count real calls, not the test harness guard
+
+        def make(real, key):
+            def wrapper(*a, **k):
+                counts[key] += 1
+                return real(*a, **k)
+            return wrapper
+        stack.enter_context(patch.object(mod, attr, make(real, attr)))
+
+
+def run(arm, home):
+    root = home / "skills"
+    for c in range(40):
+        for s in range(50):
+            d = root / f"cat{c}" / f"sk{c}-{s}"
+            (d / "references").mkdir(parents=True)
+            (d / "SKILL.md").write_text(_CONTENT.format(n=d.name), encoding="utf-8")
+            (d / "references" / "r.md").write_text("r", encoding="utf-8")
+    (root / ".locks").mkdir()
+    rows = {}
+    with ExitStack() as stack:
+        for target, value in [("SKILLS_DIR", root), ("HERMES_HOME", home)]:
+            stack.enter_context(patch.object(smt, target, value))
+        stack.enter_context(patch("agent.skill_utils.get_all_skills_dirs", return_value=[root]))
+        for symbol, rv in [("_apply_skill_write_gate", None), ("_find_skill_in_other_profiles", []),
+                           ("_maybe_debounced_sync_push", None)]:
+            stack.enter_context(patch.object(smt, symbol, return_value=rv))
+        if arm == "main":
+            spy = stack.enter_context(patch.object(smt, "_find_skill", side_effect=types.FunctionType(
+                legacy._find_skill.__code__, smt.__dict__)))
+        else:
+            spy = stack.enter_context(patch.object(smt, "_discover_skill", wraps=smt._discover_skill))
+        json.loads(smt.skill_manage(action="patch", name="sk0-0", old_string="old line",
+                                    new_string="new line"))  # warm imports, outside measurement
+        for label, kw in _OPS:
+            counts = Counter()
+            before = spy.call_count
+            with ExitStack() as inner:
+                _counting(inner, counts)
+                t = time.thread_time()
+                out = json.loads(smt.skill_manage(**kw))
+                cpu = time.thread_time() - t
+            rows[label] = dict(success=out.get("success"), discoveries=spy.call_count - before,
+                               scandir=counts["scandir"], stat=counts["stat"], lstat=counts["lstat"],
+                               cpu_ms=round(cpu * 1000, 1))
+    return rows
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline', type=Path, required=True)
-    args = parser.parse_args()
-    tree = ast.parse(args.baseline.read_text(encoding='utf-8-sig'))
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_find_skill')
-    scope = dict(vars(smt))
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(args.baseline), 'exec'), scope)
-    original_find = scope['_find_skill']
-    dispatch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'skill_manage')
-    dispatch.decorator_list = []
-    exec(compile(ast.Module(body=[dispatch], type_ignores=[]), str(args.baseline), 'exec'), scope)
-    original_dispatch = scope['skill_manage']
-    with tempfile.TemporaryDirectory(prefix='skill-index-bench-') as td:
-        home = Path(td)
-        root = home / 'skills'
-        for i in range(2000):
-            directory = root / f'cat{i % 40}' / f'skill-{i}'
-            directory.mkdir(parents=True)
-            (directory / 'SKILL.md').write_text(
-                f'---\nname: skill-{i}\ndescription: Use when testing. Does a thing.\n---\n\n# Skill\n\nold line\n',
-                encoding='utf-8')
-        # Use the last discovered target, independent of filesystem directory ordering.
-        target = list(smt._iter_skill_dirs(root))[-1] / 'SKILL.md'
-        with patch.object(smt, 'HERMES_HOME', home), patch.object(smt, 'SKILLS_DIR', root), \
-             patch('agent.skill_utils.get_all_skills_dirs', return_value=[root]), \
-             patch.object(smt, '_apply_skill_write_gate', return_value=None), \
-             patch.object(smt, '_find_skill_in_other_profiles', return_value=[]), \
-             patch('tools.skill_ledger.ledger_enabled', return_value=False), \
-             patch('tools.skill_usage._emit_skill_lifecycle'), \
-             patch.object(smt, '_maybe_debounced_sync_push'):
-            # Load the same lazy imports for BOTH cases outside the measurement.
-            for label in ('before', 'after'):
-                text = target.read_text(encoding='utf-8-sig')
-                target.write_text(text.replace('new line', 'old line'), encoding='utf-8')
-                call = original_dispatch if label == 'before' else smt.skill_manage
-                # Baseline dispatch shares patched side-effect seams, but keeps its actual
-                # pre-index entrypoint (no extra eager lookup introduced by this PR).
-                scope.update({k: v for k, v in vars(smt).items()
-                              if k not in {'_find_skill', 'skill_manage'}})
-                finder = original_find if label == 'before' else smt._find_skill
-                with patch.object(smt, '_find_skill', finder):
-                    counter = 0
-
-                    def invoke(missing=False):
-                        nonlocal counter
-                        old, new = ('old line', 'new line') if counter % 2 == 0 else ('new line', 'old line')
-                        if not missing:
-                            counter += 1
-                        return json.loads(call(action='patch', name='absent' if missing else target.parent.name,
-                                               old_string=old, new_string=new))
-
-                    assert invoke()['success']
-                    smt._invalidate_skill_index()
-                    real_walk = smt._iter_skill_dirs
-                    with patch.object(smt, '_iter_skill_dirs', wraps=real_walk) as walks, \
-                         patch.object(smt, '_build_skill_index', wraps=smt._build_skill_index) as builds, \
-                         patch('os.walk', wraps=os.walk) as topology_walks:
-                        if label == 'before':
-                            original_find.__globals__['_iter_skill_dirs'] = walks
-                        t = time.perf_counter()
-                        assert invoke()['success']
-                        cold = time.perf_counter() - t
-                        cold_walks = walks.call_count
-                        cold_topology_walks = topology_walks.call_count
-                        t = time.perf_counter()
-                        for _ in range(20):
-                            assert invoke()['success']
-                        warm = (time.perf_counter() - t) / 20
-                        warm_walks = walks.call_count - cold_walks
-                        warm_topology_walks = topology_walks.call_count - cold_topology_walks
-                        t = time.perf_counter()
-                        for _ in range(20):
-                            assert not invoke(True)['success']
-                        negative = (time.perf_counter() - t) / 20
-                        negative_walks = walks.call_count - cold_walks - warm_walks
-                        negative_topology_walks = topology_walks.call_count - cold_topology_walks - warm_topology_walks
-                        if label == 'after':
-                            assert warm_topology_walks == negative_topology_walks == 0
-                            assert cold_walks == 1 and warm_walks == negative_walks == 0
-                            assert builds.call_count == 1
-                        print(json.dumps(dict(version=label, skills=2000, cold_ms=cold * 1000,
-                                              repeated_ms=warm * 1000, negative_ms=negative * 1000,
-                                              cold_os_walks=cold_topology_walks,
-                                              repeated_os_walks=warm_topology_walks,
-                                              negative_os_walks=negative_topology_walks,
-                                              cold_walks=cold_walks, repeated_walks=warm_walks,
-                                              negative_walks=negative_walks, builds=builds.call_count)))
+    results = {}
+    for arm in ("main", "head"):
+        with tempfile.TemporaryDirectory(prefix=f"skill-memo-bench-{arm}-") as td:
+            results[arm] = run(arm, Path(td))
+    print(f"{'operation':<17} {'arm':<5} {'ok':<5} {'discoveries':>11} {'scandir':>8} "
+          f"{'stat':>7} {'lstat':>7} {'cpu_ms':>8}")
+    for label, _ in _OPS:
+        for arm in ("main", "head"):
+            r = results[arm][label]
+            print(f"{label:<17} {arm:<5} {str(r['success']):<5} {r['discoveries']:>11} {r['scandir']:>8} "
+                  f"{r['stat']:>7} {r['lstat']:>7} {r['cpu_ms']:>8}")
+    print(json.dumps(results))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -47,7 +47,7 @@ def test_dangling_skill_md_symlink_does_not_break_healthy_skills(tmp_path):
         env(stack, tmp_path, root)
         result = public('healthy', 'patch')
         assert result.get('success'), result
-        assert '# changed' in (healthy / 'SKILL.md').read_text(encoding='utf-8')
+        assert '# changed' in (healthy / 'SKILL.md').read_text(encoding='utf-8-sig')
 
 
 def test_rename_away_and_back_reorders_duplicate_name_precedence(tmp_path):
@@ -85,4 +85,4 @@ def test_rename_away_and_back_reorders_duplicate_name_precedence(tmp_path):
         assert fresh.relative_to(root) != original, 'model did not change discovery order'
         result = public('foo', 'patch')
         assert result.get('success'), result
-        assert '# changed' in (fresh / 'SKILL.md').read_text(encoding='utf-8'), (original, fresh, result)
+        assert '# changed' in (fresh / 'SKILL.md').read_text(encoding='utf-8-sig'), (original, fresh, result)

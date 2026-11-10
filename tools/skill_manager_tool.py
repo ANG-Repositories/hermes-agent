@@ -393,153 +393,12 @@ def _iter_skill_dirs(root: Path):
             yield skill_md.parent
 
 
-# Root-set indexes cache hits AND misses. Watch all discovery directories (including empty
-# categories) so external additions and precedence changes are visible without another rglob.
-# Directory metadata is sampled once per operation; downstream users share its bound target.
-_SKILL_INDEX_LOCK = threading.RLock()
-_SKILL_INDEX_BUILD_LOCK = threading.RLock()
-_SKILL_OPERATION_TARGETS = _ctxvars.ContextVar("skill_operation_targets", default=None)
-
-
-def _directory_stamp(path):
-    try:
-        st = path.stat()
-        return st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns
-    except OSError:
-        return None
-
-
-def _entry_is_dir(entry) -> bool:
-    try:
-        return entry.is_dir()
-    except OSError:
-        return False
-
-
-def _directory_shape(path):
-    """The ONE discovery shape of a directory, used by the builder, the certifier, the warm
-    validator and the hit check: its watched child directories in ENUMERATION order (first-match
-    discovery precedence follows it, so it is never sorted) and whether an entry named SKILL.md is
-    listed the same name match ``rglob("SKILL.md")`` makes (a dangling symlink counts). Support
-    dirs are pruned only when that SKILL.md exists, as ``is_skill_support_path`` decides."""
-    import os
-    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
-    try:
-        with os.scandir(path) as it:
-            entries = [(entry.name, _entry_is_dir(entry)) for entry in it]
-    except OSError:
-        return None
-    skill = any(name == "SKILL.md" for name, _ in entries)
-    prune_support = skill and os.path.exists(os.path.join(path, "SKILL.md"))
-    return (tuple(name for name, is_dir in entries if is_dir
-                  and name not in EXCLUDED_SKILL_DIRS
-                  and not (prune_support and name in SKILL_SUPPORT_DIRS)), skill)
-
-
-def _index_tree_unchanged(index, *, certify=False):
-    for path, (stamp, shape) in index["directories"].items():
-        current = _directory_stamp(path)
-        # A replacement can change first-match enumeration order even with the same names.
-        if current != stamp and (current is None or stamp is None or current[:2] != stamp[:2]):
-            return False
-        if certify or current != stamp:
-            if (shape is None and current != stamp) or _directory_shape(path) != shape:
-                return False
-            # Atomic content replacement changes directory mtime, not discovery topology.
-            index["directories"][path] = (current, shape)
-    return True
-_SKILL_INDEX: Dict[Tuple[str, ...], Dict[str, Any]] = {}
-_SKILL_INDEX_GENERATION = 0
-
-
-def _invalidate_skill_index(path: Optional[Path] = None) -> None:
-    """Invalidate affected root sets after a topology mutation, fencing in-flight builds."""
-    global _SKILL_INDEX_GENERATION
-    with _SKILL_INDEX_LOCK:
-        _SKILL_INDEX_GENERATION += 1
-        for key, index in list(_SKILL_INDEX.items()):
-            if path is None or any(path.is_relative_to(Path(root)) for root in key):
-                del _SKILL_INDEX[key]
-            else:
-                index["gen"] = _SKILL_INDEX_GENERATION
-
-
-def _build_skill_index(roots: List[Path]) -> Dict[str, Any]:
-    """One walk over ``roots`` in precedence order -> ordered dirs + first-wins name map. The
-    generation is read BEFORE the walk, so a mutation that lands mid-walk voids the build."""
-    import os
-    gen = _SKILL_INDEX_GENERATION
-    directories = {}
-    ordered: List[Path] = []
-    by_name: Dict[str, Path] = {}
-    for skills_dir in roots:
-        directories[skills_dir] = (_directory_stamp(skills_dir), _directory_shape(skills_dir))
-        for base, dirs, _files in os.walk(skills_dir):
-            directory = Path(base)
-            # Stamp BEFORE listing: a change between them leaves a stale stamp, which forces a
-            # re-list on the next validation instead of certifying an old listing.
-            stamp = _directory_stamp(directory)
-            shape = _directory_shape(directory)
-            directories[directory] = (stamp, shape)
-            dirs[:] = list(shape[0]) if shape is not None else []
-            # os.walk does not yield unreadable children. Watch their metadata too:
-            # chmod can restore a higher-precedence local skill without changing its parent.
-            for child in dirs:
-                path = directory / child
-                directories[path] = (_directory_stamp(path), _directory_shape(path))
-        if not skills_dir.exists():
-            continue
-        for skill_dir in _iter_skill_dirs(skills_dir):
-            ordered.append(skill_dir)
-            by_name.setdefault(skill_dir.name, skill_dir)
-    return {"ordered": ordered, "by_name": by_name, "by_rel": {}, "gen": gen,
-            "directories": directories}
-
-
-def _skill_index_lookup(index: Dict[str, Any], name: str, local_root: Optional[Path]) -> Optional[Path]:
-    """Same first-match order as the original walk. A bare name matches a dir by its name; a
-    categorized name (has a separator, so it can never equal a dir name) matches the first dir
-    whose resolved POSIX path relative to ``local_root`` equals it."""
-    if local_root is None:
-        return index["by_name"].get(name)
-    by_rel = index["by_rel"].get(str(local_root))
-    if by_rel is None:  # resolved lazily, once per index build, only for categorized lookups
-        by_rel = {}
-        for skill_dir in index["ordered"]:
-            with suppress(OSError, RuntimeError, ValueError):
-                resolved = skill_dir.resolve()
-                if resolved.is_relative_to(local_root):
-                    by_rel.setdefault(resolved.relative_to(local_root).as_posix(), skill_dir)
-        index["by_rel"][str(local_root)] = by_rel
-    return by_rel.get(name)
-
-
-def _skill_dir_still_valid(skill_dir: Path) -> bool:
-    from agent.skill_utils import is_excluded_skill_path
-    shape = _directory_shape(skill_dir)
-    return shape is not None and shape[1] and not is_excluded_skill_path(skill_dir / "SKILL.md")
-
-
-def _find_skill(name: str) -> Optional[Dict[str, Any]]:
-    targets = _SKILL_OPERATION_TARGETS.get()
-    if targets is None:
-        return _find_skill_indexed(name)
-    if name not in targets:
-        targets[name] = _find_skill_indexed(name)
-    return targets[name]
-
-
-class _SkillIndexChangedError(RuntimeError):
-    """Discovery could not obtain a stable tree snapshot."""
-
-
-def _find_skill_indexed(name: str) -> Optional[Dict[str, Any]]:
+def _discover_skill(name: str) -> Optional[Dict[str, Any]]:
     """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
     categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
-    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs).
-    Served from a topology-validated index; unchanged misses are cached with the root set."""
+    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs)."""
     from agent.skill_utils import get_all_skills_dirs
     local_root = None
     if "/" in name or "\\" in name:
@@ -550,37 +409,50 @@ def _find_skill_indexed(name: str) -> Optional[Dict[str, Any]]:
                 "skills dir resolve failed; categorized lookups fall back to the unresolved path",
                 exc_info=True)
             local_root = _skills_dir()
-    roots = list(get_all_skills_dirs())
-    key = tuple(str(r) for r in roots)
-    # Serialize builders, but let invalidation bump the generation during filesystem work.
-    # Never return an obsolete build, even when it was correctly withheld from publication.
-    with _SKILL_INDEX_BUILD_LOCK:
-        for _ in range(3):
-            with _SKILL_INDEX_LOCK:
-                cached = _SKILL_INDEX.get(key)
-                generation = _SKILL_INDEX_GENERATION
-            if (cached is not None and cached["gen"] == generation
-                    and _index_tree_unchanged(cached)):
-                hit = _skill_index_lookup(cached, name, local_root)
-                if hit is None or _skill_dir_still_valid(hit):
-                    with _SKILL_INDEX_LOCK:
-                        if generation == _SKILL_INDEX_GENERATION:
-                            return {"path": hit} if hit is not None else None
-                with _SKILL_INDEX_LOCK:
-                    _SKILL_INDEX.pop(key, None)
-                continue
-            index = _build_skill_index(roots)
-            if not _index_tree_unchanged(index, certify=True):
-                continue
-            with _SKILL_INDEX_LOCK:
-                if index["gen"] != _SKILL_INDEX_GENERATION:
-                    continue
-                if key not in _SKILL_INDEX and len(_SKILL_INDEX) >= 16:
-                    _SKILL_INDEX.clear()
-                _SKILL_INDEX[key] = index
-                hit = _skill_index_lookup(index, name, local_root)
-                return {"path": hit} if hit is not None else None
-    raise _SkillIndexChangedError("Skill tree changed repeatedly during discovery; retry the operation")
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        for skill_dir in _iter_skill_dirs(skills_dir):
+            if skill_dir.name == name:
+                return {"path": skill_dir}
+            if local_root is not None:
+                resolved = skill_dir.resolve()
+                if (resolved.is_relative_to(local_root)
+                        and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
+                    return {"path": skill_dir}
+    return None
+
+
+class _OperationMemo(dict):
+    """name -> discovery answer for ONE public skill_manage call, owned by the calling thread."""
+    __slots__ = ("thread", "closed")
+
+    def __init__(self):
+        super().__init__()
+        self.thread, self.closed = threading.get_ident(), False
+
+
+# A context copied into another thread (the sync-push Timer) carries the memo object along;
+# the owner/closed check keeps it from answering there or after its call has returned.
+_SKILL_OPERATION_MEMO = _ctxvars.ContextVar("skill_operation_memo", default=None)
+
+
+def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+    """``_discover_skill`` with a per-call memo: one public skill_manage call resolves a name in
+    preflight, ledger capture, the handler and post-capture; only the first runs a discovery.
+    The memo is emptied after the handler (a mutation can change which copy wins for ANY name)
+    and never outlives the call, so no answer is reused across calls, threads or sessions."""
+    memo = _SKILL_OPERATION_MEMO.get()
+    if memo is None or memo.closed or memo.thread != threading.get_ident():
+        return _discover_skill(name)
+    if name not in memo:
+        memo[name] = _discover_skill(name)
+    return memo[name]
+
+
+def _clear_skill_memo() -> None:
+    if (memo := _SKILL_OPERATION_MEMO.get()) is not None:
+        memo.clear()
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -1227,24 +1099,25 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _maybe_debounced_sync_push(name)
 
 
-def _bind_skill_targets(fn):
+def _per_call_skill_memo(fn):
     from functools import wraps
 
     @wraps(fn)
     def bound(*args, **kwargs):
         if kwargs.get("operations") is not None:
-            return fn(*args, **kwargs)  # batch snapshots/rollback need fresh post-op lookups
-        token = _SKILL_OPERATION_TARGETS.set({})
+            return fn(*args, **kwargs)  # each batch op is its own flat call with its own memo
+        memo = _OperationMemo()
+        token = _SKILL_OPERATION_MEMO.set(memo)
         try:
             return fn(*args, **kwargs)
-        except _SkillIndexChangedError as exc:
-            return tool_error(str(exc), success=False)
         finally:
-            _SKILL_OPERATION_TARGETS.reset(token)
+            memo.closed = True
+            memo.clear()
+            _SKILL_OPERATION_MEMO.reset(token)
     return bound
 
 
-@_bind_skill_targets
+@_per_call_skill_memo
 def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
@@ -1281,20 +1154,15 @@ def skill_manage(
         # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
         # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
         _ledger_before = None
-        _pre = _find_skill(name)
         with suppress(Exception):
             from tools import skill_ledger as _ledger
+            _pre = _find_skill(name)
             _ledger_before = _ledger.capture_before(
                 _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
             f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
         result = handler({"name": name, **args})
-        if action in {"create", "delete"} and isinstance(result, dict) and result.get("success"):
-            target = result.get("path") or (_pre["path"] if _pre else None)
-            _invalidate_skill_index(Path(target) if target else None)
-            # A topology mutation changes the post-ledger target (create) or removes it
-            # (delete). Do not let the pre-mutation binding escape into post-capture.
-            _SKILL_OPERATION_TARGETS.get().pop(name, None)
+        _clear_skill_memo()  # the handler may have mutated: post-capture rediscovers
         if isinstance(result, str):
             return result  # tool_error JSON for argument-shape problems (patch)
         if result.get("success"):

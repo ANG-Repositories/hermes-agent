@@ -73,7 +73,7 @@ def test_97e9a72be65e_replaced_tree_precedence(tmp_path, modeled_order):
             pytest.skip('filesystem does not expose reverse insertion order')
         result = public('foo', 'patch')
         assert result.get('success'), result
-        assert '# changed' in (fresh / 'SKILL.md').read_text(encoding="utf-8"), (original, fresh, result)
+        assert '# changed' in (fresh / 'SKILL.md').read_text(encoding="utf-8-sig"), (original, fresh, result)
 
 
 def test_6a726bb2ae97_directory_created_during_walk(tmp_path, request):
@@ -92,15 +92,13 @@ def test_6a726bb2ae97_directory_created_during_walk(tmp_path, request):
         env(stack, tmp_path, root)
         with patch('os.walk', side_effect=racing_walk):
             public('new')
-        if not raced and request.node.callspec.params['discovery_implementation'] == 'main-rglob-control':
-            _mk(root, 'new')  # legacy discovery has no os.walk snapshot seam
-        else:
-            assert raced
+        if not raced:
+            _mk(root, 'new')  # main's rglob discovery (both arms since the scope cut) has no os.walk seam
         added = _mk(root, 'new/another')
         assert added in list(smt._iter_skill_dirs(root)), 'fresh pre-PR discovery must see it'
         result = public('another', 'patch')
         assert result.get('success'), result
-        assert '# changed' in (added / 'SKILL.md').read_text(encoding="utf-8")
+        assert '# changed' in (added / 'SKILL.md').read_text(encoding="utf-8-sig")
 
 
 @pytest.mark.parametrize('external,nested', [(False, False), (False, True),
@@ -121,7 +119,7 @@ def test_public_external_topology_freshness(tmp_path, external, nested):
         renamed = created.with_name('renamed')
         assert not public('new', 'patch')['success']
         (renamed / 'SKILL.md').write_text(
-            (renamed / 'SKILL.md').read_text(encoding='utf-8').replace('# changed', '# x'),
+            (renamed / 'SKILL.md').read_text(encoding='utf-8-sig').replace('# changed', '# x'),
             encoding='utf-8')
         assert public('renamed', 'patch')['success']
         (renamed / 'SKILL.md').unlink()
@@ -134,27 +132,8 @@ def test_preflight_rejection_does_not_discover(tmp_path):
     _mk(root, 'alpha')
     with ExitStack() as stack:
         env(stack, tmp_path, root)
-        stack.enter_context(patch.object(smt, '_find_skill_indexed',
+        stack.enter_context(patch.object(smt, '_discover_skill',
                                         side_effect=AssertionError('must not discover')))
         stack.enter_context(patch.object(smt, '_background_review_preflight',
                                         return_value={'success': False, 'error': 'rejected'}))
         assert public('alpha', 'patch') == {'success': False, 'error': 'rejected'}
-
-
-def test_unstable_tree_returns_structured_error(tmp_path, request):
-    if request.node.callspec.params['discovery_implementation'] != 'head':
-        pytest.skip('legacy lookup has no snapshot retries')
-    root = tmp_path / 'skills'
-    _mk(root, 'alpha')
-    with ExitStack() as stack:
-        env(stack, tmp_path, root)
-        stack.enter_context(patch.object(smt, '_index_tree_unchanged', return_value=False))
-        builds = stack.enter_context(patch.object(smt, '_build_skill_index',
-                                                 wraps=smt._build_skill_index))
-        result = public('alpha', 'patch')
-        assert result['success'] is False
-        assert 'changed repeatedly' in result['error']
-        assert builds.call_count == 3
-        assert smt._SKILL_OPERATION_TARGETS.get() is None
-
-
