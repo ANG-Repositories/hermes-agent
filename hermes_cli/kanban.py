@@ -22,7 +22,8 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_lazy import Module, handler as _lazy_handler
+kbd = Module("hermes_cli.kanban_db_dispatch")
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
@@ -35,10 +36,9 @@ from hermes_cli.kanban_output import (
 # fields the handlers here render (FOLLOWUP: port into kanban_output, then import).
 from hermes_cli.kanban_admit import cmd_admit as _cmd_admit
 from hermes_cli.kanban_boards import _dispatch_boards
-from hermes_cli.kanban_ops import (
-    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
-    _cmd_reclaim_workspaces,
-)
+for _name in ("_cmd_daemon", "_kanban_config", "_cmd_dispatch", "_cmd_gc", "_cmd_repair",
+              "_cmd_tail", "_cmd_watch", "_cmd_reclaim_workspaces"):
+    globals()[_name] = _lazy_handler("hermes_cli.kanban_ops", _name)
 from hermes_cli import kanban_verb_input as kvi
 from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
@@ -380,7 +380,10 @@ def kanban_command(args: argparse.Namespace) -> int:
     if resolved and resolved != kb.PINNED_SLUG:
         board_scope = kb.scoped_current_board(resolved)
 
-    with board_scope:
+    from hermes_cli.kanban_read import is_read
+    read_only = is_read(args) and action not in ("list", "ls")
+    read_only = read_only and os.environ.get("HERMES_KANBAN_READ_ONLY", "1") != "0"
+    with board_scope, kbc.read_scope(read_only):
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
@@ -398,7 +401,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
-            kb.init_db()
+            if not read_only:
+                with kb.connect_closing():
+                    pass
         except Exception as exc:
             return _err(f"kanban: could not initialize database: {exc}")
 
@@ -466,6 +471,8 @@ def kanban_command(args: argparse.Namespace) -> int:
                 _lifecycle_target_ids(args), action, flags=gated_flags,
             ), actor_scope, event_actor_scope:
                 return int(handler(args) or 0)
+        except kbc.sqlite3.Error as exc:
+            return _err(f"kanban: could not read database: {exc}" if read_only else f"kanban: database error: {exc}")
         except (ValueError, RuntimeError, PermissionError) as exc:
             # A survivor refusal carries its operator-only hint on the
             # exception, not in the persisted message, so render it HERE --
@@ -1234,12 +1241,21 @@ def _cmd_list(args: argparse.Namespace) -> int:
         args.session = None
     else:
         home_session_ids = None
+    if not kb.kanban_db_path().exists():
+        # A fresh board has no tasks; a read must not initialize it just to
+        # produce the same empty listing. Delegated callers retain their fence.
+        from agent.delegation_context import kanban_path_is_fenced
+        if not kanban_path_is_fenced(kb.kanban_db_path()):
+            if not _json_out(args, []):
+                print("(no matching tasks)")
+            return 0
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
         # A delegate_task child's connection is read-only; promotion is a
         # status mutation, so it lists the board as-is (the dispatcher promotes).
-        if not kb._is_delegated_child():
+        # Promotion belongs to the dispatcher, not a read verb holding a writer lock.
+        if not kb._is_delegated_child() and not kbc._READ_ONLY.get():
             kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
@@ -1599,11 +1615,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
     else:
-        cfg_val = _kanban_config().get("failure_limit")
-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+        from hermes_cli.config import load_config
+        try:
+            cfg_val = (load_config().get("kanban") or {}).get("failure_limit")
+        except Exception:
+            cfg_val = None
+        from hermes_cli.kanban_dispatch_defaults import DEFAULT_FAILURE_LIMIT
+        if cfg_val is not None and int(cfg_val) != DEFAULT_FAILURE_LIMIT:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
         else:
-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+            print(f"  max-retries: {DEFAULT_FAILURE_LIMIT} (default)")
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.

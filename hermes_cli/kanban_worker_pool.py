@@ -856,11 +856,23 @@ def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iter
 # the whole ssh-root trigger (Q9 recommendation (a)); a root-only verb list
 # would be a lint, never a rule. control-plane-read binds on a PATH-shaped
 # mention only (Momus pass 2 R-F): "the kanban.db schema" is prose, while
-# ``~/.hermes/kanban.db`` or ``fleet/kanban-pool.json`` is a file the work opens.
+# ``~/.hermes/kanban.db`` or ``~/.hermes/fleet/kanban-pool.json`` is a file the work opens.
 _SUDO_RE = re.compile(r"(?<![\w-])sudo(?![\w-])")
 _CONTROL_PLANE_PATH_RE = re.compile(
-    r"(?:^|(?<=[\s`'\"(=:,]))(?:~|\.\.?|[\w.@*${}-]+)?(?:/[\w.@*${}-]+)*/"
+    r"(?:^|(?<=[\s`'\"(=:,]))((?:~|\.\.?|[\w.@*${}-]+)?(?:/[\w.@*${}-]+)*)/"
     r"(kanban\.db|gateway\.log|load_gate\.json|kanban-pool\.json)(?![\w-])")
+# Only a LIVE path binds (t_e7c03f48): rooted at ``~``, an env var (``$HOME``, ``$HERMES_HOME``) or ``/``,
+# dot-relative (``./``, ``../``, ``.hermes/``), or under the live ``state/`` / ``logs/`` dirs. A repo-relative
+# path (``fleet/kanban-pool.json``, ``scripts/...``, ``tests/...``, a PR file list) names the TRACKED copy a PR
+# edits, which every pool host has in its clone: t_e32e34f0 was held Studio-only for editing it.
+_LIVE_CONTROL_PLANE_DIRS = frozenset({"state", "logs"})
+
+
+def _live_control_plane_path(prefix: str) -> bool:
+    """True when the directory part of a matched control-plane path names the live file, not a repo copy."""
+    if not prefix or prefix[0] in "~$/.":
+        return True
+    return prefix.split("/", 1)[0] in _LIVE_CONTROL_PLANE_DIRS
 
 
 def _sudo_before_break(remote: str) -> bool:
@@ -900,9 +912,10 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
     known ssh host, a ``host:<pin>`` line is never a target. ``<host>`` is the
     canonical pin of the alias when ``canon`` names one (``ci`` -> ``ci-box``).
 
-    ``control-plane-read``: a path-shaped mention of kanban.db, gateway.log,
-    load_gate.json or kanban-pool.json, or an explicit
-    ``requires: control-plane-read`` line. A bare word never binds.
+    ``control-plane-read``: a LIVE path-shaped mention of kanban.db, gateway.log,
+    load_gate.json or kanban-pool.json (:func:`_live_control_plane_path`), or an
+    explicit ``requires: control-plane-read`` line. A bare word never binds, nor
+    does a repo-relative path (``fleet/kanban-pool.json``).
     """
     from hermes_cli import kanban_host_capabilities as _khc
     alias_set = {a.lower() for a in (aliases or ()) if a}
@@ -930,7 +943,8 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
             at = re.search(rf"(?<![\w.-]){re.escape(target)}(?![\w-])", rest)
             if at and _sudo_before_break(rest[at.end():]):
                 return _reasons.ssh_root(canon.get(w, w))
-        if not cp_read and _CONTROL_PLANE_PATH_RE.search(line):
+        if not cp_read and any(_live_control_plane_path(m.group(1))
+                               for m in _CONTROL_PLANE_PATH_RE.finditer(line)):
             cp_read = True
     if cp_read or _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
         return _reasons.ACCESS_CONTROL_PLANE_READ

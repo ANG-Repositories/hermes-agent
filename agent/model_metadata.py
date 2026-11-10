@@ -427,12 +427,13 @@ _BEDROCK_PROBE_FAILURE_TTL_SECONDS = 300.0
 _BEDROCK_PROBE_FAILURE_CACHE: Dict[tuple, float] = {}
 # Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
 # and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
-# Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
+# Generation-5 ids are listed explicitly (fable-5-2, fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
 # longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
 # An IMMUTABLE ((id, window), ...) tuple, not dict rows: it is the FALLBACK hermes-home's
 # scripts/anthropic-limits-render.py --check certifies against config/anthropic-limits.json, and a tuple
 # cannot be changed after this line (hermes-home#7860, Prism f-ce7cb29c7df69f55 / f-bbf4d7c761341baa).
 ANTHROPIC_CONTEXT_FALLBACK: Tuple[Tuple[str, int], ...] = (
+    ("claude-fable-5-2", 1000000),
     ("claude-fable-5-1", 1000000),
     ("claude-fable-5", 1000000),
     ("claude-fable", 1000000),

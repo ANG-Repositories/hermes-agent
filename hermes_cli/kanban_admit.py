@@ -42,9 +42,10 @@ from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_lazy import Module
+kbd = Module("hermes_cli.kanban_db_dispatch")
 
-EVENT = kbd.ADMISSION_EVENT
+from hermes_cli.kanban_dispatch_defaults import ADMISSION_EVENT as EVENT
 LOAD_FACTOR = 1.5          # refuse when load1 > threads x LOAD_FACTOR
 LOCAL = "studio"           # the canonical name of the dispatcher's own host (kwp.PIN_STUDIO)
 # A tick now holds the board lock only while it decides (kanban.dispatch.narrow_lock, t_f60f502f), so

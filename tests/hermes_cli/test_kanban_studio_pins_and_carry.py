@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -439,7 +440,7 @@ def test_local_files_kill_switch_keeps_the_old_pin(kanban_home, carried):
 
 
 def test_local_files_too_big_to_carry_keeps_the_old_pin(kanban_home, carried, monkeypatch):
-    monkeypatch.setattr(kwh, "carry_size_ok", lambda path: False)
+    monkeypatch.setattr(kwh, "carry_size_ok", lambda path, **_kw: False)
     with kb.connect_closing() as conn:
         tid, _ = _card_with_files(conn)
         assert _route(conn, tid, None) == (("local", None), "local_files", False)
@@ -464,6 +465,144 @@ def test_carry_size_ok_bounds(tmp_path):
     kwh._carry_scan_cache.clear()
     assert not kwh.carry_size_ok(str(d), max_entries=0)
     assert not kwh.carry_size_ok(None)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_carry_queue():
+    # Keep the fixture usable against the pre-fix module for the behavioral RED control.
+    queue = getattr(kwh, "_carry_waiting", {})
+    queue.clear()
+    yield
+    queue.clear()
+
+
+def _ten_files(tmp_path, name):
+    d = tmp_path / name
+    d.mkdir()
+    for i in range(10):
+        (d / str(i)).write_text("work")
+    kwh._carry_scan_cache.clear()
+    return str(d)
+
+
+class _Clock:
+    """Advances ``step`` seconds per read: every walk check costs measurable wall."""
+
+    def __init__(self, step):
+        self.t, self.step = 0.0, step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+def _no_walk(*_a, **_k):
+    pytest.fail("walked a path the cache or the budget should have answered")
+
+
+def test_carry_scan_past_its_wall_bound_is_refused_and_cached(tmp_path, monkeypatch):
+    # t_915b8d2d: one unbounded walk held a live tick for minutes. Past max_seconds the path is refused, and the
+    # refusal is cached so later ticks do not pay for it again.
+    d = _ten_files(tmp_path, "slow")
+    budget = kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0))
+    assert not kwh.carry_size_ok(d, budget=budget, max_seconds=0.5)
+    assert budget.deferred == 0 and budget.spent_s > 0
+    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    assert not kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0)))
+
+
+def test_carry_scan_out_of_tick_budget_is_deferred_uncached(tmp_path, monkeypatch):
+    # The tick's budget is spent: the row keeps the old rule THIS tick and is judged afresh on the next one.
+    d = _ten_files(tmp_path, "later")
+    spent = kwh.CarryScanBudget(seconds=0.0)
+    with monkeypatch.context() as m:
+        m.setattr(kwh.os, "walk", _no_walk)
+        assert not kwh.carry_size_ok(d, budget=spent)
+    assert spent.deferred == 1
+    assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget())
+
+
+def test_carry_scan_cut_by_the_tick_budget_is_deferred_uncached(tmp_path):
+    d = _ten_files(tmp_path, "cut")
+    budget = kwh.CarryScanBudget(seconds=0.5, clock=_Clock(1.0))
+    assert not kwh.carry_size_ok(d, budget=budget, max_seconds=10.0)
+    assert budget.deferred == 1 and budget.left() <= 0
+    assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget())
+
+
+def test_carry_scan_cache_is_stamped_when_the_walk_ends(tmp_path, monkeypatch):
+    # A walk that started TTL ago but just finished is fresh: a slow tick must not expire its own census.
+    d = _ten_files(tmp_path, "stamp")
+    clock = _Clock(0.0)
+    budget = kwh.CarryScanBudget(seconds=1e9, clock=clock)
+    real_walk = kwh.os.walk
+
+    def walk_then_jump(*a, **k):
+        clock.t += kwh.CARRY_SCAN_TTL_SECONDS + 10
+        return real_walk(*a, **k)
+
+    with monkeypatch.context() as m:
+        m.setattr(kwh.os, "walk", walk_then_jump)
+        assert kwh.carry_size_ok(d, budget=budget, max_seconds=1e9)
+    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(clock=clock))
+
+
+def test_carry_budget_serves_waiting_paths_fifo_under_a_fixed_row_order(tmp_path, monkeypatch):
+    # Worst case: every cache entry has expired by the next tick and the rows always arrive A, B, C. Each walk
+    # costs 0.8 s of a 1.0 s budget, so without a queue A re-walks every tick and C is never judged.
+    a, b, c = (_ten_files(tmp_path, n) for n in "abc")
+    clock = _Clock(0.0)
+    real_walk = kwh.os.walk
+    walked = []
+
+    def costly_walk(root, *args, **kw):
+        walked.append(root)
+        clock.t += 0.8
+        return real_walk(root, *args, **kw)
+
+    monkeypatch.setattr(kwh.os, "walk", costly_walk)
+    answers = []
+    for _tick in range(3):
+        budget = kwh.CarryScanBudget(seconds=1.0, clock=clock)
+        answers.append([kwh.carry_size_ok(p, budget=budget) for p in (a, b, c)])
+        clock.t += kwh.CARRY_SCAN_TTL_SECONDS + 1
+    assert answers[0][0] and answers[1][1] and answers[2][2], answers
+    assert kwh.os.path.realpath(c) in {kwh.os.path.realpath(w) for w in walked}
+
+
+def test_a_waiting_path_whose_card_left_is_forgotten(tmp_path):
+    d = _ten_files(tmp_path, "gone")
+    clock = _Clock(0.0)
+    kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(seconds=0.0, clock=clock))
+    assert kwh._carry_waiting
+    clock.t += kwh.CARRY_WAIT_FORGET_SECONDS + 1
+    assert kwh.CarryScanBudget(clock=clock).admit_gen is None and not kwh._carry_waiting
+
+
+def test_a_spent_carry_budget_never_holds_a_portable_peer(kanban_home, carried, monkeypatch):
+    # Saturated Studio, two local_files rows and one plain portable row, and no carry budget left: the portable
+    # row is placed this tick, the local_files rows keep the old rule (not carried) and are counted as deferred.
+    monkeypatch.setattr(kwh, "CARRY_TICK_SCAN_SECONDS", 0.0)
+    with kb.connect_closing() as conn:
+        lf1, _ = _card_with_files(conn)
+        lf2, _ = _card_with_files(conn)
+        port = kb.create_task(conn, title="portable", assignee="alpha")
+        res, spawned = _tick(conn, spillover=_plan(free=3), spawn_limit=0, spawn_paused="saturated:cpu")
+    assert (port, "ace-ai") in spawned
+    assert carried == []
+    assert not any(t in (lf1, lf2) for t, _h in spawned)
+    assert res.carry_scans_deferred == 2
+    assert res.route_ms >= res.carry_scan_ms >= 0
+
+
+def test_carry_scan_cache_respects_limits(tmp_path):
+    d = tmp_path / "limits"
+    d.mkdir()
+    (d / "work").write_bytes(b"x" * 10)
+    kwh._carry_scan_cache.clear()
+    assert kwh.carry_size_ok(str(d), max_bytes=100)
+    assert not kwh.carry_size_ok(str(d), max_bytes=5)
 
 
 def test_carry_workspace_runs_mkdir_then_rsync():
@@ -645,3 +784,300 @@ def test_a_carried_card_waits_when_there_is_no_pool_plan(kanban_home, carried):
         conn.commit()
         _res, spawned = _tick(conn, spillover=None, spawn_limit=4)
     assert (tid, None) not in spawned and (plain, None) in spawned
+
+
+# -- t_e7c03f48: only content the remote cannot reproduce binds ------------------------------------------------
+# t_e32e34f0's Studio scratch dir held a clean git worktree whose HEAD was the pushed PR head, plus logs and a patch;
+# that kept it Studio-only (local_files) for 2 h+ while the pool sat idle.
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                    "-c", "init.defaultBranch=main", *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+@pytest.fixture
+def reproducible_workspace(tmp_path):
+    """A workspace dir holding a clean `git worktree` (HEAD pushed) plus three logs, a patch and pr-body.md."""
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    origin, seed = tmp_path / "origin.git", tmp_path / "seed"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    _git(tmp_path, "clone", "-q", str(origin), str(seed))
+    (seed / "README.md").write_text("x\n")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-q", "-m", "seed")
+    _git(seed, "push", "-q", "origin", "HEAD:main")
+
+    def make(ws: Path) -> Path:
+        ws.mkdir(parents=True, exist_ok=True)
+        repo = ws / "repo"
+        _git(seed, "worktree", "add", "-q", "-b", f"feat-{ws.name}", str(repo), "HEAD")
+        (repo / "fix.py").write_text("print(1)\n")
+        _git(repo, "add", "fix.py")
+        _git(repo, "commit", "-q", "-m", "fix")
+        _git(repo, "push", "-q", "origin", "HEAD")
+        for name in ("run.log", "test.log", "gate.log", "fix.patch", "pr-body.md"):
+            (ws / name).write_text("throwaway\n")
+        return repo
+    return make
+
+
+def _card_in(conn, make, body=None):
+    tid = kb.create_task(conn, title="lf", assignee="alpha", body=body)
+    path = Path(kbw.resolve_workspace(kb.get_task(conn, tid)))
+    repo = make(path)
+    kbw.set_workspace_path(conn, tid, str(path))
+    return tid, path, repo
+
+
+def test_clean_pushed_worktree_plus_logs_is_portable(kanban_home, carried, reproducible_workspace):
+    """RED ON BASE: ((portable, None), 'local_files', True) - any file bound the card (it was carried at best)."""
+    with kb.connect_closing() as conn:
+        tid, path, _repo = _card_in(conn, reproducible_workspace)
+        assert _route(conn, tid, None) == (("portable", None), "policy", False)
+        assert kwh.local_workspace_binding(str(path)) is None
+
+
+def test_clean_pushed_worktree_is_portable_under_the_kill_switch_too(kanban_home, carried, reproducible_workspace):
+    """The fix is in the classifier, not in the continuity carry: the old pin rule no longer sees content."""
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, _path, _repo = _card_in(conn, reproducible_workspace)
+        assert _route(conn, tid, None) == (("portable", None), "policy", False)
+
+
+def test_one_untracked_file_binds_and_is_named(kanban_home, carried, reproducible_workspace):
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, path, repo = _card_in(conn, reproducible_workspace)
+        (repo / "scratch.txt").write_text("unsaved work\n")
+        assert _route(conn, tid, None) == (("local", None), "local_files", False)
+        assert kwh.local_workspace_binding(str(path)) == "repo/scratch.txt"
+
+
+def test_host_any_wait_reason_names_the_binding_path(kanban_home, carried, reproducible_workspace):
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, _path, repo = _card_in(conn, reproducible_workspace, body="host: any\nfix it")
+        (repo / "scratch.txt").write_text("unsaved work\n")
+        route, rule, _ = _route(conn, tid, None)
+    assert route == ("local", "not_portable:local_files(repo/scratch.txt)") and rule == "local_files"
+
+
+def test_dirty_tracked_file_binds(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    (repo / "README.md").write_text("edited\n")
+    assert kwh.local_workspace_binding(str(ws)) == "repo/README.md"
+
+
+def test_unpushed_commit_binds(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    (repo / "more.py").write_text("x\n")
+    _git(repo, "add", "more.py")
+    _git(repo, "commit", "-q", "-m", "local only")
+    assert (kwh.local_workspace_binding(str(ws)) or "").startswith("repo@unpushed:")
+
+
+@pytest.mark.parametrize("name", ["notes.md", "session.jsonl", "pr-body.md.bak"])
+def test_a_file_outside_the_throwaway_list_binds(reproducible_workspace, tmp_path, name):
+    ws = tmp_path / "ws"
+    reproducible_workspace(ws)
+    (ws / name).write_text("x\n")
+    assert kwh.local_workspace_binding(str(ws)) == name
+
+
+def test_a_symlink_binds(tmp_path):
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "run.log").write_text("x\n")
+    (ws / "link").symlink_to(tmp_path)
+    assert kwh.local_workspace_binding(str(ws)) == "link"
+
+
+def test_throwaway_only_workspace_is_portable_and_empty_is_none(tmp_path):
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    assert kwh.local_workspace_binding(str(ws)) is None          # missing
+    ws.mkdir()
+    assert kwh.local_workspace_binding(str(ws)) is None          # empty
+    (ws / "logs").mkdir()
+    (ws / "logs" / "a.log").write_text("x\n")
+    (ws / "b.patch").write_text("x\n")
+    assert kwh.local_workspace_binding(str(ws)) is None
+
+
+def test_a_git_failure_binds(tmp_path):
+    """A worktree whose gitdir is gone cannot be proven reproducible: fail closed."""
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    (ws / "repo").mkdir(parents=True)
+    (ws / "repo" / ".git").write_text("gitdir: /nonexistent/gitdir\n")
+    assert (kwh.local_workspace_binding(str(ws)) or "").startswith("repo@git-")
+
+
+# -- t_e7c03f48 Prism round 1: each of these let local-only work read "reproducible" --------------------------------
+
+def test_an_edit_inside_a_checkout_between_two_calls_binds(reproducible_workspace, tmp_path):
+    """Prism 5c1daae965e0: a cache keyed on the workspace root mtime missed an edit inside the checkout."""
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    (repo / "README.md").write_text("edited after the first call\n")
+    assert kwh.local_workspace_binding(str(ws), now=1) == "repo/README.md"
+
+
+def test_a_submodule_edit_hidden_by_ignore_all_binds(reproducible_workspace, tmp_path):
+    """Prism 812f89f3c723: ``submodule.<x>.ignore=all`` must not hide a modified tracked file in a submodule."""
+    sub_origin, sub_seed = tmp_path / "sub.git", tmp_path / "sub-seed"
+    _git(tmp_path, "init", "-q", "--bare", str(sub_origin))
+    _git(tmp_path, "clone", "-q", str(sub_origin), str(sub_seed))
+    (sub_seed / "lib.py").write_text("x = 1\n")
+    _git(sub_seed, "add", "lib.py")
+    _git(sub_seed, "commit", "-q", "-m", "lib")
+    _git(sub_seed, "push", "-q", "origin", "HEAD:main")
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_origin), "sub")
+    _git(repo, "commit", "-q", "-m", "add sub")
+    _git(repo, "push", "-q", "origin", "HEAD")
+    _git(repo, "config", "submodule.sub.ignore", "all")
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    (repo / "sub" / "lib.py").write_text("x = 2  # local only\n")
+    kwh._binding_cache.clear()  # isolate the status override from the stale-local-verdict regression
+    assert kwh.local_workspace_binding(str(ws), now=1) == "repo/sub"
+
+
+def test_a_branch_deleted_on_the_remote_binds_despite_the_stale_tracking_ref(reproducible_workspace, tmp_path):
+    """Prism 1c3c50990907: the local ``origin/<branch>`` ref outlives the remote branch; ask the remote."""
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    branch = f"feat-{ws.name}"
+    _git(tmp_path, "--git-dir", str(tmp_path / "origin.git"), "branch", "-D", branch)
+    tracking = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
+                              capture_output=True)
+    assert tracking.returncode == 0  # the stale local tracking ref is still there
+    assert (kwh.local_workspace_binding(str(ws), now=0) or "").startswith("repo@unpushed:")
+
+
+def test_an_ls_remote_failure_binds_as_remote_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+
+    def runner(argv, **kw):
+        if "ls-remote" in argv:
+            return subprocess.CompletedProcess(argv, 128, b"", b"fatal: unable to access")
+        return subprocess.run(argv, **kw)
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
+    # Unverified answers may be cached: they only keep a card local. Re-ask after the bounded TTL.
+    assert kwh.local_workspace_binding(str(ws), now=1) == "remote-unverified: repo"
+    assert kwh.local_workspace_binding(str(ws), now=121) is None
+    assert repo.exists()
+
+
+def test_an_ls_remote_timeout_binds_as_remote_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    reproducible_workspace(ws)
+
+    def runner(argv, **kw):
+        if "ls-remote" in argv:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        return subprocess.run(argv, **kw)
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
+
+
+
+def test_remote_containment_cache_is_keyed_by_head_but_status_always_runs(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        return subprocess.run(argv, **kw)
+
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) is None
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=1) is None
+    assert sum("status" in a for a in calls) == 2
+    assert sum("ls-remote" in a for a in calls) == 2
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "local only")
+    assert (kwh.local_workspace_binding(str(ws), runner=runner, now=2) or "").startswith("repo@unpushed:")
+    assert sum("ls-remote" in a for a in calls) == 3
+    assert (kwh.local_workspace_binding(str(ws), runner=runner, now=3) or "").startswith("repo@unpushed:")
+    assert sum("ls-remote" in a for a in calls) == 3  # negative answer is safe to cache
+
+
+def test_remote_containment_accepts_ancestor_of_a_current_remote_tip(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "later")
+    _git(repo, "push", "-q", "origin", "HEAD")
+    _git(repo, "checkout", "-q", "--detach", "HEAD~1")
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+
+
+def test_remote_tip_not_present_locally_binds_as_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", "-q", str(tmp_path / "origin.git"), str(other))
+    _git(other, "checkout", "-q", "feat-ws")
+    _git(other, "commit", "-q", "--allow-empty", "-m", "tip not fetched by workspace")
+    _git(other, "push", "-q", "origin", "HEAD")
+    assert kwh.local_workspace_binding(str(ws), now=0) == "remote-unverified: repo"
+    assert repo.exists()
+
+
+def test_remote_containment_rechecks_positive_after_deleted_remote_branch(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    _git(tmp_path, "--git-dir", str(tmp_path / "origin.git"), "branch", "-D", "feat-ws")
+    assert (kwh.local_workspace_binding(str(ws), now=1) or "").startswith("repo@unpushed:")
+    assert repo.exists()
+
+
+@pytest.mark.parametrize("source", ["fsmonitor", "hooks", "inherited-config"])
+def test_workspace_git_probes_do_not_execute_checkout_config(reproducible_workspace, tmp_path, monkeypatch, source):
+    """Prism 4d0629af60fb: dispatcher probes must not execute checkout-controlled programs."""
+    import os
+    import shlex
+
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    marker = tmp_path / "executed"
+    program = tmp_path / "marker-command"
+    program.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
+    program.chmod(0o755)
+    if source == "fsmonitor":
+        _git(repo, "config", "core.fsmonitor", str(program))
+    elif source == "hooks":
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        hook = hooks / "reference-transaction"
+        hook.write_text(program.read_text())
+        hook.chmod(0o755)
+        _git(repo, "config", "core.hooksPath", str(hooks))
+    else:
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(program))
+
+    environments = []
+
+    def runner(argv, **kw):
+        environments.append(kw["env"])
+        return subprocess.run(argv, **kw)
+
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) is None
+    assert not marker.exists(), f"{source} executed as the dispatcher"
+    # Read-only probes do not trigger reference-transaction themselves; also pin the hooks override on
+    # EVERY subprocess so the test catches an unhardened hooks path without introducing a write probe.
+    for env in environments:
+        overrides = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+                     for i in range(int(env.get("GIT_CONFIG_COUNT", "0")))}
+        assert overrides.get("core.hooksPath") == os.devnull
+        assert overrides.get("core.fsmonitor") == "false"
+        assert env["GIT_OPTIONAL_LOCKS"] == "0"
