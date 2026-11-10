@@ -64,9 +64,6 @@ def _resolve_busy_timeout_ms() -> int:
     long timeout lets WAL serialize writers instead of surfacing transient
     ``database is locked`` failures."""
     timeout = _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
-    deadline = _INIT_DEADLINE.get()
-    if deadline is not None:
-        return min(timeout, max(1, min(100, int((deadline - time.monotonic()) * 1000))))
     return timeout
 
 
@@ -1006,6 +1003,37 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
+def _initialization_signature():
+    """Invalidate receipts whenever any initializer implementation changes."""
+    import hashlib
+    root = Path(__file__).parent
+    digest = hashlib.sha256()
+    for name in ("kanban_db_connect.py", "kanban_db.py", "kanban_failure_ownership.py",
+                 "kanban_lifecycle_guards.py"):
+        digest.update((root / name).read_bytes())
+    return digest.hexdigest()
+
+
+def _initialization_is_current(conn):
+    # Both checks are reads: fresh writer processes need no write transaction on
+    # an already-migrated board. SQLite invalidates the receipt on any schema DDL.
+    if not _table_exists(conn, "kanban_initialization"):
+        return False
+    row = conn.execute("SELECT signature, schema_version FROM kanban_initialization WHERE id=1").fetchone()
+    return bool(row and row[0] == _initialization_signature()
+                and row[1] == conn.execute("PRAGMA main.schema_version").fetchone()[0])
+
+
+def _record_initialization(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS kanban_initialization "
+                 "(id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT, schema_version INTEGER)")
+    conn.execute("INSERT OR REPLACE INTO kanban_initialization VALUES (1, ?, ?)",
+                 (_initialization_signature(), conn.execute("PRAGMA main.schema_version").fetchone()[0]))
+
+
+_FORCE_INITIALIZATION = ContextVar("kanban_force_initialization", default=False)
+
+
 def _open_initialized_with_retry(path, initialize):
     """Retry transient schema/WAL lock failures within the existing init budget."""
     deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
@@ -1039,6 +1067,9 @@ _READ_ONLY = ContextVar("kanban_read_only", default=False)
 
 @contextlib.contextmanager
 def read_scope(enabled=True):
+    # Emergency rollback to legacy initialized connections; explicit readonly=True
+    # remains authoritative for callers that require a read-only connection.
+    enabled = enabled and os.environ.get("HERMES_KANBAN_READ_ONLY", "1") != "0"
     token = _READ_ONLY.set(enabled)
     try:
         yield
@@ -1166,7 +1197,8 @@ def connect(
         def _init_if_needed(conn: sqlite3.Connection) -> None:
             # Idempotent; runs under _INIT_LOCK so same-process dispatcher
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
-            if resolved not in _INITIALIZED_PATHS:
+            if resolved not in _INITIALIZED_PATHS and (
+                    _FORCE_INITIALIZATION.get() or not _initialization_is_current(conn)):
                 conn.executescript(_kb.SCHEMA_SQL)
                 # Column-presence gates one-shot backfills. Roll back both the
                 # ALTER and its backfill together if initialization is retried.
@@ -1185,7 +1217,8 @@ def connect(
                 migrate(conn)
                 from hermes_cli.kanban_lifecycle_guards import install
                 install(conn)
-                _INITIALIZED_PATHS.add(resolved)
+                _record_initialization(conn)
+            _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 
         try:
@@ -1245,8 +1278,12 @@ def init_db(
     # Clear the cache entry so connect() re-runs schema + migrations.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(str(path.resolve()))
-    with contextlib.closing(connect(path)):
-        pass
+    token = _FORCE_INITIALIZATION.set(True)
+    try:
+        with contextlib.closing(connect(path)):
+            pass
+    finally:
+        _FORCE_INITIALIZATION.reset(token)
     return path
 
 # Nullable/defaulted columns of the v1 ``tasks`` CREATE TABLE that external

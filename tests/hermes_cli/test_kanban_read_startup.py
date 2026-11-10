@@ -40,7 +40,7 @@ def test_read_connection_never_initializes_and_is_sqlite_readonly(tmp_path, monk
     assert not (tmp_path / "missing.db").exists()
 
 
-@pytest.mark.parametrize("action", ["show", "list", "placement", "context", "runs", "attachments"])
+@pytest.mark.parametrize("action", ["show", "placement", "context", "runs", "attachments"])
 def test_cli_reads_under_held_writer_and_init_lock(tmp_path, action):
     if sys.platform == "win32":
         pytest.skip("POSIX init-lock contention")
@@ -71,7 +71,8 @@ def test_cli_reads_under_held_writer_and_init_lock(tmp_path, action):
         writer.close()
 
 
-def test_show_imports_no_dispatch_pool_gateway_or_git(tmp_path):
+@pytest.mark.parametrize("output_flags", [[], ["--json"]])
+def test_show_imports_no_dispatch_pool_gateway_or_git(tmp_path, output_flags):
     db = tmp_path / "kanban.db"
     task_id = seed(db)
     code = '''
@@ -82,7 +83,7 @@ def counted(argv, *a, **kw):
     launches.append(str(argv))
     return real(argv, *a, **kw)
 subprocess.Popen = counted
-sys.argv = ['hermes', 'kanban', 'show', sys.argv[1], '--json']
+sys.argv = ['hermes', 'kanban', 'show', sys.argv[1], *sys.argv[2:]]
 runpy.run_module('hermes_cli.main', run_name='__main__')
 for name in sys.modules:
     assert name not in ('hermes_cli.kanban_db_dispatch', 'hermes_cli.kanban_worker_pool'), name
@@ -90,19 +91,24 @@ for name in sys.modules:
 assert not launches, launches
 '''
     result = subprocess.run(
-        [sys.executable, "-c", code, task_id], cwd=ROOT,
+        [sys.executable, "-c", code, task_id, *output_flags], cwd=ROOT,
         env={**os.environ, "HERMES_HOME": str(tmp_path), "HERMES_KANBAN_DB": str(db),
              "PYTHONPATH": str(ROOT)}, capture_output=True, text=True,
         stdin=subprocess.DEVNULL, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["task"]["id"] == task_id
+    if output_flags:
+        assert json.loads(result.stdout)["task"]["id"] == task_id
+    else:
+        assert task_id in result.stdout
 
 
 def test_write_init_retries_held_writer(tmp_path, monkeypatch):
     import threading
     db = tmp_path / "board.db"
     seed(db)
+    with sqlite3.connect(db) as stale:
+        stale.execute("DROP TABLE kanban_initialization")
     monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "10")
     writer = sqlite3.connect(db, check_same_thread=False)
     writer.execute("BEGIN IMMEDIATE")
@@ -172,3 +178,54 @@ def test_read_scope_resets_after_error():
             assert kbc._READ_ONLY.get()
             raise ValueError("fixture")
     assert not kbc._READ_ONLY.get()
+
+
+def test_comment_waits_for_thirty_second_writer(tmp_path):
+    import threading
+    db = tmp_path / "kanban.db"
+    task_id = seed(db)
+    writer = sqlite3.connect(db, check_same_thread=False)
+    writer.execute("BEGIN IMMEDIATE")
+    timer = threading.Timer(30, writer.rollback)
+    timer.start()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "kanban", "comment", task_id,
+             "writer wait canary"], cwd=ROOT,
+            env={**os.environ, "HERMES_HOME": str(tmp_path), "HERMES_KANBAN_DB": str(db),
+                 "HERMES_KANBAN_BUSY_TIMEOUT_MS": "40000", "PYTHONPATH": str(ROOT)},
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=55,
+        )
+        assert result.returncode == 0, result.stderr
+        with kbc.connect_closing(db_path=db, readonly=True) as conn:
+            assert conn.execute("SELECT body FROM task_comments WHERE task_id=?", (task_id,)).fetchone()[0] == "writer wait canary"
+    finally:
+        timer.cancel()
+        timer.join()
+        writer.rollback()
+        writer.close()
+
+
+def test_current_schema_connect_does_not_need_writer(tmp_path, monkeypatch):
+    db = tmp_path / "board.db"
+    seed(db)
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "10")
+    writer = sqlite3.connect(db)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        with kbc.connect_closing(db_path=db) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_readonly_kill_switch(tmp_path, monkeypatch):
+    db = tmp_path / "board.db"
+    seed(db)
+    monkeypatch.setenv("HERMES_KANBAN_READ_ONLY", "0")
+    with kbc.read_scope():
+        with kbc.connect_closing(db_path=db) as conn:
+            conn.execute("UPDATE tasks SET title='legacy connection'")
+    with kbc.connect_closing(db_path=db, readonly=True) as conn:
+        assert conn.execute("SELECT title FROM tasks").fetchone()[0] == "legacy connection"

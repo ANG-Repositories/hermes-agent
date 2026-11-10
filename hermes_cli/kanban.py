@@ -381,7 +381,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         board_scope = kb.scoped_current_board(resolved)
 
     from hermes_cli.kanban_read import is_read
-    read_only = is_read(args)
+    read_only = is_read(args) and action not in ("list", "ls")
+    read_only = read_only and os.environ.get("HERMES_KANBAN_READ_ONLY", "1") != "0"
     with board_scope, kbc.read_scope(read_only):
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
@@ -401,7 +402,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
             if not read_only:
-                kb.init_db()
+                with kb.connect_closing():
+                    pass
         except Exception as exc:
             return _err(f"kanban: could not initialize database: {exc}")
 
@@ -1615,7 +1617,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
     else:
-        cfg_val = _kanban_config().get("failure_limit")
+        from hermes_cli.config import load_config
+        cfg_val = (load_config().get("kanban") or {}).get("failure_limit")
         if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
         else:
