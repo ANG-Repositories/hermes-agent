@@ -56,6 +56,9 @@ _MATRIX = ["shellopts-pipefail", "shellopts-errexit-pipefail", "bashopts-nullglo
            "ps4", "empty-value", "non-utf8-value", "lc-ctype-c", "python-vars", "all"]
 
 
+NATIVE_SPAWNED: dict = {}  # tag -> did a native posix_spawn return 0 in the last _observe
+
+
 def _observe(monkeypatch, tmp_path, extra_env: dict, nofork_on: bool, tag: str) -> dict:
     monkeypatch.setattr(nofork, "_FORK_COPIES_PARENT", nofork_on)
     spawns = []  # return codes of native libc posix_spawn calls
@@ -85,7 +88,7 @@ def _observe(monkeypatch, tmp_path, extra_env: dict, nofork_on: bool, tag: str) 
     seen["returncode"] = result["returncode"]
     seen["output"] = result["output"]
     # Which path really started the probe: a native spawn that RETURNED 0, or plain Popen.
-    seen["_native_spawned"] = 0 in spawns
+    NATIVE_SPAWNED[tag] = 0 in spawns
     if not nofork_on:
         assert not spawns, spawns
     return seen
@@ -98,12 +101,11 @@ def test_nofork_spawn_matches_plain_popen(monkeypatch, tmp_path, case):
     monkeypatch.delenv("HERMES_SPAWN_LEGACY", raising=False)
     plain = _observe(monkeypatch, tmp_path, extra, nofork_on=False, tag="plain")
     spawned = _observe(monkeypatch, tmp_path, extra, nofork_on=True, tag="nofork")
-    if not spawned.pop("_native_spawned"):
+    if not NATIVE_SPAWNED["nofork"]:
         # Off macOS there is no native binding: both arms were plain Popen, so a comparison
         # would prove nothing. On macOS the native path must have run.
         assert sys.platform != "darwin", "the no-fork arm did not start the probe natively on macOS"
         pytest.skip(f"no native posix_spawn on {sys.platform}: both arms are plain Popen")
-    plain.pop("_native_spawned")
     differences = {k: (plain.get(k), spawned.get(k)) for k in plain.keys() | spawned.keys()
                    if plain.get(k) != spawned.get(k)}
     assert not differences, differences
