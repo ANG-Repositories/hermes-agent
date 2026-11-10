@@ -7,7 +7,7 @@ import tempfile
 
 
 def main():
-    source = Path('receipts/t_afc525a2_old_spawn.py').read_text()
+    source = Path('receipts/t_afc525a2_old_spawn.py').read_text(encoding='utf-8')
     real_popen = subprocess.Popen
     subprocess.Popen = lambda *a, **k: real_popen(*a, **k)
     try:

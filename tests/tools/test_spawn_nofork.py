@@ -241,6 +241,18 @@ def test_explicit_standard_fd_keeps_new_session(tmp_path):
         proc.wait(timeout=10)
 
 
+def test_wrapped_execute_child_signature(no_fork_exec, monkeypatch):
+    real = subprocess.Popen
+
+    class WrappedPopen(real):
+        def _execute_child(self, args, executable, *rest, **kw):
+            return real._execute_child(self, args, executable, *rest, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", WrappedPopen)
+    result = nofork.run_nofork(["/bin/cat"], input="wrapped", capture_output=True, text=True)
+    assert result.returncode == 0 and result.stdout == "wrapped"
+
+
 def test_run_input_and_conflicts(no_fork_exec):
     result = nofork.run_nofork(["/bin/cat"], input="piped", capture_output=True, text=True)
     assert result.stdout == "piped"

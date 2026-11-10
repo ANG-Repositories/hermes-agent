@@ -7,7 +7,6 @@ Unsupported Popen options retain ordinary Popen semantics (including close_fds).
 from __future__ import annotations
 
 import functools
-import inspect
 import os
 import signal
 import subprocess
@@ -46,11 +45,22 @@ def eligible(args: Any, kwargs: dict) -> bool:
 @functools.lru_cache(maxsize=4)
 def _popen_class(base):
     # Lazy: tools are also imported with Popen replaced by a recording function.
-    signature = inspect.signature(base._execute_child)
+    # Popen.__init__ supplies the POSIX ABI positionally. Instrumentation may
+    # wrap _execute_child with *rest/**kw, hiding its signature; never bind to
+    # that wrapper. Keep its original argv for the ordinary-Popen fallback.
+    parameters = (
+        "args", "executable", "preexec_fn", "close_fds", "pass_fds", "cwd", "env",
+        "startupinfo", "creationflags", "shell", "p2cread", "p2cwrite", "c2pread",
+        "c2pwrite", "errread", "errwrite", "restore_signals", "gid", "gids", "uid",
+        "umask", "start_new_session", "process_group",
+    )
 
     class NoForkPopen(base):
         def _execute_child(self, *args, **kwargs):
-            bound = signature.bind(self, *args, **kwargs).arguments
+            if len(args) > len(parameters):
+                return super()._execute_child(*args, **kwargs)
+            bound = dict(zip(parameters, args))
+            bound.update(kwargs)
             handles = [bound[n] for n in
                        ("p2cread", "p2cwrite", "c2pread", "c2pwrite", "errread", "errwrite")]
             p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite = handles
