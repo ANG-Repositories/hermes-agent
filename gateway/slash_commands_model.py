@@ -12,9 +12,8 @@ import asyncio
 import contextlib
 import contextvars
 import dataclasses
-from pathlib import Path
 import logging
-import time
+import os
 from typing import Any, Optional
 
 from agent.i18n import t
@@ -76,9 +75,156 @@ async def _persist_model_switch_to_config(result, config_path) -> None:
     await asyncio.to_thread(persist_model_selection, result, config_path)
 
 
-class DeliveredModelReply(str):
-    """Confirmation already delivered by an inline model selection's owned lifecycle."""
-    model_selection_delivered = True
+_SAVE_FAILED = object()  # a /model save step that raised (already logged and reported once)
+
+
+class _KeyedLocks:
+    """asyncio.Lock per key, dropped once no holder or waiter remains (t_2ab07928 item 11: the
+    per-session and per-config-destination lock tables must not grow with every session seen)."""
+
+    def __init__(self) -> None:
+        self._entries: dict = {}  # key -> [lock, holders + waiters]
+
+    def __contains__(self, key) -> bool:
+        return key in self._entries
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, key) -> asyncio.Lock:
+        entry = self._entries.get(key)
+        if entry is None:
+            entry = self._entries[key] = [asyncio.Lock(), 0]
+        return entry[0]
+
+    async def acquire(self, key) -> asyncio.Lock:
+        lock = self.get(key)
+        entry = self._entries[key]
+        entry[1] += 1
+        try:
+            await lock.acquire()
+        except BaseException:
+            entry[1] -= 1
+            self._prune(key, entry)
+            raise
+        return lock
+
+    def release(self, key, lock: asyncio.Lock) -> None:
+        lock.release()
+        entry = self._entries.get(key)
+        if entry is not None and entry[0] is lock:
+            entry[1] -= 1
+            self._prune(key, entry)
+
+    def _prune(self, key, entry) -> None:
+        if entry[1] <= 0 and not entry[0].locked() and self._entries.get(key) is entry:
+            del self._entries[key]
+
+
+class _HeldSwitch:
+    """One /model selection's hold on its session's switch lock, from acquire until the save
+    settles. While it is held (or waited for), ordinary messages for the session wait for it in
+    ``BasePlatformAdapter._process_message_background`` so no turn reads a half-saved route."""
+
+    def __init__(self, runner, source, key: str) -> None:
+        self.runner, self.source, self.key = runner, source, key
+        self.lock: Optional[asyncio.Lock] = None
+        self.released = self.handed_off = self.started = False
+        self.adapter = self.adapter_key = None
+
+    async def acquire(self) -> None:
+        with contextlib.suppress(Exception):
+            adapter = self.runner._delivery_adapter_for(self.source)
+            if adapter is not None and hasattr(adapter, "_source_session_key"):
+                self.adapter, self.adapter_key = adapter, adapter._source_session_key(self.source)
+        locks = self.runner._model_switch_locks()
+        if self.adapter_key is not None:
+            self.adapter.__dict__.setdefault("_model_selection_locks", {})[self.adapter_key] = locks.get(self.key)
+        try:
+            self.lock = await locks.acquire(self.key)
+        except BaseException:
+            self._drop_adapter_entry(locks)
+            raise
+
+    def release(self) -> None:
+        """Release unless already released or handed to a still-running write."""
+        if not (self.released or self.handed_off):
+            self._release_now()
+
+    def _release_now(self) -> None:
+        self.released = True
+        locks = self.runner._model_switch_locks()
+        locks.release(self.key, self.lock)
+        self._drop_adapter_entry(locks)
+
+    def _drop_adapter_entry(self, locks) -> None:
+        if self.adapter_key is None or self.key in locks:
+            return
+        table = self.adapter.__dict__.get("_model_selection_locks", {})
+        table.pop(self.adapter_key, None)
+
+    def hand_off(self, fut, label: str, landed: list) -> None:
+        """The task was cancelled while ``fut`` (a started write) still runs: keep the lock until
+        it settles, then release it and post the one follow-up saying what landed."""
+        self.handed_off = True
+
+        def _settled(f) -> None:
+            ok = not f.cancelled() and f.exception() is None
+            self._release_now()
+            self.schedule_followup(self.runner._model_switch_interrupted_text(landed + ([label] if ok else [])))
+
+        fut.add_done_callback(_settled)
+
+    def schedule_followup(self, text: str) -> None:
+        """Post a follow-up without making the cancelled task wait for the send."""
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self.runner._send_model_switch_followup(self.source, text))
+        except RuntimeError:
+            logger.warning("model switch follow-up undeliverable (no loop): %s", text)
+            return
+        pending = self.runner.__dict__.setdefault("_model_switch_followup_tasks", set())
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    def register_after_delivery(self, save, timing) -> bool:
+        """Typed /model inside the adapter's own session task: save as that task's post-delivery
+        callback, after the adapter delivered the confirmation. False when not in such a task."""
+        adapter = self.adapter
+        task = asyncio.current_task()
+        key = next((k for k, v in getattr(adapter, "_session_tasks", {}).items() if v is task), None) \
+            if adapter is not None else None
+        if key is None:
+            return False
+        ctx = contextvars.copy_context()
+        generation = getattr(adapter._active_sessions.get(key), "_hermes_run_generation", None)
+        held = self
+
+        async def after_delivery():
+            if held.started:
+                return
+            held.started = True
+            try:
+                _mct.reply_delivered(timing)
+                await asyncio.create_task(
+                    held.runner._run_model_selection_save(held, save, timing), context=ctx)
+            finally:
+                held.release()
+
+        after_delivery.post_delivery_timeout = None
+        adapter.register_post_delivery_callback(key, after_delivery, generation=generation)
+
+        def _task_done(_task) -> None:
+            # The adapter never ran the callback (stale generation, a replaced slot): the lock must
+            # not stay held for the life of the process.
+            if not held.started:
+                held.started = True
+                held.release()
+                _mct.save_finished(timing, "not_run")
+                _mct.finish(timing, getattr(timing, "delivery_outcome", None) or "ok")
+
+        task.add_done_callback(_task_done)
+        return True
 
 
 @dataclasses.dataclass
@@ -380,26 +526,34 @@ class GatewayModelCommandsMixin:
             parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
         )
 
+    def _model_switch_locks(self) -> "_KeyedLocks":
+        locks = self.__dict__.get("_model_switch_lock_table")
+        if not isinstance(locks, _KeyedLocks):
+            locks = self.__dict__["_model_switch_lock_table"] = _KeyedLocks()
+        return locks
+
     def _model_switch_lock(self, session_key: str = "") -> asyncio.Lock:
-        """Per-session lock over a /model command's read-resolve-commit (t_2ab07928; was runner-wide,
-        which made one session's slow commit stall every other session's /model). Slash commands
-        bypass the busy guard while no agent runs, so a second /model on the same session otherwise
-        interleaves with the first's store awaits and a ``--global`` cleanup wiped a session pick
-        issued after it (#100314). The cross-session half of #100314 (two ``--global`` picks racing
-        on config.yaml) is held by ``_model_config_write_lock``. Lazy: the runner is built without
+        """Per-session lock over a /model command's read-resolve-commit-save (t_2ab07928; was
+        runner-wide, which made one session's slow commit stall every other session's /model).
+        Slash commands bypass the busy guard while no agent runs, so a second /model on the same
+        session otherwise interleaves with the first's store awaits and a ``--global`` cleanup wiped
+        a session pick issued after it (#100314). The cross-session half of #100314 (two
+        ``--global`` picks racing on config.yaml) is held by the per-destination config lock.
+        Entries are dropped once no holder or waiter remains. Lazy: the runner is built without
         __init__ in tests."""
-        locks = self.__dict__.setdefault("_model_switch_locks", {})
-        lock = locks.get(session_key)
-        if lock is None:
-            lock = locks[session_key] = asyncio.Lock()
-        return lock
+        return self._model_switch_locks().get(session_key)
 
     async def _persist_ordered_model_config(self, result, config_path) -> bool:
         """Completion order per canonical destination; unrelated profiles never supersede each other."""
-        destination = str(Path(config_path).resolve())
-        locks = self.__dict__.setdefault("_model_config_write_locks", {})
-        async with locks.setdefault(destination, asyncio.Lock()):
+        destination = await asyncio.to_thread(os.path.realpath, str(config_path))
+        locks = self.__dict__.get("_model_config_write_locks")
+        if not isinstance(locks, _KeyedLocks):
+            locks = self.__dict__["_model_config_write_locks"] = _KeyedLocks()
+        lock = await locks.acquire(destination)
+        try:
             await self._settle_model_write(_persist_model_switch_to_config(result, config_path))
+        finally:
+            locks.release(destination, lock)
         return True
 
     @staticmethod
@@ -419,90 +573,109 @@ class GatewayModelCommandsMixin:
             raise asyncio.CancelledError()
         return task.result()
 
-    async def _owned_model_selection(self, source, operation):
-        """Keep the switch lock through delivery AND persistence, including adapter cancellation.
+    async def _owned_model_selection(self, source, operation, *, render=None):
+        """Run one /model selection under this session's switch lock: compute it, deliver the
+        confirmation, then save, and release the lock when the save settles (t_2ab07928).
 
-        A callback or active-session bypass has no adapter post-delivery lifecycle: it sends the
-        confirmation itself and saves inline in its invoking task. No job survives that task.
+        Three shapes, one rule (no save outlives the task that started it, and nothing here sends
+        the confirmation itself):
+
+        * typed /model in the adapter's own session task: the reply is returned for the adapter to
+          send; the save runs as that task's post-delivery callback;
+        * a picker or confirm callback that passed a ``render`` hook: the adapter renders the
+          confirmation (edits the picker in place, as before), then the save runs in the same
+          callback task;
+        * any other caller: the save runs before the reply is returned.
+
+        A callback never becomes the session's owner task and never waits for a running agent
+        turn; it waits on the switch lock only, which is held for at most one save.
         """
-        adapter = self._delivery_adapter_for(source)
-        adapter_key = (adapter._source_session_key(source)
-                       if adapter is not None and hasattr(adapter, "_source_session_key") else None)
-        task = asyncio.current_task()
-        # UI callbacks and the active-session bypass wait outside the switch lock: the current
-        # adapter task may itself be waiting for that lock. Once idle, claim the same lifecycle.
-        while adapter_key is not None:
-            previous = adapter._session_tasks.get(adapter_key)
-            if previous is None or previous is task or previous.done():
-                break
-            try:
-                await asyncio.shield(previous)
-            except asyncio.CancelledError:
-                if task.cancelling():
-                    raise
-        lock = self._model_switch_lock(self._model_switch_lock_key(source))
-        await lock.acquire()
-        owner = {"save": None, "transferred": False}
+        lock_key = self._model_switch_lock_key(source)
+        held = _HeldSwitch(self, source, lock_key)
+        await held.acquire()
+        owner = {"save": None}
         token = _model_selection_owner.set(owner)
-        if adapter_key is not None:
-            adapter.__dict__.setdefault("_model_selection_locks", {})[adapter_key] = lock
-        guard = None
-        task = asyncio.current_task()
         try:
-            if adapter_key is not None and adapter_key not in adapter._active_sessions:
-                guard = asyncio.Event()
-                adapter._active_sessions[adapter_key] = guard
-                adapter._track_session_task(adapter_key, task)
             reply = await operation()
-            save = owner["save"]
-            if save is None:
-                return reply
-            adapter = self._delivery_adapter_for(source)
-            task = asyncio.current_task()
-            lifecycle_key = next((key for key, value in
-                                getattr(adapter, "_session_tasks", {}).items() if value is task), None)
-            if guard is not None or lifecycle_key is None:
-                await self._send_model_selection_confirmation(source, reply)
-                await self._save_owned_model_selection(source, save)
-                return DeliveredModelReply(reply) if adapter is not None else reply
-            adapter_key = lifecycle_key
-            ctx = contextvars.copy_context()
-            active = adapter._active_sessions.get(adapter_key)
-            generation = getattr(active, "_hermes_run_generation", None)
-
-            async def after_delivery():
-                try:
-                    await asyncio.create_task(self._save_owned_model_selection(source, save), context=ctx)
-                finally:
-                    lock.release()
-
-            after_delivery.post_delivery_timeout = None
-            adapter.register_post_delivery_callback(adapter_key, after_delivery, generation=generation)
-            owner["transferred"] = True
-            return reply
+        except BaseException:
+            held.release()
+            raise
         finally:
             _model_selection_owner.reset(token)
-            if not owner["transferred"]:
-                lock.release()
-            if guard is not None:
-                adapter._finish_session_task(adapter_key, guard)
-                # The callback runs in an already-owned UI/request task, not a new background task.
-                adapter._background_tasks.discard(task)
-
-    async def _send_model_selection_confirmation(self, source, reply):
-        adapter = self._delivery_adapter_for(source)
-        if adapter is not None and reply:
-            await adapter.send(str(source.chat_id), reply,
-                               metadata=self._thread_metadata_for_source(source))
-
-    async def _save_owned_model_selection(self, source, save):
+        save = owner["save"]
+        if save is None:
+            held.release()
+            return reply
+        timing = _mct.current()
+        if render is None and held.register_after_delivery(save, timing):
+            _mct.mark_save_pending(timing)
+            return reply
         try:
-            await save()
+            if render is not None:
+                try:
+                    await render(reply)
+                except Exception:
+                    logger.warning("model switch confirmation render failed; saving anyway", exc_info=True)
+                _mct.reply_delivered(timing)
+            await self._run_model_selection_save(held, save, timing)
+            _mct.phase("confirm")  # an undelivered reply: its delivery is still confirm time
+        finally:
+            held.release()
+        return reply
+
+    async def _run_model_selection_save(self, held, save, timing) -> None:
+        """Run the save's writes in order, each timed under its PHASE=model_cmd stage. Every write is
+        attempted (as before the reply-first change); a failed one returns ``_SAVE_FAILED`` to the
+        save and the first failure is posted as one follow-up. On cancellation (/stop, shutdown) a
+        write already running in a worker thread keeps the switch lock until it settles, and the
+        follow-up says what landed; the cancelled task itself returns at once."""
+        _mct.bind(timing)
+        landed, failed = [], []
+
+        async def step(phase, label, awaitable, span=None):
+            _mct.phase(phase)
+            fut = asyncio.ensure_future(awaitable)
+            try:
+                with _mct.span(span) if span else contextlib.nullcontext():
+                    result = await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                if fut.done():
+                    if not fut.cancelled() and fut.exception() is None:
+                        landed.append(label)
+                else:
+                    held.hand_off(fut, label, landed)
+                raise
+            except Exception as exc:
+                logger.warning("model switch save step %s failed: %s", label, exc)
+                failed.append(exc)
+                return _SAVE_FAILED
+            landed.append(label)
+            return result
+
+        outcome = "ok"
+        try:
+            try:
+                await save(step)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # the save's own code, outside any step
+                logger.warning("model switch save failed: %s", exc)
+                failed.append(exc)
+            if failed:
+                outcome = "failed"
+                await self._send_model_switch_followup(
+                    held.source, t("gateway.model.save_failed", error=type(failed[0]).__name__))
         except asyncio.CancelledError:
-            await self._send_model_switch_followup(source, "CancelledError")
+            outcome = "interrupted"
+            if not held.handed_off:
+                held.schedule_followup(self._model_switch_interrupted_text(landed))
             raise
-        except Exception as exc:
-            await self._send_model_switch_followup(source, type(exc).__name__)
+        finally:
+            _mct.save_finished(timing, outcome)
+
+    @staticmethod
+    def _model_switch_interrupted_text(landed) -> str:
+        return t("gateway.model.save_interrupted", saved=", ".join(landed) or "-")
 
     def _model_switch_lock_key(self, source) -> str:
         """Lock key for a /model from ``source``. Sync (no await before the lock is taken, so
@@ -518,8 +691,7 @@ class GatewayModelCommandsMixin:
         except Exception:
             return ""
 
-    async def _send_model_switch_followup(self, source, failure: str) -> None:
-        text = f"⚠️ Model switch active for this session, but saving it failed: {failure}"
+    async def _send_model_switch_followup(self, source, text: str) -> None:
         try:
             adapter = self._delivery_adapter_for(source)
             if adapter is None or not getattr(source, "chat_id", None):
@@ -688,7 +860,8 @@ class GatewayModelCommandsMixin:
             async def operation():
                 _mct.phase("config")
                 return await self._handle_model_command_locked(event)
-            return await self._owned_model_selection(event.source, operation)
+            return await self._owned_model_selection(
+                event.source, operation, render=getattr(event, "_model_selection_render", None))
         except BaseException as e:
             exc = e
             raise

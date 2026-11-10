@@ -8616,15 +8616,21 @@ def _define_discord_view_classes() -> None:
             await self._edit(
                 interaction, t("platform.discord.picker.switching", model=model_id),
                 title=t("platform.discord.picker.switching_title"), view=None)
-            try:
-                result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider)
-            except Exception as exc:
-                result_text = t("platform.discord.picker.switch_error", error=str(exc))
-            if not getattr(result_text, "model_selection_delivered", False):
+            from gateway.platforms.base import call_model_selected
+
+            async def _render(text):  # the confirmation renders before the gateway saves the switch
                 await interaction.edit_original_response(
-                    embed=self._config_embed(result_text, title=t("platform.discord.picker.switched_title"), color=discord.Color.green()),
+                    embed=self._config_embed(text, title=t("platform.discord.picker.switched_title"), color=discord.Color.green()),
                     view=None,
                 )
+
+            try:
+                result_text, rendered = await call_model_selected(
+                    self.on_model_selected, str(interaction.channel_id), model_id, self._selected_provider, _render)
+            except Exception as exc:
+                result_text, rendered = t("platform.discord.picker.switch_error", error=str(exc)), False
+            if not rendered:
+                await _render(result_text)
 
         async def _on_model_selected(self, interaction: discord.Interaction):
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):

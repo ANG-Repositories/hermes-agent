@@ -8052,30 +8052,13 @@ class GatewayRunner(
             "api_mode": getattr(result, "api_mode", identity.get("api_mode")),
         }
 
-    def _model_override_commit_lock(self):
-        # Shared by synchronous clears and off-loop deferred identity writes. Resolve
-        # credentials outside it; generation validation and durable mutation are atomic.
-        return self.__dict__.setdefault("_model_override_commit_mutex", threading.RLock())
-
     def _set_session_model_override(
-        self, session_key: str, override: Optional[dict], *,
-        require_persistence: bool = False, persist_only: bool = False,
-    ) -> None:
-        identity = self._model_override_is_persistable(override) if override is not None else None
-        with self._model_override_commit_lock():
-            self._set_session_model_override_locked(
-                session_key, override, require_persistence=require_persistence,
-                persist_only=persist_only, identity=identity,
-            )
-
-    def _set_session_model_override_locked(
         self,
         session_key: str,
         override: Optional[dict],
         *,
         require_persistence: bool = False,
         persist_only: bool = False,
-        identity=None,
     ) -> None:
         """Single door for setting/clearing a session-scoped /model override (P3b/RC-2).
 
@@ -8106,7 +8089,9 @@ class GatewayRunner(
             store = getattr(self, "session_store", None)
             entry = store.entry_for(session_key) if store is not None else None
             if entry is not None and override is not None:
-                entry.model_override_identity = identity
+                entry.model_override_identity = (
+                    self._model_override_is_persistable(override)
+                )
                 entry._model_override_identity_invalid = False
                 store.persist()
         except Exception:
@@ -9348,7 +9333,8 @@ class GatewayRunner(
                 logger.warning("Chat model pin reconciliation unavailable")
                 return PersistedSessionRouteLookup("unavailable")
             if present and pin is None:
-                # NOTE(P3b/RC-2): cache reconciliation only; the user clear is already durable.
+                # NOTE(P3b/RC-2): cache reconciliation only; the durable user
+                # action already happened in the chat preference store.
                 self._session_model_overrides.pop(session_key, None)
         return lookup
 

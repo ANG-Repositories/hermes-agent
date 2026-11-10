@@ -3488,27 +3488,30 @@ class GatewaySlashCommandsMixin(
                     _cur_api_key = current_api_key
                     _picker_profile_home = _command_profile_home
 
-                    async def _on_model_selected_locked(_chat_id, model_id, provider_slug):
+                    async def _on_model_selected_locked(_chat_id, model_id, provider_slug, render=None):
                         # Reuse the typed commit path, without a second selection guard: the picker
-                        # already confirmed the choice. Both paths have the same ownership boundary.
+                        # already confirmed the choice. ``render`` is the adapter's own rendering of
+                        # the confirmation (edit the picker in place); the save runs after it, in
+                        # this callback task, under the session's switch lock.
                         from dataclasses import replace
                         selected = replace(event, text=f"/model {model_id} --provider {provider_slug}"
                                            + (" --global" if persist_global else " --session"))
                         selected._model_picker_confirmed = True
+                        selected._model_selection_render = render
                         return await _self._handle_model_command(selected)
 
                     async def _on_model_selected_dispatch(
-                        _chat_id: str, model_id: str, provider_slug: str
+                        _chat_id: str, model_id: str, provider_slug: str, render=None,
                     ) -> str:
                         if _picker_profile_home is None:
                             return await _on_model_selected_locked(
-                                _chat_id, model_id, provider_slug
+                                _chat_id, model_id, provider_slug, render
                             )
                         from gateway.run import _profile_runtime_scope
 
                         with _profile_runtime_scope(_picker_profile_home):
                             return await _on_model_selected_locked(
-                                _chat_id, model_id, provider_slug
+                                _chat_id, model_id, provider_slug, render
                             )
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -3763,23 +3766,25 @@ class GatewaySlashCommandsMixin(
 
             self._evict_cached_agent(session_key)
 
-            async def save():
+            async def save(step):
+                # Runs after the confirmation is delivered, still under this session's switch
+                # lock; ``step`` times each write under its PHASE=model_cmd stage.
                 from agent import fallback_wiring as fw
                 for root in _fallback_closures:
-                    await self._settle_model_write(asyncio.to_thread(fw.close_episodes_for_user_route, root))
+                    await step("fallback_clear", "fallback",
+                               asyncio.to_thread(fw.close_episodes_for_user_route, root))
                 if cached_entry:
                     db = getattr(cached_entry[0], "_session_db", None)
                     sid = getattr(cached_entry[0], "session_id", None)
                     if db is not None and sid:
-                        await self._settle_model_write(asyncio.to_thread(
+                        await step("record_update_model", "billing_route", asyncio.to_thread(
                             db.update_session_billing_route, sid, provider=result.target_provider,
                             base_url=result.base_url, billing_mode=result.api_mode))
                 await self._save_model_selection(
-                    result, session_key=session_key, source=source, event_source=event.source,
+                    step, result, session_key=session_key, source=source, event_source=event.source,
                     config_path=config_path, persist_global=persist_global,
                     one_turn=one_turn, override=_new_override)
             owner["save"] = save
-            _mct.phase("fallback_clear")
 
             # Build confirmation message with full metadata
             _mct.phase("confirm")
@@ -3860,7 +3865,7 @@ class GatewaySlashCommandsMixin(
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
             if persist_global:
-                lines.append("    Active for this session; saving to config.yaml after this reply.")
+                lines.append(t("gateway.model.saving_global"))
             elif one_turn:
                 lines.append("    (next turn only — restores after one response)")
             else:
@@ -3921,27 +3926,46 @@ class GatewaySlashCommandsMixin(
         return await _finish_switch()
 
     async def _save_model_selection(
-        self, result, *, session_key, source, event_source, config_path,
+        self, step, result, *, session_key, source, event_source, config_path,
         persist_global, one_turn, override,
     ):
-        """One pass in the owning turn. Completed phases survive restart; no replay state."""
+        """Durable half of a /model switch, run after the confirmation in the owning task. Every
+        write is attempted; ``step`` reports failures (one follow-up) and returns ``_SAVE_FAILED``."""
+        from gateway.slash_commands_model import _SAVE_FAILED
+
         db = getattr(self, "_session_db", None)
         if db is not None:
-            entry = await self._settle_model_write(self.async_session_store.get_or_create_session(source))
-            if getattr(entry, "was_auto_reset", False):
-                entry.was_auto_reset = False
-            await self._settle_model_write(db.update_session_model(
-                entry.session_id, result.new_model, provider=result.target_provider))
+            # Persist the new model to the session DB so the dashboard shows it (#34850).
+            entry = await step("record_get_session", "session_row",
+                               self.async_session_store.get_or_create_session(source))
+            if entry is not _SAVE_FAILED:
+                # If this session was auto-reset, consume the flag so the next regular message's
+                # cleanup does not wipe the model override stored below (Closes #48031).
+                if getattr(entry, "was_auto_reset", False):
+                    entry.was_auto_reset = False
+                await step("record_update_model", "model_column", db.update_session_model(
+                    entry.session_id, result.new_model, provider=result.target_provider))
         # Save the selected identity first: a failed global cleanup must not restore the old pick.
-        if getattr(self, "session_store", None) is not None:
-            await self._persist_session_model_override(
-                session_key, override, require_persistence=True, persist_only=True)
-            if not one_turn:
-                await self._settle_model_write(self.async_session_store.set_model_override(session_key, override))
+        await step("record_override", "override_identity", self._persist_session_model_override(
+            session_key, override, require_persistence=True, persist_only=True))
+        try:
+            async_store = self.async_session_store
+        except AttributeError:  # a runner without a session store (main skipped this write too)
+            async_store = None
+        if not one_turn and async_store is not None:
+            # A --once override must NOT outlive a restart (#29923).
+            await step("record_durable", "chat_pin",
+                       async_store.set_model_override(session_key, override),
+                       span="durable_set_override")
         if persist_global:
-            await self._persist_ordered_model_config(result, config_path)
-            if self._channel_override_for(event_source) is None:
-                await self._persist_session_model_override(session_key, None, require_persistence=True)
+            saved = await step("record_durable", "config.yaml",
+                               self._persist_ordered_model_config(result, config_path), span="durable_config")
+            # One durable authority for --global: config.yaml. A redundant session copy would
+            # shadow later global changes after a restart (#100314); a channel override keeps it,
+            # and a failed config write leaves the switch a session override.
+            if saved is not _SAVE_FAILED and self._channel_override_for(event_source) is None:
+                await step("record_durable", "override_clear", self._persist_session_model_override(
+                    session_key, None, require_persistence=True), span="durable_clear_override")
 
     async def _announce_model_switch(
         self,

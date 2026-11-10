@@ -115,18 +115,27 @@ async def test_typed_switch_logs_one_line_with_every_stage(runner, caplog):
 
 
 @pytest.mark.asyncio
-async def test_lock_wait_measures_the_runner_wide_switch_lock(runner, caplog):
-    lock = runner._model_switch_lock()
-    await lock.acquire()  # a /model in another thread holds the runner-wide lock
+async def test_lock_wait_measures_this_sessions_switch_lock(runner, caplog):
+    """The switch lock is per session (t_2ab07928): lock_wait_s is the wait for THIS session's
+    previous switch or save; another session's held lock is not waited for or counted."""
+    event = _event("/model gpt-5.5")
+    other = runner._model_switch_lock("another-session")
+    await other.acquire()  # a /model in another session holds its own lock throughout
+    lock = runner._model_switch_lock(runner._model_switch_lock_key(event.source))
+    await lock.acquire()  # this session's previous /model still saving
 
     async def _release_later():
         await asyncio.sleep(0.3)
         lock.release()
 
-    with caplog.at_level(logging.INFO, logger="gateway.run"):
-        await asyncio.gather(_release_later(), runner._handle_model_command(_event("/model gpt-5.5")))
+    try:
+        with caplog.at_level(logging.INFO, logger="gateway.run"):
+            await asyncio.gather(_release_later(), runner._handle_model_command(event))
+    finally:
+        other.release()
     f = _fields(_phase_lines(caplog)[0])
-    assert float(f["lock_wait_s"]) >= 0.25 and float(f["lock_wait_s"]) < float(f["total_s"]), f
+    assert float(f["lock_wait_s"]) >= 0.25 and float(f["lock_wait_s"]) < 1.0, f
+    assert float(f["lock_wait_s"]) < float(f["total_s"]), f
 
 
 @pytest.mark.asyncio

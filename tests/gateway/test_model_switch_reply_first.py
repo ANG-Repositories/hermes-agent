@@ -27,6 +27,7 @@ from tests.gateway.test_model_picker_persist import _make_store_runner, _setup_i
 from tests.gateway.test_turn_lease_flush_window import _Adapter, _wait_for
 
 FOLLOWUP = "switch active for this session, but saving it failed:"
+INTERRUPTED = "switch active for this session, but saving it was interrupted"
 
 
 def _source(chat_id="12345"):
@@ -240,8 +241,10 @@ async def test_stop_during_the_deferred_write_keeps_the_queued_message(tmp_path,
     await _wait_for(lambda: h.turns, "queued message after /stop")
     assert h.turns == [("hello", "gpt-5.5")]
     assert "_model_switch_pending" not in h.runner.__dict__
-    assert len(h.sent_with(FOLLOWUP)) == 1
-    assert "CancelledError" in h.sent_with(FOLLOWUP)[0]
+    # The model-column write landed after /stop: the one follow-up says interrupted, and what saved.
+    await _wait_for(lambda: h.sent_with(INTERRUPTED), "interrupted follow-up")
+    assert len(h.sent_with(INTERRUPTED)) == 1 and not h.sent_with(FOLLOWUP)
+    assert "model_column" in h.sent_with(INTERRUPTED)[0]
 
 
 
@@ -477,20 +480,24 @@ async def test_stop_settles_started_worker_before_reset(tmp_path, monkeypatch, p
         await h.adapter.handle_message(_ev("/model model-B" + (" --global" if phase == "config" else "")))
         await _wait_for(entered.is_set, "started executor mutation")
         await h.adapter.handle_message(_ev("queued hello"))
+        started = time.monotonic()
         stop = asyncio.create_task(h.adapter.handle_message(_ev("/stop")))
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(stop, 2)  # /stop answers at once; the write settles under the lock
+        stop_s = time.monotonic() - started
+        assert stop_s < 1.0, f"/stop waited {stop_s:.2f}s for a stuck write"
         reset = asyncio.create_task(h.adapter.handle_message(_ev("/model reset")))
-        await asyncio.sleep(5.2)  # adapter may release guard, switch ownership MUST survive
-        assert not reset.done(), "reset overtook the still-running executor write"
+        await asyncio.sleep(1.0)
+        assert not h.sent_with("Model session override cleared"), "reset overtook the still-running executor write"
         assert not h.turns, "queued message read a partially saved route after /stop"
-        assert not h.sent_with("Model session override cleared")
         release.set()
-        await asyncio.wait_for(stop, 10)
         await asyncio.wait_for(reset, 10)
+        await _wait_for(lambda: h.sent_with("Model session override cleared"), "reset after the write settled")
         await _drained(h, 10)
         assert store.get_chat_model_pin(h.key()) == (True, None)
-        assert len(h.sent_with(FOLLOWUP)) == 1
-        assert "CancelledError" in h.sent_with(FOLLOWUP)[0]
+        await _wait_for(lambda: h.sent_with(INTERRUPTED), "interrupted follow-up")
+        assert len(h.sent_with(INTERRUPTED)) == 1 and not h.sent_with(FOLLOWUP)
+        landed = "chat_pin" if phase == "legacy" else "config.yaml"
+        assert landed in h.sent_with(INTERRUPTED)[0], h.sent_with(INTERRUPTED)
         assert "_model_switch_pending" not in h.runner.__dict__
         await _wait_for(lambda: h.turns, "queued message retained")
     finally:
@@ -503,27 +510,91 @@ async def test_stop_settles_started_worker_before_reset(tmp_path, monkeypatch, p
 
 
 @pytest.mark.asyncio
-async def test_picker_callback_owns_session_through_save_and_delivers_once(tmp_path, monkeypatch):
+async def test_picker_render_hook_renders_before_save_in_the_callback_task(tmp_path, monkeypatch):
+    """Round 7: the tap never becomes the session owner and never sends its own message. The
+    adapter renders the confirmation through the hook, then the save runs in the same task under
+    the switch lock; a message sent meanwhile waits for the save, then runs on the new model."""
     from tests.gateway.test_model_picker_persist import _FakePickerAdapter
     h = _Harness(tmp_path, monkeypatch)
     monkeypatch.setattr("hermes_cli.model_switch_providers.list_picker_providers",
                         lambda **kw: [{"slug": "openrouter", "name": "OR", "models": ["model-B"]}])
     monkeypatch.setattr(type(h.adapter), "send_model_picker", _FakePickerAdapter.send_model_picker, raising=False)
     assert await h.runner._handle_model_command(_ev("/model --session")) is None
-    tap = asyncio.create_task(h.adapter.captured_callback("12345", "model-B", "openrouter"))
+    rendered = []
+
+    async def render(text):
+        rendered.append(text)
+
+    tap = asyncio.create_task(h.adapter.captured_callback("12345", "model-B", "openrouter", render=render))
     try:
-        await _wait_for(lambda: h.sent_with(_switched("model-B")), "picker confirmation before save")
+        await _wait_for(lambda: rendered, "picker confirmation rendered before the save")
         await asyncio.wait_for(h.db.entered.wait(), 5)
+        assert _switched("model-B") in rendered[0]
+        assert h.adapter._session_tasks.get(h.key()) is not tap, "the tap became the session owner"
         await h.adapter.handle_message(_ev("during picker save"))
-        assert not h.turns
+        await asyncio.sleep(0.2)
+        assert not h.turns, "a turn read the half-saved route"
         assert not tap.done()
         h.db.release.set()
         result = await asyncio.wait_for(tap, 5)
-        assert result.model_selection_delivered
-        await _wait_for(lambda: h.turns, "picker's queued message")
+        assert _switched("model-B") in result
+        await _wait_for(lambda: h.turns, "message sent during the save")
         assert h.turns == [("during picker save", "model-B")]
-        assert len(h.sent_with(_switched("model-B"))) == 1
+        assert not h.sent_with(_switched("model-B")), "the gateway sent its own confirmation"
+        assert h.runner.session_store.get_model_override(h.key())["model"] == "model-B"
     finally:
         h.db.release.set()
         await asyncio.wait_for(tap, 5)
         await _drained(h)
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_still_saves_and_releases_the_lock(tmp_path, monkeypatch):
+    """Item 5a: the confirmation send raises; the save still runs and the switch lock is free."""
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    real_send = h.adapter.send
+
+    async def send(chat_id, content, *a, **kw):
+        if _switched("model-A") in str(content):
+            raise RuntimeError("platform down")
+        return await real_send(chat_id, content, *a, **kw)
+
+    h.adapter.send = send
+    h.adapter._notify_turn_error = lambda *a, **kw: asyncio.sleep(0)
+    await h.adapter.handle_message(_ev("/model model-A"))
+    await _drained(h)
+    assert h.db.models == ["model-A"]
+    assert h.runner.session_store.get_model_override(h.key())["model"] == "model-A"
+    lock_key = h.runner._model_switch_lock_key(_source())
+    assert lock_key not in h.runner._model_switch_locks(), "switch lock still held / not pruned"
+
+
+@pytest.mark.asyncio
+async def test_after_delivery_never_invoked_releases_the_lock(tmp_path, monkeypatch):
+    """Item 5b: the adapter never runs the post-delivery step; the lock does not stay held."""
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    monkeypatch.setattr(type(h.adapter), "_fire_post_delivery_callback",
+                        lambda self, *a, **kw: asyncio.sleep(0))
+    await h.adapter.handle_message(_ev("/model model-A"))
+    await _wait_for(lambda: h.sent_with(_switched("model-A")), "confirmation")
+    await _drained(h)
+    lock = h.runner._model_switch_lock(h.runner._model_switch_lock_key(_source()))
+    assert not lock.locked(), "the switch lock outlived the task that should have saved"
+    second = asyncio.create_task(h.adapter.handle_message(_ev("/model model-B")))
+    await asyncio.wait_for(second, 5)
+    await _wait_for(lambda: h.sent_with(_switched("model-B")), "a later /model is not wedged")
+
+
+@pytest.mark.asyncio
+async def test_lock_tables_are_pruned_after_the_save(tmp_path, monkeypatch):
+    """Item 11: per-session and per-config-destination lock entries go when nothing holds them."""
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    for chat in ("1", "2", "3"):
+        await h.adapter.handle_message(_ev("/model model-A --global", chat))
+    await _drained(h)
+    assert len(h.runner._model_switch_locks()) == 0
+    assert len(h.runner.__dict__.get("_model_config_write_locks") or ()) == 0
+    assert not h.adapter.__dict__.get("_model_selection_locks")
