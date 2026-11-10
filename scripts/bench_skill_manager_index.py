@@ -10,6 +10,7 @@ wall times include filesystem writes and are not a production latency estimate.
 import argparse
 import ast
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -76,28 +77,36 @@ def main():
                     smt._invalidate_skill_index()
                     real_walk = smt._iter_skill_dirs
                     with patch.object(smt, '_iter_skill_dirs', wraps=real_walk) as walks, \
-                         patch.object(smt, '_build_skill_index', wraps=smt._build_skill_index) as builds:
+                         patch.object(smt, '_build_skill_index', wraps=smt._build_skill_index) as builds, \
+                         patch('os.walk', wraps=os.walk) as topology_walks:
                         if label == 'before':
                             original_find.__globals__['_iter_skill_dirs'] = walks
                         t = time.perf_counter()
                         assert invoke()['success']
                         cold = time.perf_counter() - t
                         cold_walks = walks.call_count
+                        cold_topology_walks = topology_walks.call_count
                         t = time.perf_counter()
                         for _ in range(20):
                             assert invoke()['success']
                         warm = (time.perf_counter() - t) / 20
                         warm_walks = walks.call_count - cold_walks
+                        warm_topology_walks = topology_walks.call_count - cold_topology_walks
                         t = time.perf_counter()
                         for _ in range(20):
                             assert not invoke(True)['success']
                         negative = (time.perf_counter() - t) / 20
                         negative_walks = walks.call_count - cold_walks - warm_walks
+                        negative_topology_walks = topology_walks.call_count - cold_topology_walks - warm_topology_walks
                         if label == 'after':
+                            assert warm_topology_walks == negative_topology_walks == 0
                             assert cold_walks == 1 and warm_walks == negative_walks == 0
                             assert builds.call_count == 1
                         print(json.dumps(dict(version=label, skills=2000, cold_ms=cold * 1000,
                                               repeated_ms=warm * 1000, negative_ms=negative * 1000,
+                                              cold_os_walks=cold_topology_walks,
+                                              repeated_os_walks=warm_topology_walks,
+                                              negative_os_walks=negative_topology_walks,
                                               cold_walks=cold_walks, repeated_walks=warm_walks,
                                               negative_walks=negative_walks, builds=builds.call_count)))
 

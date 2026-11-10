@@ -103,6 +103,32 @@ def test_6a726bb2ae97_directory_created_during_walk(tmp_path, request):
         assert '# changed' in (added / 'SKILL.md').read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize('external,nested', [(False, False), (False, True),
+                                            (True, False), (True, True)])
+def test_public_external_topology_freshness(tmp_path, external, nested):
+    local, ext = tmp_path / 'skills', tmp_path / 'external'
+    _mk(local, 'alpha')
+    root = ext if external else local
+    root.mkdir(exist_ok=True)
+    with ExitStack() as stack:
+        env(stack, tmp_path, local)
+        stack.enter_context(_roots(local, ext))
+        public('new')  # cached negative answer
+        rel = 'new-category/deep/new' if nested else 'new'
+        created = _mk(root, rel)
+        assert public('new', 'patch')['success']
+        created.rename(created.with_name('renamed'))
+        renamed = created.with_name('renamed')
+        assert not public('new', 'patch')['success']
+        (renamed / 'SKILL.md').write_text(
+            (renamed / 'SKILL.md').read_text(encoding='utf-8').replace('# changed', '# x'),
+            encoding='utf-8')
+        assert public('renamed', 'patch')['success']
+        (renamed / 'SKILL.md').unlink()
+        renamed.rmdir()
+        assert not public('renamed', 'patch')['success']
+
+
 def test_preflight_rejection_does_not_discover(tmp_path):
     root = tmp_path / 'skills'
     _mk(root, 'alpha')
