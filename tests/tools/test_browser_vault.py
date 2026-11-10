@@ -246,7 +246,7 @@ class TestClassifier:
         assert "elements[f.index]" not in js
         assert "[data-hermes-vault-slot=" in js and "nonce + ':' + f.index" in js
         assert 'f.token === "current-password" && el.type !== "password"' in js  # a password fill never lands in a text box
-        assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
+        assert js.rindex("strip();") > js.index("setter.set.call")  # every stamp stripped after the writes
 
     def test_build_fill_js_asserts_origin_before_any_write(self):
         # P1-2: the origin assert must run inside the SAME script, before
