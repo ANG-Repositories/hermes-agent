@@ -42,18 +42,33 @@ def _default_pool_snapshot() -> str:
 class _StopStageClock:
     """Per-stage wall clock for the /stop path, rendered as one ``PHASE=stop_stages`` line."""
 
-    def __init__(self) -> None:
+    def __init__(self, invoke_timing: Optional[dict] = None) -> None:
         self._start = self._last = time.monotonic()
         self._pool_at_start = _default_pool_snapshot()
         self._stages: List[str] = []
+        self._notes: List[str] = []
+        # inv_lag: platform invoke (e.g. the Discord slash log line) -> this clock's start, i.e. the
+        # generation bump. inv_auth / inv_defer are the platform's own sub-stages inside it.
+        timing = invoke_timing if isinstance(invoke_timing, dict) else {}
+        at = timing.get("at")
+        self._invoke = (
+            f"inv_lag={self._start - at:.2f} " if isinstance(at, (int, float)) else "inv_lag=- ")
+        self._invoke += " ".join(
+            f"inv_{k}={float(timing[k]):.2f}" for k in ("auth", "defer")
+            if isinstance(timing.get(k), (int, float)))
 
     def mark(self, name: str) -> None:
         now = time.monotonic()
         self._stages.append(f"{name}={now - self._last:.2f}")
         self._last = now
 
+    def note(self, text: str) -> None:
+        if text:
+            self._notes.append(text)
+
     def render(self) -> str:
         return (f"total={time.monotonic() - self._start:.2f} {' '.join(self._stages)} "
+                f"{self._invoke.strip()} {' '.join(self._notes)} "
                 f"pool_start={self._pool_at_start} pool_end={_default_pool_snapshot()}")
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -660,11 +675,15 @@ class GatewayAgentCacheMixin:
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
+        invoke_timing: Optional[dict] = None,
     ) -> None:
-        """Interrupt the current run and clear queued session state consistently."""
+        """Interrupt the current run and clear queued session state consistently.
+
+        ``invoke_timing``: the platform's invoke stamps (``{"at": monotonic, "auth": s,
+        "defer": s}``) for the ``inv_*`` fields of ``PHASE=stop_stages``."""
         if not session_key:
             return
-        _stop_clock = _StopStageClock()
+        _stop_clock = _StopStageClock(invoke_timing)
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
@@ -737,8 +756,10 @@ class GatewayAgentCacheMixin:
         _stop_clock.mark("hook")
         if str(invalidation_reason or "").startswith("stop_command"):
             # Durable /stop marker: the boot gate must never re-prompt a turn the user ended.
+            # The marker is on disk before /stop acks; its sub-stages go on the stage line
+            # (t_41843f70) so a slow write names its wait.
             try:
-                await self._mark_user_stopped(session_key)
+                _stop_clock.note(await self._mark_user_stopped_staged(session_key))
             except Exception:
                 logger.warning("Failed to persist user_stopped marker for stopped session %s",
                                session_key, exc_info=True)
