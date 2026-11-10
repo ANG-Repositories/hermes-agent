@@ -209,7 +209,8 @@ def _workspace_branch() -> str:
         return ""
     try:
         proc = subprocess.run(["git", "-C", ws, "rev-parse", "--abbrev-ref", "HEAD"], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=30, check=False)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+                              check=False)
     except (OSError, subprocess.SubprocessError):
         return ""
     out = (proc.stdout or "").strip()
