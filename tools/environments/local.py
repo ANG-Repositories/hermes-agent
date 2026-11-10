@@ -32,10 +32,10 @@ from tools.spawn_nofork import spawn_popen
 
 
 _IS_WINDOWS = platform.system() == "Windows"
-# POSIX spawn trampoline: $1 is the cwd, the rest is bash's argv. /bin/sh reads no startup
-# file when non-interactive (bash invoked as sh included), so nothing runs twice.
+# POSIX spawn trampoline: $1 is cwd, the rest is the command argv.
+# Startup files run only in the real command, never in the trampoline.
 _POSIX_SH = "/system/bin/sh" if hasattr(sys, "getandroidapilevel") else "/bin/sh"
-_CD_THEN_EXEC = 'cd -P -- "$1" || { printf "hermes: cannot enter working directory: %s\\n" "$1" >&2; exit 126; }; shift; exec "$@"'
+_CD_THEN_EXEC = 'CDPATH= command cd -P -- "$1" || { printf "hermes: cannot enter working directory: %s\\n" "$1" >&2; exit 126; }; shift; command exec "$@"'
 
 logger = logging.getLogger(__name__)
 
@@ -1054,9 +1054,13 @@ class LocalEnvironment(BaseEnvironment):
                                     creationflags=windows_hide_flags(), **popen_kwargs)
         else:
             # cwd= / start_new_session= make Popen fork the whole gateway under the GIL
-            # (t_afc525a2). posix_spawn has no chdir, so /bin/sh cds and execs bash: same pid,
+            # (t_afc525a2). posix_spawn has no chdir, so a shell cds and execs bash: same pid,
             # same argv for bash, and the login profile still starts in self.cwd.
-            proc = spawn_popen([_POSIX_SH, "-c", _CD_THEN_EXEC, "sh", self.cwd, *args],
+            # Privileged bash skips startup files and function imports but keeps
+            # exported functions in env for the real command (dash would strip them).
+            trampoline = ([_POSIX_SH] if hasattr(sys, "getandroidapilevel") else
+                          [args[0], "--noprofile", "--norc", "-p"])
+            proc = spawn_popen([*trampoline, "-c", _CD_THEN_EXEC, "sh", self.cwd, *args],
                                new_session=True, **popen_kwargs)
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):

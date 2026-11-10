@@ -16,7 +16,7 @@ from typing import Any, Sequence
 _FORK_ONLY_KWARGS = frozenset({
     "cwd", "preexec_fn", "pass_fds", "close_fds", "start_new_session", "process_group",
     "user", "group", "extra_groups", "umask", "shell", "executable", "startupinfo",
-    "creationflags",
+    "creationflags", "restore_signals",
 })
 _HAVE_CLOSEFROM = hasattr(os, "POSIX_SPAWN_CLOSEFROM")
 # Without CLOSEFROM, a fresh, isolated interpreter closes descriptors in its OWN

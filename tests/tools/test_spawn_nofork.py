@@ -241,6 +241,32 @@ def test_explicit_standard_fd_keeps_new_session(tmp_path):
         proc.wait(timeout=10)
 
 
+@pytest.mark.parametrize("disposition", ["SIG_DFL", "SIG_IGN"])
+def test_restore_signals_false_preserves_parent(monkeypatch, disposition):
+    import signal
+
+    old = signal.getsignal(signal.SIGPIPE)
+    try:
+        signal.signal(signal.SIGPIPE, getattr(signal, disposition))
+        monkeypatch.setattr(nofork, "_HAVE_CLOSEFROM", False)
+        result = nofork.run_nofork(
+            ["/bin/sh", "-c", "kill -PIPE $$; printf survived"],
+            restore_signals=False, capture_output=True)
+        assert result.returncode == (-signal.SIGPIPE if disposition == "SIG_DFL" else 0)
+    finally:
+        signal.signal(signal.SIGPIPE, old)
+
+
+def test_exported_functions_preserved_without_overriding_cwd(no_fork_exec, env, tmp_path):
+    env.env["BASH_FUNC_greet%%"] = "() { printf function-ok; }"
+    env.env["BASH_FUNC_cd%%"] = "() { return 0; }"
+    env.env["BASH_FUNC_exec%%"] = "() { return 0; }"
+    result = env.execute("greet; printf '\\n'; pwd -P")
+    assert result["returncode"] == 0, result
+    assert result["output"].strip().splitlines() == [
+        "function-ok", os.path.realpath(tmp_path / "work dir")]
+
+
 def test_wrapped_execute_child_signature(no_fork_exec, monkeypatch):
     real = subprocess.Popen
 
