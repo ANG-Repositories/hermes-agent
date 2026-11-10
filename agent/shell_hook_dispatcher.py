@@ -29,14 +29,21 @@ its child compiles it the old way and reports the error exactly as before. An ed
 the key and is recompiled on the next request.
 
 Prefilter (t_492356b3, opt-in): a hook may declare, as ONE top-level literal assignment
-``HOOK_PREFILTER = {"tools": [...], "tokens": [...]}`` (either key, non-empty string
-lists), which calls it can act on. The dispatcher reads it with ``ast`` (never executes it) once per
+``HOOK_PREFILTER = {"tools": [...], "tokens": [...], "tool_input_tokens": [...]}`` (any of the
+keys, non-empty string lists), which calls it can act on. The dispatcher reads it with ``ast``
+(never executes it) once per
 compile. A hook is not forked, and answers ``rc 0`` with stdout ``{}`` (the no-op every hook mode
 accepts) plus ``"skipped": true``, only when its declaration provably misses: ``tools`` names the
 tool calls it acts on and the payload's ``tool_name`` is a string outside it; ``tokens`` are
 substrings of which none occurs in the raw payload, in any decoded string in it (keys and values),
 or in that string re-joined after ``shlex.split`` (so shell quoting such as ``g''it`` still matches
-``git``); when any string in the payload does not shell-split, tokens never skip. A hook without a
+``git``); when any string in the payload does not shell-split, tokens never skip. Because the raw
+text always carries the envelope's ``{``, ``}`` and ``,``, a ``tokens`` list containing one of those
+can never skip; ``tool_input_tokens`` (t_7d9b8ad4) is the same test scoped to the decoded strings
+(keys and values, recursively) under ``tool_input`` and their shlex re-joins only, never the raw
+JSON, so ``{`` matches only a ``{`` the tool call itself carries. It never skips when ``tool_input``
+is absent or not an object, or when a string under it does not shell-split. ``tokens`` keeps its
+raw-text scope for existing declarations. A hook without a
 valid declaration, or a payload that is not a JSON object, runs as before. A hook file written
 while the dispatcher reads it is not cached. Tokens cannot
 see through shell indirection (``$X``, ``eval``): declare tokens only when the hook itself acts on
@@ -151,7 +158,7 @@ def _read_prefilter(source):
         decl = ast.literal_eval(values[0])
     except Exception:
         return None
-    if not isinstance(decl, dict) or not decl or set(decl) - {"tools", "tokens"}:
+    if not isinstance(decl, dict) or not decl or set(decl) - {"tools", "tokens", "tool_input_tokens"}:
         return None
     out = {}
     for key, items in decl.items():
@@ -205,10 +212,24 @@ def _strings(value, out):
             _strings(v, out)
 
 
+def _haystack(found, head=()):
+    """Each string plus its ``shlex.split`` re-join, newline-joined; None when one does not split."""
+    parts = list(head)
+    for s in found:
+        parts.append(s)
+        try:
+            parts.append(" ".join(shlex.split(s)))
+        except ValueError:
+            return None
+    return "\n".join(parts)
+
+
 def _payload_view(payload):
-    """``(tool_name, haystack)`` for prefilter matching, or None when the payload is not a JSON object.
-    ``haystack`` is None when a string in the payload does not shell-split: then no token miss is
-    provable (a hook may parse it another way), so token declarations never skip."""
+    """``(tool_name, haystack, input_haystack)`` for prefilter matching, or None when the payload is
+    not a JSON object. ``haystack`` (for ``tokens``) is the raw text plus every decoded string;
+    ``input_haystack`` (for ``tool_input_tokens``) is only the decoded strings under ``tool_input``,
+    and None when ``tool_input`` is absent or not an object. Either is None when one of its strings
+    does not shell-split: then no token miss is provable (a hook may parse it another way)."""
     try:
         text = payload.decode("utf-8")
         data = json.loads(text)
@@ -216,29 +237,29 @@ def _payload_view(payload):
         return None
     if not isinstance(data, dict):
         return None
-    parts = [text]
     found = []
     _strings(data, found)
-    for s in found:
-        parts.append(s)
-        try:
-            parts.append(" ".join(shlex.split(s)))
-        except ValueError:
-            return data.get("tool_name"), None
-    return data.get("tool_name"), "\n".join(parts)
+    tool_input = data.get("tool_input")
+    input_haystack = None
+    if isinstance(tool_input, dict):
+        scoped = []
+        _strings(tool_input, scoped)
+        input_haystack = _haystack(scoped)
+    return data.get("tool_name"), _haystack(found, (text,)), input_haystack
 
 
 def _prefilter_skips(prefilter, view):
     """True only when the hook's declaration provably does not match this call."""
     if prefilter is None or view is None:
         return False
-    tool_name, haystack = view
+    tool_name, haystack, input_haystack = view
     tools = prefilter.get("tools")
     if tools is not None and isinstance(tool_name, str) and tool_name not in tools:
         return True
-    tokens = prefilter.get("tokens")
-    if tokens is not None and haystack is not None and not any(t in haystack for t in tokens):
-        return True
+    for key, hay in (("tokens", haystack), ("tool_input_tokens", input_haystack)):
+        tokens = prefilter.get(key)
+        if tokens is not None and hay is not None and not any(t in hay for t in tokens):
+            return True
     return False
 
 
