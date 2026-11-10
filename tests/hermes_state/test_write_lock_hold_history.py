@@ -66,7 +66,8 @@ def test_every_recorded_hold_lands_in_history_and_a_window_is_rebuilt(db):
     assert first["pid"] == os.getpid() and first["state"] == "released"
     assert first["callback_s"] >= 0.2 and first["held_s"] >= first["callback_s"], first
     latest = json.loads((Path(lockowners._ledger_dir(db.db_path)) / f"{os.getpid()}.json").read_text())
-    assert latest["held_s"] < 0.3, "per-pid file holds only the latest hold"
+    assert latest["seq"] == rows[1]["seq"], "per-pid file holds only the latest hold"
+    assert latest["seq"] != rows[0]["seq"], "per-pid file must not retain the first hold"
     window = [r for r in lockowners.ledger_history(db.db_path, t_start, t_end) if r["op"] == "fixture_sleep_hold"]
     assert [r["seq"] for r in window] == [r["seq"] for r in rows]
     assert lockowners.ledger_history(db.db_path, t_end + 60, t_end + 120) == []
@@ -181,9 +182,17 @@ def test_busy_history_lock_drops_without_rotating(tmp_path, monkeypatch):
     peer = os.open(str(ledger / "history.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(peer, fcntl.LOCK_EX)
-        t0 = time.monotonic()
+        real_flock = fcntl.flock
+        attempts = []
+
+        def nonblocking_flock(fd, operation):
+            attempts.append(operation)
+            assert operation == fcntl.LOCK_EX | fcntl.LOCK_NB, "history lock acquisition must not block"
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", nonblocking_flock)
         lockowners._append_history(_fake_hold(ledger, 1, "contended"), {"held_s": 3.0, "state": "released"})
-        assert time.monotonic() - t0 < 1.0
+        assert attempts == [fcntl.LOCK_EX | fcntl.LOCK_NB], "busy history lock gets one nonblocking attempt"
     finally:
         os.close(peer)
     assert not (ledger / "history.jsonl.1").exists()
