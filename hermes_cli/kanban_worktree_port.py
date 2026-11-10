@@ -392,7 +392,7 @@ def push_card_branch(push: Tuple[str, str, str, str], runner: Callable = subproc
     repo, branch, expected, source = push
     # Push to the fetch URL explicitly: a remote's pushurl may name another repo.
     dest = runner(["git", "-C", repo, "remote", "get-url", "origin"], capture_output=True,
-                  text=True, timeout=10, stdin=subprocess.DEVNULL)
+                  text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
     if dest.returncode != 0 or not dest.stdout.strip():
         raise RuntimeError("cannot resolve clone source before push")
     # An explicit remote pushurl suppresses pushInsteadOf; passing the URL
