@@ -122,6 +122,30 @@ def test_write_init_retries_held_writer(tmp_path, monkeypatch):
         writer.close()
 
 
+def test_provider_discovery_does_not_probe_version_until_oauth_request():
+    code = '''
+import subprocess
+import hermes_cli.version_info as version
+calls = []
+def forbidden(*args, **kwargs):
+    raise AssertionError("provider discovery probed git/version")
+version.get_version_info = forbidden
+subprocess.Popen = forbidden
+from tools.environments.local_env_policy import _PROVIDER_ENV_BLOCKLIST
+from hermes_cli import auth_codex, auth_constants
+assert _PROVIDER_ENV_BLOCKLIST
+version_info = type('Version', (), {'base_version': 'request-sentinel'})()
+auth_constants.get_version_info = lambda: version_info
+assert auth_codex.codex_oauth_user_agent() == 'hermes-cli/request-sentinel'
+assert auth_constants.CODEX_OAUTH_USER_AGENT == 'hermes-cli/request-sentinel'
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_read_scope_resets_after_error():
     with pytest.raises(ValueError):
         with kbc.read_scope():

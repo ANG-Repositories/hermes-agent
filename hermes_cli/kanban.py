@@ -34,7 +34,7 @@ from hermes_cli.kanban_output import (
 # ``_fmt_task_line`` / ``_task_to_dict`` are defined below, not imported: the fork
 # versions carry the workspace-refusal flag, pin badge and home/pin/no_worker
 # fields the handlers here render (FOLLOWUP: port into kanban_output, then import).
-_cmd_admit = _lazy_handler("hermes_cli.kanban_admit", "cmd_admit")
+from hermes_cli.kanban_admit import cmd_admit as _cmd_admit
 from hermes_cli.kanban_boards import _dispatch_boards
 for _name in ("_cmd_daemon", "_kanban_config", "_cmd_dispatch", "_cmd_gc", "_cmd_repair",
               "_cmd_tail", "_cmd_watch", "_cmd_reclaim_workspaces"):

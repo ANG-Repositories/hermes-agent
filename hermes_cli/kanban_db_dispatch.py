@@ -6223,7 +6223,7 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
-ADMISSION_EVENT = "admission_override"
+from hermes_cli.kanban_dispatch_defaults import ADMISSION_EVENT
 ADMIT_INELIGIBLE = "admit_host_ineligible"
 ADMIT_FLOOR = "admit_floor"  # the measured-danger floor refused (placement_waits prefix)
 _FORCE_LOCAL = "studio"  # kanban_worker_pool.PIN_STUDIO: the dispatcher's own host
