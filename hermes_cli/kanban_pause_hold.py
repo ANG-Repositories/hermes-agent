@@ -101,6 +101,11 @@ SOURCE_FWA, SOURCE_MANIFEST = "fwa", "manifest"
 FWA_END_KINDS = ("time", "reboot")
 FWA_MAX_GRACE_S = 7200
 _warned_endless: set = set()
+#: kill switch (env): an fwa hold follows ``origin_host`` for every card, pinned or not (pre-t_72362742)
+FOLLOWS_ORIGIN_ENV = "KANBAN_PAUSE_FOLLOWS_ORIGIN"
+#: ``placement_rerouted`` reason when an unpinned card leaves its fwa-held origin host for the allocator
+REROUTE_EVENT = "placement_rerouted"
+REROUTE_REASON = "origin_host_paused"
 
 
 class _Unreadable:
@@ -249,6 +254,7 @@ def fwa_verdict(entries, lane: str, now: float):
 _K_REGISTRY = "fwa:registry"
 _K_ROOT = "fwa:root"
 _K_ENTRIES = "fwa:entries"
+_K_PINS = "fwa:pins"
 
 
 def registry_path() -> Path:
@@ -412,6 +418,45 @@ def destination_wait(host: Optional[str], cache: dict) -> Optional[str]:
     return None if hit is None else f"{hit[1][:-1]} stage=destination)"
 
 
+def follows_origin() -> bool:
+    """Kill switch ``KANBAN_PAUSE_FOLLOWS_ORIGIN=1`` (dispatcher env): an fwa hold freezes every card whose
+    ``origin_host`` is the held host, pinned or not, exactly as before t_72362742. Default off."""
+    return os.environ.get(FOLLOWS_ORIGIN_ENV, "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def _pin_words(cache: dict):
+    """``(known_hosts, aliases)`` of the pool registry for :func:`kanban_worker_pool.resolve_pin`, read once per
+    tick. An unreadable registry resolves only the held host's own names (a pin the router can resolve to the held
+    host still meets the destination fence, so a miss here never starts work there)."""
+    key = (_K_PINS,)
+    if key not in cache:
+        try:
+            from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_worker_pool as _kwp
+            fleet = _kb.kanban_home() / "fleet"
+            cache[key] = (tuple(_kwp.known_host_ids(fleet)), dict(_kwp.pin_aliases(fleet)))
+        except Exception:
+            _log.warning("kanban pause_hold: pool registry unreadable; pins resolve by host name only", exc_info=True)
+            cache[key] = ((), {})
+    return cache[key]
+
+
+def pinned_to(body: Optional[str], host: str, cache: dict) -> bool:
+    """Whether the card's effective ``host:`` pin names ``host`` (by id, registry alias or fwa registry name;
+    ``host: studio`` names ``mac-studio``). No pin, ``host: any`` or a pin to another host is NOT pinned: such a card
+    is placed by the allocator, so a hold on its last host does not freeze it (t_72362742)."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    names = _host_names(str(host), cache)
+    known, aliases = _pin_words(cache)
+    pin, ignored = _kwp.resolve_pin(body, (*known, *names), aliases)
+    word = pin if pin is not None else ignored
+    if not word or word == _kwp.PIN_ANY:
+        return False
+    if word == _kwp.PIN_STUDIO:
+        return _kwp.STUDIO_HOST in names
+    return str(word).lower() in names
+
+
 def local_host() -> str:
     """The dispatcher's own host as an fwa directory name: ``socket.gethostname()`` short form, lower-cased. Its
     registry aliases (``<kanban_home()>/config/fleet-hosts.json``) are resolved by :func:`_host_names`, so a hold
@@ -530,13 +575,19 @@ def _load(host: str, cache: dict):
     return doc
 
 
-def decide(origin_host: Optional[str], task_id: str, cache: dict):
+def decide(origin_host: Optional[str], task_id: str, cache: dict, *, body: Optional[str] = None):
     """None | ("wait", "pause_hold (<host>:<id>)") | ("pin", host). Pure over the manifest contents.
+
+    ``body`` (a READY card's body; None = unknown) scopes the fwa arm (t_72362742): a live fwa hold on the origin
+    holds the card only when its ``host:`` pin names that host (:func:`pinned_to`). An unpinned card is left to the
+    allocator, which never places it on the held host (destination fence). ``body=None`` (review lane, labels of
+    unknown lane) and ``KANBAN_PAUSE_FOLLOWS_ORIGIN=1`` keep the origin-keyed hold. The legacy manifest arm is
+    always origin-keyed: its resume pins return drained work to its host.
 
     Never raises: any unexpected failure holds the host's card (fail closed), so neither layer can take a
     dispatch tick or a claim down with something other than :class:`PauseHeld`."""
     try:
-        return _decide(origin_host, task_id, cache)
+        return _decide(origin_host, task_id, cache, body)
     except Exception:
         _log.warning("kanban pause_hold: decide(%s) failed; card %s HELD", origin_host, task_id, exc_info=True)
         if origin_host:
@@ -544,7 +595,7 @@ def decide(origin_host: Optional[str], task_id: str, cache: dict):
         return ("wait", f"{CODE} ({origin_host}:{UNREADABLE})")
 
 
-def _decide(origin_host, task_id, cache):
+def _decide(origin_host, task_id, cache, body=None):
     """Dual-read (SPEC §5.3, §8 P1): a legacy wait stands; else a live fwa hold on lane kanban waits (it beats a
     resume pin: a held host takes no run, pinned or not); else the legacy pin / None."""
     if not origin_host:
@@ -552,7 +603,10 @@ def _decide(origin_host, task_id, cache):
     legacy = _decide_manifest(origin_host, task_id, cache)
     if legacy is not None and legacy[0] == "wait":
         return legacy
-    return _fwa_hold(str(origin_host), cache) or legacy
+    fwa = _fwa_hold(str(origin_host), cache)
+    if fwa is not None and body is not None and not follows_origin() and not pinned_to(body, str(origin_host), cache):
+        return legacy                                       # unpinned: the allocator re-places it (t_72362742)
+    return fwa or legacy
 
 
 def _decide_manifest(origin_host, task_id, cache):
@@ -680,7 +734,7 @@ def held_routes(rows, cache: dict) -> dict:
         return {}
     out = {}
     for r in rows:
-        verdict = decide(_row(r, "origin_host"), r["id"], cache)
+        verdict = decide(_row(r, "origin_host"), r["id"], cache, body=_row(r, "body"))
         if verdict is not None and verdict[0] == "wait":
             out[r["id"]] = verdict
     return out
@@ -760,7 +814,8 @@ def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *
         return rows
     kept = []
     for r in rows:
-        verdict = decide(_row(r, "origin_host"), r["id"], cache)
+        verdict = decide(_row(r, "origin_host"), r["id"], cache,
+                         body=_row(r, "body") if lane == "ready" else None)
         if verdict is None:
             kept.append(r)
             continue
@@ -945,11 +1000,12 @@ def refuse_if_held(conn, task_id: str) -> None:
     the raise rolls it back, so nothing is written here (RC-P3-3: the caller records the refusal)."""
     if not enabled():
         return
-    row = conn.execute("SELECT origin_host FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT origin_host, status, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     origin = row[0] if row is not None else None
     if not origin:
         return
-    verdict = decide(origin, task_id, {})
+    # A review opener keeps the origin-keyed hold; any other claim is scoped by the card's pin (t_72362742).
+    verdict = decide(origin, task_id, {}, body=None if row[1] == "review" else (row[2] or ""))
     if verdict is not None and verdict[0] == "wait":
         manifest_id = verdict[1].split(":", 1)[1].rstrip(")")
         raise PauseHeld(str(origin), manifest_id, task_id)

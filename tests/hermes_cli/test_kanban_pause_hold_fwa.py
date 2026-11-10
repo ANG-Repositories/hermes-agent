@@ -35,6 +35,14 @@ def _neutral_local_host(monkeypatch):
     monkeypatch.setattr(kph, "_FQDN_MEMO", {})
 
 
+@pytest.fixture(autouse=True)
+def _follows_origin(monkeypatch):
+    """This suite pins the origin-keyed fwa hold (its cards are unpinned ``do the thing`` bodies). Since t_72362742
+    that is the ``KANBAN_PAUSE_FOLLOWS_ORIGIN=1`` kill switch, so the suite doubles as its dormant==identical
+    proof; the pin-scoped default is covered by test_kanban_pause_hold_pinned.py."""
+    monkeypatch.setenv(kph.FOLLOWS_ORIGIN_ENV, "1")
+
+
 HID = "20261107T150000Z-ci-box-fwa00001"
 
 

@@ -5228,6 +5228,26 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
     return _only, _job
 
 
+def _reroute_off_held_origin(conn, row, host: str, pause_cache: Optional[dict], *, dry_run: bool = False):
+    """``("origin", host)``, or None when a live fwa kanban hold closes ``host`` and the card is not pinned there
+    (t_72362742): ``origin_host`` is a locality hint, not a constraint, so the card goes to the ordinary ladder (the
+    destination fence keeps it off ``host``; a worktree card ports like any other port). One ``placement_rerouted``
+    ``{reason: origin_host_paused}`` event per hold episode. ``KANBAN_PAUSE_FOLLOWS_ORIGIN=1`` keeps the origin."""
+    from hermes_cli import kanban_pause_hold as _kph
+    cache = {} if pause_cache is None else pause_cache
+    if _kph.follows_origin() or not _kph.enabled():
+        return ("origin", host)
+    why = _kph.destination_wait(host, cache)
+    if why is None or _kph.pinned_to(row["body"], host, cache):
+        return ("origin", host)
+    if not dry_run:
+        payload = {"reason": _kph.REROUTE_REASON, "from": host, "hold": why}
+        last = _kb._latest_event(conn, row["id"], _kph.REROUTE_EVENT)
+        if last is None or _kb._json_or(last["payload"]) != payload:
+            _kb._append_event(conn, row["id"], _kph.REROUTE_EVENT, payload)
+    return None
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5241,7 +5261,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                held: Optional[dict] = None,
                worktree_out: Optional[dict] = None,
                board: Optional[str] = None,
-               carry_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               carry_out: Optional[dict] = None,
+               pause_cache: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5271,6 +5292,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         states=getattr(plan, "continuation_states", {}), caps=caps,
         dry_run=getattr(plan, "continuation_dry_run", False),
     )
+    if _origin is not None and _origin[0] == "origin":
+        _origin = _reroute_off_held_origin(conn, row, _origin[1], pause_cache,
+                                           dry_run=getattr(plan, "continuation_dry_run", False))
     if _origin is not None:
         return _origin
 
@@ -6780,7 +6804,7 @@ def _dispatch_once_locked(
                                          access_out=result.access_contradictions,
                                          binds=_binds, held=_pause_held,
                                          worktree_out=_worktree_ports, board=board,
-                                         carry_out=_carry_rows)
+                                         carry_out=_carry_rows, pause_cache=_pause_cache)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
