@@ -4234,6 +4234,11 @@ class BasePlatformAdapter(ABC):
                     if typing_adapter is not self:
                         await typing_adapter._stop_typing_refresh(
                             chat_id, metadata=metadata, token=typing_token)
+                    # Cleanup above yields: a stop or a new turn may have won meanwhile.
+                    if (not self._typing_token_is_current(chat_id, token)
+                            or (stop_event is not None and stop_event.is_set())
+                            or (token is not None and live._current_typing_token(chat_id) is not None)):
+                        return
                     typing_adapter = live
                     typing_token = live._issue_typing_token(chat_id) if token is not None else None
                     if "token" in _send_typing_kwargs:

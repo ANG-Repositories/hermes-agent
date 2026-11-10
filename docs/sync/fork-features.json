@@ -1,5 +1,22 @@
 [
   {
+    "feature": "Discord typing cadence, owner-matched stop and in-flight refresh survive adapter replacement without a tool-progress event",
+    "tests": [
+      "tests/gateway/test_discord_typing_stop.py",
+      "tests/gateway/test_discord_typing_recreate_race.py",
+      "tests/gateway/test_midturn_reconnect_probe.py"
+    ],
+    "paths": [
+      "gateway/platforms/base.py",
+      "plugins/platforms/discord/adapter.py"
+    ],
+    "why": "Discord liveness reconnect replaces the adapter object while a turn still refreshes typing through the retired object. Resolve the owning transport slot each tick, issue a token on the replacement, and retire only that token on stop/cancel/supersede. The probe exercises the real reconnect installer without needing progress painting. Card t_5880041a.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": ["gateway", "discord"]
+  },
+  {
     "feature": "wake headers name their kind from producer metadata: '🔔 kanban wake · review · t_X', '🔔 goal wake · check-in 1/3', loop/delegation/process/restart/watcher/heartbeat/webhook; the card id comes only from card_id metadata, never the wake text",
     "tests": [
       "tests/fork_canaries/test_fork_canary_wake_kind_headers.py",

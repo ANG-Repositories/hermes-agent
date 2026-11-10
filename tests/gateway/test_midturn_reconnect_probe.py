@@ -1,5 +1,5 @@
-"""Incident-only probe. Real painter, base refresh, Discord typing loop; no network/model.
-Run unchanged against 55f2e08a and historical 874689738e archives.
+"""Incident probe adapted to wire the real runner/installer. No network/model.
+Original probe SHA256: 56c48803aae10a97ffc5ece2e887741b0887889bf8d74dfa9d529ebe3d17b429.
 Transport retirement is injected at the watcher boundary (not a real socket fault).
 """
 import asyncio
@@ -163,3 +163,63 @@ async def test_base_refresh_alone_rebinds_to_live_adapter(monkeypatch):
         await task
         await old.stop_typing('123')
         await live.stop_typing('123')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('finish', ['cancel', 'stop', 'supersede', 'second_reconnect'])
+async def test_rebound_typing_ownership_and_cleanup(finish, monkeypatch):
+    import plugins.platforms.discord.adapter as da
+    monkeypatch.setattr(da, '_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS', .01)
+    old, live, newest = Adapter(), Adapter(), Adapter()
+    runner = reconnect_runner(old, monkeypatch)
+    stop = asyncio.Event()
+    token = old._issue_typing_token('123')
+    task = asyncio.create_task(old._keep_typing(
+        '123', interval=.01, token=token, stop_event=stop, metadata={'thread_id': '123'}))
+    try:
+        assert await settle(lambda: old.posts > 0)
+        old._set_fatal_error('discord_websocket_health_stale', 'stale', retryable=True)
+        old._client = None
+        await install(runner, live)
+        assert await settle(lambda: live.posts > 0)
+        assert live._current_typing_token('123') is not None
+        if finish == 'second_reconnect':
+            live._set_fatal_error('discord_websocket_health_stale', 'stale', retryable=True)
+            live._client = None
+            runner._failed_platforms[Platform.DISCORD] = {'retired_adapter': live}
+            await install(runner, newest)
+            assert await settle(lambda: newest.posts > 0)
+            assert not live._typing_tasks and live._current_typing_token('123') is None
+        if finish == 'supersede':
+            newer_token = live._issue_typing_token('123')
+            await live.stop_typing('123')
+            await live.send_typing('123', token=newer_token)
+            newer_loop = live._typing_tasks['123']
+            await asyncio.wait_for(task, 2)
+            assert live._current_typing_token('123') == newer_token
+            assert live._typing_tasks['123'] is newer_loop and not newer_loop.done()
+        else:
+            if finish == 'stop':
+                stop.set()
+            else:
+                task.cancel()
+            await asyncio.wait_for(task, 2)
+            for adapter in (live, newest):
+                assert not adapter._typing_tasks
+                assert not adapter._typing_loop_token
+                assert adapter._current_typing_token('123') is None
+    finally:
+        task.cancel()
+        await task
+        for adapter in (old, live, newest):
+            await adapter.stop_typing('123')
+
+
+def test_typing_lookup_never_falls_back_from_secondary_to_primary():
+    old, primary, live = Adapter(), Adapter(), Adapter()
+    runner = SimpleNamespace(adapters={Platform.DISCORD: primary}, _profile_adapters={'secondary': {}})
+    old.gateway_runner = runner
+    old.set_owner_profile('secondary')
+    assert old._live_typing_adapter() is None
+    runner._profile_adapters['secondary'][Platform.DISCORD] = live
+    assert old._live_typing_adapter() is live
