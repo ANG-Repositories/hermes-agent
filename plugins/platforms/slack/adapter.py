@@ -5398,6 +5398,9 @@ class SlackAdapter(BasePlatformAdapter):
                 confirmation = await on_model_selected(
                     state["chat_id"], model_id, provider_slug
                 )
+                if getattr(confirmation, "model_selection_delivered", False):
+                    self._model_picker_state.pop(marker, None)
+                    return
                 # The gateway reports a failed in-place swap as a localized
                 # error-prefixed return string, not an exception (#50163).
                 # Compare against the same i18n prefix so both failure

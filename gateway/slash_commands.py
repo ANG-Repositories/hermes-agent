@@ -3985,10 +3985,11 @@ class GatewaySlashCommandsMixin(
             await self._settle_model_write(db.update_session_model(
                 entry.session_id, result.new_model, provider=result.target_provider))
         # Save the selected identity first: a failed global cleanup must not restore the old pick.
-        await self._persist_session_model_override(
-            session_key, override, require_persistence=True, persist_only=True)
-        if not one_turn:
-            await self._settle_model_write(self.async_session_store.set_model_override(session_key, override))
+        if getattr(self, "session_store", None) is not None:
+            await self._persist_session_model_override(
+                session_key, override, require_persistence=True, persist_only=True)
+            if not one_turn:
+                await self._settle_model_write(self.async_session_store.set_model_override(session_key, override))
         if persist_global:
             await self._persist_ordered_model_config(result, config_path)
             if self._channel_override_for(event_source) is None:

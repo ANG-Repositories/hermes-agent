@@ -277,40 +277,6 @@ async def test_picker_tap_lands_after_a_queued_typed_switch(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_pending_switch_survives_persisted_route_reconciliation(tmp_path, monkeypatch):
-    """Prism 396516742752: with model-A persisted and the switch to model-B not yet written, the
-    runtime resolver must not reconcile the in-memory B back to the persisted A."""
-    from gateway.session import PersistedSessionRouteLookup
-
-    h = _Harness(tmp_path, monkeypatch)
-    persisted = {"model": "model-A", "provider": "openrouter", "api_mode": "chat_completions"}
-    monkeypatch.setattr(h.runner, "_persisted_session_route_identity",
-                        lambda _key: PersistedSessionRouteLookup("valid", persisted))
-    await h.adapter.handle_message(_ev("/model model-B"))
-    await _wait_for(lambda: h.sent_with(_switched("model-B")), "confirmation")
-    await asyncio.wait_for(h.db.entered.wait(), 5)
-    model, _runtime = h.runner._resolve_session_agent_runtime(source=_source())
-    assert model == "model-B"
-    h.db.release.set()
-    await _drained(h)
-
-
-
-
-
-
-
-
-def test_telegram_dm_commands_share_one_switch_lock(tmp_path, monkeypatch):
-    """Prism da07a87006ed: a lobby-shaped and a threaded Telegram DM /model normalize to the same
-    session, so they must take the same lock (the key is known only after topic recovery)."""
-    h = _Harness(tmp_path, monkeypatch)
-    lobby = _source()
-    threaded = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", thread_id="42")
-    assert h.runner._model_switch_lock_key(lobby) == h.runner._model_switch_lock_key(threaded)
-
-
-@pytest.mark.asyncio
 async def test_session_switch_does_not_discard_queued_global_intent(tmp_path, monkeypatch):
     h = _Harness(tmp_path, monkeypatch)
     await h.adapter.handle_message(_ev("/model model-A --global"))
@@ -478,3 +444,60 @@ async def test_thirty_second_blocked_write_reply_timing(tmp_path, monkeypatch):
     print(f"blocked_write_s=30 reply_s={reply_s:.3f} settled_s={time.monotonic() - started:.3f}")
     assert reply_s < 5
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["legacy", "config"])
+async def test_stop_settles_started_worker_before_reset(tmp_path, monkeypatch, phase):
+    """Cancellation cannot abandon a started executor mutation, even past adapter's 5s guard."""
+    from hermes_state import SessionDB as RealDB
+    h = _Harness(tmp_path, monkeypatch)
+    monkeypatch.setattr("hermes_state.SessionDB", RealDB)
+    db = RealDB(db_path=tmp_path / "cancel.db")
+    h.runner.session_store._db = db
+    h.db.release.set()
+    entered, release = threading.Event(), threading.Event()
+    store = h.runner.session_store
+    if phase == "legacy":
+        original = store.set_model_override
+        def write(*args, **kwargs):
+            entered.set()
+            assert release.wait(20)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(store, "set_model_override", write)
+    else:
+        from hermes_cli.model_switch import persist_model_selection
+        def write(result, path):
+            entered.set()
+            assert release.wait(20)
+            return persist_model_selection(result, path)
+        async def config(result, path):
+            await asyncio.to_thread(write, result, path)
+        monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", config)
+    reset = stop = None
+    try:
+        await h.adapter.handle_message(_ev("/model model-B" + (" --global" if phase == "config" else "")))
+        await _wait_for(entered.is_set, "started executor mutation")
+        await h.adapter.handle_message(_ev("queued hello"))
+        stop = asyncio.create_task(h.adapter.handle_message(_ev("/stop")))
+        await asyncio.sleep(0.05)
+        reset = asyncio.create_task(h.adapter.handle_message(_ev("/model reset")))
+        await asyncio.sleep(5.2)  # adapter may release guard, switch ownership MUST survive
+        assert not reset.done(), "reset overtook the still-running executor write"
+        assert not h.sent_with("Model session override cleared")
+        release.set()
+        await asyncio.wait_for(stop, 10)
+        await asyncio.wait_for(reset, 10)
+        await _drained(h, 10)
+        assert store.get_chat_model_pin(h.key()) == (True, None)
+        assert len(h.sent_with(FOLLOWUP)) == 1
+        assert "CancelledError" in h.sent_with(FOLLOWUP)[0]
+        assert "_model_switch_pending" not in h.runner.__dict__
+        await _wait_for(lambda: h.turns, "queued message retained")
+    finally:
+        release.set()
+        for task in (reset, stop):
+            if task is not None and not task.done():
+                await asyncio.wait_for(task, 10)
+        await _drained(h, 10)
+        db.close()

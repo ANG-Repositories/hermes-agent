@@ -86,4 +86,6 @@ async def resolve(session_key: str, confirm_id: str, choice: str,
     except Exception as exc:
         logger.error("Slash-confirm handler for /%s raised: %s", command, exc, exc_info=True)
         return f"❌ Error handling confirmation: {exc}"
+    if getattr(result, "model_selection_delivered", False):
+        return None
     return result if isinstance(result, str) else None

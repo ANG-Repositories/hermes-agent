@@ -8620,10 +8620,11 @@ def _define_discord_view_classes() -> None:
                 result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider)
             except Exception as exc:
                 result_text = t("platform.discord.picker.switch_error", error=str(exc))
-            await interaction.edit_original_response(
-                embed=self._config_embed(result_text, title=t("platform.discord.picker.switched_title"), color=discord.Color.green()),
-                view=None,
-            )
+            if not getattr(result_text, "model_selection_delivered", False):
+                await interaction.edit_original_response(
+                    embed=self._config_embed(result_text, title=t("platform.discord.picker.switched_title"), color=discord.Color.green()),
+                    view=None,
+                )
 
         async def _on_model_selected(self, interaction: discord.Interaction):
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):

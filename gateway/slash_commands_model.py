@@ -76,6 +76,11 @@ async def _persist_model_switch_to_config(result, config_path) -> None:
     await asyncio.to_thread(persist_model_selection, result, config_path)
 
 
+class DeliveredModelReply(str):
+    """Confirmation already delivered by an inline model selection's owned lifecycle."""
+    model_selection_delivered = True
+
+
 @dataclasses.dataclass
 class _ModelSwitchContext:
     """Everything a /model switch needs beyond the target: current route + persistence policy."""
@@ -424,19 +429,34 @@ class GatewayModelCommandsMixin:
         await lock.acquire()
         owner = {"save": None, "transferred": False}
         token = _model_selection_owner.set(owner)
+        adapter = self._delivery_adapter_for(source)
+        adapter_key = adapter._source_session_key(source) if adapter is not None else None
+        guard = None
+        task = asyncio.current_task()
         try:
+            previous = getattr(adapter, "_session_tasks", {}).get(adapter_key)
+            if previous is not None and previous is not task and not previous.done():
+                # A just-finished save releases the switch lock before its adapter turn exits.
+                # Join that owner before claiming the callback turn; do not race queued messages.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(previous)
+            if adapter is not None and adapter_key not in adapter._active_sessions:
+                guard = asyncio.Event()
+                adapter._active_sessions[adapter_key] = guard
+                adapter._track_session_task(adapter_key, task)
             reply = await operation()
             save = owner["save"]
             if save is None:
                 return reply
             adapter = self._delivery_adapter_for(source)
             task = asyncio.current_task()
-            adapter_key = next((key for key, value in
+            lifecycle_key = next((key for key, value in
                                 getattr(adapter, "_session_tasks", {}).items() if value is task), None)
-            if adapter_key is None:
+            if guard is not None or lifecycle_key is None:
                 await self._send_model_selection_confirmation(source, reply)
                 await self._save_owned_model_selection(source, save)
-                return reply
+                return DeliveredModelReply(reply) if adapter is not None else reply
+            adapter_key = lifecycle_key
             ctx = contextvars.copy_context()
             active = adapter._active_sessions.get(adapter_key)
             generation = getattr(active, "_hermes_run_generation", None)
@@ -455,6 +475,10 @@ class GatewayModelCommandsMixin:
             _model_selection_owner.reset(token)
             if not owner["transferred"]:
                 lock.release()
+            if guard is not None:
+                adapter._finish_session_task(adapter_key, guard)
+                # The callback runs in an already-owned UI/request task, not a new background task.
+                adapter._background_tasks.discard(task)
 
     async def _send_model_selection_confirmation(self, source, reply):
         adapter = self._delivery_adapter_for(source)

@@ -4592,6 +4592,8 @@ class BasePlatformAdapter(ABC):
         (``event.suppress_public_echo``), publishing here would be a second delivery of the same text
         (the duplicate-``/queue`` bug, fork 1f5a9fa464): hand the text back on
         ``event.deferred_reply_text`` and send nothing. Every other event is sent as before."""
+        if getattr(response, "model_selection_delivered", False):
+            return
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
             return

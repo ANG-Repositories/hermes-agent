@@ -2567,6 +2567,8 @@ class MatrixAdapter(BasePlatformAdapter):
         args = selection if isinstance(selection, tuple) else (selection,)
         try:
             confirmation = await prompt.on_selected(room_id, *args)
+            if getattr(confirmation, "model_selection_delivered", False):
+                return
             if redact_bot_reactions:
                 await self._redact_bot_model_picker_reactions(room_id, prompt)
             if confirmation:

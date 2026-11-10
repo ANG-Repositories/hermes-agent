@@ -4739,7 +4739,8 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("Model picker switch failed: %s", exc)
             result_text = t("platform.telegram.picker.switch_error", error=str(exc))
             switch_failed = True
-        await self._edit_result_text(query, result_text)
+        if not getattr(result_text, "model_selection_delivered", False):
+            await self._edit_result_text(query, result_text)
         await query.answer(text=_toast("platform.telegram.picker.switch_failed" if switch_failed else "platform.telegram.picker.switched"))
         self._model_picker_state.pop(chat_id, None)
 
