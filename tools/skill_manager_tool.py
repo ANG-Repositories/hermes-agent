@@ -439,8 +439,9 @@ _SKILL_OPERATION_MEMO = _ctxvars.ContextVar("skill_operation_memo", default=None
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """``_discover_skill`` with a per-call memo: one public skill_manage call resolves a name in
-    preflight, ledger capture, the handler and post-capture; only the first runs a discovery.
-    The memo is emptied after the handler (a mutation can change which copy wins for ANY name)
+    preflight, ledger capture, the handler and post-capture. The memo is emptied on entering the
+    per-skill mutation lock (so nothing taken before the lock is reused under it), after the
+    handler (a mutation can change which copy wins for ANY name)
     and never outlives the call, so no answer is reused across calls, threads or sessions."""
     memo = _SKILL_OPERATION_MEMO.get()
     if memo is None or memo.closed or memo.thread != threading.get_ident():
@@ -1148,6 +1149,7 @@ def skill_manage(
     # to a helper: guards, ledger capture, patch matching, validation, rollback,
     # and the atomic replacement all belong to the same ownership window.
     with _skill_mutation_lock(name):
+        _clear_skill_memo()  # never reuse an answer taken before the lock (the preflight's)
         # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
         # destroys the whole package (consolidation may have re-homed support files first), so
         # complete it from the newest curator backup or a restore is hollow.

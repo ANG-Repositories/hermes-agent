@@ -135,9 +135,10 @@ def test_discoveries_per_public_call_head_vs_main(tmp_path):
     main = count_discoveries(tmp_path / "main", "main")
     print(f"\ndiscoveries per call: main={main} head={head}")
     assert all(head[k] <= main[k] for k in head), (head, main)
-    # A successful single-name mutation: one discovery before the handler, one after it.
-    assert head["patch hit"] == head["write_file"] == 2
-    assert head["patch miss"] == 1
+    # A successful single-name mutation: the preflight's discovery (before the lock), one under
+    # the lock shared by the ledger pre-capture and the handler, one after the handler.
+    assert head["patch hit"] == head["write_file"] == 3
+    assert head["patch miss"] == 2
     assert head["patch hit"] < main["patch hit"]
 
 
@@ -179,7 +180,11 @@ def test_memo_does_not_survive_the_call(tmp_path):
 def test_two_threads_never_share_a_memo(tmp_path):
     """Thread A holds a memo entry for ``dup`` (external copy) mid-call. Thread B's concurrent
     call (on another skill, so it does not wait on A's per-name lock) and A's context copied into
-    a third thread must both discover ``dup`` fresh (the local override created meanwhile)."""
+    a third thread must both discover ``dup`` fresh (the local override created meanwhile).
+
+    The one remaining difference from main: inside the lock, a name's answer is fixed from lock
+    entry until the handler returns, so a writer that bypasses the lock (here the override written
+    mid-handler) is seen one discovery later than on main; main's handler would patch the override."""
     import contextvars
     local, ext = tmp_path / "skills", tmp_path / "ext"
     _mk(ext, "dup")
