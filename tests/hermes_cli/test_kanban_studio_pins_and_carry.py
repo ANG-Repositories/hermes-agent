@@ -49,8 +49,12 @@ def _row(conn, tid):
 
 
 @pytest.fixture(autouse=True)
-def _studio_last_resort_on(kanban_home):
+def _studio_last_resort_on(kanban_home, monkeypatch):
     """The live setting (hermes-home fleet/placement-policy.json since #10047): kanban on, mac-studio last."""
+    # kwp._studio_words() adds the live gethostname() short form: run on ACE-AI, ``host: ace-ai`` named
+    # this machine and resolved to the Studio pin (off-box sweep red, t_c2a562c9). Pin a name no fixture holds.
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: "fwa-test-runner.lan")
     fleet = kanban_home / "fleet"
     fleet.mkdir(parents=True, exist_ok=True)
     _write_policy(fleet)
