@@ -1029,6 +1029,24 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://www.anthropic.com/claude/fable",
         pricing_version="anthropic-pricing-2026-09",
     ),
+    # ── Anthropic Claude Fable 5.2 ───────────────────────────────────────
+    # Launched 2026-11-09. Repriced DOWN from Fable 5.1: $8/$40 per MTok,
+    # cache read $0.20, cache write $10.00, no context tiers. Values from
+    # models.dev (anthropic.models.claude-fable-5-2.cost, fetched 2026-11-09),
+    # NOT inferred from the 5.1 row. Subscription relays price NOTIONAL via
+    # is_notional_anthropic_provider(); this entry supplies the metered rate.
+    (
+        "anthropic",
+        "claude-fable-5-2",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("8.00"),
+        output_cost_per_million=Decimal("40.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("10.00"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="anthropic-pricing-2026-11",
+    ),
     # ── Anthropic Claude Sonnet 5 ────────────────────────────────────────
     # Launched 2026-06-30. Introductory pricing ($2/$10 per MTok) runs
     # through 2026-08-31, after which it reverts to $3/$15 (matching

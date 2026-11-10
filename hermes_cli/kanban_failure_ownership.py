@@ -391,7 +391,6 @@ def _reduce(conn,key_id,obs_id,obs):
 def _create_owner(conn,card,producer):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_boomerang_default as kbd
-    kb.check_mint_cap(conn,producer)
     if not isinstance(card,PreparedCard):
         raise ValueError('prepared card required')
     boomerang_wake, boomerang_source = kbd.resolve(None)
@@ -429,7 +428,7 @@ def _bind(conn,episode,obs,card,producer):
         with write_txn(conn,allow_nested=True):
             tid = _create_owner(conn,card,producer)
             conn.execute("UPDATE failure_bindings SET card_id=?,state='bound',detector_only=1,generation=generation+1 WHERE binding_id=?",(tid,bid))
-    except (ValueError,kb.MintCapError) as exc:
+    except ValueError as exc:
         conn.execute('UPDATE failure_bindings SET reason=? WHERE binding_id=?',(str(exc),bid))
         return Decision('EVIDENCE_PENDING',episode['key_id'],episode['episode_id'],revision=episode['revision'],reason=str(exc))
     _transition(conn,episode,None,'owner_bound',{'card_id':tid,'binding_id':bid})

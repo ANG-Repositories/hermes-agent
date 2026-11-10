@@ -319,6 +319,12 @@ class DispatchResult:
     rows_routed: int = 0
     """Ready rows this tick's routing/spawn loop considered (pool plan or not).
     Read by the gateway's tick series (``gate-ticks.jsonl``), never by dispatch."""
+    route_ms: float = 0.0
+    """Wall ms of this tick's routing pass over the ready rows (t_915b8d2d; gate-ticks.jsonl)."""
+    carry_scan_ms: float = 0.0
+    """Wall ms of carry size walks inside ``route_ms`` (bounded by ``CARRY_TICK_SCAN_SECONDS``)."""
+    carry_scans_deferred: int = 0
+    """local_files rows whose carry walk was left to a later tick because the tick budget ran out."""
     portable_waiting: int = 0
     """Rows routed ``portable`` still in ``placement_waits`` at the end of the
     ready section (the I-0 query's input, spec v0.3 §3.6)."""
@@ -5241,7 +5247,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                held: Optional[dict] = None,
                worktree_out: Optional[dict] = None,
                board: Optional[str] = None,
-               carry_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               carry_out: Optional[dict] = None,
+               carry_budget=None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5335,12 +5342,16 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None
+    wt_why: list = []
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
+        # t_1d2c5939: derived mode ports any GitHub repo to every pool host (no hand list), pushing an
+        # unpushed card branch first; wt_why names why a card still stays local.
         port = _kwt.port_for(row["id"], row["workspace_path"],
                              _kwt.board_default_workdir(board), _fleet_dir,
                              branch=_kb._row_get(row, "branch_name"),
-                             allow_studio_tree=last_resort)
+                             allow_studio_tree=last_resort,
+                             pool_hosts=tuple(plan.config.hosts or ()), why=wt_why)
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -5374,15 +5385,15 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
                                if scan else False), **_portable_kw)
     carried = False
-    if (not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None
-            and _kb._kwh.carry_size_ok(row["workspace_path"])
-            and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])):
+    if not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None:
         # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
         # while the Studio has room. Every OTHER rule is judged as if the directory were empty; a card that is
         # then portable runs locally when the local gate admits, else on a pool host with the directory carried
         # there first (kanban_worker_hosts.carry_workspace). A card some other rule keeps local stays local_files.
+        # Cheapest check first: the size walk is the costly one and runs within the tick's budget (t_915b8d2d).
         ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
-        if ok2:
+        if (ok2 and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])
+                and _kb._kwh.carry_size_ok(row["workspace_path"], budget=carry_budget)):
             ok, rule, route_class, carried = ok2, rule2, class2, True
             carry_out[row["id"]] = True
     if ignored is not None:
@@ -5500,6 +5511,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     if rule == "workspace_kind" and (row["workspace_kind"] or "scratch") == "worktree":
         # Linked worktrees reference the Studio's git common dir. Only the
         # mirror-backed clone route above can safely move their baseline.
+        if wt_why:
+            # Derived mode (t_1d2c5939): the one named reason, e.g. unpushed_dirty_tree.
+            return "local", f"not_portable:workspace_kind:{wt_why[0]}"
         return "local", ("not_portable:workspace_kind:worktree is Studio-only without a safe mirror-backed "
                          "clone; fleet/kanban-worktree-mirrors.json must list the repo and destination "
                          "host, and the source must be an eligible anchor or clean pushed card worktree")
@@ -6765,6 +6779,8 @@ def _dispatch_once_locked(
         _binds = _workspace_binds(conn, ready_rows, dry_run=dry_run)  # spec §2.4, per tick
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         spillover.continuation_dry_run = dry_run
+        _carry_budget = _kb._kwh.CarryScanBudget()
+        _route_t0 = time.monotonic()
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          _lineage, result.placement_affinity,
                                          unknown_out=result.unknown_pins,
@@ -6773,8 +6789,11 @@ def _dispatch_once_locked(
                                          access_out=result.access_contradictions,
                                          binds=_binds, held=_pause_held,
                                          worktree_out=_worktree_ports, board=board,
-                                         carry_out=_carry_rows)
+                                         carry_out=_carry_rows, carry_budget=_carry_budget)
                      for r in ready_rows}
+        result.route_ms += (time.monotonic() - _route_t0) * 1000.0
+        result.carry_scan_ms += _carry_budget.spent_s * 1000.0
+        result.carry_scans_deferred += _carry_budget.deferred
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"origin": 0, "pin": 0, "wait": 1, "local": 1, "portable": 2}
@@ -7997,6 +8016,9 @@ def _dispatch_once_locked(
                 claimed.workspace_kind, claimed.workspace_path = "scratch", None
                 workspace = _kbw.resolve_workspace(claimed, board=board)
                 _wt_mirror = _kwt.mirror_for(_wt_port, placed_host.name)
+                if len(_wt_port) > 4 and _wt_port[4] is not None:
+                    # Push-then-port (t_1d2c5939): committed work only the Studio has goes to origin first.
+                    _kwt.push_card_branch(_wt_port[4])
                 _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_mirror,
                                    resolved_branch_name)
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,

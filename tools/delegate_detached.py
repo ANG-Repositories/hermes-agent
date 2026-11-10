@@ -752,6 +752,11 @@ def _isolate_process_checkpoint(job_dir: Path) -> None:
     ``<home>/processes.json`` (``_write_checkpoint`` writes only the caller's own entries)."""
     import tools.process_registry as process_registry_module
 
+    from tools import file_state
+
+    # This entry runs in the unit's own process, regardless of the owning profile's runtime knobs
+    # or the runtime it fell back from. It must coordinate even when the gateway has restarted.
+    file_state.FORCE_CROSS_PROCESS = True
     process_registry_module.CHECKPOINT_PATH = job_dir / "processes.json"
     # The gateway cannot adopt a process from this registry, and this worker (with its checkpoint)
     # is gone once the unit returns: refuse the handoff rather than report a transfer that never lands.

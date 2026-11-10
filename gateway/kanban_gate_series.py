@@ -44,6 +44,8 @@ FIELDS = (
     # ``placement_default`` is the flag the tick ran under.
     "portable_waiting_with_room", "stranded_allowance", "pool_planned",
     "pool_reason", "placement_default",
+    # t_915b8d2d: the routing pass's wall and the carry size walks inside it (a stage split of tick_ms_wall).
+    "route_ms", "carry_scan_ms", "carry_scans_deferred",
 )
 
 
@@ -204,6 +206,9 @@ def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
         "pool_planned": plan is not None,
         "pool_reason": None if plan is not None else pool.get("reason"),
         "placement_default": "remote" if getattr(plan, "default_remote", False) else "local",
+        "route_ms": round(sum(float(getattr(r, "route_ms", 0) or 0) for r in res), 3),
+        "carry_scan_ms": round(sum(float(getattr(r, "carry_scan_ms", 0) or 0) for r in res), 3),
+        "carry_scans_deferred": sum(int(getattr(r, "carry_scans_deferred", 0) or 0) for r in res),
     }
     pcore = getattr(gate, "pcore_busy", None)
     if pcore is not None:
