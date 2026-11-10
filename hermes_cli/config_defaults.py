@@ -2441,7 +2441,13 @@ DEFAULT_CONFIG = {
                       # and <root>/var/alloc/shadow/kanban.jsonl gets one line per decision
                       # (promotion gate: n >= 50 answered, 0 disagreements). on = alloc_client.admit
                       # picks and books; release/renew go through alloc_client.
-                      "allocd": "off"},
+                      "allocd": "off",
+                      # studio_capability_only (t_9965b8d5; read per tick from the ROOT config): the Studio runs a
+                      # card only for a named Studio-only capability; files / a worktree are carried or ported,
+                      # else the card waits (studio_capability_only:<rule>); a pool refusal waits, never a
+                      # Studio last resort. Active only while placement-policy makes the Studio last resort
+                      # and the capability map reads. false = the behaviour before t_9965b8d5 (kill switch).
+                      "studio_capability_only": True},
         # Admission predicate of the shared placement scorer and unified_filter (t_da6f84f7): legacy = the
         # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
         # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).
