@@ -439,7 +439,7 @@ def test_derived_unpushed_commits_are_pushed_then_ported(kanban_home, anchor, tm
 @pytest.mark.parametrize("url", ["git@github.com:NousResearch/hermes-agent.git",
                                  "https://github.com/NousResearch/hermes-agent.git",
                                  "https://gitlab.com/ANG-Ventures/hermes-agent.git"])
-def test_push_to_foreign_origin_is_refused_before_any_push(anchor, url):
+def test_push_to_foreign_origin_is_refused_before_any_push(anchor, url, no_ambient_git_config):
     """t_eac2768a: origin is an upstream we do not own: no push is attempted, the refusal names the URL."""
     _commit(anchor, "base")
     _git("remote", "set-url", "origin", url, cwd=anchor)
@@ -459,7 +459,7 @@ def test_push_to_foreign_origin_is_refused_before_any_push(anchor, url):
 
 @pytest.mark.parametrize("url", ["git@github.com:ANG-Ventures/hermes-agent.git",
                                  "https://github.com/kyzcreig/demo.git"])
-def test_push_to_own_origin_runs_the_push(anchor, url):
+def test_push_to_own_origin_runs_the_push(anchor, url, no_ambient_git_config):
     _commit(anchor, "base")
     _git("remote", "set-url", "origin", url, cwd=anchor)
     calls = []
@@ -474,6 +474,14 @@ def test_push_to_own_origin_runs_the_push(anchor, url):
     assert len(pushes) == 1 and f"remote.kanban-port-destination.url={url}" in pushes[0]
 
 
+@pytest.fixture
+def no_ambient_git_config(monkeypatch):
+    """The push-destination tests read url.*.insteadOf: keep a host's global/system git config out of them
+    (ci-box has a global url.https://github.com/.insteadOf git@github.com:)."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 def _no_push_runner(calls):
     def runner(argv, **kw):
         calls.append(argv)
@@ -483,14 +491,15 @@ def _no_push_runner(calls):
     return runner
 
 
-def test_push_refused_when_insteadof_rewrites_own_origin_to_a_foreign_one(anchor):
+def test_push_refused_when_insteadof_rewrites_own_origin_to_a_foreign_one(anchor, no_ambient_git_config):
     """Prism 51498b6e31ba: `remote get-url` applies insteadOf once (alias -> ANG-Ventures), and the push applies
     it again to that URL (ANG-Ventures -> NousResearch). The URL the push will use is the one checked."""
     _commit(anchor, "base")
     _git("remote", "set-url", "origin", "git@github.com:Kyzcreig/hermes-agent.git", cwd=anchor)
     _git("config", "url.git@github.com:ANG-Ventures/.insteadOf", "git@github.com:Kyzcreig/", cwd=anchor)
     _git("config", "url.git@github.com:NousResearch/.insteadOf", "git@github.com:ANG-Ventures/", cwd=anchor)
-    assert _git("remote", "get-url", "origin", cwd=anchor).strip() == "git@github.com:ANG-Ventures/hermes-agent.git"
+    got = subprocess.run(["git", "remote", "get-url", "origin"], cwd=anchor, check=True, capture_output=True, text=True)
+    assert got.stdout.strip() == "git@github.com:ANG-Ventures/hermes-agent.git"
     calls = []
     with pytest.raises(kwt.ForeignOriginPush) as exc:
         kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=_no_push_runner(calls))
@@ -498,7 +507,7 @@ def test_push_refused_when_insteadof_rewrites_own_origin_to_a_foreign_one(anchor
     assert not [c for c in calls if "push" in c]
 
 
-def test_push_refused_when_a_configured_pushurl_of_the_push_remote_is_foreign(anchor):
+def test_push_refused_when_a_configured_pushurl_of_the_push_remote_is_foreign(anchor, no_ambient_git_config):
     """Prism 51498b6e31ba: pushurl is multivalued, so `-c ...pushurl=` APPENDS to a checkout-configured one and
     the push would go to both. Every effective push URL is checked."""
     _commit(anchor, "base")
@@ -512,7 +521,7 @@ def test_push_refused_when_a_configured_pushurl_of_the_push_remote_is_foreign(an
     assert not [c for c in calls if "push" in c]
 
 
-def test_foreign_origin_refusal_redacts_url_credentials(anchor):
+def test_foreign_origin_refusal_redacts_url_credentials(anchor, no_ambient_git_config):
     """Prism fa431e49e08b: the refusal is stored on the card, so URL userinfo never reaches it."""
     _commit(anchor, "base")
     _git("remote", "set-url", "origin", "https://x-access-token:SECRET123@github.com/NousResearch/hermes-agent.git",
@@ -525,7 +534,24 @@ def test_foreign_origin_refusal_redacts_url_credentials(anchor):
     assert not [c for c in calls if "push" in c]
 
 
-def test_derived_unpushed_branch_on_upstream_origin_blocks_without_push(kanban_home, anchor, monkeypatch):
+def test_refusal_redacts_credentials_in_the_rewritten_url(anchor, no_ambient_git_config):
+    """Prism bdade6e7f897: a credential in the insteadOf-REWRITTEN URL is redacted too, not only the origin's.
+    `remote get-url` rewrites once (kz: -> Kyzcreig, owned); the push rewrites that again (-> token URL)."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "kz:hermes-agent.git", cwd=anchor)
+    _git("config", "url.git@github.com:Kyzcreig/.insteadOf", "kz:", cwd=anchor)
+    _git("config", "url.https://x-access-token:SECRET123@github.com/NousResearch/.insteadOf",
+         "git@github.com:Kyzcreig/", cwd=anchor)
+    calls = []
+    with pytest.raises(kwt.ForeignOriginPush) as exc:
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=_no_push_runner(calls))
+    assert "SECRET123" not in str(exc.value) and "x-access-token" not in str(exc.value)
+    assert "https://github.com/NousResearch/hermes-agent.git" in str(exc.value)
+    assert not [c for c in calls if "push" in c]
+
+
+def test_derived_unpushed_branch_on_upstream_origin_blocks_without_push(kanban_home, anchor, monkeypatch,
+                                                                       no_ambient_git_config):
     """The Studio case (t_6dde6d1e): checkout origin = NousResearch, card branch has an unpushed commit."""
     _commit(anchor, "base")
     _git("remote", "set-url", "origin", "git@github.com:NousResearch/hermes-agent.git", cwd=anchor)

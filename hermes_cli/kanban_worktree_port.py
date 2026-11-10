@@ -435,9 +435,10 @@ def push_card_branch(push: Tuple[str, str, str, str], runner: Callable = subproc
                      text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
         effective = (eff.stdout or "").strip() if getattr(eff, "returncode", 1) == 0 else ""
         if not (_own_destination(url) and effective and _own_destination(effective)):
-            bad.append(url if effective in ("", url) else f"{url} (rewritten to {effective})")
+            bad.append(_redact_url(url) if effective in ("", url)
+                       else f"{_redact_url(url)} (rewritten to {_redact_url(effective)})")
     if bad or not _own_destination(destination):
-        shown = ", ".join(_redact_url(u) for u in (bad or [destination]))
+        shown = ", ".join(bad or [_redact_url(destination)])
         raise ForeignOriginPush(
             f"refused to push card branch {branch}: origin {shown} of {repo} is not a fleet-owned repo, "
             "and NO retry can fix it. The card needs a checkout whose origin is ours (re-create it with "
