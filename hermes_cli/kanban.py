@@ -22,7 +22,8 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_lazy import Module, handler as _lazy_handler
+kbd = Module("hermes_cli.kanban_db_dispatch")
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
@@ -33,12 +34,11 @@ from hermes_cli.kanban_output import (
 # ``_fmt_task_line`` / ``_task_to_dict`` are defined below, not imported: the fork
 # versions carry the workspace-refusal flag, pin badge and home/pin/no_worker
 # fields the handlers here render (FOLLOWUP: port into kanban_output, then import).
-from hermes_cli.kanban_admit import cmd_admit as _cmd_admit
+_cmd_admit = _lazy_handler("hermes_cli.kanban_admit", "cmd_admit")
 from hermes_cli.kanban_boards import _dispatch_boards
-from hermes_cli.kanban_ops import (
-    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
-    _cmd_reclaim_workspaces,
-)
+for _name in ("_cmd_daemon", "_kanban_config", "_cmd_dispatch", "_cmd_gc", "_cmd_repair",
+              "_cmd_tail", "_cmd_watch", "_cmd_reclaim_workspaces"):
+    globals()[_name] = _lazy_handler("hermes_cli.kanban_ops", _name)
 from hermes_cli import kanban_verb_input as kvi
 from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
@@ -380,7 +380,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     if resolved and resolved != kb.PINNED_SLUG:
         board_scope = kb.scoped_current_board(resolved)
 
-    with board_scope:
+    from hermes_cli.kanban_read import is_read
+    read_only = is_read(args)
+    with board_scope, kbc.read_scope(read_only):
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
@@ -398,7 +400,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
-            kb.init_db()
+            if not read_only:
+                kb.init_db()
         except Exception as exc:
             return _err(f"kanban: could not initialize database: {exc}")
 
@@ -1241,7 +1244,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
         # dependencies that may have cleared since the last dispatcher tick.
         # A delegate_task child's connection is read-only; promotion is a
         # status mutation, so it lists the board as-is (the dispatcher promotes).
-        if not kb._is_delegated_child():
+        # Promotion belongs to the dispatcher, not a read verb holding a writer lock.
+        if not kb._is_delegated_child() and not kbc._READ_ONLY.get():
             kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,

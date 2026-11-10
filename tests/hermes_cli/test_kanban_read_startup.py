@@ -49,7 +49,9 @@ def test_cli_reads_under_held_writer_and_init_lock(tmp_path, action):
     task_id = seed(db)
     env = {**os.environ, "HERMES_HOME": str(tmp_path), "HERMES_KANBAN_DB": str(db),
            "HERMES_KANBAN_BUSY_TIMEOUT_MS": "100", "PYTHONPATH": str(ROOT)}
-    argv = [action, "--json"]
+    argv = [action] + ([] if action == "context" else ["--json"])
+    if action == "list":
+        argv += ["--board", "default"]
     if action != "list":
         argv.insert(1, task_id)
     writer = sqlite3.connect(db)

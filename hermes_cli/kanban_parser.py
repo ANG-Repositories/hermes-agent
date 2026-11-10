@@ -13,7 +13,7 @@ import os
 import sys
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_dispatch_defaults as kbd
 from hermes_cli import kanban_db_notify as kbn
 
 

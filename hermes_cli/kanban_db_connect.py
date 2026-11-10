@@ -5,6 +5,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 ``kanban_db.<name>`` keeps working.
 """
 from __future__ import annotations
+from contextvars import ContextVar
 import contextlib
 import functools
 import hashlib
@@ -978,10 +979,42 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
+_READ_ONLY = ContextVar("kanban_read_only", default=False)
+
+
+@contextlib.contextmanager
+def read_scope(enabled=True):
+    token = _READ_ONLY.set(enabled)
+    try:
+        yield
+    finally:
+        _READ_ONLY.reset(token)
+
+
+def _connect_readonly(path):
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    conn = connect_tracked(
+        path.resolve().as_uri() + "?mode=ro", tracking_path=path, uri=True,
+        isolation_level=None, timeout=_resolve_busy_timeout_ms() / 1000.0,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.text_factory = _kb._lossy_text
+        conn.execute(f"PRAGMA busy_timeout={_resolve_busy_timeout_ms()}")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA cell_size_check=ON")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    readonly: bool = False,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
@@ -1011,6 +1044,9 @@ def connect(
     # explicit ``db_path=`` too: a probe that hands connect() the live path
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
+    if readonly or _READ_ONLY.get():
+        _kb._refuse_noncanonical_board_path(path)
+        return _connect_readonly(path)
     _kb._assert_live_board_write_allowed(path)
     _kb._refuse_noncanonical_board_path(path)  # before the mkdir (t_1462ab0d)
     from agent.delegation_context import kanban_path_is_fenced
@@ -1092,7 +1128,7 @@ def connect(
 
 
 @contextlib.contextmanager
-def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = None):
+def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = None, readonly: bool = False):
     """Open a kanban DB connection and guarantee it is closed on exit. Use
     instead of ``with kb.connect() as conn:`` — sqlite3's context manager only
     commits/rolls back, it does NOT close the fd, so long-lived processes
@@ -1100,7 +1136,7 @@ def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = No
 
     See #33159 for the production incident.
     """
-    conn = connect(db_path=db_path, board=board)
+    conn = connect(db_path=db_path, board=board, **({"readonly": True} if readonly else {}))
     try:
         yield conn
     finally:

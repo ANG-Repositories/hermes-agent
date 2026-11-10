@@ -3712,7 +3712,7 @@ def main():
 
     # Dependency recovery already ran before imports. Report any fleet restart
     # still owed by a previous update without restarting services here.
-    if "update" not in sys.argv[1:]:
+    if "update" not in sys.argv[1:] and _first_positional_argv() != "kanban":
         try:
             from hermes_cli.update_cmd_fleet import _warn_pending_fleet_restart_on_startup
 
