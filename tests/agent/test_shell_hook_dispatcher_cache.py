@@ -147,6 +147,8 @@ def test_serve_recompiles_a_hook_edited_on_disk(serve, tmp_path: Path) -> None:
     (b'HOOK_PREFILTER = {"tokens": ["a"]}\nHOOK_PREFILTER = {"tokens": ["b"]}\n', None),
     (b'def f():\n    HOOK_PREFILTER = {"tokens": ["a"]}\n', None),  # not top level
     (b'HOOK_PREFILTER = ["git"]\n', None),
+    (b'HOOK_PREFILTER = {"tool_input_tokens": ["git", "{"]}\n', {"tool_input_tokens": ("git", "{")}),
+    (b'HOOK_PREFILTER = {"tool_input_tokens": []}\n', None),
 ])
 def test_prefilter_declaration_is_parsed_strictly(disp, source: bytes, expected) -> None:
     assert disp._read_prefilter(source) == expected
@@ -188,6 +190,84 @@ def test_prefilter_never_skips_on_an_unreadable_payload_or_unnamed_tool(disp) ->
     assert disp._prefilter_skips(decl, None) is False
     no_tool = json.dumps({"hook_event_name": "on_session_start", "extra": {"x": "git"}}).encode()
     assert disp._prefilter_skips({"tools": frozenset({"terminal"})}, disp._payload_view(no_tool)) is False
+
+
+# --- tool_input_tokens (t_7d9b8ad4): tokens scoped to the decoded strings under tool_input ----------
+
+_BRACE = ("{", ",")
+
+
+def _wire(command: str) -> bytes:
+    """The payload exactly as the agent writes it to a hook's stdin (envelope braces and ", ")."""
+    return shell_hooks._serialize_payload("pre_tool_call", {
+        "tool_name": "terminal", "args": {"command": command}, "session_id": "s"}).encode("utf-8")
+
+
+def test_tool_input_tokens_ignore_the_json_envelope(disp) -> None:
+    """The raw-JSON matcher can never skip on `{`/`,`; the scoped one sees only the call's strings."""
+    payload = _wire("ls -la")
+    assert b"{" in payload and b", " in payload
+    view = disp._payload_view(payload)
+    assert disp._prefilter_skips({"tokens": _BRACE}, view) is False  # why the scoped key exists
+    assert disp._prefilter_skips({"tool_input_tokens": _BRACE}, view) is True
+
+
+def test_tool_input_tokens_skip_a_non_git_command(disp) -> None:
+    """Mutation canary: pointed back at the raw JSON, `{` matches the envelope and this never skips."""
+    view = disp._payload_view(_wire("ls -la"))
+    assert disp._prefilter_skips({"tool_input_tokens": ("git", "{")}, view) is True
+
+
+@pytest.mark.parametrize("command", [
+    "echo {x",                    # a `{` inside the command still matches a `{` token
+    "{a,é} {c,é}",
+    "{a,é} reset --hard",
+    "a{b,é}c=1",
+    "G{IT_DIR,}=/x",
+    "g''it push",                 # shlex re-join still applies
+    "git   push",
+])
+def test_tool_input_tokens_match_brace_and_git_shapes(disp, command: str) -> None:
+    view = disp._payload_view(_wire(command))
+    assert disp._prefilter_skips({"tool_input_tokens": ("git",) + _BRACE}, view) is False
+
+
+def test_tool_input_tokens_cover_keys_and_nested_values_under_tool_input(disp) -> None:
+    payload = json.dumps({"tool_name": "terminal", "tool_input": {"cmds": [{"git": "x"}]}}).encode()
+    assert disp._prefilter_skips({"tool_input_tokens": ("git",)}, disp._payload_view(payload)) is False
+    nested = json.dumps({"tool_name": "terminal", "tool_input": {"cmds": ["ls", {"a": "git st"}]}}).encode()
+    assert disp._prefilter_skips({"tool_input_tokens": ("git",)}, disp._payload_view(nested)) is False
+
+
+def test_tool_input_tokens_ignore_strings_outside_tool_input(disp) -> None:
+    payload = json.dumps({"tool_name": "terminal", "tool_input": {"command": "ls"},
+                          "cwd": "/repo/git", "extra": {"note": "git {"}}).encode()
+    view = disp._payload_view(payload)
+    assert disp._prefilter_skips({"tokens": ("git",)}, view) is False
+    assert disp._prefilter_skips({"tool_input_tokens": ("git", "{")}, view) is True
+
+
+def test_tool_input_tokens_never_skip_without_a_readable_tool_input(disp) -> None:
+    decl = {"tool_input_tokens": ("git",)}
+    for data in ({"tool_name": "terminal"}, {"tool_name": "terminal", "tool_input": None},
+                 {"tool_name": "terminal", "tool_input": "ls"}):
+        assert disp._prefilter_skips(decl, disp._payload_view(json.dumps(data).encode())) is False
+    assert disp._prefilter_skips(decl, disp._payload_view(_wire("g''it push # '"))) is False  # no split
+    assert disp._prefilter_skips(decl, disp._payload_view(b"[1]")) is False  # not an object
+
+
+@pytest.mark.parametrize("fail_closed", [True, False])
+def test_a_tool_input_tokens_skip_is_an_allow_in_every_mode(manager, tmp_path: Path,
+                                                            fail_closed: bool) -> None:
+    hook = tmp_path / "scoped_blocker.py"
+    hook.write_text('HOOK_PREFILTER = {"tool_input_tokens": ["git", "{", ","]}\nimport json, sys\n'
+                    'sys.stdin.read()\nprint(json.dumps({"action": "block", "message": "refused"}))\n',
+                    encoding="utf-8")
+    _register([hook], fail_closed=fail_closed)
+    assert _fire(manager, "ls -la") == []
+    blocked = [{"action": "block", "message": "refused"}]
+    assert _fire(manager, "git push") == blocked
+    assert _fire(manager, "{a,é} reset --hard") == blocked
 
 
 def test_serve_skips_a_declared_miss_without_forking(serve, tmp_path: Path) -> None:
