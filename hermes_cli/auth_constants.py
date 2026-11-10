@@ -90,7 +90,7 @@ STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 def codex_oauth_user_agent() -> str:
-    """Resolve runtime identity at request time, never during provider discovery."""
+    """Resolve runtime identity when constructing an OAuth request."""
     return f"hermes-cli/{get_version_info().base_version}"
 
 
