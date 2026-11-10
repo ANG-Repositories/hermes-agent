@@ -28,6 +28,7 @@ from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
+from gateway import model_cmd_timing as _mct
 from gateway.slash_commands_model import GatewayModelCommandsMixin, _model_switch_skew_guard
 from gateway.slash_commands_branch_thread import merge_delta_rows
 from gateway.slash_commands_session import (
@@ -3356,8 +3357,11 @@ class GatewaySlashCommandsMixin(
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
+        _mct.phase("normalize")
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        _mct.annotate(session=session_key)
+        _mct.phase("prepare")
         configured_model = current_model
         configured_provider = current_provider
         override = self._session_model_overrides.get(session_key, {})
@@ -3441,6 +3445,7 @@ class GatewaySlashCommandsMixin(
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
+            _mct.phase("listing")
             # Try interactive picker if the platform supports it
             adapter = getattr(self, "_adapter_for_source")(source)
             has_picker = (
@@ -3839,6 +3844,7 @@ class GatewaySlashCommandsMixin(
             return "\n".join(lines)
 
         # Perform the switch
+        _mct.phase("resolve")
         skew_error = _model_switch_skew_guard()
         if skew_error:
             return skew_error
@@ -3862,6 +3868,7 @@ class GatewaySlashCommandsMixin(
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
 
+        _mct.phase("enrich")
         try:
             from hermes_cli.context_switch_guard import (
                 enrich_model_switch_warnings_for_gateway,
@@ -3894,6 +3901,7 @@ class GatewaySlashCommandsMixin(
                     cached_entry = _cache.get(session_key)
             # Explicit route beats an automatic one: read + close the fallback
             # episode BEFORE the in-place swap resets the live flags.
+            _mct.phase("fallback_clear")
             _fb_cleared = await asyncio.to_thread(
                 self._clear_fallback_for_user_route,
                 session_key,
@@ -3901,6 +3909,7 @@ class GatewaySlashCommandsMixin(
             )
 
             if cached_entry and cached_entry[0] is not None:
+                _mct.phase("agent_switch")
                 _sw_old_model = getattr(cached_entry[0], "model", current_model)
                 _sw_old_provider = getattr(cached_entry[0], "provider", current_provider)
                 _sw_effort = getattr(cached_entry[0], "reasoning_config", None)
@@ -3991,12 +4000,14 @@ class GatewaySlashCommandsMixin(
             _sess_db = getattr(self, "_session_db", None)
             if _sess_db is not None:
                 try:
+                    _mct.phase("record_get_session")
                     _sess_entry = await self.async_session_store.get_or_create_session(source)
                     # If this session was auto-reset, consume the flag so the
                     # next regular message's cleanup does not wipe the model
                     # override just stored below (Closes #48031).
                     if getattr(_sess_entry, "was_auto_reset", False):
                         _sess_entry.was_auto_reset = False
+                    _mct.phase("record_update_model")
                     await _sess_db.update_session_model(
                         _sess_entry.session_id, result.new_model,
                         provider=result.target_provider,
@@ -4017,6 +4028,7 @@ class GatewaySlashCommandsMixin(
             # token over the network). On-loop, this chain held Discord for
             # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
             # open_credentialed_url) and expired /model interactions.
+            _mct.phase("record_override")
             await self._persist_session_model_override(session_key, {
                 "model": result.new_model,
                 "provider": result.target_provider,
@@ -4041,6 +4053,7 @@ class GatewaySlashCommandsMixin(
             # Announce the deliberate switch to the conversation (P2). Compares the
             # (provider, model, api_mode) route so a same-slug/different-endpoint
             # switch still announces; silent on a true no-op. Best-effort.
+            _mct.phase("announce")
             if not cached_entry or cached_entry[0] is None:
                 await self._announce_switch(
                     event.source,
@@ -4057,12 +4070,14 @@ class GatewaySlashCommandsMixin(
             # Session-override write-through (never for --once, #29923), config
             # write-through (--global), the #100314 redundant-override drop and the
             # cache eviction — one durable commit shared with the picker path.
+            _mct.phase("record_durable")
             _global_error = await self._commit_model_switch_durable(
                 result, session_key=session_key, source=event.source,
                 config_path=config_path, persist_global=persist_global, one_turn=one_turn,
             )
 
             # Build confirmation message with full metadata
+            _mct.phase("confirm")
             provider_label = result.provider_label or result.target_provider
             lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
             lines.append(t("gateway.model.provider_label", provider=_with_resolved_route(provider_label, result)))
@@ -4162,6 +4177,7 @@ class GatewaySlashCommandsMixin(
         # Runs the unified registry (cost + data-policy + future guards).
         # Pricing lookups may hit models.dev or a /models endpoint on a
         # cache miss, so run it off the event loop.
+        _mct.phase("guard")
         _cost_warning = None
         try:
             from hermes_cli.model_selection_guards import combined_selection_warning
@@ -4220,7 +4236,8 @@ class GatewaySlashCommandsMixin(
         if persist_global:
             try:
                 # Resolved through the module so tests/operators can patch the writer seam.
-                await _model_mixin._persist_model_switch_to_config(result, config_path)
+                with _mct.span("durable_config"):
+                    await _model_mixin._persist_model_switch_to_config(result, config_path)
             except Exception as e:
                 logger.warning("Failed to persist model switch: %s", e)
                 global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
@@ -4233,9 +4250,10 @@ class GatewaySlashCommandsMixin(
                 # Fork single door (P3b/RC-2): clears the in-memory override AND the persisted
                 # identity off the loop; require_persistence surfaces a failed clear so the
                 # switch truthfully stays a session override (#100314).
-                await self._persist_session_model_override(
-                    session_key, None, require_persistence=True,
-                )
+                with _mct.span("durable_clear_override"):
+                    await self._persist_session_model_override(
+                        session_key, None, require_persistence=True,
+                    )
             except Exception as e:
                 logger.warning("Failed to clear persisted session model override: %s", e)
                 global_error = t("gateway.model.err_stale_override", error=e)
@@ -4243,9 +4261,10 @@ class GatewaySlashCommandsMixin(
             # Non-secret write-through so the override survives a restart (api_key/api_mode are
             # re-resolved on rehydration); a --once override must NOT outlive a restart (#29923).
             try:
-                await self.async_session_store.set_model_override(
-                    session_key, self._session_model_overrides[session_key],
-                )
+                with _mct.span("durable_set_override"):
+                    await self.async_session_store.set_model_override(
+                        session_key, self._session_model_overrides[session_key],
+                    )
             except Exception:
                 logger.debug("Failed to persist session model override", exc_info=True)
         # Evict cached agent so the next turn builds fresh from the override.
