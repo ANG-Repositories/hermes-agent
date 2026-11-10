@@ -9261,8 +9261,9 @@ class GatewayRunner(
                 return PersistedSessionRouteLookup("unavailable")
             if (present and pin is None
                     and not self._model_switch_write_pending(session_key)):
-                # A NULL pin may predate a reply-first switch still being saved.
-                # Otherwise reconcile the already-durable user clear.
+                # NOTE(P3b/RC-2): cache reconciliation only; the user clear is
+                # already durable. A NULL pin may predate a reply-first switch
+                # still being saved, so retain its pending in-memory override.
                 self._session_model_overrides.pop(session_key, None)
         return lookup
 
