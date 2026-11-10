@@ -73,7 +73,7 @@ def _alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     try:  # an unreaped zombie still answers kill(0)
-        out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+        out = nofork.run_nofork(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
     except OSError:
         return True
     return bool(out.strip()) and not out.strip().startswith("Z")
@@ -253,7 +253,7 @@ def test_off_macos_the_spawn_is_plain_popen(monkeypatch):
     monkeypatch.delenv("HERMES_SPAWN_LEGACY", raising=False)
     monkeypatch.setattr(nofork, "_FORK_COPIES_PARENT", False)
     assert not nofork.eligible(["/bin/true"], {"cwd": "/"})
-    proc = nofork.spawn_popen(["/bin/true"], new_session=True)
+    proc = nofork.spawn_popen(["/bin/sh", "-c", "exit 0"], new_session=True)
     proc.wait(timeout=10)
     assert type(proc) is subprocess.Popen
     calls = []

@@ -11,11 +11,11 @@ stopped) for that time. Modes:
   path can use vfork.
 * ``legacy-fork``: the same call with ``subprocess._USE_VFORK = False``. That is the macOS
   shape, where fork_exec always does a real fork() of the whole process.
-* ``nofork``: ``tools.spawn_nofork.spawn_popen`` (posix_spawn + setsid + the isolated exec
-  helper that closes descriptors, chdirs and execs bash), forced on off macOS too.
+* ``nofork``: ``tools.spawn_nofork.spawn_popen``: one libc posix_spawn call (macOS only;
+  CLOEXEC_DEFAULT, SETSID, SETSIGDEF, addchdir) that execs bash directly.
 
-Per spawn it also records spawn-to-first-output wall: Popen call until bash's first line
-arrives on the pipe, which includes the exec helper's interpreter start.
+Per spawn it also records spawn-to-first-output wall (Popen call until bash's first line
+arrives on the pipe) and the calling thread's CPU time inside Popen().
 """
 
 from __future__ import annotations
@@ -108,13 +108,14 @@ def main() -> int:
     for mode in opts.modes.split(","):
         counters.update(fork_exec=0, posix_spawn=0)
         subprocess._USE_VFORK = mode != "legacy-fork"
-        stalls, walls, firsts = [], [], []
+        stalls, walls, firsts, cpus = [], [], [], []
         for _ in range(opts.spawns):
             time.sleep(0.01)
             ticker.window_max = 0.0
-            t0 = time.perf_counter()
+            t0, c0 = time.perf_counter(), time.thread_time()
             proc = _spawn(mode, cwd)
             walls.append(time.perf_counter() - t0)
+            cpus.append(time.thread_time() - c0)
             stalls.append(ticker.window_max)
             assert proc.stdout.readline() == "ready\n"
             firsts.append(time.perf_counter() - t0)
@@ -127,7 +128,8 @@ def main() -> int:
             "gil_stall_ms_max": round(1000 * max(stalls), 3),
             "spawn_wall_ms_p50": round(1000 * statistics.median(walls), 3), "spawn_wall_ms_p95": ms(walls, 18),
             "first_output_ms_p50": round(1000 * statistics.median(firsts), 3),
-            "first_output_ms_p95": ms(firsts, 18)}
+            "first_output_ms_p95": ms(firsts, 18),
+            "spawn_cpu_ms_p50": round(1000 * statistics.median(cpus), 3), "spawn_cpu_ms_p95": ms(cpus, 18)}
     ticker.stop = True
     idle.set()
     print(json.dumps(results, indent=2))
