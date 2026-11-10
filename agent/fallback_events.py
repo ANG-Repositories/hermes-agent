@@ -1051,8 +1051,18 @@ def stash_api_error(agent: Any, api_error: BaseException,
         from agent.agent_runtime_helpers import extract_api_error_context
         from agent.credential_pool import _parse_absolute_timestamp
 
-        quota_reset_at = _parse_absolute_timestamp(
-            extract_api_error_context(api_error).get("reset_at")) if isinstance(api_error, Exception) else None
+        quota_reset_at = None
+        if isinstance(api_error, Exception):
+            try:
+                quota_reset_at = _parse_absolute_timestamp(
+                    extract_api_error_context(api_error).get("reset_at"))
+                if quota_reset_at is not None:
+                    # Reject malformed/non-finite/out-of-range upstream timestamps.
+                    import datetime
+
+                    datetime.datetime.fromtimestamp(quota_reset_at, datetime.timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                quota_reset_at = None
         agent._pending_fallback_error = {
             "at": time.monotonic(),
             "quota_reset_at": quota_reset_at,

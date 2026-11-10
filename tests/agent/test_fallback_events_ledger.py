@@ -217,7 +217,7 @@ def test_401_token_redacted_in_err_head(_home, monkeypatch):
     assert len(r["err_head"]) <= 160
 
 
-@pytest.mark.parametrize("reset", [None, "2026-11-10T03:00:00Z", "not-a-time"])
+@pytest.mark.parametrize("reset", [None, "2026-11-10T03:00:00Z", "not-a-time", "nan", "inf"])
 def test_model_cap_notice_names_route_and_only_upstream_reset(reset):
     import datetime as dt
     from agent import fallback_policy as fp
