@@ -1296,7 +1296,9 @@ def _account_home_board_root() -> Optional[Path]:
     ace-ai 2026-10-10).
     """
     from hermes_state_roots import account_home as _os_account_home
-    account = _os_account_home()
+    state = sys.modules.get("hermes_state")
+    anchor = getattr(state, "_os_account_home", _os_account_home)
+    account = anchor()
     if account is None:
         return None
     try:
@@ -1317,7 +1319,9 @@ def _live_kanban_roots() -> tuple:
     plus :func:`_account_home_board_root` for a process that redirected its home).
     """
     from hermes_state_roots import account_home, deployed_root
-    roots = [r for r in (_live_kanban_root(), deployed_root(account_home()), _account_home_board_root())
+    state = sys.modules.get("hermes_state")
+    deployed = getattr(state, "_deployed_hermes_home_root", lambda: deployed_root(account_home()))
+    roots = [r for r in (_live_kanban_root(), deployed(), _account_home_board_root())
              if r is not None]
     return tuple(dict.fromkeys(roots))
 

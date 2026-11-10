@@ -19,6 +19,7 @@ import sqlite3
 import sys
 import threading
 import time
+import socket
 from dataclasses import dataclass
 from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -149,7 +150,7 @@ def _read_init_holder(handle):
 def _stamp_init_holder(handle):
     handle.seek(0)
     handle.truncate()
-    handle.write(json.dumps({"pid": os.getpid(), "host": __import__("socket").gethostname()}).encode())
+    handle.write(json.dumps({"pid": os.getpid(), "host": socket.gethostname()}).encode())
     handle.flush()
 
 
@@ -1058,6 +1059,8 @@ def _connect_readonly(path):
         conn.execute(f"PRAGMA busy_timeout={_resolve_busy_timeout_ms()}")
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA cell_size_check=ON")
+        if not _schema_is_present(conn):
+            raise _kb.KanbanDbNotABoardError(path)
         return conn
     except BaseException:
         conn.close()

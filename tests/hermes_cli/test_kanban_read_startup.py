@@ -97,3 +97,34 @@ assert not launches, launches
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["id"] == task_id
+
+
+def test_write_init_retries_held_writer(tmp_path, monkeypatch):
+    import threading
+    db = tmp_path / "board.db"
+    seed(db)
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "10")
+    writer = sqlite3.connect(db, check_same_thread=False)
+    writer.execute("BEGIN IMMEDIATE")
+    sleeps = []
+    real_sleep = kbc.time.sleep
+    def release_on_backoff(delay):
+        sleeps.append(delay)
+        writer.rollback()
+        real_sleep(delay)
+    monkeypatch.setattr(kbc.time, "sleep", release_on_backoff)
+    try:
+        with kbc.connect_closing(db_path=db) as conn:
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 10
+        assert sleeps, "held writer never exercised retry"
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_read_scope_resets_after_error():
+    with pytest.raises(ValueError):
+        with kbc.read_scope():
+            assert kbc._READ_ONLY.get()
+            raise ValueError("fixture")
+    assert not kbc._READ_ONLY.get()
