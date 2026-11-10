@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
@@ -129,6 +130,52 @@ async def test_slow_marker_write_is_attributed_and_still_durable_before_return(t
     assert _field(line, "exec_s") >= 0.0 and _field(line, "commit_s") >= 0.0, line
     assert _field(line, "lock_s") < 0.5 and _field(line, "save_lock_s") < 0.5, line
     assert "held the write lock" in slow, slow
+
+
+@pytest.mark.asyncio
+async def test_idle_holder_never_stalls_the_marker_inside_its_transaction(tmp_path, monkeypatch, caplog):
+    """t_6e1c17e7, ledger 11-10: refresh_session_turn_lease held 101 s, append_messages_batch 96 s, both
+    with ~0 callback CPU and ~0 commit. The one non-SQL wait inside BEGIN IMMEDIATE was the lock-holder
+    ledger restarting its watchdog thread: Thread.start() waits for the new thread to be scheduled, a
+    GIL handoff measured at p90 0.66 s / max 1.04 s per start with 8 busy threads (t6e1_spawn_cost.py).
+    The slow start is simulated here; the marker must not wait for it."""
+    import hermes_state_lockowners as lockowners
+
+    runner, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    db.create_session(entry.session_id, "gateway", session_key=entry.session_key)
+    lease_holder = f"gw:pid={os.getpid()}:test"
+    assert db.try_acquire_session_turn_lease(entry.session_id, lease_holder)
+    runner._session_db = None  # isolate the marker write (see the test above)
+
+    stall_s = 2.5
+    starting = threading.Event()
+    base = lockowners._Thread
+
+    class _DescheduledStart(base):
+        def start(self):
+            starting.set()
+            time.sleep(stall_s)  # the GIL handoff Thread.start() waits on, under load
+            super().start()
+
+    monkeypatch.setattr(lockowners, "_Thread", _DescheduledStart)
+    monkeypatch.setattr(lockowners, "_watchdog_running", False)  # gone between holds
+
+    holder = threading.Thread(
+        target=db.refresh_session_turn_lease, args=(entry.session_id, lease_holder), daemon=True)
+    holder.start()
+    assert starting.wait(5.0)
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        t0 = time.monotonic()
+        assert await runner._mark_user_stopped(entry.session_key) is True
+        took = time.monotonic() - t0
+    holder.join(10.0)
+    assert not holder.is_alive()
+
+    line = next(r.getMessage() for r in caplog.records if "PHASE=user_stopped " in r.getMessage())
+    print(f"\nmeasured: took={took:.3f}s (holder stall {stall_s}s) | {line}")
+    assert took < 1.0, (took, line)
+    assert _field(line, "wait_s") < 1.0, line
 
 
 @pytest.mark.asyncio

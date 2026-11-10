@@ -79,8 +79,8 @@ from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import (
-    WAITER_ATTRIBUTION_S, describe_write_lock_holders, hold_committing, hold_ended, hold_started,
-    log_write_lock_holders, log_write_lock_waiter,
+    WAITER_ATTRIBUTION_S, describe_write_lock_holders, ensure_watchdog, hold_committing, hold_ended,
+    hold_started, log_write_lock_holders, log_write_lock_waiter,
 )
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
@@ -1288,6 +1288,9 @@ class SessionDB(
             # later writes (#105567). Inside the lock the probe only ever sees the
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
+            # Outside both locks: a watchdog (re)start is a GIL handoff that took ~1 s under load
+            # inside BEGIN IMMEDIATE, stalling every other writer (t_6e1c17e7).
+            ensure_watchdog()
             try:
                 waiter_timer = self._writer_wait_timer()
                 with self._lock:

@@ -171,6 +171,12 @@ _DIR_FD_OK = (all(f in os.supports_dir_fd for f in (os.open, os.unlink, os.stat,
               and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
 _watchdog_running = False
 _watchdog_pid = 0
+# The watchdog parks on _wake while no hold is active instead of exiting, and is started by
+# ensure_watchdog() BEFORE a writer takes the write lock: Thread.start() blocks until the new thread
+# is scheduled, which under GIL contention took up to 1 s per start and was paid inside BEGIN
+# IMMEDIATE by every write that found the watchdog gone (t_6e1c17e7).
+_wake = threading.Event()
+_watchdog_start_lock = threading.Lock()
 _last_timeout: Dict[str, Tuple[float, str]] = {}
 # Bound at import: the watchdog is internal plumbing. Tests (and libraries) that replace
 # ``threading.Thread`` with an inline starter would otherwise run the watchdog loop inside
@@ -182,7 +188,9 @@ def _reset_after_fork() -> None:
     """A fork child inherits the locks in whatever state another parent thread left them, and no
     watchdog thread: start from scratch (Prism c0c7a990a4d6)."""
     global _holds_lock, _publish_lock, _active_holds, _published_seq, _watchdog_running, _watchdog_pid
+    global _wake, _watchdog_start_lock
     _holds_lock, _publish_lock = threading.Lock(), threading.Lock()
+    _wake, _watchdog_start_lock = threading.Event(), threading.Lock()
     _active_holds, _published_seq = {}, {}
     _watchdog_running, _watchdog_pid = False, 0
 
@@ -272,12 +280,11 @@ def _write_json(target: str, hold: dict, fields: dict) -> None:
 
 
 def _select_due_holds() -> Optional[List[dict]]:
-    """Mark and return holds open >= _HOLD_RECORD_MIN_S; None when no hold is active (watchdog exits)."""
-    global _watchdog_running
+    """Mark and return holds open >= _HOLD_RECORD_MIN_S; None when no hold is active (watchdog parks)."""
     now = time.monotonic()
     with _holds_lock:
         if not _active_holds:
-            _watchdog_running = False  # under the lock: hold_started() restarts it
+            _wake.clear()  # under the lock: hold_started() sets it again for the next hold
             return None
         due = [h for h in _active_holds.values() if not h["marked"] and now - h["t0"] >= _HOLD_RECORD_MIN_S]
         for hold in due:
@@ -293,18 +300,39 @@ def _publish_holding(hold: dict) -> None:
 
 def _watchdog_loop() -> None:
     while True:
+        _wake.wait()  # parked between holds: no thread churn, no tick while idle
         time.sleep(_WATCHDOG_TICK_S)
-        due = _select_due_holds()
-        if due is None:
+        try:
+            for hold in _select_due_holds() or ():
+                _publish_holding(hold)
+        except Exception:  # the one watchdog of this process must outlive a bad tick
+            _safe_debug("state.db lock-holder watchdog tick failed", exc_info=True)
+
+
+def ensure_watchdog() -> None:
+    """Start this process's ledger watchdog once. Call it BEFORE taking the write lock: Thread.start()
+    waits for the new thread to be scheduled, which is a GIL handoff, and under contention that cost
+    up to ~1 s per start on a loaded host (t_6e1c17e7). Never raises: a write without "holding" marks
+    is better than no write (thread exhaustion at load 160)."""
+    global _watchdog_running, _watchdog_pid
+    pid = os.getpid()
+    with _watchdog_start_lock:  # claim only; the start itself runs unlocked so no writer waits on it
+        if _watchdog_running and _watchdog_pid == pid:
             return
-        for hold in due:
-            _publish_holding(hold)
+        _watchdog_running, _watchdog_pid = True, pid
+    try:
+        _Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
+    except Exception:  # RuntimeError("can't start new thread"): no "holding" marks; the next write retries
+        with _watchdog_start_lock:
+            _watchdog_running = False
+        _safe_debug("state.db lock-holder watchdog did not start", exc_info=True)
 
 
 def hold_started(db_path, op: str) -> Optional[int]:
     """Register a write-lock hold that just began (BEGIN IMMEDIATE succeeded); returns its token.
-    Never raises: a failure here (thread exhaustion at load 160) must not break the write."""
-    global _hold_seq, _watchdog_running, _watchdog_pid
+    Never starts a thread: the caller ran ensure_watchdog() before it took the lock. Never raises:
+    a failure here must not break the write."""
+    global _hold_seq
     try:
         with _holds_lock:
             _hold_seq += 1
@@ -313,12 +341,7 @@ def hold_started(db_path, op: str) -> Optional[int]:
                                     "marked": False, "ended": False, "pid": os.getpid(), "who": None,
                                     "ledger": None, "seq": token, "commit_t0": None,
                                     "tid": threading.get_ident(), "cpu0": _thread_cpu(), "callback_cpu_s": None}
-            if not _watchdog_running or _watchdog_pid != os.getpid():
-                try:
-                    _Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
-                    _watchdog_running, _watchdog_pid = True, os.getpid()
-                except Exception:  # RuntimeError("can't start new thread"): no "holding" marks this time
-                    _safe_debug("state.db lock-holder watchdog did not start", exc_info=True)
+            _wake.set()
         return token
     except Exception:
         _safe_debug("state.db lock-holder ledger registration failed", exc_info=True)
