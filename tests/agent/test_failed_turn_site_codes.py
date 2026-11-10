@@ -114,7 +114,63 @@ def test_loopback_relay_context_rejection_compresses_once(provider, caplog):
     )
     assert not compressed and verdict.action == "return"
     assert verdict.result is not None
-    assert verdict.result["failure_reason"] == "context_overflow"
+    assert verdict.result["failure_retryable"] is True and "compression_exhausted" not in verdict.result
+
+
+_RELAY_REJECTION = (
+    "context_length_exceeded: prompt is too long: the interactive session hit the model context limit; compact the history"
+)
+
+
+def _assert_session_kept(result):
+    """``compression_exhausted`` makes ``gateway/run_turn.py::_hmwa_compression_exhaustion_reset``
+    wipe the session; a rejection far below the window is not proof the transcript is too long."""
+    from gateway.run_turn import is_context_overflow_failure_result
+
+    assert result["failed"] is True
+    assert "compression_exhausted" not in result
+    assert result["failure_retryable"] is True and result["failure_reason"] != "context_overflow"
+    text = result["final_response"]
+    assert "/compress" in text and "/retry" in text and "/new" not in text
+    assert is_context_overflow_failure_result(result, history_len=3_000) is False
+
+
+def test_second_explicit_rejection_below_the_window_keeps_the_session():
+    verdict, compressed = _context_rejection(
+        155_618, window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider="claude-dtlr",
+        error=_RELAY_REJECTION, compression_attempts=1,
+    )
+    assert not compressed and verdict.action == "return"
+    _assert_session_kept(verdict.result)
+
+
+def test_explicit_rejection_below_the_window_that_cannot_shrink_keeps_the_session():
+    from unittest.mock import patch
+
+    with patch("agent.turn_overflow._Recovery.compress_scored_by_tokens", return_value=(None, False, 155_618)):
+        verdict, _ = _context_rejection(
+            155_618, window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider="claude-dtlr",
+            error=_RELAY_REJECTION,
+        )
+    assert verdict.action == "return"
+    _assert_session_kept(verdict.result)
+
+
+@pytest.mark.parametrize("request_tokens,error", [
+    (990_000, _RELAY_REJECTION),  # at the window: a genuine overflow
+    (155_618, "context_length_exceeded: prompt is too long: 1200000 tokens > 1000000 maximum"),  # provider's own count
+])
+def test_genuine_overflow_that_cannot_shrink_still_exhausts(request_tokens, error):
+    from unittest.mock import patch
+
+    with patch("agent.turn_overflow._Recovery.compress_scored_by_tokens", return_value=(None, False, request_tokens)):
+        verdict, _ = _context_rejection(
+            request_tokens, window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider="claude-dtlr",
+            error=error,
+        )
+    assert verdict.action == "return"
+    assert verdict.result["compression_exhausted"] is True
+    assert verdict.result["failure_reason"] == "context_overflow" and verdict.result["failure_retryable"] is False
 
 
 def test_context_ceiling_observation_never_logs_url_credentials(caplog):

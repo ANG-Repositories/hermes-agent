@@ -381,6 +381,22 @@ def _endpoint_for_log(base_url: Any) -> str:
     return f"{parts.scheme}://{host}{port}" if parts.scheme and host else "<unset>"
 
 
+def _unexplained_rejection_kept(st: _Recovery, request_tokens: int, window: int) -> OverflowVerdict:
+    """End a turn whose explicit context rejection sits far below the known window, keeping the
+    session: no ``compression_exhausted`` (``gateway/run_turn.py::_hmwa_compression_exhaustion_reset``
+    would wipe it), retryable. The provider's limit may not live in this transcript at all."""
+    agent = st.agent
+    return st.fail_turn(
+        site_copy("provider_context_rejection", model=agent.model, tokens=request_tokens, window=window),
+        log=(
+            "%sProvider context rejection below the window persisted (~%s of %s tokens, %d compression "
+            "attempts); keeping the session", agent.log_prefix, f"{request_tokens:,}", f"{window:,}",
+            st.compression_attempts,
+        ),
+        compression_exhausted=False, reason=FailoverReason.server_error.value, retryable=True,
+    )
+
+
 def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: str) -> OverflowVerdict:
     """Context-length error. Two shapes: "prompt too long" = INPUT overflows the window
     (shrink context_length + compress); "max_tokens too large" = input fits but
@@ -421,9 +437,11 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     window = agent.context_compressor.context_length
     request_tokens = st.request_tokens() + max(0, int(getattr(agent, "max_tokens", 0) or 0))
     explicit_context_rejection = "context_length_exceeded" in error_msg.lower()
+    # A provider that quotes its own count ("1200000 tokens > 1000000") measured a real overflow.
     unexplained = (
         new_ctx is None and isinstance(window, int) and window > 0
         and request_tokens < window * _UNEXPLAINED_REJECTION_FRACTION
+        and not re.search(r"\d{4,}", error_msg)
     )
     if explicit_context_rejection and unexplained:
         # A rejected request is an upper bound, not a measured model window. Keep
@@ -435,7 +453,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
             request_tokens, window, st.compression_attempts,
         )
         if st.compression_attempts >= 1:
-            return st.fail_turn(site_copy("context_overflow", model=agent.model))
+            return _unexplained_rejection_kept(st, request_tokens, window)
     if (
         is_local_endpoint(agent.base_url)
         and not explicit_context_rejection
@@ -458,15 +476,18 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
             compression_exhausted=False, reason=FailoverReason.server_error.value, retryable=True,
         )
 
+    keep_session = explicit_context_rejection and unexplained
     exhausted = st.count_attempt()
     if exhausted is not None:
-        return exhausted
+        return _unexplained_rejection_kept(st, request_tokens, window) if keep_session else exhausted
     agent._buffer_diagnostic_status(COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(
         tokens=st.approx_tokens, attempt=st.compression_attempts, cap=st.max_compression_attempts,
     ))
 
+    # keep_session: a summary timeout falls through to the session-keeping exit below instead of
+    # the compression_exhausted timeout contract.
     deferred, shrank, new_tokens = st.compress_scored_by_tokens(
-        st.request_tokens(), fail_on_timeout=True, trigger_reason="overflow_context")
+        st.request_tokens(), fail_on_timeout=not keep_session, trigger_reason="overflow_context")
     if deferred is not None:
         return deferred
     st.approx_tokens = new_tokens
@@ -478,6 +499,8 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
         _retry.restart_with_compressed_messages = True
         return st.done("break")
 
+    if keep_session:
+        return _unexplained_rejection_kept(st, request_tokens, window)
     # Can't compress further and already at minimum tier.
     return st.fail_turn(
         site_copy("context_overflow", model=agent.model),
