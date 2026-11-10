@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import time
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -74,30 +76,43 @@ def test_unpinned_card_on_a_held_origin_is_placed_elsewhere(home, body):
 
 
 @pytest.mark.parametrize("body", ["do the thing", "host: any\ndo the thing"], ids=["no-pin", "host-any"])
-def test_unpinned_origin_route_is_rerouted_under_continuation_enforce(home, enforce, body):
+def test_unpinned_origin_route_preserves_remote_only_state(home, enforce, body, tmp_path):
     with kb.connect_closing() as conn:
         tid = _card(conn, body)
         _hold(home)
+        # Separate host filesystems: only the origin has the previous worker's output.
+        origin = tmp_path / "remote-ci-box"
+        origin.mkdir()
+        sentinel = origin / "unfinished-work.txt"
+        sentinel.write_text("unpublished work")
+        destination = tmp_path / "remote-ace-ai"
+        destination.mkdir()
+        workspace = str(destination / tid)
+        _set(conn, tid, workspace_path=workspace)
+        assert not Path(workspace).exists()
         plan = _enforced_plan(conn, [tid])
         plan.default_remote = True
         res, spawned = _tick(conn, plan)
-        assert (tid, "ace-ai") in spawned, (spawned, res.placement_waits.get(tid))
+        assert spawned == [], (spawned, res.placement_waits.get(tid))
+        assert res.placement_waits[tid].startswith("continuity_hold (origin_host_paused:ci-box")
+        row = conn.execute("SELECT origin_host,status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert tuple(row) == ("ci-box", "ready")
+        assert _runs(conn, tid) == 0
+        assert sentinel.read_text() == "unpublished work"
+        assert not Path(workspace).exists()
         assert _pause_waits(conn, tid) == 0
-        ev = _reroutes(conn, tid)
-        assert len(ev) == 1 and ev[0]["reason"] == "origin_host_paused" and ev[0]["from"] == "ci-box", ev
-        assert ev[0]["hold"].startswith(f"pause_hold (ci-box:fwa:pause:{HID} "), ev
+        assert _reroutes(conn, tid) == []
 
 
-def test_reroute_event_is_written_once_per_hold_episode(home):
+def test_continuity_hold_never_reports_a_successful_reroute(home):
     with kb.connect_closing() as conn:
         tid = _card(conn, "do the thing")
         _hold(home)
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
-        for _ in range(3):
-            assert kbd._reroute_off_held_origin(conn, row, "ci-box", {}) is None
-        assert len(_reroutes(conn, tid)) == 1
-        assert kbd._reroute_off_held_origin(conn, row, "ci-box", {}, dry_run=True) is None
-        assert len(_reroutes(conn, tid)) == 1
+        for dry_run in (False, False, True):
+            route = kbd._reroute_off_held_origin(conn, row, "ci-box", {}, dry_run=dry_run)
+            assert route == ("wait", "continuity_hold (origin_host_paused:ci-box source_workspace_transfer_unavailable)")
+        assert _reroutes(conn, tid) == []
 
 
 @pytest.mark.parametrize("pin", ["ci-box", "CI-Box"])
@@ -120,6 +135,26 @@ def test_pinned_card_is_held_under_continuation_enforce(home, enforce):
         assert tid not in {t for t, _ in spawned}
         assert _pause_waits(conn, tid) >= 1
         assert _reroutes(conn, tid) == []
+
+
+@pytest.mark.parametrize("reader", ["known_host_ids", "pin_aliases"])
+def test_layer2_refuses_alias_when_registry_read_fails(home, monkeypatch, reader):
+    from hermes_cli import kanban_worker_pool as kwp
+
+    monkeypatch.setattr(kwp, "known_host_ids", lambda fleet: ("ci-box", "ace-ai"))
+    monkeypatch.setattr(kwp, "pin_aliases", lambda fleet: {"build-alias": "ci-box"})
+    with kb.connect_closing() as conn:
+        tid = _card(conn, "host: build-alias\nx")
+        _hold(home)
+        assert kph.pinned_to("host: build-alias\nx", "ci-box", {})
+
+        def fail(fleet):
+            raise OSError("registry read failed")
+
+        monkeypatch.setattr(kwp, reader, fail)
+        with pytest.raises(kph.PauseHeld):
+            kb.claim_task(conn, tid)
+        assert _runs(conn, tid) == 0
 
 
 def test_layer2_refuses_only_a_pinned_card(home):

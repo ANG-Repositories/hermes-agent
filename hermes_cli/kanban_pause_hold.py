@@ -425,19 +425,17 @@ def follows_origin() -> bool:
 
 
 def _pin_words(cache: dict):
-    """``(known_hosts, aliases)`` of the pool registry for :func:`kanban_worker_pool.resolve_pin`, read once per
-    tick. An unreadable registry resolves only the held host's own names (a pin the router can resolve to the held
-    host still meets the destination fence, so a miss here never starts work there)."""
+    """``(known_hosts, aliases)`` of the pool registry, read once per tick.
+
+    Errors propagate to decide's fail-closed handler: a missing alias map is
+    not proof that a direct claim is unpinned (there is no destination fence).
+    """
     key = (_K_PINS,)
     if key not in cache:
-        try:
-            from hermes_cli import kanban_db as _kb
-            from hermes_cli import kanban_worker_pool as _kwp
-            fleet = _kb.kanban_home() / "fleet"
-            cache[key] = (tuple(_kwp.known_host_ids(fleet)), dict(_kwp.pin_aliases(fleet)))
-        except Exception:
-            _log.warning("kanban pause_hold: pool registry unreadable; pins resolve by host name only", exc_info=True)
-            cache[key] = ((), {})
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_worker_pool as _kwp
+        fleet = _kb.kanban_home() / "fleet"
+        cache[key] = (tuple(_kwp.known_host_ids(fleet)), dict(_kwp.pin_aliases(fleet)))
     return cache[key]
 
 

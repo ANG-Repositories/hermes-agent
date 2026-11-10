@@ -5229,23 +5229,26 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
 
 
 def _reroute_off_held_origin(conn, row, host: str, pause_cache: Optional[dict], *, dry_run: bool = False):
-    """``("origin", host)``, or None when a live fwa kanban hold closes ``host`` and the card is not pinned there
-    (t_72362742): ``origin_host`` is a locality hint, not a constraint, so the card goes to the ordinary ladder (the
-    destination fence keeps it off ``host``; a worktree card ports like any other port). One ``placement_rerouted``
-    ``{reason: origin_host_paused}`` event per hold episode. ``KANBAN_PAUSE_FOLLOWS_ORIGIN=1`` keeps the origin."""
+    """Preserve a populated origin unless a verified transfer can replace it.
+
+    origin_route reaches here only for retained remote state. The ordinary
+    scratch allocator cannot carry that host's files; a local path/port check
+    would inspect the dispatcher's different filesystem. Until a source-aware
+    transfer exists, keep the origin and hold this card only. Empty origins
+    already fall through origin_route after positive state-loss proof.
+    """
     from hermes_cli import kanban_pause_hold as _kph
     cache = {} if pause_cache is None else pause_cache
     if _kph.follows_origin() or not _kph.enabled():
         return ("origin", host)
     why = _kph.destination_wait(host, cache)
-    if why is None or _kph.pinned_to(row["body"], host, cache):
+    try:
+        pinned = _kph.pinned_to(row["body"], host, cache) if why else False
+    except Exception:
+        return "wait", f"continuity_hold (origin_host_paused:{host} pin_registry_unreadable)"
+    if why is None or pinned:
         return ("origin", host)
-    if not dry_run:
-        payload = {"reason": _kph.REROUTE_REASON, "from": host, "hold": why}
-        last = _kb._latest_event(conn, row["id"], _kph.REROUTE_EVENT)
-        if last is None or _kb._json_or(last["payload"]) != payload:
-            _kb._append_event(conn, row["id"], _kph.REROUTE_EVENT, payload)
-    return None
+    return "wait", f"continuity_hold (origin_host_paused:{host} source_workspace_transfer_unavailable)"
 
 
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
