@@ -336,6 +336,15 @@ def test_carry_size_ok_bounds(tmp_path):
     assert not kwh.carry_size_ok(None)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_carry_queue():
+    # Keep the fixture usable against the pre-fix module for the behavioral RED control.
+    queue = getattr(kwh, "_carry_waiting", {})
+    queue.clear()
+    yield
+    queue.clear()
+
+
 def _ten_files(tmp_path, name):
     d = tmp_path / name
     d.mkdir()
@@ -406,6 +415,38 @@ def test_carry_scan_cache_is_stamped_when_the_walk_ends(tmp_path, monkeypatch):
         assert kwh.carry_size_ok(d, budget=budget, max_seconds=1e9)
     monkeypatch.setattr(kwh.os, "walk", _no_walk)
     assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(clock=clock))
+
+
+def test_carry_budget_serves_waiting_paths_fifo_under_a_fixed_row_order(tmp_path, monkeypatch):
+    # Worst case: every cache entry has expired by the next tick and the rows always arrive A, B, C. Each walk
+    # costs 0.8 s of a 1.0 s budget, so without a queue A re-walks every tick and C is never judged.
+    a, b, c = (_ten_files(tmp_path, n) for n in "abc")
+    clock = _Clock(0.0)
+    real_walk = kwh.os.walk
+    walked = []
+
+    def costly_walk(root, *args, **kw):
+        walked.append(root)
+        clock.t += 0.8
+        return real_walk(root, *args, **kw)
+
+    monkeypatch.setattr(kwh.os, "walk", costly_walk)
+    answers = []
+    for _tick in range(3):
+        budget = kwh.CarryScanBudget(seconds=1.0, clock=clock)
+        answers.append([kwh.carry_size_ok(p, budget=budget) for p in (a, b, c)])
+        clock.t += kwh.CARRY_SCAN_TTL_SECONDS + 1
+    assert answers[0][0] and answers[1][1] and answers[2][2], answers
+    assert kwh.os.path.realpath(c) in {kwh.os.path.realpath(w) for w in walked}
+
+
+def test_a_waiting_path_whose_card_left_is_forgotten(tmp_path):
+    d = _ten_files(tmp_path, "gone")
+    clock = _Clock(0.0)
+    kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(seconds=0.0, clock=clock))
+    assert kwh._carry_waiting
+    clock.t += kwh.CARRY_WAIT_FORGET_SECONDS + 1
+    assert kwh.CarryScanBudget(clock=clock).admit_gen is None and not kwh._carry_waiting
 
 
 def test_a_spent_carry_budget_never_holds_a_portable_peer(kanban_home, carried, monkeypatch):
