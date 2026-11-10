@@ -70,14 +70,15 @@ def main() -> int:
     ap.add_argument("--fds", type=int, default=1500)
     opts = ap.parse_args()
     descriptors = [os.open(os.devnull, os.O_RDONLY) for _ in range(opts.fds)]
-    counters = {"fork_exec": 0, "posix_spawn": 0}
-    real_spawn = os.posix_spawn
+    counters = {"fork_exec": 0, "native_posix_spawn_ok": 0}
+    real_spawn = nofork._native_spawn
 
     def counted_spawn(*args, **kwargs):
-        counters["posix_spawn"] += 1
-        return real_spawn(*args, **kwargs)
+        rc, pid = real_spawn(*args, **kwargs)
+        counters["native_posix_spawn_ok"] += rc == 0
+        return rc, pid
 
-    os.posix_spawn = counted_spawn
+    nofork._native_spawn = counted_spawn
     import _posixsubprocess
     fork_owner = subprocess if hasattr(subprocess, "_fork_exec") else _posixsubprocess
     fork_name = "_fork_exec" if fork_owner is subprocess else "fork_exec"
@@ -106,7 +107,7 @@ def main() -> int:
     results = {"python": sys.version.split()[0], "platform": sys.platform, "rss_mb": rss_kb // 1024,
                "threads": threading.active_count(), "pid": os.getpid(), "modes": {}}
     for mode in opts.modes.split(","):
-        counters.update(fork_exec=0, posix_spawn=0)
+        counters.update(fork_exec=0, native_posix_spawn_ok=0)
         subprocess._USE_VFORK = mode != "legacy-fork"
         stalls, walls, firsts, cpus = [], [], [], []
         for _ in range(opts.spawns):
