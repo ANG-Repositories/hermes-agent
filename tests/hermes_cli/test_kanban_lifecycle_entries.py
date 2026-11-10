@@ -104,6 +104,21 @@ def test_review_entry_binds_implementer_before_any_exit(conn, current_run, inter
     assert json.loads(payload)["implementer"] == "human:operator"
 
 
+def test_review_run_returning_to_review_keeps_the_implementer(conn):
+    """A REVIEW claim released back to review (unbound-claim release, TTL reclaim) is the same episode:
+    no repair handoff naming the reviewer as implementer (t_c2a562c9; #177 wrote one, so a later
+    request-changes routed the card to ``human`` and parked it in todo)."""
+    tid = kb.create_task(conn, title="Review claim released", assignee="builder")
+    impl = kb.claim_task(conn, tid)
+    assert kb.request_review(conn, tid, summary="ready", reviewer="human",
+                             expected_run_id=impl.current_run_id)
+    assert kb.claim_review_task(conn, tid, session_ref=None) is not None
+    conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' "
+                        "ORDER BY id", (tid,)).fetchall()
+    assert [json.loads(r[0])["implementer"] for r in rows] == ["builder"]
+
+
 def test_normal_request_review_has_one_complete_handoff(conn):
     tid = kb.create_task(conn, title="Canonical handoff", assignee="builder")
     assert kb.request_review(conn, tid, summary="verified", reviewer="human:apollo")

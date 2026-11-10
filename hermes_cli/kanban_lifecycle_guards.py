@@ -68,6 +68,9 @@ def _trigger_definitions() -> dict[str, str]:
                 CAST(strftime('%s','now') AS INTEGER));
         END
     """.strip()
+    # A REVIEW run handing the card back to review (unbound-claim release, TTL reclaim) continues the same
+    # episode: its review->running claim is not an exit, and that run's profile is the reviewer, never the
+    # implementer, so no repair handoff is written for it (t_c2a562c9; regression from #177).
     definitions["tasks_review_handoff"] = """
         CREATE TRIGGER tasks_review_handoff
         AFTER UPDATE OF status ON tasks
@@ -77,9 +80,13 @@ def _trigger_definitions() -> dict[str, str]:
             AND kind='review_requested'
             AND json_valid(payload)
             AND length(json_extract(payload, '$.implementer')) > 0
-            AND COALESCE(json_extract(payload, '$.review_exit_id'), 0) =
+            AND (COALESCE(json_extract(payload, '$.review_exit_id'), 0) =
                 (SELECT COALESCE(max(id), 0) FROM task_status_audit
                  WHERE task_id=NEW.id AND old_status='review' AND new_status!='review')
+              OR EXISTS (SELECT 1 FROM task_events c WHERE c.task_id=NEW.id
+                         AND c.run_id=OLD.current_run_id AND c.kind='claimed'
+                         AND json_valid(c.payload)
+                         AND json_extract(c.payload, '$.source_status')='review'))
           )
         BEGIN
             INSERT INTO task_events(task_id, kind, payload, created_at)
