@@ -2,8 +2,9 @@
 
 56 placement_wait ``pause_hold (nas-fleet:fwa:pause:...)`` in 2 h on 2026-11-09: the hold was keyed on
 ``origin_host`` (the host the LAST run used), so a ``host: any`` card that last ran on the paused host sat for the
-whole pause. Now: a pinned card is held (today's behaviour), an unpinned one is re-placed by the allocator
-(``placement_rerouted`` ``origin_host_paused``), and the origin hint is honoured again once the hold ends.
+whole pause. Pinned cards remain held; an empty origin can be re-placed after a positive
+state-loss probe. Populated remote origins retain a continuity hold until source-aware
+transfer is available; host:any is not evidence that their only workspace is recoverable.
 ``KANBAN_PAUSE_FOLLOWS_ORIGIN=1`` restores the origin-keyed hold.
 """
 
@@ -91,6 +92,8 @@ def test_unpinned_origin_route_preserves_remote_only_state(home, enforce, body, 
         _set(conn, tid, workspace_path=workspace)
         assert not Path(workspace).exists()
         plan = _enforced_plan(conn, [tid])
+        # Model the remote probe over the origin filesystem, not the empty local path.
+        plan.continuation_states[("ci-box", workspace)] = "nonempty" if sentinel.is_file() else "empty"
         plan.default_remote = True
         res, spawned = _tick(conn, plan)
         assert spawned == [], (spawned, res.placement_waits.get(tid))
@@ -102,6 +105,20 @@ def test_unpinned_origin_route_preserves_remote_only_state(home, enforce, body, 
         assert not Path(workspace).exists()
         assert _pause_waits(conn, tid) == 0
         assert _reroutes(conn, tid) == []
+
+
+def test_proven_empty_paused_origin_can_relocate(home, enforce):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, "host: any\ndo the thing")
+        _hold(home)
+        workspace = conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        plan = _plan()
+        plan.continuation_states = {("ci-box", workspace): "empty"}
+        plan.default_remote = True
+        res, spawned = _tick(conn, plan)
+        assert (tid, "ace-ai") in spawned, res.placement_waits.get(tid)
+        assert conn.execute("SELECT origin_host FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ace-ai"
+        assert _pause_waits(conn, tid) == 0
 
 
 def test_continuity_hold_never_reports_a_successful_reroute(home):
