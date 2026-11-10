@@ -420,11 +420,14 @@ def _directory_shape(path):
         return None
 
 
-def _index_tree_unchanged(index):
+def _index_tree_unchanged(index, *, certify=False):
     for path, (stamp, shape) in index["directories"].items():
         current = _directory_stamp(path)
-        if current != stamp:
-            if shape is None or _directory_shape(path) != shape:
+        # A replacement can change first-match enumeration order even with the same names.
+        if current != stamp and (current is None or stamp is None or current[:2] != stamp[:2]):
+            return False
+        if certify or current != stamp:
+            if (shape is None and current != stamp) or _directory_shape(path) != shape:
                 return False
             # Atomic content replacement changes directory mtime, not discovery topology.
             index["directories"][path] = (current, shape)
@@ -512,6 +515,10 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     return targets[name]
 
 
+class _SkillIndexChangedError(RuntimeError):
+    """Discovery could not obtain a stable tree snapshot."""
+
+
 def _find_skill_indexed(name: str) -> Optional[Dict[str, Any]]:
     """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
 
@@ -549,7 +556,7 @@ def _find_skill_indexed(name: str) -> Optional[Dict[str, Any]]:
                     _SKILL_INDEX.pop(key, None)
                 continue
             index = _build_skill_index(roots)
-            if not _index_tree_unchanged(index):
+            if not _index_tree_unchanged(index, certify=True):
                 continue
             with _SKILL_INDEX_LOCK:
                 if index["gen"] != _SKILL_INDEX_GENERATION:
@@ -559,7 +566,7 @@ def _find_skill_indexed(name: str) -> Optional[Dict[str, Any]]:
                 _SKILL_INDEX[key] = index
                 hit = _skill_index_lookup(index, name, local_root)
                 return {"path": hit} if hit is not None else None
-    raise RuntimeError("Skill tree changed repeatedly during discovery; retry the operation")
+    raise _SkillIndexChangedError("Skill tree changed repeatedly during discovery; retry the operation")
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -1216,6 +1223,8 @@ def _bind_skill_targets(fn):
         token = _SKILL_OPERATION_TARGETS.set({})
         try:
             return fn(*args, **kwargs)
+        except _SkillIndexChangedError as exc:
+            return tool_error(str(exc), success=False)
         finally:
             _SKILL_OPERATION_TARGETS.reset(token)
     return bound
@@ -1232,8 +1241,6 @@ def skill_manage(
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
-    if name:
-        _find_skill(name)  # bind once before guards, approval, ledger and write helpers
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless

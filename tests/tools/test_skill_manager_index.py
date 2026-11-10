@@ -233,6 +233,7 @@ def test_skill_manage_patch_walks_at_most_once(tmp_path):
         assert builds.call_count == 1  # atomic same-path replacement never rebuilds
 
 
+@pytest.mark.platforms("posix")
 def test_restored_category_permissions_reselect_local_override(tmp_path):
     import os
 
