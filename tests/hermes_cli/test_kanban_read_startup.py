@@ -96,7 +96,7 @@ assert not launches, launches
         stdin=subprocess.DEVNULL, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["id"] == task_id
+    assert json.loads(result.stdout)["task"]["id"] == task_id
 
 
 def test_write_init_retries_held_writer(tmp_path, monkeypatch):

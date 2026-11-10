@@ -18986,6 +18986,7 @@ def _record_worker_returncode(pid: int, code: int) -> None:
     """Remember Popen's native return code, including on Windows."""
     if not pid or pid <= 0:
         return
+    __getattr__("_recent_worker_exits")
     now = time.time()
     # (code, wall, boot evidence): the reap's upper bound on both clocks.
     _recent_worker_exits[int(pid)] = (int(code), now, _boot_evidence())
@@ -21009,7 +21010,7 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     comments = conn.execute(
         "SELECT id, author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY id DESC",
-        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+        (task_id, int(time.time()) - _kbd._RESPAWN_GUARD_PR_WINDOW),
     ).fetchall()
     pr_comment = next(
         (c for c in comments if _kbd._RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
@@ -23610,7 +23611,7 @@ def __getattr__(name):
     from hermes_cli import kanban_db_dispatch
     # Internal function globals must see the same constants and mutable registry.
     for exported in _DISPATCH_EXPORTS:
-        globals()[exported] = getattr(kanban_db_dispatch, exported)
+        globals().setdefault(exported, getattr(kanban_db_dispatch, exported))
     return globals()[name]
 
 from hermes_cli.kanban_db_board_registry import (  # noqa: E402
