@@ -8058,6 +8058,7 @@ class GatewayRunner(
         override: Optional[dict],
         *,
         require_persistence: bool = False,
+        persist_only: bool = False,
     ) -> None:
         """Single door for setting/clearing a session-scoped /model override (P3b/RC-2).
 
@@ -8065,6 +8066,11 @@ class GatewayRunner(
         SessionEntry (config-backed-only per RC-4) AND saves. Manual /new and
         /reset copy persisted identity directly; /model reset and automatic cleanup
         use this user-action door.
+
+        ``persist_only``: the in-memory half already ran on the loop
+        (:meth:`_apply_session_model_override_in_memory`, the reply-first /model path,
+        t_2ab07928); write only the durable half and leave the in-memory map alone, so a
+        later switch's in-memory value is never overwritten from a worker thread.
         """
         if not session_key:
             return
@@ -8077,6 +8083,27 @@ class GatewayRunner(
                 if require_persistence:
                     raise
                 logger.debug("model-route clear persist skipped", exc_info=True)
+        if not persist_only:
+            self._apply_session_model_override_in_memory(session_key, override)
+        try:
+            store = getattr(self, "session_store", None)
+            entry = store.entry_for(session_key) if store is not None else None
+            if entry is not None and override is not None:
+                entry.model_override_identity = (
+                    self._model_override_is_persistable(override)
+                )
+                entry._model_override_identity_invalid = False
+                store.persist()
+        except Exception:
+            if persist_only and require_persistence:
+                raise
+            logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
+
+    def _apply_session_model_override_in_memory(
+        self, session_key: str, override: Optional[dict]
+    ) -> None:
+        """In-memory half of the single door: the override map the next turn reads.
+        Sync and I/O-free, so the reply-first /model path runs it on the loop."""
         # Stamp "the user changed the override target this turn" for the NEXT
         # turn's pre-run recovery announce: the shared recovery_should_announce
         # predicate suppresses the manual /model re-target (or clear) transition
@@ -8088,23 +8115,14 @@ class GatewayRunner(
             self._override_target_just_changed = {}
         self._override_target_just_changed[session_key] = True
         if override is None:
+            # NOTE(P3b/RC-2): the in-memory half of the single door (_set_session_model_override),
+            # split out so the reply-first /model path can run it on the loop (t_2ab07928).
             self._session_model_overrides.pop(session_key, None)
         else:
             self._session_model_overrides[session_key] = dict(override)
         unavailable = getattr(self, "_session_model_override_unavailable", None)
         if unavailable is not None:
             unavailable.discard(session_key)
-        try:
-            store = getattr(self, "session_store", None)
-            entry = store.entry_for(session_key) if store is not None else None
-            if entry is not None and override is not None:
-                entry.model_override_identity = (
-                    self._model_override_is_persistable(override)
-                )
-                entry._model_override_identity_invalid = False
-                store.persist()
-        except Exception:
-            logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
 
     def _sweep_restart_initiated_breadcrumbs(self) -> int:
         """Prune breadcrumb files from a prior boot or past the TTL (D-8).
@@ -8858,6 +8876,7 @@ class GatewayRunner(
         override: Optional[dict],
         *,
         require_persistence: bool = False,
+        persist_only: bool = False,
     ) -> None:
         """Run :meth:`_set_session_model_override` off the loop, serialized per
         session in issue order (C5 #36, PR #970).
@@ -8879,6 +8898,7 @@ class GatewayRunner(
                 session_key,
                 override,
                 require_persistence=require_persistence,
+                **({"persist_only": True} if persist_only else {}),
             ))
             cancelled = False
             while True:

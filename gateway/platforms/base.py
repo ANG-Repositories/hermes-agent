@@ -2268,6 +2268,27 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
+async def call_model_selected(callback, chat_id, model_id, provider_slug, render):
+    """Invoke a /model picker callback, handing it ``render`` (the adapter's own rendering of the
+    confirmation) when it accepts one. The gateway's callback renders through it, then saves;
+    returns ``(text, rendered)`` so the adapter renders a not-yet-rendered reply itself."""
+    rendered = []
+
+    async def _render(text):
+        rendered.append(text)
+        await render(text)
+
+    try:
+        takes_render = "render" in inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        takes_render = False
+    if takes_render:
+        text = await callback(chat_id, model_id, provider_slug, render=_render)
+    else:
+        text = await callback(chat_id, model_id, provider_slug)
+    return text, bool(rendered)
+
+
 class BasePlatformAdapter(ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
@@ -5599,6 +5620,12 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
+            selection_lock = self.__dict__.get("_model_selection_locks", {}).get(session_key)
+            if selection_lock is not None:
+                # A /model save (or a write /stop interrupted) may still be settling under the
+                # session's switch lock: no turn reads the half-saved route (t_2ab07928).
+                async with selection_lock:
+                    pass
             response = await self._message_handler(event)
             _handler_returned = time.monotonic()
             # A muted diagnostic wake ran for the session; its reply is not presented. The

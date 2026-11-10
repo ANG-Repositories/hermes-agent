@@ -3,15 +3,19 @@
 An idle-session ``/m opus-d`` took ~79 s on 2026-11-09 while ``switch_model()`` alone took 0.09 s warm
 and 3.6 s cold; nothing said where the rest went. The handler marks each stage boundary with
 :func:`phase` (one line per boundary, so the long handler body is not re-indented); the time from one
-boundary to the next belongs to the earlier phase; the final phase includes adapter delivery::
+boundary to the next belongs to the earlier phase; ``confirm`` includes adapter delivery::
 
-    PHASE=model_cmd session=<key> outcome=ok lock_wait_s=0.000 config_s=0.002 normalize_s=0.001 ...
-        record_s=4.210 record_get_session_s=0.020 record_update_model_s=4.100 ... total_s=4.300
+    PHASE=model_cmd session=<key> outcome=ok save=ok lock_wait_s=0.000 config_s=0.002 ...
+        record_s=4.210 record_get_session_s=0.020 record_update_model_s=4.100 ... reply_s=0.090 total_s=4.300
 
-Phases are exclusive and sum to ``total_s - other_s`` (``other_s`` = time before the first phase).
-``record_s`` is derived: the sum of the ``record_*`` phases, one per DB/store call. ``durable_*``
-fields are nested spans inside ``record_durable`` (config write, override clear, override write-through)
-and are not added again. A phase the command never reached prints ``-``.
+The reply goes out before the save (t_2ab07928), so the line is logged when the save settles, not
+at delivery: ``reply_s`` is the time to the confirmation, ``total_s`` the time to the settled save,
+``save`` its outcome (ok / failed / interrupted / not_run, ``-`` when nothing was switched).
+Phases are exclusive and sum to ``total_s - other_s`` (``other_s`` = time outside any phase: before
+the first one and between delivery and the first save stage). ``record_s`` is derived: the sum of
+the ``record_*`` phases, one per DB/store call. ``durable_*`` fields are nested spans inside
+``record_durable`` (config write, override clear, override write-through) and are not added again.
+A phase the command never reached prints ``-``.
 Telemetry only: every entry point swallows its own errors, so it can never change the reply.
 """
 
@@ -46,6 +50,10 @@ class ModelCmdTiming:
         self.phases: Dict[str, float] = {}
         self.spans: Dict[str, float] = {}
         self.finished = False
+        self.save_pending = False
+        self.reply_s: Optional[float] = None
+        self.delivery_outcome: Optional[str] = None
+        self.save_outcome: Optional[str] = None
 
     def enter(self, name: Optional[str], now: float) -> None:
         if self.phase is not None:
@@ -57,12 +65,13 @@ class ModelCmdTiming:
             value = table.get(name)
             return f"{name}_s=" + ("-" if value is None else f"{value:.3f}")
 
-        fields = [f"PHASE=model_cmd session={self.session} outcome={outcome}"]
+        fields = [f"PHASE=model_cmd session={self.session} outcome={outcome} save={self.save_outcome or '-'}"]
         fields += [_fmt(name, self.phases) for name in PHASES]
         reached = [self.phases[n] for n in RECORD_PHASES if n in self.phases]
         fields.append("record_s=" + (f"{sum(reached):.3f}" if reached else "-"))
         fields += [_fmt(name, self.spans) for name in DURABLE_SPANS]
         other = total_s - sum(self.phases.values())
+        fields.append("reply_s=" + ("-" if self.reply_s is None else f"{self.reply_s:.3f}"))
         fields.append(f"other_s={max(other, 0.0):.3f} total_s={total_s:.3f}")
         return " ".join(fields)
 
@@ -132,15 +141,73 @@ def span(name: str) -> Iterator[None]:
             pass
 
 
-def handler_finished(event, timing, exc: Optional[BaseException]) -> None:
-    """Keep the command clock open through the adapter's owned delivery callback.
+def current() -> Optional[ModelCmdTiming]:
+    """The timer of the /model command running in this context, if any. Never raises."""
+    try:
+        return _current.get()
+    except Exception:
+        return None
 
-    Direct callers have no adapter delivery and finish at handler return. The event carries
-    the timer rather than a task-local lookup: routed handlers may run in another context.
+
+def bind(timing: Optional[ModelCmdTiming]) -> None:
+    """Make *timing* current in this context (the save may run in another task). Never raises."""
+    try:
+        if timing is not None:
+            _current.set(timing)
+    except Exception:
+        pass
+
+
+def mark_save_pending(timing: Optional[ModelCmdTiming]) -> None:
+    """The command switched the model and its save is still to run: the line waits for it."""
+    try:
+        if timing is not None:
+            timing.save_pending = True
+    except Exception:
+        pass
+
+
+def reply_delivered(timing: Optional[ModelCmdTiming]) -> None:
+    """Stamp ``reply_s`` (once) and close the ``confirm`` phase. Never raises."""
+    try:
+        if timing is None or timing.finished or timing.reply_s is not None:
+            return
+        now = time.monotonic()
+        timing.reply_s = max(now - timing.t0, 0.0)
+        timing.enter(None, now)
+    except Exception:
+        pass
+
+
+def save_finished(timing: Optional[ModelCmdTiming], outcome: str) -> None:
+    """The save settled: log the one line with the delivery outcome (if any). Never raises."""
+    try:
+        if timing is None:
+            return
+        timing.save_outcome = outcome
+        timing.save_pending = False
+        if timing.reply_s is not None:  # else the delivery (or handler return) logs it
+            finish(timing, timing.delivery_outcome or "ok")
+    except Exception:
+        pass
+
+
+def handler_finished(event, timing, exc: Optional[BaseException]) -> None:
+    """Keep the command clock open through the adapter's owned delivery callback, and through
+    the save when the command switched the model.
+
+    Direct callers have no adapter delivery and finish at handler return (or when the save
+    settles). The event carries the timer rather than a task-local lookup: routed handlers may
+    run in another context.
     """
     try:
-        if exc is not None or not getattr(event, "_model_cmd_delivery", None):
+        if exc is not None:
             finish(timing, outcome_for(exc))
+            return
+        if not getattr(event, "_model_cmd_delivery", None):
+            if timing is not None and not timing.save_pending:
+                reply_delivered(timing)  # a direct caller gets the reply now
+                finish(timing, "ok")
             return
         event._model_cmd_timing = timing
         adapter, key = event._model_cmd_delivery
@@ -150,9 +217,17 @@ def handler_finished(event, timing, exc: Optional[BaseException]) -> None:
 
 
 def delivery_finished(event, outcome: str = "ok") -> None:
-    """Idempotent across the ordinary callback and exceptional adapter cleanup."""
+    """Record the delivery outcome (first call wins); log now unless a save is still to run.
+    Idempotent across the ordinary callback and exceptional adapter cleanup."""
     try:
-        finish(getattr(event, "_model_cmd_timing", None), outcome)
+        timing = getattr(event, "_model_cmd_timing", None)
+        if timing is None or timing.finished:
+            return
+        if timing.delivery_outcome is None:
+            timing.delivery_outcome = outcome
+        reply_delivered(timing)
+        if not timing.save_pending:
+            finish(timing, timing.delivery_outcome)
     except Exception:
         pass
 
