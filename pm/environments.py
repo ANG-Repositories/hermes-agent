@@ -316,19 +316,22 @@ def activate_dependencies(project_root: Path) -> None:
     if owned:
         root = Path(project_root).resolve()
         environment = Path(owned).absolute()
-        if (not (root / ".git").exists() or environment != root / "venv"
-                or Path(sys.prefix).absolute() != environment
-                or not (environment / "pyvenv.cfg").is_file()):
-            raise RuntimeError("HERMES_CHECKOUT_VENV must be this checkout's running venv")
-        # Do not inherit a PM generation's PYTHONPATH from a parent launcher.
-        selected = site_packages(environment)
-        sys.path[:] = [entry for entry in sys.path
-                       if Path(entry).name not in ("site-packages", "dist-packages")
-                       or Path(entry).resolve() == selected.resolve()]
-        if str(selected) not in sys.path:
-            sys.path.insert(0, str(selected))
-        os.environ["PYTHONPATH"] = os.pathsep.join([str(root), str(selected)])
-        return
+        if ((root / ".git").exists() and environment == root / "venv"
+                and Path(sys.prefix).absolute() == environment
+                and (environment / "pyvenv.cfg").is_file()):
+            # A parent launcher's checkout root is as stale as its site-packages.
+            selected = site_packages(environment)
+            inherited = {Path(p).resolve() for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p}
+            keep = {root, selected.resolve()}
+            sys.path[:] = [str(root), str(selected), *[
+                entry for entry in sys.path
+                if Path(entry).resolve() not in inherited | keep
+                and Path(entry).name not in ("site-packages", "dist-packages")]]
+            os.environ["PYTHONPATH"] = os.pathsep.join([str(root), str(selected)])
+            return
+        # Workers, cron and terminal children may deliberately use another Python.
+        # The supervisor's contract does not own that interpreter or its children.
+        os.environ.pop("HERMES_CHECKOUT_VENV", None)
 
     state = install_state_dir(project_root)
     if state.is_dir():
