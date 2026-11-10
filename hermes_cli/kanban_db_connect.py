@@ -1173,16 +1173,18 @@ def connect(
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     _migrate_add_optional_columns(conn)
-                    _kb._ensure_status_audit(conn)
-                    from hermes_cli.kanban_failure_ownership import migrate
-                    migrate(conn)
-                    from hermes_cli.kanban_lifecycle_guards import install
-                    install(conn)
                     conn.execute("COMMIT")
                 except BaseException:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
                     raise
+                # Audit installation uses executescript (an implicit commit),
+                # so it follows the atomic additive/backfill migration.
+                _kb._ensure_status_audit(conn)
+                from hermes_cli.kanban_failure_ownership import migrate
+                migrate(conn)
+                from hermes_cli.kanban_lifecycle_guards import install
+                install(conn)
                 _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 
