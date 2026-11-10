@@ -292,6 +292,13 @@ os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 #: even with this block removed.
 HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
 
+# Runtime identity used to be warmed by the guard's eager state/auth imports.
+# Resolve it explicitly before tests install subprocess doubles; plugin metadata
+# must not run git through a fake meant for a player, worker, or updater child.
+from hermes_cli.version_info import get_version_info as _test_runtime_version
+_test_runtime_version()
+
+
 # ── Host-rendezvous isolation ───────────────────────────────────────────────
 # ``gateway/host_rendezvous.py`` publishes ONE record per role per OS USER, in
 # ``$HERMES_GATEWAY_LOCK_DIR`` else ``$XDG_STATE_HOME/hermes/gateway-locks`` —
