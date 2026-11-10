@@ -4164,6 +4164,16 @@ class BasePlatformAdapter(ABC):
             cleaned = cleaned.replace(raw, '')
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
+    def _live_typing_adapter(self):
+        """Resolve this transport's slot, not a chat route that may belong to another bot."""
+        runner = self.gateway_runner
+        if self.platform != Platform.DISCORD or runner is None:
+            return self
+        profile = getattr(self, "_owner_profile", None)
+        adapters = (getattr(runner, "_profile_adapters", {}).get(profile, {})
+                    if profile else runner.adapters)
+        return adapters.get(self.platform)
+
     async def _keep_typing(
         self,
         chat_id: str,
@@ -4207,14 +4217,33 @@ class BasePlatformAdapter(ABC):
                     _send_typing_kwargs["token"] = token
             except (TypeError, ValueError):
                 pass
+        typing_adapter, typing_token = self, token
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
+                if not self._typing_token_is_current(chat_id, token):
+                    return
+                if not typing_adapter._typing_token_is_current(chat_id, typing_token):
+                    return
+                live = self._live_typing_adapter()
+                if live is not None and live is not typing_adapter and not live.has_fatal_error:
+                    # A new turn on the replacement owns its own bubble; never steal it.
+                    if token is not None and live._current_typing_token(chat_id) is not None:
+                        return
+                    if typing_adapter is not self:
+                        await typing_adapter._stop_typing_refresh(
+                            chat_id, metadata=metadata, token=typing_token)
+                    typing_adapter = live
+                    typing_token = live._issue_typing_token(chat_id) if token is not None else None
+                    if "token" in _send_typing_kwargs:
+                        _send_typing_kwargs["token"] = typing_token
+                if (live is typing_adapter and not live.has_fatal_error
+                        and chat_id not in self._typing_paused
+                        and chat_id not in live._typing_paused):
                     try:
                         await asyncio.wait_for(
-                            self.send_typing(chat_id, **_send_typing_kwargs),
+                            live.send_typing(chat_id, **_send_typing_kwargs),
                             timeout=_send_typing_timeout,
                         )
                     except asyncio.TimeoutError:
@@ -4236,8 +4265,13 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
+            # Tear down the rebound loop with OUR token, never a newer turn's loop.
+            if typing_adapter is not self:
+                await typing_adapter._stop_typing_refresh(
+                    chat_id, metadata=metadata, token=typing_token)
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
-            await self._stop_typing_quietly(chat_id, metadata)
+            if self._typing_token_is_current(chat_id, token):
+                await self._stop_typing_quietly(chat_id, metadata)
             self._typing_paused.discard(chat_id)
             # getattr-guard: tests build adapters via object.__new__ without _status_text.
             getattr(self, "_status_text", {}).pop(str(chat_id), None)
@@ -4281,7 +4315,7 @@ class BasePlatformAdapter(ABC):
             for attempt in range(max(1, stop_attempts)):
                 if attempt:
                     await asyncio.sleep(0)
-                if metadata is None and _stop_kwargs:
+                if _stop_kwargs:
                     # Forward the ownership token to adapters whose stop_typing accepts it (Discord).
                     with contextlib.suppress(Exception):
                         await self.stop_typing(chat_id, **_stop_kwargs)
