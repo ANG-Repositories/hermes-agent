@@ -1653,6 +1653,8 @@ def _build_moa_pricing_calls(
     aggregator_provider: str | None,
     aggregator_base_url: str | None,
     aggregator_tier_prompt_tokens: int | None = None,
+    aggregator_tier_last_usage: dict[str, int] | None = None,
+    aggregator_tier_requests: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return physical advisor + aggregator calls for Blackbox pricing."""
     from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
@@ -1669,6 +1671,8 @@ def _build_moa_pricing_calls(
         "cache_write_tokens": aggregator_usage.cache_write_tokens,
         "reasoning_tokens": aggregator_usage.reasoning_tokens,
         "tier_prompt_tokens": aggregator_tier_prompt_tokens,
+        "tier_last_usage": aggregator_tier_last_usage,
+        "tier_requests": aggregator_tier_requests,
     })
     return calls
 

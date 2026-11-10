@@ -3364,13 +3364,121 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
     return CostResult(amount_usd=None, status="unknown", source=source, label="n/a", notes=notes)
 
 
+def _price_buckets(entry: PricingEntry, usage: CanonicalUsage, above: bool, notes: list[str]):
+    """The four per-class Decimals for ``usage`` at one context tier, or an unknown CostResult."""
+    parts: list[Decimal] = []
+    for tokens, rate, rate_above, note, is_cache_write in (
+        (usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, (), False),
+        (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, (), False),
+        (usage.cache_read_tokens, entry.cache_read_cost_per_million, entry.cache_read_cost_per_million_above,
+         ("cache-read pricing unavailable for route",), False),
+        (usage.cache_write_tokens, entry.cache_write_cost_per_million, entry.cache_write_cost_per_million_above,
+         ("cache-write pricing unavailable for route",), True),
+    ):
+        if above and rate_above is not None:
+            rate = rate_above
+        if rate is None and is_cache_write and tokens and entry.input_cost_per_million is not None:
+            # No published cache-write rate. For OpenAI-family routes (and any
+            # provider that doesn't charge a separate cache-write premium) the
+            # live models API omits this field by design — cache-write tokens
+            # are just input tokens that were also written to cache and are
+            # billed at the regular input rate. So if we DO know the input
+            # rate, price cache-write at the input rate rather than dropping
+            # the entire turn as unpriced (which silently loses real spend).
+            # Only bail when input pricing is ALSO missing (truly unpriceable).
+            rate = entry.input_cost_per_million
+            if above and entry.input_cost_per_million_above is not None:
+                rate = entry.input_cost_per_million_above
+            _note = "cache-write priced at input rate (no separate cache-write rate published)"
+            if _note not in notes:
+                notes.append(_note)
+        if rate is None:
+            if tokens:
+                return _unknown_cost(entry.source, *note)
+            parts.append(_ZERO)
+            continue
+        parts.append(Decimal(tokens) * rate / _ONE_MILLION)
+    return parts
+
+
+def _multi_request_tier_parts(
+    entry: PricingEntry, usage: CanonicalUsage, notes: list[str], *, last_prompt: int,
+    last_usage: Optional[CanonicalUsage], requests: Optional[int],
+):
+    """Price a bill that sums several requests' prompts on a context-tiered route (t_044f701c).
+
+    Only the LAST request's prompt (``last_prompt``, and its buckets ``last_usage``) is reported;
+    the remainder R = S - L is the sum of the earlier prompts. Every earlier prompt is <= R, so
+    R <= T means every earlier request was below the tier; with exactly two requests R IS the
+    earlier request. Anything else cannot be tiered per request: unknown, never one guessed tier.
+    """
+    threshold = entry.tier_threshold_tokens
+    if last_usage is not None and prompt_tokens_unknown(last_usage):
+        # The last request's prompt is unmeasured: its placeholder zeros must not pick a tier or a
+        # split. Every request is <= S, so S <= T is still exact at base; otherwise unknown.
+        if usage.prompt_tokens <= threshold:
+            return _price_buckets(entry, usage, False, notes)
+        return _unknown_cost(
+            entry.source, "context tier mixed across requests; last request's prompt unmeasured",
+        )
+    remainder = max(int(usage.prompt_tokens) - int(last_prompt), 0)
+    last_above = last_prompt > threshold
+    if remainder <= threshold:
+        earlier_above = False
+    elif requests == 2:
+        earlier_above = True
+    else:
+        n = "several" if requests is None else str(requests)
+        return _unknown_cost(
+            entry.source,
+            f"context tier mixed across {n} requests; per-request prompt sizes unavailable",
+        )
+    if earlier_above == last_above:
+        return _price_buckets(entry, usage, last_above, notes)
+    if last_usage is None:
+        return _unknown_cost(
+            entry.source, "context tier mixed across requests; last request's token split unavailable",
+        )
+    rest = CanonicalUsage(
+        input_tokens=usage.input_tokens - last_usage.input_tokens,
+        cache_read_tokens=usage.cache_read_tokens - last_usage.cache_read_tokens,
+        cache_write_tokens=usage.cache_write_tokens - last_usage.cache_write_tokens,
+    )
+    if min(rest.input_tokens, rest.cache_read_tokens, rest.cache_write_tokens) < 0:
+        return _unknown_cost(entry.source, "relay bill smaller than its last request; unpriceable")
+    last = CanonicalUsage(
+        input_tokens=last_usage.input_tokens, cache_read_tokens=last_usage.cache_read_tokens,
+        cache_write_tokens=last_usage.cache_write_tokens,
+    )
+    # The relay reports output only as a sum, so its per-request tier is unknown: price it at the
+    # higher of the two tiers (an upper bound, never an under-bill) and say so.
+    output_only = CanonicalUsage(output_tokens=usage.output_tokens)
+    notes.append(
+        "context tier mixed across 2 requests; prompts priced per request, output priced at the "
+        "higher tier (per-request output split unavailable)"
+    )
+    priced = [
+        _price_buckets(entry, rest, earlier_above, notes),
+        _price_buckets(entry, last, last_above, notes),
+        _price_buckets(entry, output_only, True, notes),
+    ]
+    for part in priced:
+        if isinstance(part, CostResult):
+            return part
+    return [sum(column, _ZERO) for column in zip(*priced)]
+
+
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
     tier_prompt_tokens: Optional[int] = None,
+    tier_last_usage: Optional[CanonicalUsage] = None,
+    tier_requests: Optional[int] = None,
 ) -> CostResult:
-    """``tier_prompt_tokens``: the ONE request's prompt size that selects a context tier, when
-    ``usage`` bills several requests (a multi-request relay, t_caa85ee7); default ``usage.prompt_tokens``."""
+    """``tier_prompt_tokens``: the LAST request's own prompt when ``usage`` bills several requests
+    (a multi-request relay, t_caa85ee7); None = ``usage`` is one request. On a context-tiered route
+    the bill is priced per request where the payload allows it (``tier_last_usage`` = the last
+    request's own buckets, ``tier_requests`` = N) and is UNKNOWN where it does not (t_044f701c)."""
     from providers import get_provider_profile
     profile = get_provider_profile(provider or '')
     reported = profile.get_usage_cost(model_name, usage) if profile else None
@@ -3406,43 +3514,21 @@ def estimate_usage_cost(
         return _unknown_cost("none")
 
     # Whole-request context tier (e.g. Gemini Pro >200k prompts): above the
-    # threshold the *_above rates apply to the entire request; None falls back.
-    _tier_basis = usage.prompt_tokens if tier_prompt_tokens is None else tier_prompt_tokens
-    above = entry.tier_threshold_tokens is not None and _tier_basis > entry.tier_threshold_tokens
-    amount = _ZERO
+    # threshold the *_above rates apply to the entire request.
     notes: list[str] = []
-    parts: list[Decimal] = []
-    for tokens, rate, rate_above, note, is_cache_write in (
-        (usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, (), False),
-        (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, (), False),
-        (usage.cache_read_tokens, entry.cache_read_cost_per_million, entry.cache_read_cost_per_million_above,
-         ("cache-read pricing unavailable for route",), False),
-        (usage.cache_write_tokens, entry.cache_write_cost_per_million, entry.cache_write_cost_per_million_above,
-         ("cache-write pricing unavailable for route",), True),
-    ):
-        if above and rate_above is not None:
-            rate = rate_above
-        if rate is None and is_cache_write and tokens and entry.input_cost_per_million is not None:
-            # No published cache-write rate. For OpenAI-family routes (and any
-            # provider that doesn't charge a separate cache-write premium) the
-            # live models API omits this field by design — cache-write tokens
-            # are just input tokens that were also written to cache and are
-            # billed at the regular input rate. So if we DO know the input
-            # rate, price cache-write at the input rate rather than dropping
-            # the entire turn as unpriced (which silently loses real spend).
-            # Only bail when input pricing is ALSO missing (truly unpriceable).
-            rate = entry.input_cost_per_million
-            if above and entry.input_cost_per_million_above is not None:
-                rate = entry.input_cost_per_million_above
-            notes.append("cache-write priced at input rate (no separate cache-write rate published)")
-        if rate is None:
-            if tokens:
-                return _unknown_cost(entry.source, *note)
-            parts.append(_ZERO)
-            continue
-        part = Decimal(tokens) * rate / _ONE_MILLION
-        parts.append(part)
-        amount += part
+    if tier_prompt_tokens is not None and entry.tier_threshold_tokens is not None:
+        priced = _multi_request_tier_parts(
+            entry, usage, notes, last_prompt=int(tier_prompt_tokens),
+            last_usage=tier_last_usage, requests=tier_requests,
+        )
+    else:
+        above = (entry.tier_threshold_tokens is not None
+                 and usage.prompt_tokens > entry.tier_threshold_tokens)
+        priced = _price_buckets(entry, usage, above, notes)
+    if isinstance(priced, CostResult):
+        return priced
+    parts: list[Decimal] = priced
+    amount = sum(parts, _ZERO)
     # Fork: per-class cost attribution (CostResult cost_*_usd fields), priced at
     # the tier-aware rates resolved above. The four parts sum to amount_usd.
     cost_input, cost_output, cost_cache_read, cost_cache_write = parts

@@ -21,7 +21,8 @@ from agent.usage_pricing import (
     USAGE_UNKNOWN_FIELDS, cache_stats_line, estimate_usage_cost, prompt_tokens_unknown,
     verbose_token_usage_log_args, with_served_service_tier,
 )
-from agent.usage_pricing_relay import relay_billed_usage
+from agent.usage_pricing_relay import _count as _relay_count
+from agent.usage_pricing_relay import _relay_field, relay_billed_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -149,8 +150,21 @@ def record_response_usage(
     billed_flags = {key: bool(getattr(billed_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
     # A multi-request bill sums several prompts; a context-tiered price is chosen per request, so the
     # tier basis is the last request's own prompt (t_caa85ee7). None = the bill is one request.
+    # The last request's buckets and N let pricing split a bill whose requests straddle the tier,
+    # or refuse it as unknown when the payload cannot say which request was above (t_044f701c).
     _tier_prompt_tokens = (
         None if billed_aggregator is aggregator_usage else int(aggregator_usage.prompt_tokens or 0)
+    )
+    _tier_last_usage = None if _tier_prompt_tokens is None else {
+        "input_tokens": aggregator_usage.input_tokens,
+        "cache_read_tokens": aggregator_usage.cache_read_tokens,
+        "cache_write_tokens": aggregator_usage.cache_write_tokens,
+        # An unmeasured last prompt is zeros + flags; pricing must see the flags, not the zeros.
+        **{key: bool(getattr(aggregator_usage, key)) for key in USAGE_UNKNOWN_FIELDS},
+    }
+    _tier_requests = (
+        None if _tier_prompt_tokens is None
+        else _relay_count(_relay_field(getattr(response, "usage", None), "upstream_requests"))
     )
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
@@ -319,6 +333,8 @@ def record_response_usage(
                 "context_cache_read_tokens": aggregator_usage.cache_read_tokens,
                 "context_cache_write_tokens": aggregator_usage.cache_write_tokens,
                 "tier_prompt_tokens": _tier_prompt_tokens,
+                "tier_last_usage": _tier_last_usage,
+                "tier_requests": _tier_requests,
                 "latency_s": api_duration,
                 "composition": call_composition,
                 "provider": _route["provider"],
@@ -390,6 +406,8 @@ def record_response_usage(
                     _moa_ref_pricing_calls, billed_aggregator, aggregator_model=_agg_cost_model,
                     aggregator_provider=_agg_cost_provider, aggregator_base_url=_agg_cost_base_url,
                     aggregator_tier_prompt_tokens=_tier_prompt_tokens,
+                    aggregator_tier_last_usage=_tier_last_usage,
+                    aggregator_tier_requests=_tier_requests,
                 )
                 # Ledger each physical advisor/aggregator call as a child of this composite call's
                 # virtual turn_api_calls row (card t_02323499).
@@ -408,6 +426,8 @@ def record_response_usage(
         _agg_cost_model, billed_aggregator, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
         tier_prompt_tokens=_tier_prompt_tokens,
+        tier_last_usage=None if _tier_prompt_tokens is None else aggregator_usage,
+        tier_requests=_tier_requests,
     )
     _cost_status = _loop._session_cost_status_with_known_spend(
         _loop._moa_session_cost_status(cost_result, _moa_ref_pricing_calls, _moa_ref_cost),
