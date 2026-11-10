@@ -102,13 +102,18 @@ def test_hosted_context_rejection_far_below_the_known_window_compresses():
 @pytest.mark.parametrize("provider", ["claude-dtlr", "custom"])
 def test_loopback_relay_context_rejection_compresses_once(provider, caplog):
     error = "context_length_exceeded: prompt is too long: the interactive session hit the model context limit; compact the history"
-    kwargs = dict(window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider=provider, error=error)
-    verdict, compressed = _context_rejection(155_618, **kwargs)
+    verdict, compressed = _context_rejection(
+        155_618, window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider=provider, error=error,
+    )
     assert compressed and verdict.action == "break"
     assert verdict.provider_overflow_recovery_pending
     assert "155618" in caplog.text and "observed_rejected_request_tokens" in caplog.text
-    verdict, compressed = _context_rejection(155_618, compression_attempts=1, **kwargs)
+    verdict, compressed = _context_rejection(
+        155_618, window=1_000_000, base_url="http://127.0.0.1:18816/v1/", provider=provider,
+        error=error, compression_attempts=1,
+    )
     assert not compressed and verdict.action == "return"
+    assert verdict.result is not None
     assert verdict.result["failure_reason"] == "context_overflow"
 
 

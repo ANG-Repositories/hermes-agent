@@ -748,6 +748,29 @@ def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "failed"
 
 
+def test_context_overflow_child_requeues_wake_across_failed_home_admission(env, monkeypatch):
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    real_resurface = ah.resurface
+
+    async def unavailable(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(ah, "resurface", unavailable)
+    _run(env, entry, "failed", "context_length_exceeded: This conversation has grown too long for claude-fable-5-2")
+    state = ah.BoomerangWakeState()
+    assert state.handbacks()[entry["delegation_id"]]["parts"] == [ah.PART_TURN]
+    assert state.get_claim(entry["key"])["resurface_delivered"] is False
+    monkeypatch.setattr(ah, "resurface", real_resurface)
+    asyncio.run(ah.reconcile(env["runner"], state=ah.BoomerangWakeState()))
+    asyncio.run(ah.reconcile(env["runner"], state=ah.BoomerangWakeState()))
+    assert [event.text for event in env["adapter"].handled] == [entry["wake_text"]]
+    assert state.handbacks() == {}
+    assert state.get_claim(entry["key"])["resurface_delivered"] is True
+    assert len(env["adapter"].sent) == 1
+
+
 @pytest.mark.parametrize("stop", [True, False])
 def test_child_stop_attribution_preserves_wake(env, stop):
     """Exercise delegate-result decoding as well as the durable failure handback."""

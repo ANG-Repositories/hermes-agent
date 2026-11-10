@@ -400,15 +400,10 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
 
     new_ctx = _adopt_provider_context_limit(st, error_msg, old_ctx)
 
-    # A rejection the transcript cannot explain (#114644): the request sits far below the window
-    # Hermes knows for this model (after adopting any limit the server reported), so compressing
-    # would destroy history for nothing. Single-slot local servers reject like this while ANOTHER
-    # request — a background review from an earlier session — holds their context. Name that,
-    # keep the turn retryable and transient: no "conversation too long", no gateway auto-reset.
-    # Only when the server quoted NO measurement of its own: "prompt is too long: 233153 tokens
-    # > 200000" is the server's count and beats the local estimate. Local endpoints only: a hosted
-    # route has no shared slot, so the same rejection means its real window is smaller than the one
-    # Hermes assumes, and "wait and /retry" would fail identically forever; compress instead.
+    # Ambiguous generic failures on local single-slot servers can mean another
+    # request holds their context. An explicit context_length_exceeded is different:
+    # loopback may be a relay to a hosted provider, so trust that rejection and
+    # compress once rather than classifying it as local contention.
     window = agent.context_compressor.context_length
     request_tokens = st.request_tokens() + max(0, int(getattr(agent, "max_tokens", 0) or 0))
     explicit_context_rejection = "context_length_exceeded" in error_msg.lower()
