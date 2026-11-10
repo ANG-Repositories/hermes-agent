@@ -1490,6 +1490,11 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
                 return pool_pressure_label(pp)
             return "relay unavailable"
         if "budget" in t and "capped" in t:
+            # Name the model and say "not account-wide" only when the relay's own text scopes the cap
+            # to the requested model (#188 follow-up, Prism 341f2b8e51c2); a bare or account budget cap
+            # keeps the spec-pinned wording (route-notice spec rev12 §4.8).
+            if "requested model" not in t and "other models" not in t:
+                return "model budget capped"
             model = str(row.get("from_model") or "the requested model")
             provider = str(row.get("from_provider") or "the requested provider")
             return (f"model budget capped for {model} via {provider} "
