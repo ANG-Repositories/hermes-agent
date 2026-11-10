@@ -49,7 +49,9 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -538,6 +540,57 @@ def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
     if rc != 0:
         raise RuntimeError(f"worktree clone of {slug} on {host.name} failed rc={rc}: "
                            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+
+
+# Pool-host clone off the dispatcher tick (t_915b8d2d). A gateway tick measured 5 of 6 py-spy samples in
+# clone_on_host: the ssh fetch + clone ran inside the per-row loop and every other ready row waited on it.
+# The gateway tick now STARTS the push+clone here and moves on. The card waits ``clone_pending`` and is claimed
+# and launched on a later tick, once the clone has finished. A failed clone is raised at the old call site, so
+# the claim release, spillover refund and failure accounting stay the existing exception path. Only the
+# long-lived gateway tick uses this (``defer_pool_clone``): a one-shot CLI process would exit with the clone
+# thread still running.
+CLONE_PENDING = "clone_pending"
+CLONE_PREFETCH_WORKERS = 4
+CLONE_PREFETCH_TTL_S = 3600.0
+_prefetch_lock = threading.Lock()
+_prefetch: Dict[tuple, tuple] = {}   # key -> (Future, started monotonic)
+_prefetch_pool: Optional[ThreadPoolExecutor] = None
+
+
+def clone_key(task_id: str, host_name: str, workspace: str, slug: str, mirror: str, branch: str) -> tuple:
+    return (task_id, host_name, str(workspace), slug, mirror, branch)
+
+
+def clone_ready(key: tuple, job: Callable[[], None]) -> bool:
+    """True once ``job`` (push + clone for ``key``) has finished, ok or failed. On the first call it is started
+    on a small background pool and False is returned. While it runs this returns False. The caller collects
+    the outcome with :func:`take_clone`."""
+    global _prefetch_pool
+    now = time.monotonic()
+    with _prefetch_lock:
+        for k, (fut, t0) in list(_prefetch.items()):
+            if fut.done() and now - t0 > CLONE_PREFETCH_TTL_S:
+                del _prefetch[k]    # finished, never collected (the card moved on): forget it
+        entry = _prefetch.get(key)
+        if entry is None:
+            if _prefetch_pool is None:
+                _prefetch_pool = ThreadPoolExecutor(max_workers=CLONE_PREFETCH_WORKERS,
+                                                    thread_name_prefix="kanban-clone")
+            _prefetch[key] = (_prefetch_pool.submit(job), now)
+            return False
+        return entry[0].done()
+
+
+def take_clone(key: tuple) -> bool:
+    """Collect a finished prefetched clone: True when it succeeded, False when none is recorded for ``key``
+    (the caller clones synchronously). Re-raises the clone's own exception when it failed."""
+    with _prefetch_lock:
+        entry = _prefetch.get(key)
+        if entry is None or not entry[0].done():
+            return False
+        del _prefetch[key]
+    entry[0].result()
+    return True
 
 
 def convert(conn, task, workspace: str, branch: str, *, host: str, slug: str,

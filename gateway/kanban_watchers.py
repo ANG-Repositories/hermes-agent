@@ -4224,6 +4224,8 @@ class GatewayKanbanWatchersMixin:
                     reconcile_orphans=reconcile_orphans,
                     budget_cache=budget_cache,
                     spillover=spillover,
+                    # The long-lived gateway tick runs pool-host clones in the background (t_915b8d2d).
+                    defer_pool_clone=True,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
