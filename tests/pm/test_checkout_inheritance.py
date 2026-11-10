@@ -18,13 +18,24 @@ def test_foreign_child_drops_checkout_contract(tmp_path):
     child = tmp_path / "child"
     venv.EnvBuilder(with_pip=False).create(child)
     repo = Path(__file__).resolve().parents[2]
+    (parent / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages' / 'supervisor_only.py').touch()
+    inherited_site = parent / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages'
+    unrelated = tmp_path / 'unrelated'
+    unrelated.mkdir()
     code = (f"import sys, os; sys.path.insert(0, {str(repo)!r}); "
             "from pathlib import Path; from pm.environments import activate_dependencies; "
             f"activate_dependencies(Path({str(root)!r})); "
-            "assert 'HERMES_CHECKOUT_VENV' not in os.environ; print('child started')")
+            "assert 'HERMES_CHECKOUT_VENV' not in os.environ; "
+            f"assert {str(root)!r} not in sys.path; "
+            f"assert {str(inherited_site)!r} not in sys.path; "
+            f"assert {str(unrelated)!r} in sys.path; "
+            f"assert os.environ['PYTHONPATH'] == {str(unrelated)!r}; "
+            "import importlib.util; assert importlib.util.find_spec('supervisor_only') is None; "
+            "print('child started')")
     for python in (sys.executable, str(child / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))):
         result = subprocess.run([python, "-c", code],
-                                env=dict(os.environ, HERMES_CHECKOUT_VENV=str(parent), HERMES_HOME=str(tmp_path / 'home')),
+                                env=dict(os.environ, HERMES_CHECKOUT_VENV=str(parent), HERMES_HOME=str(tmp_path / 'home'),
+                                         PYTHONPATH=os.pathsep.join([str(root), str(inherited_site), str(unrelated)])),
                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "child started"

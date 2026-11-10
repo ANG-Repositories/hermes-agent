@@ -345,6 +345,13 @@ def activate_dependencies(project_root: Path) -> None:
         # Workers, cron and terminal children may deliberately use another Python.
         # The supervisor's contract does not own that interpreter or its children.
         os.environ.pop("HERMES_CHECKOUT_VENV", None)
+        supervisor = Path(owned).absolute()
+        if supervisor.name == "venv":
+            rejected = {supervisor.parent.resolve(), site_packages(supervisor).resolve()}
+            inherited = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+            os.environ["PYTHONPATH"] = os.pathsep.join(
+                entry for entry in inherited if entry and Path(entry).resolve() not in rejected)
+            sys.path[:] = [entry for entry in sys.path if Path(entry).resolve() not in rejected]
 
     state = install_state_dir(project_root)
     if state.is_dir():
