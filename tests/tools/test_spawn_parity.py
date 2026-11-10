@@ -12,6 +12,7 @@ SHELLOPTS/BASHOPTS this way.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -57,14 +58,15 @@ _MATRIX = ["shellopts-pipefail", "shellopts-errexit-pipefail", "bashopts-nullglo
 
 def _observe(monkeypatch, tmp_path, extra_env: dict, nofork_on: bool, tag: str) -> dict:
     monkeypatch.setattr(nofork, "_FORK_COPIES_PARENT", nofork_on)
-    spawns = []
-    real_spawn = os.posix_spawn
+    spawns = []  # return codes of native libc posix_spawn calls
+    real_spawn = nofork._native_spawn
 
     def counted(*args, **kwargs):
-        spawns.append(args[1])
-        return real_spawn(*args, **kwargs)
+        rc, pid = real_spawn(*args, **kwargs)
+        spawns.append(rc)
+        return rc, pid
 
-    monkeypatch.setattr(os, "posix_spawn", counted)
+    monkeypatch.setattr(nofork, "_native_spawn", counted)
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     out = tmp_path / f"out-{tag}"
@@ -82,9 +84,10 @@ def _observe(monkeypatch, tmp_path, extra_env: dict, nofork_on: bool, tag: str) 
     seen = {p.name: p.read_bytes() for p in sorted(out.iterdir())}
     seen["returncode"] = result["returncode"]
     seen["output"] = result["output"]
-    # The probe itself must have run through the path under test.
-    took_nofork = any(len(argv) > 4 and argv[4] == nofork._EXEC_HELPER for argv in spawns)
-    assert took_nofork is (nofork_on and hasattr(os, "posix_spawn")), spawns
+    # Which path really started the probe: a native spawn that RETURNED 0, or plain Popen.
+    seen["_native_spawned"] = 0 in spawns
+    if not nofork_on:
+        assert not spawns, spawns
     return seen
 
 
@@ -95,6 +98,12 @@ def test_nofork_spawn_matches_plain_popen(monkeypatch, tmp_path, case):
     monkeypatch.delenv("HERMES_SPAWN_LEGACY", raising=False)
     plain = _observe(monkeypatch, tmp_path, extra, nofork_on=False, tag="plain")
     spawned = _observe(monkeypatch, tmp_path, extra, nofork_on=True, tag="nofork")
+    if not spawned.pop("_native_spawned"):
+        # Off macOS there is no native binding: both arms were plain Popen, so a comparison
+        # would prove nothing. On macOS the native path must have run.
+        assert sys.platform != "darwin", "the no-fork arm did not start the probe natively on macOS"
+        pytest.skip(f"no native posix_spawn on {sys.platform}: both arms are plain Popen")
+    plain.pop("_native_spawned")
     differences = {k: (plain.get(k), spawned.get(k)) for k in plain.keys() | spawned.keys()
                    if plain.get(k) != spawned.get(k)}
     assert not differences, differences
