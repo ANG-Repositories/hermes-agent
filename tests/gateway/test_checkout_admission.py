@@ -1258,6 +1258,42 @@ def test_lease_thread_renews_while_serving_loop_is_stalled(store):
         g.stop_lease()
 
 
+def test_concurrent_same_name_publish_never_drops_the_shared_mark(store, monkeypatch):
+    """Two publishers under one name, interleaved the way a busy host runs them: A reads
+    the record (its own), B writes a record that names A as a peer, then A writes. A's
+    write was computed from a read that predates B's, so it carried no ``shared_with`` and
+    ``evaluate`` read QUIESCENT while both were live (test_lease_real_publisher_killed_9
+    red on ACE-AI at load ~40/32t). The read-mark-write of one record is serialized
+    across processes, so B's write lands after A's and keeps the mark."""
+    store.hold("op", [SERVE], mode="freeze")
+    a = AdmissionGate(ca.HoldStore(store.directory), SERVE, active_work=Work(), lease_s=30)
+    b = AdmissionGate(ca.HoldStore(store.directory), SERVE, active_work=Work(), lease_s=30)
+    a.publish()
+    a_read, b_tried = threading.Event(), threading.Event()
+    real_read = a.store.read_consumer
+
+    def read_then_stall(name):
+        rec = real_read(name)
+        if threading.current_thread().name == "publisher-a":
+            a_read.set()
+            b_tried.wait(5)
+        return rec
+
+    monkeypatch.setattr(a.store, "read_consumer", read_then_stall)
+    ta = threading.Thread(target=a.publish, name="publisher-a")
+    ta.start()
+    assert a_read.wait(5)
+    tb = threading.Thread(target=b.publish, name="publisher-b")
+    tb.start()
+    tb.join(1.0)  # unserialized: B writes now; serialized: B waits for A's write
+    b_tried.set()
+    ta.join(10)
+    tb.join(10)
+    assert not ta.is_alive() and not tb.is_alive()
+    assert store.read_consumer(SERVE).get("shared_with"), "the last write dropped the live peer"
+    assert ca.evaluate(store)["verdict"] == UNKNOWN
+
+
 def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
     """Real process: a second publisher under our name, then SIGKILL. Its
     lease expires after 3*lease_s and the shared flag clears."""

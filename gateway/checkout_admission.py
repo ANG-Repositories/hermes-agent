@@ -456,6 +456,21 @@ class HoldStore:
     def write_consumer(self, name: str, record: Mapping[str, Any]) -> None:
         _atomic_write_json(self.consumer_path(name), record)
 
+    @contextlib.contextmanager
+    def consumer_lock(self, name: str):
+        """Exclusive across processes for one consumer record, so a publisher's
+        read-mark-write of a shared name is one step: without it a write computed
+        from a read that predates a peer's write drops the peer's ``shared_with``."""
+        self.consumers_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.consumers_dir / f".{_consumer_filename(name)}.lock", "a+b") as fh:
+            if fcntl is not None:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+
     def read_consumer(self, name: str) -> Optional[dict]:
         try:
             raw = self.consumer_path(name).read_text(encoding="utf-8-sig")
@@ -744,7 +759,7 @@ class AdmissionGate:
     def _write(self, record: dict, *, release: bool = False) -> dict:
         """Mark + write as one step (the serving loop and the lease thread
         both write); stamps the lease on success."""
-        with self._write_lock:
+        with self._write_lock, self.store.consumer_lock(self.consumer):
             record = dict(record)
             record.pop("shared_with", None)
             record.pop("lease_released", None)
