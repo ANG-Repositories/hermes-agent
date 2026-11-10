@@ -1168,12 +1168,21 @@ def connect(
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
-                _migrate_add_optional_columns(conn)
-                _kb._ensure_status_audit(conn)
-                from hermes_cli.kanban_failure_ownership import migrate
-                migrate(conn)
-                from hermes_cli.kanban_lifecycle_guards import install
-                install(conn)
+                # Column-presence gates one-shot backfills. Roll back both the
+                # ALTER and its backfill together if initialization is retried.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _migrate_add_optional_columns(conn)
+                    _kb._ensure_status_audit(conn)
+                    from hermes_cli.kanban_failure_ownership import migrate
+                    migrate(conn)
+                    from hermes_cli.kanban_lifecycle_guards import install
+                    install(conn)
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
                 _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 

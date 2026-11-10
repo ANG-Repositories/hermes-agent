@@ -146,6 +146,26 @@ assert auth_constants.CODEX_OAUTH_USER_AGENT == 'hermes-cli/request-sentinel'
     assert result.returncode == 0, result.stderr
 
 
+def test_migration_backfill_is_atomic_across_busy_retry(tmp_path, monkeypatch):
+    db = tmp_path / "migration.db"
+    real = kbc._migrate_add_optional_columns
+    attempts = []
+    def interrupted(conn):
+        attempts.append(1)
+        conn.execute("CREATE TABLE IF NOT EXISTS retry_canary (id INTEGER PRIMARY KEY)")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(retry_canary)")}
+        if "delivery_mode" not in columns:
+            conn.execute("ALTER TABLE retry_canary ADD COLUMN delivery_mode TEXT DEFAULT 'notify'")
+            if len(attempts) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            conn.execute("INSERT INTO retry_canary VALUES (1, 'notify+wake')")
+        real(conn)
+    monkeypatch.setattr(kbc, "_migrate_add_optional_columns", interrupted)
+    with kbc.connect_closing(db_path=db) as conn:
+        assert conn.execute("SELECT delivery_mode FROM retry_canary").fetchone()[0] == "notify+wake"
+    assert len(attempts) == 2
+
+
 def test_read_scope_resets_after_error():
     with pytest.raises(ValueError):
         with kbc.read_scope():
