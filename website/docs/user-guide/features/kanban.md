@@ -1312,14 +1312,17 @@ The GUI is deliberately thin. Everything the plugin does is reachable from the C
 ## Studio placement pins
 
 A first-line `host: studio` or `host: mac-studio*` needs a `requires:` line
-naming a Studio-served capability. Create and body edits refuse an unjustified
-pin and list the accepted words from `fleet/host-capabilities.json` (the Studio
-row plus `control-plane-read`). Add `requires: studio-state` only when the task
+naming a Studio-served capability. By default, create and body edits accept an
+unjustified pin unchanged, print a warning listing accepted words, and persist
+one placement notice shared with dispatch. The words come from
+`fleet/host-capabilities.json` (the Studio row plus `control-plane-read`). Add `requires: studio-state` only when the task
 needs that state; otherwise remove the pin. When `CARD_NEEDS` already identifies
 Studio relay, launchd, Obsidian vault, skills tree or live Studio tree work, the
 entry path adds `requires: studio-state` and create reports the derivation.
-`kanban.studio_pin_requires_reason: false` disables this entry guard. An absent
-or invalid capability map retains the existing safe-local behavior.
+`kanban.studio_pin_requires_reason` accepts `notice` (default), `refuse` (opt-in
+rejection), or `off` (no entry warning, notice, or derivation). Legacy booleans
+remain supported: `true` means `refuse`, `false` means `off`. Refusal is not armed
+by default. An absent or invalid capability map retains the existing safe-local behavior.
 
 Legacy bare pins can still reach dispatch. The dispatcher logs their removal at
 WARNING (rate-limited per card) and persists one card comment beginning

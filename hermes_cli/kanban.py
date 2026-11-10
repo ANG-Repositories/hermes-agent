@@ -1159,13 +1159,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         scope_warning = kb.inferred_scope_warning(task.body)
         if scope_warning:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
-        try:
-            from hermes_cli import kanban_worker_pool as _kpool
-            _pin_note = _kpool.mint_studio_pin_note(task.body, kb.kanban_home() / "fleet",
-                                                    getattr(task, "skills", None))
-        except Exception:
-            _pin_note = None
-        for _note in (*_placement_notes, *((_pin_note,) if _pin_note else ())):
+        for _note in _placement_notes:
             print(f"placement: {task_id}: {_note}", file=sys.stderr)
 
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle

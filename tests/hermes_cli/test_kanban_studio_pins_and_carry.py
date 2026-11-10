@@ -139,7 +139,7 @@ def test_create_prints_the_drop(kanban_home, monkeypatch):
 
 @pytest.mark.parametrize("host", ["studio", "mac-studio-m3u"])
 def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, host):
-    (kanban_home / "config.yaml").unlink()
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: refuse\n")
     monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
     with kb.connect_closing() as conn:
         with pytest.raises(ValueError, match="accepted words:.*studio-state"):
@@ -170,6 +170,57 @@ def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, hos
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="disabled", body=f"host: {host}")
         assert kb.get_task(conn, tid).body.endswith(f"host: {host}")
+
+
+@pytest.mark.parametrize("mode, refuses, warns", [
+    (None, False, True), ("notice", False, True), ("refuse", True, False),
+    ("off", False, False), (True, True, False), (False, False, False),
+])
+def test_entry_modes_preserve_bare_pins_and_notice_once(kanban_home, monkeypatch, capsys,
+                                                       mode, refuses, warns):
+    config = kanban_home / "config.yaml"
+    if mode is None:
+        config.unlink()
+    else:
+        config.write_text("kanban:\n  studio_pin_requires_reason: " + json.dumps(mode) + "\n")
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    from hermes_cli import kanban as cli
+    with kb.connect_closing() as conn:
+        if refuses:
+            with pytest.raises(ValueError, match="accepted words:"):
+                kb.create_task(conn, title="mode create", body="host: studio\nfix lint")
+        else:
+            output = cli.run_slash("--board default create 'mode create' --body 'host: studio\nfix lint'")
+            assert ("Warning: bare host: studio" in output) == warns
+            if warns:
+                assert output.count("Warning: bare host: studio") == 1
+                assert "accepted words:" in output and "studio-state" in output
+            tid = conn.execute("SELECT id FROM tasks WHERE title='mode create'").fetchone()[0]
+            assert kb.get_task(conn, tid).body.endswith("host: studio\nfix lint")
+            before = conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
+            assert sum(r[0].startswith("[placement] bare host: studio") for r in before) == int(warns)
+            _route(conn, tid, _caps())
+            after = conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
+            assert sum(r[0].startswith("[placement] bare host: studio") for r in after) == 1
+        tid = kb.create_task(conn, title="mode edit", body="host: any")
+        original = kb.get_task(conn, tid).body
+        stamped = original.replace("host: any", "host: mac-studio-m3u\nfix lint")
+        capsys.readouterr()
+        if refuses:
+            with pytest.raises(ValueError, match="accepted words:"):
+                kb.edit_task(conn, tid, body=stamped)
+            assert kb.get_task(conn, tid).body == original
+        else:
+            assert kb.edit_task(conn, tid, body=stamped)
+            assert kb.get_task(conn, tid).body == stamped
+            output = capsys.readouterr().err
+            assert ("Warning: bare host: studio" in output) == warns
+            assert output.count("Warning: bare host: studio") == int(warns)
+        if mode is not False and mode != "off":
+            capsys.readouterr()
+            derived = kb.create_task(conn, title="mode derived", body="host: studio\nlaunchctl print gui/501")
+            assert "requires: studio-state" in kb.get_task(conn, derived).body
+            assert "Warning: bare host: studio" not in capsys.readouterr().err
 
 
 def test_drop_notice_is_durable_and_warning(kanban_home, caplog):

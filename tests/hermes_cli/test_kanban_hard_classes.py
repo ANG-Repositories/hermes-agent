@@ -203,7 +203,7 @@ def test_docker_goes_only_to_the_advertising_host(home):
 
 def test_docker_with_a_studio_pin_spawns_on_the_studio(home):
     with kb.connect_closing() as conn:
-        tid = _card(conn, "host: studio\nrequires: docker\n" + DOCKER)
+        tid = _card(conn, "host: studio\n" + DOCKER)
         res, spawned = _tick(conn)
         assert spawned == [(tid, "studio")] and not res.placed
 
@@ -261,7 +261,7 @@ def test_identity_only_waits_with_no_pool_plan(home):
     waits instead of spawning on the Studio. `host: studio` still runs."""
     with kb.connect_closing() as conn:
         tid = _card(conn, DOCKER)
-        pinned = _card(conn, "host: studio\nrequires: docker\n" + DOCKER)
+        pinned = _card(conn, "host: studio\n" + DOCKER)
         spawned = []
 
         def spawn(task, workspace, *, board=None, placement=None):
