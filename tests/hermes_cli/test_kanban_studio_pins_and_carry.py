@@ -309,7 +309,7 @@ def test_local_files_kill_switch_keeps_the_old_pin(kanban_home, carried):
 
 
 def test_local_files_too_big_to_carry_keeps_the_old_pin(kanban_home, carried, monkeypatch):
-    monkeypatch.setattr(kwh, "carry_size_ok", lambda path: False)
+    monkeypatch.setattr(kwh, "carry_size_ok", lambda path, **_kw: False)
     with kb.connect_closing() as conn:
         tid, _ = _card_with_files(conn)
         assert _route(conn, tid, None) == (("local", None), "local_files", False)
@@ -336,20 +336,92 @@ def test_carry_size_ok_bounds(tmp_path):
     assert not kwh.carry_size_ok(None)
 
 
-def test_carry_scan_deadline_fails_closed_and_caches_refusal(tmp_path, monkeypatch):
-    import time
-
-    d = tmp_path / "bounded"
+def _ten_files(tmp_path, name):
+    d = tmp_path / name
     d.mkdir()
     for i in range(10):
         (d / str(i)).write_text("work")
     kwh._carry_scan_cache.clear()
-    ticks = iter([0.0, 0.0, 0.0, 1.0])
-    monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 1.0))
-    assert not kwh.carry_size_ok(str(d))
-    # Refusals are cached at completion, not at the start of a slow scan.
-    monkeypatch.setattr(kwh.os, "scandir", lambda *_: pytest.fail("rescanned"))
-    assert not kwh.carry_size_ok(str(d), now=2.0)
+    return str(d)
+
+
+class _Clock:
+    """Advances ``step`` seconds per read: every walk check costs measurable wall."""
+
+    def __init__(self, step):
+        self.t, self.step = 0.0, step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+def _no_walk(*_a, **_k):
+    pytest.fail("walked a path the cache or the budget should have answered")
+
+
+def test_carry_scan_past_its_wall_bound_is_refused_and_cached(tmp_path, monkeypatch):
+    # t_915b8d2d: one unbounded walk held a live tick for minutes. Past max_seconds the path is refused, and the
+    # refusal is cached so later ticks do not pay for it again.
+    d = _ten_files(tmp_path, "slow")
+    budget = kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0))
+    assert not kwh.carry_size_ok(d, budget=budget, max_seconds=0.5)
+    assert budget.deferred == 0 and budget.spent_s > 0
+    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    assert not kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0)))
+
+
+def test_carry_scan_out_of_tick_budget_is_deferred_uncached(tmp_path, monkeypatch):
+    # The tick's budget is spent: the row keeps the old rule THIS tick and is judged afresh on the next one.
+    d = _ten_files(tmp_path, "later")
+    spent = kwh.CarryScanBudget(seconds=0.0)
+    with monkeypatch.context() as m:
+        m.setattr(kwh.os, "walk", _no_walk)
+        assert not kwh.carry_size_ok(d, budget=spent)
+    assert spent.deferred == 1
+    assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget())
+
+
+def test_carry_scan_cut_by_the_tick_budget_is_deferred_uncached(tmp_path):
+    d = _ten_files(tmp_path, "cut")
+    budget = kwh.CarryScanBudget(seconds=0.5, clock=_Clock(1.0))
+    assert not kwh.carry_size_ok(d, budget=budget, max_seconds=10.0)
+    assert budget.deferred == 1 and budget.left() <= 0
+    assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget())
+
+
+def test_carry_scan_cache_is_stamped_when_the_walk_ends(tmp_path, monkeypatch):
+    # A walk that started TTL ago but just finished is fresh: a slow tick must not expire its own census.
+    d = _ten_files(tmp_path, "stamp")
+    clock = _Clock(0.0)
+    budget = kwh.CarryScanBudget(seconds=1e9, clock=clock)
+    real_walk = kwh.os.walk
+
+    def walk_then_jump(*a, **k):
+        clock.t += kwh.CARRY_SCAN_TTL_SECONDS + 10
+        return real_walk(*a, **k)
+
+    with monkeypatch.context() as m:
+        m.setattr(kwh.os, "walk", walk_then_jump)
+        assert kwh.carry_size_ok(d, budget=budget, max_seconds=1e9)
+    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(clock=clock))
+
+
+def test_a_spent_carry_budget_never_holds_a_portable_peer(kanban_home, carried, monkeypatch):
+    # Saturated Studio, two local_files rows and one plain portable row, and no carry budget left: the portable
+    # row is placed this tick, the local_files rows keep the old rule (not carried) and are counted as deferred.
+    monkeypatch.setattr(kwh, "CARRY_TICK_SCAN_SECONDS", 0.0)
+    with kb.connect_closing() as conn:
+        lf1, _ = _card_with_files(conn)
+        lf2, _ = _card_with_files(conn)
+        port = kb.create_task(conn, title="portable", assignee="alpha")
+        res, spawned = _tick(conn, spillover=_plan(free=3), spawn_limit=0, spawn_paused="saturated:cpu")
+    assert (port, "ace-ai") in spawned
+    assert carried == []
+    assert not any(t in (lf1, lf2) for t, _h in spawned)
+    assert res.carry_scans_deferred == 2
+    assert res.route_ms >= res.carry_scan_ms >= 0
 
 
 def test_carry_scan_cache_respects_limits(tmp_path):

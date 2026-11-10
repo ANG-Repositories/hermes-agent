@@ -337,11 +337,17 @@ CARRY_MAX_BYTES = 1024 ** 3
 CARRY_MAX_ENTRIES = 20000
 CARRY_TIMEOUT_SECONDS = 300
 CARRY_SCAN_TTL_SECONDS = 300
+# Wall bounds on the in-tick size census (t_915b8d2d): on a loaded Studio one walk took minutes and every ready
+# local_files row walked in the routing pass, so a tick ran 4-30 min and new portable cards waited for it. A path
+# whose walk outlives CARRY_SCAN_MAX_SECONDS is refused (cached, like any refusal); once a tick has spent
+# CARRY_TICK_SCAN_SECONDS on walks, the rest of its rows are refused uncached and walked on a later tick.
+CARRY_SCAN_MAX_SECONDS = 2.0
+CARRY_TICK_SCAN_SECONDS = 5.0
 CARRIED_EVENT = "workspace_carried"
 # portable() bind rule of a carried card: once carried, every later run binds to the host holding the copy
 # (custody, independent of placement.continuation); the Studio original is never run against or carried again.
 CARRY_BIND_RULE = "workspace_carry"
-_carry_scan_cache: Dict[str, tuple] = {}
+_carry_scan_cache: Dict[tuple, tuple] = {}
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
 # and ``--protect-args`` is not portable across them (Prism a39b11fdf16d). So a carried path is limited to a
 # charset no shell interprets: absolute, components of [A-Za-z0-9._@+-], no empty / . / .. component, none
@@ -408,11 +414,31 @@ def carry_path_shared(conn, task_id: str, workspace_path: Optional[str]) -> bool
     return False
 
 
+class CarryScanBudget:
+    """One tick's wall budget for :func:`carry_size_ok` walks. ``spent_s`` and ``deferred`` feed the tick record."""
+
+    def __init__(self, seconds: Optional[float] = None, clock: Optional[Callable[[], float]] = None):
+        import time as _time
+        self.clock = clock or _time.monotonic
+        self.seconds = CARRY_TICK_SCAN_SECONDS if seconds is None else seconds
+        self.spent_s = 0.0
+        self.deferred = 0
+
+    def left(self) -> float:
+        return self.seconds - self.spent_s
+
+
 def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
-                  max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None) -> bool:
+                  max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None,
+                  budget: Optional[CarryScanBudget] = None,
+                  max_seconds: float = CARRY_SCAN_MAX_SECONDS) -> bool:
     """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed) and its
-    path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path for
-    ``CARRY_SCAN_TTL_SECONDS``: the dispatcher asks every tick."""
+    path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path and
+    limits for ``CARRY_SCAN_TTL_SECONDS`` from the END of the walk: the dispatcher asks every tick.
+
+    The walk is wall-bounded: past ``max_seconds`` it is False and cached; with ``budget`` exhausted (before or
+    during the walk) it is False and NOT cached, so the path is judged on a later tick. False only keeps THIS card
+    on the old local_files rule; it never delays another row."""
     import time as _time
     if not path or not carry_path_safe(path):
         return False
@@ -421,12 +447,21 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
         root = canon(path)
     except (OSError, RuntimeError, ValueError):
         return False
-    t = _time.monotonic() if now is None else now
-    hit = _carry_scan_cache.get(root)
+    clock = budget.clock if budget is not None else _time.monotonic
+    key = (root, max_bytes, max_entries)
+    t = clock() if now is None else now
+    hit = _carry_scan_cache.get(key)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
         return hit[1]
+    if budget is not None and budget.left() <= 0:
+        budget.deferred += 1
+        return False
+    start = clock()
+    tick_bound = budget is not None and budget.left() < max_seconds
+    stop = start + (budget.left() if tick_bound else max_seconds)
     total = entries = 0
     ok = True
+    timed_out = False
     try:
         for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
             for name in (*dirnames, *filenames):
@@ -435,11 +470,24 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                 if entries > max_entries or total > max_bytes:
                     ok = False
                     break
+                if entries % 256 == 0 and clock() >= stop:
+                    ok, timed_out = False, True
+                    break
+            if ok and clock() >= stop:
+                ok, timed_out = False, True
             if not ok:
                 break
     except OSError:
         ok = False
-    _carry_scan_cache[root] = (t, ok)
+    end = clock()
+    if budget is not None:
+        budget.spent_s += max(0.0, end - start)
+    if timed_out and tick_bound:
+        budget.deferred += 1
+        return False
+    if timed_out:
+        _log.info("carry census of %s refused: walk passed %.1fs at %d entries", root, max_seconds, entries)
+    _carry_scan_cache[key] = (end if now is None else now, ok)
     return ok
 
 
