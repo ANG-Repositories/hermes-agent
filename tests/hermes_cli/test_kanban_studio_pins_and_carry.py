@@ -225,6 +225,37 @@ def test_entry_modes_preserve_bare_pins_and_notice_once(kanban_home, monkeypatch
             assert "Warning: bare host: studio" not in capsys.readouterr().err
 
 
+def test_derived_requires_on_stamped_edit_keeps_the_host_line_first(kanban_home, monkeypatch):
+    """Prism c-d245cc2a9f4f: the derived line goes after the host directive, not after the provenance header."""
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: notice\n")
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="stamped", body="host: mac-studio-m3u")
+        stored = kb.get_task(conn, tid).body
+        assert stored.startswith("origin:")
+        assert kb.edit_task(conn, tid, body=stored + "\nlaunchctl print gui/501")
+        content = [ln for ln in kwp.without_header_lines(kb.get_task(conn, tid).body).splitlines() if ln.strip()]
+        assert content[:2] == ["host: mac-studio-m3u", "requires: studio-state"]
+        route, rule, _ = _route(conn, tid, _caps())
+        assert route[0] == "local", (route, rule)
+
+
+def test_entry_notice_failure_does_not_fail_a_saved_create(kanban_home, monkeypatch, caplog):
+    """Prism c-27ab31c46b5c: the card is already saved; a notice write failure is logged, not raised."""
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: notice\n")
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    from hermes_cli import kanban_studio_pin as ksp
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(ksp, "note_drop", boom)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="saved", body="host: studio\nfix lint")
+        assert kb.get_task(conn, tid).body.endswith("host: studio\nfix lint")
+        assert kb.edit_task(conn, tid, body=kb.get_task(conn, tid).body + "\nmore")
+    assert any(r.levelname == "WARNING" and "placement notice" in r.message for r in caplog.records)
+
+
 def test_drop_notice_is_durable_and_warning(kanban_home, caplog):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="legacy", body="host: studio")

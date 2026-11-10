@@ -1,6 +1,7 @@
 """Entry validation and durable notices for bare Studio pins."""
 from __future__ import annotations
 
+import logging
 import re
 import sys
 
@@ -9,6 +10,7 @@ from hermes_cli import kanban_worker_pool as pool
 _FIRST_LINE = re.compile(r"^[ \t]*host:[ \t]*(?:studio|mac-studio[\w-]*)[ \t]*$", re.IGNORECASE)
 _STUDIO_NEEDS = frozenset({"studio_relay", "studio_launchd", "vault", "skills_tree", "studio_tree"})
 NOTICE_PREFIX = "[placement] bare host: studio dropped: add requires: "
+_log = logging.getLogger(__name__)
 
 
 def prepare_body(body, notices=None):
@@ -30,8 +32,12 @@ def prepare_body(body, notices=None):
         head = re.compile(r"^([ \t]*requires:[ \t]*)", re.IGNORECASE | re.MULTILINE)
         if head.search(body):
             return head.sub(lambda m: m.group(1) + "studio-state, ", body, count=1)
-        first, sep, rest = body.partition("\n")
-        return first + "\nrequires: studio-state" + (sep + rest if sep else "")
+        # After the host directive itself: a provenance header may precede it on a stored body.
+        lines = body.splitlines(keepends=True)
+        at = next(i for i, ln in enumerate(lines) if _FIRST_LINE.fullmatch(ln.rstrip("\r\n")))
+        host = lines[at] if lines[at].endswith("\n") else lines[at] + "\n"
+        return "".join(lines[:at]) + host + "requires: studio-state" + ("\n" if at + 1 < len(lines) else "") \
+            + "".join(lines[at + 1:])
     if mode is not True and mode != "refuse":
         if notices is not None:
             notices.append(reasons)
@@ -46,7 +52,10 @@ def prepare_body(body, notices=None):
 def report_notices(conn, card_id, notices):
     """Report only after a successful write, sharing dispatch's durable dedup key."""
     for reasons in notices:
-        note_drop(conn, card_id, reasons)
+        try:
+            note_drop(conn, card_id, reasons)
+        except Exception as exc:  # the card is already saved; the dispatcher posts the notice later
+            _log.warning("placement notice for %s not written: %s", card_id, exc)
         print("Warning: bare host: studio accepted without a Studio-served reason; "
               "accepted words: " + ", ".join(sorted(reasons))
               + ". Add `requires: <word>` or remove the host: studio line.", file=sys.stderr)
