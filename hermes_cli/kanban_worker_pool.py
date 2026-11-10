@@ -1061,13 +1061,13 @@ def effective_pin(body: Optional[str], known_hosts: Iterable[str],
 
 
 def note_dropped_studio_pin(card_id: str) -> None:
-    """One INFO per card per 5 minutes for a dropped bare ``host: studio`` pin."""
+    """One WARNING per card per 5 minutes for a dropped bare ``host: studio`` pin."""
     now = time.monotonic()
     key = f"studio-pin:{card_id}"
     last = _ignored_pin_warned.get(key)
     if last is None or now - last >= IGNORED_PIN_WARN_SECONDS:
         _ignored_pin_warned[key] = now
-        _log.info("kanban pool: card %s: bare `host: studio` dropped (no requires: reason the Studio serves); "
+        _log.warning("kanban pool: card %s: bare `host: studio` dropped (no requires: reason the Studio serves); "
                   "placed by FWA", card_id)
 
 

@@ -16,6 +16,7 @@ fleet/placement-policy.json; off / absent = every old pin, exactly as before.
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -54,6 +55,8 @@ def _studio_last_resort_on(kanban_home):
     fleet = kanban_home / "fleet"
     fleet.mkdir(parents=True, exist_ok=True)
     _write_policy(fleet)
+    # Dispatcher tests replay cards minted before entry validation existed.
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: false\n")
 
 
 def _kill_switch(home: Path, value) -> None:
@@ -134,6 +137,164 @@ def test_create_prints_the_drop(kanban_home, monkeypatch):
     assert kwp.mint_studio_pin_note("host: ace-ai", kanban_home / "fleet") is None
     _kill_switch(kanban_home, False)
     assert kwp.mint_studio_pin_note("host: studio", kanban_home / "fleet") is None
+
+
+@pytest.mark.parametrize("host", ["studio", "mac-studio-m3u"])
+def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, host):
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: refuse\n")
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="accepted words:.*studio-state"):
+            kb.create_task(conn, title="entry", body=f"host: {host}\nfix lint")
+        tid = kb.create_task(conn, title="edit", body="host: any")
+        original = kb.get_task(conn, tid).body
+        with pytest.raises(ValueError, match="requires:"):
+            kb.edit_task(conn, tid, body=f"host: {host}")
+        assert kb.get_task(conn, tid).body == original
+        assert kb.edit_task(conn, tid, body=f"host: {host}\nlaunchctl print gui/501")
+        assert "requires: studio-state" in kb.get_task(conn, tid).body
+        saved = kb.create_task(conn, title="saved", body=f"host: {host}\nrequires: studio-state\nfix lint")
+        stored = kb.get_task(conn, saved).body
+        assert stored.startswith("origin:")
+        bare = stored.replace("requires: studio-state\n", "")
+        with pytest.raises(ValueError, match="requires:"):
+            kb.edit_task(conn, saved, body=bare)
+        assert kb.get_task(conn, saved).body == stored
+        assert kb.edit_task(conn, saved, body=bare + "\nlaunchctl print gui/501")
+        assert "requires: studio-state" in kb.get_task(conn, saved).body
+        for work in ("launchctl", "vault", "skill_view", "localhost:18810", "run ~/.hermes/scripts/check.py"):
+            derived = kb.create_task(conn, title="derived", body=f"host: {host}\n{work}")
+            assert "requires: studio-state" in kb.get_task(conn, derived).body
+        from hermes_cli import kanban as cli
+        output = cli.run_slash(f"--board default create 'derive cli' --body 'host: {host}\nlaunchctl print gui/501'")
+        assert "auto-derived requires: studio-state" in output
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: false\n")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="disabled", body=f"host: {host}")
+        assert kb.get_task(conn, tid).body.endswith(f"host: {host}")
+
+
+@pytest.mark.parametrize("mode, refuses, warns", [
+    (None, False, True), ("notice", False, True), ("refuse", True, False),
+    ("off", False, False), (True, True, False), (False, False, False),
+])
+def test_entry_modes_preserve_bare_pins_and_notice_once(kanban_home, monkeypatch, capsys,
+                                                       mode, refuses, warns):
+    config = kanban_home / "config.yaml"
+    if mode is None:
+        config.unlink()
+    else:
+        config.write_text("kanban:\n  studio_pin_requires_reason: " + json.dumps(mode) + "\n")
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    from hermes_cli import kanban as cli
+    with kb.connect_closing() as conn:
+        if refuses:
+            with pytest.raises(ValueError, match="accepted words:"):
+                kb.create_task(conn, title="mode create", body="host: studio\nfix lint")
+        else:
+            output = cli.run_slash("--board default create 'mode create' --body 'host: studio\nfix lint'")
+            assert ("Warning: bare host: studio" in output) == warns
+            if warns:
+                assert output.count("Warning: bare host: studio") == 1
+                assert "accepted words:" in output and "studio-state" in output
+            tid = conn.execute("SELECT id FROM tasks WHERE title='mode create'").fetchone()[0]
+            assert kb.get_task(conn, tid).body.endswith("host: studio\nfix lint")
+            before = conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
+            assert sum(r[0].startswith("[placement] bare host: studio") for r in before) == int(warns)
+            _route(conn, tid, _caps())
+            after = conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
+            assert sum(r[0].startswith("[placement] bare host: studio") for r in after) == 1
+        tid = kb.create_task(conn, title="mode edit", body="host: any")
+        original = kb.get_task(conn, tid).body
+        stamped = original.replace("host: any", "host: mac-studio-m3u\nfix lint")
+        capsys.readouterr()
+        if refuses:
+            with pytest.raises(ValueError, match="accepted words:"):
+                kb.edit_task(conn, tid, body=stamped)
+            assert kb.get_task(conn, tid).body == original
+        else:
+            assert kb.edit_task(conn, tid, body=stamped)
+            assert kb.get_task(conn, tid).body == stamped
+            output = capsys.readouterr().err
+            assert ("Warning: bare host: studio" in output) == warns
+            assert output.count("Warning: bare host: studio") == int(warns)
+        if mode is not False and mode != "off":
+            capsys.readouterr()
+            derived = kb.create_task(conn, title="mode derived", body="host: studio\nlaunchctl print gui/501")
+            assert "requires: studio-state" in kb.get_task(conn, derived).body
+            assert "Warning: bare host: studio" not in capsys.readouterr().err
+
+
+def test_derived_requires_on_stamped_edit_keeps_the_host_line_first(kanban_home, monkeypatch):
+    """Prism c-d245cc2a9f4f: the derived line goes after the host directive, not after the provenance header."""
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: notice\n")
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="stamped", body="host: mac-studio-m3u")
+        stored = kb.get_task(conn, tid).body
+        assert stored.startswith("origin:")
+        assert kb.edit_task(conn, tid, body=stored + "\nlaunchctl print gui/501")
+        content = [ln for ln in kwp.without_header_lines(kb.get_task(conn, tid).body).splitlines() if ln.strip()]
+        assert content[:2] == ["host: mac-studio-m3u", "requires: studio-state"]
+        route, rule, _ = _route(conn, tid, _caps())
+        assert route[0] == "local", (route, rule)
+
+
+def test_entry_notice_failure_does_not_fail_a_saved_create(kanban_home, monkeypatch, caplog):
+    """Prism c-27ab31c46b5c: the card is already saved; a notice write failure is logged, not raised."""
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: notice\n")
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    from hermes_cli import kanban_studio_pin as ksp
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(ksp, "note_drop", boom)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="saved", body="host: studio\nfix lint")
+        assert kb.get_task(conn, tid).body.endswith("host: studio\nfix lint")
+        assert kb.edit_task(conn, tid, body=kb.get_task(conn, tid).body + "\nmore")
+    assert any(r.levelname == "WARNING" and "placement notice" in r.message for r in caplog.records)
+
+
+def test_drop_notice_is_durable_and_warning(kanban_home, caplog):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", body="host: studio")
+        for _ in range(2):
+            kwp._ignored_pin_warned.clear()
+            _route(conn, tid, _caps())
+        notices = conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
+        assert sum(r[0].startswith("[placement] bare host: studio dropped: add requires:") for r in notices) == 1
+    assert any(r.levelname == "WARNING" and "bare `host: studio` dropped" in r.message for r in caplog.records)
+
+
+def test_drop_notice_already_posted_takes_no_write_lock(kanban_home, monkeypatch):
+    """Every tick re-routes every dropped-pin card: once its notice exists, routing must not write."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", body="host: studio")
+        first = _route(conn, tid, _caps())
+        writes = []
+
+        def no_write(*a, **_k):
+            writes.append(a)
+            raise AssertionError("write_txn taken")
+        monkeypatch.setattr(kb, "write_txn", no_write)
+        assert _route(conn, tid, _caps()) == first
+    assert writes == []
+
+
+def test_drop_notice_failure_does_not_change_routing(kanban_home, monkeypatch, caplog):
+    """A placement notice must never stop dispatch: a raising note_drop leaves the route unchanged."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", body="host: studio")
+        expected = _route(conn, tid, _caps())
+        conn.execute("DELETE FROM task_comments WHERE task_id=?", (tid,))
+        conn.commit()
+
+        def boom(*_a, **_k):
+            raise sqlite3.OperationalError("database is locked")
+        monkeypatch.setattr(kb, "write_txn", boom)
+        assert _route(conn, tid, _caps()) == expected
+    assert any(r.levelname == "WARNING" and "placement notice" in r.message for r in caplog.records)
 
 
 # -- rule 2: local_files is continuity ------------------------------------------------------------------------

@@ -6469,6 +6469,9 @@ def create_task(
     if not container_card:
         from hermes_cli.kanban_ruling_citation import validate_fields
         validate_fields(conn, [("title", title), ("body", body)])
+    from hermes_cli.kanban_studio_pin import prepare_body, report_notices
+    pin_notices = []
+    body = prepare_body(body, pin_notices)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -7113,6 +7116,7 @@ def create_task(
                         )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
+            report_notices(conn, task_id, pin_notices)
             if overlap_hits:
                 # After commit, fire-and-forget: a create never waits on Discord.
                 _kov.notify_logs(board, task_id, overlap_hits)
@@ -13075,6 +13079,9 @@ def edit_task(
     """Edit task fields, optionally backfilling a completed task's result."""
     from hermes_cli.kanban_ruling_citation import validate_fields
     validate_fields(conn, [("title", title), ("body", body)])
+    from hermes_cli.kanban_studio_pin import prepare_body, report_notices
+    pin_notices = []
+    body = prepare_body(body, pin_notices)
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -13141,6 +13148,7 @@ def edit_task(
                 },
                 run_id=run_id,
             )
+    report_notices(conn, task_id, pin_notices)
     notify_task_updated(conn, task_id, changed_fields, board=board)
     return True
 

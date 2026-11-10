@@ -2238,6 +2238,7 @@ DEFAULT_CONFIG = {
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "workspaces_root": None,
         "workspaces_root_require_mount": False,
+        "studio_pin_requires_reason": "notice",
         # Let the dispatcher itself clear a scratch card stranded by mount
         # loss (persisted path gone, root mounted + writable again) when the
         # lost tree provably held nothing: no worker ever spawned into it, or
