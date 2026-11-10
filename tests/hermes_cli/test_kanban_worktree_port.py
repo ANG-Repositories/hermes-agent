@@ -436,6 +436,72 @@ def test_derived_unpushed_commits_are_pushed_then_ported(kanban_home, anchor, tm
     assert _ref(bare, f"refs/heads/wt/{tid}") == _ref(anchor, f"refs/heads/wt/{tid}") != ""
 
 
+@pytest.mark.parametrize("url", ["git@github.com:NousResearch/hermes-agent.git",
+                                 "https://github.com/NousResearch/hermes-agent.git",
+                                 "https://gitlab.com/ANG-Ventures/hermes-agent.git"])
+def test_push_to_foreign_origin_is_refused_before_any_push(anchor, url):
+    """t_eac2768a: origin is an upstream we do not own: no push is attempted, the refusal names the URL."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", url, cwd=anchor)
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        if "push" in argv:  # never executed: no network push from a test
+            return subprocess.CompletedProcess(argv, 1, "", "runner: push not executed")
+        return subprocess.run(argv, **kw)
+    with pytest.raises(kwt.ForeignOriginPush) as exc:
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=runner)
+    assert url in str(exc.value) and "checkout whose origin is ours" in str(exc.value)
+    assert not [c for c in calls if "push" in c]
+    assert kb._unusable_workspace_reason(exc.value) == str(exc.value)  # permanent: blocks on failure #1
+
+
+@pytest.mark.parametrize("url", ["git@github.com:ANG-Ventures/hermes-agent.git",
+                                 "https://github.com/kyzcreig/demo.git"])
+def test_push_to_own_origin_runs_the_push(anchor, url):
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", url, cwd=anchor)
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        if "push" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(argv, **kw)
+    kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=runner)
+    pushes = [c for c in calls if "push" in c]
+    assert len(pushes) == 1 and f"remote.kanban-port-destination.url={url}" in pushes[0]
+
+
+def test_derived_unpushed_branch_on_upstream_origin_blocks_without_push(kanban_home, anchor, monkeypatch):
+    """The Studio case (t_6dde6d1e): checkout origin = NousResearch, card branch has an unpushed commit."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "git@github.com:NousResearch/hermes-agent.git", cwd=anchor)
+    pushes, clones = [], []
+    real_push = kwt.push_card_branch
+
+    def spy(argv, **kw):
+        if "push" in argv:
+            pushes.append(argv)  # recorded, never executed: no network push from a test
+            return subprocess.CompletedProcess(argv, 1, "", "spy: push not executed")
+        return subprocess.run(argv, **kw)
+    monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=None: real_push(push, runner=spy))
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: clones.append(a))
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        _git("branch", f"wt/{tid}", cwd=anchor)
+        _git("checkout", "-q", f"wt/{tid}", cwd=anchor)
+        _commit(anchor, "studio-only")
+        _git("checkout", "-q", "main", cwd=anchor)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        row = _row(conn, tid)
+    assert not pushes and not clones and not spawned
+    assert tid in res.auto_blocked  # first failure, not a transient retry
+    assert row["status"] == "blocked"
+    assert "git@github.com:NousResearch/hermes-agent.git" in (row["last_failure_error"] or "")
+
+
 def test_push_lease_refuses_a_branch_moved_on_origin(anchor, tmp_path):
     bare = _origin_with_push(anchor, tmp_path)
     _commit(anchor, "base")
