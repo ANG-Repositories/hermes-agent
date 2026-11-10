@@ -220,6 +220,24 @@ def test_current_schema_connect_does_not_need_writer(tmp_path, monkeypatch):
         writer.close()
 
 
+def test_list_recomputes_dependency_readiness(tmp_path):
+    db = tmp_path / "kanban.db"
+    child = seed(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE tasks SET status='todo', assignee='daedalus' WHERE id=?", (child,))
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "list", "--board", "default",
+         "--status", "ready", "--json"], cwd=ROOT,
+        env={**os.environ, "HERMES_HOME": str(tmp_path), "HERMES_KANBAN_DB": str(db),
+             "PYTHONPATH": str(ROOT)}, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert any(task["id"] == child for task in json.loads(result.stdout))
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "ready"
+
+
 def test_readonly_kill_switch(tmp_path, monkeypatch):
     db = tmp_path / "board.db"
     seed(db)

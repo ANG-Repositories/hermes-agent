@@ -1619,10 +1619,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
     else:
         from hermes_cli.config import load_config
         cfg_val = (load_config().get("kanban") or {}).get("failure_limit")
-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+        from hermes_cli.kanban_dispatch_defaults import DEFAULT_FAILURE_LIMIT
+        if cfg_val is not None and int(cfg_val) != DEFAULT_FAILURE_LIMIT:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
         else:
-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+            print(f"  max-retries: {DEFAULT_FAILURE_LIMIT} (default)")
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
