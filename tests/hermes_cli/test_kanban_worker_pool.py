@@ -1018,7 +1018,8 @@ def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
         conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), tid))
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
-    assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files"
+    # t_e7c03f48: the reason names the first path the remote cannot reproduce (split_reason keeps the code).
+    assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files(handoff.md)"
 
 
 # -- Prism round 1 (PR #1730) -----------------------------------------------

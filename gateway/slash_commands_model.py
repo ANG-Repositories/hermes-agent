@@ -18,6 +18,7 @@ import time
 from typing import Any, Optional
 
 from agent.i18n import t
+from gateway import model_cmd_timing as _mct
 from gateway.platforms.event import MessageEvent
 from hermes_cli.config import atomic_config_write
 from utils import base_url_host_matches
@@ -691,10 +692,22 @@ class GatewayModelCommandsMixin:
         )
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /model command — switch model. Taken under this session's switch lock BEFORE the first
-        await so concurrent same-session commands commit in issue order (see ``_model_switch_lock``)."""
-        async with self._model_switch_lock(self._model_switch_lock_key(event.source)):
-            return await self._handle_model_command_locked(event)
+        """Handle /model command — switch model. Taken under the switch lock BEFORE the first await so
+        concurrent commands commit in issue order (see ``_model_switch_lock``).
+
+        Logs one ``PHASE=model_cmd`` line per command; the first phase is the wait for this lock
+        (gateway/model_cmd_timing.py, t_7fe48f0b)."""
+        timing = _mct.begin()  # phase lock_wait: a /model on any other session queues here
+        exc: Optional[BaseException] = None
+        try:
+            async with self._model_switch_lock(self._model_switch_lock_key(event.source)):
+                _mct.phase("config")
+                return await self._handle_model_command_locked(event)
+        except BaseException as e:
+            exc = e
+            raise
+        finally:
+            _mct.handler_finished(event, timing, exc)
 
     async def _handle_model_command_locked(self, event: MessageEvent) -> Optional[str]:
         from gateway.run import _hermes_home

@@ -329,6 +329,188 @@ def local_workspace_has_content(path: Optional[str]) -> bool:
         return True
 
 
+# local_files binds only on content the remote cannot reproduce (t_e7c03f48): t_e32e34f0's Studio scratch dir held a
+# clean worktree whose HEAD was the pushed PR head plus logs and a patch, and that alone kept it Studio-only for 2 h+
+# while the pool sat idle. A placed run starts from a fresh directory on the pool host (workspaces are host-local,
+# TERMINAL_SSH_SYNC_FILES=false) and re-clones from the remote; the Studio directory is left in place, untouched.
+WORKSPACE_THROWAWAY_GLOBS = ("*.log", "*.patch", "pr-body.md")
+WORKSPACE_SCAN_MAX_ENTRIES = 2000
+WORKSPACE_GIT_TIMEOUT_SECONDS = 20
+WORKSPACE_LS_REMOTE_TIMEOUT_SECONDS = 10
+# Only negative/unverified remote-containment answers are cached, keyed by checkout and exact HEAD sha.
+# Positive containment is re-proven every call: its only remote ref can be deleted inside the TTL. The local half
+# (``git status``) also runs every call: checkout edits never touch the workspace root's mtime (5c1daae965e0).
+WORKSPACE_BINDING_TTL_SECONDS = 120
+_binding_cache: Dict[tuple, tuple] = {}
+
+
+def _throwaway(name: str) -> bool:
+    import fnmatch
+    return any(fnmatch.fnmatchcase(name, g) for g in WORKSPACE_THROWAWAY_GLOBS)
+
+
+def _show(rel: str) -> str:
+    """``rel`` safe for a one-line reason detail (no parens, no control characters), bounded."""
+    text = "".join(c if c.isprintable() and c not in "()" else "?" for c in rel)
+    return text[:200] or "."
+
+
+def _remote_contains(git: Callable, head: str) -> Optional[bool]:
+    """True when HEAD equals, or is an ancestor of, a branch/tag tip a remote reports NOW (``git ls-remote``) and
+    that tip is present locally; False when every remote answered, every tip is local, and none contains HEAD; None
+    when containment cannot be proven (no remote, ls-remote failed or timed out, a tip is not present locally).
+    Local remote-tracking refs are never consulted: a branch deleted on the remote leaves them behind (Prism
+    1c3c50990907)."""
+    rem = git("remote", timeout=WORKSPACE_GIT_TIMEOUT_SECONDS)
+    names = (rem.stdout or b"").decode("utf-8", "replace").split() if rem.returncode == 0 else []
+    if not names:
+        return None
+    tips: set = set()
+    for name in names:
+        ls = git("ls-remote", "--heads", "--tags", name, timeout=WORKSPACE_LS_REMOTE_TIMEOUT_SECONDS)
+        if ls.returncode != 0:
+            return None
+        tips.update(line.split()[0] for line in (ls.stdout or b"").decode("ascii", "replace").splitlines()
+                    if line.strip())
+    if head in tips:
+        return True
+    if not tips:
+        return False
+    order = sorted(tips)
+    bc = git("cat-file", "--batch-check=%(objectname) %(objecttype)",
+             input="".join(f"{x}^{{commit}}\n" for x in order).encode())
+    if bc.returncode != 0:
+        return None
+    out = (bc.stdout or b"").decode("ascii", "replace").splitlines()
+    present = [x for x, line in zip(order, out) if line.endswith(" commit")]
+    unknown = len(present) < len(order)  # a tip we never fetched: it might contain HEAD
+    if present:
+        rl = git("rev-list", "-n1", head, "--stdin", input="".join(f"^{x}\n" for x in present).encode())
+        if rl.returncode != 0:
+            return None
+        if not (rl.stdout or b"").strip():
+            return True  # HEAD is reachable from a tip the remote reports now
+    return None if unknown else False
+
+
+def _git_binding(repo: str, rel: str, runner: Callable, t: float) -> Optional[str]:
+    """The first thing in git checkout ``repo`` the remote cannot reproduce, or None: a dirty tracked path (submodule
+    edits included, whatever ``submodule.<x>.ignore`` says), an untracked file outside
+    :data:`WORKSPACE_THROWAWAY_GLOBS`, a HEAD no remote tip contains (``@unpushed:<sha>``), or a HEAD whose
+    containment the remote could not confirm now (``remote-unverified: <rel>``). Ignored files are the repo's own
+    throwaway list. Any git failure binds (fail closed)."""
+    from hermes_cli._subprocess_compat import noninteractive_git_env
+
+    env = noninteractive_git_env(os.environ)
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(k, None)
+
+    def git(*args, timeout=WORKSPACE_GIT_TIMEOUT_SECONDS, input=None):
+        io = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+        return runner(["git", "-C", repo, *args], capture_output=True, env=env, timeout=timeout, **io)
+
+    def join(p: str) -> str:
+        return p if rel in ("", ".") else f"{rel}/{p}"
+
+    try:
+        st = git("-c", "status.showUntrackedFiles=all", "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                 "--ignore-submodules=none")
+        if st.returncode != 0:
+            return f"{rel or '.'}@git-status-failed"
+        recs = (st.stdout or b"").split(b"\0")
+        i = 0
+        while i < len(recs):
+            rec = recs[i].decode("utf-8", "replace")
+            i += 1
+            if len(rec) < 4:
+                continue
+            code, path = rec[:2], rec[3:]
+            if code[0] in "RC":
+                i += 1  # the rename/copy source record follows
+            if code == "??" and _throwaway(os.path.basename(path.rstrip("/"))):
+                continue
+            return join(path)
+        hp = git("rev-parse", "--verify", "HEAD")
+        head = (hp.stdout or b"").decode("ascii", "replace").strip()
+        if hp.returncode != 0 or not head:
+            return f"{rel or '.'}@git-head-unreadable"
+        key = (os.path.realpath(repo), head)
+        hit = _binding_cache.get(key)
+        if hit is not None and t - hit[0] < WORKSPACE_BINDING_TTL_SECONDS:
+            contained = hit[1]
+        else:
+            try:
+                contained = _remote_contains(git, head)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                contained = None
+            if contained is not True:  # cache only fail-closed answers; a containing remote ref can vanish now
+                if len(_binding_cache) > 4096:
+                    _binding_cache.clear()
+                _binding_cache[key] = (t, contained)
+        if contained is None:
+            return f"remote-unverified: {rel or '.'}"
+        if not contained:
+            return f"{rel or '.'}@unpushed:{head[:12]}"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return f"{rel or '.'}@git-failed"
+    return None
+
+
+def local_workspace_binding(path: Optional[str], *, runner: Callable = subprocess.run,
+                            now: Optional[float] = None) -> Optional[str]:
+    """None when the card's LOCAL workspace holds nothing a pool host cannot reproduce; else the first binding
+    path, relative to the workspace (the ``local_files`` reason detail).
+
+    Reproducible = (a) a git checkout that is clean (no dirty tracked path, no untracked file outside
+    :data:`WORKSPACE_THROWAWAY_GLOBS`) with HEAD contained in a live remote tip, and (b) files matching
+    :data:`WORKSPACE_THROWAWAY_GLOBS`. Anything else binds: another file, a symlink, a special file, an unpushed
+    HEAD, a HEAD the remote cannot confirm now, a scan or git error, more than :data:`WORKSPACE_SCAN_MAX_ENTRIES`
+    entries outside checkouts. An empty or missing workspace is None (:func:`local_workspace_has_content`). The
+    scan and ``git status`` run on every call; only negative/unverified remote answers are cached (per HEAD sha,
+    for :data:`WORKSPACE_BINDING_TTL_SECONDS`). Positive containment is always re-proven.
+    """
+    import time as _time
+    if not local_workspace_has_content(path):
+        return None
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        root = str(canon(path))
+    except (OSError, RuntimeError, ValueError):
+        return "."
+    t = _time.monotonic() if now is None else now
+    seen = [0]
+
+    def walk(d: str, rel: str) -> Optional[str]:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return _git_binding(d, rel, runner, t)
+        try:
+            with os.scandir(d) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            return rel or "."
+        for e in entries:
+            r = e.name if not rel else f"{rel}/{e.name}"
+            seen[0] += 1
+            if seen[0] > WORKSPACE_SCAN_MAX_ENTRIES:
+                return f"{r}@scan-limit"
+            try:
+                if e.is_symlink():
+                    return r
+                if e.is_dir(follow_symlinks=False):
+                    sub = walk(e.path, r)
+                    if sub is not None:
+                        return sub
+                elif not (e.is_file(follow_symlinks=False) and _throwaway(e.name)):
+                    return r
+            except OSError:
+                return r
+        return None
+
+    verdict = walk(root, "")
+    return None if verdict is None else _show(verdict)
+
+
 # local_files continuity overflow (t_e604c0f9): a card whose Studio scratch dir holds files runs on the Studio while
 # its gate admits; when it does not, the dir is carried to the chosen pool host (same path) and the card runs there.
 # The bounds keep the in-tick scan and copy short; they are a cost bound, not a capacity count: a bigger dir keeps
@@ -337,11 +519,20 @@ CARRY_MAX_BYTES = 1024 ** 3
 CARRY_MAX_ENTRIES = 20000
 CARRY_TIMEOUT_SECONDS = 300
 CARRY_SCAN_TTL_SECONDS = 300
+# Wall bounds on the in-tick size census (t_915b8d2d): on a loaded Studio one walk took minutes and every ready
+# local_files row walked in the routing pass, so a tick ran 4-30 min and new portable cards waited for it. A path
+# whose walk outlives CARRY_SCAN_MAX_SECONDS is refused (cached, like any refusal); once a tick has spent
+# CARRY_TICK_SCAN_SECONDS on walks, the rest of its rows are refused uncached and walked on a later tick.
+CARRY_SCAN_MAX_SECONDS = 2.0
+CARRY_TICK_SCAN_SECONDS = 5.0
+CARRY_WAIT_FORGET_SECONDS = 900
 CARRIED_EVENT = "workspace_carried"
 # portable() bind rule of a carried card: once carried, every later run binds to the host holding the copy
 # (custody, independent of placement.continuation); the Studio original is never run against or carried again.
 CARRY_BIND_RULE = "workspace_carry"
-_carry_scan_cache: Dict[str, tuple] = {}
+_carry_scan_cache: Dict[tuple, tuple] = {}
+_carry_waiting: Dict[tuple, tuple] = {}  # cache key -> (budget generation first deferred, last asked); FIFO
+_carry_gen = 0
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
 # and ``--protect-args`` is not portable across them (Prism a39b11fdf16d). So a carried path is limited to a
 # charset no shell interprets: absolute, components of [A-Za-z0-9._@+-], no empty / . / .. component, none
@@ -408,11 +599,55 @@ def carry_path_shared(conn, task_id: str, workspace_path: Optional[str]) -> bool
     return False
 
 
+class CarryScanBudget:
+    """One tick's wall budget for :func:`carry_size_ok` walks. ``spent_s`` and ``deferred`` feed the tick record."""
+
+    def __init__(self, seconds: Optional[float] = None, clock: Optional[Callable[[], float]] = None):
+        import time as _time
+        self.clock = clock or _time.monotonic
+        self.seconds = CARRY_TICK_SCAN_SECONDS if seconds is None else seconds
+        self.spent_s = 0.0
+        self.deferred = 0
+        # FIFO across ticks (no starvation under the fixed row order): while any path waits from an earlier tick,
+        # only the oldest-waiting generation may walk; every other path is deferred and queued behind it. A
+        # waiting path not asked for in CARRY_WAIT_FORGET_SECONDS (its card left ready) is forgotten.
+        global _carry_gen
+        _carry_gen += 1
+        self.gen = _carry_gen
+        t = self.clock()
+        for k, (_g, seen) in list(_carry_waiting.items()):
+            if t - seen > CARRY_WAIT_FORGET_SECONDS:
+                del _carry_waiting[k]
+        self.admit_gen = min((g for g, _s in _carry_waiting.values()), default=None)
+
+    def left(self) -> float:
+        return self.seconds - self.spent_s
+
+    def may_walk(self, key) -> bool:
+        if self.admit_gen is None:
+            return True
+        w = _carry_waiting.get(key)
+        return w is not None and w[0] <= self.admit_gen
+
+    def defer(self, key) -> None:
+        self.deferred += 1
+        w = _carry_waiting.get(key)
+        _carry_waiting[key] = (w[0] if w else self.gen, self.clock())
+
+
 def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
-                  max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None) -> bool:
+                  max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None,
+                  budget: Optional[CarryScanBudget] = None,
+                  max_seconds: float = CARRY_SCAN_MAX_SECONDS) -> bool:
     """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed) and its
-    path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path for
-    ``CARRY_SCAN_TTL_SECONDS``: the dispatcher asks every tick."""
+    path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path and
+    limits for ``CARRY_SCAN_TTL_SECONDS`` from the END of the walk: the dispatcher asks every tick.
+
+    The walk uses a cooperative deadline: once a check observes ``max_seconds`` elapsed, the refusal is cached.
+    Tick-budget exhaustion instead queues the path FIFO for a later tick without caching a refusal.
+    Checks run between directories and every 256 entries. Canonicalization or a blocking scandir/lstat can
+    overrun the deadline and still delay routing; this is not a hard filesystem timeout. A refused carry
+    retains this card's old local_files rule rather than authorizing a transfer with an incomplete census."""
     import time as _time
     if not path or not carry_path_safe(path):
         return False
@@ -421,12 +656,21 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
         root = canon(path)
     except (OSError, RuntimeError, ValueError):
         return False
-    t = _time.monotonic() if now is None else now
-    hit = _carry_scan_cache.get(root)
+    clock = budget.clock if budget is not None else _time.monotonic
+    key = (root, max_bytes, max_entries)
+    t = clock() if now is None else now
+    hit = _carry_scan_cache.get(key)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
         return hit[1]
+    if budget is not None and (budget.left() <= 0 or not budget.may_walk(key)):
+        budget.defer(key)
+        return False
+    start = clock()
+    tick_bound = budget is not None and budget.left() < max_seconds
+    stop = start + (budget.left() if tick_bound else max_seconds)
     total = entries = 0
     ok = True
+    timed_out = False
     try:
         for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
             for name in (*dirnames, *filenames):
@@ -435,11 +679,25 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                 if entries > max_entries or total > max_bytes:
                     ok = False
                     break
+                if entries % 256 == 0 and clock() >= stop:
+                    ok, timed_out = False, True
+                    break
+            if ok and clock() >= stop:
+                ok, timed_out = False, True
             if not ok:
                 break
     except OSError:
         ok = False
-    _carry_scan_cache[root] = (t, ok)
+    end = clock()
+    if budget is not None:
+        budget.spent_s += max(0.0, end - start)
+    if timed_out and tick_bound:
+        budget.defer(key)
+        return False
+    _carry_waiting.pop(key, None)
+    if timed_out:
+        _log.info("carry census of %s refused: walk passed %.1fs at %d entries", root, max_seconds, entries)
+    _carry_scan_cache[key] = (end if now is None else now, ok)
     return ok
 
 
