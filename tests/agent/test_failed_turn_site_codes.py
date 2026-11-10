@@ -117,6 +117,22 @@ def test_loopback_relay_context_rejection_compresses_once(provider, caplog):
     assert verdict.result["failure_reason"] == "context_overflow"
 
 
+def test_context_ceiling_observation_never_logs_url_credentials(caplog):
+    """Prism d4b1105d40df: the observation line carries scheme/host/port only, never userinfo,
+    path or query (a relay base_url may embed a password or an api_key)."""
+    error = "context_length_exceeded: prompt is too long"
+    _context_rejection(
+        155_618, window=1_000_000, provider="custom", error=error,
+        base_url="https://alice:s3cretpw@relay.example:8443/v1/tenant-path?api_key=sk-leak123",
+    )
+    records = [r.getMessage() for r in caplog.records if "observed_rejected_request_tokens" in r.getMessage()]
+    assert records, "observation line not emitted"
+    for text in records:
+        assert "endpoint=https://relay.example:8443 " in text
+        for secret in ("alice", "s3cretpw", "sk-leak123", "api_key", "tenant-path"):
+            assert secret not in text
+
+
 def test_empty_response_exhaustion_has_one_text_everywhere():
     """One constant feeds the CLI explainer and the gateway '(empty)' rewrite; no surface
     asserts 'after processing tool results' or 'inspect the tool output above'."""

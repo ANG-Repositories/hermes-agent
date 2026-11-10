@@ -14,6 +14,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from agent.conversation_compression import (
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE, COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
@@ -367,6 +368,19 @@ def _adopt_provider_context_limit(st: _Recovery, error_msg: str, old_ctx: int) -
     return None
 
 
+def _endpoint_for_log(base_url: Any) -> str:
+    """scheme://host[:port] only: userinfo, path and query can carry credentials."""
+    try:
+        parts = urlsplit(str(base_url or ""))
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return "<unparseable>"
+    return f"{parts.scheme}://{host}{port}" if parts.scheme and host else "<unset>"
+
+
 def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: str) -> OverflowVerdict:
     """Context-length error. Two shapes: "prompt too long" = INPUT overflows the window
     (shrink context_length + compress); "max_tokens too large" = input fits but
@@ -415,9 +429,9 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
         # A rejected request is an upper bound, not a measured model window. Keep
         # the observation in telemetry; never poison the authoritative metadata cache.
         logger.warning(
-            "%sProvider context ceiling observation provider=%s model=%s base_url=%s "
+            "%sProvider context ceiling observation provider=%s model=%s endpoint=%s "
             "observed_rejected_request_tokens=%d believed_window=%d compression_attempts=%d",
-            agent.log_prefix, agent.provider, agent.model, agent.base_url,
+            agent.log_prefix, agent.provider, agent.model, _endpoint_for_log(agent.base_url),
             request_tokens, window, st.compression_attempts,
         )
         if st.compression_attempts >= 1:
