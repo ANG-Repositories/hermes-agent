@@ -469,6 +469,8 @@ def kanban_command(args: argparse.Namespace) -> int:
                 _lifecycle_target_ids(args), action, flags=gated_flags,
             ), actor_scope, event_actor_scope:
                 return int(handler(args) or 0)
+        except kbc.sqlite3.Error as exc:
+            return _err(f"kanban: could not read database: {exc}" if read_only else f"kanban: database error: {exc}")
         except (ValueError, RuntimeError, PermissionError) as exc:
             # A survivor refusal carries its operator-only hint on the
             # exception, not in the persisted message, so render it HERE --
