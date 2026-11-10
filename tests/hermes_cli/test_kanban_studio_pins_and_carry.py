@@ -135,6 +135,38 @@ def test_create_prints_the_drop(kanban_home, monkeypatch):
     assert kwp.mint_studio_pin_note("host: studio", kanban_home / "fleet") is None
 
 
+@pytest.mark.parametrize("host", ["studio", "mac-studio-m3u"])
+def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, host):
+    monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="accepted words:.*studio-state"):
+            kb.create_task(conn, title="entry", body=f"host: {host}\nfix lint")
+        tid = kb.create_task(conn, title="edit", body="host: any")
+        with pytest.raises(ValueError, match="requires:"):
+            kb.edit_task(conn, tid, body=f"host: {host}")
+        assert kb.get_task(conn, tid).body == "host: any"
+        assert kb.edit_task(conn, tid, body=f"host: {host}\nlaunchctl print gui/501")
+        assert "requires: studio-state" in kb.get_task(conn, tid).body
+        for work in ("launchctl", "vault", "skill_view", "localhost:18810", "run ~/.hermes/scripts/check.py"):
+            derived = kb.create_task(conn, title="derived", body=f"host: {host}\n{work}")
+            assert "requires: studio-state" in kb.get_task(conn, derived).body
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: false\n")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="disabled", body=f"host: {host}")
+        assert kb.get_task(conn, tid).body == f"host: {host}"
+
+
+def test_drop_notice_is_durable_and_warning(kanban_home, caplog):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", body="host: studio")
+        for _ in range(2):
+            kwp._ignored_pin_warned.clear()
+            _route(conn, tid, _caps())
+        notices = conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
+        assert sum(r[0].startswith("[placement] bare host: studio dropped: add requires:") for r in notices) == 1
+    assert any(r.levelname == "WARNING" and "bare `host: studio` dropped" in r.message for r in caplog.records)
+
+
 # -- rule 2: local_files is continuity ------------------------------------------------------------------------
 
 def _card_with_files(conn, body=None):

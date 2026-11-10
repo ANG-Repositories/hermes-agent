@@ -1,0 +1,46 @@
+"""Entry validation and durable notices for bare Studio pins."""
+from __future__ import annotations
+
+import re
+
+from hermes_cli import kanban_worker_pool as pool
+
+_FIRST_LINE = re.compile(r"^[ \t]*host:[ \t]*(?:studio|mac-studio[\w-]*)[ \t]*$", re.IGNORECASE)
+_STUDIO_NEEDS = frozenset({"studio_relay", "studio_launchd", "vault", "skills_tree", "studio_tree"})
+NOTICE_PREFIX = "[placement] bare host: studio dropped: add requires: "
+
+
+def prepare_body(body):
+    """Validate against the dispatcher's vocabulary; unknown maps retain the existing safe-local behavior."""
+    if not body or not _FIRST_LINE.fullmatch(body.splitlines()[0]):
+        return body
+    from hermes_cli.config import load_config
+    if load_config().get("kanban", {}).get("studio_pin_requires_reason", True) is False:
+        return body
+    from hermes_cli import kanban_db as kb, kanban_host_capabilities as caps
+    reasons = pool.studio_map_reasons(caps.load_map(kb.kanban_home() / "fleet"))
+    if reasons is None or pool.studio_pin_justified(body, reasons):
+        return body
+    if pool.card_needs(body) & _STUDIO_NEEDS and "studio-state" in reasons:
+        # One line, including when the caller already declared unrelated requirements.
+        head = re.compile(r"^([ \t]*requires:[ \t]*)", re.IGNORECASE | re.MULTILINE)
+        if head.search(body):
+            return head.sub(lambda m: m.group(1) + "studio-state, ", body, count=1)
+        first, sep, rest = body.partition("\n")
+        return first + "\nrequires: studio-state" + (sep + rest if sep else "")
+    raise ValueError(
+        "bare host: studio requires a Studio-served reason; accepted words: "
+        + ", ".join(sorted(reasons))
+        + ". Add a line `requires: <word>` or remove the host: studio line."
+    )
+
+
+def note_drop(conn, card_id, reasons):
+    """Persist one notice per card, not one per dispatcher process or retry."""
+    from hermes_cli import kanban_db as kb
+    with kb.write_txn(conn):
+        if conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE ? LIMIT 1",
+                        (card_id, NOTICE_PREFIX + "%")).fetchone():
+            return
+        kb.add_comment(conn, card_id, "dispatcher",
+                       NOTICE_PREFIX + ", ".join(sorted(reasons or ())))
