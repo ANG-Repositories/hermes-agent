@@ -103,6 +103,10 @@ class MessageEvent:
     # The progress header reads it instead of guessing from the text. None = a human turn.
     wake_kind: Optional[str] = None
 
+    # Platform invoke stamps for the /stop stage line (t_41843f70): {"at": monotonic at the
+    # adapter's invoke, "auth": s, "defer": s}. Diagnostics only; None when the adapter sets none.
+    invoke_timing: Optional[Dict[str, float]] = field(default=None, init=False, repr=False, compare=False)
+
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Idle wake hooks require a concrete execution receipt (never ingress metadata).

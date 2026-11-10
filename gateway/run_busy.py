@@ -1362,6 +1362,7 @@ class GatewayBusySessionMixin:
         from gateway.run import _INTERRUPT_REASON_STOP
         await self._interrupt_and_clear_session(
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
+            **({"invoke_timing": event.invoke_timing} if isinstance(getattr(event, "invoke_timing", None), dict) else {}),
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
         suffix = ""
