@@ -9,10 +9,10 @@ the import cycle.
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import contextvars
 import dataclasses
+from pathlib import Path
 import logging
 import time
 from typing import Any, Optional
@@ -22,6 +22,8 @@ from gateway import model_cmd_timing as _mct
 from gateway.platforms.event import MessageEvent
 from hermes_cli.config import atomic_config_write
 from utils import base_url_host_matches
+
+_model_selection_owner = contextvars.ContextVar("model_selection_owner", default=None)
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
@@ -247,7 +249,6 @@ class GatewayModelCommandsMixin:
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
-        self._bump_model_override_seq(ctx.session_key)  # supersedes any queued reply-first write
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
             # command's snapshot is the first temporary model, not the user's standing override.
@@ -388,29 +389,87 @@ class GatewayModelCommandsMixin:
             lock = locks[session_key] = asyncio.Lock()
         return lock
 
-    def _model_config_write_lock(self) -> asyncio.Lock:
-        """Runner-wide lock around the ``--global`` config.yaml write-through only (#100314)."""
-        lock = self.__dict__.get("_model_config_write_lock_obj")
-        if lock is None:
-            lock = self.__dict__["_model_config_write_lock_obj"] = asyncio.Lock()
-        return lock
-
-    def _claim_global_model_switch(self, result) -> None:
-        if not hasattr(result, "_gateway_global_seq"):
-            seq = self.__dict__.get("_global_model_issue_seq", 0) + 1
-            self.__dict__["_global_model_issue_seq"] = seq
-            result._gateway_global_seq = seq
-
     async def _persist_ordered_model_config(self, result, config_path) -> bool:
-        """Serialize config writes without letting a delayed older confirmation undo a newer one."""
-        self._claim_global_model_switch(result)
-        async with self._model_config_write_lock():
-            seq = result._gateway_global_seq
-            if seq < self.__dict__.get("_global_model_committed_seq", 0):
-                return False
-            await _persist_model_switch_to_config(result, config_path)
-            self.__dict__["_global_model_committed_seq"] = seq
-            return True
+        """Completion order per canonical destination; unrelated profiles never supersede each other."""
+        destination = str(Path(config_path).resolve())
+        locks = self.__dict__.setdefault("_model_config_write_locks", {})
+        async with locks.setdefault(destination, asyncio.Lock()):
+            await self._settle_model_write(_persist_model_switch_to_config(result, config_path))
+        return True
+
+    @staticmethod
+    async def _settle_model_write(awaitable):
+        """A cancelled executor await does not stop its thread. Join it before releasing ownership."""
+        task = asyncio.ensure_future(awaitable)
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            # Retrieve worker exceptions, but interruption remains the caller's terminal outcome.
+            with contextlib.suppress(Exception):
+                task.result()
+            raise asyncio.CancelledError()
+        return task.result()
+
+    async def _owned_model_selection(self, source, operation):
+        """Keep the switch lock through delivery AND persistence, including adapter cancellation.
+
+        A callback or active-session bypass has no adapter post-delivery lifecycle: it sends the
+        confirmation itself and saves inline in its invoking task. No job survives that task.
+        """
+        lock = self._model_switch_lock(self._model_switch_lock_key(source))
+        await lock.acquire()
+        owner = {"save": None, "transferred": False}
+        token = _model_selection_owner.set(owner)
+        try:
+            reply = await operation()
+            save = owner["save"]
+            if save is None:
+                return reply
+            adapter = self._delivery_adapter_for(source)
+            task = asyncio.current_task()
+            adapter_key = next((key for key, value in
+                                getattr(adapter, "_session_tasks", {}).items() if value is task), None)
+            if adapter_key is None:
+                await self._send_model_selection_confirmation(source, reply)
+                await self._save_owned_model_selection(source, save)
+                return reply
+            ctx = contextvars.copy_context()
+            active = adapter._active_sessions.get(adapter_key)
+            generation = getattr(active, "_hermes_run_generation", None)
+
+            async def after_delivery():
+                try:
+                    await asyncio.create_task(self._save_owned_model_selection(source, save), context=ctx)
+                finally:
+                    lock.release()
+
+            after_delivery.post_delivery_timeout = None
+            adapter.register_post_delivery_callback(adapter_key, after_delivery, generation=generation)
+            owner["transferred"] = True
+            return reply
+        finally:
+            _model_selection_owner.reset(token)
+            if not owner["transferred"]:
+                lock.release()
+
+    async def _send_model_selection_confirmation(self, source, reply):
+        adapter = self._delivery_adapter_for(source)
+        if adapter is not None and reply:
+            await adapter.send(str(source.chat_id), reply,
+                               metadata=self._thread_metadata_for_source(source))
+
+    async def _save_owned_model_selection(self, source, save):
+        try:
+            await save()
+        except asyncio.CancelledError:
+            await self._send_model_switch_followup(source, "CancelledError")
+            raise
+        except Exception as exc:
+            await self._send_model_switch_followup(source, type(exc).__name__)
 
     def _model_switch_lock_key(self, source) -> str:
         """Lock key for a /model from ``source``. Sync (no await before the lock is taken, so
@@ -425,110 +484,6 @@ class GatewayModelCommandsMixin:
             return self._session_key_for_source(source) or ""
         except Exception:
             return ""
-
-    def _model_override_seq(self, session_key: str) -> int:
-        """Bumped by every in-memory /model override change (``_bump_model_override_seq``); a
-        deferred write whose seq is no longer current was superseded by a later switch."""
-        return int((self.__dict__.get("_model_override_seqs") or {}).get(session_key, 0))
-
-    def _bump_model_override_seq(self, session_key: str) -> int:
-        seqs = self.__dict__.setdefault("_model_override_seqs", {})
-        seqs[session_key] = seqs.get(session_key, 0) + 1
-        return seqs[session_key]
-
-    def _model_switch_write_pending(self, session_key: str) -> bool:
-        """A reply-first /model for this session has durable writes not yet committed; its
-        in-memory override is authoritative until then (persisted-route reconciliation keeps it)."""
-        return bool(session_key and (self.__dict__.get("_model_switch_pending") or {}).get(session_key))
-
-    # Reply-first /model (t_2ab07928): the confirmation is sent once the switch is applied in memory;
-    # the durable writes (state.db column, session-store identity, --global config.yaml) run after the
-    # send as the adapter's post-delivery callback inside the session's own task (skill
-    # latency-stage-attribution §5b). Jobs queue per session and drain FIFO under one lock, so they
-    # commit in issue order; any drain runs every job still queued (a dropped or /stop-cancelled
-    # callback leaves its job for the next one).
-
-    def _model_switch_deferral(self, source, session_key: str = ""):
-        """``(adapter, adapter_session_key)`` when this /model runs as the adapter's own session task
-        (its post-delivery callback fires after the reply); ``(None, None)`` when this session's
-        deferred writes are draining right now (a /model dispatched while the session is busy queues
-        behind them: the running drain picks it up, in issue order); else None (write inline)."""
-        try:
-            adapter = self._delivery_adapter_for(source)
-            task = asyncio.current_task()
-            if (adapter is not None and task is not None
-                    and getattr(type(adapter), "register_post_delivery_callback", None) is not None):
-                for key, owner in list((getattr(adapter, "_session_tasks", None) or {}).items()):
-                    if owner is task:
-                        return adapter, key
-        except Exception:
-            logger.debug("model switch deferral probe failed; writing inline", exc_info=True)
-        # A held write lock means a drain is inside its loop: a job appended now (no await between
-        # this check and the append) is run by that drain before it exits.
-        lock = (self.__dict__.get("_model_switch_write_locks") or {}).get(session_key)
-        if session_key and lock is not None and lock.locked():
-            return None, None
-        return None
-
-    def _defer_model_switch_writes(self, deferral, session_key: str, source, job) -> bool:
-        """Queue ``job`` (async, returns failure text or None) to run after the reply is delivered.
-        False when nothing will run it (the drain it meant to queue behind has finished since the
-        probe): the caller drains inline."""
-        adapter, adapter_key = deferral
-        pending = self.__dict__.setdefault("_model_switch_pending", {})
-        pending.setdefault(session_key, collections.deque()).append(job)
-        if adapter is None:  # queued behind the drain already running for this session
-            lock = (self.__dict__.get("_model_switch_write_locks") or {}).get(session_key)
-            return lock is not None and lock.locked()
-        active = (getattr(adapter, "_active_sessions", None) or {}).get(adapter_key)
-        generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
-        # The routed profile scope (home/secret contextvars) is gone when the adapter fires the
-        # callback; run the writes in the context captured here.
-        ctx = contextvars.copy_context()
-
-        async def _after_delivery() -> None:
-            # Awaiting the task: a /stop cancelling the session task cancels the writes with it.
-            await asyncio.create_task(self._drain_model_switch_writes(session_key, source), context=ctx)
-
-        # Unbounded, as the inline await was: the store/config writes carry no generic short timeout.
-        _after_delivery.post_delivery_timeout = None
-        adapter.register_post_delivery_callback(adapter_key, _after_delivery, generation=generation)
-        # A skipped/cancelled callback leaves its job queued for the next owned drain.
-        # Never restart persistence from a task-done callback: the adapter has released the
-        # session at that point, so /stop, /new and shutdown cannot own or cancel that work.
-        return True
-
-    async def _drain_model_switch_writes(self, session_key: str, source) -> None:
-        """Run every queued deferred /model write for ``session_key`` in issue order. A failure is
-        posted as a visible follow-up line, never dropped silently."""
-        queue = (self.__dict__.get("_model_switch_pending") or {}).get(session_key)
-        if not queue:
-            return
-        locks = self.__dict__.setdefault("_model_switch_write_locks", {})
-        lock = locks.get(session_key)
-        if lock is None:
-            lock = locks[session_key] = asyncio.Lock()
-        async with lock:
-            while queue:
-                job = queue[0]
-                started = time.monotonic()
-                try:
-                    failure = await job()
-                except asyncio.CancelledError:
-                    # Completed phases are recorded on the job; the next drain resumes after them
-                    # (an already-written config.yaml is never written again, Prism fce37d9b26ea).
-                    logger.warning("deferred /model writes for %s interrupted; left queued for the next drain",
-                                   session_key)
-                    raise
-                except Exception as exc:
-                    failure = str(exc) or type(exc).__name__
-                queue.popleft()
-                if (took := time.monotonic() - started) > 2.0:
-                    logger.info("PHASE=model_switch_deferred_writes session=%s s=%.2f (after delivery)",
-                                session_key, took)
-                if failure:
-                    logger.warning("deferred /model writes for %s failed: %s", session_key, failure)
-                    await self._send_model_switch_followup(source, failure)
 
     async def _send_model_switch_followup(self, source, failure: str) -> None:
         text = f"⚠️ Model switch active for this session, but saving it failed: {failure}"
@@ -570,7 +525,6 @@ class GatewayModelCommandsMixin:
         one_turn = False if picker else ctx.one_turn
         # An inline commit lands after any reply-first write still queued for this session, so the
         # older switch can never overwrite this one (Prism ea8bef1a2f75 / af86b8cbef02).
-        await self._drain_model_switch_writes(ctx.session_key, source)
         error = self._switch_cached_agent_model(result, ctx, picker)
         if error is not None:
             return error
@@ -700,9 +654,10 @@ class GatewayModelCommandsMixin:
         timing = _mct.begin()  # phase lock_wait: a /model on any other session queues here
         exc: Optional[BaseException] = None
         try:
-            async with self._model_switch_lock(self._model_switch_lock_key(event.source)):
+            async def operation():
                 _mct.phase("config")
                 return await self._handle_model_command_locked(event)
+            return await self._owned_model_selection(event.source, operation)
         except BaseException as e:
             exc = e
             raise

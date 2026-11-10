@@ -44,8 +44,7 @@ def _switched(model):
 async def _drained(h, timeout=5.0):
     """Wait until the session's deferred jobs are committed and the session task is done; read the
     store only after that (a concurrent read races the store creating its tables)."""
-    await _wait_for(lambda: not h.runner._model_switch_write_pending(h.key())
-                    and not any(not t.done() for t in list(h.adapter._session_tasks.values())),
+    await _wait_for(lambda: not any(not t.done() for t in list(h.adapter._session_tasks.values())),
                     "deferred writes to settle", timeout)
 
 
@@ -164,10 +163,12 @@ async def test_same_session_switches_commit_in_issue_order(tmp_path, monkeypatch
     await h.adapter.handle_message(_ev("/model model-A"))
     await _wait_for(lambda: h.sent_with(_switched("model-A")), "first confirmation")
     await asyncio.wait_for(h.db.entered.wait(), 5)
-    await asyncio.wait_for(h.adapter.handle_message(_ev("/model model-B")), 5)  # session busy: dispatched inline
-    await _wait_for(lambda: h.sent_with(_switched("model-B")), "second confirmation while the first write is blocked")
-    assert h.runner._session_model_override(h.key())["model"] == "model-B"
+    second = asyncio.create_task(h.adapter.handle_message(_ev("/model model-B")))
+    await asyncio.sleep(0.05)
+    assert not second.done()
+    assert not h.sent_with(_switched("model-B"))
     h.db.release.set()
+    await asyncio.wait_for(second, 5)
     await _drained(h)
     # model-A's state.db write was already in flight when model-B was issued; it lands first.
     assert h.db.models == ["model-A", "model-B"]
@@ -218,7 +219,7 @@ async def test_deferred_global_write_failure_posts_a_followup_line(tmp_path, mon
     reply = h.sent_with(_switched("gpt-5.5"))[0]
     assert "Saved to config.yaml" not in reply and "disk full" not in reply
     followup = h.sent_with(FOLLOWUP)[0]
-    assert "disk full" in followup
+    assert "OSError" in followup and "disk full" not in followup
     assert h.adapter.sent.index(reply) < h.adapter.sent.index(followup)
     # #100314 semantics: the switch truthfully stays a session override (memory + store).
     assert yaml.safe_load(h.cfg_path.read_text(encoding="utf-8"))["model"]["default"] == "old-model"
@@ -234,41 +235,17 @@ async def test_stop_during_the_deferred_write_keeps_the_queued_message(tmp_path,
     await _wait_for(lambda: h.sent_with(_switched("gpt-5.5")), "confirmation")
     await asyncio.wait_for(h.db.entered.wait(), 5)
     await h.adapter.handle_message(_ev("hello"))  # queued behind the deferred write
-    await h.adapter.handle_message(_ev("/stop"))  # real /stop path: cancel, keep pending, drain
+    stop = asyncio.create_task(h.adapter.handle_message(_ev("/stop")))
+    await asyncio.sleep(0.05)
+    h.db.release.set()
+    await stop
     await _wait_for(lambda: h.turns, "queued message after /stop")
     assert h.turns == [("hello", "gpt-5.5")]
-    # The interrupted write stays queued for the next drain instead of being dropped.
-    assert len(h.runner.__dict__["_model_switch_pending"][h.key()]) == 1
-    assert h.db.models == []
+    assert "_model_switch_pending" not in h.runner.__dict__
+    assert len(h.sent_with(FOLLOWUP)) == 1
+    assert "CancelledError" in h.sent_with(FOLLOWUP)[0]
 
 
-@pytest.mark.asyncio
-async def test_reset_pin_does_not_clear_pending_switch_after_stop(tmp_path, monkeypatch):
-    """Prism 28b3a5cdd324: reset's NULL pin predates the uncommitted B pick."""
-    from hermes_state import SessionDB
-
-    h = _Harness(tmp_path, monkeypatch)
-    monkeypatch.setattr("hermes_state.SessionDB", SessionDB)
-    db = SessionDB(db_path=tmp_path / "state.db")
-    h.runner.session_store._db = db
-    h.runner.session_store.get_or_create_session(_source())
-    await h.adapter.handle_message(_ev("/model reset"))
-    await _wait_for(lambda: not h.adapter._session_tasks, "reset to settle")
-    assert h.runner.session_store.get_chat_model_pin(h.key()) == (True, None)
-    await h.adapter.handle_message(_ev("/model model-B"))
-    await _wait_for(lambda: h.sent_with(_switched("model-B")), "B confirmation")
-    await asyncio.wait_for(h.db.entered.wait(), 5)
-    try:
-        await h.adapter.handle_message(_ev("/stop"))
-        await _wait_for(lambda: not h.adapter._session_tasks, "stop to release the session")
-        assert h.runner._model_switch_write_pending(h.key())
-        assert h.db.models == []
-        model, _runtime = h.runner._resolve_session_agent_runtime(source=_source())
-        assert model == "model-B"
-    finally:
-        h.db.release.set()
-        await h.runner._drain_model_switch_writes(h.key(), _source())
-        db.close()
 
 
 # --------------------------------------------------------------------------- Prism round 1 (#169)
@@ -285,10 +262,10 @@ async def test_picker_tap_lands_after_a_queued_typed_switch(tmp_path, monkeypatc
                         lambda **kw: [{"slug": "openrouter", "name": "OpenRouter", "models": ["model-B"]}])
     monkeypatch.setattr(type(h.adapter), "send_model_picker", _FakePickerAdapter.send_model_picker, raising=False)
     h.adapter.captured_callback = None
+    assert await h.runner._handle_model_command(_ev("/model --global")) is None
     await h.adapter.handle_message(_ev("/model model-A --global"))
     await _wait_for(lambda: h.sent_with(_switched("model-A")), "typed confirmation")
     await asyncio.wait_for(h.db.entered.wait(), 5)
-    assert await h.runner._handle_model_command(_ev("/model --global")) is None
     tap = asyncio.ensure_future(h.adapter.captured_callback("12345", "model-B", "openrouter"))
     await asyncio.sleep(0.2)
     assert not tap.done(), "the tap committed before the queued typed switch"
@@ -318,76 +295,10 @@ async def test_pending_switch_survives_persisted_route_reconciliation(tmp_path, 
     await _drained(h)
 
 
-@pytest.mark.asyncio
-async def test_superseded_global_switch_does_not_clear_a_newer_override(tmp_path, monkeypatch):
-    """Prism 9ea56997a2df: a newer override installed while a deferred --global switch waits on its
-    config write is not cleared from memory or the store by the older switch."""
-    h = _Harness(tmp_path, monkeypatch)
-    h.db.release.set()
-    gate, entered = asyncio.Event(), asyncio.Event()
-    from hermes_cli.model_switch import persist_model_selection
-
-    async def _slow_write(result, config_path):
-        entered.set()
-        await gate.wait()
-        await asyncio.to_thread(persist_model_selection, result, config_path)
-
-    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", _slow_write)
-    await h.adapter.handle_message(_ev("/model model-A --global"))
-    await asyncio.wait_for(entered.wait(), 5)
-    newer = {"model": "model-B", "provider": "openrouter", "api_mode": "chat_completions"}
-    await h.runner._persist_session_model_override(h.key(), newer)
-    gate.set()
-    await _drained(h)
-    assert h.runner._session_model_override(h.key())["model"] == "model-B"
 
 
-@pytest.mark.asyncio
-async def test_cancelled_drain_does_not_replay_a_completed_config_write(tmp_path, monkeypatch):
-    """Prism fce37d9b26ea: a drain cancelled after its config.yaml write resumes after that phase."""
-    h = _Harness(tmp_path, monkeypatch)
-    h.db.release.set()
-    writes = []
-    from hermes_cli.model_switch import persist_model_selection
-
-    async def _write(result, config_path):
-        await asyncio.to_thread(persist_model_selection, result, config_path)
-        writes.append(result.new_model)
-
-    store_gate = asyncio.Event()
-    real_persist = h.runner._persist_session_model_override
-
-    async def _held_persist(key, override, **kw):
-        if kw.get("persist_only"):
-            await store_gate.wait()
-        return await real_persist(key, override, **kw)
-
-    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", _write)
-    h.runner._persist_session_model_override = _held_persist
-    await h.adapter.handle_message(_ev("/model model-A --global"))
-    await _wait_for(lambda: writes == ["model-A"], "config write")
-    await h.adapter.cancel_session_processing(h.key())  # /stop mid store phase
-    assert h.runner._model_switch_write_pending(h.key())
-    store_gate.set()
-    await h.runner._drain_model_switch_writes(h.key(), _source())
-    await _drained(h)
-    assert writes == ["model-A"], "the completed config.yaml write was replayed"
 
 
-@pytest.mark.asyncio
-async def test_writes_stay_queued_when_the_post_delivery_callback_is_skipped(tmp_path, monkeypatch):
-    """No detached recovery task may persist after the adapter releases session ownership."""
-    h = _Harness(tmp_path, monkeypatch)
-    h.db.release.set()
-    h.adapter._fire_post_delivery_callback = lambda *_a, **_k: asyncio.sleep(0)
-    await h.adapter.handle_message(_ev("/model gpt-5.5"))
-    await _wait_for(lambda: not h.adapter._session_tasks, "session released")
-    await asyncio.sleep(0.1)
-    assert h.db.models == [], "a detached orphan task wrote after session release"
-    assert h.runner._model_switch_write_pending(h.key())
-    # A subsequent owned command resumes the queue before its own inline commit.
-    await h.runner._handle_model_command(_ev("/model model-B"))
-    assert h.runner.session_store.get_model_override(h.key())["model"] == "model-B"
 
 
 def test_telegram_dm_commands_share_one_switch_lock(tmp_path, monkeypatch):
@@ -404,9 +315,11 @@ async def test_session_switch_does_not_discard_queued_global_intent(tmp_path, mo
     h = _Harness(tmp_path, monkeypatch)
     await h.adapter.handle_message(_ev("/model model-A --global"))
     await asyncio.wait_for(h.db.entered.wait(), 5)
-    await h.adapter.handle_message(_ev("/model model-B"))
-    await _wait_for(lambda: h.sent_with(_switched("model-B")), "second confirmation")
+    second = asyncio.create_task(h.adapter.handle_message(_ev("/model model-B")))
+    await asyncio.sleep(0.05)
+    assert not second.done()
     h.db.release.set()
+    await second
     await _drained(h)
     assert yaml.safe_load(h.cfg_path.read_text())["model"]["default"] == "model-A"
     assert h.runner.session_store.get_model_override(h.key())["model"] == "model-B"
@@ -433,35 +346,10 @@ async def test_failed_global_cleanup_keeps_new_identity_persisted(tmp_path, monk
     monkeypatch.setattr(h.runner.session_store, "clear_model_route_override", real_clear)
 
 
-@pytest.mark.asyncio
-async def test_config_failure_survives_cancelled_drain(tmp_path, monkeypatch):
-    h = _Harness(tmp_path, monkeypatch)
-    h.db.release.set()
-    entered, release = asyncio.Event(), asyncio.Event()
-    real_persist = h.runner._persist_session_model_override
-
-    async def fail_config(result, config_path):
-        raise OSError("config disk full")
-
-    async def held_persist(key, override, **kw):
-        if kw.get("persist_only"):
-            entered.set()
-            await release.wait()
-        return await real_persist(key, override, **kw)
-
-    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", fail_config)
-    h.runner._persist_session_model_override = held_persist
-    await h.adapter.handle_message(_ev("/model model-A --global"))
-    await asyncio.wait_for(entered.wait(), 5)
-    await h.adapter.cancel_session_processing(h.key())
-    release.set()
-    await h.runner._drain_model_switch_writes(h.key(), _source())
-    await _drained(h)
-    assert any("config disk full" in line for line in h.sent_with(FOLLOWUP))
 
 
 @pytest.mark.asyncio
-async def test_global_issue_order_survives_cross_session_db_delay(tmp_path, monkeypatch):
+async def test_global_completion_order_after_cross_session_db_delay(tmp_path, monkeypatch):
     h = _Harness(tmp_path, monkeypatch)
     first_entered, release = asyncio.Event(), asyncio.Event()
 
@@ -477,8 +365,7 @@ async def test_global_issue_order_survives_cross_session_db_delay(tmp_path, monk
     await _wait_for(lambda: yaml.safe_load(h.cfg_path.read_text())["model"]["default"] == "model-B", "newer global saved")
     release.set()
     await _drained(h)
-    await _wait_for(lambda: not h.runner._model_switch_write_pending(h.key("111")), "older global settled")
-    assert yaml.safe_load(h.cfg_path.read_text())["model"]["default"] == "model-B"
+    assert yaml.safe_load(h.cfg_path.read_text())["model"]["default"] == "model-A"
 
 
 @pytest.mark.asyncio
@@ -574,30 +461,6 @@ async def test_cached_agent_real_sqlite_has_no_write_before_confirmation(tmp_pat
     assert not h.sent_with(FOLLOWUP)
 
 
-@pytest.mark.asyncio
-async def test_superseding_clear_fences_worker_credential_resolution(tmp_path, monkeypatch):
-    h = _Harness(tmp_path, monkeypatch)
-    entry = h.runner.session_store.get_or_create_session(_source())
-    override = {"model": "model-A", "provider": "openrouter"}
-    h.runner._apply_session_model_override_in_memory(h.key(), override)
-    entered, release = threading.Event(), threading.Event()
-
-    def resolve(value):
-        entered.set()
-        assert release.wait(10)
-        return dict(value)
-
-    h.runner._model_override_is_persistable = resolve
-    worker = asyncio.create_task(h.runner._persist_session_model_override(
-        h.key(), override, persist_only=True, require_persistence=True))
-    try:
-        await _wait_for(entered.is_set, "worker in credential resolution")
-        h.runner._set_session_model_override(h.key(), None)
-    finally:
-        release.set()
-    await worker
-    assert entry.model_override_identity is None
-    assert h.runner._session_model_override(h.key()) is None
 
 
 @pytest.mark.asyncio

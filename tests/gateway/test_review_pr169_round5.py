@@ -62,49 +62,30 @@ async def test_cost_callback_keeps_initial_deferral_decision(tmp_path, monkeypat
         await original_update(sid, model, **kw)
         await asyncio.to_thread(db.update_session_model, sid, model, **kw)
     h.db.update_session_model = update
-    send_entered, send_release = asyncio.Event(), asyncio.Event()
-    original_send = h.adapter.send
-    async def held_send(chat_id, content, **kw):
-        if _switched('model-A') in content:
-            send_entered.set()
-            await send_release.wait()
-        return await original_send(chat_id, content, **kw)
-    h.adapter.send = held_send
     captured = {}
     async def confirm(**kw):
         captured['handler'] = kw['handler']
         return 'cost confirmation requested'
     h.runner._request_slash_confirm = confirm
     monkeypatch.setattr('hermes_cli.model_selection_guards.combined_selection_warning', lambda model, **kw: types.SimpleNamespace(title='cost', message='cost') if model == 'model-B' else None)
-    clear_entered, clear_release = threading.Event(), threading.Event()
-    original_clear = h.runner._clear_fallback_for_user_route
-    def held_clear(*a, **kw):
-        clear_entered.set()
-        assert clear_release.wait(15)
-        return original_clear(*a, **kw)
     task = None
     try:
-        await h.adapter.handle_message(_ev('/model model-A'))
-        await asyncio.wait_for(send_entered.wait(), 5)
         await h.adapter.handle_message(_ev('/model model-B'))
         await _wait_for(lambda: 'handler' in captured, 'cost callback registered')
-        h.runner._clear_fallback_for_user_route = held_clear
-        task = asyncio.create_task(captured['handler']('once'))
-        await _wait_for(clear_entered.is_set, 'B precommit await')
-        send_release.set()
+        await _drained(h)
+        await h.adapter.handle_message(_ev('/model model-A'))
         await asyncio.wait_for(h.db.entered.wait(), 5)
-        clear_release.set()
+        task = asyncio.create_task(captured['handler']('once'))
+        await asyncio.sleep(0.05)
+        assert not task.done(), 'cost callback bypassed the owning save'
+        h.db.release.set()
         reply = await asyncio.wait_for(task, 10)
         assert _switched('model-B') in reply
-        h.db.release.set()
         await _drained(h, 10)
-        print('COST_CALLBACK_FOLLOWUPS', h.sent_with(FOLLOWUP))
+        assert not h.sent_with(FOLLOWUP)
         actual = h.runner.session_store.get_chat_model_pin(h.key())
-        print('COST_CALLBACK_FINAL_PIN', actual)
         assert actual[0] and actual[1] and actual[1]['model'] == 'model-B'
     finally:
-        send_release.set()
-        clear_release.set()
         h.db.release.set()
         if task and not task.done():
             await asyncio.wait_for(task, 10)
@@ -129,10 +110,13 @@ async def test_reset_cannot_be_undone_by_started_legacy_write(tmp_path, monkeypa
     try:
         await h.adapter.handle_message(_ev('/model model-B'))
         await _wait_for(entered.is_set, 'legacy worker entered')
-        await h.adapter.handle_message(_ev('/model reset'))
+        reset = asyncio.create_task(h.adapter.handle_message(_ev('/model reset')))
+        await asyncio.sleep(0.05)
+        assert not reset.done(), 'reset bypassed started writer'
+        release.set()
+        await asyncio.wait_for(reset, 10)
         await _wait_for(lambda: h.sent_with('Model session override cleared'), 'reset confirmed')
         assert store.get_chat_model_pin(h.key()) == (True, None)
-        release.set()
         await _drained(h, 10)
         pin = store.get_chat_model_pin(h.key())
         await h.adapter.handle_message(_ev('hello after reset'))

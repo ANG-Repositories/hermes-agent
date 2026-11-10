@@ -264,10 +264,7 @@ class GatewayTurnMixin:
                 )
             persisted_identity = route_lookup.identity
             cached_override = self._session_model_overrides.get(skey)
-            # A reply-first /model whose durable write is still queued (t_2ab07928) is newer than
-            # the persisted identity: the in-memory override stays authoritative until it commits.
-            _write_pending = getattr(self, "_model_switch_write_pending", None)
-            if persisted_identity and cached_override and not (_write_pending and _write_pending(skey)):
+            if persisted_identity and cached_override:
                 def _identity(o):
                     return self._configured_route_identity({"model": {
                         "default": o.get("model"), "provider": o.get("provider"), "api_mode": o.get("api_mode"),

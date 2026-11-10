@@ -8060,12 +8060,9 @@ class GatewayRunner(
     def _set_session_model_override(
         self, session_key: str, override: Optional[dict], *,
         require_persistence: bool = False, persist_only: bool = False,
-        expected_seq: Optional[int] = None,
     ) -> None:
         identity = self._model_override_is_persistable(override) if override is not None else None
         with self._model_override_commit_lock():
-            if expected_seq is not None and self._model_override_seq(session_key) != expected_seq:
-                return
             self._set_session_model_override_locked(
                 session_key, override, require_persistence=require_persistence,
                 persist_only=persist_only, identity=identity,
@@ -8141,8 +8138,6 @@ class GatewayRunner(
         unavailable = getattr(self, "_session_model_override_unavailable", None)
         if unavailable is not None:
             unavailable.discard(session_key)
-        # Supersedes any reply-first /model write still queued for this session (t_2ab07928).
-        self._bump_model_override_seq(session_key)
 
     def _sweep_restart_initiated_breadcrumbs(self) -> int:
         """Prune breadcrumb files from a prior boot or past the TTL (D-8).
@@ -8907,7 +8902,6 @@ class GatewayRunner(
         so writes land in the order the commands were issued; every write
         runs (none is skipped, so no caller reports a write that never landed).
         """
-        expected_seq = self._model_override_seq(session_key) if persist_only else None
         locks = self.__dict__.setdefault("_model_override_locks", {})
         lock = locks.setdefault(session_key, asyncio.Lock())
         async with lock:
@@ -8919,7 +8913,7 @@ class GatewayRunner(
                 session_key,
                 override,
                 require_persistence=require_persistence,
-                **({"persist_only": True, "expected_seq": expected_seq} if persist_only else {}),
+                **({"persist_only": True} if persist_only else {}),
             ))
             cancelled = False
             while True:
@@ -9353,11 +9347,8 @@ class GatewayRunner(
                 # Read failures can carry credential-bearing paths or URLs.
                 logger.warning("Chat model pin reconciliation unavailable")
                 return PersistedSessionRouteLookup("unavailable")
-            if (present and pin is None
-                    and not self._model_switch_write_pending(session_key)):
-                # NOTE(P3b/RC-2): cache reconciliation only; the user clear is
-                # already durable. A NULL pin may predate a reply-first switch
-                # still being saved, so retain its pending in-memory override.
+            if present and pin is None:
+                # NOTE(P3b/RC-2): cache reconciliation only; the user clear is already durable.
                 self._session_model_overrides.pop(session_key, None)
         return lookup
 

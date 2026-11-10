@@ -3488,308 +3488,14 @@ class GatewaySlashCommandsMixin(
                     _cur_api_key = current_api_key
                     _picker_profile_home = _command_profile_home
 
-                    async def _on_model_selected(
-                        _chat_id: str, model_id: str, provider_slug: str
-                    ) -> str:
-                        """Perform the model switch and return confirmation text."""
-                        skew_error = _model_switch_skew_guard()
-                        if skew_error:
-                            return skew_error
-                        # Offload the switch off the event loop — switch_model()
-                        # can fall through to a synchronous models.dev HTTP fetch
-                        # (requests.get, 15s timeout) on a cold/expired cache,
-                        # which freezes the gateway otherwise. See #20525, #41289.
-                        result = await asyncio.to_thread(
-                            _switch_model,
-                            raw_input=model_id,
-                            current_provider=_cur_provider,
-                            current_model=_cur_model,
-                            current_base_url=_cur_base_url,
-                            current_api_key=_cur_api_key,
-                            is_global=persist_global,
-                            explicit_provider=provider_slug,
-                            user_providers=user_provs,
-                            custom_providers=custom_provs,
-                        )
-                        if not result.success:
-                            return t("gateway.model.error_prefix", error=result.error_message)
-
-                        try:
-                            from hermes_cli.context_switch_guard import (
-                                enrich_model_switch_warnings_for_gateway,
-                            )
-
-                            # Offload: merge_preflight_compression_warning()
-                            # calls the sync resolve_display_context_length()
-                            # provider probe ladder — must not run on the loop.
-                            await asyncio.to_thread(
-                                enrich_model_switch_warnings_for_gateway,
-                                result,
-                                _self,
-                                session_key=_session_key,
-                                source=event.source,
-                                custom_providers=custom_provs,
-                                load_gateway_config=_load_gateway_config,
-                            )
-                        except Exception as exc:
-                            logger.debug("preflight-compression switch warning failed: %s", exc)
-
-                        if persist_global:
-                            _self._claim_global_model_switch(result)
-                        # Update cached agent in-place
-                        _switch_announce_kwargs = {}
-                        cached_entry = None
-                        _cache_lock = getattr(_self, "_agent_cache_lock", None)
-                        _cache = getattr(_self, "_agent_cache", None)
-                        if _cache_lock and _cache is not None:
-                            with _cache_lock:
-                                cached_entry = _cache.get(_session_key)
-                        # Explicit route beats an automatic one (t_b2e9bb23).
-                        _fb_cleared = await asyncio.to_thread(
-                            _self._clear_fallback_for_user_route,
-                            _session_key,
-                            cached_entry[0] if cached_entry else None,
-                        )
-                        if cached_entry and cached_entry[0] is not None:
-                            _sw_old_model = getattr(cached_entry[0], "model", _cur_model)
-                            _sw_old_provider = getattr(cached_entry[0], "provider", _cur_provider)
-                            _sw_effort = getattr(cached_entry[0], "reasoning_config", None)
-                            _sw_old_window = None
-                            try:
-                                _sw_old_window = getattr(
-                                    getattr(cached_entry[0], "context_compressor", None),
-                                    "context_length",
-                                    None,
-                                )
-                            except Exception:
-                                _sw_old_window = None
-                            try:
-                                # Off-loop: the in-place swap rebuilds clients and
-                                # can probe the provider (t_515b7fce).
-                                await asyncio.to_thread(
-                                    cached_entry[0].switch_model,
-                                    new_model=result.new_model,
-                                    new_provider=result.target_provider,
-                                    api_key=result.api_key,
-                                    base_url=result.base_url,
-                                    api_mode=result.api_mode,
-                                    # Keep the session's /reasoning override
-                                    # across the route change (#467 contract);
-                                    # without this switch_model would fall back
-                                    # to its own keep-current rule, which is
-                                    # blind to a session override the gateway
-                                    # holds but config.yaml does not.
-                                    **_self._switch_reasoning_kwargs(
-                                        source=event.source,
-                                        session_key=_session_key,
-                                        model=result.new_model,
-                                    ),
-                                )
-                            except Exception as exc:
-                                # The in-place swap rolled the agent back to the
-                                # OLD working model/client and re-raised.  Abort
-                                # the rest of the commit: do NOT persist the
-                                # failed model to the DB, do NOT set a session
-                                # override pointing at the broken model, and do
-                                # NOT evict the working cached agent.  Otherwise
-                                # the next message rebuilds a dead agent from the
-                                # broken override and the conversation is lost
-                                # (#50163).  A failed switch must be a no-op.
-                                logger.warning(
-                                    "Picker model switch failed for cached agent: %s", exc
-                                )
-                                return t(
-                                    "gateway.model.error_prefix",
-                                    error=(
-                                        f"Model switch to {result.new_model} failed ({exc}); "
-                                        f"staying on {_cur_model}."
-                                    ),
-                                )
-
-                            # Announce the deliberate switch in-chat (like
-                            # failover does) so spectators who didn't run
-                            # /model see the change, not just the ephemeral
-                            # reply. Delivery belongs to this command's source.
-                            _sw_new_window = None
-                            try:
-                                _sw_new_window = getattr(
-                                    getattr(cached_entry[0], "context_compressor", None),
-                                    "context_length",
-                                    None,
-                                )
-                            except Exception:
-                                _sw_new_window = None
-
-                            # #467 rule 3: the NEW side reads the agent's ACTUAL
-                            # post-switch reasoning_config, never the value that
-                            # requested the change — a per-model override for the
-                            # new model must show up here.
-                            _sw_new_effort = _sw_effort
-                            try:
-                                _sw_new_effort = _self._reasoning_effort_label(
-                                    _self._post_switch_reasoning_config(
-                                        cached_entry[0],
-                                        source=event.source,
-                                        session_key=_session_key,
-                                        model=result.new_model,
-                                    )
-                                )
-                            except Exception:
-                                _sw_new_effort = _sw_effort
-                            _switch_announce_kwargs = {
-                                "source": event.source,
-                                "old_model": _sw_old_model,
-                                "new_model": result.new_model,
-                                "old_provider": _sw_old_provider,
-                                "new_provider": result.target_provider,
-                                "old_effort": _sw_effort,
-                                "new_effort": _sw_new_effort,
-                                "old_window": _sw_old_window,
-                                "new_window": _sw_new_window,
-                            }
-
-                        # Persist the new model to the session DB so the
-                        # dashboard shows the updated model (#34850).
-                        _sess_db = getattr(_self, "_session_db", None)
-                        if _sess_db is not None:
-                            try:
-                                _sess_entry = await _self.async_session_store.get_or_create_session(
-                                    event.source
-                                )
-                                await _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model,
-                                    provider=result.target_provider,
-                                )
-                            except Exception as exc:
-                                logger.debug(
-                                    "Failed to persist model switch to DB: %s", exc
-                                )
-
-                        # Store the session override (changes ``intended`` only). The model
-                        # learns of the switch from the per-call route note (agent/route_identity.py).
-                        from hermes_cli.model_switch import format_model_for_display
-                        # Off the loop: the persistability check re-resolves
-                        # credentials (config load + provider resolution, which
-                        # can refresh an OAuth token over the network).
-                        await _self._persist_session_model_override(_session_key, {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                            "request_overrides": dict(result.request_overrides or {}),
-                            "capabilities": dict(result.runtime_capabilities or {}),
-                        })
-
-                        # Announce the deliberate switch to the conversation (P2).
-                        if not cached_entry or cached_entry[0] is None:
-                            await _self._announce_switch(
-                                event.source,
-                                "Model",
-                                f"{_cur_provider}/{_cur_model}",
-                                f"{result.target_provider}/{result.new_model}",
-                            )
-                        else:
-                            await _self._announce_model_switch(
-                                cached_entry[0],
-                                **_switch_announce_kwargs,
-                            )
-
-                        # Config write-through (--global, #49066), session-override
-                        # write-through / #100314 redundant-override drop, and the
-                        # cache eviction — one durable commit shared with the typed path.
-                        _global_error = await _self._commit_model_switch_durable(
-                            result, session_key=_session_key, source=event.source,
-                            config_path=config_path, persist_global=persist_global,
-                            one_turn=False,
-                        )
-
-                        # Build confirmation text.  Use display form so opaque
-                        # Palantir IDs (ri.language-model-service..*) get
-                        # shortened to their trailing slug for the UI.
-                        plabel = result.provider_label or result.target_provider
-                        lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
-                        _fast_row = self._fast_unavailable_model_switch_row(result)
-                        if _fast_row:
-                            lines.append(_fast_row)
-                        lines.append(t("gateway.model.provider_label", provider=_with_resolved_route(plabel, result)))
-                        try:
-                            # Read the ACTUAL post-switch effort off the agent
-                            # (#467 rule 3) rather than re-resolving for the OLD
-                            # model, so the row can't advertise an effort the
-                            # session is not running at.
-                            _reasoning_label = _self._reasoning_effort_label(
-                                _self._post_switch_reasoning_config(
-                                    cached_entry[0] if cached_entry else None,
-                                    source=event.source,
-                                    session_key=_session_key,
-                                    model=result.new_model,
-                                )
-                            )
-                            if _reasoning_label:
-                                lines.append(t("gateway.model.reasoning_label", effort=_reasoning_label))
-                        except Exception:
-                            pass
-                        mi = result.model_info
-                        from hermes_cli.model_switch import resolve_display_context_length_async
-                        _sw_config_ctx = None
-                        _sw_model_cfg = {}
-                        try:
-                            _sw_cfg = _load_gateway_config()
-                            _sw_model_cfg = _sw_cfg.get("model", {})
-                            if isinstance(_sw_model_cfg, dict):
-                                _sw_raw = _sw_model_cfg.get("context_length")
-                                if _sw_raw is not None:
-                                    _sw_config_ctx = int(_sw_raw)
-                        except Exception:
-                            pass
-                        if not isinstance(_sw_model_cfg, dict):
-                            _sw_model_cfg = {}
-                        ctx = await resolve_display_context_length_async(
-                            result.new_model,
-                            result.target_provider,
-                            base_url=result.base_url or current_base_url or "",
-                            api_key=result.api_key or current_api_key or "",
-                            model_info=mi,
-                            custom_providers=custom_provs,
-                            config_context_length=_sw_config_ctx,
-                            configured_model=(
-                                _sw_model_cfg.get("default")
-                                or _sw_model_cfg.get("model")
-                            ),
-                            configured_provider=_sw_model_cfg.get("provider"),
-                            configured_base_url=_sw_model_cfg.get("base_url"),
-                        )
-                        if ctx:
-                            lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
-                        if mi:
-                            if mi.max_output:
-                                lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
-                            lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
-                        if result.warning_message:
-                            lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global and _global_error is not None:
-                            # Never claim a clean global commit the disk did not take (#100314).
-                            lines.append(t("gateway.model.warning_prefix", warning=_global_error))
-                            lines.append(t("gateway.model.session_only_hint"))
-                        elif persist_global:
-                            lines.append(t("gateway.model.saved_global"))
-                        else:
-                            lines.append(t("gateway.model.session_only_hint"))
-                        if _fb_cleared:
-                            lines.append(_self._fallback_cleared_line(
-                                result.target_provider, result.new_model))
-                        return "\n".join(lines)
-
-                    async def _on_model_selected_locked(
-                        _chat_id: str, model_id: str, provider_slug: str
-                    ) -> str:
-                        # A tap is a /model of its own: same per-session lock, and it commits only
-                        # after any reply-first write still queued for this session, so that older
-                        # switch cannot land over it (Prism f05146212848, t_2ab07928).
-                        async with _self._model_switch_lock(_self._model_switch_lock_key(event.source)):
-                            await _self._drain_model_switch_writes(_session_key, event.source)
-                            return await _on_model_selected(_chat_id, model_id, provider_slug)
+                    async def _on_model_selected_locked(_chat_id, model_id, provider_slug):
+                        # Reuse the typed commit path, without a second selection guard: the picker
+                        # already confirmed the choice. Both paths have the same ownership boundary.
+                        from dataclasses import replace
+                        selected = replace(event, text=f"/model {model_id} --provider {provider_slug}"
+                                           + (" --global" if persist_global else " --session"))
+                        selected._model_picker_confirmed = True
+                        return await _self._handle_model_command(selected)
 
                     async def _on_model_selected_dispatch(
                         _chat_id: str, model_id: str, provider_slug: str
@@ -3903,9 +3609,8 @@ class GatewaySlashCommandsMixin(
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
-            if persist_global:
-                self._claim_global_model_switch(result)
-            _defer = self._model_switch_deferral(event.source, session_key)
+            from gateway.slash_commands_model import _model_selection_owner
+            owner = _model_selection_owner.get()
             # If there's a cached agent, update it in-place
             _switch_announce_kwargs = {}
             cached_entry = None
@@ -3916,7 +3621,7 @@ class GatewaySlashCommandsMixin(
                     cached_entry = _cache.get(session_key)
             # Capture fallback lineage BEFORE the in-place swap resets live flags;
             # reply-first switches close its durable episode after delivery.
-            _fallback_closures = [] if _defer is not None else None
+            _fallback_closures = []
             _mct.phase("fallback_clear")
             _fb_cleared = await asyncio.to_thread(
                 self._clear_fallback_for_user_route,
@@ -3951,8 +3656,7 @@ class GatewaySlashCommandsMixin(
                         api_mode=result.api_mode,
                         # Gateway owns the deferred durable phase; the resident swap must not
                         # write its billing route before the confirmation.
-                        **({"persist_billing_route": False, "persist_fallback": False}
-                           if _defer is not None else {}),
+                        persist_billing_route=False, persist_fallback=False,
                         # Keep the session's /reasoning override across the
                         # route change (#467 contract) — see the picker path.
                         **self._switch_reasoning_kwargs(
@@ -4027,53 +3731,9 @@ class GatewaySlashCommandsMixin(
                 # (native compaction etc.) so the next agent build does not re-probe them.
                 "capabilities": dict(result.runtime_capabilities or {}),
             }
-            # Reply first (t_2ab07928): inside the adapter's session task the durable writes run
-            # after the confirmation is sent; a /model dispatched while this session's deferred
-            # writes drain queues behind them; elsewhere (cost-confirm callback) they stay inline,
-            # after any queued deferred write for this session. Picker taps commit in their own
-            # callback (``_on_model_selected_locked``), which drains first too.
-            _defer = self._model_switch_deferral(event.source, session_key)
-            _override_seq = None
-            if _defer is None:
-                await self._drain_model_switch_writes(session_key, event.source)
-                # Persist the new model to the session DB so the dashboard
-                # shows the updated model (#34850).
-                _sess_db = getattr(self, "_session_db", None)
-                if _sess_db is not None:
-                    try:
-                        _sess_entry = await self.async_session_store.get_or_create_session(source)
-                        # If this session was auto-reset, consume the flag so the
-                        # next regular message's cleanup does not wipe the model
-                        # override just stored below (Closes #48031).
-                        if getattr(_sess_entry, "was_auto_reset", False):
-                            _sess_entry.was_auto_reset = False
-                        await _sess_db.update_session_model(
-                            _sess_entry.session_id, result.new_model,
-                            provider=result.target_provider,
-                        )
-                    except Exception as exc:
-                        logger.debug(
-                            "Failed to persist model switch to DB: %s", exc
-                        )
-
-            # No model-facing note here: the switch changes ``intended`` only, and the
-            # per-call route note (agent/route_identity.py) tells the model what serves.
+            # No durable work before confirmation. The owned turn saves after delivery.
             from hermes_cli.model_switch import format_model_for_display
-
-            if _defer is None:
-                # Store session override so next agent creation uses the new model
-                # (single door — also persists the config-backed identity, RC-2/P3b).
-                # Off the loop: the persistability check re-resolves credentials
-                # (config load + provider resolution, which can refresh an OAuth
-                # token over the network). On-loop, this chain held Discord for
-                # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
-                # open_credentialed_url) and expired /model interactions.
-                await self._persist_session_model_override(session_key, _new_override)
-            else:
-                # The in-memory override is authoritative for the next turn until the deferred
-                # write commits; the identity persist (and its credential re-resolve) runs after.
-                self._apply_session_model_override_in_memory(session_key, _new_override)
-                _override_seq = self._model_override_seq(session_key)
+            self._apply_session_model_override_in_memory(session_key, _new_override)
             if one_turn:
                 # A repeated --once before the turn runs must keep the EARLIEST snapshot: the
                 # later command's snapshot is the first temporary model, not the user's
@@ -4101,49 +3761,24 @@ class GatewaySlashCommandsMixin(
                     **_switch_announce_kwargs,
                 )
 
-            # Session-override write-through (never for --once, #29923), config
-            # write-through (--global), the #100314 redundant-override drop and the
-            # cache eviction — one durable commit shared with the picker path.
-            if _defer is None:
-                _global_error = await self._commit_model_switch_durable(
-                    result, session_key=session_key, source=event.source,
-                    config_path=config_path, persist_global=persist_global, one_turn=one_turn,
-                )
-            else:
-                _global_error = None
-                self._evict_cached_agent(session_key)  # next turn builds fresh from the override
-                _job_source = source
-                _job_done: set = set()  # completed phases survive a cancelled drain
+            self._evict_cached_agent(session_key)
 
-                async def _deferred_writes() -> Optional[str]:
-                    if "fallback" not in _job_done:
-                        from agent import fallback_wiring as _fw
-
-                        for root in _fallback_closures:
-                            await asyncio.to_thread(_fw.close_episodes_for_user_route, root)
-                        _job_done.add("fallback")
-                    if cached_entry and "billing" not in _job_done:
-                        db = getattr(cached_entry[0], "_session_db", None)
-                        sid = getattr(cached_entry[0], "session_id", None)
-                        if db is not None and sid:
-                            try:
-                                await asyncio.to_thread(
-                                    db.update_session_billing_route, sid,
-                                    provider=result.target_provider, base_url=result.base_url,
-                                    billing_mode=result.api_mode,
-                                )
-                            except Exception as exc:
-                                _job_done.add(("failure", f"billing route not saved ({exc})"))
-                        _job_done.add("billing")
-                    return await self._model_switch_deferred_writes(
-                        result, session_key=session_key, source=_job_source,
-                        event_source=event.source, config_path=config_path,
-                        persist_global=persist_global, one_turn=one_turn,
-                        override=_new_override, seq=_override_seq, done=_job_done,
-                    )
-
-                if not self._defer_model_switch_writes(_defer, session_key, event.source, _deferred_writes):
-                    await self._drain_model_switch_writes(session_key, event.source)
+            async def save():
+                from agent import fallback_wiring as fw
+                for root in _fallback_closures:
+                    await self._settle_model_write(asyncio.to_thread(fw.close_episodes_for_user_route, root))
+                if cached_entry:
+                    db = getattr(cached_entry[0], "_session_db", None)
+                    sid = getattr(cached_entry[0], "session_id", None)
+                    if db is not None and sid:
+                        await self._settle_model_write(asyncio.to_thread(
+                            db.update_session_billing_route, sid, provider=result.target_provider,
+                            base_url=result.base_url, billing_mode=result.api_mode))
+                await self._save_model_selection(
+                    result, session_key=session_key, source=source, event_source=event.source,
+                    config_path=config_path, persist_global=persist_global,
+                    one_turn=one_turn, override=_new_override)
+            owner["save"] = save
             _mct.phase("fallback_clear")
 
             # Build confirmation message with full metadata
@@ -4224,15 +3859,8 @@ class GatewaySlashCommandsMixin(
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
-            if persist_global and _global_error is not None:
-                # Never claim a clean global commit the disk did not take (#100314).
-                lines.append(t("gateway.model.warning_prefix", warning=_global_error))
-                lines.append(t("gateway.model.session_only_hint"))
-            elif persist_global and _defer is not None:
-                # Not written yet: a failure arrives as a follow-up line (t_2ab07928).
-                lines.append("    Saving to config.yaml (`--global`) after this reply; a failure is reported below.")
-            elif persist_global:
-                lines.append(t("gateway.model.saved_global"))
+            if persist_global:
+                lines.append("    Active for this session; saving to config.yaml after this reply.")
             elif one_turn:
                 lines.append("    (next turn only — restores after one response)")
             else:
@@ -4265,7 +3893,7 @@ class GatewaySlashCommandsMixin(
             )
         except Exception:
             _cost_warning = None
-        if _cost_warning is not None:
+        if _cost_warning is not None and not getattr(event, "_model_picker_confirmed", False):
             async def _on_cost_confirm(choice: str) -> str:
                 if choice == "cancel":
                     return (
@@ -4275,7 +3903,7 @@ class GatewaySlashCommandsMixin(
                 # "once" and "always" both proceed — there is no persistent
                 # opt-out for selection guards (each guarded switch should be
                 # an explicit decision).
-                return await _finish_switch()
+                return await self._owned_model_selection(event.source, _finish_switch)
 
             _p = self._typed_command_prefix_for(event.source.platform)
             return await self._request_slash_confirm(
@@ -4344,96 +3972,27 @@ class GatewaySlashCommandsMixin(
         self._evict_cached_agent(session_key)
         return global_error
 
-    async def _model_switch_deferred_writes(
-        self, result, *, session_key: str, source, event_source, config_path,
-        persist_global: bool, one_turn: bool, override: dict, seq: int, done: set,
-    ) -> Optional[str]:
-        """Durable half of a reply-first /model switch (t_2ab07928), run after the confirmation
-        was delivered. The in-memory override, eviction and one-turn bookkeeping already ran on
-        the loop. Session persistence re-checks that this switch is still the session's latest
-        (``seq``); global config intent is independent of later session-only picks. ``done`` records
-        completed phases and failures on the job, so a cancelled drain resumes without replaying
-        config.yaml writes or losing a warning. Returns failure text for the follow-up, or None."""
-        from gateway import slash_commands_model as _model_mixin
-
-        def latest() -> bool:
-            return self._model_override_seq(session_key) == seq
-
-        # Keep failures on the job along with completed phases: cancellation can resume this
-        # function after a failed config/DB phase, and must not erase its visible warning.
-        failures = [item[1] for item in done if isinstance(item, tuple) and item[0] == "failure"]
-
-        def failed(message):
-            failures.append(message)
-            done.add(("failure", message))
-
-        _sess_db = getattr(self, "_session_db", None)
-        if "db" not in done and _sess_db is not None and latest():
-            try:
-                _sess_entry = await self.async_session_store.get_or_create_session(source)
-                # Consume the auto-reset flag so the next message's cleanup keeps the override (#48031).
-                if getattr(_sess_entry, "was_auto_reset", False):
-                    _sess_entry.was_auto_reset = False
-                if latest():
-                    await _sess_db.update_session_model(
-                        _sess_entry.session_id, result.new_model, provider=result.target_provider,
-                    )
-            except Exception as exc:
-                logger.warning("Failed to persist model switch to DB: %s", exc)
-                failed(f"session database not updated ({exc})")
-        done.add("db")
-
-        if persist_global and "config" not in done:
-            # Global intent is independent of this session's latest override. A later
-            # session-only pick must not discard the confirmed global default change.
-            try:
-                if await self._persist_ordered_model_config(result, config_path):
-                    done.add("config_written")
-            except Exception as e:
-                logger.warning("Failed to persist model switch: %s", e)
-                failed(t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__))
-            done.add("config")
-        drop_override = (persist_global and "config_written" in done
-                         and self._channel_override_for(event_source) is None)
-
-        if "store" not in done:
-            # Store writes are serialized per session in issue order (_persist_session_model_override's
-            # lock); the seq is re-read at that boundary, after the config await (Prism 9ea56997a2df).
-            if latest():
-                try:
-                    # Save the selected identity before removing a redundant global override.
-                    # If cleanup fails, restart must restore this pick, never the old identity.
-                    if drop_override and "fallback_saved" not in done:
-                        await self._persist_session_model_override(
-                            session_key, override, require_persistence=True, persist_only=True,
-                        )
-                        if latest() and not one_turn:
-                            await self.async_session_store.set_model_override(session_key, override)
-                        done.add("fallback_saved")
-                    if not latest():
-                        done.add("store")
-                        return "; ".join(failures) or None
-                    await self._persist_session_model_override(
-                        session_key, None if drop_override else override,
-                        require_persistence=True, persist_only=True,
-                    )
-                    # Same as the inline path: a --once override never reaches the store write-through (#29923).
-                    if not drop_override and not one_turn and latest():
-                        await self.async_session_store.set_model_override(session_key, override)
-                except Exception as exc:
-                    if drop_override:
-                        logger.warning("Failed to clear persisted session model override: %s", exc)
-                        failed(t("gateway.model.err_stale_override", error=exc))
-                    else:
-                        logger.warning("Failed to persist session model override: %s", exc)
-                        failed(f"session override not saved ({exc})")
-                else:
-                    if drop_override and latest():
-                        # NOTE(P3b/RC-2): the persisted identity was cleared through the single door
-                        # above (persist_only); this is its in-memory half, still this switch's own.
-                        self._session_model_overrides.pop(session_key, None)
-            done.add("store")
-        return "; ".join(failures) or None
+    async def _save_model_selection(
+        self, result, *, session_key, source, event_source, config_path,
+        persist_global, one_turn, override,
+    ):
+        """One pass in the owning turn. Completed phases survive restart; no replay state."""
+        db = getattr(self, "_session_db", None)
+        if db is not None:
+            entry = await self._settle_model_write(self.async_session_store.get_or_create_session(source))
+            if getattr(entry, "was_auto_reset", False):
+                entry.was_auto_reset = False
+            await self._settle_model_write(db.update_session_model(
+                entry.session_id, result.new_model, provider=result.target_provider))
+        # Save the selected identity first: a failed global cleanup must not restore the old pick.
+        await self._persist_session_model_override(
+            session_key, override, require_persistence=True, persist_only=True)
+        if not one_turn:
+            await self._settle_model_write(self.async_session_store.set_model_override(session_key, override))
+        if persist_global:
+            await self._persist_ordered_model_config(result, config_path)
+            if self._channel_override_for(event_source) is None:
+                await self._persist_session_model_override(session_key, None, require_persistence=True)
 
     async def _announce_model_switch(
         self,
