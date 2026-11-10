@@ -310,6 +310,26 @@ def activate_dependencies(project_root: Path) -> None:
     """
     import sys
 
+    # Supervised external deployers own this checkout venv, including its lock sync.
+    # Lazy-install suppression alone does not opt out of PM's import-path selection.
+    owned = os.environ.get("HERMES_CHECKOUT_VENV")
+    if owned:
+        root = Path(project_root).resolve()
+        environment = Path(owned).absolute()
+        if (not (root / ".git").exists() or environment != root / "venv"
+                or Path(sys.prefix).absolute() != environment
+                or not (environment / "pyvenv.cfg").is_file()):
+            raise RuntimeError("HERMES_CHECKOUT_VENV must be this checkout's running venv")
+        # Do not inherit a PM generation's PYTHONPATH from a parent launcher.
+        selected = site_packages(environment)
+        sys.path[:] = [entry for entry in sys.path
+                       if Path(entry).name not in ("site-packages", "dist-packages")
+                       or Path(entry).resolve() == selected.resolve()]
+        if str(selected) not in sys.path:
+            sys.path.insert(0, str(selected))
+        os.environ["PYTHONPATH"] = os.pathsep.join([str(root), str(selected)])
+        return
+
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
