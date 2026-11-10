@@ -157,3 +157,64 @@ def test_extracted_main_verdict_parity(tmp_path, monkeypatch, case):
     oracle._carry_scan_cache.clear()
     expected = oracle.carry_size_ok(str(root), **kwargs)
     assert kwh.carry_size_ok(str(root), **kwargs) is expected
+
+
+def _clear():
+    from tests.hermes_cli import carry_census_main_oracle as oracle
+    for mod in (oracle, kwh):
+        mod._carry_scan_cache.clear()
+        mod._carry_waiting.clear()
+
+
+def test_directory_swapped_for_a_symlink_after_its_stat(tmp_path, monkeypatch):
+    """Prism 9ea482d5451b: a child directory is replaced by a symlink after the census has statted it and
+    before the census descends into it. Main (os.walk, followlinks=False) rechecks and skips the link."""
+    from tests.hermes_cli import carry_census_main_oracle as oracle
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "a").touch()
+    (other / "b").touch()
+    real = os.scandir
+    out = {}
+    for label, mod in (("main", oracle), ("head", kwh)):
+        root = tmp_path / ("tree-" + label)
+        (root / "d").mkdir(parents=True)
+        target = os.path.realpath(root)
+
+        class Swap:
+            def __init__(self, it):
+                self.it = it
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.it.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    return next(self.it)
+                except StopIteration:
+                    d = root / "d"
+                    if not d.is_symlink():
+                        d.rmdir()
+                        d.symlink_to(other, target_is_directory=True)
+                    raise
+
+            def close(self):
+                self.it.close()
+
+        def scandir(path, _target=target, _Swap=Swap, _root=root):
+            it = real(path)
+            return _Swap(it) if os.path.realpath(os.fspath(path)) == _target and not (_root / "d").is_symlink() else it
+
+        _clear()
+        with monkeypatch.context() as m:
+            m.setattr(os, "scandir", scandir)
+            out[label] = mod.carry_size_ok(str(root), max_entries=2, max_bytes=10 ** 9)
+        assert (root / "d").is_symlink(), "the swap did not happen"
+    assert out["main"] is True, out
+    assert out["head"] is out["main"], out

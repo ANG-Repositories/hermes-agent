@@ -678,7 +678,11 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     pending = [root]
     try:
         while pending and ok:
-            with os.scandir(pending.pop()) as scan:
+            current = pending.pop()
+            # Like os.walk(followlinks=False): a queued child swapped for a symlink after its stat is skipped.
+            if current is not root and os.path.islink(current):
+                continue
+            with os.scandir(current) as scan:
                 for entry in scan:
                     entries += 1
                     info = entry.stat(follow_symlinks=False)
