@@ -1252,6 +1252,7 @@ class SessionDB(
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, timings: Optional[dict] = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
@@ -1261,6 +1262,7 @@ class SessionDB(
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        write_started = time.monotonic() if timings is not None else None
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1295,9 +1297,17 @@ class SessionDB(
                         # transaction open (hold_started never raises; this is the backstop).
                         hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                         fn_started = True
+                        if timings is not None:
+                            exec_started = time.monotonic()
+                            timings["wait_s"] = exec_started - write_started
                         result = fn(self._conn)
                         hold_committing(hold)  # a long hold then says callback vs commit I/O
+                        if timings is not None:
+                            commit_started = time.monotonic()
+                            timings["exec_s"] = commit_started - exec_started
                         self._conn.commit()
+                        if timings is not None:
+                            timings["commit_s"] = time.monotonic() - commit_started
                     except BaseException:
                         try:
                             self._conn.rollback()

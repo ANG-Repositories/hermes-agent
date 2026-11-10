@@ -2004,7 +2004,11 @@ class SessionStore(
                         return
                     _t_upsert = time.monotonic()
                     try:
-                        saver(session_key, entry_json, scope=self._routing_scope())
+                        from agent.interrupt_compat import _accepts_keyword
+                        kwargs = {"scope": self._routing_scope()}
+                        if timings is not None and _accepts_keyword(saver, "timings"):
+                            kwargs["timings"] = timings
+                        saver(session_key, entry_json, **kwargs)
                     finally:
                         if timings is not None:
                             timings["upsert_s"] = time.monotonic() - _t_upsert

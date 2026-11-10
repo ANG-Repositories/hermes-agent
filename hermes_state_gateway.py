@@ -297,7 +297,9 @@ class SessionGatewayMixin:
             self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
-    def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = "") -> None:
+    def save_gateway_routing_entry(
+        self, session_key: str, entry_json: str, *, scope: str = "", timings: Optional[dict] = None,
+    ) -> None:
         """Upsert one gateway routing entry (session_key -> SessionEntry JSON); ``scope``
         namespaces the index per sessions_dir so two stores never share routing state."""
         if not session_key or not entry_json:
@@ -312,7 +314,7 @@ class SessionGatewayMixin:
                        updated_at = excluded.updated_at""",
                 (scope, session_key, entry_json, time.time()),
             )
-        self._execute_write(_do)
+        self._execute_write(_do, timings=timings)
 
     def replace_gateway_routing_entries(
         self, entries: Dict[str, str], *, scope: str = "", retired_keys=(),
