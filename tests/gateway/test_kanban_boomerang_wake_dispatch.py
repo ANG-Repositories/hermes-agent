@@ -40,6 +40,7 @@ class Adapter:
         self.sent: list = []
         self.handled: list = []
         self.fail_sends = 0   # next N sends report success=False (no receipt)
+        self.fail_turns = 0   # next N turns get no admission receipt
 
     async def send(self, chat_id, text, metadata=None):
         from gateway.platforms.base import SendResult
@@ -50,6 +51,9 @@ class Adapter:
         return SendResult(success=True, message_id=str(len(self.sent)))
 
     async def handle_message(self, event):
+        if self.fail_turns:
+            self.fail_turns -= 1
+            return
         event._gateway_accepted = True
         self.handled.append(event)
 
@@ -1249,6 +1253,84 @@ def test_restart_surfaced_finding_failed_redelivery_posts_one_lost_line(env, mon
     claim = ah.BoomerangWakeState().get_claim(entry["key"])
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "surfaced"
     assert claim["resurfaced"] is True and claim["resurface_delivered"] is False
+
+
+@pytest.mark.parametrize("stop_file", [False, True])
+@pytest.mark.parametrize("failed_part", ["turn", "line"])
+def test_lost_resurface_failed_send_is_queued_and_delivered_once_by_reconcile(env, failed_part, stop_file):
+    """t_525de3f0 item 1 + 3: a lost re-surface whose first send fails stays in the pending-handback
+    queue; the next reconcile delivers it exactly once, also with the kill switch on (every wake
+    surfaces, no new child)."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    ah.BoomerangWakeState().bump_retry(tid)
+    _kill(env, entry)
+    setattr(env["adapter"], "fail_turns" if failed_part == "turn" else "fail_sends", 1)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    state = ah.BoomerangWakeState()
+    assert state.handbacks()[entry["delegation_id"]]["parts"] == [failed_part]
+    if stop_file:
+        _config(False)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    assert env["adapter"].sent == [f"⚠️ boomerang-wake lost {tid} (reason: gateway restart, retry spent)"]
+    assert state.handbacks() == {}
+    assert state.get_claim(entry["key"])["resurface_delivered"] is True
+    assert len(env["dispatched"]) == 1
+
+
+def test_superseded_surfaced_finding_failed_turn_is_queued_and_delivered_once(env):
+    """t_525de3f0 item 1: the restart's surfaced-finding turn that gets no receipt is retried by the
+    next reconcile (one warning line, one turn), instead of vanishing behind a terminal claim."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _verdict_on_board(entry, "surfaced")
+    _kill(env, entry)
+    env["adapter"].fail_turns = 1
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    state = ah.BoomerangWakeState()
+    assert state.handbacks()[entry["delegation_id"]]["parts"] == [ah.PART_TURN]
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    [turn] = env["adapter"].handled
+    assert "child surfaced it" in turn.text
+    assert env["adapter"].sent == [
+        f"⚠️ boomerang-wake lost {tid} (reason: gateway restart); child surfaced: child surfaced it"]
+    assert state.handbacks() == {}
+    assert state.get_claim(entry["key"])["resurface_delivered"] is True
+
+
+@pytest.mark.parametrize("case", ["fork_died", "ordinary_surface"])
+def test_dead_fork_original_wake_bypasses_only_the_newer_owner_comment_rule(env, case):
+    """t_525de3f0 item 2 (gateway.log 2026-11-09 18:29:58, t_3ec99a93): a fork that died on
+    context_length_exceeded owes its ORIGINAL wake; a newer owner comment does not refuse that one
+    re-delivery. An ordinary surface handback under the same comment is still refused."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    env["adapter"].fail_turns = 1
+    if case == "fork_died":
+        _run(env, entry, "failed", "context_length_exceeded: This conversation has grown too long")
+    else:
+        _run(env, entry, "completed", _verdict(entry, "surface", summary="needs operator"))
+    state = ah.BoomerangWakeState()
+    assert state.handbacks()[entry["delegation_id"]]["parts"] == [ah.PART_TURN]
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        handback_at = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? "
+                                   "AND kind = 'completed'", (tid,)).fetchone()[0]
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "worker", "owner note", handback_at + 60))
+    assert ah.stale_surface_reason(entry) == "owner comment newer than handback"
+    asyncio.run(ah.reconcile(env["runner"]))
+    assert state.handbacks() == {}
+    if case == "fork_died":
+        assert [t.text for t in env["adapter"].handled] == [entry["wake_text"]]
+        assert state.get_claim(entry["key"])["resurface_delivered"] is True
+    else:
+        assert env["adapter"].handled == []
 
 
 def test_restart_completed_wake_without_verdict_redispatches_verification(env):

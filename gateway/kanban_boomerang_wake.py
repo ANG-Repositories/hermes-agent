@@ -973,6 +973,9 @@ def _verify_land_inherited(entry: dict, verdict: dict, kb: Any, conn: Any) -> Op
     return None
 
 
+_OWNER_COMMENT_NEWER = "owner comment newer than handback"
+
+
 def stale_surface_reason(entry: dict) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
 
@@ -1005,7 +1008,7 @@ def stale_surface_reason(entry: dict) -> Optional[str]:
             if re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M):
                 return "owner release/hold line"
             if handback and newest.created_at > handback["created_at"]:
-                return "owner comment newer than handback"
+                return _OWNER_COMMENT_NEWER
         refs = []
         if handback:
             payload = json.loads(handback["payload"] or "{}")
@@ -1247,7 +1250,8 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
     # A legacy row has no action: a turn part marks it as a surface (handback_row sets turn for surfaces only).
     action = row.get("action")
     guarded = action == "surface" or (action is None and row.get("turn") is not None)
-    for part in list(left):
+    delivery_parts = list(left)
+    for part in delivery_parts:
         if guarded:
             # Recover original cursors for rows persisted before the guard was introduced.
             claim = await asyncio.to_thread(state.get_claim, row.get("claim_key") or "") or {}
@@ -1256,6 +1260,12 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
                 if guard_entry.get(field) is None:
                     guard_entry[field] = claim.get(field)
             why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one")
+            if why == _OWNER_COMMENT_NEWER and row.get("fork_died"):
+                # t_525de3f0: a dead fork's ORIGINAL wake is still owed; this one rule only.
+                logger.info("kanban boomerang-wake: stale rule bypassed task=%s reason=%s "
+                            "(fork died; original wake re-delivered) delegation=%s",
+                            row.get("task_id"), why, delegation_id)
+                why = None
             if why:
                 await asyncio.to_thread(state.drop_handback, delegation_id)
                 return sent
@@ -1264,6 +1274,11 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
         else:
             ok = await post_line(runner, entry, str(row.get("line") or ""))
         if not ok:
+            if part == PART_TURN and row.get("warn_on_failure") and PART_LINE not in done and PART_LINE not in left:
+                # A refused turn owes its warning line too; persist it before the send.
+                left.append(PART_LINE)
+                await asyncio.to_thread(state.update_handback, delegation_id, parts=left)
+                delivery_parts.append(PART_LINE)
             continue
         left.remove(part)
         sent += 1
@@ -1422,10 +1437,14 @@ async def _home_is_live(runner: Any, entry: dict) -> bool:
 
 
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
-                text: Optional[str] = None) -> None:
+                text: Optional[str] = None, *, fork_died: bool = False) -> None:
     """Commit the original wake obligation before any best-effort delivery. A freshness refusal
     (the card moved under the claim) is a supersede, not a fault (t_ce8bd439): the handback keeps
-    only the re-delivered wake, the origin chat gets no line, and one #logs line records it."""
+    only the re-delivered wake, the origin chat gets no line, and one #logs line records it.
+
+    ``fork_died``: the child died (context_length_exceeded, crash) before a verdict, so the wake it
+    replaced was never handled; its ORIGINAL wake skips the "owner comment newer than handback"
+    rule at delivery (t_525de3f0). Every other stale rule still applies."""
     if entry.get("row") == "blocked_assess":
         result = {"summary": reason, "action": "surface", "detail": reason}
         await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
@@ -1442,6 +1461,8 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
     stopped = reason == "stopped by /stop"
     handback = handback_row(entry, {"summary": reason},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
+    if fork_died and text is None:
+        handback[1]["fork_died"] = True
     status = await asyncio.to_thread(_card_status, entry) if superseded else ""
     # Quiet only when the re-delivered wake has somewhere to land. With no live home the turn part
     # retries silently forever, so the origin chat keeps ONE plain line (Prism c-4e2273b5aa3cb68a).
@@ -1666,7 +1687,7 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
         logger.debug("kanban boomerang-wake: ledger close failed: %s", exc)
     if status != "completed":
         reason = "stopped by /stop" if status == "stopped" else f"child {status}: {_first_line(final, 200)}"
-        await _fail(runner, live, reason, state)
+        await _fail(runner, live, reason, state, fork_died=status != "stopped")
         return
     if await asyncio.to_thread(deadman_owner_acted, live):
         logger.info("kanban boomerang-wake: stale surface refused task=%s stage=run_entry "
@@ -1908,14 +1929,18 @@ async def _lost(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
     if entry.get("row") == "blocked_assess":
         await _fail(runner, entry, f"blocked assessment lost: {reason}; owner assessment required", state)
         return
-    ok = await resurface(runner, entry)
+    # The re-surface commits with the terminal claim; a failed send stays pending for the next
+    # reconcile drain instead of being dropped (t_525de3f0).
+    did, row = handback_row(entry, {}, turn_text=str(entry.get("wake_text") or ""))
+    row["line"] = f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason})"
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="lost",
+                            reason=reason, resurfaced=True, resurface_delivered=False, handback=(did, row))
+    await deliver_handbacks(runner, state, delegation_id=did)
+    claim = await asyncio.to_thread(state.get_claim, entry["key"]) or {}
     # The reconciler's observable (README §5, smoke step 4 / AC-11): it was the only boomerang-wake
     # outcome with no log line, so a correct re-surface read as FAIL live (2026-10-19 23:07).
     logger.info("kanban boomerang-wake: %s lost reason=%s resurfaced delivered=%s delegation=%s",
-                entry["task_id"], reason, ok, entry.get("delegation_id"))
-    await post_line(runner, entry, f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason})")
-    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="lost",
-                            reason=reason, resurfaced=True, resurface_delivered=ok)
+                entry["task_id"], reason, bool(claim.get("resurface_delivered")), entry.get("delegation_id"))
 
 
 async def _cancel_then_resurface(runner: Any, entry: dict, state: BoomerangWakeState, wait_s: float) -> None:
@@ -2026,15 +2051,21 @@ async def _superseded_by_terminal(runner: Any, entry: dict, reason: str, state: 
         return False
     status, how, summary = found
     if how == "surfaced":
-        # verdict known, delivery unconfirmed: deliver the child's finding once (never redispatch)
-        ok = await resurface(runner, entry, finding_text(entry, {"summary": summary}, "child surfaced"))
-        logger.info("kanban boomerang-wake: %s lost reason=%s surfaced finding re-delivered=%s status=%s "
-                    "delegation=%s (no lost line)", entry["task_id"], reason, ok, status, entry.get("delegation_id"))
-        if not ok:   # fail visible, as _lost does (Prism af30fe379f6c): the finding must not vanish
-            await post_line(runner, entry, f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason}); "
-                                           f"child surfaced: {str(summary)[:300]}")
+        # verdict known, delivery unconfirmed: deliver the child's finding once (never redispatch).
+        # Quiet on success; a refused turn also owes one lost line (Prism af30fe379f6c). Both stay
+        # pending in the handback queue until their receipt (t_525de3f0).
+        did, row = handback_row(entry, {}, turn_text=finding_text(entry, {"summary": summary}, "child surfaced"))
+        row.update(parts=[PART_TURN], warn_on_failure=True,
+                   line=f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason}); "
+                        f"child surfaced: {str(summary)[:300]}")
         await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="surfaced",
-                                reason=reason, resurfaced=True, resurface_delivered=ok, finished_at=_time.time())
+                                reason=reason, resurfaced=True, resurface_delivered=False,
+                                finished_at=_time.time(), handback=(did, row))
+        await deliver_handbacks(runner, state, delegation_id=did)
+        claim = await asyncio.to_thread(state.get_claim, entry["key"]) or {}
+        logger.info("kanban boomerang-wake: %s lost reason=%s surfaced finding re-delivered=%s status=%s "
+                    "delegation=%s (no lost line)", entry["task_id"], reason,
+                    bool(claim.get("resurface_delivered")), status, entry.get("delegation_id"))
         return True
     logger.info("kanban boomerang-wake: %s lost reason=%s superseded-by-terminal status=%s kind=%s "
                 "delegation=%s (receipt on board; no line, no re-surface)", entry["task_id"], reason, status,
