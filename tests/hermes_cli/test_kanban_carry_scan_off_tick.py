@@ -100,3 +100,60 @@ def test_huge_directory_stops_at_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "scandir", lambda path: Scan())
     assert not kwh.carry_size_ok(str(tmp_path), max_entries=2)
     assert len(consumed) == 3
+
+
+@pytest.mark.parametrize("case", ["empty", "small", "at_entries", "over_entries",
+                                  "at_bytes", "over_bytes", "dir_link", "file_link",
+                                  "broken_link", "hardlinks", "deep", "non_utf8",
+                                  "unreadable"])
+def test_extracted_main_verdict_parity(tmp_path, monkeypatch, case):
+    from tests.hermes_cli import carry_census_main_oracle as oracle
+    root = tmp_path / "tree"
+    root.mkdir()
+    kwargs = {}
+    if case in ("small", "at_entries", "over_entries", "at_bytes", "over_bytes"):
+        (root / "f").write_bytes(b"abc")
+        if case == "at_entries":
+            kwargs["max_entries"] = 1
+        if case == "over_entries":
+            kwargs["max_entries"] = 0
+        if case == "at_bytes":
+            kwargs["max_bytes"] = 3
+        if case == "over_bytes":
+            kwargs["max_bytes"] = 2
+    elif case in ("dir_link", "file_link", "broken_link"):
+        target = tmp_path / "outside"
+        if case == "dir_link":
+            target.mkdir()
+            (target / "uncounted").write_bytes(b"x" * 1000)
+        elif case == "file_link":
+            target.write_bytes(b"x" * 1000)
+        (root / "link").symlink_to(target, target_is_directory=case == "dir_link")
+        kwargs["max_entries"] = 1
+    elif case == "hardlinks":
+        (root / "f").write_bytes(b"abc")
+        os.link(root / "f", root / "g")
+        kwargs["max_bytes"] = 6
+    elif case == "deep":
+        leaf = root
+        for _ in range(100):
+            leaf = leaf / "d"
+            leaf.mkdir()
+        (leaf / "f").touch()
+    elif case == "non_utf8":
+        fd = os.open(os.fsencode(root) + b"/bad-\xff", os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+    elif case == "unreadable":
+        locked = root / "locked"
+        locked.mkdir()
+        original = os.scandir
+
+        def unreadable(path):
+            if os.fspath(path) == str(locked):
+                raise PermissionError("fixture unreadable directory")
+            return original(path)
+
+        monkeypatch.setattr(os, "scandir", unreadable)
+    oracle._carry_scan_cache.clear()
+    expected = oracle.carry_size_ok(str(root), **kwargs)
+    assert kwh.carry_size_ok(str(root), **kwargs) is expected
