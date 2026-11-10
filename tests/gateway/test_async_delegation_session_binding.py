@@ -396,6 +396,6 @@ async def test_delegated_origin_watcher_stops_once(
         assert len(warnings) == 1
         assert "dropping notification" in warnings[0].getMessage()
         runner._inject_watch_notification.assert_not_awaited()
-        assert runner.session_store.lookup_by_session_key("child") is None
+        assert runner.session_store.lookup_by_session_key(entry.session_key).session_id == entry.session_id
     finally:
         db.close()
