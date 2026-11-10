@@ -533,9 +533,15 @@ def test_create_rewrites_a_portable_worktree_target(kanban_home, anchor):
     assert path == str(anchor) and "portable" in note
 
 
-def test_create_says_why_a_worktree_stays_local(kanban_home, anchor):
-    _mirrors(kanban_home, slug="ANG-Ventures/something-else")
+def test_create_says_why_a_worktree_stays_local(kanban_home, anchor, monkeypatch):
     target = str(anchor / ".worktrees" / "fix-lint")
+    # Derived mode (default since #176, t_1d2c5939): every GitHub repo ports unless the file excludes it.
+    (kanban_home / "fleet" / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "exclude": [SLUG]}))
+    path, note = kwt.mint_rewrite("worktree", target, kanban_home / "fleet")
+    assert path == target and "stays Studio-local" in note and SLUG in note and "excluded" in note
+    # The hand list (derived mode's kill switch): a repo with no row stays local.
+    monkeypatch.setenv(kwt.DERIVED_ENV, "0")
+    _mirrors(kanban_home, slug="ANG-Ventures/something-else")
     path, note = kwt.mint_rewrite("worktree", target, kanban_home / "fleet")
     assert path == target and "stays Studio-local" in note and SLUG in note
     assert kwt.mint_rewrite("scratch", None, kanban_home / "fleet") == (None, None)

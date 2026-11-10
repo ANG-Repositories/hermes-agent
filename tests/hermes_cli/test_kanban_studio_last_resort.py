@@ -9,8 +9,9 @@ Ace 2026-11-08 17:05: fleet work goes to every other machine first. The real
 4. a card whose persisted workspace is its OWN Studio ``.worktrees/<id>``
    (t_5e8801d8: ``rule=workspace_kind``, then 30+ min in ``local_full``)
    ports to a pool host when that tree is clean and its branch is on origin,
-   and stays local when it is dirty, ahead of origin, or the shared setting is
-   off (``host_preference`` in fleet/placement-policy.json: no key, kanban
+   and stays local when it is dirty, off its branch (ahead of origin or with no
+   origin ref: only under the hand list; derived mode pushes then ports it,
+   t_1d2c5939), or the shared setting is off (``host_preference`` in fleet/placement-policy.json: no key, kanban
    switch off, or env FLEET_LAST_RESORT_HOSTS empty).
 """
 
@@ -131,6 +132,11 @@ def _commit(repo, name):
     _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name, cwd=repo)
 
 
+def _sha(repo, ref):
+    return subprocess.run(["git", "rev-parse", ref], cwd=repo, check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
 @pytest.fixture
 def studio_tree(home, tmp_path, monkeypatch):
     """A Studio repo with a card whose persisted path is its own linked
@@ -184,7 +190,7 @@ def test_own_pushed_clean_studio_worktree_goes_to_the_pool(studio_tree):
 
 
 @pytest.mark.parametrize("damage", ["untracked", "modified", "ahead", "no_origin_ref", "other_branch"])
-def test_a_studio_worktree_with_studio_only_work_stays_local(studio_tree, damage):
+def test_a_studio_worktree_with_studio_only_work_stays_local(studio_tree, damage, monkeypatch):
     tid, repo, wt, _clones = studio_tree
     if damage == "untracked":
         (wt / "notes.txt").write_text("x", encoding="utf-8")
@@ -196,6 +202,17 @@ def test_a_studio_worktree_with_studio_only_work_stays_local(studio_tree, damage
         _git("update-ref", "-d", f"refs/remotes/origin/wt/{tid}", cwd=repo)
     elif damage == "other_branch":
         _git("checkout", "-q", "-b", "side", cwd=wt)
+    if damage in ("ahead", "no_origin_ref"):
+        # Committed work origin lacks: derived mode (the default since #176, t_1d2c5939) pushes the
+        # card branch then ports it; the hand list (its kill switch) still keeps it on the Studio.
+        with kb.connect_closing() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+            out: dict = {}
+            assert kbd._route_row(conn, row, _plan(), worktree_out=out) == ("portable", None)
+        push = out[tid][4]
+        assert push is not None and push[1] == f"wt/{tid}"
+        assert push[2] == ("" if damage == "no_origin_ref" else _sha(repo, f"refs/remotes/origin/wt/{tid}"))
+        monkeypatch.setenv(kwt.DERIVED_ENV, "0")
     (route, _arg), rule = _route(tid)
     assert route == "local" and rule == "workspace_kind"
 
