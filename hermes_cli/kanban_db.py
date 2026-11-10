@@ -12496,7 +12496,7 @@ def complete_task(
                  WHERE id = ?
                    AND (status IN ('running', 'ready', 'blocked', 'review')
                         OR (? AND status = 'triage')
-                        OR (status = 'todo' AND (assignee = 'human' OR assignee LIKE 'human:%')))
+                        OR (status = 'todo' AND (assignee = 'human' OR substr(assignee, 1, 6) = 'human:')))
                 """,
                 (result, now, task_id, bool(external)),
             )
