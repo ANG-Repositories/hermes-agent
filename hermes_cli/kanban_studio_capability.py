@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Mapping, Optional
 
 KNOB = "studio_capability_only"
 WAIT_PREFIX = "studio_capability_only"
