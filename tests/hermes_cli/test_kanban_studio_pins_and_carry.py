@@ -377,7 +377,7 @@ def test_carry_scan_past_its_wall_bound_is_refused_and_cached(tmp_path, monkeypa
     budget = kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0))
     assert not kwh.carry_size_ok(d, budget=budget, max_seconds=0.5)
     assert budget.deferred == 0 and budget.spent_s > 0
-    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    monkeypatch.setattr(kwh.os, "scandir", _no_walk)
     assert not kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0)))
 
 
@@ -386,7 +386,7 @@ def test_carry_scan_out_of_tick_budget_is_deferred_uncached(tmp_path, monkeypatc
     d = _ten_files(tmp_path, "later")
     spent = kwh.CarryScanBudget(seconds=0.0)
     with monkeypatch.context() as m:
-        m.setattr(kwh.os, "walk", _no_walk)
+        m.setattr(kwh.os, "scandir", _no_walk)
         assert not kwh.carry_size_ok(d, budget=spent)
     assert spent.deferred == 1
     assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget())
@@ -405,16 +405,16 @@ def test_carry_scan_cache_is_stamped_when_the_walk_ends(tmp_path, monkeypatch):
     d = _ten_files(tmp_path, "stamp")
     clock = _Clock(0.0)
     budget = kwh.CarryScanBudget(seconds=1e9, clock=clock)
-    real_walk = kwh.os.walk
+    real_walk = kwh.os.scandir
 
     def walk_then_jump(*a, **k):
         clock.t += kwh.CARRY_SCAN_TTL_SECONDS + 10
         return real_walk(*a, **k)
 
     with monkeypatch.context() as m:
-        m.setattr(kwh.os, "walk", walk_then_jump)
+        m.setattr(kwh.os, "scandir", walk_then_jump)
         assert kwh.carry_size_ok(d, budget=budget, max_seconds=1e9)
-    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    monkeypatch.setattr(kwh.os, "scandir", _no_walk)
     assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(clock=clock))
 
 
@@ -423,7 +423,7 @@ def test_carry_budget_serves_waiting_paths_fifo_under_a_fixed_row_order(tmp_path
     # costs 0.8 s of a 1.0 s budget, so without a queue A re-walks every tick and C is never judged.
     a, b, c = (_ten_files(tmp_path, n) for n in "abc")
     clock = _Clock(0.0)
-    real_walk = kwh.os.walk
+    real_walk = kwh.os.scandir
     walked = []
 
     def costly_walk(root, *args, **kw):
@@ -431,7 +431,7 @@ def test_carry_budget_serves_waiting_paths_fifo_under_a_fixed_row_order(tmp_path
         clock.t += 0.8
         return real_walk(root, *args, **kw)
 
-    monkeypatch.setattr(kwh.os, "walk", costly_walk)
+    monkeypatch.setattr(kwh.os, "scandir", costly_walk)
     answers = []
     for _tick in range(3):
         budget = kwh.CarryScanBudget(seconds=1.0, clock=clock)

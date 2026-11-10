@@ -671,21 +671,32 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     total = entries = 0
     ok = True
     timed_out = False
+    # Stream entries rather than materializing os.walk's per-directory lists.
+    # Reuse the no-follow stat for both size and recursion; symlinks count but
+    # never recurse, including links to directories and dangling links.
+    import stat
+    pending = [root]
     try:
-        for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
-            for name in (*dirnames, *filenames):
-                entries += 1
-                total += os.lstat(os.path.join(dirpath, name)).st_size
-                if entries > max_entries or total > max_bytes:
-                    ok = False
-                    break
-                if entries % 256 == 0 and clock() >= stop:
-                    ok, timed_out = False, True
-                    break
+        while pending and ok:
+            current = pending.pop()
+            # Like os.walk(followlinks=False): a queued child swapped for a symlink after its stat is skipped.
+            if current is not root and os.path.islink(current):
+                continue
+            with os.scandir(current) as scan:
+                for entry in scan:
+                    entries += 1
+                    info = entry.stat(follow_symlinks=False)
+                    total += info.st_size
+                    if entries > max_entries or total > max_bytes:
+                        ok = False
+                        break
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(entry.path)
+                    if entries % 256 == 0 and clock() >= stop:
+                        ok, timed_out = False, True
+                        break
             if ok and clock() >= stop:
                 ok, timed_out = False, True
-            if not ok:
-                break
     except OSError:
         ok = False
     end = clock()
