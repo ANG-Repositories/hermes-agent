@@ -24,7 +24,8 @@ def prepare_body(body, notices=None):
     if mode is False or mode == "off":
         return body
     from hermes_cli import kanban_db as kb, kanban_host_capabilities as caps
-    reasons = pool.studio_map_reasons(caps.load_map(kb.kanban_home() / "fleet"))
+    from hermes_cli import kanban_studio_capability as ksc
+    reasons = ksc.create_reasons(caps.load_map(kb.kanban_home() / "fleet"))  # dispatch's vocabulary (t_9965b8d5)
     if reasons is None or pool.studio_pin_justified(body, reasons):
         return body
     if pool.card_needs(body) & _STUDIO_NEEDS and "studio-state" in reasons:

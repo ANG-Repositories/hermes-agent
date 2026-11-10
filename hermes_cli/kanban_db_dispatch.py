@@ -4747,8 +4747,10 @@ def _reroute_placement_blocks(conn, result) -> None:
         from hermes_cli import kanban_worker_pool as _kwp
         fleet = _kb.kanban_home() / "fleet"
         pool = _kwp.read_pool(fleet)
-        # t_388c4ab2: the Studio pin it writes must carry a requires: word this map's Studio row serves.
-        reasons = _kwp.studio_map_reasons(_khc.load_map(fleet))
+        # t_388c4ab2: the Studio pin it writes must carry a requires: word this map's Studio row serves
+        # (t_9965b8d5: a Studio-ONLY word while that rule is on, or dispatch drops the pin it just wrote).
+        from hermes_cli import kanban_studio_capability as _ksc
+        reasons = _ksc.create_reasons(_khc.load_map(fleet))
         result.placement_rerouted, result.placement_unroutable = _kpb.reroute_placement_blocks(
             conn, pool, studio_reasons=reasons)
     except Exception:
@@ -5137,7 +5139,7 @@ def _placement_rule(route: str, arg: Optional[str], rule: Optional[str], placed:
 
 def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional[str],
                        placed_host, plan, entry: str, gate: dict,
-                       take_refusal: Optional[str] = None) -> dict:
+                       take_refusal: Optional[str] = None, studio: Optional[dict] = None) -> dict:
     """The ``placement`` event payload, every key present (spec §4.1).
 
     Control-Plane Protection v0.3 §3.1 adds the fields the I-1 / AC-2 queries
@@ -5174,6 +5176,9 @@ def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional
         "reason": "pool" if placed else (_pr.LAST_RESORT if take_refusal else "local-first"),
         "take_refusal": take_refusal,
         "pool_free_at_spawn": plan.budget if plan is not None else 0,
+        # t_9965b8d5: what established a Studio placement ({capability, source, evidence, kind}); None = rule off
+        # this tick, or a pool placement. One query audits it: placement rows on the Studio with this null.
+        "studio_capability": studio if not placed else None,
     }
 
 
@@ -5269,6 +5274,19 @@ def _reroute_off_held_origin(conn, row, host: str, pause_cache: Optional[dict], 
     return "wait", f"continuity_hold (origin_host_paused:{host} source_workspace_transfer_unavailable)"
 
 
+def _studio_capability_on(caps, last_resort: bool) -> bool:
+    """t_9965b8d5's rule this tick: knob on, Studio last resort, and a readable map to name capabilities from."""
+    from hermes_cli import kanban_studio_capability as _ksc
+    return (_ksc.active(_root_kanban_cfg(), last_resort)
+            and _ksc.studio_only(getattr(caps, "cmap", None)) is not None)
+
+
+# portable()/_route_row rules a worktree card stays local under that NAME a Studio-only fact holds (an operator's
+# concrete path, a non-GitHub origin, an excluded repo, no pool): recorded as structural, never waited.
+_WT_STRUCTURAL = frozenset({"concrete_target_path", "not_a_repo", "origin_not_github", "excluded", "no_pool_host",
+                            "overrides_file_malformed"})
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5284,7 +5302,72 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                board: Optional[str] = None,
                carry_out: Optional[dict] = None,
                pause_cache: Optional[dict] = None,
-               carry_budget=None) -> "tuple[str, Optional[str]]":
+               carry_budget=None,
+               studio_on: Optional[bool] = None,
+               studio_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+    """:func:`_route_row_base`, then t_9965b8d5: a ``local`` route stands only with a named Studio-only
+    capability or structural fact (``studio_out[id]`` records it for the placement event); else it WAITS,
+    ``studio_capability_only:<rule> (...)``. ``studio_on`` None = read the knob here (tests, one-off callers)."""
+    from hermes_cli import kanban_studio_capability as _ksc
+    if studio_on is None:
+        studio_on = _studio_capability_on(caps, _studio_last_resort(_kb.kanban_home() / "fleet"))
+    rules = rules_out if rules_out is not None else {}
+    aff = affinity_out if affinity_out is not None else {}
+    route = _route_row_base(conn, row, plan, default_assignee, native_cache, linked_ids, lineage_mode, aff,
+                            unknown_out, caps, caps_out, rules, access_out, binds, held, worktree_out, board,
+                            carry_out, pause_cache, carry_budget, studio_on=studio_on)
+    if not studio_on or route[0] != "local":
+        return route
+    tid = row["id"]
+    rule = rules.get(tid)
+    try:
+        skills = tuple(s for s in (json.loads(row["skills"] or "[]") or []) if isinstance(s, str))
+    except (TypeError, ValueError):
+        skills = ()
+    why = _ksc.justify(rule=rule, affinity=aff.get(tid), body=row["body"], skills=skills,
+                       assignee=row["assignee"] or default_assignee, cmap=getattr(caps, "cmap", None))
+    kind = row["workspace_kind"] or "scratch"
+    if why is None and rule == "workspace_kind":
+        tail = (route[1] or "").rsplit(":", 1)[-1] if (route[1] or "").startswith("not_portable:workspace_kind:") \
+            else None
+        if kind != "worktree":
+            why = {"capability": f"workspace_kind:{kind}", "source": "card", "evidence": row["workspace_path"],
+                   "kind": "structural"}
+        elif tail in _WT_STRUCTURAL:
+            why = {"capability": f"workspace_kind:{tail}", "source": "card", "evidence": row["workspace_path"],
+                   "kind": "structural"}
+    if why is not None:
+        if studio_out is not None:
+            studio_out[tid] = why
+        return route
+    return "wait", _ksc.wait_reason(rule, route[1], task_id=tid, workspace_path=row["workspace_path"],
+                                    board_default=_board_default_safe(board) if kind == "worktree" else None)
+
+
+def _board_default_safe(board):
+    try:
+        from hermes_cli import kanban_worktree_port as _kwt
+        return _kwt.board_default_workdir(board)
+    except Exception:
+        return None
+
+
+def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
+                    native_cache: Optional[dict] = None,
+                    linked_ids: Optional[dict] = None,
+                    lineage_mode: Optional[str] = None,
+                    affinity_out: Optional[dict] = None,
+                    unknown_out: Optional[dict] = None,
+                    caps=None, caps_out: Optional[dict] = None,
+                    rules_out: Optional[dict] = None,
+                    access_out: Optional[dict] = None,
+                    binds: Optional[dict] = None,
+                    held: Optional[dict] = None,
+                    worktree_out: Optional[dict] = None,
+                    board: Optional[str] = None,
+                    carry_out: Optional[dict] = None,
+                    pause_cache: Optional[dict] = None,
+                    carry_budget=None, *, studio_on: bool = False) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5369,7 +5452,10 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     # `host: studio` with no requires: reason the Studio serves is dropped, and local_files is continuity only.
     _fleet_dir = _kb.kanban_home() / "fleet"
     last_resort = _studio_last_resort(_fleet_dir)
-    studio_reasons = _kwp.studio_pin_reasons(caps) if last_resort else None
+    # t_9965b8d5: under studio_on only a Studio-ONLY capability holds `host: studio` (fleet-ssh, docker, screen
+    # are on pool hosts too); off, every word the Studio row lists, as before.
+    from hermes_cli import kanban_studio_capability as _ksc
+    studio_reasons = _ksc.reasons_for(getattr(caps, "cmap", None), studio_on) if last_resort else None
     if _kwp.skills_need_studio(skills, getattr(caps, "cmap", None), studio_reasons):
         # An attached skill needs a capability the Studio serves (identity-only docker included): its
         # `host: studio` pin is justified, in this check and in portable() alike (Prism f5bbe97bc028).
@@ -5409,6 +5495,10 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             row["body"], skills, caps,
             pin_host=cap_pin if cap_pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
             any_pin=cap_pin == _kwp.PIN_ANY)
+        if studio_on:
+            # Rule 4 (t_9965b8d5): a studio-state SNIFFED from body words (kanban.db, ~/.hermes/state/) no longer
+            # establishes a Studio placement; an explicit `requires: studio-state` line or a skill does.
+            verdict = _ksc.tighten(verdict)
         if verdict.body_ignored and caps_out is not None:
             # Advisory body pin no host may serve (t_640a4ea0): placed without it, recorded.
             caps_out.setdefault("body_ignored", {})[row["id"]] = verdict.body_ignored[0]
@@ -5444,10 +5534,19 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         # there first (kanban_worker_hosts.carry_workspace). A card some other rule keeps local stays local_files.
         # Cheapest check first: the size walk is the costly one and runs within the tick's budget (t_915b8d2d).
         ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
-        if (ok2 and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])
+        shared = ok2 and _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])
+        if (ok2 and not shared
                 and _kb._kwh.carry_size_ok(row["workspace_path"], budget=carry_budget)):
             ok, rule, route_class, carried = ok2, rule2, class2, True
             carry_out[row["id"]] = True
+        elif studio_on and ok2:
+            # t_9965b8d5: files are no capability; a dir the carry cannot move this tick waits, named.
+            if rules_out is not None:
+                rules_out[row["id"]] = rule
+            return "wait", _ksc.wait_reason(rule, "workspace shared with another card" if shared else
+                                            f"carry refused or deferred: {lf_detail}", task_id=row["id"])
+        elif studio_on:
+            rule = rule2  # the files masked the rule that really keeps it home: that rule is judged
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
     if (verdict is not None and not ok and pin in (None, _kwp.PIN_ANY)
@@ -6126,6 +6225,8 @@ def _portable_goes_remote(local_free: bool, cap_only, plan, browser_joined: bool
     publisher (kanban_priority.waiting_by_host) both call it, so a card waits where it would start (round 5,
     Prism a51c53f3bd02). A browser-joined row keeps the host its join was cut for. A ``continuity`` row (its
     files are in the Studio scratch dir, t_e604c0f9) keeps the Studio while the local gate admits."""
+    if getattr(plan, "studio_capability_only", False) and not browser_joined:
+        return True  # t_9965b8d5: a portable card never takes a Studio slot, files or not
     remote_first = bool(getattr(plan, "default_remote", False)) and not browser_joined and not continuity
     return not local_free or bool(cap_only) or remote_first
 
@@ -6135,7 +6236,9 @@ def _last_resort_allowed(route: str, local_free: bool, cap_only, plan) -> bool:
     under ``kanban.placement.default: remote`` with local allowance left and no
     capability ``only`` set (a docker card never drifts onto the Studio, §3.4).
     No count, no cap (spec v0.3 I-0 / I-2): the pool having refused IS the
-    last-resort condition."""
+    last-resort condition. Never under t_9965b8d5's rule: a pool refusal is a wait, not a Studio spawn."""
+    if getattr(plan, "studio_capability_only", False):
+        return False
     return (route == "portable" and local_free and not cap_only
             and bool(getattr(plan, "default_remote", False)))
 
@@ -6812,6 +6915,7 @@ def _dispatch_once_locked(
     row_rules: dict = {}  # task id -> portable() rule, for the placement record
     _worktree_ports: dict = {}  # worktree card -> (repo, mirror, hosts) (t_6d9e7d90)
     _carry_rows: dict = {}  # local_files card -> True: local while the gate admits, else carried (t_e604c0f9)
+    _studio_why: dict = {}  # card -> the capability that justified its local route (t_9965b8d5)
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
     # ran the classifier on every one of them) and, of those, the ones the
     # spawn loop reached: the affinity event log reconciles against both.
@@ -6836,6 +6940,9 @@ def _dispatch_once_locked(
         _binds = _workspace_binds(conn, ready_rows, dry_run=dry_run)  # spec §2.4, per tick
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         spillover.continuation_dry_run = dry_run
+        # t_9965b8d5, read ONCE per tick: the Studio runs a card only for a named Studio-only capability.
+        _studio_on = _studio_capability_on(_caps, _studio_last_resort(_kb.kanban_home() / "fleet"))
+        spillover.studio_capability_only = _studio_on
         _carry_budget = _kb._kwh.CarryScanBudget()
         _route_t0 = time.monotonic()
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
@@ -6847,7 +6954,8 @@ def _dispatch_once_locked(
                                          binds=_binds, held=_pause_held,
                                          worktree_out=_worktree_ports, board=board,
                                          carry_out=_carry_rows, pause_cache=_pause_cache,
-                                         carry_budget=_carry_budget)
+                                         carry_budget=_carry_budget,
+                                         studio_on=_studio_on, studio_out=_studio_why)
                      for r in ready_rows}
         result.route_ms += (time.monotonic() - _route_t0) * 1000.0
         result.carry_scan_ms += _carry_budget.spent_s * 1000.0
@@ -8266,6 +8374,7 @@ def _dispatch_once_locked(
                     run_id=claimed.current_run_id, route=route, arg=route_arg,
                     rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
                     entry=entry, gate=tick_gate, take_refusal=_take_refusal,
+                    studio=_studio_why.get(claimed.id),
                 ),
             )
             _lw.mark("spawn")
