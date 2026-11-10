@@ -6809,9 +6809,9 @@ def _dispatch_once_locked(
                                          carry_out=_carry_rows, carry_budget=_carry_budget)
                      for r in ready_rows}
         result.route_ms += (time.monotonic() - _route_t0) * 1000.0
-        _carry_scan_after_routing()
         result.carry_scan_ms += _carry_budget.spent_s * 1000.0
-        result.carry_scans_deferred += _carry_budget.deferred
+        result.carry_scans_deferred += _kb._kwh.carry_scan_stats(reset=False)["pending"]
+        _carry_scan_after_routing()
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"origin": 0, "pin": 0, "wait": 1, "local": 1, "portable": 2}

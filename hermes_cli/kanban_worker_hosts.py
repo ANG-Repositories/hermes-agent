@@ -429,7 +429,7 @@ def _carry_root(path: Optional[str]) -> Optional[str]:
         return None
 
 
-def _carry_walk(root: str, max_bytes: int, max_entries: int, *, budget_entries=None, deadline=None, clock=None) -> "tuple[bool, int]":
+def _carry_walk(root: str, max_bytes: int, max_entries: int, *, budget_entries=None, deadline=None, clock=None) -> "tuple[Optional[bool], int]":
     """``(ok, entries_seen)`` for ``root``: bytes and entries, symlinks not followed. Stops AT the cap
     (t_3489445d): the walk reads one directory entry at a time and returns at entry ``max_entries + 1`` or
     the first byte over ``max_bytes``, so a 1M-entry directory costs ``max_entries`` reads, never a full
@@ -671,6 +671,10 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
         _log.info("carry census of %s refused: walk passed %.1fs at %d entries", root, max_seconds, entries)
     _carry_sync_cache[key] = (end if now is None else now, ok)
     return ok
+
+
+def _raise(exc: OSError) -> None:
+    raise exc
 
 
 def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subprocess.run) -> None:

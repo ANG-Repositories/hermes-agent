@@ -31,6 +31,7 @@ def _fresh(kanban_home, monkeypatch):
     fleet.mkdir(parents=True, exist_ok=True)
     _write_policy(fleet)
     kwh._carry_scan_cache.clear()
+    kwh._carry_sync_cache.clear()
     getattr(kwh, "_carry_pending", {}).clear()
     getattr(kwh, "_carry_stats", {}).clear()
     monkeypatch.setattr(kwh, "carry_workspace", lambda host, ws, runner=None: None)
@@ -107,19 +108,20 @@ def test_refresh_respects_the_per_tick_budget(tmp_path):
             (d / f"f{i}").write_text("x")
         paths.append(str(d))
         assert kwh.carry_size_known(str(d)) is None
-    assert kwh.carry_scan_refresh(budget_entries=5) == 10  # one walk starts, the rest wait
-    assert len(kwh._carry_pending) == 2
+    assert kwh.carry_scan_refresh(budget_entries=5) == 5  # no workspace may overrun the remaining budget
+    assert len(kwh._carry_pending) == 3
     kwh.carry_scan_refresh(budget_entries=10 ** 6)
     assert not kwh._carry_pending and all(kwh.carry_size_known(p) is True for p in paths)
     s = kwh.carry_scan_stats()
-    assert s["walks"] == 3 and s["walk_entries"] == 30 and s["paths"] == 3
+    assert s["walks"] == 4 and s["walk_entries"] == 35 and s["paths"] == 3
 
 
-def test_stale_verdict_is_answered_and_requeued(tmp_path):
+def test_stale_positive_is_unknown_and_requeued(tmp_path):
     d = tmp_path / "w"
     d.mkdir()
-    assert kwh.carry_size_ok(str(d), now=0.0) is True
-    assert kwh.carry_size_known(str(d), now=kwh.CARRY_SCAN_TTL_SECONDS + 1.0) is True
+    assert kwh.carry_size_known(str(d), now=0.0) is None
+    kwh.carry_scan_refresh(now=0.0)
+    assert kwh.carry_size_known(str(d), now=kwh.CARRY_SCAN_TTL_SECONDS + 1.0) is None
     assert kwh._carry_pending
 
 
@@ -136,8 +138,8 @@ def test_too_big_verdict_is_not_rewalked_every_ttl(tmp_path):
     assert kwh._carry_pending  # answered False, re-queued after the negative TTL
 
 
-def test_placement_parity_with_the_synchronous_scan(kanban_home, monkeypatch):
-    """Once the cache is warm, every fixture row routes exactly as the old in-tick scan routed it."""
+def test_warm_placement_parity_with_main_synchronous_scanner(kanban_home, monkeypatch):
+    """Warm-routing parity only: main synchronous scanner versus cached scanner on fixture rows."""
     with kb.connect_closing() as conn:
         small, _ = _card(conn, files=2)
         big, _ = _card(conn, files=30)
@@ -154,9 +156,11 @@ def test_placement_parity_with_the_synchronous_scan(kanban_home, monkeypatch):
         kwh._carry_pending.clear()
         for t in ids:
             _route(conn, t)  # cold pass: queues
-        for root in list(kwh._carry_pending):
-            kwh._carry_pending[root] = (kwh.CARRY_MAX_BYTES, 10, True)
+        for key in list(kwh._carry_pending):
+            item = kwh._carry_pending.pop(key)
+            kwh._carry_pending[(key[0], kwh.CARRY_MAX_BYTES, 10)] = (kwh.CARRY_MAX_BYTES, 10, True)
         kwh.carry_scan_refresh(budget_entries=10 ** 6)
+        monkeypatch.setattr(kwh, "carry_size_known", lambda p: real_known(p, max_entries=10))
         after = {t: _route(conn, t) for t in ids}
     assert after == before
     assert before[small][2] is True and before[big][2] is False
@@ -164,6 +168,8 @@ def test_placement_parity_with_the_synchronous_scan(kanban_home, monkeypatch):
 
 def test_kanban_home_nested_check_is_memoized(monkeypatch, tmp_path):
     calls = []
+    monkeypatch.setattr(kb, "_kanban_isolation_context", lambda: None)
+    monkeypatch.setattr(kb, "kanban_sandbox_enabled", lambda: False)
     monkeypatch.setattr(kb, "_refuse_nested_non_profile_home", lambda root: calls.append(root))
     kb._NESTED_HOME_OK.clear()
     kb._refuse_nested_non_profile_home_memo(tmp_path)
@@ -184,4 +190,41 @@ def test_kanban_home_refusal_is_never_memoized(monkeypatch, tmp_path):
     for _ in range(2):
         with pytest.raises(kb.KanbanLiveBoardRefusedError):
             kb._refuse_nested_non_profile_home_memo(tmp_path)
+    assert len(calls) == 2
+
+
+def test_refresh_deadline_is_checked_inside_walk(tmp_path):
+    d = tmp_path / "deadline"
+    d.mkdir()
+    for i in range(100):
+        (d / str(i)).touch()
+    ticks = iter(i / 1000 for i in range(1000))
+    clock = lambda: next(ticks)
+    kwh.carry_size_known(str(d))
+    used = kwh.carry_scan_refresh(max_seconds=0.010, clock=clock)
+    assert used < 10
+    assert kwh.carry_size_known(str(d)) is None
+
+
+def test_expanded_home_change_invalidates_memo(monkeypatch, tmp_path):
+    monkeypatch.setattr(kb, "_matching_live_root", lambda root: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", "$CARRY_TEST_HOME")
+    monkeypatch.setenv("CARRY_TEST_HOME", str(tmp_path / "profiles" / "ok"))
+    kb._NESTED_HOME_OK.clear()
+    kb._refuse_nested_non_profile_home_memo(tmp_path)
+    monkeypatch.setenv("CARRY_TEST_HOME", str(tmp_path / "profiles" / "ok" / "scratch"))
+    with pytest.raises(kb.KanbanLiveBoardRefusedError):
+        kb._refuse_nested_non_profile_home_memo(tmp_path)
+
+
+def test_memo_expires(monkeypatch, tmp_path):
+    import time
+    now = [0.0]
+    calls = []
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(kb, "_refuse_nested_non_profile_home", lambda root: calls.append(root))
+    kb._NESTED_HOME_OK.clear()
+    kb._refuse_nested_non_profile_home_memo(tmp_path)
+    now[0] = 86400
+    kb._refuse_nested_non_profile_home_memo(tmp_path)
     assert len(calls) == 2

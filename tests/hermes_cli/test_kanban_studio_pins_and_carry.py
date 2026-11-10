@@ -145,7 +145,8 @@ def _card_with_files(conn, body=None):
     kbw.set_workspace_path(conn, tid, str(path))
     # Steady state: the carry scan runs off the routing pass (t_3489445d), so a card is carried from the tick
     # after its directory was scanned. Warm the cache the way that scan would.
-    kwh.carry_size_ok(str(path))
+    kwh.carry_size_known(str(path))
+    kwh.carry_scan_refresh()
     return tid, str(path)
 
 
@@ -456,7 +457,7 @@ def test_a_waiting_path_whose_card_left_is_forgotten(tmp_path):
 def test_a_spent_carry_budget_never_holds_a_portable_peer(kanban_home, carried, monkeypatch):
     # Saturated Studio, two local_files rows and one plain portable row, and no carry budget left: the portable
     # row is placed this tick, the local_files rows keep the old rule (not carried) and are counted as deferred.
-    monkeypatch.setattr(kwh, "CARRY_TICK_SCAN_SECONDS", 0.0)
+    monkeypatch.setattr(kwh, "CARRY_REFRESH_SECONDS", 0.0)
     with kb.connect_closing() as conn:
         lf1, _ = _card_with_files(conn)
         lf2, _ = _card_with_files(conn)

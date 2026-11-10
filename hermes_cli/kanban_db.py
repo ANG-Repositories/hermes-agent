@@ -1237,24 +1237,38 @@ def kanban_home() -> Path:
     return root
 
 
-# kanban_home() runs many times per dispatcher tick; its nested-home check resolves paths and the live roots
-# every call (~2% of gateway GIL samples, t_3489445d). A PASSING check is memoized per process, keyed on what it
-# reads: the root, HERMES_HOME, and the resolver functions themselves (a monkeypatched resolver is a new key).
-# A refusal is never memoized, so it re-raises every call.
-_NESTED_HOME_OK: set = set()
+# Short-lived, atomically published generation. Include expanded env inputs, not just
+# HERMES_HOME's raw spelling. Never retain a refusal or a time-dependent approval.
+_NESTED_HOME_OK: dict = {}
+_NESTED_HOME_TTL_SECONDS = 1.0
 
 
 def _refuse_nested_non_profile_home_memo(root: Path) -> None:
-    import hermes_state as _cc
-    key = (str(root), os.environ.get("HERMES_HOME", ""), _refuse_nested_non_profile_home,
-           _matching_live_root, _live_kanban_roots, _rel_to_live, _live_kanban_root, _LIVE_KANBAN_ROOT_MEMO,
-           _account_home_board_root, _cc._deployed_hermes_home_root, _cc._os_account_home)
-    if key in _NESTED_HOME_OK:
+    import time
+    import hermes_state as state
+    raw = os.environ.get("HERMES_HOME", "")
+    if _kanban_isolation_context() or kanban_sandbox_enabled():
+        _refuse_nested_non_profile_home(root)
+        return
+    config = Path(os.path.expanduser(os.path.expandvars(raw))) / "config.yaml" if raw else root / "config.yaml"
+    try:
+        st = config.stat()
+        config_stamp = (str(config), st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        config_stamp = (str(config), None)
+    key = (str(root), config_stamp, tuple(sorted(os.environ.items())),
+           os.path.expanduser(os.path.expandvars(raw)),
+           _refuse_nested_non_profile_home, _matching_live_root, _live_kanban_roots,
+           _rel_to_live, _live_kanban_root, _LIVE_KANBAN_ROOT_MEMO,
+           _account_home_board_root, state._deployed_hermes_home_root, state._os_account_home)
+    now = time.monotonic()
+    generation = _NESTED_HOME_OK
+    if generation.get("key") == key and now < generation.get("until", 0):
         return
     _refuse_nested_non_profile_home(root)
-    if len(_NESTED_HOME_OK) > 256:
-        _NESTED_HOME_OK.clear()
-    _NESTED_HOME_OK.add(key)
+    # A single dict replacement publishes key and expiry together across threads.
+    globals()["_NESTED_HOME_OK"] = {"key": key, "until": now + _NESTED_HOME_TTL_SECONDS}
+
 
 
 class KanbanLiveBoardRefusedError(RuntimeError):
