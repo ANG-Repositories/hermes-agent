@@ -425,13 +425,25 @@ class GatewayModelCommandsMixin:
         A callback or active-session bypass has no adapter post-delivery lifecycle: it sends the
         confirmation itself and saves inline in its invoking task. No job survives that task.
         """
+        adapter = self._delivery_adapter_for(source)
+        adapter_key = (adapter._source_session_key(source)
+                       if adapter is not None and hasattr(adapter, "_source_session_key") else None)
+        task = asyncio.current_task()
+        # UI callbacks and the active-session bypass wait outside the switch lock: the current
+        # adapter task may itself be waiting for that lock. Once idle, claim the same lifecycle.
+        while adapter_key is not None:
+            previous = adapter._session_tasks.get(adapter_key)
+            if previous is None or previous is task or previous.done():
+                break
+            try:
+                await asyncio.shield(previous)
+            except asyncio.CancelledError:
+                if task.cancelling():
+                    raise
         lock = self._model_switch_lock(self._model_switch_lock_key(source))
         await lock.acquire()
         owner = {"save": None, "transferred": False}
         token = _model_selection_owner.set(owner)
-        adapter = self._delivery_adapter_for(source)
-        adapter_key = (adapter._source_session_key(source)
-                       if adapter is not None and hasattr(adapter, "_source_session_key") else None)
         if adapter_key is not None:
             adapter.__dict__.setdefault("_model_selection_locks", {})[adapter_key] = lock
         guard = None
