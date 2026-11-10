@@ -419,7 +419,7 @@ def test_derived_unpushed_commits_are_pushed_then_ported(kanban_home, anchor, tm
     real_push = kwt.push_card_branch
     monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=subprocess.run:
                         (order.append("push"), real_push(push))[1])
-    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None, sha=None:
                         order.append(("clone", host.name, branch)))
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
@@ -693,3 +693,224 @@ def test_clone_script_expands_a_home_relative_mirror(tmp_path):
     ws2 = tmp_path / "ws2"
     sc2 = kwt.clone_script(str(ws2), "acme/r", "~/.hermes/mirrors/acme/none.git", "feature", url=str(origin))
     assert subprocess.run(["sh", "-c", sc2], env=env).returncode == 0
+
+
+# -- pool-host clone off the dispatcher tick (t_915b8d2d) ------------------------------------------------------
+
+@pytest.fixture
+def clone_prefetch():
+    kwt._prefetch.clear()
+    yield kwt._prefetch
+    for fut, _t0 in list(kwt._prefetch.values()):
+        fut.cancel()
+    kwt._prefetch.clear()
+
+
+def _wait_prefetch_done(timeout=10.0):
+    import time as _t
+    deadline = _t.monotonic() + timeout
+    while _t.monotonic() < deadline:
+        if kwt._prefetch and all(f.done() for f, _ in kwt._prefetch.values()):
+            return
+        _t.sleep(0.02)
+    raise AssertionError("background clone never finished")
+
+
+def test_gateway_tick_does_not_wait_on_a_slow_pool_host_clone(kanban_home, anchor, monkeypatch, clone_prefetch):
+    """A clone that takes as long as it likes never holds up the tick: the card waits clone_pending, its slot
+    goes back to the next portable card in the SAME tick, and the clone's card launches on a later tick."""
+    import threading
+    import time as _t
+    _mirrors(kanban_home)
+    gate, calls = threading.Event(), []
+
+    def slow_clone(host, workspace, slug, mirror, branch, runner=None):
+        calls.append((host.name, workspace, branch))
+        assert gate.wait(30), "test released the clone"
+
+    monkeypatch.setattr(kwt, "clone_on_host", slow_clone)
+    with kb.connect_closing() as conn:
+        wt = kb.create_task(conn, title="wt", assignee="alpha", priority=9,
+                            workspace_kind="worktree", workspace_path=str(anchor))
+        other = kb.create_task(conn, title="plain", assignee="alpha", priority=1)
+        t0 = _t.monotonic()
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                             defer_pool_clone=True)
+        wall = _t.monotonic() - t0
+        assert wall < 10, f"tick waited on the clone ({wall:.1f}s)"
+        assert res.placement_waits[wt] == f"{kwt.CLONE_PENDING}:ace-ai"
+        assert (other, "ace-ai") in spawned          # the slot went to the next portable card this tick
+        assert all(tid != wt for tid, _ in spawned)
+        assert _row(conn, wt)["status"] == "ready"   # never claimed while the clone runs
+        assert res.clone_ms < 5000
+        gate.set()
+        _wait_prefetch_done()
+        conn.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id=?", (other,))
+        conn.commit()
+        res2, spawned2 = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                               defer_pool_clone=True)
+        row = _row(conn, wt)
+    assert (wt, "ace-ai") in spawned2
+    assert len(calls) == 1                           # collected, not cloned a second time
+    assert row["workspace_kind"] == "scratch" and row["workspace_path"] == calls[0][1]
+    assert calls[0][2] == f"wt/{wt}"
+    assert not kwt._prefetch
+
+
+def test_failed_background_clone_takes_the_existing_failure_path(kanban_home, anchor, monkeypatch,
+                                                                 clone_prefetch):
+    _mirrors(kanban_home)
+
+    def bad_clone(host, workspace, slug, mirror, branch, runner=None):
+        raise RuntimeError(f"worktree clone of {slug} on {host.name} failed rc=128: boom")
+
+    monkeypatch.setattr(kwt, "clone_on_host", bad_clone)
+    with kb.connect_closing() as conn:
+        wt = _worktree_card(conn, anchor)
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                             defer_pool_clone=True)
+        assert spawned == [] and res.placement_waits[wt].startswith(kwt.CLONE_PENDING)
+        _wait_prefetch_done()
+        plan = _plan(free=1)
+        res2, spawned2 = _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="test",
+                               defer_pool_clone=True)
+        row = _row(conn, wt)
+        run = conn.execute("SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                           (wt,)).fetchone()
+        # The refunded slot is free again: a fresh portable card takes it in the next tick.
+        other = kb.create_task(conn, title="plain", assignee="alpha")
+        _res3, spawned3 = _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="test")
+    assert spawned2 == [] and wt in res2.spawn_failed
+    assert row["status"] in ("ready", "blocked") and row["claim_lock"] is None
+    assert run["outcome"] == "spawn_failed" and "boom" in (run["error"] or "")
+    assert (other, "ace-ai") in spawned3
+
+
+def test_cli_tick_keeps_the_synchronous_clone(kanban_home, anchor, monkeypatch, clone_prefetch):
+    """Without defer_pool_clone (CLI, admit, dashboard) the clone runs in the tick as before: a one-shot
+    process must not exit with a clone thread still running."""
+    _mirrors(kanban_home)
+    calls = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
+                        calls.append(host.name))
+    with kb.connect_closing() as conn:
+        wt = _worktree_card(conn, anchor)
+        _res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+    assert (wt, "ace-ai") in spawned and calls == ["ace-ai"] and not kwt._prefetch
+
+
+# -- Prism 3e2f8506c8ff / d4847ef87c43: the pending clone is keyed on the tip and visible to every dispatcher ---
+
+def test_tip_moved_after_prefetch_never_launches_the_stale_clone(kanban_home, anchor, tmp_path, monkeypatch,
+                                                                 clone_prefetch):
+    """Prism 3e2f8506c8ff: prefetch at A, commit B, dispatch -> the card launches on B, never on A's clone."""
+    _origin_with_push(anchor, tmp_path)
+    monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: SLUG)
+    _commit(anchor, "base")
+    pushes, clones = [], []
+    real_push = kwt.push_card_branch
+    monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=subprocess.run:
+                        (pushes.append(push[3]), real_push(push))[1])
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None, sha=None:
+                        clones.append(sha))
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        _git("checkout", "-q", "-b", f"wt/{tid}", cwd=anchor)
+        _commit(anchor, "A")
+        sha_a = _ref(anchor, f"wt/{tid}")
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                             defer_pool_clone=True)
+        assert spawned == [] and res.placement_waits[tid].startswith(kwt.CLONE_PENDING)
+        _wait_prefetch_done()
+        _git("fetch", "-q", "origin", cwd=anchor)       # the Studio sees its own push
+        _commit(anchor, "B")                             # the tip moves before the clone is collected
+        sha_b = _ref(anchor, f"wt/{tid}")
+        _git("checkout", "-q", "main", cwd=anchor)
+        res2, spawned2 = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                               defer_pool_clone=True)
+        assert spawned2 == [], "launched on the clone of the old tip"
+        assert res2.placement_waits[tid].startswith(kwt.CLONE_PENDING)
+        _wait_prefetch_done()
+        _res3, spawned3 = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                                defer_pool_clone=True)
+    assert (tid, "ace-ai") in spawned3
+    assert pushes == [sha_a, sha_b]
+    assert clones == [sha_a, sha_b]                      # the launched workspace is pinned to B
+    assert not kwt._prefetch
+
+
+def test_deferred_then_sync_tick_never_starts_a_second_clone(kanban_home, anchor, monkeypatch, clone_prefetch):
+    """Prism d4847ef87c43: a gateway (deferred) tick starts the clone; a CLI/admit (synchronous) tick before it
+    finishes must skip the card, never run a second writer into the same workspace."""
+    import threading
+    _mirrors(kanban_home)
+    gate, calls = threading.Event(), []
+
+    def slow_clone(host, workspace, slug, mirror, branch, runner=None):
+        calls.append(workspace)
+        assert gate.wait(30), "test released the clone"
+
+    monkeypatch.setattr(kwt, "clone_on_host", slow_clone)
+    with kb.connect_closing() as conn:
+        wt = _worktree_card(conn, anchor)
+        _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test", defer_pool_clone=True)
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+        assert spawned == [] and res.placement_waits[wt].startswith(kwt.CLONE_PENDING)
+        assert _row(conn, wt)["status"] == "ready"
+        assert len(calls) == 1, "a second clone started while the first was running"
+        gate.set()
+        _wait_prefetch_done()
+        _res2, spawned2 = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+    assert (wt, "ace-ai") in spawned2 and len(calls) == 1   # the sync tick collected the finished clone
+
+
+def test_a_clone_held_by_another_dispatcher_process_is_skipped_by_every_tick(kanban_home, anchor, monkeypatch,
+                                                                            clone_prefetch):
+    """The pending marker is a per-workspace lock any dispatcher process sees (the in-process cache is not):
+    while another process holds it, deferred and synchronous ticks both skip the card; it dies with that
+    process, so a crashed dispatcher never strands the card."""
+    import sys
+    _mirrors(kanban_home)
+    calls = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, ws, slug, mirror, branch, runner=None:
+                        calls.append(ws))
+    with kb.connect_closing() as conn:
+        wt = _worktree_card(conn, anchor)
+        out: dict = {}
+        kbd._route_row(conn, _row(conn, wt), _plan(free=1), worktree_out=out)
+        _key, _job, lock = kbd._pool_clone_job(wt, None, _host(), out[wt], kb.workspaces_root() / wt)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,sys,time; fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); "
+                                   "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)",
+                                   str(lock)], stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            for defer in (True, False):
+                res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                                     defer_pool_clone=defer)
+                assert spawned == [] and res.placement_waits[wt].startswith(kwt.CLONE_PENDING), defer
+            assert calls == [] and not kwt._prefetch
+        finally:
+            holder.kill()
+            holder.wait()
+        _res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+    assert (wt, "ace-ai") in spawned and len(calls) == 1
+
+
+def test_clone_script_pins_a_reused_workspace_to_the_tip(tmp_path):
+    """A workspace an earlier (stale) clone left at A is moved to the pushed tip B, and proved there (rc 5)."""
+    origin, mirror = _origin_with_feature(tmp_path)
+    ws = tmp_path / "ws"
+    sha_a = _ref(origin, "feature")
+    sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin), sha=sha_a)
+    assert subprocess.run(["sh", "-c", sc]).returncode == 0
+    _git("checkout", "-q", "feature", cwd=origin)
+    _commit(origin, "b")
+    _git("checkout", "-q", "main", cwd=origin)
+    sha_b = _ref(origin, "feature")
+    sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin), sha=sha_b)
+    assert subprocess.run(["sh", "-c", sc]).returncode == 0
+    assert _ref(ws, "HEAD") == sha_b
+    sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin), sha="0" * 40)
+    assert subprocess.run(["sh", "-c", sc], capture_output=True).returncode == 5

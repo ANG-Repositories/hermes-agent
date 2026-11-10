@@ -325,6 +325,9 @@ class DispatchResult:
     """Wall ms of carry size walks inside ``route_ms`` (bounded by ``CARRY_TICK_SCAN_SECONDS``)."""
     carry_scans_deferred: int = 0
     """local_files rows whose carry walk was left to a later tick because the tick budget ran out."""
+    clone_ms: float = 0.0
+    """Wall ms the tick itself spent on pool-host worktree clones (push + clone, or the prefetch check of a
+    gateway tick that runs them in the background; t_915b8d2d, gate-ticks.jsonl)."""
     portable_waiting: int = 0
     """Rows routed ``portable`` still in ``placement_waits`` at the end of the
     ready section (the I-0 query's input, spec v0.3 §3.6)."""
@@ -4204,6 +4207,7 @@ def dispatch_once(
     spillover=None,
     max_new: Optional[int] = None,
     entry: str = "gateway",
+    defer_pool_clone: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -4286,6 +4290,7 @@ def dispatch_once(
                 max_new=max_new,
                 entry=entry,
                 lock_window=window,
+                defer_pool_clone=defer_pool_clone,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -6365,6 +6370,7 @@ def _dispatch_once_locked(
     admission_event: Optional[dict] = None,
     admit_floor=None,
     lock_window=None,
+    defer_pool_clone: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7975,6 +7981,23 @@ def _dispatch_once_locked(
             if _local_wait is not None:
                 result.placement_waits[row["id"]] = _local_wait
                 continue
+        if (not dry_run and placed_host is not None and row["id"] in _worktree_ports
+                and (row["workspace_kind"] or "scratch") == "worktree"):
+            # Pool-host clone off the tick (t_915b8d2d): a gateway tick starts it in the background and claims
+            # the card once it has finished; until then the card waits and its slot goes back. Every tick,
+            # deferred or not, skips a card whose clone is pending anywhere (Prism d4847ef87c43).
+            from hermes_cli import kanban_worktree_port as _kwt
+            _ct0 = time.monotonic()
+            _ckey, _cjob, _clock = _pool_clone_job(
+                row["id"], row["branch_name"], placed_host, _worktree_ports[row["id"]],
+                _kb.workspaces_root(board=board) / row["id"], board=board)
+            _ready = (_kwt.clone_ready(_ckey, _cjob, _clock) if defer_pool_clone
+                      else not _kwt.clone_busy(_ckey, _clock))
+            result.clone_ms += (time.monotonic() - _ct0) * 1000.0
+            if not _ready:
+                spillover.release(placed_host, _rid)
+                result.placement_waits[row["id"]] = f"{_kwt.CLONE_PENDING}:{placed_host.name}"
+                continue
         if _take_refusal is not None and placed_host is None:
             result.take_refusals[row["id"]] = _take_refusal
         if dry_run:
@@ -8061,11 +8084,14 @@ def _dispatch_once_locked(
                 claimed.workspace_kind, claimed.workspace_path = "scratch", None
                 workspace = _kbw.resolve_workspace(claimed, board=board)
                 _wt_mirror = _kwt.mirror_for(_wt_port, placed_host.name)
-                if len(_wt_port) > 4 and _wt_port[4] is not None:
-                    # Push-then-port (t_1d2c5939): committed work only the Studio has goes to origin first.
-                    _kwt.push_card_branch(_wt_port[4])
-                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_mirror,
-                                   resolved_branch_name)
+                _ckey, _cjob, _clock = _pool_clone_job(claimed.id, resolved_branch_name, placed_host, _wt_port,
+                                                       workspace, board=board)
+                _ct0 = time.monotonic()
+                try:
+                    # A finished background clone (gateway tick) is collected; a failed one raises here.
+                    _kwt.run_clone(_ckey, _cjob, _clock)
+                finally:
+                    result.clone_ms += (time.monotonic() - _ct0) * 1000.0
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
                              host=placed_host.name, slug=_wt_port[0], mirror=_wt_mirror)
             elif claimed.workspace_kind == "worktree":
@@ -9172,6 +9198,27 @@ def _run_started_at(task: Task, board: Optional[str]) -> int:
         except Exception as exc:
             _kb._log.debug("kanban worker: run start unreadable for %s (%s)", task.id, exc)
     return int(time.time())
+
+
+def _pool_clone_job(task_id: str, branch_name, host, wt_port, workspace, board: Optional[str] = None) -> tuple:
+    """``(key, job, lock_path)`` of a ported worktree's clone on ``host`` (t_915b8d2d): push-then-port
+    (t_1d2c5939, committed work only the Studio has goes to origin first), then the clone, pinned to the pushed
+    tip. The same key before the claim (prefetch) and after it (collect) while the tip is unchanged; the key
+    carries the push plan, so a moved tip never collects the old clone (Prism 3e2f8506c8ff). ``lock_path`` is
+    the per-workspace pending marker every dispatcher of the board sees (Prism d4847ef87c43)."""
+    from hermes_cli import kanban_worktree_port as _kwt
+    branch = (branch_name or "").strip() or f"wt/{task_id}"
+    mirror = _kwt.mirror_for(wt_port, host.name)
+    push = wt_port[4] if len(wt_port) > 4 else None
+    tip = push[3] if push is not None else None
+
+    def job() -> None:
+        if push is not None:
+            _kwt.push_card_branch(push)
+        _kwt.clone_on_host(host, str(workspace), wt_port[0], mirror, branch, **({"sha": tip} if tip else {}))
+
+    key = _kwt.clone_key(task_id, host.name, str(workspace), wt_port[0], mirror, branch, push)
+    return key, job, _kwt.clone_lock_path(_kb.board_dir(board) / "clone-locks", key)
 
 
 def _default_spawn(
