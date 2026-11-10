@@ -23,17 +23,57 @@ from tools.file_operations_lint_shell import _parse_check, _parse_bash
 pytestmark = pytest.mark.platforms("posix")
 
 
-@pytest.fixture
-def no_fork_exec(monkeypatch):
-    """Make CPython's fork path fail loudly; posix_spawn stays available."""
+@pytest.fixture(scope="session")
+def posix_spawn_setsid_supported():
+    """Probe the interpreter build, not its OS name or Python version."""
+    try:
+        pid = os.posix_spawn("/bin/true", ["/bin/true"], os.environ, setsid=True)
+    except NotImplementedError:
+        return False
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    return True
+
+
+@pytest.fixture(params=["native", "unsupported-setsid"])
+def no_fork_exec(monkeypatch, posix_spawn_setsid_supported, request, record_property):
+    """Forbid forks except the required session-preserving setsid fallback.
+
+    Run the same real-process semantics with setsid forced unavailable as well.
+    Non-session launches must never fork, even on an unsupported interpreter.
+    """
     import _posixsubprocess
 
-    def _forbidden(*_a, **_k):
-        raise AssertionError("fork_exec called: this spawn forks the whole parent under the GIL")
+    supported = posix_spawn_setsid_supported and request.param == "native"
+    real_spawn = os.posix_spawn
+    real_fork = getattr(subprocess, "_fork_exec", _posixsubprocess.fork_exec)
+    attempts = fallbacks = 0
+    if not supported:
+        record_property("no_fork_assertion_xfail_reason",
+                        "posix_spawn setsid unavailable; require isolated Popen fallback instead")
 
-    monkeypatch.setattr(_posixsubprocess, "fork_exec", _forbidden)
+    def spawn(*args, **kwargs):
+        nonlocal attempts
+        if kwargs.get("setsid") and not supported:
+            attempts += 1
+            raise NotImplementedError("posix_spawn: setsid unavailable on this platform")
+        return real_spawn(*args, **kwargs)
+
+    def checked_fork(*args, **kwargs):
+        nonlocal fallbacks
+        assert not supported and attempts > fallbacks, (
+            "fork_exec called: this spawn forks the whole parent under the GIL")
+        pid = real_fork(*args, **kwargs)
+        fallbacks += 1
+        assert os.getpgid(pid) == os.getsid(pid) == pid
+        return pid
+
+    monkeypatch.setattr(os, "posix_spawn", spawn)
+    monkeypatch.setattr(_posixsubprocess, "fork_exec", checked_fork)
     if hasattr(subprocess, "_fork_exec"):  # 3.12+ binds it at import
-        monkeypatch.setattr(subprocess, "_fork_exec", _forbidden)
+        monkeypatch.setattr(subprocess, "_fork_exec", checked_fork)
+    yield
+    assert attempts == fallbacks, "unsupported setsid did not take the Popen fallback"
 
 
 def _alive(pid: int) -> bool:
@@ -153,10 +193,28 @@ def test_plain_popen_when_platform_lacks_setsid(monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(os, "posix_spawn", no_setsid)
-    proc = nofork.spawn_popen(["/bin/sh", "-c", 'echo "$$ $(ps -o pgid= -p $$)"'],
+    import _posixsubprocess
+
+    real_fork = getattr(subprocess, "_fork_exec", _posixsubprocess.fork_exec)
+    forks = []
+
+    def counted_fork(*args, **kwargs):
+        pid = real_fork(*args, **kwargs)
+        forks.append(pid)
+        return pid
+
+    monkeypatch.setattr(_posixsubprocess, "fork_exec", counted_fork)
+    if hasattr(subprocess, "_fork_exec"):
+        monkeypatch.setattr(subprocess, "_fork_exec", counted_fork)
+    proc = nofork.spawn_popen(["/bin/sh", "-c", 'echo "$$"; sleep 30'],
                               new_session=True, stdout=subprocess.PIPE, text=True)
-    pid, pgid = (int(x) for x in proc.communicate(timeout=10)[0].split())
-    assert pid == pgid == proc.pid
+    try:
+        assert int(proc.stdout.readline()) == proc.pid
+        assert forks == [proc.pid], "unsupported setsid must use ordinary Popen"
+        assert os.getpgid(proc.pid) == os.getsid(proc.pid) == proc.pid
+    finally:
+        os.killpg(proc.pid, 9)
+        proc.wait(timeout=10)
 
 
 def test_ineligible_calls_keep_plain_popen_semantics(tmp_path):
