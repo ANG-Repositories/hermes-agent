@@ -1758,7 +1758,9 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     if not drifted:
         return
 
-    conn.execute("BEGIN IMMEDIATE")
+    # Compose with the outer optional-column migration transaction. A
+    # savepoint also remains atomic when this helper is called standalone.
+    conn.execute("SAVEPOINT rebuild_drifted_tables")
     try:
         for table in drifted:
             create_sql, index_sqls = _REBUILD_SPECS[table]
@@ -1782,10 +1784,11 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP TABLE {table}_legacy")
             for index_sql in index_sqls:
                 conn.execute(index_sql)
-        conn.execute("COMMIT")
+        conn.execute("RELEASE SAVEPOINT rebuild_drifted_tables")
     except Exception:
         with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
+            conn.execute("ROLLBACK TO SAVEPOINT rebuild_drifted_tables")
+            conn.execute("RELEASE SAVEPOINT rebuild_drifted_tables")
         raise
 
 
