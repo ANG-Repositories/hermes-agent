@@ -259,15 +259,8 @@ def _os_account_home() -> Optional[Path]:
     clever: an unusable anchor would point the deny-list at a root nothing
     ever resolves to, silently disarming the guard.
     """
-    try:
-        import pwd
-
-        home = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX-only module inside try/except
-        if home and os.path.isdir(home):
-            return Path(home)
-    except Exception:
-        pass
-    return None
+    from hermes_state_roots import account_home
+    return account_home()
 
 
 def _deployed_hermes_home_root() -> Optional[Path]:
@@ -316,22 +309,8 @@ def _deployed_hermes_home_root() -> Optional[Path]:
     ``Path.home``), and a guard that resolves through a patched callable
     misidentifies the patcher's own tmpdir as production.
     """
-    declared = os.environ.get("HERMES_HOME", "").strip()
-    if not declared:
-        return None
-    account_home = _os_account_home()
-    if account_home is None:
-        return None
-    try:
-        root = Path(declared).expanduser().resolve()
-        account = account_home.resolve()
-    except Exception:
-        return None
-    if root.parent.name == "profiles":
-        root = root.parent.parent
-    if root != account:
-        return None  # a redirected/hermetic HERMES_HOME, not a deployment
-    return root
+    from hermes_state_roots import deployed_root
+    return deployed_root(_os_account_home())
 
 
 _STATE_DB_GUARD_BYPASS = False

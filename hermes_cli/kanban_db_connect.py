@@ -32,6 +32,7 @@ from typing import Optional
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
+_INIT_DEADLINE = ContextVar("kanban_init_deadline", default=None)
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
 # Cap on ``<db>.corrupt.<hash>.bak`` quarantines per board: content-addressing
@@ -61,7 +62,11 @@ def _resolve_busy_timeout_ms() -> int:
     shared cross-profile dispatch bus, so worker stampedes are expected; a
     long timeout lets WAL serialize writers instead of surfacing transient
     ``database is locked`` failures."""
-    return _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
+    timeout = _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
+    deadline = _INIT_DEADLINE.get()
+    if deadline is not None:
+        return min(timeout, max(1, min(100, int((deadline - time.monotonic()) * 1000))))
+    return timeout
 
 
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
@@ -133,6 +138,21 @@ def _unlock(handle) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _read_init_holder(handle):
+    try:
+        handle.seek(0)
+        return handle.read(2048).decode("utf-8", errors="replace").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _stamp_init_holder(handle):
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"pid": os.getpid(), "host": __import__("socket").gethostname()}).encode())
+    handle.flush()
+
+
 @contextlib.contextmanager
 def _cross_process_init_lock(path: Path):
     """Serialize first-connect WAL/schema/integrity setup across processes.
@@ -153,6 +173,7 @@ def _cross_process_init_lock(path: Path):
     acquired = False
     try:
         deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
+        holder = None
         while True:
             try:
                 acquired = _try_lock_nb(handle)
@@ -160,7 +181,12 @@ def _cross_process_init_lock(path: Path):
                 acquired = False
             if acquired or time.monotonic() >= deadline:
                 break
+            if holder is None:
+                holder = _read_init_holder(handle)
+                _kb._log.warning("kanban init waiting on %s holder=%s", lock_path, holder)
             time.sleep(_INIT_LOCK_POLL_SECONDS)
+        if acquired:
+            _stamp_init_holder(handle)
         if not acquired:
             _kb._log.warning(
                 "kanban init lock for %s not acquired within %.0fs — proceeding "
@@ -979,6 +1005,34 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
+def _open_initialized_with_retry(path, initialize):
+    """Retry transient schema/WAL lock failures within the existing init budget."""
+    deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
+    delay = _INIT_LOCK_POLL_SECONDS
+    while True:
+        token = _INIT_DEADLINE.set(deadline)
+        try:
+            conn, result = _open_configured(path, initialize)
+            conn.execute(f"PRAGMA busy_timeout={_kb._env_int('HERMES_KANBAN_BUSY_TIMEOUT_MS', DEFAULT_BUSY_TIMEOUT_MS, minimum=1)}")
+            return conn, result
+        except sqlite3.OperationalError as exc:
+            if not any(word in str(exc).lower() for word in ("locked", "busy")):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            # SQLite doesn't expose an external writer's PID. The advisory
+            # init owner is known; don't falsely label it the SQLite writer.
+            _kb._log.warning(
+                "kanban SQLite init for %s waiting on writer (pid unavailable); "
+                "init owner pid=%s; retry in %.2fs", path, os.getpid(), min(delay, remaining),
+            )
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.5)
+        finally:
+            _INIT_DEADLINE.reset(token)
+
+
 _READ_ONLY = ContextVar("kanban_read_only", default=False)
 
 
@@ -1119,7 +1173,7 @@ def connect(
             _kb._install_status_audit_marker(conn)
 
         try:
-            conn, _ = _open_configured(path, _init_if_needed)
+            conn, _ = _open_initialized_with_retry(path, _init_if_needed)
         except Exception:
             if creating:
                 _kb._discard_stub_db(path)
