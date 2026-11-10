@@ -401,6 +401,11 @@ def _own_destination(url: str) -> bool:
     return url.startswith("/") or url.startswith("file://")
 
 
+def _redact_url(url: str) -> str:
+    """Drop URL userinfo (``https://user:token@host/...`` -> ``https://host/...``): the refusal is stored on the card."""
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^@/]*@", r"\1", url)
+
+
 def push_card_branch(push: Tuple[str, str, str, str], runner: Callable = subprocess.run) -> None:
     """Push the card branch to origin before the port (t_1d2c5939): ``--force-with-lease`` pinned to the
     origin sha the routing saw ("" = the branch must not exist on origin), so a branch someone moved since
@@ -416,14 +421,28 @@ def push_card_branch(push: Tuple[str, str, str, str], runner: Callable = subproc
     # An explicit remote pushurl suppresses pushInsteadOf; passing the URL
     # directly does not. Command-local configuration leaves the checkout intact.
     destination = dest.stdout.strip()
-    if not _own_destination(destination):
+    remote_cfg = ["-c", f"remote.kanban-port-destination.url={destination}",
+                  "-c", f"remote.kanban-port-destination.pushurl={destination}"]
+    # pushurl is multivalued: -c APPENDS to any checkout-configured pushurl of the synthetic remote, and the
+    # push goes to every one of them. Each is also rewritten by url.<base>.insteadOf at push time
+    # (ls-remote --get-url applies that rewrite). Every effective destination must be ours.
+    got = runner(["git", "-C", repo, *remote_cfg, "config", "--get-all", "remote.kanban-port-destination.pushurl"],
+                 capture_output=True, text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    urls = (got.stdout or "").split() if getattr(got, "returncode", 1) == 0 else []
+    bad = [] if urls else [destination]
+    for url in urls:
+        eff = runner(["git", "-C", repo, "ls-remote", "--get-url", url], capture_output=True,
+                     text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+        effective = (eff.stdout or "").strip() if getattr(eff, "returncode", 1) == 0 else ""
+        if not (_own_destination(url) and effective and _own_destination(effective)):
+            bad.append(url if effective in ("", url) else f"{url} (rewritten to {effective})")
+    if bad or not _own_destination(destination):
+        shown = ", ".join(_redact_url(u) for u in (bad or [destination]))
         raise ForeignOriginPush(
-            f"refused to push card branch {branch}: origin {destination} of {repo} is not a fleet-owned repo, "
+            f"refused to push card branch {branch}: origin {shown} of {repo} is not a fleet-owned repo, "
             "and NO retry can fix it. The card needs a checkout whose origin is ours (re-create it with "
             f"--workspace worktree:<a checkout whose origin is ANG-Ventures/* or Kyzcreig/*>). Nothing was pushed.")
-    proc = runner(["git", "-C", repo,
-                   "-c", f"remote.kanban-port-destination.url={destination}",
-                   "-c", f"remote.kanban-port-destination.pushurl={destination}",
+    proc = runner(["git", "-C", repo, *remote_cfg,
                    "push", "--porcelain",
                    f"--force-with-lease=refs/heads/{branch}:{expected}",
                    "kanban-port-destination", f"{source}:refs/heads/{branch}"],
