@@ -22,7 +22,6 @@ import os
 import re
 import shlex
 import subprocess
-import threading
 from typing import Callable, Dict, Mapping, MutableMapping, Optional
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
@@ -532,7 +531,6 @@ CARRIED_EVENT = "workspace_carried"
 # (custody, independent of placement.continuation); the Studio original is never run against or carried again.
 CARRY_BIND_RULE = "workspace_carry"
 _carry_scan_cache: Dict[tuple, tuple] = {}
-_carry_sync_cache: Dict[tuple, tuple] = {}
 _carry_waiting: Dict[tuple, tuple] = {}  # cache key -> (budget generation first deferred, last asked); FIFO
 _carry_gen = 0
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
@@ -601,162 +599,6 @@ def carry_path_shared(conn, task_id: str, workspace_path: Optional[str]) -> bool
     return False
 
 
-def _carry_root(path: Optional[str]) -> Optional[str]:
-    """The cache key of a carry candidate, or None when it can never be carried (unsafe / unresolvable)."""
-    if not path or not carry_path_safe(path):
-        return None
-    try:
-        return os.path.normpath(path)
-    except (OSError, RuntimeError, ValueError):
-        return None
-
-
-def _carry_walk(root: str, max_bytes: int, max_entries: int, *, budget_entries=None, deadline=None, clock=None) -> "tuple[Optional[bool], int]":
-    """``(ok, entries_seen)`` for ``root``: bytes and entries, symlinks not followed. Stops AT the cap
-    (t_3489445d): the walk reads one directory entry at a time and returns at entry ``max_entries + 1`` or
-    the first byte over ``max_bytes``, so a 1M-entry directory costs ``max_entries`` reads, never a full
-    listing. Any scan error is ``ok=False`` (the card keeps the old rule)."""
-    import time
-    clock = clock or time.monotonic
-    total = entries = 0
-    stack = [root]
-    try:
-        while stack:
-            if deadline is not None and clock() >= deadline:
-                return None, entries
-            with os.scandir(stack.pop()) as it:
-                for entry in it:
-                    if ((budget_entries is not None and entries >= budget_entries)
-                            or (deadline is not None and clock() >= deadline)):
-                        return None, entries
-                    entries += 1
-                    st = entry.stat(follow_symlinks=False)
-                    total += st.st_size
-                    if entries > max_entries or total > max_bytes:
-                        return False, entries
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(entry.path)
-    except OSError:
-        return False, entries
-    return True, entries
-
-
-# Per-tick counters of the carry scan (t_3489445d): the dispatcher logs and resets them once per routing pass.
-_carry_stats: Dict[str, float] = {}
-# Paths a routing pass asked about with no fresh verdict, oldest first: root -> (max_bytes, max_entries, cold).
-_carry_pending: Dict[str, tuple] = {}
-_carry_lock = threading.Lock()
-# Entries one :func:`carry_scan_refresh` call may walk before it starts no further walk (one capped walk may
-# finish past it, so the worst case per call is about twice this). At the default 60 s dispatch interval that
-# is ~330 lstat/s, whatever the number of carry candidates; measured before (t_3489445d) on 85 real workspaces,
-# 72 of them repo-sized: ~1.53M lstat per 300 s TTL cycle, ~5,100 lstat/s.
-CARRY_WALK_BUDGET_ENTRIES = CARRY_MAX_ENTRIES
-CARRY_REFRESH_SECONDS = 0.1
-_carry_refresh_lock = threading.Lock()
-# Re-scan age of a "too big" verdict in the routing pass. A capped walk spends the whole tick budget, and a
-# repo-sized dir rarely shrinks under the cap: re-walking those every 300 s kept ~80 paths queued and starved new
-# cards on nas-fleet (measured t_3489445d). A "small enough" verdict keeps the 300 s TTL, so a dir that grew is
-# re-checked as fast as before.
-CARRY_SCAN_NEGATIVE_TTL_SECONDS = 3600
-
-
-def _stat(key: str, n: float = 1) -> None:
-    _carry_stats[key] = _carry_stats.get(key, 0) + n
-
-
-def carry_size_known(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
-                     max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None) -> Optional[bool]:
-    """The cached :func:`carry_size_ok` verdict, WITHOUT touching the filesystem tree (t_3489445d). The
-    dispatcher's routing pass asks this for every local_files candidate, every tick. None = unknown (never
-    scanned): the caller keeps the old rule and the path is queued for :func:`carry_scan_refresh`. A verdict
-    older than ``CARRY_SCAN_TTL_SECONDS`` is still answered and the path is queued for a re-scan."""
-    import time as _time
-    root = _carry_root(path)
-    if root is None:
-        return False
-    t = _time.monotonic() if now is None else now
-    with _carry_lock:
-        _stat("asks")
-        seen = _carry_stats.setdefault("_paths", set())  # type: ignore[arg-type]
-        seen.add(root)  # type: ignore[union-attr]
-        key = (root, max_bytes, max_entries)
-        hit = _carry_scan_cache.get(key)
-        if hit is None:
-            _stat("misses")
-            _carry_pending.setdefault(key, (max_bytes, max_entries, True))
-            return None
-        if t - hit[0] < (CARRY_SCAN_TTL_SECONDS if hit[1] else CARRY_SCAN_NEGATIVE_TTL_SECONDS):
-            _stat("hits")
-        else:
-            _stat("stale")
-            _carry_pending.setdefault(key, (max_bytes, max_entries, False))
-            return None if hit[1] else False
-        return hit[1]
-
-
-def carry_scan_refresh(*, budget_entries=None, now=None, max_seconds=None, clock=None) -> int:
-    """Cooperatively bounded refresh, called only by the single background worker.
-
-    Filesystem syscalls cannot be interrupted; they never hold the dispatcher or cache lock.
-    Incomplete censuses stay unknown and rotate behind other queued paths.
-    """
-    import time
-    clock = clock or time.monotonic
-    budget = CARRY_WALK_BUDGET_ENTRIES if budget_entries is None else budget_entries
-    stop = clock() + (CARRY_REFRESH_SECONDS if max_seconds is None else max_seconds)
-    used = 0
-    with _carry_lock:
-        candidates = list(_carry_pending)
-    for key in candidates:
-        if used >= budget or clock() >= stop:
-            break
-        with _carry_lock:
-            item = _carry_pending.pop(key, None)
-        if item is None:
-            continue
-        root, max_bytes, max_entries = key
-        t0 = clock()
-        ok, seen = _carry_walk(root, max_bytes, max_entries,
-                               budget_entries=budget-used, deadline=stop, clock=clock)
-        dt = clock() - t0
-        used += seen
-        with _carry_lock:
-            if ok is None:
-                _carry_pending.setdefault(key, item)
-            else:
-                _carry_scan_cache[key] = (clock() if now is None else now, ok)
-            _stat("walks")
-            _stat("walk_entries", seen)
-            _stat("walk_s", dt)
-    return used
-
-
-def carry_scan_schedule() -> None:
-    """Single-flight daemon; no walk runs on the dispatcher thread or under its lock."""
-    if not _carry_refresh_lock.acquire(blocking=False):
-        return
-
-    def refresh():
-        try:
-            carry_scan_refresh()
-        finally:
-            _carry_refresh_lock.release()
-    try:
-        threading.Thread(target=refresh, name="kanban-carry-refresh", daemon=True).start()
-    except BaseException:
-        _carry_refresh_lock.release()
-        raise
-
-
-def carry_scan_stats(reset: bool = True) -> Dict[str, float]:
-    """This pass's counters: asks, hits, stale, misses, walks, walk_entries, walk_s, distinct paths, pending."""
-    with _carry_lock:
-        out = {k: v for k, v in _carry_stats.items() if k != "_paths"}
-        out["paths"] = len(_carry_stats.get("_paths") or ())  # type: ignore[arg-type]
-        out["pending"] = len(_carry_pending)
-        if reset:
-            _carry_stats.clear()
-    return out
 class CarryScanBudget:
     """One tick's wall budget for :func:`carry_size_ok` walks. ``spent_s`` and ``deferred`` feed the tick record."""
 
@@ -807,13 +649,17 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     overrun the deadline and still delay routing; this is not a hard filesystem timeout. A refused carry
     retains this card's old local_files rule rather than authorizing a transfer with an incomplete census."""
     import time as _time
-    root = _carry_root(path)
-    if root is None:
+    if not path or not carry_path_safe(path):
+        return False
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        root = canon(path)
+    except (OSError, RuntimeError, ValueError):
         return False
     clock = budget.clock if budget is not None else _time.monotonic
     key = (root, max_bytes, max_entries)
     t = clock() if now is None else now
-    hit = _carry_sync_cache.get(key)
+    hit = _carry_scan_cache.get(key)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
         return hit[1]
     if budget is not None and (budget.left() <= 0 or not budget.may_walk(key)):
@@ -825,21 +671,28 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     total = entries = 0
     ok = True
     timed_out = False
+    # Stream entries rather than materializing os.walk's per-directory lists.
+    # Reuse the no-follow stat for both size and recursion; symlinks count but
+    # never recurse, including links to directories and dangling links.
+    import stat
+    pending = [root]
     try:
-        for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
-            for name in (*dirnames, *filenames):
-                entries += 1
-                total += os.lstat(os.path.join(dirpath, name)).st_size
-                if entries > max_entries or total > max_bytes:
-                    ok = False
-                    break
-                if entries % 256 == 0 and clock() >= stop:
-                    ok, timed_out = False, True
-                    break
+        while pending and ok:
+            with os.scandir(pending.pop()) as scan:
+                for entry in scan:
+                    entries += 1
+                    info = entry.stat(follow_symlinks=False)
+                    total += info.st_size
+                    if entries > max_entries or total > max_bytes:
+                        ok = False
+                        break
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(entry.path)
+                    if entries % 256 == 0 and clock() >= stop:
+                        ok, timed_out = False, True
+                        break
             if ok and clock() >= stop:
                 ok, timed_out = False, True
-            if not ok:
-                break
     except OSError:
         ok = False
     end = clock()
@@ -851,7 +704,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     _carry_waiting.pop(key, None)
     if timed_out:
         _log.info("carry census of %s refused: walk passed %.1fs at %d entries", root, max_seconds, entries)
-    _carry_sync_cache[key] = (end if now is None else now, ok)
+    _carry_scan_cache[key] = (end if now is None else now, ok)
     return ok
 
 

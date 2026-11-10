@@ -5234,23 +5234,6 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
     return _only, _job
 
 
-def _carry_scan_after_routing() -> None:
-    """The local_files carry scan, OFF the routing pass (t_3489445d): walk the paths this pass found unknown or
-    stale, within ``CARRY_WALK_BUDGET_ENTRIES``, then log the pass's counters at debug level. Never raises."""
-    try:
-        _kb._kwh.carry_scan_schedule()
-        s = _kb._kwh.carry_scan_stats()
-    except Exception as exc:  # a scan must never cost the tick
-        _kb._log.debug("kanban carry scan refresh failed: %s: %s", type(exc).__name__, exc)
-        return
-    if s.get("asks"):
-        _kb._log.debug(
-            "kanban carry scan: asks=%d paths=%d hits=%d stale=%d misses=%d walks=%d entries=%d walk_ms=%.1f "
-            "pending=%d", s.get("asks", 0), s.get("paths", 0), s.get("hits", 0), s.get("stale", 0),
-            s.get("misses", 0), s.get("walks", 0), s.get("walk_entries", 0), 1000 * s.get("walk_s", 0.0),
-            s.get("pending", 0))
-
-
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5418,7 +5401,7 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         # Cheapest check first: the size walk is the costly one and runs within the tick's budget (t_915b8d2d).
         ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
         if (ok2 and not _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])
-                and _kb._kwh.carry_size_known(row["workspace_path"]) is True):
+                and _kb._kwh.carry_size_ok(row["workspace_path"], budget=carry_budget)):
             ok, rule, route_class, carried = ok2, rule2, class2, True
             carry_out[row["id"]] = True
     if ignored is not None:
@@ -6822,8 +6805,7 @@ def _dispatch_once_locked(
                      for r in ready_rows}
         result.route_ms += (time.monotonic() - _route_t0) * 1000.0
         result.carry_scan_ms += _carry_budget.spent_s * 1000.0
-        result.carry_scans_deferred += _kb._kwh.carry_scan_stats(reset=False)["pending"]
-        _carry_scan_after_routing()
+        result.carry_scans_deferred += _carry_budget.deferred
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"origin": 0, "pin": 0, "wait": 1, "local": 1, "portable": 2}

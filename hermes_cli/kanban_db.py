@@ -1232,43 +1232,9 @@ def kanban_home() -> Path:
         if kanban_sandbox_enabled():
             root = _sandbox_kanban_home(root)
         else:
-            _refuse_nested_non_profile_home_memo(root)
+            _refuse_nested_non_profile_home(root)
     _refuse_live_kanban_root_in_isolation(root, "kanban_home()")
     return root
-
-
-# Short-lived, atomically published generation. Include expanded env inputs, not just
-# HERMES_HOME's raw spelling. Never retain a refusal or a time-dependent approval.
-_NESTED_HOME_OK: dict = {}
-_NESTED_HOME_TTL_SECONDS = 1.0
-
-
-def _refuse_nested_non_profile_home_memo(root: Path) -> None:
-    import time
-    import hermes_state as state
-    raw = os.environ.get("HERMES_HOME", "")
-    if _kanban_isolation_context() or kanban_sandbox_enabled():
-        _refuse_nested_non_profile_home(root)
-        return
-    config = Path(os.path.expanduser(os.path.expandvars(raw))) / "config.yaml" if raw else root / "config.yaml"
-    try:
-        st = config.stat()
-        config_stamp = (str(config), st.st_mtime_ns, st.st_size, st.st_ino)
-    except OSError:
-        config_stamp = (str(config), None)
-    key = (str(root), config_stamp, tuple(sorted(os.environ.items())),
-           os.path.expanduser(os.path.expandvars(raw)),
-           _refuse_nested_non_profile_home, _matching_live_root, _live_kanban_roots,
-           _rel_to_live, _live_kanban_root, _LIVE_KANBAN_ROOT_MEMO,
-           _account_home_board_root, state._deployed_hermes_home_root, state._os_account_home)
-    now = time.monotonic()
-    generation = _NESTED_HOME_OK
-    if generation.get("key") == key and now < generation.get("until", 0):
-        return
-    _refuse_nested_non_profile_home(root)
-    # A single dict replacement publishes key and expiry together across threads.
-    globals()["_NESTED_HOME_OK"] = {"key": key, "until": now + _NESTED_HOME_TTL_SECONDS}
-
 
 
 class KanbanLiveBoardRefusedError(RuntimeError):

@@ -144,10 +144,6 @@ def _card_with_files(conn, body=None):
     Path(path).mkdir(parents=True, exist_ok=True)
     (Path(path) / "notes.md").write_text("prior run's work\n")
     kbw.set_workspace_path(conn, tid, str(path))
-    # Steady state: the carry scan runs off the routing pass (t_3489445d), so a card is carried from the tick
-    # after its directory was scanned. Warm the cache the way that scan would.
-    kwh.carry_size_known(str(path))
-    kwh.carry_scan_refresh()
     return tid, str(path)
 
 
@@ -314,7 +310,6 @@ def test_local_files_kill_switch_keeps_the_old_pin(kanban_home, carried):
 
 
 def test_local_files_too_big_to_carry_keeps_the_old_pin(kanban_home, carried, monkeypatch):
-    monkeypatch.setattr(kwh, "carry_size_known", lambda path, **kw: False)
     monkeypatch.setattr(kwh, "carry_size_ok", lambda path, **_kw: False)
     with kb.connect_closing() as conn:
         tid, _ = _card_with_files(conn)
@@ -382,7 +377,7 @@ def test_carry_scan_past_its_wall_bound_is_refused_and_cached(tmp_path, monkeypa
     budget = kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0))
     assert not kwh.carry_size_ok(d, budget=budget, max_seconds=0.5)
     assert budget.deferred == 0 and budget.spent_s > 0
-    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    monkeypatch.setattr(kwh.os, "scandir", _no_walk)
     assert not kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(seconds=100.0, clock=_Clock(1.0)))
 
 
@@ -391,7 +386,7 @@ def test_carry_scan_out_of_tick_budget_is_deferred_uncached(tmp_path, monkeypatc
     d = _ten_files(tmp_path, "later")
     spent = kwh.CarryScanBudget(seconds=0.0)
     with monkeypatch.context() as m:
-        m.setattr(kwh.os, "walk", _no_walk)
+        m.setattr(kwh.os, "scandir", _no_walk)
         assert not kwh.carry_size_ok(d, budget=spent)
     assert spent.deferred == 1
     assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget())
@@ -410,16 +405,16 @@ def test_carry_scan_cache_is_stamped_when_the_walk_ends(tmp_path, monkeypatch):
     d = _ten_files(tmp_path, "stamp")
     clock = _Clock(0.0)
     budget = kwh.CarryScanBudget(seconds=1e9, clock=clock)
-    real_walk = kwh.os.walk
+    real_walk = kwh.os.scandir
 
     def walk_then_jump(*a, **k):
         clock.t += kwh.CARRY_SCAN_TTL_SECONDS + 10
         return real_walk(*a, **k)
 
     with monkeypatch.context() as m:
-        m.setattr(kwh.os, "walk", walk_then_jump)
+        m.setattr(kwh.os, "scandir", walk_then_jump)
         assert kwh.carry_size_ok(d, budget=budget, max_seconds=1e9)
-    monkeypatch.setattr(kwh.os, "walk", _no_walk)
+    monkeypatch.setattr(kwh.os, "scandir", _no_walk)
     assert kwh.carry_size_ok(d, budget=kwh.CarryScanBudget(clock=clock))
 
 
@@ -428,7 +423,7 @@ def test_carry_budget_serves_waiting_paths_fifo_under_a_fixed_row_order(tmp_path
     # costs 0.8 s of a 1.0 s budget, so without a queue A re-walks every tick and C is never judged.
     a, b, c = (_ten_files(tmp_path, n) for n in "abc")
     clock = _Clock(0.0)
-    real_walk = kwh.os.walk
+    real_walk = kwh.os.scandir
     walked = []
 
     def costly_walk(root, *args, **kw):
@@ -436,7 +431,7 @@ def test_carry_budget_serves_waiting_paths_fifo_under_a_fixed_row_order(tmp_path
         clock.t += 0.8
         return real_walk(root, *args, **kw)
 
-    monkeypatch.setattr(kwh.os, "walk", costly_walk)
+    monkeypatch.setattr(kwh.os, "scandir", costly_walk)
     answers = []
     for _tick in range(3):
         budget = kwh.CarryScanBudget(seconds=1.0, clock=clock)
@@ -458,7 +453,7 @@ def test_a_waiting_path_whose_card_left_is_forgotten(tmp_path):
 def test_a_spent_carry_budget_never_holds_a_portable_peer(kanban_home, carried, monkeypatch):
     # Saturated Studio, two local_files rows and one plain portable row, and no carry budget left: the portable
     # row is placed this tick, the local_files rows keep the old rule (not carried) and are counted as deferred.
-    monkeypatch.setattr(kwh, "CARRY_REFRESH_SECONDS", 0.0)
+    monkeypatch.setattr(kwh, "CARRY_TICK_SCAN_SECONDS", 0.0)
     with kb.connect_closing() as conn:
         lf1, _ = _card_with_files(conn)
         lf2, _ = _card_with_files(conn)
