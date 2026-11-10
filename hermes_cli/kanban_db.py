@@ -19928,6 +19928,7 @@ def reap_exited_worker_leftovers(
             continue
         task_id, run_id, spawned_at = ident[:3]
         boot = {"after_boot": ident[3] if len(ident) > 3 else None}
+        __getattr__("_recent_worker_exits")
         exit_entry = _recent_worker_exits.get(int(pid))
         if exit_entry:
             now = exit_entry[1]
