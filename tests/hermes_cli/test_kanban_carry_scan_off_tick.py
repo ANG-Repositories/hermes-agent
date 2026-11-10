@@ -207,6 +207,8 @@ def test_refresh_deadline_is_checked_inside_walk(tmp_path):
 
 
 def test_expanded_home_change_invalidates_memo(monkeypatch, tmp_path):
+    monkeypatch.setattr(kb, "_kanban_isolation_context", lambda: None)
+    monkeypatch.setattr(kb, "kanban_sandbox_enabled", lambda: False)
     monkeypatch.setattr(kb, "_matching_live_root", lambda root: tmp_path)
     monkeypatch.setenv("HERMES_HOME", "$CARRY_TEST_HOME")
     monkeypatch.setenv("CARRY_TEST_HOME", str(tmp_path / "profiles" / "ok"))
@@ -228,3 +230,57 @@ def test_memo_expires(monkeypatch, tmp_path):
     now[0] = 86400
     kb._refuse_nested_non_profile_home_memo(tmp_path)
     assert len(calls) == 2
+
+
+def test_background_refresh_does_not_block_scheduler(monkeypatch):
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    threads = []
+
+    def slow_refresh():
+        threads.append(threading.get_ident())
+        entered.set()
+        try:
+            assert release.wait(5)
+        finally:
+            finished.set()
+    monkeypatch.setattr(kwh, "carry_scan_refresh", slow_refresh)
+    try:
+        kwh.carry_scan_schedule()
+        assert entered.wait(5)
+        kwh.carry_scan_schedule()  # single flight, even while a filesystem call hangs
+        assert threads == [threads[0]]
+        assert threads[0] != threading.get_ident()
+    finally:
+        release.set()
+        assert finished.wait(5)
+        # Synchronize with the worker's final release before fixture teardown.
+        assert kwh._carry_refresh_lock.acquire(timeout=5)
+        kwh._carry_refresh_lock.release()
+
+
+def test_two_large_trees_share_one_remaining_entry_budget(tmp_path):
+    for n in range(2):
+        d = tmp_path / str(n)
+        d.mkdir()
+        for i in range(20000):
+            (d / str(i)).touch()
+        kwh.carry_size_known(str(d))
+    used = kwh.carry_scan_refresh(budget_entries=20000, max_seconds=100)
+    assert used == 20000
+    assert kwh.carry_scan_stats(reset=False)["walk_entries"] == 20000
+
+
+def test_positive_approval_cannot_survive_growth_and_backlog(tmp_path):
+    d = tmp_path / "growing"
+    d.mkdir()
+    kwh.carry_size_known(str(d), max_entries=2, now=0)
+    kwh.carry_scan_refresh(now=0)
+    assert kwh.carry_size_known(str(d), max_entries=2, now=1) is True
+    for i in range(4):
+        (d / str(i)).touch()
+    assert kwh.carry_size_known(str(d), max_entries=2, now=86400) is None
+    assert kwh.carry_scan_refresh(budget_entries=0) == 0
+    assert kwh.carry_size_known(str(d), max_entries=2, now=86400) is None
