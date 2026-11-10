@@ -3720,7 +3720,7 @@ def main():
         except Exception:
             pass
 
-    if _first_positional_argv() != "update":
+    if _first_positional_argv() not in {"update", "kanban"}:
         from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
         from pm.paths import install_root
         maybe_run_boot_bootstrap(install_root())

@@ -452,7 +452,7 @@ _SPECS = [
                   f"circuit breaker. Trip on the Nth failure — e.g. --max-retries 1 blocks on the "
                   f"first failure (no retries), --max-retries 3 allows two retries. Omit to use "
                   f"the dispatcher's kanban.failure_limit config (default "
-                  f"{kb.DEFAULT_FAILURE_LIMIT})."),
+                  f"{kbd.DEFAULT_FAILURE_LIMIT})."),
         _arg("--model", dest="model_override",
              help="Pin the worker to this model (passed as -m <model>) without "
                   "changing the profile's configured model. Combine with --provider "

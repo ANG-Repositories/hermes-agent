@@ -1295,7 +1295,7 @@ def _account_home_board_root() -> Optional[Path]:
     Inert on fleet hosts: no ``~/kanban.db`` exists there (checked Studio and
     ace-ai 2026-10-10).
     """
-    from hermes_state import _os_account_home
+    from hermes_state_roots import account_home as _os_account_home
     account = _os_account_home()
     if account is None:
         return None
@@ -1316,8 +1316,8 @@ def _live_kanban_roots() -> tuple:
     is not where the board lives (``hermes_state._deployed_hermes_home_root``,
     plus :func:`_account_home_board_root` for a process that redirected its home).
     """
-    from hermes_state import _deployed_hermes_home_root
-    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root(), _account_home_board_root())
+    from hermes_state_roots import account_home, deployed_root
+    roots = [r for r in (_live_kanban_root(), deployed_root(account_home()), _account_home_board_root())
              if r is not None]
     return tuple(dict.fromkeys(roots))
 
