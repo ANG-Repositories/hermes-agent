@@ -3413,6 +3413,14 @@ def _multi_request_tier_parts(
     earlier request. Anything else cannot be tiered per request: unknown, never one guessed tier.
     """
     threshold = entry.tier_threshold_tokens
+    if last_usage is not None and prompt_tokens_unknown(last_usage):
+        # The last request's prompt is unmeasured: its placeholder zeros must not pick a tier or a
+        # split. Every request is <= S, so S <= T is still exact at base; otherwise unknown.
+        if usage.prompt_tokens <= threshold:
+            return _price_buckets(entry, usage, False, notes)
+        return _unknown_cost(
+            entry.source, "context tier mixed across requests; last request's prompt unmeasured",
+        )
     remainder = max(int(usage.prompt_tokens) - int(last_prompt), 0)
     last_above = last_prompt > threshold
     if remainder <= threshold:

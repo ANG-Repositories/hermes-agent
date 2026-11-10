@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Optional
 
-from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+from agent.usage_pricing import USAGE_UNKNOWN_FIELDS, CanonicalUsage, estimate_usage_cost
 
 
 _STATUS_RANK = {
@@ -145,6 +145,7 @@ def compute_turn_cost(
                         input_tokens=_int_value(last.get("input_tokens")),
                         cache_read_tokens=_int_value(last.get("cache_read_tokens")),
                         cache_write_tokens=_int_value(last.get("cache_write_tokens")),
+                        **{key: bool(last.get(key)) for key in USAGE_UNKNOWN_FIELDS},
                     )
                 if call.get("tier_requests") is not None:
                     tier_kw["tier_requests"] = _int_value(call.get("tier_requests"))

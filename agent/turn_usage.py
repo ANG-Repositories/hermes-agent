@@ -159,6 +159,8 @@ def record_response_usage(
         "input_tokens": aggregator_usage.input_tokens,
         "cache_read_tokens": aggregator_usage.cache_read_tokens,
         "cache_write_tokens": aggregator_usage.cache_write_tokens,
+        # An unmeasured last prompt is zeros + flags; pricing must see the flags, not the zeros.
+        **{key: bool(getattr(aggregator_usage, key)) for key in USAGE_UNKNOWN_FIELDS},
     }
     _tier_requests = (
         None if _tier_prompt_tokens is None

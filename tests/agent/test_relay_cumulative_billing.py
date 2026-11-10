@@ -434,3 +434,40 @@ def test_untiered_model_keeps_the_cumulative_price_without_a_split():
     if one.amount_usd is None:
         pytest.skip("no anthropic pricing entry for claude-haiku-4-5")
     assert many.amount_usd == one.amount_usd * 300
+
+
+# --- Unmeasured last-request prompt (Prism bf75d0b8acfd / 287fcee94ef0, t_044f701c r1) ------------
+# The relay can bill a complete cumulative split while the LAST request's own prompt is unmeasured
+# (``*_unknown`` flags over placeholder zeros). Those zeros must not choose the tier or the split.
+
+
+def test_unmeasured_last_prompt_above_the_tier_is_unknown_not_split_on_zeros():
+    last = CanonicalUsage(input_tokens_unknown=True)
+    r = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=180_000),
+                            provider="anthropic", tier_prompt_tokens=0,
+                            tier_last_usage=last, tier_requests=2)
+    assert r.amount_usd is None
+    assert r.status == "unknown"
+
+
+def test_unmeasured_last_prompt_with_the_whole_bill_below_the_tier_prices_at_base():
+    from decimal import Decimal
+
+    last = CanonicalUsage(cache_read_tokens_unknown=True)
+    r = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=90_000),
+                            provider="anthropic", tier_prompt_tokens=0,
+                            tier_last_usage=last, tier_requests=3)
+    assert r.status == "estimated"
+    assert r.amount_usd == Decimal("0.009")  # every request <= 90k <= T: 90k x 0.10/M
+
+
+def test_blackbox_reads_the_last_request_unknown_flags():
+    from plugins.blackbox.cost import compute_turn_cost
+
+    calls = [{"model": "claude-haiku-5-5", "provider": "anthropic", "input_tokens": 180_000,
+              "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+              "tier_prompt_tokens": 0, "tier_requests": 2,
+              "tier_last_usage": {"input_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                                  "input_tokens_unknown": True}}]
+    cost, status, _ = compute_turn_cost("claude-haiku-5-5", "anthropic", None, calls)
+    assert cost is None and status == "unknown"
