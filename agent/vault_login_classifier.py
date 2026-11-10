@@ -250,13 +250,24 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   // Same-origin frames (Apple's idmsa sign-in widget) are walked too; a cross-origin frame's document is
   // unreadable and stays excluded. Each walked frame is stamped with the nonce so the fill can refuse if it
   // left the origin in between.
+  // A same-origin frame is walked only while it RENDERS: a display:none, visibility:hidden, opacity:0 or
+  // under-10px frame is where an invisible credential sink would sit, so its inputs are never stamped.
+  const frameShown = (frame) => {
+    const v = frame.ownerDocument.defaultView;
+    for (let n = frame; n; n = n.parentElement) {
+      const st = v.getComputedStyle(n);
+      if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
+    }
+    const r = frame.getBoundingClientRect();
+    return r.width >= 10 && r.height >= 10;
+  };
   const origin = window.location.origin;
   const docs = [document];
   for (let i = 0; i < docs.length; i++) {
     for (const frame of Array.from(docs[i].querySelectorAll("iframe, frame"))) {
       let child = null;
       try { if (origin !== "null" && frame.contentWindow.location.origin === origin) child = frame.contentDocument; } catch (e) { child = null; }
-      if (!child) continue;
+      if (!child || !frameShown(frame)) continue;
       frame.setAttribute("data-hermes-vault-frame", nonce);
       docs.push(child);
     }
@@ -325,18 +336,33 @@ _FILL_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
   // Re-walk the same-origin frames. A frame THIS inspection walked that is no longer on expectedOrigin
   // (navigated away, now cross-origin) refuses the whole fill before any write.
+  // A same-origin frame is walked only while it RENDERS: a display:none, visibility:hidden, opacity:0 or
+  // under-10px frame is where an invisible credential sink would sit, so its inputs are never stamped.
+  // A walked frame that has since been hidden refuses the fill like one that navigated.
+  const frameShown = (frame) => {
+    const v = frame.ownerDocument.defaultView;
+    for (let n = frame; n; n = n.parentElement) {
+      const st = v.getComputedStyle(n);
+      if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
+    }
+    const r = frame.getBoundingClientRect();
+    return r.width >= 10 && r.height >= 10;
+  };
   const docs = [document];
+  const touched = [document];
   let frameMoved = null;
-  for (let i = 0; i < docs.length; i++) {
-    for (const frame of Array.from(docs[i].querySelectorAll("iframe, frame"))) {
+  for (let i = 0; i < touched.length; i++) {
+    for (const frame of Array.from(touched[i].querySelectorAll("iframe, frame"))) {
       let child = null;
       let found = null;
       try { found = frame.contentWindow.location.origin; if (found === expectedOrigin) child = frame.contentDocument; } catch (e) { found = "cross-origin frame"; }
-      if (child) docs.push(child);
-      else if (frame.getAttribute("data-hermes-vault-frame") === nonce) frameMoved = frameMoved || ("frame:" + (found || "unknown"));
+      if (child) touched.push(child);
+      const walked = frame.getAttribute("data-hermes-vault-frame") === nonce;
+      if (child && frameShown(frame)) { if (docs.includes(frame.ownerDocument)) docs.push(child); }
+      else if (walked) frameMoved = frameMoved || (child ? "frame:hidden" : "frame:" + (found || "unknown"));
     }
   }
-  const strip = () => docs.forEach((d) => {
+  const strip = () => touched.forEach((d) => {
     d.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
     d.querySelectorAll("[data-hermes-vault-frame]").forEach((n) => n.removeAttribute("data-hermes-vault-frame"));
   });
