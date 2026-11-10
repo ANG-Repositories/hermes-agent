@@ -1170,6 +1170,14 @@ def kanban_active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES and r.get("kanban_unit"))
 
 
+def cross_process_active_count() -> int:
+    """Live units running (or about to run) outside this gateway PID, across all profiles."""
+    with _records_lock:
+        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES
+                   and (r.get("execution_pid", os.getpid()) != os.getpid()
+                        or r.get("kanban_unit") or r.get("detached_unit")))
+
+
 def in_process_active_count() -> int:
     """The live units of ``active_count`` this process runs, from ONE snapshot: the difference of
     two separately locked counts can hide one when a kanban unit lands between them."""
@@ -1480,10 +1488,18 @@ def _dispatch_admitted(
         handed_off = False
         kanban_spawned = False
         try:
+            launch = None
             if kanban is not None and record.get("attempt_id"):
-                kanban_spawned = _launch_kanban_unit(delegation_id, record, kanban)
+                launch = _launch_kanban_unit(delegation_id, record, kanban)
+                kanban_spawned = launch == LAUNCH_KANBAN
             if kanban_spawned:
                 raw = None  # the runner owns the terminal write; the card-end watcher settles this record
+            elif launch == LAUNCH_DETACHED:
+                # The card could not spawn: a detached child, never a gateway thread (t_49e02567).
+                raw, job_dir = _run_detached_unit(
+                    delegation_id, record["attempt_id"], _record_profile_home(record), continuation=None,
+                    live_delegation_id=delegation_id, fallback_runner=_refuse_in_process,
+                    on_spawned=kanban.get("on_spawned"))
             elif detached is not None and record.get("attempt_id"):
                 raw, job_dir = _run_detached_unit(
                     delegation_id, record["attempt_id"], _record_profile_home(record), continuation=None,
@@ -1620,21 +1636,42 @@ def dispatch_async_delegation_batch(
 # ── Detached units (docs/dev/delegate-detached-background.md) ───────────────
 
 
-def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict[str, Any]) -> bool:
-    """§5.2 steps 2-5, on the dispatch worker after ``mark_submitted``. True: the unit's card runs
-    it (this live record becomes a ``kanban_unit`` the card-end watcher settles). False: run the
-    unit in-process on ``record["attempt_id"]`` (superseded here when the card or spawn failed);
-    raises when even the supersede was refused (the attempt is no longer current: nothing runs)."""
+#: Backoff between kanban launch attempts that failed on a transient error (registry/board lock
+#: contention): the unit's card is retried before it leaves the kanban runtime (t_49e02567).
+_KANBAN_LAUNCH_RETRY_DELAYS = (1.0, 3.0)
+_TRANSIENT_LAUNCH_ERRORS = ("TimeoutError", "OperationalError")
+
+#: ``_launch_kanban_unit`` outcomes: the card runs the unit / a detached child must / a gateway thread does.
+LAUNCH_KANBAN, LAUNCH_DETACHED, LAUNCH_IN_PROCESS = "kanban", "detached", "in_process"
+
+
+def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict[str, Any]) -> str:
+    """§5.2 steps 2-5, on the dispatch worker after ``mark_submitted``. ``LAUNCH_KANBAN``: the unit's
+    card runs it (this live record becomes a ``kanban_unit`` the card-end watcher settles). Otherwise the
+    attempt is superseded onto ``record["attempt_id"]`` and the unit runs as a detached child
+    (``LAUNCH_DETACHED``, default) or, under the ``background_kanban_fallback: in_process`` kill switch, in
+    this process (``LAUNCH_IN_PROCESS``). Raises when nothing may run (the attempt is no longer current,
+    the card is unfenced, or the host cannot detach a child and the kill switch is off)."""
     from tools import async_delegation_kanban as _akb
 
     profile_home = _record_profile_home(record) or _registry_path().parent.parent
     old_attempt = str(record["attempt_id"])
-    launched = _akb.launch_unit(
-        delegation_id=delegation_id, attempt_id=old_attempt, profile_home=Path(profile_home),
-        profile=str(kanban.get("profile") or "default"), goal=str(record.get("goal") or ""),
-        cwd=str(kanban.get("cwd") or ""), session_id=kanban.get("session_id"),
-        spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"),
-        flagship_reason=kanban.get("flagship_reason"))
+    for delay in (*_KANBAN_LAUNCH_RETRY_DELAYS, None):
+        launched = _akb.launch_unit(
+            delegation_id=delegation_id, attempt_id=old_attempt, profile_home=Path(profile_home),
+            profile=str(kanban.get("profile") or "default"), goal=str(record.get("goal") or ""),
+            cwd=str(kanban.get("cwd") or ""), session_id=kanban.get("session_id"),
+            spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"),
+            flagship_reason=kanban.get("flagship_reason"))
+        transient = str(launched.get("error") or "").split(":", 1)[0] in _TRANSIENT_LAUNCH_ERRORS
+        # Retry only a launch that failed before creating a card. An archived card names the still-current
+        # attempt: released from its fence it would be drained as a dead runner and fail the attempt (Prism
+        # 9fd4d9c1e37e / 9e36f53682e3). Once a card exists the fallback supersedes the attempt under the fence.
+        if launched.get("ok") or launched.get("task_id") or not transient or delay is None:
+            break
+        logger.info("async_delegation_kanban_spawn_retry delegation_id=%s error=%s delay=%.1fs",
+                    delegation_id, launched.get("error"), delay)
+        time.sleep(delay)
     if launched.get("ok"):
         with _records_lock:
             rec = _records.get(delegation_id)
@@ -1655,7 +1692,7 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         logger.info("async_delegation_kanban_spawned delegation_id=%s task_id=%s pid=%s",
                     delegation_id, launched.get("task_id"), launched.get("pid"))
         _note_kanban_launch(delegation_id, KANBAN_SPAWNED_RUNTIME)
-        return True
+        return LAUNCH_KANBAN
     logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
                    delegation_id, old_attempt, launched.get("error"))
     # One rule at one point: a launch refused OR failed while this host is held never falls back (in-process or
@@ -1675,15 +1712,51 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         raise RuntimeError(f"background unit not started: {held}{failed}{parked}; no in-process "
                            "fallback while the host is held")
     error_class = str(launched.get("error") or "").split(":", 1)[0] or "unknown"
+    from tools.delegate_tool_config import _get_kanban_launch_fallback
+
+    mode = LAUNCH_IN_PROCESS if _get_kanban_launch_fallback() == "in_process" else LAUNCH_DETACHED
     try:
-        on_card = _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home)
+        if mode == LAUNCH_DETACHED:
+            from tools import delegate_detached as dd
+
+            if dd.spawn_mode() == "degraded":
+                raise RuntimeError(f"background unit not started: kanban spawn failed ({error_class}) and this "
+                                   "host cannot run a detached child; no in-process fallback "
+                                   "(delegation.background_kanban_fallback: in_process restores it)")
+        _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home,
+                              detached=mode == LAUNCH_DETACHED)
     except Exception:
         _note_kanban_launch(delegation_id, f"none (kanban spawn failed: {error_class}; not run)")
         raise
     finally:
         _akb.release_launch_fence(launched.get("task_id"))
-    _note_kanban_launch(delegation_id, f"in_process (kanban spawn failed: {error_class})")
-    return on_card
+    _note_kanban_launch(delegation_id, f"{mode} (kanban spawn failed: {error_class})")
+    _note_kanban_fallback_receipt(delegation_id, mode, error_class, record)
+    return mode
+
+
+def _note_kanban_fallback_receipt(delegation_id: str, mode: str, reason: str, record: dict) -> None:
+    """Best-effort fleet #logs receipt via the existing sandbox-aware notify boundary."""
+    logger.warning("async_delegation_runtime_fallback delegation_id=%s runtime=%s reason=%s",
+                   delegation_id, mode, reason)
+    try:
+        from gateway.kanban_watchers import _alert_notify_script, _needs_input_channels, _notify_send
+
+        script = _alert_notify_script()
+        if script is not None:
+            _notify_send(script, f"delegate_task {delegation_id}: kanban ineligible ({reason}); "
+                         f"runtime={mode}", ["--target", _needs_input_channels()[1]],
+                         profile=str(record.get("profile") or "default"))
+    except Exception:
+        logger.warning("async_delegation_fallback_receipt_failed delegation_id=%s", delegation_id,
+                       exc_info=True)
+
+
+def _refuse_in_process() -> Dict[str, Any]:
+    """Fallback runner of a unit that left the kanban runtime for a detached child: when the child cannot
+    spawn either, the unit errors instead of running inside the gateway (t_49e02567)."""
+    raise RuntimeError("background unit not started: kanban spawn and detached spawn both failed; no "
+                       "in-process fallback (delegation.background_kanban_fallback: in_process restores it)")
 
 
 #: Archive attempts on a held launch's card once it is parked, the pause between them, and how long the park waits for
@@ -1824,21 +1897,24 @@ def kanban_launch_runtime(delegation_id: str, timeout: float) -> Optional[str]:
 
 
 def _fall_back_in_process(delegation_id: str, record: Dict[str, Any], launched: Dict[str, Any],
-                          old_attempt: str, profile_home: Any) -> bool:
+                          old_attempt: str, profile_home: Any, *, detached: bool = False) -> None:
     if not launched.get("fenced"):
         # The card could not be archived and its runner may have started: running the unit here too
         # would put two writers on one tree. Deliver the error instead (Q1: no automatic re-run).
         raise RuntimeError(f"background unit card {launched.get('task_id')} not fenced after a failed "
                            f"spawn ({launched.get('error')}); not run in-process")
-    new_attempt = _store.supersede_attempt(delegation_id, old_attempt, profile_home=profile_home)
+    new_attempt = _store.supersede_attempt(delegation_id, old_attempt, profile_home=profile_home,
+                                           detached=detached)
     if new_attempt is None:
         raise RuntimeError("background unit stopped before it started (attempt no longer current)")
     with _records_lock:
         record["attempt_id"] = new_attempt
-        record.pop("kanban_unit", None)  # an in-process unit now: shutdown/interrupt_all treat it as one
+        record.pop("kanban_unit", None)  # the card-end watcher no longer owns this attempt
+        # Publish before the child can edit, not after Popen/supervision (a profile with both knobs
+        # off must already take the shared lock). Zero reserves a PID outside this gateway.
+        record["execution_pid"] = 0 if detached else os.getpid()
     if not _store.mark_submitted(delegation_id, new_attempt, profile_home=profile_home):
         raise RuntimeError("background unit stopped before it started (fallback attempt refused)")
-    return False
 
 
 def _durable_record(delegation_id: str, profile_home: Optional[Path]) -> Optional[Dict[str, Any]]:
@@ -1867,7 +1943,7 @@ def _install_detached_supervision(delegation_id: str, pid: Any, create_time: Any
         rec.update(
             interrupt_fn=lambda: dd.terminate_job(job_dir, pid, create_time),
             progress_fn=dd.heartbeat_progress_fn(lambda: job_dir),
-            detached_unit=True, _started=started, _progress_token=None, _progress_ts=time.time())
+            detached_unit=True, execution_pid=pid, _started=started, _progress_token=None, _progress_ts=time.time())
     _ensure_stale_monitor()
     return True
 

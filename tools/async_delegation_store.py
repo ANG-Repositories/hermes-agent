@@ -1634,12 +1634,13 @@ def set_kanban_block(
 
 
 def supersede_attempt(
-    delegation_id: str, old_attempt_id: str, *, profile_home: Path | None = None,
+    delegation_id: str, old_attempt_id: str, *, profile_home: Path | None = None, detached: bool = False,
 ) -> str | None:
     """A kanban spawn failed: hand the unit to an in-process attempt. Returns the new attempt id.
 
     Generation + 1 and a new ``attempt_id``; ``execution.runtime`` becomes ``in_process`` and the
-    ``kanban`` block is dropped; the state stays ``running``. Nothing else of ``claim_recoveries``'
+    ``kanban`` block is dropped; the state stays ``running``. ``detached=True`` (t_49e02567) marks the
+    new attempt ``execution.detached`` instead, so it runs as a detached child the next boot adopts. Nothing else of ``claim_recoveries``'
     bump: ``redispatch_count`` is unchanged and no restart event is written (a spawn failure is
     not a restart). A runner already launched for the old attempt then finds it not current and
     exits without a model call (or has its terminal write refused). None when the old attempt is
@@ -1657,6 +1658,8 @@ def supersede_attempt(
         execution = record.get("execution")
         if isinstance(execution, dict):
             execution["runtime"] = "in_process"
+            if detached:
+                execution["detached"] = True
         record.pop("kanban", None)
         record["updated_at"] = time.time()
         append_lifecycle_event(record, "kanban_superseded",

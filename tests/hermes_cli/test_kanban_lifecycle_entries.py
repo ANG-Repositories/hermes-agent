@@ -61,8 +61,9 @@ def test_guard_install_repairs_definitions_without_committing(conn, damage):
     assert dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")) == expected
 
 
+@pytest.mark.parametrize("intervening", [False, True])
 @pytest.mark.parametrize("current_run", [False, True])
-def test_review_entry_binds_implementer_before_any_exit(conn, current_run):
+def test_review_entry_binds_implementer_before_any_exit(conn, current_run, intervening):
     tid = kb.create_task(conn, title="Recovered review", assignee="builder")
     if current_run:
         conn.execute("INSERT INTO task_runs(task_id,profile,status,outcome,started_at) VALUES(?,'old-builder','completed','completed',1)", (tid,))
@@ -74,10 +75,25 @@ def test_review_entry_binds_implementer_before_any_exit(conn, current_run):
     ).fetchone()
     assert event is not None
     assert json.loads(event[0])["implementer"] == "builder"
+    if intervening:
+        kb._append_event(conn, tid, "unrelated", {"note": "between entry and handoff"})
     kb._append_event(conn, tid, "review_requested", {"implementer": "builder", "reviewer": "human:apollo", "summary": "verified"})
     handoffs = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested'", (tid,)).fetchall()
     assert len(handoffs) == 1
     assert json.loads(handoffs[0][0])["summary"] == "verified"
+
+    # A second raw entry must bind a new episode even though the first has
+    # complete provenance. An unrelated event must not split either episode.
+    conn.execute("UPDATE tasks SET status='running',assignee='builder' WHERE id=?", (tid,))
+    conn.execute("UPDATE tasks SET status='review',assignee='human:apollo' WHERE id=?", (tid,))
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='review_requested'", (tid,)).fetchone()[0] == 2
+    if intervening:
+        kb._append_event(conn, tid, "unrelated")
+    kb._append_event(conn, tid, "review_requested", {"summary": "round 2"})
+    handoffs = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id", (tid,)).fetchall()
+    assert len(handoffs) == 2
+    assert [json.loads(row[0])["summary"] for row in handoffs] == ["verified", "round 2"]
+    assert json.loads(handoffs[0][0])["review_exit_id"] != json.loads(handoffs[1][0])["review_exit_id"]
 
     # A new raw INSERT has no prior run/assignee to recover.
     conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES('raw-review','Raw review','review',1)")
@@ -86,6 +102,18 @@ def test_review_entry_binds_implementer_before_any_exit(conn, current_run):
     kb._append_event(conn, "raw-review", "review_requested", {"summary": "verified"})
     payload = conn.execute("SELECT payload FROM task_events WHERE task_id='raw-review' AND kind='review_requested'").fetchone()[0]
     assert json.loads(payload)["implementer"] == "human:operator"
+
+
+def test_normal_request_review_has_one_complete_handoff(conn):
+    tid = kb.create_task(conn, title="Canonical handoff", assignee="builder")
+    assert kb.request_review(conn, tid, summary="verified", reviewer="human:apollo")
+    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested'", (tid,)).fetchall()
+    assert len(rows) == 1
+    payload = json.loads(rows[0][0])
+    assert payload["implementer"] == "builder"
+    assert payload["reviewer"] == "human:apollo"
+    assert payload["summary"] == "verified"
+    assert "source" not in payload
 
 
 def test_human_ready_is_operator_todo_and_cannot_promote(conn):
