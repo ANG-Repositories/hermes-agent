@@ -16,6 +16,7 @@ fleet/placement-policy.json; off / absent = every old pin, exactly as before.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -653,3 +654,300 @@ def test_a_carried_card_waits_when_there_is_no_pool_plan(kanban_home, carried):
         conn.commit()
         _res, spawned = _tick(conn, spillover=None, spawn_limit=4)
     assert (tid, None) not in spawned and (plain, None) in spawned
+
+
+# -- t_e7c03f48: only content the remote cannot reproduce binds ------------------------------------------------
+# t_e32e34f0's Studio scratch dir held a clean git worktree whose HEAD was the pushed PR head, plus logs and a patch;
+# that kept it Studio-only (local_files) for 2 h+ while the pool sat idle.
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                    "-c", "init.defaultBranch=main", *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+@pytest.fixture
+def reproducible_workspace(tmp_path):
+    """A workspace dir holding a clean `git worktree` (HEAD pushed) plus three logs, a patch and pr-body.md."""
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    origin, seed = tmp_path / "origin.git", tmp_path / "seed"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    _git(tmp_path, "clone", "-q", str(origin), str(seed))
+    (seed / "README.md").write_text("x\n")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-q", "-m", "seed")
+    _git(seed, "push", "-q", "origin", "HEAD:main")
+
+    def make(ws: Path) -> Path:
+        ws.mkdir(parents=True, exist_ok=True)
+        repo = ws / "repo"
+        _git(seed, "worktree", "add", "-q", "-b", f"feat-{ws.name}", str(repo), "HEAD")
+        (repo / "fix.py").write_text("print(1)\n")
+        _git(repo, "add", "fix.py")
+        _git(repo, "commit", "-q", "-m", "fix")
+        _git(repo, "push", "-q", "origin", "HEAD")
+        for name in ("run.log", "test.log", "gate.log", "fix.patch", "pr-body.md"):
+            (ws / name).write_text("throwaway\n")
+        return repo
+    return make
+
+
+def _card_in(conn, make, body=None):
+    tid = kb.create_task(conn, title="lf", assignee="alpha", body=body)
+    path = Path(kbw.resolve_workspace(kb.get_task(conn, tid)))
+    repo = make(path)
+    kbw.set_workspace_path(conn, tid, str(path))
+    return tid, path, repo
+
+
+def test_clean_pushed_worktree_plus_logs_is_portable(kanban_home, carried, reproducible_workspace):
+    """RED ON BASE: ((portable, None), 'local_files', True) - any file bound the card (it was carried at best)."""
+    with kb.connect_closing() as conn:
+        tid, path, _repo = _card_in(conn, reproducible_workspace)
+        assert _route(conn, tid, None) == (("portable", None), "policy", False)
+        assert kwh.local_workspace_binding(str(path)) is None
+
+
+def test_clean_pushed_worktree_is_portable_under_the_kill_switch_too(kanban_home, carried, reproducible_workspace):
+    """The fix is in the classifier, not in the continuity carry: the old pin rule no longer sees content."""
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, _path, _repo = _card_in(conn, reproducible_workspace)
+        assert _route(conn, tid, None) == (("portable", None), "policy", False)
+
+
+def test_one_untracked_file_binds_and_is_named(kanban_home, carried, reproducible_workspace):
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, path, repo = _card_in(conn, reproducible_workspace)
+        (repo / "scratch.txt").write_text("unsaved work\n")
+        assert _route(conn, tid, None) == (("local", None), "local_files", False)
+        assert kwh.local_workspace_binding(str(path)) == "repo/scratch.txt"
+
+
+def test_host_any_wait_reason_names_the_binding_path(kanban_home, carried, reproducible_workspace):
+    _kill_switch(kanban_home, False)
+    with kb.connect_closing() as conn:
+        tid, _path, repo = _card_in(conn, reproducible_workspace, body="host: any\nfix it")
+        (repo / "scratch.txt").write_text("unsaved work\n")
+        route, rule, _ = _route(conn, tid, None)
+    assert route == ("local", "not_portable:local_files(repo/scratch.txt)") and rule == "local_files"
+
+
+def test_dirty_tracked_file_binds(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    (repo / "README.md").write_text("edited\n")
+    assert kwh.local_workspace_binding(str(ws)) == "repo/README.md"
+
+
+def test_unpushed_commit_binds(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    (repo / "more.py").write_text("x\n")
+    _git(repo, "add", "more.py")
+    _git(repo, "commit", "-q", "-m", "local only")
+    assert (kwh.local_workspace_binding(str(ws)) or "").startswith("repo@unpushed:")
+
+
+@pytest.mark.parametrize("name", ["notes.md", "session.jsonl", "pr-body.md.bak"])
+def test_a_file_outside_the_throwaway_list_binds(reproducible_workspace, tmp_path, name):
+    ws = tmp_path / "ws"
+    reproducible_workspace(ws)
+    (ws / name).write_text("x\n")
+    assert kwh.local_workspace_binding(str(ws)) == name
+
+
+def test_a_symlink_binds(tmp_path):
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "run.log").write_text("x\n")
+    (ws / "link").symlink_to(tmp_path)
+    assert kwh.local_workspace_binding(str(ws)) == "link"
+
+
+def test_throwaway_only_workspace_is_portable_and_empty_is_none(tmp_path):
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    assert kwh.local_workspace_binding(str(ws)) is None          # missing
+    ws.mkdir()
+    assert kwh.local_workspace_binding(str(ws)) is None          # empty
+    (ws / "logs").mkdir()
+    (ws / "logs" / "a.log").write_text("x\n")
+    (ws / "b.patch").write_text("x\n")
+    assert kwh.local_workspace_binding(str(ws)) is None
+
+
+def test_a_git_failure_binds(tmp_path):
+    """A worktree whose gitdir is gone cannot be proven reproducible: fail closed."""
+    getattr(kwh, "_binding_cache", {}).clear()  # absent on main: red-first runs reach the assertion
+    ws = tmp_path / "ws"
+    (ws / "repo").mkdir(parents=True)
+    (ws / "repo" / ".git").write_text("gitdir: /nonexistent/gitdir\n")
+    assert (kwh.local_workspace_binding(str(ws)) or "").startswith("repo@git-")
+
+
+# -- t_e7c03f48 Prism round 1: each of these let local-only work read "reproducible" --------------------------------
+
+def test_an_edit_inside_a_checkout_between_two_calls_binds(reproducible_workspace, tmp_path):
+    """Prism 5c1daae965e0: a cache keyed on the workspace root mtime missed an edit inside the checkout."""
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    (repo / "README.md").write_text("edited after the first call\n")
+    assert kwh.local_workspace_binding(str(ws), now=1) == "repo/README.md"
+
+
+def test_a_submodule_edit_hidden_by_ignore_all_binds(reproducible_workspace, tmp_path):
+    """Prism 812f89f3c723: ``submodule.<x>.ignore=all`` must not hide a modified tracked file in a submodule."""
+    sub_origin, sub_seed = tmp_path / "sub.git", tmp_path / "sub-seed"
+    _git(tmp_path, "init", "-q", "--bare", str(sub_origin))
+    _git(tmp_path, "clone", "-q", str(sub_origin), str(sub_seed))
+    (sub_seed / "lib.py").write_text("x = 1\n")
+    _git(sub_seed, "add", "lib.py")
+    _git(sub_seed, "commit", "-q", "-m", "lib")
+    _git(sub_seed, "push", "-q", "origin", "HEAD:main")
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_origin), "sub")
+    _git(repo, "commit", "-q", "-m", "add sub")
+    _git(repo, "push", "-q", "origin", "HEAD")
+    _git(repo, "config", "submodule.sub.ignore", "all")
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    (repo / "sub" / "lib.py").write_text("x = 2  # local only\n")
+    kwh._binding_cache.clear()  # isolate the status override from the stale-local-verdict regression
+    assert kwh.local_workspace_binding(str(ws), now=1) == "repo/sub"
+
+
+def test_a_branch_deleted_on_the_remote_binds_despite_the_stale_tracking_ref(reproducible_workspace, tmp_path):
+    """Prism 1c3c50990907: the local ``origin/<branch>`` ref outlives the remote branch; ask the remote."""
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    branch = f"feat-{ws.name}"
+    _git(tmp_path, "--git-dir", str(tmp_path / "origin.git"), "branch", "-D", branch)
+    tracking = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
+                              capture_output=True)
+    assert tracking.returncode == 0  # the stale local tracking ref is still there
+    assert (kwh.local_workspace_binding(str(ws), now=0) or "").startswith("repo@unpushed:")
+
+
+def test_an_ls_remote_failure_binds_as_remote_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+
+    def runner(argv, **kw):
+        if "ls-remote" in argv:
+            return subprocess.CompletedProcess(argv, 128, b"", b"fatal: unable to access")
+        return subprocess.run(argv, **kw)
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
+    # Unverified answers may be cached: they only keep a card local. Re-ask after the bounded TTL.
+    assert kwh.local_workspace_binding(str(ws), now=1) == "remote-unverified: repo"
+    assert kwh.local_workspace_binding(str(ws), now=121) is None
+    assert repo.exists()
+
+
+def test_an_ls_remote_timeout_binds_as_remote_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    reproducible_workspace(ws)
+
+    def runner(argv, **kw):
+        if "ls-remote" in argv:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        return subprocess.run(argv, **kw)
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) == "remote-unverified: repo"
+
+
+
+def test_remote_containment_cache_is_keyed_by_head_but_status_always_runs(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        return subprocess.run(argv, **kw)
+
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) is None
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=1) is None
+    assert sum("status" in a for a in calls) == 2
+    assert sum("ls-remote" in a for a in calls) == 2
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "local only")
+    assert (kwh.local_workspace_binding(str(ws), runner=runner, now=2) or "").startswith("repo@unpushed:")
+    assert sum("ls-remote" in a for a in calls) == 3
+    assert (kwh.local_workspace_binding(str(ws), runner=runner, now=3) or "").startswith("repo@unpushed:")
+    assert sum("ls-remote" in a for a in calls) == 3  # negative answer is safe to cache
+
+
+def test_remote_containment_accepts_ancestor_of_a_current_remote_tip(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "later")
+    _git(repo, "push", "-q", "origin", "HEAD")
+    _git(repo, "checkout", "-q", "--detach", "HEAD~1")
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+
+
+def test_remote_tip_not_present_locally_binds_as_unverified(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", "-q", str(tmp_path / "origin.git"), str(other))
+    _git(other, "checkout", "-q", "feat-ws")
+    _git(other, "commit", "-q", "--allow-empty", "-m", "tip not fetched by workspace")
+    _git(other, "push", "-q", "origin", "HEAD")
+    assert kwh.local_workspace_binding(str(ws), now=0) == "remote-unverified: repo"
+    assert repo.exists()
+
+
+def test_remote_containment_rechecks_positive_after_deleted_remote_branch(reproducible_workspace, tmp_path):
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    assert kwh.local_workspace_binding(str(ws), now=0) is None
+    _git(tmp_path, "--git-dir", str(tmp_path / "origin.git"), "branch", "-D", "feat-ws")
+    assert (kwh.local_workspace_binding(str(ws), now=1) or "").startswith("repo@unpushed:")
+    assert repo.exists()
+
+
+@pytest.mark.parametrize("source", ["fsmonitor", "hooks", "inherited-config"])
+def test_workspace_git_probes_do_not_execute_checkout_config(reproducible_workspace, tmp_path, monkeypatch, source):
+    """Prism 4d0629af60fb: dispatcher probes must not execute checkout-controlled programs."""
+    import os
+    import shlex
+
+    ws = tmp_path / "ws"
+    repo = reproducible_workspace(ws)
+    marker = tmp_path / "executed"
+    program = tmp_path / "marker-command"
+    program.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
+    program.chmod(0o755)
+    if source == "fsmonitor":
+        _git(repo, "config", "core.fsmonitor", str(program))
+    elif source == "hooks":
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        hook = hooks / "reference-transaction"
+        hook.write_text(program.read_text())
+        hook.chmod(0o755)
+        _git(repo, "config", "core.hooksPath", str(hooks))
+    else:
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(program))
+
+    environments = []
+
+    def runner(argv, **kw):
+        environments.append(kw["env"])
+        return subprocess.run(argv, **kw)
+
+    assert kwh.local_workspace_binding(str(ws), runner=runner, now=0) is None
+    assert not marker.exists(), f"{source} executed as the dispatcher"
+    # Read-only probes do not trigger reference-transaction themselves; also pin the hooks override on
+    # EVERY subprocess so the test catches an unhardened hooks path without introducing a write probe.
+    for env in environments:
+        overrides = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+                     for i in range(int(env.get("GIT_CONFIG_COUNT", "0")))}
+        assert overrides.get("core.hooksPath") == os.devnull
+        assert overrides.get("core.fsmonitor") == "false"
+        assert env["GIT_OPTIONAL_LOCKS"] == "0"

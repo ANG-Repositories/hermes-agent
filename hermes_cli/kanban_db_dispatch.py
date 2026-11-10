@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
-DEFAULT_FAILURE_LIMIT = 2
+from hermes_cli.kanban_dispatch_defaults import DEFAULT_FAILURE_LIMIT
 
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -5381,9 +5381,17 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         body_signals=caps is None or caps.legacy_body,
         worktree_hosts=wt_hosts, studio_reasons=studio_reasons,
     )
-    ok, rule, route_class = _kwp.portable(
-        workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
-                               if scan else False), **_portable_kw)
+    # Only content the remote cannot reproduce binds (t_e7c03f48): a clean, pushed checkout plus logs/patches does
+    # not. ``lf_detail`` names the first binding path for the reason; a placed run starts fresh on the pool host
+    # and the Studio directory is left as it is.
+    lf_detail = _kb._kwh.local_workspace_binding(row["workspace_path"]) if scan else None
+    if lf_detail is not None and _lf_noted.get(row["id"]) != lf_detail:
+        if len(_lf_noted) > 4096:
+            _lf_noted.clear()  # bound: a long-lived dispatcher sees every card id once
+        _lf_noted[row["id"]] = lf_detail
+        _kb._log.info("kanban dispatch: %s local_files: %s is not reproducible from the remote", row["id"],
+                      lf_detail)
+    ok, rule, route_class = _kwp.portable(workspace_has_content=lf_detail is not None, **_portable_kw)
     carried = False
     if not ok and rule == _pr.LOCAL_FILES and last_resort and carry_out is not None:
         # Continuity, not a pin (t_e604c0f9, Ace 2026-11-08 16:38): the Studio's files keep the card there only
@@ -5519,9 +5527,13 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                          "host, and the source must be an eligible anchor or clean pushed card worktree")
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
+    if pin == _kwp.PIN_ANY and rule == _pr.LOCAL_FILES and lf_detail is not None:
+        return "local", f"{_pr.not_portable(rule)}({lf_detail})"
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
 
 
+# task id -> the local_files detail last logged for it (one INFO line per change, not per tick).
+_lf_noted: dict = {}
 _last_resort_cache: dict = {}
 
 
@@ -6211,7 +6223,7 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
-ADMISSION_EVENT = "admission_override"
+from hermes_cli.kanban_dispatch_defaults import ADMISSION_EVENT
 ADMIT_INELIGIBLE = "admit_host_ineligible"
 ADMIT_FLOOR = "admit_floor"  # the measured-danger floor refused (placement_waits prefix)
 _FORCE_LOCAL = "studio"  # kanban_worker_pool.PIN_STUDIO: the dispatcher's own host

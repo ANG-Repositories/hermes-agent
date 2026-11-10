@@ -35,7 +35,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from hermes_cli import kanban_worker_hosts as _kwh
+from hermes_cli.kanban_lazy import Module
+_kbd = Module("hermes_cli.kanban_db_dispatch")
+_kwh = Module("hermes_cli.kanban_worker_hosts")
 from toolsets import get_toolset_names
 from utils import env_var_enabled
 import unicodedata  # noqa: E402
@@ -694,8 +696,8 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
             parsed = -1
         if parsed >= 0:
             return parsed
-        return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+        return _kbd.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", _kbd.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
@@ -1293,8 +1295,10 @@ def _account_home_board_root() -> Optional[Path]:
     Inert on fleet hosts: no ``~/kanban.db`` exists there (checked Studio and
     ace-ai 2026-10-10).
     """
-    from hermes_state import _os_account_home
-    account = _os_account_home()
+    from hermes_state_roots import account_home as _os_account_home
+    state = sys.modules.get("hermes_state")
+    anchor = getattr(state, "_os_account_home", _os_account_home)
+    account = anchor()
     if account is None:
         return None
     try:
@@ -1314,8 +1318,10 @@ def _live_kanban_roots() -> tuple:
     is not where the board lives (``hermes_state._deployed_hermes_home_root``,
     plus :func:`_account_home_board_root` for a process that redirected its home).
     """
-    from hermes_state import _deployed_hermes_home_root
-    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root(), _account_home_board_root())
+    from hermes_state_roots import account_home, deployed_root
+    state = sys.modules.get("hermes_state")
+    deployed = getattr(state, "_deployed_hermes_home_root", lambda: deployed_root(account_home()))
+    roots = [r for r in (_live_kanban_root(), deployed(), _account_home_board_root())
              if r is not None]
     return tuple(dict.fromkeys(roots))
 
@@ -9654,7 +9660,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
       3. ``DEFAULT_FAILURE_LIMIT``
     """
     if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
+        failure_limit = _kbd.DEFAULT_FAILURE_LIMIT
     from hermes_cli import kanban_after_merge as _am
     _am.release_prless_closed_parents(conn)
     promoted = 0
@@ -10284,7 +10290,7 @@ def _recorded_worker_alive(
     started_at = row["worker_started_at"] if row is not None else None
     if (
         started_at is not None
-        and started_at != UNVERIFIED_WORKER_FINGERPRINT
+        and started_at != _kbd.UNVERIFIED_WORKER_FINGERPRINT
         and _pid_recycled(pid, started_at)
     ):
         return False
@@ -18980,6 +18986,7 @@ def _record_worker_returncode(pid: int, code: int) -> None:
     """Remember Popen's native return code, including on Windows."""
     if not pid or pid <= 0:
         return
+    __getattr__("_recent_worker_exits")
     now = time.time()
     # (code, wall, boot evidence): the reap's upper bound on both clocks.
     _recent_worker_exits[int(pid)] = (int(code), now, _boot_evidence())
@@ -19921,6 +19928,7 @@ def reap_exited_worker_leftovers(
             continue
         task_id, run_id, spawned_at = ident[:3]
         boot = {"after_boot": ident[3] if len(ident) > 3 else None}
+        __getattr__("_recent_worker_exits")
         exit_entry = _recent_worker_exits.get(int(pid))
         if exit_entry:
             now = exit_entry[1]
@@ -20469,7 +20477,7 @@ def detect_progress_stalls(
             continue
         start = int(row["started_at"])
         hb = row["last_heartbeat_at"]
-        if hb is None or now - int(hb) >= _STALE_HEARTBEAT_GAP_SECONDS:
+        if hb is None or now - int(hb) >= _kbd._STALE_HEARTBEAT_GAP_SECONDS:
             continue
         pid = int(row["worker_pid"])
         lock = row["claim_lock"]
@@ -20697,7 +20705,7 @@ def _protocol_violation_history(
         "SELECT outcome, error, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY id DESC LIMIT ?",
-        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+        (task_id, _kbd._PROTOCOL_VIOLATION_SCAN_LIMIT),
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
@@ -21003,10 +21011,10 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     comments = conn.execute(
         "SELECT id, author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY id DESC",
-        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+        (task_id, int(time.time()) - _kbd._RESPAWN_GUARD_PR_WINDOW),
     ).fetchall()
     pr_comment = next(
-        (c for c in comments if _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
+        (c for c in comments if _kbd._RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
     )
     if pr_comment is None:
         return False
@@ -23573,37 +23581,40 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _managed_scratch_path_info,
     _scratch_workspace,
 )
-from hermes_cli.kanban_db_dispatch import (  # noqa: E402
-    DEFAULT_FAILURE_LIMIT,
-    DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
-    DispatchResult,
-    _PROTOCOL_VIOLATION_SCAN_LIMIT,
-    _RECENT_WORKER_EXITS_MAX,
-    _RECENT_WORKER_EXIT_TTL_SECONDS,
-    _RESPAWN_GUARD_PR_URL_RE,
-    _RESPAWN_GUARD_PR_WINDOW,
-    _STALE_HEARTBEAT_GAP_SECONDS,
-    UNVERIFIED_WORKER_FINGERPRINT,
-    _classify_worker_exit,
-    _clear_failure_counter,
-    _defer_reclaim_for_live_worker,
-    _pid_alive,
-    _pid_recycled,
-    _recent_worker_exits,
-    _record_task_failure,
-    _terminate_reclaimed_worker,
-    _worker_alive,
-    _worker_survived_termination,
-    _worker_terminal_timeout_env,
-    # Fork facade re-exports: the dispatcher entry points lived here before
-    # upstream's kanban_db_dispatch split; fork tests and callers still reach
-    # them as ``kanban_db.dispatch_once`` etc.
-    check_respawn_guard,
-    detect_crashed_workers,
-    dispatch_once,
-    enforce_max_runtime,
-    has_spawnable_ready,
-)
+# Keep the facade's dispatcher API without loading it for board reads.
+_DISPATCH_EXPORTS = frozenset({
+    "DEFAULT_FAILURE_LIMIT", "DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS", "DispatchResult",
+    "_PROTOCOL_VIOLATION_SCAN_LIMIT", "_RECENT_WORKER_EXITS_MAX",
+    "_RECENT_WORKER_EXIT_TTL_SECONDS", "_RESPAWN_GUARD_PR_URL_RE", "_RESPAWN_GUARD_PR_WINDOW",
+    "_STALE_HEARTBEAT_GAP_SECONDS", "UNVERIFIED_WORKER_FINGERPRINT", "_recent_worker_exits",
+})
+def _dispatch_handler(name):
+    def call(*args, **kwargs):
+        __getattr__("DispatchResult")
+        from hermes_cli import kanban_db_dispatch
+        return getattr(kanban_db_dispatch, name)(*args, **kwargs)
+    return call
+
+
+for _name in (
+    "_classify_worker_exit", "_clear_failure_counter", "_defer_reclaim_for_live_worker",
+    "_pid_alive", "_pid_recycled", "_record_task_failure", "_terminate_reclaimed_worker",
+    "_worker_alive", "_worker_survived_termination", "_worker_terminal_timeout_env",
+    "check_respawn_guard", "detect_crashed_workers", "dispatch_once", "enforce_max_runtime",
+    "has_spawnable_ready",
+):
+    globals()[_name] = _dispatch_handler(_name)
+
+
+def __getattr__(name):
+    if name not in _DISPATCH_EXPORTS:
+        raise AttributeError(name)
+    from hermes_cli import kanban_db_dispatch
+    # Internal function globals must see the same constants and mutable registry.
+    for exported in _DISPATCH_EXPORTS:
+        globals().setdefault(exported, getattr(kanban_db_dispatch, exported))
+    return globals()[name]
+
 from hermes_cli.kanban_db_board_registry import (  # noqa: E402
     PINNED_SLUG,
     KanbanBoardDerivationError,

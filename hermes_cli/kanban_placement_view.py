@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from hermes_cli import kanban_placement_reasons as _pr
-from hermes_cli import kanban_worker_pool as _kwp
+from hermes_cli.kanban_lazy import Module
+_kwp = Module("hermes_cli.kanban_worker_pool")
 
 HELD_ROWS_SHOWN = 20
 TOP_REASONS_SHOWN = 5
