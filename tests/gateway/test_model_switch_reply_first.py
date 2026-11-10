@@ -242,6 +242,35 @@ async def test_stop_during_the_deferred_write_keeps_the_queued_message(tmp_path,
     assert h.db.models == []
 
 
+@pytest.mark.asyncio
+async def test_reset_pin_does_not_clear_pending_switch_after_stop(tmp_path, monkeypatch):
+    """Prism 28b3a5cdd324: reset's NULL pin predates the uncommitted B pick."""
+    from hermes_state import SessionDB
+
+    h = _Harness(tmp_path, monkeypatch)
+    monkeypatch.setattr("hermes_state.SessionDB", SessionDB)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    h.runner.session_store._db = db
+    h.runner.session_store.get_or_create_session(_source())
+    await h.adapter.handle_message(_ev("/model reset"))
+    await _wait_for(lambda: not h.adapter._session_tasks, "reset to settle")
+    assert h.runner.session_store.get_chat_model_pin(h.key()) == (True, None)
+    await h.adapter.handle_message(_ev("/model model-B"))
+    await _wait_for(lambda: h.sent_with(_switched("model-B")), "B confirmation")
+    await asyncio.wait_for(h.db.entered.wait(), 5)
+    try:
+        await h.adapter.handle_message(_ev("/stop"))
+        await _wait_for(lambda: not h.adapter._session_tasks, "stop to release the session")
+        assert h.runner._model_switch_write_pending(h.key())
+        assert h.db.models == []
+        model, _runtime = h.runner._resolve_session_agent_runtime(source=_source())
+        assert model == "model-B"
+    finally:
+        h.db.release.set()
+        await h.runner._drain_model_switch_writes(h.key(), _source())
+        db.close()
+
+
 # --------------------------------------------------------------------------- Prism round 1 (#169)
 
 

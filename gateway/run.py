@@ -9259,9 +9259,10 @@ class GatewayRunner(
                 # Read failures can carry credential-bearing paths or URLs.
                 logger.warning("Chat model pin reconciliation unavailable")
                 return PersistedSessionRouteLookup("unavailable")
-            if present and pin is None:
-                # NOTE(P3b/RC-2): cache reconciliation only; the durable user
-                # action already happened in the chat preference store.
+            if (present and pin is None
+                    and not self._model_switch_write_pending(session_key)):
+                # A NULL pin may predate a reply-first switch still being saved.
+                # Otherwise reconcile the already-durable user clear.
                 self._session_model_overrides.pop(session_key, None)
         return lookup
 
