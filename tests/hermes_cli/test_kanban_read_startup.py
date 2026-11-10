@@ -223,7 +223,10 @@ def test_current_schema_connect_does_not_need_writer(tmp_path, monkeypatch):
 def test_list_recomputes_dependency_readiness(tmp_path):
     db = tmp_path / "kanban.db"
     child = seed(db)
-    with sqlite3.connect(db) as conn:
+    with kbc.connect_closing(db_path=db) as conn:
+        parent = kb.create_task(conn, title="completed dependency")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.execute("INSERT INTO task_links(parent_id, child_id, kind) VALUES (?, ?, 'blocks')", (parent, child))
         conn.execute("UPDATE tasks SET status='todo', assignee='daedalus' WHERE id=?", (child,))
     result = subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "kanban", "list", "--board", "default",

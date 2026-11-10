@@ -1618,7 +1618,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  max-retries: {task.max_retries} (task)")
     else:
         from hermes_cli.config import load_config
-        cfg_val = (load_config().get("kanban") or {}).get("failure_limit")
+        try:
+            cfg_val = (load_config().get("kanban") or {}).get("failure_limit")
+        except Exception:
+            cfg_val = None
         from hermes_cli.kanban_dispatch_defaults import DEFAULT_FAILURE_LIMIT
         if cfg_val is not None and int(cfg_val) != DEFAULT_FAILURE_LIMIT:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
