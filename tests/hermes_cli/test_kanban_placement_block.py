@@ -129,7 +129,10 @@ def kanban_home(tmp_path: Path, monkeypatch):
 
 
 def _placed_block(conn, body, reason, host="ci-box"):
-    tid = kb.create_task(conn, title="t", assignee="alpha", body=body)
+    # Seed a legacy body: this suite exercises recovery, not mint validation.
+    tid = kb.create_task(conn, title="t", assignee="alpha")
+    conn.execute("UPDATE tasks SET body=? WHERE id=?", (body, tid))
+    conn.commit()
     assert kb.claim_task(conn, tid, claimer="alpha") is not None
     run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
     if host:

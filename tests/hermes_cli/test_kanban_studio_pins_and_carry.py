@@ -53,6 +53,8 @@ def _studio_last_resort_on(kanban_home):
     fleet = kanban_home / "fleet"
     fleet.mkdir(parents=True, exist_ok=True)
     _write_policy(fleet)
+    # Dispatcher tests replay cards minted before entry validation existed.
+    (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: false\n")
 
 
 def _kill_switch(home: Path, value) -> None:
@@ -137,6 +139,7 @@ def test_create_prints_the_drop(kanban_home, monkeypatch):
 
 @pytest.mark.parametrize("host", ["studio", "mac-studio-m3u"])
 def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, host):
+    (kanban_home / "config.yaml").unlink()
     monkeypatch.setattr(khc, "load_map", lambda fleet: _caps().cmap)
     with kb.connect_closing() as conn:
         with pytest.raises(ValueError, match="accepted words:.*studio-state"):
@@ -151,6 +154,9 @@ def test_entry_refuses_bare_pin_and_edit_is_atomic(kanban_home, monkeypatch, hos
         for work in ("launchctl", "vault", "skill_view", "localhost:18810", "run ~/.hermes/scripts/check.py"):
             derived = kb.create_task(conn, title="derived", body=f"host: {host}\n{work}")
             assert "requires: studio-state" in kb.get_task(conn, derived).body
+        from hermes_cli import kanban as cli
+        output = cli.run_slash(f"--board default create 'derive cli' --body 'host: {host}\nlaunchctl print gui/501'")
+        assert "auto-derived requires: studio-state" in output
     (kanban_home / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: false\n")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="disabled", body=f"host: {host}")
