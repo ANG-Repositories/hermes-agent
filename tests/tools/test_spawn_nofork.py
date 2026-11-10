@@ -199,12 +199,12 @@ def test_parse_check_does_not_fork(no_fork_exec):
     assert ok is False and "syntax error" in msg
 
 
-def test_run_nofork_timeout_does_not_wait_for_descendants(no_fork_exec, monkeypatch, tmp_path):
+def test_run_nofork_timeout_does_not_wait_for_descendants(no_fork_exec, monkeypatch):
     """subprocess.run's POSIX contract: kill, wait, re-raise with the output so far.
 
-    A second communicate() would block until the backgrounded sleep closes the pipe.
+    A second communicate() would block until the backgrounded sleep (reparented after
+    the kill, so it ends on its own) closes the pipe.
     """
-    marker = tmp_path / "bg.pid"
     calls = []
     real_communicate = subprocess.Popen.communicate
 
@@ -213,15 +213,11 @@ def test_run_nofork_timeout_does_not_wait_for_descendants(no_fork_exec, monkeypa
         return real_communicate(self, input, timeout)
 
     monkeypatch.setattr(subprocess.Popen, "communicate", counted)
-    try:
-        with pytest.raises(subprocess.TimeoutExpired) as info:
-            nofork.run_nofork(["/bin/sh", "-c", f"printf partial; sleep 60 & echo $! > '{marker}'; wait"],
-                              capture_output=True, timeout=1)
-        assert calls == [1], "communicate() must not run again after the timeout"
-        assert info.value.stdout == b"partial"
-    finally:
-        if marker.exists():
-            os.kill(int(marker.read_text()), signal.SIGKILL)
+    with pytest.raises(subprocess.TimeoutExpired) as info:
+        nofork.run_nofork(["/bin/sh", "-c", "printf partial; sleep 5 & wait"],
+                          capture_output=True, timeout=1)
+    assert calls == [1], "communicate() must not run again after the timeout"
+    assert info.value.stdout == b"partial"
 
 
 @pytest.mark.parametrize("new_session", [False, True])

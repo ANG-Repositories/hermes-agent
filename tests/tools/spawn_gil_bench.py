@@ -11,7 +11,11 @@ stopped) for that time. Modes:
   path can use vfork.
 * ``legacy-fork``: the same call with ``subprocess._USE_VFORK = False``. That is the macOS
   shape, where fork_exec always does a real fork() of the whole process.
-* ``nofork``: ``tools.spawn_nofork.spawn_popen`` (posix_spawn + setsid).
+* ``nofork``: ``tools.spawn_nofork.spawn_popen`` (posix_spawn + setsid + the isolated exec
+  helper that closes descriptors, chdirs and execs bash), forced on off macOS too.
+
+Per spawn it also records spawn-to-first-output wall: Popen call until bash's first line
+arrives on the pipe, which includes the exec helper's interpreter start.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from tools.spawn_nofork import spawn_popen  # noqa: E402
+import tools.spawn_nofork as nofork  # noqa: E402
 
 BASH = "/bin/bash"
 
@@ -52,9 +56,9 @@ def _spawn(mode: str, cwd: str) -> subprocess.Popen:
     kwargs = dict(text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     if mode == "nofork":
-        return spawn_popen(["/bin/sh", "-c", 'cd -- "$1" || exit 126; shift; exec "$@"', "sh", cwd,
-                            BASH, "-c", "true"], new_session=True, **kwargs)
-    return subprocess.Popen([BASH, "-c", "true"], start_new_session=True, cwd=cwd, **kwargs)
+        nofork._FORK_COPIES_PARENT = True
+        return nofork.spawn_popen([BASH, "-c", "echo ready"], new_session=True, cwd=cwd, **kwargs)
+    return subprocess.Popen([BASH, "-c", "echo ready"], start_new_session=True, cwd=cwd, **kwargs)
 
 
 def main() -> int:
@@ -104,7 +108,7 @@ def main() -> int:
     for mode in opts.modes.split(","):
         counters.update(fork_exec=0, posix_spawn=0)
         subprocess._USE_VFORK = mode != "legacy-fork"
-        stalls, walls = [], []
+        stalls, walls, firsts = [], [], []
         for _ in range(opts.spawns):
             time.sleep(0.01)
             ticker.window_max = 0.0
@@ -112,6 +116,8 @@ def main() -> int:
             proc = _spawn(mode, cwd)
             walls.append(time.perf_counter() - t0)
             stalls.append(ticker.window_max)
+            assert proc.stdout.readline() == "ready\n"
+            firsts.append(time.perf_counter() - t0)
             proc.communicate()
         subprocess._USE_VFORK = True
         ms = lambda xs, q: round(1000 * statistics.quantiles(xs, n=20)[q], 3)  # noqa: E731
@@ -119,7 +125,9 @@ def main() -> int:
             "calls": dict(counters),
             "gil_stall_ms_p50": round(1000 * statistics.median(stalls), 3), "gil_stall_ms_p95": ms(stalls, 18),
             "gil_stall_ms_max": round(1000 * max(stalls), 3),
-            "spawn_wall_ms_p50": round(1000 * statistics.median(walls), 3), "spawn_wall_ms_p95": ms(walls, 18)}
+            "spawn_wall_ms_p50": round(1000 * statistics.median(walls), 3), "spawn_wall_ms_p95": ms(walls, 18),
+            "first_output_ms_p50": round(1000 * statistics.median(firsts), 3),
+            "first_output_ms_p95": ms(firsts, 18)}
     ticker.stop = True
     idle.set()
     print(json.dumps(results, indent=2))
