@@ -305,7 +305,11 @@ class SessionGatewayMixin:
         if not session_key or not entry_json:
             return
         def _do(conn):
+            started = time.monotonic() if timings is not None else None
             self._assert_unique_gateway_routes(conn, {session_key: entry_json}, scope)
+            if timings is not None:
+                checked = time.monotonic()
+                timings["route_check_s"] = checked - started
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -314,6 +318,8 @@ class SessionGatewayMixin:
                        updated_at = excluded.updated_at""",
                 (scope, session_key, entry_json, time.time()),
             )
+            if timings is not None:
+                timings["route_sql_s"] = time.monotonic() - checked
         self._execute_write(_do, timings=timings)
 
     def replace_gateway_routing_entries(

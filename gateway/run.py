@@ -7908,7 +7908,7 @@ class GatewayRunner(
     @staticmethod
     def _render_user_stop_timings(timings: dict) -> str:
         keys = ("rowid_s", "store_s", "lock_s", "save_lock_s", "upsert_s",
-                "wait_s", "exec_s", "commit_s", "fallback_s", "other_s")
+                "wait_s", "exec_s", "commit_s", "route_check_s", "route_sql_s", "fallback_s", "other_s")
         return " ".join(
             f"{k}={timings[k]:.3f}" if isinstance(timings.get(k), (int, float)) else f"{k}=-"
             for k in keys)
