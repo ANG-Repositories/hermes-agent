@@ -187,3 +187,33 @@ def test_legacy_repair_preserves_creation_dependency_release(conn, legacy_source
     assert kb.get_task(conn, child).status == "ready"
     assert kb.get_task(conn, explicit).status == "blocked"
     assert repair(conn, apply=True)["before"] == 0
+
+
+def test_operator_todo_card_completes_and_promote_says_why(conn):
+    """t_554b6dc1 (2026-11-10): an operator card (human:*) is held in todo by the lifecycle guard, so
+    complete must accept todo for it, and promote must not report a promotion the trigger reverts."""
+    tid = kb.create_task(conn, title="Operator closeout", assignee="human:apollo")
+    assert kb.get_task(conn, tid).status == "todo"
+    ok, why = kb.promote_task(conn, tid, actor="apollo")
+    assert not ok and "operator card stays 'todo' by design" in why
+    assert kb.get_task(conn, tid).status == "todo"
+    assert not conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='promoted_manual'", (tid,)).fetchone()
+    assert kb.complete_task(conn, tid, result="merged and deployed", summary="merged and deployed")
+    assert kb.get_task(conn, tid).status == "done"
+
+
+def test_operator_todo_card_with_an_open_parent_still_refuses_complete(conn):
+    parent = kb.create_task(conn, title="Parent", assignee="builder")
+    tid = kb.create_task(conn, title="Operator child", assignee="human:apollo", parents=[parent])
+    assert kb.get_task(conn, tid).status == "todo"
+    assert not kb.complete_task(conn, tid, result="x", summary="x")
+    assert kb.get_task(conn, tid).status == "todo"
+
+
+def test_worker_todo_card_still_refuses_complete(conn):
+    parent = kb.create_task(conn, title="Parent", assignee="builder")
+    tid = kb.create_task(conn, title="Worker child", assignee="builder", parents=[parent])
+    assert kb.get_task(conn, tid).status == "todo"
+    assert not kb.complete_task(conn, tid, result="x", summary="x")
+    assert "complete needs running/ready/blocked/review" in kb.explain_complete_refusal(conn, tid)
