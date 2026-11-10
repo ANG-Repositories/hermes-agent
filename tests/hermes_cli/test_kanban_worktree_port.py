@@ -436,6 +436,149 @@ def test_derived_unpushed_commits_are_pushed_then_ported(kanban_home, anchor, tm
     assert _ref(bare, f"refs/heads/wt/{tid}") == _ref(anchor, f"refs/heads/wt/{tid}") != ""
 
 
+@pytest.mark.parametrize("url", ["git@github.com:NousResearch/hermes-agent.git",
+                                 "https://github.com/NousResearch/hermes-agent.git",
+                                 "https://gitlab.com/ANG-Ventures/hermes-agent.git"])
+def test_push_to_foreign_origin_is_refused_before_any_push(anchor, url, no_ambient_git_config):
+    """t_eac2768a: origin is an upstream we do not own: no push is attempted, the refusal names the URL."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", url, cwd=anchor)
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        if "push" in argv:  # never executed: no network push from a test
+            return subprocess.CompletedProcess(argv, 1, "", "runner: push not executed")
+        return subprocess.run(argv, **kw)
+    with pytest.raises(kwt.ForeignOriginPush) as exc:
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=runner)
+    assert url in str(exc.value) and "checkout whose origin is ours" in str(exc.value)
+    assert not [c for c in calls if "push" in c]
+    assert kb._unusable_workspace_reason(exc.value) == str(exc.value)  # permanent: blocks on failure #1
+
+
+@pytest.mark.parametrize("url", ["git@github.com:ANG-Ventures/hermes-agent.git",
+                                 "https://github.com/kyzcreig/demo.git"])
+def test_push_to_own_origin_runs_the_push(anchor, url, no_ambient_git_config):
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", url, cwd=anchor)
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        if "push" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(argv, **kw)
+    kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=runner)
+    pushes = [c for c in calls if "push" in c]
+    assert len(pushes) == 1 and f"remote.kanban-port-destination.url={url}" in pushes[0]
+
+
+@pytest.fixture
+def no_ambient_git_config(monkeypatch):
+    """The push-destination tests read url.*.insteadOf: keep a host's global/system git config out of them
+    (ci-box has a global url.https://github.com/.insteadOf git@github.com:)."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+def _no_push_runner(calls):
+    def runner(argv, **kw):
+        calls.append(argv)
+        if "push" in argv:  # never executed: no network push from a test
+            return subprocess.CompletedProcess(argv, 1, "", "runner: push not executed")
+        return subprocess.run(argv, **kw)
+    return runner
+
+
+def test_push_refused_when_insteadof_rewrites_own_origin_to_a_foreign_one(anchor, no_ambient_git_config):
+    """Prism 51498b6e31ba: `remote get-url` applies insteadOf once (alias -> ANG-Ventures), and the push applies
+    it again to that URL (ANG-Ventures -> NousResearch). The URL the push will use is the one checked."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "git@github.com:Kyzcreig/hermes-agent.git", cwd=anchor)
+    _git("config", "url.git@github.com:ANG-Ventures/.insteadOf", "git@github.com:Kyzcreig/", cwd=anchor)
+    _git("config", "url.git@github.com:NousResearch/.insteadOf", "git@github.com:ANG-Ventures/", cwd=anchor)
+    got = subprocess.run(["git", "remote", "get-url", "origin"], cwd=anchor, check=True, capture_output=True, text=True)
+    assert got.stdout.strip() == "git@github.com:ANG-Ventures/hermes-agent.git"
+    calls = []
+    with pytest.raises(kwt.ForeignOriginPush) as exc:
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=_no_push_runner(calls))
+    assert "git@github.com:NousResearch/hermes-agent.git" in str(exc.value)
+    assert not [c for c in calls if "push" in c]
+
+
+def test_push_refused_when_a_configured_pushurl_of_the_push_remote_is_foreign(anchor, no_ambient_git_config):
+    """Prism 51498b6e31ba: pushurl is multivalued, so `-c ...pushurl=` APPENDS to a checkout-configured one and
+    the push would go to both. Every effective push URL is checked."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "https://github.com/ANG-Ventures/hermes-agent.git", cwd=anchor)
+    _git("config", "remote.kanban-port-destination.pushurl", "https://github.com/NousResearch/hermes-agent.git",
+         cwd=anchor)
+    calls = []
+    with pytest.raises(kwt.ForeignOriginPush) as exc:
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=_no_push_runner(calls))
+    assert "https://github.com/NousResearch/hermes-agent.git" in str(exc.value)
+    assert not [c for c in calls if "push" in c]
+
+
+def test_foreign_origin_refusal_redacts_url_credentials(anchor, no_ambient_git_config):
+    """Prism fa431e49e08b: the refusal is stored on the card, so URL userinfo never reaches it."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "https://x-access-token:SECRET123@github.com/NousResearch/hermes-agent.git",
+         cwd=anchor)
+    calls = []
+    with pytest.raises(kwt.ForeignOriginPush) as exc:
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=_no_push_runner(calls))
+    assert "SECRET123" not in str(exc.value) and "x-access-token" not in str(exc.value)
+    assert "https://github.com/NousResearch/hermes-agent.git" in str(exc.value)
+    assert not [c for c in calls if "push" in c]
+
+
+def test_refusal_redacts_credentials_in_the_rewritten_url(anchor, no_ambient_git_config):
+    """Prism bdade6e7f897: a credential in the insteadOf-REWRITTEN URL is redacted too, not only the origin's.
+    `remote get-url` rewrites once (kz: -> Kyzcreig, owned); the push rewrites that again (-> token URL)."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "kz:hermes-agent.git", cwd=anchor)
+    _git("config", "url.git@github.com:Kyzcreig/.insteadOf", "kz:", cwd=anchor)
+    _git("config", "url.https://x-access-token:SECRET123@github.com/NousResearch/.insteadOf",
+         "git@github.com:Kyzcreig/", cwd=anchor)
+    calls = []
+    with pytest.raises(kwt.ForeignOriginPush) as exc:
+        kwt.push_card_branch((str(anchor), "feature", "", _ref(anchor, "HEAD")), runner=_no_push_runner(calls))
+    assert "SECRET123" not in str(exc.value) and "x-access-token" not in str(exc.value)
+    assert "https://github.com/NousResearch/hermes-agent.git" in str(exc.value)
+    assert not [c for c in calls if "push" in c]
+
+
+def test_derived_unpushed_branch_on_upstream_origin_blocks_without_push(kanban_home, anchor, monkeypatch,
+                                                                       no_ambient_git_config):
+    """The Studio case (t_6dde6d1e): checkout origin = NousResearch, card branch has an unpushed commit."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "git@github.com:NousResearch/hermes-agent.git", cwd=anchor)
+    pushes, clones = [], []
+    real_push = kwt.push_card_branch
+
+    def spy(argv, **kw):
+        if "push" in argv:
+            pushes.append(argv)  # recorded, never executed: no network push from a test
+            return subprocess.CompletedProcess(argv, 1, "", "spy: push not executed")
+        return subprocess.run(argv, **kw)
+    monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=None: real_push(push, runner=spy))
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: clones.append(a))
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        _git("branch", f"wt/{tid}", cwd=anchor)
+        _git("checkout", "-q", f"wt/{tid}", cwd=anchor)
+        _commit(anchor, "studio-only")
+        _git("checkout", "-q", "main", cwd=anchor)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        row = _row(conn, tid)
+    assert not pushes and not clones and not spawned
+    assert tid in res.auto_blocked  # first failure, not a transient retry
+    assert row["status"] == "blocked"
+    assert "git@github.com:NousResearch/hermes-agent.git" in (row["last_failure_error"] or "")
+
+
 def test_push_lease_refuses_a_branch_moved_on_origin(anchor, tmp_path):
     bare = _origin_with_push(anchor, tmp_path)
     _commit(anchor, "base")

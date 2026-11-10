@@ -20861,6 +20861,8 @@ def _unusable_workspace_reason(exc: BaseException) -> Optional[str]:
     characters that ended mid-path and told the reader nothing.
     """
     text = str(exc)
+    if getattr(exc, "permanent_spawn_wall", False):
+        return text  # carries its own operator fix (kanban_worktree_port.ForeignOriginPush, t_eac2768a)
     if not any(marker in text for marker in _UNUSABLE_WORKSPACE_MARKERS):
         return None
     return (
