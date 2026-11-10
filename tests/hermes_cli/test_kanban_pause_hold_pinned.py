@@ -154,24 +154,51 @@ def test_pinned_card_is_held_under_continuation_enforce(home, enforce):
         assert _reroutes(conn, tid) == []
 
 
-@pytest.mark.parametrize("reader", ["known_host_ids", "pin_aliases"])
-def test_layer2_refuses_alias_when_registry_read_fails(home, monkeypatch, reader):
+@pytest.mark.parametrize("registry", [
+    "fleet/fleet-roles.json", "fleet/kanban-pool.json",
+    "fleet/ci-hosts.json", "config/fleet-hosts.json",
+])
+@pytest.mark.parametrize("failure", ["malformed", "unreadable"])
+def test_layer2_refuses_alias_when_registry_read_fails(home, monkeypatch, registry, failure):
     from hermes_cli import kanban_worker_pool as kwp
 
-    monkeypatch.setattr(kwp, "known_host_ids", lambda fleet: ("ci-box", "ace-ai"))
-    monkeypatch.setattr(kwp, "pin_aliases", lambda fleet: {"build-alias": "ci-box"})
+    files = {
+        "fleet/fleet-roles.json": {"hosts": {"ci-box": {"roles": {"kanban-worker": {}}}}},
+        "fleet/kanban-pool.json": {"hosts": {"ci-box": {}}},
+        "fleet/ci-hosts.json": {"hosts": {"ci-box": {"ssh_alias": "build-alias"}}},
+        "config/fleet-hosts.json": {"hosts": {}},
+    }
+    for name, data in files.items():
+        path = home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
     with kb.connect_closing() as conn:
         tid = _card(conn, "host: build-alias\nx")
+        loose = _card(conn, "host: any\nx")
         _hold(home)
         assert kph.pinned_to("host: build-alias\nx", "ci-box", {})
+        # Healthy real registries preserve explicit host:any direct claims.
+        assert kb.claim_task(conn, loose) is not None
 
-        def fail(fleet):
-            raise OSError("registry read failed")
+        broken = home / registry
+        if failure == "malformed":
+            broken.write_text("{broken JSON")
+        else:
+            read_text = Path.read_text
 
-        monkeypatch.setattr(kwp, reader, fail)
+            def unreadable(path, *args, **kwargs):
+                if path == broken:
+                    raise PermissionError("registry unreadable")
+                return read_text(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "read_text", unreadable)
+        # Discovery callers remain permissive; enforcement uses the same real readers.
+        kwp.known_host_ids(home / "fleet")
+        kwp.pin_aliases(home / "fleet")
         with pytest.raises(kph.PauseHeld):
             kb.claim_task(conn, tid)
         assert _runs(conn, tid) == 0
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ready"
 
 
 def test_layer2_refuses_only_a_pinned_card(home):

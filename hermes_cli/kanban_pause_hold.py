@@ -435,7 +435,8 @@ def _pin_words(cache: dict):
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_worker_pool as _kwp
         fleet = _kb.kanban_home() / "fleet"
-        cache[key] = (tuple(_kwp.known_host_ids(fleet)), dict(_kwp.pin_aliases(fleet)))
+        cache[key] = (tuple(_kwp.known_host_ids(fleet, strict=True)),
+                      dict(_kwp.pin_aliases(fleet, strict=True)))
     return cache[key]
 
 
