@@ -1490,7 +1490,10 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
                 return pool_pressure_label(pp)
             return "relay unavailable"
         if "budget" in t and "capped" in t:
-            return "model budget capped"
+            model = str(row.get("from_model") or "the requested model")
+            provider = str(row.get("from_provider") or "the requested provider")
+            return (f"model budget capped for {model} via {provider} "
+                    "(model-specific, not account-wide)")
         windowed = _window_cause(row, t)
         if windowed and quota_window_from_text(t) is None:
             # A synthetic no-eligible refusal can still carry the rejected window.
@@ -1605,6 +1608,14 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     if floors is not None:
         floors.extend(hit)
     body = _seat_absent_words(row, body)
+    reset = row.get("quota_reset_at")
+    if (row.get("trigger_class") in ("quota_model", "quota_seat")
+            and isinstance(reset, (int, float)) and not isinstance(reset, bool)
+            and "reset" not in body):
+        at = _hms(reset, tz).strftime("%Y-%m-%d %H:%M %Z").strip()
+        m = _TRAILING_WINDOW_RE.search(body)
+        tail = f"; upstream reset {at}"
+        body = f"{body[:m.start()]}{tail}{body[m.start():]}" if m else body + tail
     wait = _cause_wait_clause(row)
     if wait:
         m = _TRAILING_WINDOW_RE.search(body)
