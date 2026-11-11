@@ -1270,3 +1270,66 @@ def test_admit_gets_in_while_a_tick_is_stuck_in_a_spawn(board, monkeypatch, narr
     else:
         assert isinstance(got, ka.AdmitRefused) and "board tick lock held for 3s" in str(got)
         assert SPAWNS == [] and _status(b) == "ready"
+
+
+# -- t_bf2c4ade: admit releases its own claim only when the launch did not happen --
+
+def test_admit_whose_launch_raises_releases_the_claim_and_refuses(board, monkeypatch, capsys):
+    """admit_once raising after the claim (before any worker) leaves a claim held
+    by this CLI's own pid; the CLI exits and nothing finishes the run. Release it."""
+    _hot_local(monkeypatch)
+    tid = _card()
+    real = kbd.admit_once
+
+    def claim_then_raise(conn, task_id, *a, **k):
+        def spawn_raises(*_a, **_k):
+            raise KeyboardInterrupt("operator ^C mid-launch")
+        try:
+            real(conn, task_id, *a, **{**k, "spawn_fn": spawn_raises})
+        except KeyboardInterrupt as exc:
+            raise RuntimeError(str(exc)) from exc
+        raise AssertionError("spawn_fn was not reached")
+
+    monkeypatch.setattr(kbd, "admit_once", claim_then_raise)
+    ns = argparse.Namespace(task_id=tid, host="studio", reason="Ace: proceed")
+    assert ka.cmd_admit(ns) == 1
+    err = capsys.readouterr().err
+    assert "kanban admit: REFUSED" in err and "launch failed" in err and "card is ready" in err, err
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+        assert (t.status, t.claim_lock, t.worker_pid) == ("ready", None, None)
+        run = conn.execute("SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                           (tid,)).fetchone()
+        assert run["outcome"] == "spawn_failed"
+        assert int(t.consecutive_failures or 0) == 0     # a launch fault, not the card's
+
+
+def test_admit_whose_spawn_returns_no_pid_keeps_the_claim_and_says_starting(board, monkeypatch, capsys):
+    """A missing pid is not proof no worker launched (Prism 3515cb6bd1ed): the
+    claim stays (the launch bound handles a launch that made nothing) and admit
+    says the worker may be starting instead of printing a bare pid=None."""
+    _hot_local(monkeypatch)
+    tid = _card()
+    monkeypatch.setattr(kbd, "_default_spawn", lambda *a, **k: None)
+    ns = argparse.Namespace(task_id=tid, host="studio", reason="Ace: proceed")
+    assert ka.cmd_admit(ns) == 0
+    out = capsys.readouterr().out
+    assert "may be starting" in out and "claim is kept" in out, out
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+        assert t.status == "running" and t.claim_lock and t.worker_pid is None
+        assert conn.execute("SELECT outcome FROM task_runs WHERE id=?",
+                            (t.current_run_id,)).fetchone()[0] is None
+
+
+def test_admit_records_the_worker_pid_never_its_own(board, monkeypatch):
+    import os
+    _hot_local(monkeypatch)
+    tid = _card()
+    res = ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+        run_pid = conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (t.current_run_id,)).fetchone()[0]
+    assert res["pid"] == t.worker_pid == run_pid == 4242
+    assert t.worker_pid != os.getpid()
+    assert "note" not in res

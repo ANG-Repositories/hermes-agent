@@ -316,18 +316,61 @@ def admit(task_id: str, host_word: str, reason: str, *, kanban_cfg: Optional[dic
             raise AdmitRefused(f"{task_id}: status is {task.status}, admit takes a ready card only")
         payload = {"source": "cli admit", "actor": _actor(), "host": host, "reason": reason.strip()}
         floor = _floor(measure_local_fn or measure_local, measure_remote_fn, payload)
-        res = kbd.admit_once(conn, task_id, host, board=board, spawn_fn=spawn_fn, spillover=plan,
-                             admission_event=payload, admit_floor=floor,
-                             **_tick_knobs(kanban_cfg), lock_wait_s=_LOCK_WAIT_SECONDS)
+        try:
+            res = kbd.admit_once(conn, task_id, host, board=board, spawn_fn=spawn_fn, spillover=plan,
+                                 admission_event=payload, admit_floor=floor,
+                                 **_tick_knobs(kanban_cfg), lock_wait_s=_LOCK_WAIT_SECONDS)
+        except Exception as exc:
+            # The claim names THIS process; once it exits nothing heartbeats or
+            # finishes the run, so a launch that raised does not leave it behind (t_bf2c4ade).
+            raise AdmitRefused(f"{task_id}: launch failed ({exc})"
+                               f"{_release_failed_launch_claim(conn, task_id, f'admit launch raised: {exc}')}"
+                               ) from exc
         if res.skipped_locked:
             raise AdmitRefused(f"{task_id}: board tick lock held for {_LOCK_WAIT_SECONDS:.0f}s by "
                                f"{kb.format_dispatch_lock_skip(res.lock_holder)}")
         spawned = [x for x in res.spawned if x[0] == task_id]
         if not spawned:
-            raise AdmitRefused(f"{task_id}: {refusal_from(res, task_id)}")
+            raise AdmitRefused(f"{task_id}: {refusal_from(res, task_id)}"
+                               f"{_release_failed_launch_claim(conn, task_id, 'admit: not spawned')}")
         after = kb.get_task(conn, task_id)
-    return {"task_id": task_id, "host": host, "pid": getattr(after, "worker_pid", None),
-            "workspace": spawned[0][2], "payload": payload}
+    out = {"task_id": task_id, "host": host, "pid": getattr(after, "worker_pid", None),
+           "workspace": spawned[0][2], "payload": payload}
+    if out["pid"] is None:
+        # Reported spawned, no pid recorded yet. A missing pid is not proof that no
+        # worker launched (Prism 3515cb6bd1ed), so the claim stays; the dead-claimer
+        # launch bound releases it if no worker ever shows up (t_bf2c4ade).
+        out["note"] = ("no worker pid recorded yet; the worker may be starting. The claim is kept: "
+                       "if no worker shows up, the launch bound releases it")
+    return out
+
+
+def _release_failed_launch_claim(conn, task_id: str, why: str) -> str:
+    """Release the claim THIS process holds on ``task_id`` after a launch that
+    definitively did not happen (admit_once raised, or did not spawn the card)
+    (t_bf2c4ade). Re-checked under the release's write lock: a stamped worker
+    pid or a ``spawned``/``heartbeat`` row on the run keeps the claim. Returns
+    the operator-facing suffix, ``""`` when the claim is not ours to release."""
+    task = kb.get_task(conn, task_id)
+    if (task is None or task.status != "running" or task.worker_pid
+            or task.current_run_id is None or task.claim_lock != kb._claimer_id()):
+        return ""
+    run_id = int(task.current_run_id)
+
+    def _no_worker_evidence(c) -> bool:
+        row = c.execute("SELECT worker_pid FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is not None and row[0]:
+            return False
+        return c.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                         "AND kind IN ('spawned','heartbeat') LIMIT 1", (task_id, run_id)).fetchone() is None
+
+    kbd._record_task_failure(conn, task_id, why, outcome="spawn_failed", release_claim=True,
+                             end_run=True, infrastructure=True,
+                             expected_run_id=run_id, precondition=_no_worker_evidence)
+    after = kb.get_task(conn, task_id)
+    if after is not None and after.claim_lock:
+        return "; a worker was recorded, so the claim was kept"
+    return f"; claim released, card is {getattr(after, 'status', 'gone')}"
 
 
 def _floor(measure_local_fn, measure_remote_fn, payload: dict):
@@ -420,4 +463,6 @@ def cmd_admit(args) -> int:
           f"(overrode band={p.get('band')} allowance={p.get('gate_allowance', '-')}; "
           f"load1={p.get('load1')} / limit {p.get('load_limit')}, mem {p.get('mem_available_gb')} GB "
           f"/ reserve {p.get('mem_reserve_gb')} GB) event={EVENT}")
+    if res.get("note"):
+        print(f"kanban admit: {res['task_id']}: {res['note']}")
     return 0
