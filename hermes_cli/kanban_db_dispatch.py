@@ -9210,14 +9210,19 @@ def _pool_clone_job(task_id: str, branch_name, host, wt_port, workspace, board: 
     branch = (branch_name or "").strip() or f"wt/{task_id}"
     mirror = _kwt.mirror_for(wt_port, host.name)
     push = wt_port[4] if len(wt_port) > 4 else None
-    tip = push[3] if push is not None else None
+    # A dirty own Studio tree (t_894be273): (tree, HEAD). The clone is pinned to that HEAD and the tree's changed
+    # files are then copied straight into it over ssh; nothing of them is pushed.
+    carry = wt_port[5] if len(wt_port) > 5 else None
+    tip = push[3] if push is not None else (carry[1] if carry else None)
 
     def job() -> None:
         if push is not None:
             _kwt.push_card_branch(push)
         _kwt.clone_on_host(host, str(workspace), wt_port[0], mirror, branch, **({"sha": tip} if tip else {}))
+        if carry:
+            _kwt.carry_dirty(host, str(workspace), carry[0], carry[1])
 
-    key = _kwt.clone_key(task_id, host.name, str(workspace), wt_port[0], mirror, branch, push)
+    key = _kwt.clone_key(task_id, host.name, str(workspace), wt_port[0], mirror, branch, push, carry)
     return key, job, _kwt.clone_lock_path(_kb.board_dir(board) / "clone-locks", key)
 
 
