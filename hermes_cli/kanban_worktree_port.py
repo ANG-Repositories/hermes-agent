@@ -860,7 +860,8 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     tip, Prism 3e2f8506c8ff): a reused checkout behind it is fetched and
     fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise). ``exact``
     (a fresh re-clone of a carried scratch clone, t_9965b8d5): reset to
-    ``sha`` even when it is behind the branch tip, then PROVE it (rc 5). ``carried`` (a dirty carry follows,
+    ``sha`` even when it is behind the branch tip, then PROVE it (rc 5); a reused clone with uncommitted edits
+    (rc 7) or commits no remote holds (rc 6) is refused before the reset, nothing reset. ``carried`` (a dirty carry follows,
     t_894be273): an earlier carry's files are undone (:func:`_carry_undo`) before the checkout and fast-forward.
     The two combine: a reused clone is undone, then put on the exact ``sha``."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
@@ -893,7 +894,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
            f"[ \"$(git rev-parse HEAD)\" = {shlex.quote(sha)} ] || exit 5" if sha and not exact else "")
         # t_9965b8d5: a re-cloned scratch clone lands on the Studio's exact commit, even behind the tip (rc 5 otherwise)
         # Prism 30f81cba3dfc: never reset away a reused clone's commits that no remote holds (rc 6)
+        # Apollo F1 01:0x: nor its uncommitted edits (tracked changes, untracked non-ignored files: rc 7)
         + (f"; s={shlex.quote(sha)}; if [ \"$(git rev-parse HEAD)\" != \"$s\" ]; then "
+           "[ -z \"$(git status --porcelain)\" ] || exit 7; "
            "[ -z \"$(git rev-list -n 1 HEAD --not --remotes)\" ] || exit 6; git reset -q --hard \"$s\"; fi; "
            "[ \"$(git rev-parse HEAD)\" = \"$s\" ] || exit 5" if sha and exact else "")
     )

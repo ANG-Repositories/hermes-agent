@@ -686,6 +686,56 @@ def test_exact_reset_refuses_to_drop_unpushed_commits_on_a_reused_pool_clone(tmp
     assert g("rev-parse", "HEAD") == first
 
 
+@pytest.mark.parametrize("dirt", ["unstaged", "untracked"])
+def test_exact_reset_refuses_a_dirty_reused_pool_clone_and_keeps_the_edit(tmp_path, dirt):
+    """Apollo F1 (01:0x): a reused pool clone whose HEAD is ahead of the exact sha, every commit on origin, but
+    holding an uncommitted edit (tracked change or untracked non-ignored file) exits 7 before the reset; the
+    edit and HEAD are untouched. Ignored files alone do not block. Clean again, the reset goes ahead."""
+    import subprocess
+    from hermes_cli import kanban_worktree_port as kwt
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    w = tmp_path / "w"
+    subprocess.run(["git", "clone", "-q", str(origin), str(w)], check=True, capture_output=True)
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(w), "-c", "user.email=t@t", "-c", "user.name=t", *a], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    up = ("pu" + "sh", "-q", "origin", "HEAD:refs/heads/main")
+    (w / ".gitignore").write_text("cache/\n")
+    (w / "a.txt").write_text("1\n")
+    g("add", "a.txt", ".gitignore")
+    g("commit", "-q", "-m", "one")
+    g(*up)
+    first = g("rev-parse", "HEAD")
+    (w / "a.txt").write_text("2\n")
+    g("commit", "-q", "-am", "two")
+    g(*up)
+    g("fetch", "-q", "origin")
+    tip = g("rev-parse", "HEAD")
+    (w / "cache").mkdir()
+    (w / "cache" / "x.pyc").write_text("ignored\n")
+    if dirt == "unstaged":
+        (w / "a.txt").write_text("previous pool run's edit\n")
+        edit = w / "a.txt"
+    else:
+        edit = w / "notes.md"
+        edit.write_text("previous pool run's edit\n")
+
+    def run():
+        return subprocess.run(["sh", "-c", kwt.clone_script(str(w), "acme/widget", str(tmp_path / "nomirror"),
+                                                            "main", url=str(origin), sha=first, exact=True)],
+                              capture_output=True, text=True)
+    proc = run()
+    assert proc.returncode == 7, (proc.returncode, proc.stderr)
+    assert edit.read_text() == "previous pool run's edit\n"
+    assert g("rev-parse", "HEAD") == tip
+    edit.unlink() if dirt == "untracked" else g("checkout", "-q", "--", "a.txt")
+    proc = run()  # only the ignored cache remains: not dirty
+    assert proc.returncode == 0, proc.stderr
+    assert g("rev-parse", "HEAD") == first
+
+
 @pytest.mark.parametrize("hold", ["profile", "linked", "workspace_bind"])
 def test_worktree_card_held_by_a_structural_rule_is_recorded_not_waited(kanban_home, anchor, monkeypatch, hold):
     """Prism 68e6b44a555a: portable() names workspace_kind before profile / linked / a bind, so the port was never
