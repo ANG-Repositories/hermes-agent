@@ -23,14 +23,24 @@ _REASON_LEASE_LOST = "session turn lease lost"
 
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
-# A refresh that RAISES (e.g. state.db "database is locked" behind a long VACUUM) is retried while
-# the lease is still valid; the turn is interrupted only this close to the lease's expiry.
+# A refresh that RAISES is retried. Lock contention (state.db "database is locked") is retried for as
+# long as it lasts; any other error interrupts the turn only this close to the lease's expiry.
 LEASE_REFRESH_SAFETY_MARGIN_SECONDS = 30.0
 _REFRESH_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 
 
 def _now() -> float:
     return time.monotonic()
+
+
+def _is_lock_contention(exc: BaseException) -> bool:
+    """True when a refresh failed only because another writer held state.db. That says nothing
+    about who owns the row: an expired row stays this holder's until a successor claims it, and
+    the holder-qualified UPDATE answers that once the lock clears. Interrupting on it killed nine
+    kanban workers in two bursts on 2026-11-10 (t_61a89317) while sibling workers held the writer."""
+    from hermes_state import classify_persistence_error
+
+    return classify_persistence_error(exc) == "locked"
 
 
 class DurableTurnLease:
@@ -200,10 +210,12 @@ class DurableTurnLease:
         False stops the timer.
 
         A refresh that returns False means the lease is gone: interrupt at once. A refresh that
-        RAISES (state.db write lock held past the busy timeout) proves nothing about ownership and
-        the lease is still valid, so retry on a short backoff and interrupt only once the lease
-        could lapse (``LEASE_TTL_SECONDS - LEASE_REFRESH_SAFETY_MARGIN_SECONDS`` since the last
-        successful refresh).
+        RAISES proves nothing about ownership, so retry on a short backoff. Lock contention (another
+        writer held state.db past the busy timeout) is retried until the write goes through, even
+        past the TTL: an expired row is reclaimable, not taken, and the holder-qualified UPDATE
+        returns False the moment a successor has claimed it. Any other error interrupts once the
+        lease could lapse (``LEASE_TTL_SECONDS - LEASE_REFRESH_SAFETY_MARGIN_SECONDS`` since the
+        last successful refresh).
 
         The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
         finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
@@ -227,11 +239,11 @@ class DurableTurnLease:
                 )
                 self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
                 return False
-            except Exception:
+            except Exception as exc:
                 if self.stop.is_set():
                     return False
                 elapsed = _now() - self.last_refresh_ok
-                if elapsed >= give_up_after:
+                if elapsed >= give_up_after and not _is_lock_contention(exc):
                     logger.error(
                         "Failed to refresh session turn lease %s for %.0fs (%.0fs of validity "
                         "left); interrupting the turn", self._current_session_id(), elapsed,
@@ -241,10 +253,9 @@ class DurableTurnLease:
                         "Session turn lease could not be refreshed; stopping to protect the transcript."
                     )
                     return False
-                delay = min(
-                    _REFRESH_RETRY_BACKOFF_SECONDS[min(attempt, len(_REFRESH_RETRY_BACKOFF_SECONDS) - 1)],
-                    give_up_after - elapsed,
-                )
+                delay = _REFRESH_RETRY_BACKOFF_SECONDS[min(attempt, len(_REFRESH_RETRY_BACKOFF_SECONDS) - 1)]
+                if elapsed < give_up_after:
+                    delay = min(delay, give_up_after - elapsed)
                 logger.warning(
                     "Failed to refresh session turn lease %s (%.0fs of validity left); retrying "
                     "in %.0fs", self._current_session_id(), LEASE_TTL_SECONDS - elapsed, delay,

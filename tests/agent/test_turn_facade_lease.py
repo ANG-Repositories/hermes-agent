@@ -186,19 +186,48 @@ def test_refresh_locked_once_then_ok_does_not_interrupt(monkeypatch):
     assert lease.last_refresh_ok == calls[1]
 
 
-def test_refresh_locked_until_ttl_margin_interrupts_once(monkeypatch):
+def test_refresh_locked_past_ttl_then_ok_kills_no_turn(monkeypatch):
+    """2026-11-10 18:59 / 19:29: nine kanban workers exited 130 in two bursts. Each one's refresh
+    raised "database is locked" for ~290 s while other workers held the state.db writer 37-80 s
+    at a time, and the refresher interrupted the turn although its row was never taken. A locked
+    write proves nothing about ownership: retry past the TTL, renew when the lock clears."""
+    import sqlite3
+
+    locked = [sqlite3.OperationalError("database is locked")] * 20
+    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, locked + [True])
+    acquired_at = clock[0] - 60.0
+    assert lease.refresh_tick() is None  # timer keeps running
+    assert clock[0] - acquired_at > LEASE_TTL_SECONDS  # the lock really outlasted the TTL
+    assert interrupts == [] and lease.interrupt_message is None
+    assert len(calls) == 21 and len(waits) == 20
+    assert max(waits) <= 30.0  # backoff stays capped while it keeps trying
+    assert lease.last_refresh_ok == calls[-1]
+
+
+def test_refresh_non_lock_error_interrupts_at_ttl_margin(monkeypatch):
     from agent import turn_facade_lease as mod
 
-    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, [])
+    errors = [OSError("disk I/O error")] * 40
+    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, errors)
     acquired_at = clock[0] - 60.0
     assert lease.refresh_tick() is False
     assert interrupts == [_REFRESH_FAILED_MSG]
     # Gave up only once the lease could actually lapse, never with real validity left.
     assert clock[0] - acquired_at >= LEASE_TTL_SECONDS - mod.LEASE_REFRESH_SAFETY_MARGIN_SECONDS
     assert clock[0] - acquired_at < LEASE_TTL_SECONDS
-    assert len(calls) > 2
-    # Each failed attempt logged a WARNING; one ERROR when it finally interrupted.
     assert len(waits) == len(calls) - 1
+
+
+def test_refresh_locked_then_row_taken_over_interrupts_once(monkeypatch):
+    """The holder-qualified UPDATE is the ownership answer: once the lock clears and the row
+    names another holder, the turn stops."""
+    import sqlite3
+
+    locked = [sqlite3.OperationalError("database is locked")] * 20
+    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, locked + [False])
+    assert lease.refresh_tick() is False
+    assert interrupts == ["Session turn lease lost; stopping to protect the transcript."]
+    assert len(calls) == 21
 
 
 def test_refresh_returning_false_interrupts_immediately(monkeypatch):
