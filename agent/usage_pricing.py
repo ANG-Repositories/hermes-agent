@@ -1463,6 +1463,31 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-argon/",
         pricing_version="google-gemini-4-argon-intro-2026-09-30",
     ),
+    # gemini-4-carbon Standard paid tier, read 2026-11-11 from the pricing page:
+    # $2 in / $10 out (thinking included) / $0.10 cached input per 1M through
+    # 2026-11-30, then $4 / $20 / $0.20 from 2026-12-01. Implicit caching only,
+    # so no cache-write price. Served on the Ultra sub as gemini-4-carbon-high
+    # (cpa); effort ids resolve here via _strip_gemini_effort_suffix (t_fed0d5bb).
+    (
+        "google",
+        "gemini-4-carbon",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-gemini-4-carbon-intro-2026-11-11",
+        superseded_at=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        superseded_by=PricingEntry(
+            input_cost_per_million=Decimal("4.00"),
+            output_cost_per_million=Decimal("20.00"),
+            cache_read_cost_per_million=Decimal("0.20"),
+            source="official_docs_snapshot",
+            source_url="https://ai.google.dev/gemini-api/docs/pricing",
+            pricing_version="google-gemini-4-carbon-2026-12-01",
+        ),
+    ),
     # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
     # These are the launch rates Google lists "through December 31, 2026"; the
     # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027". Both are
