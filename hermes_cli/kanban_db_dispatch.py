@@ -684,6 +684,54 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     return int(matches[-1]) if matches else None
 
 
+# ``cli_single_query._raise_worker_exit`` (t_61a89317) prints this on the line before
+# the rc trailer when the turn was stopped in-process. Only a reason carrying a system
+# issuer (``interrupted_by_system(<issuer>)`` / ``interrupted_during_api_call(<issuer>)``)
+# matches: ``interrupted_by_user`` and a bare ``interrupted_during_api_call`` are human stops.
+_SYSTEM_INTERRUPT_RE = re.compile(
+    r"^\[kanban-worker-exit\] interrupted: "
+    r"((?:interrupted_by_system|interrupted_during_api_call)\(([^()\s]+)\))\s*$"
+)
+SYSTEM_INTERRUPT_EXIT_CODE = 130
+# A card whose every run is stopped by a system producer (e.g. a watchdog killing a
+# turn that hangs on the card's own tool) must still reach the breaker: after this
+# many trailing ``system_interrupted`` runs, the next one is booked as a crash.
+_SYSTEM_INTERRUPT_FREE_LIMIT = 3
+
+
+def _worker_log_system_interrupt(task_id: str, board: Optional[str] = None) -> "Optional[tuple[str, str]]":
+    """``(turn_exit_reason, issuer)`` when the current run's LAST exit trailer is ``rc=130``
+    and the non-blank line directly before it names a system-issued stop; else None."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=_kb._WORKER_LOG_SEGMENT_BYTES, board=board)
+    except Exception:
+        return None
+    raw = raw or ""
+    boundary = raw.rfind(_kb._RUN_BOUNDARY_PREFIX)
+    if boundary >= 0:
+        raw = raw[boundary:]
+    trailers = list(_EXIT_TRAILER_RE.finditer(raw))
+    if not trailers or int(trailers[-1].group(1)) != SYSTEM_INTERRUPT_EXIT_CODE:
+        return None
+    before = [ln for ln in raw[:trailers[-1].start()].splitlines() if ln.strip()]
+    m = _SYSTEM_INTERRUPT_RE.match(before[-1].strip()) if before else None
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _system_interrupted_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Trailing count of CLOSED runs whose outcome is ``system_interrupted``."""
+    streak = 0
+    for r in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT ?",
+        (task_id, _SYSTEM_INTERRUPT_FREE_LIMIT + 1),
+    ):
+        if r["outcome"] != "system_interrupted":
+            break
+        streak += 1
+    return streak
+
+
 def reap_worker_zombies() -> "list[int]":
     """Poll only our retained children, not other subsystems' subprocesses.
 
@@ -2506,6 +2554,7 @@ def detect_crashed_workers(
     # (task_id, pid, claimer, protocol_violation, error_text, stderr_tail)
     dead: list[tuple] = []  # (row, pid, exit_kind, exit_code) for every dead pid
     cohort_dead: list[str] = []
+    system_interrupted: list[str] = []
     # Cohort members whose pid was still in the process table: a misjudged
     # liveness check, not a kill (t_5c37ab9d). Named in the page.
     cohort_alive: list[str] = []
@@ -2602,6 +2651,16 @@ def detect_crashed_workers(
             cohort_death = row["id"] in cohort_ids
             stderr_exit_class = None
             provider_rejected_line = None
+            system_interrupt = None
+            if kind == "nonzero_exit" and code == SYSTEM_INTERRUPT_EXIT_CODE and not cohort_death:
+                # The worker's own process stopped the turn (turn-lease loss, liveness
+                # watchdog): not the card's fault, so no strike (t_69b98ec5). A user or
+                # operator stop, SIGINT (no line) and a signaled exit never get here.
+                system_interrupt = _worker_log_system_interrupt(row["id"], board=board)
+                if system_interrupt is not None and (
+                    _system_interrupted_streak(conn, row["id"]) < _SYSTEM_INTERRUPT_FREE_LIMIT
+                ):
+                    kind = "system_interrupted"
             if kind == "nonzero_exit" and not cohort_death:
                 stderr_exit_class = _kb._stderr_cooldown_class(
                     _kb._worker_log_run_segment(row["id"], board=board)
@@ -2650,6 +2709,23 @@ def detect_crashed_workers(
                 stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
                 if stderr_tail:
                     event_payload["stderr_tail"] = stderr_tail
+            elif kind == "system_interrupted":
+                protocol_violation = False
+                error_text = (
+                    f"pid {pid} exited {code}: its own process stopped the turn "
+                    f"({system_interrupt[0]}) — not a task failure; requeued "
+                    f"without counting a failure"
+                )
+                event_kind = "system_interrupted"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_kind": kind,
+                    "exit_code": code,
+                    "turn_exit_reason": system_interrupt[0],
+                    "interrupt_issuer": system_interrupt[1],
+                    "liveness": liveness[row["id"]],
+                }
             elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -2853,6 +2929,8 @@ def detect_crashed_workers(
                 # being filed under a quota wall it never hit.
                 if cohort_death:
                     _run_outcome = "cohort_death"
+                elif kind == "system_interrupted":
+                    _run_outcome = "system_interrupted"
                 elif kind == "infra_unavailable":
                     _run_outcome = "infra_unavailable"
                 elif kind == "provider_rejected":
@@ -2889,6 +2967,10 @@ def detect_crashed_workers(
                     # Released like a quota wall (no failure counted) but with
                     # no respawn deferral: the task was healthy, respawn it.
                     cohort_dead.append(row["id"])
+                elif kind == "system_interrupted":
+                    # Same release as a cohort death: no failure counted, no respawn
+                    # deferral (the card was healthy; its worker stopped itself).
+                    system_interrupted.append(row["id"])
                 elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
@@ -3093,6 +3175,7 @@ def detect_crashed_workers(
     # failure counted, not a crash, and NOT a quota wall.
     detect_crashed_workers._last_infra_unavailable = infra_unavailable  # type: ignore[attr-defined]
     detect_crashed_workers._last_cohort_deaths = cohort_dead  # type: ignore[attr-defined]
+    detect_crashed_workers._last_system_interrupted = system_interrupted  # type: ignore[attr-defined]
     if cohort_dead:
         _kb._log.error(
             "kanban cohort death: %d workers ended externally in one tick "
