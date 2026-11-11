@@ -785,6 +785,43 @@ def test_an_off_branch_tree_that_drops_branch_commits_stays_local_named(studio_c
     assert "own_tree_off_branch" in kwt.LOCAL_ONLY_REASONS
 
 
+def test_an_off_branch_carry_stays_portable_after_its_own_prefetch_push(studio_card, clone_prefetch,
+                                                                       no_ambient_git_config):
+    """Prism 97743f997e44: local and tracked ``wt/<id>`` at B; the own tree detached at descendant L with a
+    committed file and an untracked note; card persisted at the anchor. A deferred tick pushes L and clones +
+    carries. The next tick, without a fetch (the tracking ref still says B, origin says L), must stay portable and
+    collect THAT clone: never route local, never check out B. The Studio's refs are not changed."""
+    tid, wt, bare, calls = studio_card
+    anchor = wt.parent.parent
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    _git("fetch", "-q", "origin", cwd=anchor)
+    b = _ref(anchor, f"refs/heads/wt/{tid}")
+    _git("checkout", "-q", "--detach", cwd=wt)
+    _commit(wt, "committed-off-branch")
+    (wt / "note.txt").write_text("untracked note")
+    l_sha = _ref(wt, "HEAD")
+    studio_refs = _refs(anchor)
+    with kb.connect_closing() as conn:
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                             defer_pool_clone=True)
+        assert spawned == [] and res.placement_waits[tid].startswith(kwt.CLONE_PENDING), res.placement_waits
+        _wait_prefetch_done()
+        assert _ref(bare, f"refs/heads/wt/{tid}") == l_sha               # the prefetch pushed L
+        assert _ref(anchor, f"refs/remotes/origin/{f'wt/{tid}'}") == b   # the tracking ref still says B
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=1), worktree_out=out) == ("portable", None)
+        res2, spawned2 = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test",
+                               defer_pool_clone=True)
+        row = _row(conn, tid)
+    assert (tid, "ace-ai") in spawned2, (res2.placement_waits, getattr(res2, "spawn_failed", None))
+    assert len(calls) == 1                                               # collected, never cloned again
+    ws = Path(row["workspace_path"])
+    assert row["workspace_kind"] == "scratch" and _ref(ws, "HEAD") == l_sha   # L, never B
+    assert (ws / "note.txt").read_text() == "untracked note"
+    assert _refs(anchor) == studio_refs                                  # the Studio's refs are unchanged
+    assert _ref(wt, "HEAD") == l_sha
+
+
 def test_derived_diverged_branch_stays_local_and_ahead_branch_pushes(anchor):
     _commit(anchor, "base")
     base = _ref(anchor, "HEAD")

@@ -29,6 +29,28 @@ def test_the_tree_passes_and_every_reason_has_a_justification():
     assert set(kwt.LOCAL_ONLY_REASONS) == set(lint.ENUMERATED)
 
 
+def test_why_is_the_choke_point_every_constant_is_listed_and_an_unknown_reason_is_recorded(caplog, tmp_path):
+    """Prism b4c7ade40781: whatever the static lint misses, ``_why`` records a reason outside the table as
+    ``unenumerated_local_reason`` (one loud log line naming it), and is the only writer of a reason list."""
+    from hermes_cli import kanban_worktree_port as kwt
+    consts = {n: v for n, v in vars(kwt).items() if n.startswith("WHY_")}
+    assert consts and all(v in kwt.LOCAL_ONLY_REASONS for v in consts.values()), consts
+    why: list = []
+    with caplog.at_level("ERROR", logger=kwt.__name__):
+        kwt._why(why, "operator_pin" + "_extra")
+    assert why == ["unenumerated_local_reason"]
+    assert [r for r in caplog.records if "'operator_pin_extra'" in r.getMessage()]
+    known: list = []
+    kwt._why(known, kwt.WHY_NO_POOL)
+    assert known == ["no_pool_host"]
+    # a write round the choke point fails the lint
+    src = PORT.read_text(encoding="utf-8-sig")
+    port = tmp_path / "kanban_worktree_port.py"
+    port.write_text(src + '\n\ndef _new_rule(why):\n    why.append("checkout_lives_on_the_studio")\n',
+                    encoding="utf-8")
+    assert _lint().main([str(port), str(DISPATCH)]) == 1
+
+
 def test_an_unlisted_local_only_reason_fails(tmp_path):
     src = PORT.read_text(encoding="utf-8-sig")
     port = tmp_path / "kanban_worktree_port.py"

@@ -38,7 +38,11 @@ ENUMERATED = frozenset({
     "dirty_path_through_symlink", "dirty_path_not_plain_file",
     # kill-switch / hand-list only (derived: false, KANBAN_DIRTY_CARRY=0)
     "unpushed_dirty_tree", "unpushed_commits", "derived_mode_off",
+    # _why's own runtime fallback for a reason outside the table (Prism b4c7ade40781)
+    "unenumerated_local_reason",
 })
+# Methods that write a list in place: only `_why` may call one on a `why` list.
+_LIST_WRITERS = frozenset({"append", "extend", "insert", "__setitem__", "__iadd__"})
 # The one sanctioned fixed string (a host: pin the port does not serve); it names no repo list.
 DISPATCH_FIXED_OK = re.compile(r"^not_portable:workspace_kind:worktree card not portable to the pinned host")
 
@@ -165,6 +169,26 @@ def check_port(path: Path) -> list:
                           "justification AND to scripts/check_worktree_local_reasons.py ENUMERATED)")
     funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    # `_why` is the only writer of a reason list: it maps an unlisted reason to unenumerated_local_reason at
+    # runtime, so a write that goes round it would bypass that (Prism b4c7ade40781).
+    if "_why" not in funcs:
+        errors.append(f"{path.name}: the _why choke point is missing")
+    inside_why = {id(n) for n in ast.walk(funcs["_why"])} if "_why" in funcs else set()
+    for node in ast.walk(tree):
+        if id(node) in inside_why:
+            continue
+        target = None
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _LIST_WRITERS:
+            target = node.func.value
+        elif isinstance(node, ast.AugAssign):
+            target = node.target
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                if isinstance(t, ast.Subscript):
+                    target = t.value
+        if isinstance(target, ast.Name) and target.id == "why":
+            errors.append(f"{path.name}:{getattr(node, 'lineno', '?')}: writes the reason list outside _why "
+                          "(only _why may: it records an unlisted reason as unenumerated_local_reason)")
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_why":
             arg = node.args[1] if len(node.args) >= 2 else next(

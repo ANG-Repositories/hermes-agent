@@ -97,6 +97,7 @@ WHY_CARRY_SIZE = "dirty_tree_over_cap"               # more than DIRTY_CARRY_MAX
 WHY_BASE_MOVED = "origin_tip_not_studio_head"        # the clone would not start at the tree's HEAD
 WHY_SYMLINK_PARENT = "dirty_path_through_symlink"     # a changed path under a symlinked directory (Prism 9e03f1e94c2d)
 WHY_SPECIAL_FILE = "dirty_path_not_plain_file"        # a changed path that is not a regular file or a symlink
+WHY_UNENUMERATED = "unenumerated_local_reason"        # _why got a reason outside LOCAL_ONLY_REASONS (a code bug)
 # Every reason a GitHub worktree card may stay on the Studio, with why it must. The lint
 # (scripts/check_worktree_local_reasons.py) keeps its own copy of the keys: adding a reason
 # changes both, so it shows in review (t_20fa16c7, Ace 2026-11-10: "All machines can make any checkout always").
@@ -125,6 +126,8 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
                "the tree failed: uncommitted work in the Studio tree",
     WHY_UNPUSHED: "hand-list mode only (derived: false): committed work origin lacks",
     WHY_DERIVED_OFF: "hand-list mode (derived: false / KANBAN_MIRROR_DERIVED=0) and the repo has no row",
+    WHY_UNENUMERATED: "a code bug: a path named a reason that is not in this table; _why records this instead and "
+                      "logs the offending string, so no unlisted reason reaches the dispatcher",
 }
 PORTED_EVENT = "worktree_ported"
 # portable() bind rule of a ported card: it runs where its clone is.
@@ -285,7 +288,14 @@ def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str
 
 
 def _why(why: Optional[List[str]], reason: str) -> None:
+    """The ONLY writer of a ``why`` list (Prism b4c7ade40781): a reason outside :data:`LOCAL_ONLY_REASONS` is
+    recorded as :data:`WHY_UNENUMERATED` with one loud log line naming it. Never raises (the dispatcher tick)."""
     if why is not None and not why:
+        if not isinstance(reason, str) or reason not in LOCAL_ONLY_REASONS:
+            _log.error("kanban worktree port: unenumerated local-only reason %r recorded as %s (add it to "
+                       "LOCAL_ONLY_REASONS and scripts/check_worktree_local_reasons.py ENUMERATED, or fix the "
+                       "caller)", reason, WHY_UNENUMERATED)
+            reason = WHY_UNENUMERATED
         why.append(reason)
 
 
@@ -528,7 +538,10 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
         if top_ret is None:
             return None, None
         live = _origin_tip(top, b, runner)
-        if not local or live is None or live != (push[2] if push is not None else local):
+        # Origin already at the assessed source tip = the push happened (a prefetch pushed it and the tracking
+        # ref, never updated by that push, still shows the old sha): keep the same plan, so the key still
+        # collects that clone (Prism 97743f997e44). Re-pushing it is a no-op.
+        if not local or live is None or live not in ((push[2], local) if push is not None else (local,)):
             _why(why, WHY_BASE_MOVED)
             return None, None
         carry_out.append((str(own_tree), local, carry))
