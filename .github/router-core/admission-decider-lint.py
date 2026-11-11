@@ -160,8 +160,57 @@ _MAY_COMPARE = re.compile(METRIC.replace("_", "_?").replace(r"\b", ""), re.IGNOR
 _MAY_COUNT = re.compile(_MAY_COMPARE.pattern + "|" + LOAD_VARIABLE + "|ncpu", re.IGNORECASE)
 # t_27c11e86: an awk program reading /proc/loadavg compares load fields ($1..$3) inside one quoted literal, where no
 # metric name ever appears. Same command only: the file argument, `< /proc/loadavg`, or a pipe from it.
-_AWK_LOADAVG = re.compile(r"\bawk\b[^\n|;&]*?'(?P<a>[^'\n]*)'[^\n|;&]*?/proc/loadavg\b"
-                          r"|/proc/loadavg\b[^\n;&|]*\|\s*awk\b[^\n|;&']*'(?P<b>[^'\n]*)'")
+_AWK_CMD = re.compile(r"\bawk\b")
+_AWK_PIPED_FROM_LOADAVG = re.compile(r"/proc/loadavg\b[^\n;&|]*\|\s*$")
+# awk options whose value is the NEXT word (`-F ' '`, `-W posix`); an attached value (`-F' '`, `--assign=x=1`) is part
+# of the option word. POSIX -F -v -f; mawk/gawk -W; gawk -E -i -l and the long forms getopt also accepts detached.
+# Never -e/--source: that value IS the program text (Prism c-ec900d6cb1a6e6e6, c-7339dcf869edcf47).
+_AWK_VALUE_OPTS = ("-F", "-v", "-f", "-W", "-E", "-i", "-l",
+                   "--field-separator", "--assign", "--file", "--exec", "--include", "--load")
+
+
+def _awk_loadavg_programs(source: str):
+    """(offset, text) of each single-quoted awk PROGRAM fed from /proc/loadavg in the same command.
+
+    The program is the first operand word, never an option value (Prism c-a4131cd75d88ece3: `awk -F' ' '$1 > 8'`
+    and `awk -F ' ' ...` took the separator ' ' as the program). Words are read shell-style up to an unquoted
+    `|`, `;`, `&` or newline."""
+    for awk in _AWK_CMD.finditer(source):
+        line_start = source.rfind("\n", 0, awk.start()) + 1
+        piped = bool(_AWK_PIPED_FROM_LOADAVG.search(source, line_start, awk.start()))
+        i, n, words = awk.end(), len(source), []
+        while i < n and source[i] not in "\n|;&":
+            if source[i] in " \t":
+                i += 1
+                continue
+            start, quoted = i, []
+            while i < n and source[i] not in " \t\n|;&":
+                if source[i] in "'\"":
+                    close = source.find(source[i], i + 1)
+                    if close < 0 or "\n" in source[i:close]:
+                        i = n
+                        break
+                    quoted.append((i + 1, source[i + 1:close]))
+                    i = close + 1
+                else:
+                    i += 1
+            words.append((source[start:i], quoted))
+        program, expect_value = None, False
+        for k, (word, quoted) in enumerate(words):
+            if program is None:
+                if expect_value:
+                    expect_value = False
+                elif word in _AWK_VALUE_OPTS:
+                    expect_value = True
+                elif word.startswith("-"):
+                    pass
+                else:
+                    program = (k, quoted[0] if word.startswith("'") and len(quoted) == 1 else None)
+        if program is None or program[1] is None:
+            continue
+        rest = " ".join(w for w, _ in words[program[0] + 1:])
+        if piped or re.search(r"/proc/loadavg\b", rest):
+            yield program[1]
 _AWK_LOAD_FIELD = re.compile(r"\$[123](?!\d)")
 
 
@@ -178,7 +227,7 @@ def _operand(source: str, pos: int, direction: int, quotes=None, nest=None, lang
     newline inside an open (/[ group (``nest``) continues the expression.
     Python has no brace blocks or pipelines: there code braces (``braces``,
     never an f-string replacement field) group like `()` (dict and set
-    displays) and `|` is bitwise OR, an operator inside the operand.
+    displays) and `|` is bitwise OR, an operator inside the operand (Go too).
     """
     limit = 0 if direction < 0 else len(source)
     cursor, depth = pos, 0
@@ -205,7 +254,9 @@ def _operand(source: str, pos: int, direction: int, quotes=None, nest=None, lang
                 fragment = source[index + 1:pos] if direction < 0 else source[pos:index]
                 if fragment.strip():
                     break
-            if char in ',:;{}' and index not in braces or char == '|' and lang != "py":
+            # Python and Go bind `|` tighter than a comparison (Prism c-b7b8d1e87411456b): there it is inside the
+            # operand. Elsewhere it is a pipe or a lower-precedence bitwise OR.
+            if char in ',:;{}' and index not in braces or char == '|' and lang not in ("py", "go"):
                 break
             if char.isspace():
                 # Only the nearest non-blank neighbours matter; never copy the
@@ -296,43 +347,19 @@ def hits_in(text: str, lang: str = "py") -> int:
         return 0   # t_89091ec3: nothing here can count; skip the per-line comment strip
     lines = []
     depth = 0
-    for row, line in enumerate(text.splitlines()):
-        comments = ("//", "#!") if lang == "js" else ("#", "//")
-        if line.lstrip().startswith(comments):
-            lines.append("")
-            continue
-        marker = "//" if lang in ("c", "go", "js", "ts", "tsx") else "#"
-        adapter = "c" if marker == "//" else lang
-        bare, _ = _blank_line(line, adapter, None)
-        prefix = line.split(marker, 1)
+    for row, (code, bare, comment, clean) in enumerate(_code_lines(text, lang)):
         before_depth = depth
         for char in bare:
             if char in "([":
                 depth += 1
             elif char in ")]":
                 depth = max(0, depth - 1)
-        if (before_depth == depth == 0 and not bare.rstrip().endswith("\\") and
-                len(prefix) == 2 and WAIVER in prefix[1] and
-                _blank_line(prefix[0], adapter, None)[0] == bare and
-                _blank_line(prefix[0] + " ADMISSION_COMMENT_BOUNDARY", adapter, None)[0].endswith(
-                    "ADMISSION_COMMENT_BOUNDARY") and
-                _waiver_owner(row, row, row, bare) is not None):
+        # The waiver is the text of the REAL trailing comment the one pass found (Prism c-6b306bcf46008466: never
+        # the first marker substring, which may sit inside a string).
+        if (clean and comment is not None and WAIVER in comment and before_depth == depth == 0 and
+                not bare.rstrip().endswith("\\") and _waiver_owner(row, row, row, bare) is not None):
             lines.append("")
         else:
-            # Locate a real trailing comment without deleting literal metric keys.
-            # Reuse the quote adapter only to recognize comment boundaries.
-            code = line
-            for match in re.finditer(re.escape(marker), line):
-                before = line[:match.start()]
-                # An escaped slash in a JS regex is not a line-comment opener.
-                # Unknown slash syntax counts conservatively rather than hiding code.
-                if marker == "//" and before.endswith("\\"):
-                    continue
-                if _blank_line(before + " ADMISSION_COMMENT_BOUNDARY", adapter, None)[0].endswith(
-                        "ADMISSION_COMMENT_BOUNDARY"):
-                    if marker != "#" or adapter != "sh" or not before or before[-1] in " \t;(":
-                        code = before
-                        break
             lines.append(code)
     source = "\n".join(lines).replace("\\\n", " ")
     quotes = {}
@@ -426,6 +453,19 @@ def hits_in(text: str, lang: str = "py") -> int:
             bound.update(names)
         elif len(items) == len(names):
             bound.update(n for n, item in zip(names, items) if metric_read(item))
+    if lang == "sh":
+        # Shell `read` from /proc/loadavg (Prism c-c72ba317243173bb): `read -r one five fifteen _ < /proc/loadavg`
+        # binds the three load fields; a read fed by a command that reads /proc/loadavg (`< <(ssh h 'read l _
+        # </proc/loadavg; echo "$l $(nproc)"')`) binds its first name, the field the command echoes first.
+        for read in re.finditer(r"\bread\b((?:[ \t]+-[A-Za-z]+)*)((?:[ \t]+[A-Za-z_]\w*)+)[ \t]*(<[^\n]*)", source):
+            # Slice by field position first, then drop `_` placeholders (Prism 3a5d25cf0633: filtering first shifted
+            # `read _ _ _ procs pid` onto the load fields).
+            names = read.group(2).split()
+            rest = read.group(3)
+            if re.match(r"<\s*/proc/loadavg\b", rest):
+                bound.update(n for n in names[:3] if n != "_")
+            elif re.search(r"/proc/loadavg\b", rest):
+                bound.update(n for n in names[:1] if n != "_")
     bound = {n for n in bound if len(n) > 1}   # `p`, `n`: loop scratch names get rebound
     # Shell: an awk program is a literal, but `awk -v l="$load1" '... l < m ...'`
     # compares the load under an alias. Aliases of a load variable (metric-named
@@ -476,9 +516,7 @@ def hits_in(text: str, lang: str = "py") -> int:
             compared_spans.append((op.start() - len(left), op.end() + len(right)))
             counted_ops.add(op.start())
     if lang == "sh":
-        for awk in _AWK_LOADAVG.finditer(source):
-            group = "a" if awk.group("a") is not None else "b"
-            program, base = awk.group(group), awk.start(group)
+        for base, program in _awk_loadavg_programs(source):
             for op in _COMPARISON.finditer(program):
                 if base + op.start() in counted_ops:
                     continue
@@ -495,88 +533,115 @@ def hits_in(text: str, lang: str = "py") -> int:
     return count
 
 
-def _blank_line(code: str, lang: str, in_triple):
-    """(bare, in_triple') for one physical line: blanks quoted spans and the trailing comment for delimiter
-    counting, carrying Python triple-quote state across lines (053e4801af29).
+# JS/TS: a `/` starts a regex literal where an operand is expected: at line start, after an operator/opening punctuator,
+# or after a keyword that takes an expression. Anywhere else (after an identifier, a number, `)` or `]`) it divides.
+# A doubled `++`/`--` is a postfix operator on a complete operand, so a `/` after it divides too (Prism c-d55cc5e55f7c).
+_JS_REGEX_PREV = re.compile(r"(?:^|[(,=:\[!&|?{};*%<>~^]|(?<![+\-])[+\-]|"
+                            r"\b(?:return|typeof|case|do|else|in|of|new|delete|void|"
+                            r"throw|instanceof|yield|await))\s*$")
 
-    Prism a21209b97e0e: one left-to-right scan of the whole line, so a triple quote opens wherever it sits
-    (after indentation, after `x = `, after a closed single-line string), never only at column zero."""
-    if lang != "py":
-        return _blank_quotes_and_comment(code, lang), None
+
+def _js_regex_end(line: str, i: int):
+    """Index just past the regex literal opening at ``line[i] == '/'``, or None when it does not close on the line.
+    `\\` escapes one char; a `/` inside a `[...]` class does not close it."""
+    k, in_class = i + 1, False
+    while k < len(line):
+        c = line[k]
+        if c == "\\":
+            k += 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]":
+            in_class = False
+        elif c == "/" and not in_class:
+            k += 1
+            while k < len(line) and (line[k].isalnum() or line[k] == "_"):
+                k += 1   # flags
+            return k
+        k += 1
+    return None
+
+
+def _code_lines(text: str, lang: str) -> list:
+    """ONE comment/string pass over the file (t_91299393): per physical line (code, bare, comment, clean).
+
+    ``code`` is the line with comments removed and string literals KEPT (a literal metric key still counts); a block
+    comment is blanked to spaces, so `cpu_busy /* 0..100 */ > 90` keeps its operand and Python columns never move.
+    ``bare`` is the code outside every literal (delimiter counting, waiver ownership). ``comment`` is the text of the
+    line's real trailing comment, or None. ``clean``: the line opens and closes outside any multi-line literal/comment.
+    Carried across lines: Python triple quotes (Prism c-4aa8c4b368f46149), C-family block comments (c-c278ea1076b23728)
+    and backtick literals (Go raw strings, JS templates). Other quotes close at end of line, as before.
+    Markers: Python `#`; shell `#` starting a word (never `$#`, `${#a[@]}`, `foo#bar`); C-family `//` and `/* */`
+    (neither after `\\`, a JS regex); JS/TS also a `#!` first line."""
+    cfam = lang in ("c", "go", "js", "ts", "tsx")
     out = []
-    q = None                     # open single-line quote char
-    i, n = 0, len(code)
-    while i < n:
-        if in_triple:
-            if code[i] == "\\":
+    state = None                      # '"""' / "'''" (py), '*/' (block comment), '`' (go/js)
+    for line in text.splitlines():
+        opened = state
+        code, bare, comment, q = [], [], None, None
+        i, n = 0, len(line)
+        if lang in ("js", "ts", "tsx") and state is None and line.lstrip().startswith("#!"):
+            out.append(("", "", line.lstrip()[2:], True))
+            continue
+        while i < n:
+            c = line[i]
+            if state == "*/":
+                if line.startswith("*/", i):
+                    code.append("  ")
+                    i, state = i + 2, None
+                else:
+                    code.append(" ")
+                    i += 1
+                continue
+            if state is not None or q is not None:
+                close = state or q
+                if c == "\\" and not (close == "`" and lang == "go") and not (close == "'" and lang == "sh"):
+                    code.append(line[i:i + 2])
+                    i += 2
+                    continue
+                if line.startswith(close, i):
+                    code.append(close)
+                    i += len(close)
+                    state, q = (None, q) if state else (state, None)
+                    continue
+                code.append(c)
+                i += 1
+                continue
+            if lang == "py" and line.startswith(('"""', "'''"), i):
+                state = line[i:i + 3]
+            elif c == "`" and (lang == "go" or lang in ("js", "ts", "tsx")):
+                state = c
+            elif c in "'\"" or (c == "`" and lang == "sh"):
+                q = c
+            elif (lang in ("js", "ts", "tsx") and c == "/" and line[i + 1:i + 2] not in ("/", "*") and
+                  _JS_REGEX_PREV.search("".join(code)) and (end := _js_regex_end(line, i)) is not None):
+                # A regex literal where an operand is expected (Prism 2bd37a842cdd): its body (`/[/*]/`) never opens a
+                # comment. Kept in ``code`` like any literal; an unclosed one falls through as a plain `/`.
+                code.append(line[i:end])
+                i = end
+                continue
+            elif cfam and line.startswith("/*", i) and not (i and line[i - 1] == "\\"):
+                state = "*/"
+                code.append("  ")
                 i += 2
                 continue
-            if code.startswith(in_triple, i):
-                i, in_triple = i + 3, None
+            elif cfam and line.startswith("//", i) and not (i and line[i - 1] == "\\"):
+                comment = line[i + 2:]
+                break
+            elif not cfam and c == "#" and (lang != "sh" or i == 0 or line[i - 1] in " \t;("):
+                comment = line[i + 1:]
+                break
+            if state is not None or q is not None:
+                opener = state if state and state != "*/" else c
+                code.append(opener)
+                i += len(opener)
                 continue
+            code.append(c)
+            bare.append(c)
             i += 1
-            continue
-        c = code[i]
-        if q:
-            if c == "\\":
-                i += 2
-                continue
-            if c == q:
-                q = None
-            i += 1
-            continue
-        if code.startswith(("'''", '"""'), i):
-            in_triple = code[i:i + 3]
-            i += 3
-            continue
-        if c in ("'", '"'):
-            q = c
-            i += 1
-            continue
-        if c == "#":
-            break
-        out.append(c)
-        i += 1
-    return "".join(out), in_triple
-
-
-
-
-def _blank_quotes_and_comment(code: str, lang: str = "py") -> str:
-    """The line with every quoted span blanked and a trailing comment removed, for delimiter counting only (the
-    comparison regex still reads the real text). Quotes are matched per line: a quote that does not close on its
-    line blanks to EOL, which keeps a multi-line string from opening a join either.
-
-    Prism fba51c46ef6f / 7cfa74e7831e: the comment marker is per language. Python: `#` only (`//` is floor
-    division). Shell: `#` only when it starts a word (preceded by start/space/`;`/`(`), never inside `$#`,
-    `${#arr[@]}` or `foo#bar`. JS/TS/Go-style: `//`. A wrong marker ate the closing delimiter and opened a join."""
-    out = []
-    q = None
-    i = 0
-    n = len(code)
-    while i < n:
-        c = code[i]
-        if q:
-            if c == "\\":
-                i += 2
-                continue
-            if c == q:
-                q = None
-            i += 1
-            continue
-        if c in ("'", '"', '`'):
-            q = c
-            i += 1
-            continue
-        if lang == "py" and c == "#":
-            break
-        if lang == "sh" and c == "#" and (i == 0 or code[i - 1] in " \t;(") :
-            break
-        if lang in ("c", "go") and code.startswith("//", i):
-            break
-        out.append(c)
-        i += 1
-    return "".join(out)
+        out.append(("".join(code), "".join(bare), comment, opened is None and state is None))
+    return out
 
 
 _LANG_BY_SUFFIX = {".py": "py", ".sh": "sh", ".bash": "sh", ".zsh": "sh", ".js": "js", ".ts": "ts", ".go": "go",
