@@ -2997,18 +2997,18 @@ def restore_cron_jobs_all_profiles(
     return restored
 
 
-_QUICK_PARTIAL_MAX_AGE_S = 12 * 3600
+_QUICK_PARTIAL_MAX_AGE_S = 24 * 3600
 _QUICK_PARTIAL_RE = re.compile(r"^\.(?P<id>.+)\.(?P<pid>\d+)\.partial$")
 
 
 def _pid_alive(pid: int) -> bool:
+    """True when the pid exists or cannot be checked (fail closed: keep the partial)."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return True  # exists but not ours, or unknown: treat as alive
-    return True
+        import psutil
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:  # noqa: BLE001 - psutil missing or erroring: never sweep on doubt
+        return True
 
 
 def _newest_mtime(path: Path) -> Optional[float]:
@@ -3031,22 +3031,28 @@ def _sweep_stale_partials(root: Path, max_age_s: float = _QUICK_PARTIAL_MAX_AGE_
     """Remove ``.<id>.<pid>.partial`` staging dirs left by a killed quick snapshot. Returns count deleted.
 
     create_quick_snapshot only clears a staging dir with its own name, so a run killed mid-copy (SIGKILL,
-    reboot, OOM) leaves a full-size orphan nothing else removes: 14.6 GiB of fleetbk partials sat in the
-    Studio's state-snapshots for weeks (t_8ca3f9a1). A partial goes only when its writer pid is gone AND
-    nothing under it was written for ``max_age_s`` (default 12 h); an unreadable tree is kept.
+    reboot, OOM) leaves a full-size orphan nothing else removes: 5 partials / 15.2 GiB sat in the Studio's
+    state-snapshots for weeks (t_8ca3f9a1). A partial goes only when ALL hold: it is not the newest partial
+    (that may be the run in progress), its writer pid is gone, and nothing under it was written for
+    ``max_age_s`` (default 24 h). An unreadable tree is kept.
     """
     if not root.is_dir():
         return 0
     now = time.time() if now is None else now
-    deleted = 0
+    found: List[Tuple[float, Path, int]] = []
     for d in root.iterdir():
         m = _QUICK_PARTIAL_RE.match(d.name)
         if not m or d.is_symlink() or not d.is_dir():
             continue
-        if _pid_alive(int(m.group("pid"))):
-            continue
         newest = _newest_mtime(d)
-        if newest is None or now - newest < max_age_s:
+        if newest is None:
+            continue  # unreadable: keep
+        found.append((newest, d, int(m.group("pid"))))
+    found.sort(key=lambda t: t[0])
+    found = found[:-1]  # never the newest partial: it may be the run in progress
+    deleted = 0
+    for newest, d, pid in found:
+        if now - newest < max_age_s or _pid_alive(pid):
             continue
         try:
             shutil.rmtree(d)
