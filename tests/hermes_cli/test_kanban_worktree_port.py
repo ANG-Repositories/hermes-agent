@@ -594,8 +594,10 @@ def test_push_lease_refuses_a_branch_moved_on_origin(anchor, tmp_path):
 
 
 def test_derived_dirty_own_tree_stays_local_named(kanban_home, anchor, monkeypatch):
-    """The only remaining local-only worktree case: the card's own Studio tree has uncommitted work."""
+    """With the dirty-tree carry switched off (t_894be273 kill switch), the card's own Studio tree with
+    uncommitted work stays local, as before."""
     _commit(anchor, "base")
+    monkeypatch.setenv(kwt.DIRTY_CARRY_ENV, "0")
     monkeypatch.setattr(kbd, "_studio_last_resort", lambda fleet_dir: True)
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
@@ -914,3 +916,367 @@ def test_clone_script_pins_a_reused_workspace_to_the_tip(tmp_path):
     assert _ref(ws, "HEAD") == sha_b
     sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin), sha="0" * 40)
     assert subprocess.run(["sh", "-c", sc], capture_output=True).returncode == 5
+
+
+# ---- dirty own tree carried into the pool clone, never pushed (t_894be273) ----
+
+def _local_ssh(calls):
+    """A runner that runs the remote half of an ``ssh ... <target> <cmd>`` argv in a local ``sh``."""
+    def run(argv, **kw):
+        if argv and argv[0] == "ssh":
+            calls.append(argv[-1])
+            argv = ["sh", "-c", argv[-1]]
+        return subprocess.run(argv, **kw)
+    return run
+
+
+def _clone_locally(monkeypatch, tmp_path, bare, calls):
+    """The real clone_on_host (clone + carry in one ssh call), with the clone pointed at the local origin and the
+    ssh half run in a local sh."""
+    real_script = kwt.clone_script
+    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, mirror, branch, url=None, sha=None, **kw: real_script(
+        w, slug, str(tmp_path / "no-mirror.git"), branch, url=str(bare), sha=sha, **kw))
+    real = kwt.clone_on_host
+    monkeypatch.setattr(kwt, "clone_on_host", lambda host, w, slug, mirror, branch, runner=None, sha=None,
+                        carry=None: real(host, w, slug, mirror, branch, runner=_local_ssh(calls), sha=sha,
+                                         carry=carry))
+
+
+def _carry(ws, wt, head, calls, bare, tmp_path, runner=None):
+    """Clone (or re-run on a reused clone) at ``head`` and carry ``wt``'s dirty state, one local 'ssh' call."""
+    real_script = kwt.clone_script
+    sc = lambda w, slug, mirror, branch, url=None, sha=None, **kw: real_script(  # noqa: E731
+        w, slug, str(tmp_path / "no-mirror.git"), branch, url=str(bare), sha=sha, **kw)
+    orig, kwt.clone_script = kwt.clone_script, sc
+    try:
+        census = kwt.dirty_census(wt)
+        kwt.clone_on_host(_host("ace-ai"), str(ws), SLUG, "unused", _branch(wt),
+                          runner=runner or _local_ssh(calls), sha=head,
+                          carry=(str(wt), head, kwt.carry_digest(wt, census)))
+    finally:
+        kwt.clone_script = orig
+
+
+def _branch(tree):
+    return subprocess.run(["git", "-C", str(tree), "branch", "--show-current"], capture_output=True,
+                          text=True).stdout.strip()
+
+
+def _dirty_tree(conn, anchor, tmp_path, monkeypatch):
+    bare = _origin_with_push(anchor, tmp_path)
+    monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: SLUG)
+    _commit(anchor, "base")
+    _commit(anchor, "doomed")
+    tid = _worktree_card(conn, anchor)
+    wt = anchor / ".worktrees" / tid
+    _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    _git("fetch", "-q", "origin", cwd=anchor)
+    (wt / "scratch.txt").write_text("uncommitted")
+    (wt / "base").write_text("edited")
+    (wt / "doomed").unlink()
+    return bare, tid, wt
+
+
+def _port_of(tid, wt, fleet):
+    why: list = []
+    return kwt.port_for(tid, str(wt), None, fleet, allow_studio_tree=True, pool_hosts=("ace-ai",), why=why), why
+
+
+def _tree_state(tree):
+    """Every non-ignored path with its bytes, as the working tree holds it."""
+    out = subprocess.run(["git", "-C", str(tree), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                         capture_output=True).stdout
+    names = [f.decode() for f in out.split(b"\0") if f]
+    return {n: (tree / n).read_bytes() for n in names if (tree / n).is_file()}
+
+
+def _refs(bare):
+    return subprocess.run(["git", "-C", str(bare), "for-each-ref"], capture_output=True, text=True).stdout
+
+
+def test_dirty_own_tree_is_carried_into_the_clone_and_nothing_is_pushed(kanban_home, anchor, tmp_path,
+                                                                        monkeypatch):
+    """Red-first (Apollo 18:0x F1): a dirty own tree used to stay local as unpushed_dirty_tree. Now port_for
+    returns a route, the clone job clones the card branch pinned to the tree's HEAD, and the changed files and the
+    deletion are copied straight into that clone over ssh. Nothing reaches the remote: its refs are unchanged."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    head, refs_before, studio = _ref(wt, "HEAD"), _refs(bare), _tree_state(wt)
+    port, why = _port_of(tid, wt, kanban_home / "fleet")
+    assert port is not None and why == [], why
+    assert port[4] is None and port[5][:2] == (str(wt), head) and len(port[5][2]) == 64
+    ws = tmp_path / "pool" / tid
+    calls: list = []
+    _clone_locally(monkeypatch, tmp_path, bare, calls)
+    _key, job, _lock = kbd._pool_clone_job(tid, f"wt/{tid}", _host("ace-ai"), port, ws)
+    job()
+    assert len(calls) == 1                                  # clone + carry: ONE ssh call (one admitted site)
+    assert _ref(ws, "HEAD") == head                         # the clone is at the Studio head, no extra commit
+    assert _tree_state(ws) == studio                        # byte-equal, deletion applied
+    assert not (ws / "doomed").exists() and (ws / "scratch.txt").read_text() == "uncommitted"
+    assert _refs(bare) == refs_before                       # nothing pushed: no new ref, card branch unmoved
+    assert _tree_state(wt) == studio                        # the Studio tree is untouched
+
+
+def test_carry_runs_on_every_port_and_a_reused_clone_ends_byte_equal(kanban_home, anchor, tmp_path, monkeypatch):
+    """Apollo F4 / Prism 6d57e664864b: a reused clone already dirty from an earlier carry is brought to the
+    Studio tree's CURRENT state, including a file the Studio has since removed."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    head = _ref(wt, "HEAD")
+    ws = tmp_path / "pool" / tid
+    calls: list = []
+    _carry(ws, wt, head, calls, bare, tmp_path)
+    assert _tree_state(ws) == _tree_state(wt)
+    # a later round of Studio work: one untracked file gone, a new one, the edit and the deletion reverted
+    (wt / "scratch.txt").unlink()
+    (wt / "second.txt").write_text("second round")
+    _git("checkout", "--", "base", "doomed", cwd=wt)
+    _carry(ws, wt, head, calls, bare, tmp_path)                       # the reused clone, still dirty
+    assert _tree_state(ws) == _tree_state(wt)
+    assert not (ws / "scratch.txt").exists() and (ws / "second.txt").read_text() == "second round"
+    assert (ws / "doomed").read_text() == "doomed" and (ws / "base").read_text() == "base"
+    assert len(calls) == 2
+
+
+def test_dirty_submodule_or_nested_repo_keeps_the_card_local(kanban_home, anchor, tmp_path, monkeypatch):
+    """Apollo F3 / Prism 136fb02e9f5e, 571037abe277: status cannot see inside an embedded repository or a
+    submodule, so a tree holding either stays local with a named reason."""
+    import shutil
+    with kb.connect_closing() as conn:
+        _bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    nested = wt / "vendor" / "inner"
+    nested.mkdir(parents=True)
+    _git("init", "-q", cwd=nested)
+    (nested / "work.txt").write_text("inner work")
+    assert _port_of(tid, wt, kanban_home / "fleet") == (None, [kwt.WHY_NESTED_REPO])
+    # a registered submodule with its own uncommitted work
+    shutil.rmtree(wt / "vendor")
+    sub_origin = tmp_path / "sub"
+    sub_origin.mkdir()
+    _git("init", "-q", "-b", "main", cwd=sub_origin)
+    _commit(sub_origin, "s")
+    _git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_origin), "sub", cwd=wt)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "sub", cwd=wt)
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    _git("fetch", "-q", "origin", cwd=anchor)
+    (wt / "sub" / "s").write_text("modified inside the submodule")
+    assert kwt.dirty_census(wt) == kwt.WHY_NESTED_REPO
+    assert _port_of(tid, wt, kanban_home / "fleet") == (None, [kwt.WHY_NESTED_REPO])
+
+
+def test_carry_refusals_and_kill_switch_keep_the_card_local(kanban_home, anchor, tmp_path, monkeypatch):
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    fleet = kanban_home / "fleet"
+    # kill switch: env, then the overrides file
+    monkeypatch.setenv(kwt.DIRTY_CARRY_ENV, "0")
+    assert _port_of(tid, wt, fleet) == (None, [kwt.WHY_DIRTY])
+    monkeypatch.delenv(kwt.DIRTY_CARRY_ENV)
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "dirty_carry": False}))
+    assert _port_of(tid, wt, fleet) == (None, [kwt.WHY_DIRTY])
+    (fleet / kwt.MIRRORS_FILE).unlink()
+    # size cap (the survivor-capture cap)
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1024)
+    (wt / "big.bin").write_bytes(b"x" * 4096)
+    assert _port_of(tid, wt, fleet) == (None, [kwt.WHY_CARRY_SIZE])
+    (wt / "big.bin").unlink()
+    # origin's card branch moved past the Studio head from elsewhere (stale tracking ref): local, no clone
+    other = tmp_path / "elsewhere"
+    _git("clone", "-q", "-b", f"wt/{tid}", str(bare), str(other), cwd=tmp_path)
+    _commit(other, "operator-fold")
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=other)
+    assert _port_of(tid, wt, fleet) == (None, [kwt.WHY_BASE_MOVED])
+    # the carry itself refuses a tree that moved off the routed HEAD, before anything is sent
+    calls: list = []
+    with pytest.raises(RuntimeError, match="HEAD moved"):
+        kwt.clone_on_host(_host("ace-ai"), str(tmp_path / "x"), SLUG, "m", f"wt/{tid}", runner=_local_ssh(calls),
+                          sha="0" * 40, carry=(str(wt), "0" * 40, "d"))
+    assert calls == []
+
+
+def test_type_change_dir_to_file_and_file_to_dir_ends_byte_equal(kanban_home, anchor, tmp_path, monkeypatch):
+    """Apollo 19:13: a tracked directory replaced by a file of the same name, and a tracked file replaced by a
+    directory. After the reset, rm -f leaves the old directory behind; the carry removes the emptied parents, so
+    tar -xf lands the file and the clone ends byte-equal (both ways)."""
+    import shutil
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    (wt / "pkg" / "sub").mkdir(parents=True)
+    (wt / "pkg" / "sub" / "a.txt").write_text("a")
+    (wt / "pkg" / "b.txt").write_text("b")
+    _git("add", "pkg", cwd=wt)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "pkg", cwd=wt)
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    head = _ref(wt, "HEAD")
+    shutil.rmtree(wt / "pkg")
+    (wt / "pkg").write_text("pkg is a file now")                     # dir -> file
+    (wt / "base").unlink()
+    (wt / "base").mkdir()
+    (wt / "base" / "inner.txt").write_text("base is a dir now")      # file -> dir
+    census = kwt.dirty_census(wt)
+    assert not isinstance(census, str), census
+    ws = tmp_path / "pool" / tid
+    calls: list = []
+    _carry(ws, wt, head, calls, bare, tmp_path)
+    assert (ws / "pkg").is_file() and (ws / "pkg").read_text() == "pkg is a file now"
+    assert (ws / "base" / "inner.txt").read_text() == "base is a dir now"
+    assert _tree_state(ws) == _tree_state(wt)
+    # and the reverse on the same reused clone: the Studio puts both back as HEAD has them
+    (wt / "pkg").unlink()
+    shutil.rmtree(wt / "base")
+    _git("checkout", "--", "pkg", "base", cwd=wt)
+    _carry(ws, wt, head, calls, bare, tmp_path)
+    assert (ws / "pkg" / "sub" / "a.txt").read_text() == "a" and (ws / "base").read_text() == "base"
+    assert _tree_state(ws) == _tree_state(wt)
+
+
+def test_a_dir_replaced_by_a_symlink_out_of_the_tree_is_refused(kanban_home, anchor, tmp_path, monkeypatch):
+    """Prism 9e03f1e94c2d red-first: a tracked dir replaced by a symlink to a directory OUTSIDE the tree holding a
+    same-named file. git reports the old child as deleted; lstat through the linked parent found the outside
+    file and the tar carried it. Now the card stays local with a named reason, and no tar ever holds it."""
+    import tarfile
+    import io
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    (wt / "conf").mkdir()
+    (wt / "conf" / "settings").write_text("tracked")
+    _git("add", "conf", cwd=wt)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "conf", cwd=wt)
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    _git("fetch", "-q", "origin", cwd=anchor)
+    head = _ref(wt, "HEAD")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "settings").write_text("OUTSIDE-SECRET")
+    import shutil
+    shutil.rmtree(wt / "conf")
+    (wt / "conf").symlink_to(outside)
+    assert kwt.dirty_census(wt) == kwt.WHY_SYMLINK_PARENT
+    assert _port_of(tid, wt, kanban_home / "fleet") == (None, [kwt.WHY_SYMLINK_PARENT])
+    calls: list = []
+    with pytest.raises(RuntimeError, match=kwt.WHY_SYMLINK_PARENT):
+        kwt.clone_on_host(_host("ace-ai"), str(tmp_path / "ws"), SLUG, "m", f"wt/{tid}",
+                          runner=_local_ssh(calls), sha=head, carry=(str(wt), head, "d"))
+    assert calls == []
+    # the tar builder itself never follows a symlinked parent either
+    with pytest.raises(OSError):
+        kwt._carry_tar(wt, ("conf/settings",))
+    with tarfile.open(fileobj=io.BytesIO(kwt._carry_tar(wt, ("scratch.txt",)))) as tar:
+        assert all(b"OUTSIDE-SECRET" not in tar.extractfile(m).read() for m in tar.getmembers() if m.isfile())
+
+
+def test_snapshot_race_a_commit_while_the_tar_is_built_raises(kanban_home, anchor, tmp_path, monkeypatch):
+    """Prism d9d8d2d38b45 (snapshot race): HEAD is read again after the tar is built. A commit in between (the
+    census would now be empty) raises instead of sending an empty carry against a clone pinned to the old HEAD.
+    The same holds for a carried file edited while the tar is built."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    head = _ref(wt, "HEAD")
+    real_tar = kwt._carry_tar
+
+    def tar_then_commit(tree, copy):
+        out = real_tar(tree, copy)
+        _git("add", "-A", cwd=wt)
+        _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "raced", cwd=wt)
+        return out
+
+    calls: list = []
+    monkeypatch.setattr(kwt, "_carry_tar", tar_then_commit)
+    with pytest.raises(RuntimeError, match="HEAD moved"):
+        kwt.clone_on_host(_host("ace-ai"), str(tmp_path / "ws"), SLUG, "m", f"wt/{tid}",
+                          runner=_local_ssh(calls), sha=head, carry=(str(wt), head, "d"))
+    assert calls == []
+    _git("reset", "-q", "--soft", head, cwd=wt)
+    _git("reset", "-q", cwd=wt)
+
+    def tar_then_edit(tree, copy):
+        out = real_tar(tree, copy)
+        (wt / "scratch.txt").write_text("edited during the build, a different size")
+        return out
+
+    monkeypatch.setattr(kwt, "_carry_tar", tar_then_edit)
+    with pytest.raises(RuntimeError, match="changed while the carry was built"):
+        kwt.clone_on_host(_host("ace-ai"), str(tmp_path / "ws"), SLUG, "m", f"wt/{tid}",
+                          runner=_local_ssh(calls), sha=head, carry=(str(wt), head, "d"))
+    assert calls == []
+
+
+def test_prefetched_clone_is_not_collected_after_the_dirty_files_change(kanban_home, anchor, tmp_path,
+                                                                        monkeypatch):
+    """Prism b4ca10cadc5b: the census digest is in the clone key. Prefetch with content A, change the file to B
+    without committing, dispatch: the A clone is a different key, never collected, and the clone job that runs
+    carries B."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    fleet = kanban_home / "fleet"
+    ws = tmp_path / "pool" / tid
+    calls: list = []
+    _clone_locally(monkeypatch, tmp_path, bare, calls)
+    port_a, why = _port_of(tid, wt, fleet)
+    assert port_a is not None, why
+    key_a, job_a, _lock = kbd._pool_clone_job(tid, f"wt/{tid}", _host("ace-ai"), port_a, ws)
+    job_a()                                                           # the prefetch, content A
+    assert (ws / "scratch.txt").read_text() == "uncommitted"
+    (wt / "scratch.txt").write_text("content B, not committed")
+    port_b, why = _port_of(tid, wt, fleet)
+    key_b, job_b, _lock = kbd._pool_clone_job(tid, f"wt/{tid}", _host("ace-ai"), port_b, ws)
+    assert key_a != key_b and key_a[:7] == key_b[:7]                  # same clone, different carry digest
+    job_b()
+    assert (ws / "scratch.txt").read_text() == "content B, not committed"
+    assert _tree_state(ws) == _tree_state(wt)
+
+
+def test_a_carried_file_head_ignores_does_not_survive_the_next_carry(kanban_home, anchor, tmp_path, monkeypatch):
+    """Prism 23f7819e68e3: carry 1 brings an edited .gitignore that un-ignores secret.txt and secret.txt itself.
+    Carry 2 has neither. The reset puts HEAD's .gitignore back, which ignores secret.txt, so clean -fd would keep
+    it and a later carried .gitignore would un-ignore it again. The carry manifest removes exactly what carry 1
+    wrote; a worker's own ignored build output (never carried) is kept."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    (wt / ".gitignore").write_text("secret.txt\nbuild/\n")
+    _git("add", ".gitignore", cwd=wt)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "ignore", cwd=wt)
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    head = _ref(wt, "HEAD")
+    ws = tmp_path / "pool" / tid
+    calls: list = []
+    (wt / ".gitignore").write_text("build/\n")                       # un-ignores secret.txt
+    (wt / "secret.txt").write_text("carried once")
+    _carry(ws, wt, head, calls, bare, tmp_path)
+    assert (ws / "secret.txt").read_text() == "carried once"
+    (ws / "build").mkdir()
+    (ws / "build" / "out.o").write_text("worker build output")       # ignored in every version
+    # round 2: the Studio reverted .gitignore and dropped secret.txt
+    _git("checkout", "--", ".gitignore", cwd=wt)
+    (wt / "secret.txt").unlink()
+    _carry(ws, wt, head, calls, bare, tmp_path)
+    assert not (ws / "secret.txt").exists()
+    assert (ws / "build" / "out.o").read_text() == "worker build output"
+    assert _tree_state(ws) == _tree_state(wt)
+
+
+def test_a_reused_clone_is_cleaned_before_the_fast_forward_to_a_new_head(kanban_home, anchor, tmp_path,
+                                                                          monkeypatch):
+    """Apollo 20:4x F1: carry 1 at H1 leaves the clone dirty. The Studio then commits the carried files (H2) and
+    edits one again. The reused clone's fast-forward H1 -> H2 touches those same files, so git refused it over the
+    first carry's local changes (rc 5 on every retry). The previous carry is now undone BEFORE the fast-forward;
+    the clone ends at H2, byte-equal to the Studio tree."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    h1 = _ref(wt, "HEAD")
+    ws = tmp_path / "pool" / tid
+    calls: list = []
+    _carry(ws, wt, h1, calls, bare, tmp_path)
+    assert (ws / "base").read_text() == "edited" and (ws / "scratch.txt").exists()
+    _git("add", "-A", cwd=wt)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "carried work committed", cwd=wt)
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    h2 = _ref(wt, "HEAD")
+    (wt / "base").write_text("edited again after H2")
+    _carry(ws, wt, h2, calls, bare, tmp_path)
+    assert _ref(ws, "HEAD") == h2
+    assert _tree_state(ws) == _tree_state(wt)
+    assert (ws / "base").read_text() == "edited again after H2" and not (ws / "doomed").exists()
