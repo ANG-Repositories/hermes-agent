@@ -614,10 +614,15 @@ class GatewayModelCommandsMixin:
             _mct.mark_save_pending(timing)
             return reply
         if render is None and after_reply is not None:
+            # The adapter runs this after the handler returned, outside the runner's profile scope
+            # wrappers: run the save under the handler's context, as register_after_delivery does.
+            ctx = contextvars.copy_context()
+
             async def _save_after_inline_reply():
                 try:
                     _mct.reply_delivered(timing)
-                    await self._run_model_selection_save(held, save, timing)
+                    await asyncio.create_task(
+                        self._run_model_selection_save(held, save, timing), context=ctx)
                 finally:
                     held.release()
 

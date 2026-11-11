@@ -92,6 +92,43 @@ async def test_busy_session_model_reply_is_sent_before_the_save_settles(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_inline_save_runs_in_the_handlers_context(tmp_path, monkeypatch):
+    """Prism df94c26a880e: the runner binds the routed profile scope around the handler only; the
+    inline save runs after the handler returned, so it must run under the handler's context."""
+    import contextvars
+
+    scope = contextvars.ContextVar("routed_profile_probe", default="launch")
+    h = _Harness(tmp_path, monkeypatch)
+    h.db.release.set()
+    seen = []
+    inner_update = h.db.update_session_model
+
+    async def update(sid, model, **kw):
+        seen.append(scope.get())
+        await inner_update(sid, model, **kw)
+
+    h.db.update_session_model = update
+    model_handler = h.adapter._message_handler
+
+    async def scoped(event):
+        token = scope.set("routed-B")
+        try:
+            return await model_handler(event)
+        finally:
+            scope.reset(token)
+
+    h.adapter.set_message_handler(scoped)
+    busy = await _busy(h)
+    try:
+        await asyncio.wait_for(h.adapter.handle_message(_ev("/model gpt-5.5")), 5)
+        assert h.db.models == ["gpt-5.5"]
+        assert seen == ["routed-B"], seen
+    finally:
+        busy.set()
+        await _drained(h)
+
+
+@pytest.mark.asyncio
 async def test_busy_session_switch_lock_is_released_after_the_inline_save(tmp_path, monkeypatch):
     """No write outlives its owner: the switch lock is held until the save lands, then dropped, and
     the busy turn's next queued message runs on the new model."""
