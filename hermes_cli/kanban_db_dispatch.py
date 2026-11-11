@@ -5459,7 +5459,7 @@ def _studio_capability_on(caps, last_resort: bool) -> bool:
 # concrete path, a non-GitHub origin, no pool, unpushed work on an upstream we do not own, an operator pin that names
 # the Studio): recorded as structural, never waited. A pin that does not name the Studio waits (t_fbe8a067).
 _WT_STRUCTURAL = frozenset({"concrete_target_path", "not_a_repo", "origin_not_github", "no_pool_host",
-                            "origin_not_ours", "operator_pin"})
+                            "origin_not_ours", "operator_pin", "own_tree_repo_mismatch"})
 
 
 def _wt_pin_hosts(row, board) -> "Optional[tuple]":
