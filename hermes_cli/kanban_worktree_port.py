@@ -397,10 +397,11 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
 
     remote = _sha(f"refs/remotes/origin/{b}")
     local = _sha(f"refs/heads/{b}")
-    if refs is not None and local:
-        # The tick's table answers "no branch here" for the many fresh cards. A branch that exists is re-read live
-        # before any port is accepted (Prism ce53b51a0bc2): its tree may have committed after the table was read
-        # this tick, and a stale tip would port origin's commit with no push and drop the new one.
+    if refs is not None and (local or own_tree is not None):
+        # The tick's table answers "no branch here" for the many fresh cards. A branch that exists, or a card with
+        # its own tree, is re-read live before any port is accepted (Prism ce53b51a0bc2, 4ceddf92a18f): the tree
+        # (or the branch itself) may be newer than the table, and a stale tip or a cached absence would port
+        # origin's commit with no push and drop the tree's commits.
         refs = None
         remote = _sha(f"refs/remotes/origin/{b}")
         local = _sha(f"refs/heads/{b}")

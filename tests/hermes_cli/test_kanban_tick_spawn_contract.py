@@ -543,6 +543,29 @@ def test_worktree_port_rereads_a_branch_tip_that_moved_inside_the_tick(anchor, m
     assert push is not None and push[3] == head, push
 
 
+
+def test_worktree_port_rereads_a_cached_absence_once_an_own_tree_exists(anchor, monkeypatch):
+    """Prism 4ceddf92a18f: the table was read before the card's branch and own worktree existed. Once that tree
+    exists with an unpushed commit, the port must see the branch (push it), never port origin with push=None."""
+    from hermes_cli import kanban_tick_steps as kts
+
+    def commit(cwd, msg):
+        _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", msg, cwd=cwd)
+
+    commit(anchor, "A")
+    _git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=anchor)
+    tid = "t_bbbbbbbb"
+    kw = dict(allow_studio_tree=True, push_ok=True)
+    with kts.scope():
+        kwt.assess("t_aaaaaaaa", str(anchor), None, **kw)           # warms the repo's ref table
+        tree = anchor / ".worktrees" / tid
+        _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(tree), cwd=anchor)
+        commit(tree, "B")
+        top, push = kwt.assess(tid, str(tree), None, **kw)
+    head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    assert push is not None and push[3] == head, (top, push)
+
 def test_a_running_background_sweep_never_holds_interpreter_exit(tmp_path):
     """Gateway shutdown (SIGTERM, then SIGKILL after the grace): a sweep still running must not hold the exit. A
     ThreadPoolExecutor worker is joined at interpreter shutdown, and the sweep's cwd probe has no total bound
