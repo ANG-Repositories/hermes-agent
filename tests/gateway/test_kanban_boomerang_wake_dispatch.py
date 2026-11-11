@@ -1401,9 +1401,9 @@ def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
 
     real_resurface = ah.resurface
 
-    async def resurface(runner, e):
+    async def resurface(runner, e, text=None):
         order.append("resurface")
-        return await real_resurface(runner, e)
+        return await real_resurface(runner, e, text)
 
     mp = env["monkeypatch"]
     mp.setattr(ah, "_alive", _REAL_ALIVE)
