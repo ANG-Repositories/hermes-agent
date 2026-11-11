@@ -408,3 +408,84 @@ def test_spawn_only_aggregate_publish_is_fire_and_forget(fleet, monkeypatch):
     assert err                                            # reported to the caller, not raised
     counted = {k: klg.PUBLISH_STATS[k] - before[k] for k in before}
     assert counted["ok"] == 0 and counted["failed"] + counted["skipped"] == len(doc["hosts"])
+
+
+def _spawn_only_fleet(fleet, monkeypatch, hosts, tokened):
+    """A spawn-only fleet table with ``hosts`` (sorted publish order) and a pair token for each name in ``tokened``."""
+    fleet.registry("spawn-only")
+    doc = json.loads(json.dumps(TABLE))
+    doc["hosts"] = {name: {**TABLE["hosts"]["mac-studio"], "aliases": []} for name in hosts}
+    doc["default_first"] = hosts[-1]
+    (fleet.root / "config" / "fleet-hosts.json").write_text(json.dumps(doc), encoding="utf-8")
+    d = fleet.root / alloc_client.TOKENS_REL
+    d.mkdir(parents=True, exist_ok=True)
+    for name in tokened:
+        (d / f"kanban@{name}").write_text("pair-token\n", encoding="utf-8")
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    return allocd
+
+
+def _queue_ok(slow=(), delay=1.5):
+    def answer(path, body):
+        if body.get("host") in slow:
+            time.sleep(delay)                             # the local door's write outlasts the pass budget
+        return 200, {"schema": 1, "workload": body.get("workload"), "host": body.get("host"), "ok": True}
+    return answer
+
+
+def test_spawn_only_publish_tokenless_host_is_not_a_failure_and_is_asked_again_once_tokened(fleet, monkeypatch,
+                                                                                            caplog):
+    """A host with no local publisher token next to a tokened one: every pass returns None, one log line names it,
+    and it is still checked every pass, so a token written between pass 2 and pass 3 is published on pass 3 with
+    no restart and no reset of module state."""
+    import logging
+    from hermes_cli import kanban_load_gate as klg
+    allocd = _spawn_only_fleet(fleet, monkeypatch, ["mbp-arm", "studio"], tokened=["studio"])
+    allocd.answer = _queue_ok()
+    errs = []
+    with caplog.at_level(logging.INFO, logger=klg.__name__):
+        for _ in range(3):
+            errs.append(klg.publish_ready_demand(1))
+    assert errs == [None, None, None], errs
+    named = [r for r in caplog.records if "mbp-arm" in r.getMessage()]
+    assert len(named) == 1, [r.getMessage() for r in caplog.records]
+    # provision it now: token file + protected marker, as alloc_client._token requires
+    (fleet.root / alloc_client.TOKENS_REL / "kanban@mbp-arm").write_text("pair-token\n", encoding="utf-8")
+    marker = fleet.root / alloc_client.PROTECTED_REL / "kanban@mbp-arm"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    assert klg.publish_ready_demand(1) is None
+    published = [b["host"] for p, b in allocd.calls if p == "/demand/publish"]
+    assert published.count("mbp-arm") == 1 and published.count("studio") == 4, published
+
+
+def test_spawn_only_publish_slow_door_text_is_unchanged(fleet, monkeypatch):
+    """The first write outlasts the 1.0 s budget: the hosts after it read "skipped (publish budget 1.0 s spent)",
+    exactly as on main (the publish stays sequential on one shared budget)."""
+    from hermes_cli import kanban_load_gate as klg
+    hosts = ["a-slow", "h2", "h3"]
+    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
+    allocd.answer = _queue_ok(slow={"a-slow"})
+    err = klg.publish_ready_demand(2)
+    assert err and err.startswith("a-slow: Unreachable"), err
+    for h in ("h2", "h3"):
+        assert f"{h}: skipped (publish budget {klg.PUBLISH_BUDGET_S} s spent)" in err, err
+
+
+def test_spawn_only_publish_logs_no_failed_line_when_every_host_answers(fleet, monkeypatch, caplog):
+    """All reachable and tokened: zero "failed" lines over several passes, and None (the gate tick's caller,
+    gateway/kanban_gate_tick.py publish_demand, logs "failed" only for a non-None return)."""
+    import logging
+    from hermes_cli import kanban_load_gate as klg
+    hosts = ["ace-ai", "mac-studio", "nas"]
+    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
+    allocd.answer = _queue_ok()
+    monkeypatch.setattr(klg, "unified_admit", lambda env=None: True)
+    errs = []
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            errs.append(klg.publish_ready_demand(4, root=fleet.root))
+    assert errs == [None, None, None], errs
+    assert not [r for r in caplog.records if "failed" in r.getMessage()], [r.getMessage() for r in caplog.records]
+    assert sorted(b["host"] for p, b in allocd.calls if p == "/demand/publish") == sorted(hosts * 3)

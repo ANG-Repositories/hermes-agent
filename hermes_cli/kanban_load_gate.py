@@ -813,7 +813,8 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
 
     Fire-and-forget (fault-taxonomy ruling 2026-11-05): the whole call spends at most PUBLISH_BUDGET_S across every
     host (a host left when the budget is gone is skipped, not waited for), never raises, and is counted in
-    PUBLISH_STATS (ok / failed / skipped hosts)."""
+    PUBLISH_STATS (ok / failed / skipped hosts). A host with no local publisher token is skipped, not failed, and is
+    re-checked every pass (t_93618cb2)."""
     try:
         return _publish_ready_demand(queued, root)
     except Exception as exc:  # advisory: nothing here may fail the tick
@@ -823,6 +824,8 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
 
 PUBLISH_BUDGET_S = 1.0
 PUBLISH_STATS = {"ok": 0, "failed": 0, "skipped": 0}
+TOKENLESS_REFUSAL = "provisioned demand publisher token required"
+_TOKENLESS_LOGGED = set()                 # host names already logged as token-less; gates the log line only
 
 
 def _publish_ready_demand(queued, root):
@@ -854,6 +857,18 @@ def _publish_ready_demand(queued, root):
                               {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib},
                               unified=unified_admit(), timeout=left)
             PUBLISH_STATS["ok"] += 1
+        except _ac.Refused as exc:
+            if isinstance(exc, _ac.AuthorizeRefused) or str(exc) != TOKENLESS_REFUSAL:
+                PUBLISH_STATS["failed"] += 1
+                errors.append(f"{hid}: {type(exc).__name__}: {exc}")
+                continue
+            # a local token-file check, not an answer from a host: re-checked every pass (a token provisioned
+            # later is used at once), never a failure, logged once per host per process (t_93618cb2)
+            PUBLISH_STATS["skipped"] += 1
+            if hid not in _TOKENLESS_LOGGED:
+                _TOKENLESS_LOGGED.add(hid)
+                _log.warning("kanban demand: %s has no demand publisher token; not published until one is "
+                             "provisioned (checked every tick, logged once)", hid)
         except Exception as exc:
             PUBLISH_STATS["failed"] += 1
             errors.append(f"{hid}: {type(exc).__name__}: {exc}")

@@ -662,6 +662,11 @@
    "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers.",
    "where": "hermes_cli/kanban_worktree_port.py:249 read_overrides"
   },
+  "hermes_cli/kanban_worktree_port.py::repo_pin::fold::slug::return pins.get(slug.lower()) if slug else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; the operator pin map is keyed by the folded repo (read_overrides), so the lookup folds the same way (t_fbe8a067).",
+   "where": "hermes_cli/kanban_worktree_port.py:307 repo_pin"
+  },
   "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::pinned = pins.get(slug.lower())": {
    "verdict": "kept",
    "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers. Lookup matches the key normalized in read_overrides.",

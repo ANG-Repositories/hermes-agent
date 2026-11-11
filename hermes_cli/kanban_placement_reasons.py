@@ -262,6 +262,16 @@ def take_refusal_code(refusal) -> "str | None":
     return code or None
 
 
+# A worktree card whose repo has an operator pin row that names no host able to take it now, and not the Studio
+# (t_fbe8a067): it waits, named, never falls back to the Studio.
+WORKTREE_PIN = "worktree_pin"
+
+
+def worktree_pin(hosts: str, detail: str) -> str:
+    """``worktree_pin (<pinned hosts>: <why none of them takes it>)``."""
+    return f"{WORKTREE_PIN} ({hosts}: {detail})"
+
+
 def not_portable(rule: str) -> str:
     """``not_portable:<rule>``."""
     return f"{NOT_PORTABLE}:{rule}"
