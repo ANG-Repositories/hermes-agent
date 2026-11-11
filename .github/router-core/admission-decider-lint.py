@@ -605,6 +605,7 @@ def _code_lines(text: str, lang: str) -> list:
     for line in text.splitlines():
         opened = state
         code, bare, comment, q, ansi = [], [], None, None, False
+        subst = []                    # sh: open `$(` inside "..." as [paren depth]; its body is code again (c-42258d231e80ff9e)
         i, n = 0, len(line)
         if lang in ("js", "ts", "tsx") and state is None and line.lstrip().startswith("#!"):
             out.append(("", "", line.lstrip()[2:], True))
@@ -626,6 +627,13 @@ def _code_lines(text: str, lang: str) -> list:
                         close == "'" and lang == "sh" and not ansi):
                     code.append(line[i:i + 2])
                     i += 2
+                    continue
+                if q == '"' and lang == "sh" and line.startswith("$(", i):
+                    # `"$(echo "$x # y")"`: the inner `"` opens a new quote, so its ` #` is literal (Prism
+                    # c-42258d231e80ff9e). The body is scanned as code until the matching `)` returns to the `"`.
+                    subst.append(0)
+                    code.append("$(")
+                    i, q = i + 2, None
                     continue
                 if line.startswith(close, i):
                     code.append(close)
@@ -668,8 +676,17 @@ def _code_lines(text: str, lang: str) -> list:
                 code.append(opener)
                 i += len(opener)
                 continue
+            if subst and c in "()":
+                if c == ")" and not subst[-1]:
+                    subst.pop()
+                    q = '"'           # back inside the enclosing double quote
+                    code.append(c)
+                    i += 1
+                    continue
+                subst[-1] += 1 if c == "(" else -1
             code.append(c)
-            bare.append(c)
+            if not subst:             # a substitution body sits inside a literal: never bare
+                bare.append(c)
             i += 1
         out.append(("".join(code), "".join(bare), comment, opened is None and state is None))
     return out
