@@ -154,8 +154,12 @@ def _extend_canonical_from_plugins() -> None:
         added: list[ProviderEntry] = []
         try:
             from providers import list_providers as _list_providers_for_canonical
+            # Discovery FIRST, then read what is listed: plugins imported by this
+            # call (and the post-discovery catalog sync) list their own rows, and
+            # a ``known`` captured before them re-appended every plugin-only slug.
+            _profiles = _list_providers_for_canonical()
             known = {p.slug for p in provider_seam.current().CANONICAL_PROVIDERS}
-            for _pp in _list_providers_for_canonical():
+            for _pp in _profiles:
                 if _pp.name in known:
                     continue
                 # Admission is by slug, not auth_type (upstream #102421, parity 2026-10-01): an
@@ -950,13 +954,16 @@ def list_available_providers() -> list[dict[str, str]]:
     aliases_for: dict[str, list[str]] = {}
     for alias, canonical in g._PROVIDER_ALIASES.items():
         aliases_for.setdefault(canonical, []).append(alias)
+    slugs = [p.slug for p in g.CANONICAL_PROVIDERS]
+    if "custom" not in slugs:  # the bundled ``custom`` plugin may already list it
+        slugs.append("custom")
     return [
         {
             "id": pid,
             "label": _PROVIDER_LABELS.get(pid, pid),
             "aliases": aliases_for.get(pid, []),
             "authenticated": _provider_has_credentials(pid)}
-        for pid in [p.slug for p in g.CANONICAL_PROVIDERS] + ["custom"]]
+        for pid in slugs]
 
 
 def parse_model_input(
