@@ -94,6 +94,7 @@ from hermes_state_messages import SessionMessagesMixin
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
+    writer_autocheckpoint_enabled,
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from hermes_state_titles import SessionTitlesMixin
@@ -1042,6 +1043,9 @@ class SessionDB(
             # normalize any sidecars that became visible during WAL setup.
             _secure_state_db_files(self.db_path)
             apply_database_pragmas(conn, db_label="state.db")
+            if self._wal_active and not writer_autocheckpoint_enabled():
+                # No checkpoint inside COMMIT (it ran under self._lock); _try_wal_checkpoint backfills.
+                conn.execute("PRAGMA wal_autocheckpoint=0")
             conn.execute("PRAGMA foreign_keys=ON")
             self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         except BaseException:
