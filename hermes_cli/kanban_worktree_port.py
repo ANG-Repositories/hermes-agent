@@ -274,6 +274,39 @@ def pin_names_studio(pinned) -> bool:
     return bool({str(h).lower() for h in (pinned or ())} & {"mac-studio", "studio"})
 
 
+def repo_pin(workspace_path: Optional[str], board_default: Optional[str], fleet_dir: Path,
+             runner: Callable = subprocess.run) -> Optional[Tuple[str, ...]]:
+    """The hosts of the operator pin row for the repo a worktree card's workspace is in, or None (t_fbe8a067).
+
+    Read from the workspace alone, before and independently of :func:`assess` (Prism 345896e571e6): an early
+    refusal there (off-branch tree, failed probe, not a checkout) must not drop the pin. The repo is the git
+    toplevel of the workspace path (a linked worktree shares its repo's ``origin``), or of the repo a
+    not-yet-made ``<repo>/.worktrees/<id>`` names. When no repo can be resolved (no path, not a git checkout, a
+    non-GitHub origin) there is no pin row to read and the card routes as it does without one."""
+    if not derived_enabled(fleet_dir):
+        return None  # hand-list mode has no pin rows (its rows name mirror hosts only)
+    pins = read_overrides(fleet_dir)[0]
+    if not pins:
+        return None
+    raw = (workspace_path or "").strip() or (board_default or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    target = worktree_target_anchor(p)
+    if target is not None:
+        p = target
+    try:
+        if not p.is_absolute() or not p.is_dir():
+            return None
+    except OSError:
+        return None
+    from hermes_cli import kanban_db_workspace as _kbw
+    from hermes_cli.kanban_tick_steps import tick_memo
+    top = tick_memo(("wt_toplevel", str(p)), lambda: _kbw._git_toplevel(p), inner=True)
+    slug = origin_slug(top, runner) if top is not None else None
+    return pins.get(slug.lower()) if slug else None
+
+
 def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str]] = None
                   ) -> Optional[Tuple[str, Tuple[str, ...], Dict[str, str]]]:
     """``(mirror, hosts, {host: mirror})`` for ``slug`` in derived mode: every pool host (or the hosts an operator
@@ -1028,13 +1061,9 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
              fleet_dir: Path, runner: Callable = subprocess.run, *,
              branch: Optional[str] = None,
              allow_studio_tree: bool = False,
-             pool_hosts=None, why: Optional[List[str]] = None,
-             pin_out: Optional[list] = None) -> Optional[tuple]:
+             pool_hosts=None, why: Optional[List[str]] = None) -> Optional[tuple]:
     """``(owner/repo, mirror, hosts, {host: mirror}, push)`` when this worktree card
     may run on a pool host, else None (:func:`mirror_for` picks the path).
-
-    ``pin_out`` gets the hosts of the repo's operator pin row once the repo is known (t_fbe8a067): a pinned card
-    runs only on those hosts, the Studio included, whatever route this returns.
 
     Derived mode (:func:`derived_enabled`): any GitHub repo, every host in ``pool_hosts``, ``push`` set when
     the card branch must be pushed first. Hand-list mode: the file's rows only, ``push`` always None."""
@@ -1048,8 +1077,6 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
         if not slug:
             _why(why, WHY_NOT_GITHUB)
             return None
-        if pin_out is not None:
-            pin_out.extend(read_overrides(fleet_dir)[0].get(slug.lower(), ()))
         if push is not None and not _own_destination(_origin_url(repo, runner)):
             # Named at routing, not a spawn wall (t_20fa16c7): the Studio's work cannot be published to an
             # upstream we do not own, so the card runs where the work is. push_card_branch still re-checks.

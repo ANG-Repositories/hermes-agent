@@ -1653,3 +1653,42 @@ def test_an_uninitialized_own_tree_at_an_ancestor_of_the_card_branch_still_ports
     with kb.connect_closing() as conn:
         out: dict = {}
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out)[0] == "portable"
+
+
+def test_a_pin_survives_an_assessment_early_return(studio_card, kanban_home, anchor):
+    """Prism 345896e571e6 (finding input): pin [ace-ai]; the card's own tree made with `worktree add --no-checkout
+    --detach` at a commit ahead of the card branch, so the assessment returns early (own_tree_off_branch) before
+    the repo is ported. studio_on False: the pin is still read from the workspace and the card waits, not local."""
+    tid, wt, bare, calls = studio_card
+    _pin(kanban_home, ["ace-ai"])
+    _git("checkout", "-q", "--detach", cwd=wt)
+    _commit(wt, "b-only")
+    b = _ref(wt, "HEAD")
+    _git("worktree", "remove", "--force", str(wt), cwd=anchor)
+    _git("worktree", "add", "-q", "--no-checkout", "--detach", str(wt), b, cwd=anchor)
+    with kb.connect_closing() as conn:
+        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=False)
+    assert route[0] == "wait", route
+    assert route[1].startswith("worktree_pin (ace-ai: ") and "own_tree_off_branch" in route[1], route
+    assert not calls
+
+
+def test_a_pinned_card_on_a_tick_with_no_pool_plan_waits_never_on_the_studio(kanban_home, anchor):
+    """Prism 1a0b618f832f / a427dd03f8a6 (finding input): pin [ace-ai], a clean worktree card, a dispatch tick with
+    no pool plan. The card does not spawn on the Studio: it waits, worktree_pin, no plan."""
+    _pin(kanban_home, ["ace-ai"])
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+    assert spawned == [], spawned
+    assert res.placement_waits.get(tid, "").startswith("worktree_pin (ace-ai: no pool plan"), res.placement_waits
+
+
+def test_an_unpinned_worktree_card_on_a_tick_with_no_pool_plan_still_runs_locally(kanban_home, anchor):
+    """No pin row (today's default): no change, the card runs where it did."""
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+    assert spawned == [(tid, None)], spawned
