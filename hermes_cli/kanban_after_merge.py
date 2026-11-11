@@ -87,7 +87,9 @@ def _default_query() -> Optional[QueryFn]:
 
 
 def _cached(ref, query_fn: QueryFn, now: float) -> Optional[tuple]:
-    hit = _CACHE.get((id(query_fn), ref.repo.lower(), ref.number))
+    # Keyed on the repo bytes as recorded (the identifier-key lint): a case variant of one repo is one extra read,
+    # never a wrong verdict.
+    hit = _CACHE.get((id(query_fn), ref.repo, ref.number))
     if hit is not None and hit[0] is query_fn and (hit[1] == "MERGED" or now - hit[2] < CACHE_TTL_SECONDS):
         return hit
     return None
@@ -95,14 +97,14 @@ def _cached(ref, query_fn: QueryFn, now: float) -> Optional[tuple]:
 
 def _state(ref, query_fn: QueryFn, now: float, budget: list,
            prefetched: Optional[dict] = None) -> Optional[str]:
-    key = (id(query_fn), ref.repo.lower(), ref.number)
+    key = (id(query_fn), ref.repo, ref.number)
     hit = _cached(ref, query_fn, now)
     if hit is not None:
         return hit[1]
     if budget[0] <= 0:
         return None
     budget[0] -= 1
-    pkey = (ref.repo.lower(), ref.number)
+    pkey = (ref.repo, ref.number)
     try:
         payload = prefetched[pkey] if prefetched is not None and pkey in prefetched else query_fn(ref.repo, ref.number)
     except Exception:
@@ -126,7 +128,7 @@ def _batch_reads(conn: sqlite3.Connection, parents: list, query_fn: QueryFn, now
     plan: dict = {}
     for parent_id in parents:
         for ref in _fleet_refs(conn, parent_id):
-            key = (ref.repo.lower(), ref.number)
+            key = (ref.repo, ref.number)
             if len(plan) < budget and key not in plan and _cached(ref, query_fn, now) is None:
                 plan[key] = ref
         if len(plan) >= budget:

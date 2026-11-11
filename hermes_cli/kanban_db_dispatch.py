@@ -729,9 +729,10 @@ def _orphan_sweep_due(board: Optional[str], *, now: Optional[float] = None) -> b
 
 # Off the tick (t_97a78e19): py-spy 2026-11-10 put the sweep (a full process walk + realpath per orphan) in 7 of
 # 40 tick samples. A gateway tick (``defer_maintenance``) runs it on this pool on its own connection, at the same
-# cadence, and books what the last finished run reaped; at most one run per (home, board) at a time.
+# cadence, and books what the last finished run reaped; at most one run per (home, board) at a time. A DAEMON thread
+# per run, never an executor: interpreter exit joins executor workers, and the sweep's cwd probe has no total
+# bound, so a running sweep would hold a gateway's SIGTERM exit until the SIGKILL.
 _ORPHAN_SWEEP_JOBS: dict = {}
-_ORPHAN_SWEEP_POOL = None
 
 
 def _orphan_sweep_job(board: Optional[str]) -> dict:
@@ -745,7 +746,6 @@ def _orphan_sweep_job(board: Optional[str]) -> dict:
 def _orphan_sweep_off_tick(board: Optional[str]) -> dict:
     """What a finished background sweep reaped (once), and a new run started when the cadence is due and none
     runs. A sweep that raised is logged here, never raised into the tick."""
-    global _ORPHAN_SWEEP_POOL
     try:
         key = (str(_kb.kanban_home()), board)
     except Exception:
@@ -767,10 +767,20 @@ def _orphan_sweep_off_tick(board: Optional[str]) -> dict:
     with _ORPHAN_SWEEP_LOCK:
         if key in _ORPHAN_SWEEP_JOBS:
             return reaped
-        if _ORPHAN_SWEEP_POOL is None:
-            from concurrent.futures import ThreadPoolExecutor
-            _ORPHAN_SWEEP_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kanban-orphan-sweep")
-        _ORPHAN_SWEEP_JOBS[key] = _ORPHAN_SWEEP_POOL.submit(_orphan_sweep_job, board)
+        # The tick thread's context rides along (Prism 9bb17d5fb49b): a ContextVar home override is the board
+        # this tick runs for; a bare thread would see the process default home.
+        import contextvars
+        from concurrent.futures import Future
+        fut = _ORPHAN_SWEEP_JOBS[key] = Future()
+        ctx = contextvars.copy_context()
+
+        def _run(fut=fut, ctx=ctx):
+            try:
+                fut.set_result(ctx.run(_orphan_sweep_job, board))
+            except BaseException as exc:
+                fut.set_exception(exc)
+
+        threading.Thread(target=_run, name="kanban-orphan-sweep", daemon=True).start()
     return reaped
 
 

@@ -55,7 +55,8 @@ ALLOWED_SPAWN_SITES = {
     "kanban_worktree_port.py:origin_slug": "remote get-url, cached per repo (TTL)",
     "kanban_worktree_port.py:_clean_on_branch": "own .worktrees/<id> tree only",
     "kanban_worktree_port.py:_on_branch": "own .worktrees/<id> tree only",
-    "kanban_worktree_port.py:_git": "ahead/merge-base for a card branch that exists locally",
+    "kanban_worktree_port.py:_git": "ahead/merge-base, and the live tip re-read (Prism ce53b51a0bc2), for a card "
+                                     "branch that exists locally: per routed card that already has one (a rerun), never a fresh card",
     # pool-host clone: background on a gateway tick (t_915b8d2d); the synchronous path is the one-shot CLI
     "kanban_worktree_port.py:clone_on_host": "per placed worktree card (background in the gateway)",
     # the spawn itself and its placement prep: per spawned worker, bounded by the spawn allowance, not by N
@@ -490,3 +491,79 @@ def test_worktree_routing_verdicts_unchanged_with_one_ref_read_per_repo(board, a
     assert counter.sites["kanban_worktree_port.py:_read"] == 1
     assert counter.sites["kanban_worktree_port.py:_git"] == 0
     assert counter.sites["kanban_db.py:_git_out"] <= 3   # toplevel + git-dir + common-dir, once
+
+
+def test_background_sweep_runs_under_the_tick_threads_home_context(sweep_conn, monkeypatch, tmp_path):
+    """Prism 9bb17d5fb49b: a ContextVar home override (a profile-scoped gateway tick) reaches the sweep thread,
+    so the sweep connects to and reaps the board the tick was running for, not the process default."""
+    import hermes_constants as vc
+
+    seen = []
+
+    class _Conn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(kb, "connect", lambda board=None: seen.append(("connect", vc.get_hermes_home_override()))
+                        or _Conn())
+    monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans",
+                        lambda c, board=None: seen.append(("sweep", vc.get_hermes_home_override())) or {})
+    other = str(tmp_path / "profile-home")
+    tok = vc.set_hermes_home_override(other)
+    try:
+        kbd._orphan_sweep_off_tick("default")
+    finally:
+        vc.reset_hermes_home_override(tok)
+    _drain_sweeps()
+    assert seen == [("connect", other), ("sweep", other)], seen
+
+
+def test_worktree_port_rereads_a_branch_tip_that_moved_inside_the_tick(anchor, monkeypatch):
+    """Prism ce53b51a0bc2: an own clean worktree gains an unpushed commit after the repo's refs were read this
+    tick. The port must see the new tip (push it first), never port origin's stale tip with push=None."""
+    from hermes_cli import kanban_tick_steps as kts
+
+    def commit(cwd, msg):
+        _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", msg, cwd=cwd)
+
+    tid = "t_bbbbbbbb"
+    commit(anchor, "A")
+    _git("branch", f"wt/{tid}", cwd=anchor)
+    _git("update-ref", f"refs/remotes/origin/wt/{tid}", "HEAD", cwd=anchor)
+    tree = anchor / ".worktrees" / tid
+    _git("worktree", "add", "-q", str(tree), f"wt/{tid}", cwd=anchor)
+    kw = dict(allow_studio_tree=True, push_ok=True)
+    with kts.scope():
+        top, push = kwt.assess(tid, str(tree), None, **kw)
+        assert top is not None and push is None, (top, push)   # in step with origin: the table is warm
+        commit(tree, "B")
+        top, push = kwt.assess(tid, str(tree), None, **kw)
+    head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    assert push is not None and push[3] == head, push
+
+
+def test_a_running_background_sweep_never_holds_interpreter_exit(tmp_path):
+    """Gateway shutdown (SIGTERM, then SIGKILL after the grace): a sweep still running must not hold the exit. A
+    ThreadPoolExecutor worker is joined at interpreter shutdown, and the sweep's cwd probe has no total bound
+    (15 s start + 2 s per hung pid), so the sweep runs on a daemon thread instead."""
+    root = Path(__file__).resolve().parents[2]
+    script = (
+        "import sys, time, threading\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "from hermes_cli import kanban_db as kb, kanban_db_dispatch as kbd\n"
+        "started = threading.Event()\n"
+        "kb.connect = lambda board=None: type('C', (), {'close': lambda self: None})()\n"
+        "kb.sweep_terminal_workspace_orphans = lambda c, board=None: (started.set(), time.sleep(25))\n"
+        "kbd._orphan_sweep_due = lambda board, now=None: True\n"
+        "kb.kanban_home = lambda: '/nonexistent-home'\n"
+        "kbd._orphan_sweep_off_tick('default')\n"
+        "assert started.wait(10)\n"
+    )
+    t0 = time.monotonic()
+    proc = subprocess.run([sys.executable, "-c", script], cwd=str(tmp_path), capture_output=True, text=True,
+                          timeout=45)
+    took = time.monotonic() - t0
+    assert proc.returncode == 0, proc.stderr
+    assert took < 15, f"interpreter exit waited {took:.1f}s on the running sweep"
+
