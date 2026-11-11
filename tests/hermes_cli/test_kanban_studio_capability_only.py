@@ -197,7 +197,7 @@ def test_no_capability_map_leaves_the_rule_off(kanban_home, carried):
 # -- 1b. over the carry limit: carry everything but the git clones, re-clone those (operator 2026-11-10 15:3x) -----
 # t_b41d322b ran on the Studio under local_files with a 1.1 GB scratch dir (four repo clones), over CARRY_MAX_BYTES.
 
-def _clone_in(ws, name="repo", *, dirty=False, ahead=False):
+def _clone_in(ws, name="repo", *, dirty=False, ahead=False, ignored=False):
     import subprocess
     from pathlib import Path
     repo = Path(ws) / name
@@ -219,6 +219,10 @@ def _clone_in(ws, name="repo", *, dirty=False, ahead=False):
         g("commit", "-q", "-m", "unpushed")
     if dirty:
         (repo / "wip.txt").write_text("uncommitted\n")
+    if ignored:
+        (repo / ".git" / "info" / "exclude").write_text("data/\n")
+        (repo / "data").mkdir()
+        (repo / "data" / "input.csv").write_text("only here\n")
     sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
                          text=True).stdout.strip()
     return sha
@@ -270,6 +274,17 @@ def test_over_limit_with_a_dirty_clone_waits_named(kanban_home, small_carry):
     assert plan is None
     assert route[0] == "wait" and route[1].startswith("studio_capability_only:local_files"), route
     assert "clone repo cannot be rebuilt from origin: dirty_tree" in route[1], route
+
+
+def test_over_limit_clone_with_ignored_files_waits_named(kanban_home, small_carry):
+    """Prism 38aae6c981c1/62448b5b6868: a re-clone cannot restore ignored files (data, .env), so a clone holding
+    any is never split off; the card waits with the reason named."""
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path, ignored=True)
+        route, plan = _route_carry(conn, tid)
+    assert plan is None
+    assert route[0] == "wait" and "clone repo cannot be rebuilt from origin: ignored_files" in route[1], route
 
 
 def test_over_limit_without_clones_waits_named(kanban_home, small_carry):

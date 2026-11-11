@@ -743,7 +743,7 @@ def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None
 def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional[dict], Optional[str]]:
     """``(record, None)`` when the clone at ``repo`` can be rebuilt from origin on a pool host, else
     ``(None, reason)``. The rules are the worktree port's (t_1d2c5939): a GitHub origin, on a branch, nothing
-    uncommitted or untracked, and a branch origin has or is behind (``push`` then carries the unpushed commits,
+    uncommitted, untracked or ignored (a re-clone cannot restore those), and a branch origin has or is behind (``push`` then carries the unpushed commits,
     force-with-lease pinned to the origin sha seen here); a branch that diverged from origin is refused."""
     from pathlib import Path as _P
     from hermes_cli import kanban_worktree_port as _kwt
@@ -764,6 +764,12 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         return None, "detached_head"
     if not _kwt._clean_on_branch(_P(repo), branch, runner):
         return None, "dirty_tree"
+    # Prism 38aae6c981c1/62448b5b6868: a re-clone cannot restore ignored files (datasets, .env, built state)
+    ign = _out("status", "--porcelain", "--ignored", "--untracked-files=all")
+    if ign is None:
+        return None, "dirty_tree"
+    if any(line.startswith("!! ") for line in ign.splitlines()):
+        return None, "ignored_files"
     local = _out("rev-parse", "-q", "--verify", f"refs/heads/{branch}")
     if not local:
         return None, "no_local_branch"
