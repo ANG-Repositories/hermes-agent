@@ -817,7 +817,7 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
         mirror = _kwt.mirror_for((c["slug"], *route), host.name) if route else \
             f"{_kwt.DERIVED_MIRROR_ROOT}/{c['slug']}.git"
         # the one allowlisted clone spawn, told to end on the Studio's commit (rc 5 otherwise: raises)
-        _kwt.clone_on_host(host, dest, c["slug"], mirror, c["branch"], runner, sha=c["sha"])
+        _kwt.clone_on_host(host, dest, c["slug"], mirror, c["branch"], runner, sha=c["sha"], exact=True)
 
 
 def remote_workspace_has_content(placement_raw: Optional[str],

@@ -540,7 +540,7 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
 
 
 def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
-                 url: Optional[str] = None, sha: Optional[str] = None) -> str:
+                 url: Optional[str] = None, sha: Optional[str] = None, exact: bool = False) -> str:
     """Remote sh: clone origin into the (empty) workspace, then put HEAD on
     ``branch`` and PROVE it (rc 4 otherwise). The mirror only accelerates the
     clone: ``--dissociate`` copies what was borrowed, so a later mirror prune
@@ -552,7 +552,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     the checkout instead of returning early (Prism f43e48b43fc3). rc 3 = the
     workspace holds something else (never overwritten). ``sha`` (the pushed
     tip, Prism 3e2f8506c8ff): a reused checkout behind it is fetched and
-    fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise)."""
+    fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise). ``exact``
+    (a fresh re-clone of a carried scratch clone, t_9965b8d5): reset to
+    ``sha`` even when it is behind the branch tip, then PROVE it (rc 5)."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
     if mirror.startswith("~/"):
         # A derived per-host default (t_1d2c5939): the host's own $HOME, whatever user/OS it runs.
@@ -579,15 +581,19 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
         f"[ \"$(git branch --show-current)\" = {b} ] || exit 4"
         + (f"; if [ \"$(git rev-parse HEAD)\" != {shlex.quote(sha)} ]; then "
            f"{{ git fetch -q origin {b} && git merge -q --ff-only {shlex.quote(sha)}; }} || exit 5; fi; "
-           f"[ \"$(git rev-parse HEAD)\" = {shlex.quote(sha)} ] || exit 5" if sha else "")
+           f"[ \"$(git rev-parse HEAD)\" = {shlex.quote(sha)} ] || exit 5" if sha and not exact else "")
+        # t_9965b8d5: a re-cloned scratch clone lands on the Studio's exact commit, even behind the tip (rc 5 otherwise)
+        + (f"; s={shlex.quote(sha)}; [ \"$(git rev-parse HEAD)\" = \"$s\" ] || git reset -q --hard \"$s\"; "
+           "[ \"$(git rev-parse HEAD)\" = \"$s\" ] || exit 5" if sha and exact else "")
     )
 
 
 def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
-                  runner: Callable = subprocess.run, sha: Optional[str] = None) -> None:
+                  runner: Callable = subprocess.run, sha: Optional[str] = None, exact: bool = False) -> None:
     """Run :func:`clone_script` on ``host`` (a ``PoolHost``); raise on failure."""
     from hermes_cli.kanban_worker_pool import _ssh_argv
-    proc = runner(_ssh_argv(host, clone_script(workspace, slug, mirror, branch, sha=sha)),
+    proc = runner(_ssh_argv(host, clone_script(workspace, slug, mirror, branch, sha=sha, exact=exact)
+                            if exact else clone_script(workspace, slug, mirror, branch, sha=sha)),
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=CLONE_TIMEOUT_S, stdin=subprocess.DEVNULL)
     rc = getattr(proc, "returncode", 1)
