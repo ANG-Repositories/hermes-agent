@@ -1081,9 +1081,17 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     return p
 
 
+# The only columns _set_task_column may write. None is home-session guarded
+# (status/assignee/priority/session_id); tests/hermes_cli/test_kanban_home_session.py
+# checks the set stays disjoint from those and that the function enforces it.
+_SET_TASK_COLUMN_ALLOWED = frozenset({"workspace_path", "branch_name"})
+
+
 def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str,
                      run_id: Optional[int] = None) -> None:
     """``run_id``: write only while that run still owns the card (same transaction), else raise ClaimLost."""
+    if column not in _SET_TASK_COLUMN_ALLOWED:
+        raise ValueError(f"_set_task_column: {column!r} is not in _SET_TASK_COLUMN_ALLOWED")
     with _kb.write_txn(conn):
         if run_id is None:
             conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
