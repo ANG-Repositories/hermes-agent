@@ -280,11 +280,18 @@ def test_pass_fds_reach_the_child_and_nothing_else_does(spawns, tmp_path):
     os.set_inheritable(stray, True)
     try:
         def call():
-            script = f'echo kept >&{keep_w}; [ -e /dev/fd/{stray} ] && echo leaked || echo closed'
-            return subprocess.run(["/bin/sh", "-c", script], pass_fds=(keep_w,), capture_output=True,
-                                  text=True, timeout=10)
+            # One line per fd in a Python child: portable to any fd number (a /bin/sh
+            # redirection like >&12 only takes single digits in POSIX sh, dash on Linux).
+            script = ("import os, sys\n"
+                      f"os.write({keep_w}, b'kept\\n')\n"
+                      f"for fd in ({keep_w}, {stray}):\n"
+                      "    try:\n        os.fstat(fd); print(fd, 'open')\n"
+                      "    except OSError:\n        print(fd, 'closed')\n")
+            return subprocess.run([sys.executable, "-c", script], pass_fds=(keep_w,), capture_output=True,
+                                  text=True, timeout=30)
         plain, hooked = _pair(spawns, call)
-        assert plain["out"] == "closed\n" and hooked == plain
+        assert plain["out"] == f"{keep_w} open\n{stray} closed\n" and plain["rc"] == 0
+        assert hooked == plain
         assert os.read(keep_r, 100) == b"kept\nkept\n"
     finally:
         for fd in (keep_r, keep_w, stray):

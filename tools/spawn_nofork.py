@@ -149,8 +149,11 @@ def _native_spawn(libc: _Libc, executable: bytes, argv: list, envp: list, cwd: "
             redirected = {target for _, target in dup2s}
             for fd in keep:
                 steps.append(("addinherit_np", libc.fa_inherit(ctypes.byref(actions), fd)))
-            for fd in (0, 1, 2):  # Popen leaves an unredirected, open standard fd to the child
-                if fd not in redirected and _is_open(fd):
+            # Popen leaves an unredirected standard fd as it is: an inheritable one reaches the
+            # child, a close-on-exec one is closed by the exec. CLOEXEC_DEFAULT closes every fd
+            # not named here, so name only the inheritable ones.
+            for fd in (0, 1, 2):
+                if fd not in redirected and _is_open(fd) and os.get_inheritable(fd):
                     steps.append(("addinherit_np", libc.fa_inherit(ctypes.byref(actions), fd)))
             if cwd is not None:
                 steps.append(("addchdir", libc.fa_chdir(ctypes.byref(actions), cwd)))
@@ -263,6 +266,13 @@ def _execute_child_nofork(popen: subprocess.Popen, args: tuple, kwargs: dict, fa
     bound.update(kwargs)
     if set(bound) != set(_EXECUTE_CHILD_PARAMS):
         return fallback(*args, **kwargs)
+    # Planning reads args and pass_fds; an iterator would reach the fallback consumed.
+    # Materialize both ONCE (as CPython's own list(args) / set(pass_fds) would) and hand
+    # the same values to the native path and to the fallback.
+    if not isinstance(bound["args"], (str, bytes, os.PathLike)):
+        bound["args"] = list(bound["args"])
+    bound["pass_fds"] = tuple(bound["pass_fds"])
+    args, kwargs = tuple(bound[n] for n in _EXECUTE_CHILD_PARAMS), {}
     try:
         plan = _plan(bound)
     except Exception:  # noqa: BLE001 - anything odd is CPython's to handle (and to raise)
