@@ -333,18 +333,21 @@ def stop_runtime_status_writers(timeout: float = 2.0) -> bool:
     """Drain and end every runtime-status writer thread; ``True`` when none is left running.
 
     The test suite's teardown: a write still in flight from one test must not land during
-    the next one (t_3187cbec).
+    the next one (t_3187cbec). Reads no clock (each wait gets ``timeout``): it runs in
+    a test's teardown, where ``time.monotonic`` may still be monkeypatched.
     """
-    deadline = time.monotonic() + max(timeout, 0.0)
     # Drain the ordered lane first: its queued write_runtime_status jobs submit to the writer
-    # and would start it again after it stopped.
-    with contextlib.suppress(Exception):
-        _RUNTIME_STATUS_LANE.submit(lambda: None).result(timeout=max(timeout, 0.0))
+    # and would start it again after it stopped. Only when its worker already exists: with no
+    # worker nothing is queued, and a submit would build a thread through a possibly patched
+    # ``threading.Thread`` (tests/test_harness_bounds.py runs it inline, forever).
+    if getattr(_RUNTIME_STATUS_LANE, "_threads", None):
+        with contextlib.suppress(Exception):
+            _RUNTIME_STATUS_LANE.submit(lambda: None).result(timeout=max(timeout, 0.0))
     stopped = True
     for thread in threading.enumerate():
         writer = getattr(thread, "status_writer", None)
         if writer is not None:
-            stopped = writer.stop(timeout=max(deadline - time.monotonic(), 0.0)) and stopped
+            stopped = writer.stop(timeout=timeout) and stopped
     return stopped
 
 
