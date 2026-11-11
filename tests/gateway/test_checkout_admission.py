@@ -1294,6 +1294,57 @@ def test_concurrent_same_name_publish_never_drops_the_shared_mark(store, monkeyp
     assert ca.evaluate(store)["verdict"] == UNKNOWN
 
 
+@pytest.mark.skipif(ca.fcntl is None, reason="no flock: the consumer lock is a no-op")
+def test_suspended_lock_holder_never_stalls_a_peers_lease_renewal(store, tmp_path):
+    """Prism c-5bb4a50e76ea73ff: a process that holds a consumer's record lock and
+    never lets go (SIGSTOP, debugger, frozen host) must not block a healthy
+    same-name publisher's renewal or its shutdown release: the lock wait is
+    bounded, then the write goes ahead unlocked (the pre-lock behaviour)."""
+    import subprocess
+    import sys
+
+    store.hold("op", [SERVE], mode="freeze")
+    b = AdmissionGate(store, SERVE, active_work=Work(), lease_s=0.6)
+    b.publish()
+    lock_path = store.consumers_dir / f".{ca._consumer_filename(SERVE)}.lock"
+    ready = tmp_path / "holder-ready"
+    code = (
+        "import fcntl, time\n"
+        "from pathlib import Path\n"
+        f"fh = open({str(lock_path)!r}, 'a+b')\n"
+        "fcntl.flock(fh, fcntl.LOCK_EX)\n"
+        f"Path({str(ready)!r}).write_text('1')\n"
+        "time.sleep(600)\n"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", code])
+    try:
+        deadline = time.monotonic() + 60
+        while not ready.exists():
+            assert holder.poll() is None and time.monotonic() < deadline, "holder did not lock"
+            time.sleep(0.02)
+        t = threading.Thread(target=b.renew_lease, name="renewal", daemon=True)
+        t.start()
+        t.join(10)
+        assert not t.is_alive(), "lease renewal blocked behind a peer's held lock"
+        rec = store.read_consumer(SERVE)
+        assert rec["token"] == b.token and ca._lease_fresh(store, SERVE, rec)
+        # Fail closed: a held lock means another live process has this record open
+        # mid-write, so the unlocked write flags the name as shared -> UNKNOWN.
+        assert rec.get("shared_with"), "unlocked write did not flag the lock holder"
+        assert ca.evaluate(store)["verdict"] == UNKNOWN
+        s = threading.Thread(target=b.stop_lease, name="release", daemon=True)
+        s.start()
+        s.join(10)
+        assert not s.is_alive(), "shutdown release blocked behind a peer's held lock"
+        assert store.read_consumer(SERVE).get("lease_released") is True
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+    # Holder gone: the kernel dropped its flock, the next write locks and clears the mark.
+    c = AdmissionGate(store, SERVE, active_work=Work(), lease_s=0.6)
+    assert "shared_with" not in c.publish()
+
+
 def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
     """Real process: a second publisher under our name, then SIGKILL. Its
     lease expires after 3*lease_s and the shared flag clears."""

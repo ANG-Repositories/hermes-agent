@@ -87,6 +87,8 @@ DEFAULT_PUBLISH_INTERVAL = 2.0
 # skew cannot fake or hide liveness.
 DEFAULT_LEASE_S = 30.0
 LEASE_EXPIRY_FACTOR = 3
+# Upper bound on a publisher's wait for a peer's consumer-record lock.
+CONSUMER_LOCK_MAX_WAIT_S = 5.0
 QUIESCENT, DRAINED, BUSY, UNKNOWN, NOT_HELD, DEFER = (
     "QUIESCENT", "DRAINED", "BUSY", "UNKNOWN", "NOT_HELD", "DEFER",
 )
@@ -457,20 +459,39 @@ class HoldStore:
         _atomic_write_json(self.consumer_path(name), record)
 
     @contextlib.contextmanager
-    def consumer_lock(self, name: str):
+    def consumer_lock(self, name: str, timeout: float):
         """Exclusive across processes for one consumer record, so a publisher's
         read-mark-write of a shared name is one step: without it a write computed
-        from a read that predates a peer's write drops the peer's ``shared_with``."""
+        from a read that predates a peer's write drops the peer's ``shared_with``.
+
+        The wait is BOUNDED (Prism c-5bb4a50e76ea73ff): a holder that never lets
+        go (SIGSTOP, debugger, frozen host) must not stall a peer's lease renewal
+        or its shutdown release. Yields True when the lock is held, False when
+        ``timeout`` passed with another open file description still holding it;
+        the caller then writes unlocked and must fail closed (see ``_write``)."""
         self.consumers_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self.consumers_dir / f".{_consumer_filename(name)}.lock"
         with open(lock_path, "a+b") as fh:
-            if fcntl is not None:
-                fcntl.flock(fh, fcntl.LOCK_EX)
+            if fcntl is None:
+                yield True
+                return
+            deadline = time.monotonic() + max(0.0, timeout)
+            delay = 0.005
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        yield False
+                        return
+                    time.sleep(min(delay, left))
+                    delay = min(delay * 2, 0.1)
             try:
-                yield
+                yield True
             finally:
-                if fcntl is not None:
-                    fcntl.flock(fh, fcntl.LOCK_UN)
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
     def read_consumer(self, name: str) -> Optional[dict]:
         try:
@@ -759,17 +780,37 @@ class AdmissionGate:
 
     def _write(self, record: dict, *, release: bool = False) -> dict:
         """Mark + write as one step (the serving loop and the lease thread
-        both write); stamps the lease on success."""
-        with self._write_lock, self.store.consumer_lock(self.consumer):
+        both write); stamps the lease on success.
+
+        The cross-process record lock is waited on for at most
+        ``_consumer_lock_timeout()`` (well under ``lease_s``), so a renewal is
+        never blocked indefinitely by a peer. On timeout the write goes ahead
+        unlocked, as before the lock existed, and is marked ``shared_with``:
+        a held flock is released by the kernel when its holder exits, so it
+        proves another live process has this consumer's record open mid-write
+        (and a suspended one may still hold work). ``evaluate`` then reads
+        UNKNOWN for as long as the lock stays held; the next write that gets
+        the lock recomputes the mark from the record."""
+        with self._write_lock, self.store.consumer_lock(
+                self.consumer, self._consumer_lock_timeout()) as locked:
             record = dict(record)
             record.pop("shared_with", None)
             record.pop("lease_released", None)
             record = self._mark_shared_record(record)
+            if not locked:
+                record.setdefault("shared_with", {
+                    "pid": None, "instance": None,
+                    "why": "consumer record lock held by another live process"})
             if release:
                 record["lease_released"] = True
             self.store.write_consumer(self.consumer, record)
             self._last_record = record
             return record
+
+    def _consumer_lock_timeout(self) -> float:
+        # A third of the renewal period (capped): a renewal that times out still
+        # lands long before the 3 * lease_s expiry any reader applies.
+        return min(CONSUMER_LOCK_MAX_WAIT_S, self.lease_s / 3)
 
     def renew_lease(self) -> Optional[dict]:
         """Rewrite the last record so the lease stays fresh even while the
