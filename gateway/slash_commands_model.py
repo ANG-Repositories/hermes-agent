@@ -573,15 +573,18 @@ class GatewayModelCommandsMixin:
             raise asyncio.CancelledError()
         return task.result()
 
-    async def _owned_model_selection(self, source, operation, *, render=None):
+    async def _owned_model_selection(self, source, operation, *, render=None, after_reply=None):
         """Run one /model selection under this session's switch lock: compute it, deliver the
         confirmation, then save, and release the lock when the save settles (t_2ab07928).
 
-        Three shapes, one rule (no save outlives the task that started it, and nothing here sends
+        Four shapes, one rule (no save outlives the task that started it, and nothing here sends
         the confirmation itself):
 
         * typed /model in the adapter's own session task: the reply is returned for the adapter to
           send; the save runs as that task's post-delivery callback;
+        * typed /model on a busy session, dispatched inline by the adapter (``after_reply``, the
+          list ``_dispatch_inline_reply`` runs after its send, in the same task; t_2bf22375): the
+          save is appended there;
         * a picker or confirm callback that passed a ``render`` hook: the adapter renders the
           confirmation (edits the picker in place, as before), then the save runs in the same
           callback task;
@@ -609,6 +612,22 @@ class GatewayModelCommandsMixin:
         timing = _mct.current()
         if render is None and held.register_after_delivery(save, timing):
             _mct.mark_save_pending(timing)
+            return reply
+        if render is None and after_reply is not None:
+            # The adapter runs this after the handler returned, outside the runner's profile scope
+            # wrappers: run the save under the handler's context, as register_after_delivery does.
+            ctx = contextvars.copy_context()
+
+            async def _save_after_inline_reply():
+                try:
+                    _mct.reply_delivered(timing)
+                    await asyncio.create_task(
+                        self._run_model_selection_save(held, save, timing), context=ctx)
+                finally:
+                    held.release()
+
+            _mct.mark_save_pending(timing)
+            after_reply.append(_save_after_inline_reply)
             return reply
         try:
             if render is not None:
@@ -856,12 +875,18 @@ class GatewayModelCommandsMixin:
         (gateway/model_cmd_timing.py, t_7fe48f0b)."""
         timing = _mct.begin()  # phase lock_wait: a /model on any other session queues here
         exc: Optional[BaseException] = None
+        render = getattr(event, "_model_selection_render", None)
+        after_reply = getattr(event, "_inline_after_reply", None)
+        _mct.annotate(path="callback" if render is not None
+                      else "background" if getattr(event, "_model_cmd_delivery", None)
+                      else "inline_bypass" if isinstance(after_reply, list) else "direct")
         try:
             async def operation():
                 _mct.phase("config")
                 return await self._handle_model_command_locked(event)
             return await self._owned_model_selection(
-                event.source, operation, render=getattr(event, "_model_selection_render", None))
+                event.source, operation, render=render,
+                after_reply=after_reply if isinstance(after_reply, list) else None)
         except BaseException as e:
             exc = e
             raise
