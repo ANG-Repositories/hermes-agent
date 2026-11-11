@@ -270,7 +270,7 @@ def test_refresh_locked_successor_claims_expired_row_interrupts_within_one_step(
     assert interrupts == ["Session turn lease lost; stopping to protect the transcript."]
     assert db.reads[-1] == "succ" and "h" in db.reads
     assert clock[0] - takeover_at <= 5.0 + 20.0  # one re-check step + one busy timeout
-    assert max(waits[-3:]) == 5.0  # past the margin it re-checks at the shortest step
+    assert waits[-2:] == [5.0, 5.0]  # past the margin it re-checks at the shortest step
 
 
 def test_refresh_locked_and_owner_read_fails_keeps_ttl_margin_give_up(monkeypatch):
