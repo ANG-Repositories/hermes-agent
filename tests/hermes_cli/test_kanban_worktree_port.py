@@ -716,17 +716,61 @@ def test_a_clean_pushed_prior_run_tree_ports_without_a_carry(studio_card):
     assert out[tid][4] is None and len(out[tid]) == 5  # nothing to push, nothing to carry
 
 
-def test_an_unfinished_worktree_add_is_not_work_and_ports(studio_card):
-    """t_20fa16c7's own first spawn: `git worktree add` timed out, leaving no index (every file reads deleted)."""
-    tid, wt, bare, calls = studio_card
+def _drop_index(wt: Path) -> None:
     gitdir = Path(subprocess.run(["git", "-C", str(wt), "rev-parse", "--absolute-git-dir"],
                                  check=True, capture_output=True, text=True).stdout.strip())
     (gitdir / "index").unlink()
+
+
+def test_an_unfinished_worktree_add_with_no_files_is_not_work_and_ports(studio_card):
+    """t_20fa16c7's own first spawn: `git worktree add` timed out before writing anything but ``.git``: no index,
+    no files. Nothing was ever worked in it, so it ports and is left as it is."""
+    tid, wt, bare, calls = studio_card
+    _drop_index(wt)
+    for p in wt.iterdir():
+        if p.name != ".git":
+            p.unlink()
     with kb.connect_closing() as conn:
         out: dict = {}
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
     assert len(out[tid]) == 5  # no carry of "deleted" files
-    assert (wt / "base").exists()
+    assert (wt / ".git").exists()
+
+
+@pytest.mark.parametrize("how", ["no_checkout", "index_lost"])
+def test_a_tree_with_no_index_that_holds_files_stays_local_named(studio_card, anchor, how):
+    """Prism 9afe97134805: a tree with no index cannot be carried (git status reads every file as deleted, an
+    untracked file is not seen), so one holding any file besides ``.git`` fails closed, never ports without it."""
+    tid, wt, bare, calls = studio_card
+    if how == "no_checkout":
+        _git("worktree", "remove", "--force", str(wt), cwd=anchor)
+        _git("worktree", "add", "-q", "--no-checkout", str(wt), f"wt/{tid}", cwd=anchor)
+        (wt / "notes.txt").write_text("work done in a tree git never indexed")
+    else:
+        _drop_index(wt)
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == (
+            "local", "not_portable:workspace_kind:own_tree_not_a_checkout")
+    assert tid not in out
+
+
+def test_a_failed_index_probe_refuses_the_port_named(studio_card, monkeypatch):
+    """Prism b7868d8b43cd: a probe that fails (git error, timeout) is not "uninitialized": the port is refused
+    with a named reason, never read as a tree nobody worked in."""
+    tid, wt, bare, calls = studio_card
+    (wt / "notes.txt").write_text("untracked work")
+    real = kwt._tree_git
+
+    def failing(tree, runner, *args):
+        return None if "--git-path" in args else real(tree, runner, *args)
+
+    monkeypatch.setattr(kwt, "_tree_git", failing)
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == (
+            "local", "not_portable:workspace_kind:own_tree_probe_failed")
+    assert "own_tree_probe_failed" in kwt.LOCAL_ONLY_REASONS
 
 
 def test_an_off_branch_tree_that_drops_branch_commits_stays_local_named(studio_card):

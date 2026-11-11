@@ -7,6 +7,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 PORT = ROOT / "hermes_cli" / "kanban_worktree_port.py"
 DISPATCH = ROOT / "hermes_cli" / "kanban_db_dispatch.py"
@@ -38,6 +40,39 @@ def test_an_unlisted_local_only_reason_fails(tmp_path):
     port.write_text(src.replace('WHY_PINNED = "operator_pin"', 'WHY_PINNED = "repo_on_the_list"'),
                     encoding="utf-8")
     assert _lint().main([str(port), str(DISPATCH)]) == 1
+
+
+@pytest.mark.parametrize("body", [
+    # Prism f202699b4161: the reason routed through a local variable
+    '    reason = "checkout_lives_on_the_studio"\n    _why(why, reason)\n',
+    '    reason = WHY_NO_POOL\n    if why:\n        reason = "checkout_lives_on_the_studio"\n    _why(why, reason)\n',
+    '    for reason in ("checkout_lives_on_the_studio",):\n        _why(why, reason)\n',
+    '    reason = _helper()\n    _why(why, reason)\n',
+    '    _why(why, reason="checkout_lives_on_the_studio")\n',
+])
+def test_an_unlisted_reason_through_a_variable_fails(tmp_path, body):
+    src = PORT.read_text(encoding="utf-8-sig")
+    port = tmp_path / "kanban_worktree_port.py"
+    port.write_text(src + '\n\ndef _helper():\n    return "checkout_lives_on_the_studio"\n\n\n'
+                    'def _new_rule(why):\n' + body, encoding="utf-8")
+    assert _lint().main([str(port), str(DISPATCH)]) == 1
+
+
+def test_an_enumerated_reason_through_a_variable_passes(tmp_path):
+    src = PORT.read_text(encoding="utf-8-sig")
+    port = tmp_path / "kanban_worktree_port.py"
+    port.write_text(src + '\n\ndef _new_rule(why, x):\n    reason = WHY_NO_POOL\n    if x:\n'
+                    '        reason = "operator_pin"\n    _why(why, reason)\n', encoding="utf-8")
+    assert _lint().main([str(port), str(DISPATCH)]) == 0
+
+
+def test_a_suffix_after_the_workspace_kind_prefix_in_the_dispatcher_fails(tmp_path):
+    """Prism 4418d7472cae: the literal head must be exactly the prefix; anything after it is a new reason."""
+    src = DISPATCH.read_text(encoding="utf-8-sig")
+    dispatch = tmp_path / "kanban_db_dispatch.py"
+    dispatch.write_text(src + '\n\ndef _old(wt_why):\n    return "local", '
+                        'f"not_portable:workspace_kind:checkout_lives_on_the_studio:{wt_why[0]}"\n', encoding="utf-8")
+    assert _lint().main([str(PORT), str(dispatch)]) == 1
 
 
 def test_a_fixed_repo_list_reason_in_the_dispatcher_fails(tmp_path):

@@ -89,6 +89,7 @@ WHY_PINNED = "operator_pin"
 WHY_DIVERGED = "diverged_from_origin"
 WHY_UNPUSHED = "unpushed_commits"          # hand-list mode only
 WHY_NOT_CHECKOUT = "own_tree_not_a_checkout"
+WHY_PROBE_FAILED = "own_tree_probe_failed"
 WHY_DERIVED_OFF = "derived_mode_off"
 # A dirty own tree is carried to the clone (t_894be273) except in these cases, where the card stays local:
 WHY_NESTED_REPO = "dirty_submodule_or_nested_repo"   # a modified submodule or an embedded repository
@@ -109,7 +110,10 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
     WHY_PINNED: "an operator pin row in fleet/kanban-worktree-mirrors.json names the hosts (explicit, nightly-listed)",
     WHY_CONCRETE: "a path that is neither a repo root nor this card's own .worktrees/<id> (another card's tree, "
                   "a sub-directory), or the host_preference kanban switch is off (Studio not last resort)",
-    WHY_NOT_CHECKOUT: "the card's .worktrees/<id> holds files but is not a git checkout: git cannot carry them",
+    WHY_NOT_CHECKOUT: "the card's .worktrees/<id> holds files but is not a git checkout, or has no index: git "
+                      "cannot see or carry them",
+    WHY_PROBE_FAILED: "git could not read whether the card's own Studio tree has an index (error or timeout): "
+                      "unknown state is never read as an empty tree",
     WHY_OFF_BRANCH: "the Studio tree is off its branch and its HEAD does not contain the card branch's commits "
                     "(putting the branch at it would drop them), or the carry kill switch / hand-list mode is on",
     WHY_NESTED_REPO: "a modified submodule or an embedded repository: git status cannot see the work inside it",
@@ -440,10 +444,21 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
                 _why(why, WHY_NOT_CHECKOUT)
                 return None, None
             own_tree = None  # an empty leftover directory holds no work: port, leave it where it is
-    if own_tree is not None and not _tree_initialized(own_tree, runner):
-        # `git worktree add` never finished (t_20fa16c7's own first spawn timed out): no run ever worked in it,
-        # and its `git status` would read as "every file deleted". Nothing to carry: port, leave it as it is.
-        own_tree = None
+    if own_tree is not None:
+        initialized = _tree_initialized(own_tree, runner)
+        if initialized is None:
+            # The probe itself failed (git error, timeout): unknown is not "never worked in" (Prism b7868d8b43cd).
+            _why(why, WHY_PROBE_FAILED)
+            return None, None
+        if not initialized:
+            # No index: git cannot see this tree's files (status reads every tracked file as deleted and an
+            # untracked one is not carried). Only a tree holding nothing but `.git` was never worked in
+            # (t_20fa16c7's own first spawn timed out): port, leave it as it is. Any file: fail closed
+            # (Prism 9afe97134805).
+            if not _only_git(own_tree):
+                _why(why, WHY_NOT_CHECKOUT)
+                return None, None
+            own_tree = None
     carry = False
     off_head = None
     if own_tree is not None and not _clean_on_branch(own_tree, b, runner):
@@ -596,12 +611,28 @@ def _git_path(tree: Path, runner: Callable, name: str) -> Optional[Path]:
     return Path(proc.stdout.strip())
 
 
-def _tree_initialized(tree: Path, runner: Callable) -> bool:
+def _only_git(path: Path) -> bool:
+    """``path`` holds nothing but its ``.git`` entry. An unreadable directory is not empty (fail closed)."""
+    try:
+        return all(p.name == ".git" for p in path.iterdir())
+    except OSError:
+        return False
+
+
+def _tree_initialized(tree: Path, runner: Callable) -> Optional[bool]:
     """The worktree's checkout completed: it has an index. ``worktree add`` writes the index last (via
     ``index.lock``), so a killed add leaves none. Its ``initializing`` lock is not the signal: an operator may
-    finish such a tree by hand and work in it."""
+    finish such a tree by hand and work in it. None = the probe failed (unknown, never read as False)."""
     index = _git_path(tree, runner, "index")
-    return index is not None and index.exists()
+    if index is None:
+        return None
+    try:
+        index.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    return True
 
 
 def _tree_head(tree: Path, runner: Callable) -> str:

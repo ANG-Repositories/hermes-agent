@@ -32,6 +32,7 @@ DISPATCH = ROOT / "hermes_cli" / "kanban_db_dispatch.py"
 ENUMERATED = frozenset({
     "no_pool_host", "origin_not_ours", "origin_not_github", "not_a_repo", "diverged_from_origin",
     "operator_pin", "concrete_target_path", "own_tree_not_a_checkout", "own_tree_off_branch",
+    "own_tree_probe_failed",
     # the dirty-tree carry's own refusals (t_894be273)
     "dirty_submodule_or_nested_repo", "dirty_tree_over_cap", "origin_tip_not_studio_head",
     "dirty_path_through_symlink", "dirty_path_not_plain_file",
@@ -59,6 +60,98 @@ def _resolve(node: ast.AST, consts: dict):
     return None
 
 
+def _assignments(name: str, scope: ast.AST) -> list:
+    """Every value bound to ``name`` in ``scope``: ``(kind, node)`` with kind ``value`` (an expression) or
+    ``unknown`` (a binding the lint cannot read: a parameter, augmented assign, with/except target, ...)."""
+    out = []
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        a = scope.args
+        if any(p.arg == name for p in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg] if p):
+            out.append(("unknown", scope))
+    for n in ast.walk(scope):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name) and t.id == name:
+                    out.append(("value", n.value))
+                elif any(isinstance(e, ast.Name) and e.id == name for e in ast.walk(t)):
+                    out.append(("unknown", n))
+        elif isinstance(n, (ast.AnnAssign, ast.NamedExpr)) and isinstance(n.target, ast.Name) \
+                and n.target.id == name:
+            out.append(("value", n.value) if n.value is not None else ("unknown", n))
+        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id == name:
+            out.append(("unknown", n))
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            if not any(isinstance(e, ast.Name) and e.id == name for e in ast.walk(n.target)):
+                continue
+            # literal iteration only: `for r in (A, B)` or `for x, r in ((x1, A), (x2, B))`
+            if isinstance(n.target, ast.Name) and isinstance(n.iter, (ast.Tuple, ast.List)):
+                out.extend(("value", e) for e in n.iter.elts)
+            elif isinstance(n.target, ast.Tuple) and isinstance(n.iter, (ast.Tuple, ast.List)):
+                idx = next((i for i, e in enumerate(n.target.elts) if isinstance(e, ast.Name) and e.id == name), None)
+                for row in n.iter.elts:
+                    if idx is None or not isinstance(row, (ast.Tuple, ast.List)) or len(row.elts) <= idx:
+                        out.append(("unknown", n))
+                    else:
+                        out.append(("value", row.elts[idx]))
+            else:
+                out.append(("unknown", n))
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            if any(i.optional_vars is not None and any(isinstance(e, ast.Name) and e.id == name
+                                                       for e in ast.walk(i.optional_vars)) for i in n.items):
+                out.append(("unknown", n))
+        elif isinstance(n, ast.ExceptHandler) and n.name == name:
+            out.append(("unknown", n))
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+            out.append(("unknown", n))
+    return out
+
+
+def _reason_values(node: ast.AST, scope: ast.AST, consts: dict, funcs: dict, seen=None) -> list:
+    """Descriptions of every value ``node`` (a ``_why`` reason argument) can take that is NOT enumerated (Prism
+    f202699b4161). A string literal or WHY_* constant is checked by value; a local Name is accepted only when
+    every binding of it in its function resolves to enumerated reasons; a call to a module function only when
+    each of its returns does (a tuple return is not a reason string). Anything else is an error."""
+    seen = set() if seen is None else seen
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [] if node.value in ENUMERATED else [repr(node.value)]
+    if isinstance(node, ast.IfExp):
+        return (_reason_values(node.body, scope, consts, funcs, seen)
+                + _reason_values(node.orelse, scope, consts, funcs, seen))
+    if isinstance(node, ast.Name):
+        key = (id(scope), node.id)
+        if key in seen:
+            return []
+        seen.add(key)
+        binds = _assignments(node.id, scope) if not isinstance(scope, ast.Module) else []
+        if not binds:
+            val = consts.get(node.id)
+            if val is None:
+                return [f"{node.id!r} (unbound here)"]
+            return [] if val in ENUMERATED else [f"{val!r} ({node.id})"]
+        bad = []
+        for kind, value in binds:
+            if kind == "unknown":
+                bad.append(f"{node.id!r} (bound at line {getattr(value, 'lineno', '?')} to a value the lint "
+                           "cannot read)")
+            else:
+                bad.extend(_reason_values(value, scope, consts, funcs, seen))
+        return bad
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in funcs:
+        fn = funcs[node.func.id]
+        key = ("fn", fn.name)
+        if key in seen:
+            return []
+        seen.add(key)
+        bad = []
+        for ret in (n for n in ast.walk(fn) if isinstance(n, ast.Return)):
+            if ret.value is None or isinstance(ret.value, ast.Tuple) or (
+                    isinstance(ret.value, ast.Constant) and ret.value.value is None):
+                continue  # not a reason string (the caller's isinstance(..., str) guard)
+            bad.extend(_reason_values(ret.value, fn, consts, funcs, seen))
+        return bad
+    return [f"{ast.unparse(node)!r} (not a literal, WHY_* constant or traceable local)"]
+
+
 def check_port(path: Path) -> list:
     src = path.read_text(encoding="utf-8-sig")
     tree = ast.parse(src, str(path))
@@ -70,22 +163,22 @@ def check_port(path: Path) -> list:
         if name.startswith("WHY_") and val not in ENUMERATED:
             errors.append(f"{path.name}: {name} = {val!r} is not enumerated (add it to LOCAL_ONLY_REASONS with a "
                           "justification AND to scripts/check_worktree_local_reasons.py ENUMERATED)")
+    funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_why":
-            if len(node.args) < 2:
+            arg = node.args[1] if len(node.args) >= 2 else next(
+                (k.value for k in node.keywords if k.arg == "reason"), None)
+            if arg is None:
+                errors.append(f"{path.name}:{node.lineno}: _why call without a reason argument")
                 continue
-            arg = node.args[1]
-            names = [arg]
-            if isinstance(arg, ast.IfExp):
-                names = [arg.body, arg.orelse]
-            for n in names:
-                val = _resolve(n, consts)
-                if val is None and isinstance(n, ast.Name):
-                    continue  # a loop variable over checked tuples (resolved below via the tuple literals)
-                if val not in ENUMERATED:
-                    errors.append(f"{path.name}:{node.lineno}: local-only reason {val or ast.unparse(n)!r} is not "
-                                  "enumerated (add it to LOCAL_ONLY_REASONS with a justification AND to "
-                                  "scripts/check_worktree_local_reasons.py ENUMERATED)")
+            scope = node
+            while scope in parents and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope = parents[scope]
+            for desc in _reason_values(arg, scope, consts, funcs):
+                errors.append(f"{path.name}:{node.lineno}: local-only reason {desc} is not enumerated (add it to "
+                              "LOCAL_ONLY_REASONS with a justification AND to scripts/check_worktree_local_reasons.py "
+                              "ENUMERATED)")
         if isinstance(node, ast.Tuple):
             # (base, WHY_X) pairs fed to _why through a loop variable
             for elt in node.elts:
@@ -130,7 +223,10 @@ def check_dispatch(path: Path) -> list:
             head = node.values[0] if node.values else None
             if isinstance(head, ast.Constant) and str(head.value).startswith("not_portable:workspace_kind:"):
                 rest = node.values[1:]
-                ok = (len(rest) == 1 and isinstance(rest[0], ast.FormattedValue)
+                # the literal head is exactly the prefix: any text after it is a new, unenumerated reason
+                # (Prism 4418d7472cae)
+                ok = (head.value == "not_portable:workspace_kind:"
+                      and len(rest) == 1 and isinstance(rest[0], ast.FormattedValue)
                       and ast.unparse(rest[0].value) == "wt_why[0]")
                 if not ok:
                     errors.append(f"{path.name}:{node.lineno}: workspace_kind reason built from "
