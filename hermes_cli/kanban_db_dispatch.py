@@ -8246,8 +8246,10 @@ def _dispatch_once_locked(
                     # failure (claim released, reservation refunded), never an empty-dir run.
                     _split = _carry_rows.get(claimed.id)
                     _split = _split if isinstance(_split, dict) else None
-                    _kb._kwh.carry_workspace(placed_host, str(workspace),
-                                             exclude=_split["exclude"] if _split else ())
+                    if _split:
+                        _kb._kwh.carry_workspace(placed_host, str(workspace), exclude=_split["exclude"])
+                    else:
+                        _kb._kwh.carry_workspace(placed_host, str(workspace))
                     if _split:
                         # t_9965b8d5: the clones the carry left out are rebuilt from origin, same branch + commit.
                         _kb._kwh.carry_clones(placed_host, str(workspace), _split["clones"],

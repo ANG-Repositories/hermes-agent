@@ -228,9 +228,10 @@ def _clone_in(ws, name="repo", *, dirty=False, ahead=False):
 def small_carry(monkeypatch):
     """CARRY_MAX_BYTES scaled down: the 20 kB clone puts the dir over, notes.md alone fits."""
     kwh._carry_scan_cache.clear()
-    kwh._carry_clone_cache.clear()
+    getattr(kwh, "_carry_clone_cache", {}).clear()
     monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_bytes", 8192)
-    monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_bytes", 8192)
+    if hasattr(kwh, "carry_split"):  # absent before the split (red-first run on the base)
+        monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_bytes", 8192)
 
 
 def _route_carry(conn, tid):
@@ -326,3 +327,42 @@ def test_kill_switch_keeps_the_over_limit_card_on_the_old_rule(kanban_home, smal
         _clone_in(path)
         route, plan = _route_carry(conn, tid)
     assert plan is None and route[0] == "local", route
+
+
+def test_carry_clones_rebuilds_the_clone_at_the_same_commit(kanban_home, tmp_path, monkeypatch):
+    """The host-side script, run locally: ssh is stripped from the argv and origin is a local bare repo."""
+    import subprocess
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    src = tmp_path / "src"
+    subprocess.run(["git", "clone", "-q", str(origin), str(src)], check=True, capture_output=True)
+    for args in (("config", "user.email", "t@t"), ("config", "user.name", "t")):
+        subprocess.run(["git", "-C", str(src), *args], check=True)
+    (src / "a.txt").write_text("1\n")
+    subprocess.run(["git", "-C", str(src), "add", "a.txt"], check=True)
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "one"], check=True)
+    subprocess.run(["git", "-C", str(src), "push", "-q", "origin", "main"], check=True, capture_output=True)
+    first = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], check=True, capture_output=True,
+                           text=True).stdout.strip()
+    (src / "a.txt").write_text("2\n")
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "-am", "two"], check=True)
+    subprocess.run(["git", "-C", str(src), "push", "-q", "origin", "main"], check=True, capture_output=True)
+
+    real_clone_script = kwt.clone_script
+    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, m, b: real_clone_script(w, slug, m, b,
+                                                                                      url=str(origin)))
+
+    def local(argv, **kw):
+        if argv[0] == "ssh":
+            argv = ["sh", "-c", argv[-1]]
+        return subprocess.run(argv, **{k: v for k, v in kw.items() if k != "stdin"})
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    kwh.carry_clones(_host(), str(ws), [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": first,
+                                         "push": None}], kanban_home / "fleet", runner=local)
+    head = subprocess.run(["git", "-C", str(ws / "repo"), "rev-parse", "HEAD"], check=True, capture_output=True,
+                          text=True).stdout.strip()
+    assert head == first  # the Studio's commit, not origin's newer tip
+    assert (ws / "repo" / "a.txt").read_text() == "1\n"
