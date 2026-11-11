@@ -11474,6 +11474,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # gateway.run imports from CLI code don't poison them. Shared with the cron script runner (§5.6).
     _apply_start_env()
 
+    # macOS: every subprocess launch in this process goes through one posix_spawn instead of
+    # fork()ing the multi-GB gateway under the GIL (t_aa2e2d4e). No-op elsewhere; launches it
+    # cannot express exactly keep plain Popen; HERMES_SPAWN_LEGACY=1 turns it off per spawn.
+    from tools.spawn_nofork import install_process_hook
+    install_process_hook()
+
     from hermes_cli.resource_limits import apply_nofile_soft_limit
     apply_nofile_soft_limit()
 
