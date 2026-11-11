@@ -52,6 +52,9 @@ _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple, Opt
 
 logger = logging.getLogger(__name__)
 
+# Every writer ever built (weakly), so ``stop_runtime_status_writers`` reaches test-built ones too.
+_RUNTIME_STATUS_WRITERS: "weakref.WeakSet[_RuntimeStatusWriter]" = weakref.WeakSet()
+
 
 class _RuntimeStatusWriter:
     """Persist the latest complete status snapshot on one daemon thread.
@@ -72,12 +75,15 @@ class _RuntimeStatusWriter:
         self._last_error: Optional[BaseException] = None
         self._failure_logged = False
         self._thread: Optional[threading.Thread] = None
+        self._stopping = False
+        _RUNTIME_STATUS_WRITERS.add(self)
 
     def submit(self, path: Path, payload: dict[str, Any]) -> int:
         with self._condition:
             self._submitted_generation += 1
             generation = self._submitted_generation
             self._pending = (generation, path, copy.deepcopy(payload))
+            self._stopping = False
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
                     target=self._run, daemon=True, name="gateway-runtime-status-writer")
@@ -118,10 +124,27 @@ class _RuntimeStatusWriter:
             )
             return False if no_more_work else None
 
+    def stop(self, timeout: float = 2.0) -> bool:
+        """Persist what is pending, then end the writer thread; ``True`` once it has exited.
+
+        A later ``submit`` starts a fresh thread, so a stopped writer stays usable.
+        """
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=max(timeout, 0.0))
+        return not thread.is_alive()
+
     def _run(self) -> None:
         while True:
             with self._condition:
                 while self._pending is None:
+                    if self._stopping:
+                        self._thread = None  # under the lock: a later submit starts a fresh thread
+                        return
                     self._condition.wait()
                 generation, path, payload = self._pending
                 self._pending = None
@@ -303,6 +326,19 @@ def flush_runtime_status(timeout: float = 2.0) -> bool:
     """Wait boundedly for all runtime-status updates submitted so far."""
     writer = _runtime_status_writer
     return True if writer is None else writer.flush(timeout=timeout)
+
+
+def stop_runtime_status_writers(timeout: float = 2.0) -> bool:
+    """Drain and end every runtime-status writer thread; ``True`` when none is left running.
+
+    The test suite's teardown: a write still in flight from one test must not land during
+    the next one (t_3187cbec).
+    """
+    deadline = time.monotonic() + max(timeout, 0.0)
+    stopped = True
+    for writer in list(_RUNTIME_STATUS_WRITERS):
+        stopped = writer.stop(timeout=max(deadline - time.monotonic(), 0.0)) and stopped
+    return stopped
 
 
 async def flush_runtime_status_async(timeout: float = 2.0) -> bool:
