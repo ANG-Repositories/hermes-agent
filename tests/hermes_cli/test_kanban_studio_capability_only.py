@@ -82,9 +82,12 @@ def test_local_files_the_carry_cannot_move_waits_named(kanban_home, carried, mon
     assert not studio
 
 
-def test_unpushed_dirty_worktree_waits_and_names_the_dirty_path_count(kanban_home, anchor):
-    """A worktree is not a capability: a dirty one cannot port, so it waits with the count of dirty paths."""
+def test_unpushed_dirty_worktree_waits_and_names_the_dirty_path_count(kanban_home, anchor, monkeypatch):
+    """A worktree is not a capability: a dirty one that cannot port waits with the count of dirty paths. Since
+    #219 (t_894be273) a dirty tree is carried, so this pins the case where it is not: the dirty carry switched off."""
+    from hermes_cli import kanban_worktree_port as kwt
     from tests.hermes_cli.test_kanban_worktree_port import _commit, _git, _worktree_card
+    monkeypatch.setenv(kwt.DIRTY_CARRY_ENV, "0")
     _commit(anchor, "base")
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
@@ -512,12 +515,57 @@ def test_carry_clones_rebuilds_the_clone_at_the_same_commit(kanban_home, tmp_pat
         return subprocess.run(argv, **{k: v for k, v in kw.items() if k != "stdin"})
     ws = tmp_path / "ws"
     ws.mkdir()
+    # Studio and pool host are one local path here: the Studio-side re-check (review F2) has no Studio clone to read
+    monkeypatch.setattr(kwh, "clone_moved_since_routing", lambda *a, **k: None)
     kwh.carry_clones(_host(), str(ws), [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": first,
                                          "push": None}], kanban_home / "fleet", runner=local)
     head = subprocess.run(["git", "-C", str(ws / "repo"), "rev-parse", "HEAD"], check=True, capture_output=True,
                           text=True).stdout.strip()
     assert head == first  # the Studio's commit, not origin's newer tip
     assert (ws / "repo" / "a.txt").read_text() == "1\n"
+
+
+def test_carry_clones_refuses_a_clone_edited_after_a_cached_clean_verdict(kanban_home, tmp_path, monkeypatch):
+    """Review F2 (22:1x): assess_clone_cached keys on HEAD, the branch ref and the index mtime, so an unstaged edit
+    or a new untracked file reuses a clean record. carry_clones re-checks uncached before any push or rebuild and
+    raises; nothing is pushed or cloned. A HEAD that moved off the recorded sha is refused the same way."""
+    import subprocess
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sha = _clone_in(ws, branch="feature", ahead=True)
+    repo = ws / "repo"
+    rec, why = kwh.assess_clone_cached(str(repo), now=0.0)
+    assert why is None and rec["sha"] == sha and rec["push"] is not None, (rec, why)
+    pushed, cloned = [], []
+    monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=None: pushed.append(push))
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
+    clone = [{"rel": "repo", **{k: rec[k] for k in ("slug", "branch", "sha", "push")}, "ignored": ()}]
+
+    def unstaged(undo=False):
+        (repo / "big.bin").write_bytes(b"x" * 20000 if undo else b"edited, not staged")
+
+    def untracked(undo=False):
+        (repo / "new.txt").unlink() if undo else (repo / "new.txt").write_text("untracked\n")
+    for edit in (unstaged, untracked):
+        kwh._clone_assess_cache.clear()
+        assert kwh.assess_clone_cached(str(repo), now=0.0) == (rec, None)               # primed clean
+        edit()
+        assert kwh.assess_clone_cached(str(repo), now=1.0) == (rec, None), edit         # the stale cached verdict
+        with pytest.raises(RuntimeError, match="no longer clean"):
+            kwh.carry_clones(_host(), str(ws), clone, kanban_home / "fleet")
+        assert pushed == [] and cloned == [], edit
+        edit(undo=True)
+    # HEAD moved off the recorded sha (clean tree, so only the sha check can catch it)
+    subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard", "HEAD~1"], check=True)
+    with pytest.raises(RuntimeError, match="HEAD moved off"):
+        kwh.carry_clones(_host(), str(ws), clone, kanban_home / "fleet")
+    assert pushed == [] and cloned == []
+    # back on the recorded sha and clean: pushed then rebuilt, as before
+    subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard", sha], check=True)
+    kwh.carry_clones(_host(), str(ws), clone, kanban_home / "fleet")
+    assert len(pushed) == 1 and len(cloned) == 1
 
 
 def test_studio_capability_is_consumer_neutral():

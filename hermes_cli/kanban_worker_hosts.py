@@ -928,17 +928,40 @@ def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subproces
                            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
 
 
+def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable = subprocess.run) -> Optional[str]:
+    """None when the Studio clone at ``repo`` is still clean on ``branch`` with HEAD at ``sha``, else the reason
+    (review F2, 22:1x). Uncached on purpose: the routing record may come from :func:`assess_clone_cached`, whose
+    key cannot see an unstaged edit or a new untracked file, and the file carry excludes the clone, so rebuilding
+    a clone that changed since routing would lose that work."""
+    from pathlib import Path as _P
+    from hermes_cli import kanban_worktree_port as _kwt
+    if not _kwt._clean_on_branch(_P(repo), branch, runner):
+        return f"is no longer clean on {branch}"
+    try:
+        cur = runner(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8",
+                     timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return "HEAD unreadable"
+    if getattr(cur, "returncode", 1) != 0 or (cur.stdout or "").strip() != sha:
+        return f"HEAD moved off {str(sha)[:12]}"
+    return None
+
+
 def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run) -> None:
     """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
     pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
     put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
     from hermes_cli import kanban_worktree_port as _kwt
     for c in clones:
-        if c.get("push") is not None:
-            _kwt.push_card_branch(tuple(c["push"]), runner)
         dest = f"{workspace.rstrip('/')}/{c['rel'].strip('/')}"
         if not carry_path_safe(dest):
             raise RuntimeError(f"carry to {host.name}: refused, clone path {dest!r} is not shell-inert")
+        # Review F2 (22:1x): uncached re-check before anything is pushed or rebuilt (see clone_moved_since_routing).
+        moved = clone_moved_since_routing(dest, c["branch"], c["sha"], runner)
+        if moved:
+            raise RuntimeError(f"carry to {host.name}: clone {c['rel']} {moved}")
+        if c.get("push") is not None:
+            _kwt.push_card_branch(tuple(c["push"]), runner)
         route = _kwt.derived_route(c["slug"], fleet_dir, (host.name,))
         mirror = _kwt.mirror_for((c["slug"], *route), host.name) if route else \
             f"{_kwt.DERIVED_MIRROR_ROOT}/{c['slug']}.git"
