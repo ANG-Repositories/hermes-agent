@@ -504,6 +504,28 @@ def _signal_script_tree(proc: subprocess.Popen, snapshot: Optional[list], sig: i
             member.send_signal(sig)  # psutil checks pid + create_time before signalling
 
 
+def _job_for_text(job_id: Optional[str]) -> Optional[dict]:
+    """The job record for a failure text (active cron scope); None on any error."""
+    if not job_id:
+        return None
+    try:
+        from cron.jobs import get_job
+        return get_job(str(job_id))
+    except Exception:
+        return None
+
+
+def drain_kill_followup(job: Optional[dict], *, refire: bool) -> str:
+    """One sentence for a drain-killed run: whether and when the job runs again (t_fa0b5cff)."""
+    if refire:
+        return ("It will re-run once as soon as the cron runner is back on the new code and the "
+                "killed run's processes are gone (normally within minutes), not at its next "
+                "scheduled time.")
+    nxt = (job or {}).get("next_run_at") or "unknown"
+    return (f"It will NOT be re-fired (its one re-fire is already spent on a failing streak); "
+            f"next scheduled run: {nxt}.")
+
+
 def _drain_script_pipes(proc: subprocess.Popen) -> None:
     """Reap a terminated script without blocking forever: a surviving descendant can hold the pipe
     write ends open, so bound the drain and abandon the pipes (output is not needed)."""
@@ -861,9 +883,16 @@ def _run_job_script(
 
         if _skew_cut:
             # Cut off by the script runner's bounded code-skew drain: never a success, whatever the
-            # script's own exit status (Prism b86087faa72f); its re-fire flag is set above.
+            # script's own exit status (Prism b86087faa72f); its re-fire flag is set above. The
+            # text says whether and when it runs again (t_fa0b5cff: "eligible" read as a promise
+            # while the re-fire was withheld, and nobody could tell a night was lost). A key
+            # withheld before the kill (a re-fire-spent failing streak) is never re-fired; a tree
+            # that outlives the kill only DEFERS the re-fire (script_runner_rearm gated rows).
+            with _sched._script_procs_lock:
+                _withheld = _skew_key in _sched._refire_spent_withheld_job_ids
             parts = [f"Script interrupted by the cron script runner's code-skew drain "
-                     f"(exit {proc.returncode}); eligible for one re-fire after restart."]
+                     f"(exit {proc.returncode}). "
+                     + drain_kill_followup(_job_for_text(job_id), refire=not _withheld)]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             return False, "\n".join(parts)

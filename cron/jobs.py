@@ -4834,6 +4834,22 @@ RESTART_REQUEUE_MAX_AGE_SECONDS = DEFAULT_ONESHOT_CATCHUP_SECONDS
 # fleet-upstream-leak-lint re-fired 71 ms apart -> Studio load1=67). The n-th
 # re-fire in one scan is deferred n * this many seconds; the first fires now.
 RESTART_REQUEUE_STAGGER_S = 300
+# t_fa0b5cff: a row may ask the script runner's code-skew drain to let its in-flight run finish
+# instead of terminating it at ``RUNNER_SKEW_DRAIN_MAX_S``, for at most this many seconds of run
+# time (measured from the run's start). Past it the run is cut like any other (one re-fire).
+DRAIN_FINISH_KEY = "drain_finish_s"
+
+
+def drain_finish_seconds(job: Optional[Dict[str, Any]]) -> Optional[int]:
+    """The row's positive ``drain_finish_s`` as int seconds, else None (today's bounded drain)."""
+    raw = (job or {}).get(DRAIN_FINISH_KEY)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value > 0 else None
 
 
 def restart_refire_refusal(job: Optional[Dict[str, Any]], *, run_counted: bool = True) -> Optional[str]:

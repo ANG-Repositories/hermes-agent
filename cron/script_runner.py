@@ -127,6 +127,36 @@ def _inflight_refire_status() -> tuple:
     return spent, failed
 
 
+def _inflight_finish_requested() -> List[tuple]:
+    """``(job_id, elapsed_s, max_s)`` per in-flight run whose row sets ``drain_finish_s`` and has
+    run for less than that (t_fa0b5cff): the bounded skew drain waits for it instead of cutting it
+    at ``RUNNER_SKEW_DRAIN_MAX_S``. A run past its own maximum is cut like any other."""
+    import cron.scheduler as sched
+    from cron.jobs import drain_finish_seconds, get_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    with sched._running_lock:
+        keys = sorted(sched._running_job_ids | sched._running_fire_owners.keys())
+        since = {k: sched._running_since.get(k) for k in keys}
+    now = time.time()
+    out = []
+    for key in keys:
+        home_key, job_id = key
+        try:
+            with _profile_cron_scope(sched._inflight_home_path(home_key)):
+                max_s = drain_finish_seconds(get_job(job_id))
+        except Exception:
+            logger.debug("drain-finish lookup failed for %s", job_id, exc_info=True)
+            continue
+        started = since.get(key)
+        if max_s is None or started is None:
+            continue
+        elapsed = now - started
+        if elapsed < max_s:
+            out.append((job_id, round(elapsed), max_s))
+    return out
+
+
 def _boot_code_sha() -> Optional[str]:
     try:
         from gateway.code_skew import current_code_sha
@@ -266,6 +296,13 @@ class ScriptRunner:
 
         self._last_homes = [_profile_entry(e) for e in _existing_profile_homes(homes)]
         self._check_skew()
+        if not self.draining:
+            # A gated re-fire waits for the drain-killed tree to go (t_fa0b5cff); checked every
+            # cycle so it fires within one cycle of that, not at the next restart.
+            with contextlib.suppress(Exception):
+                from cron import script_runner_rearm as rearm_policy
+
+                rearm_policy.apply_gated_refires()
         if not lanes.knob_enabled():
             marker = trip_marker_path()
             if marker.exists():
@@ -388,6 +425,14 @@ class ScriptRunner:
                 names = ", ".join(f"{job_id} {elapsed}s" for job_id, elapsed in spent)
                 self._warn_hourly("skew_wait", tuple(j for j, _ in spent),
                                   "script runner code-skew drain waiting: re-fire spent, %s", names)
+                return
+            finishing = _inflight_finish_requested()
+            if finishing:
+                names = ", ".join(f"{job_id} {elapsed}s of {max_s}s"
+                                  for job_id, elapsed, max_s in finishing)
+                self._warn_hourly("skew_finish", tuple(j for j, _e, _m in finishing),
+                                  "script runner code-skew drain waiting: finish requested, %s",
+                                  names)
                 return
             logger.warning("script runner code-skew drain bounded: re-fire available; %d script(s) "
                            "in flight past %s s, terminating them (one re-fire each) and exiting 0; "
@@ -752,11 +797,14 @@ class ScriptRunner:
         import cron.scheduler as sched
         from cron import scheduler_script as ss
 
+        with sched._running_lock:  # run starts, before any worker can release its key
+            since = dict(sched._running_since)
         with sched._script_procs_lock:
             sched.signal_shutdown("cron script runner code-skew drain bound")
             # Re-fire-spent jobs whose last run failed were not waited for (t_af461294): their cut
             # run is recorded as a failure with no re-fire.
             sched._refire_withheld_job_ids.update(self._skew_withhold)
+            sched._refire_spent_withheld_job_ids.update(self._skew_withhold)
             trees = [(key, proc, ss._script_tree_snapshot(proc))
                      for key, proc in sched._active_script_procs.items() if proc.returncode is None]
             # returncode stays None until the worker reaps its script, so an exited run reads as in
@@ -797,11 +845,92 @@ class ScriptRunner:
             withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
             sched._refire_withheld_job_ids.update(withheld)
             sched._restart_killed_job_ids.difference_update(withheld)
+            # Withheld here only DEFERS the re-fire (t_fa0b5cff): it used to drop it for good, so
+            # sub-vps-backup (2026-11-11 02:55, "12 script tree(s) survived SIGKILL") never re-ran.
+            # Record the surviving members; the next runner re-fires once they are gone or the
+            # run's own script timeout has passed. A spent failing job stays withheld.
+            gates = [(sched._script_proc_job_ids.get(key), self._gate_members(proc, snap))
+                     for key, proc, snap in alive
+                     if sched._script_proc_job_ids.get(key) in withheld
+                     and sched._script_proc_job_ids.get(key) not in self._skew_withhold]
+        if gates:
+            self._record_gated_refires(gates, since)
         if alive:
             logger.error("script runner code-skew drain: %d script tree(s) survived SIGKILL (%s); "
                          "re-fire withheld for %s", len(alive),
                          ", ".join(str(proc.pid) for _k, proc, _s in alive),
                          ", ".join(sorted(f"{j}@{h}" for h, j in withheld)) or "-")
+
+    @staticmethod
+    def _gate_members(proc, snap) -> dict:
+        """``{"members": [[pid, create_time]...], "unsure": [...]}`` for a survivor tree's
+        still-running members. ``unsure`` are ``_UnreadableMember`` hits: a same-user orphan with
+        an unreadable environ that MAY be ours (on macOS every launchd job has ppid 1, so a long
+        run collects unrelated ones; the likely source of 02:55's "12 survived"). They hold the
+        re-fire only for ``RUNNER_GATED_UNSURE_S``; a real member holds it to the run's deadline.
+        ``unproven``: a failed scan, or nothing re-identifiable in a tree that was alive; the
+        re-fire then waits for the run's deadline (``until``), never less."""
+        import psutil
+        from cron import scheduler_script as ss
+
+        out: Dict[str, Any] = {"members": [], "unsure": [], "unproven": False}
+        for member in snap or []:
+            if isinstance(member, ss._UnprovenMember):
+                out["unproven"] = True  # a failed scan: an escapee cannot be ruled out
+                continue
+            unsure = isinstance(member, ss._UnreadableMember)
+            target = getattr(member, "_process", member)
+            try:
+                if member.pid <= 0 or not target.is_running() \
+                        or target.status() == psutil.STATUS_ZOMBIE:
+                    continue
+                out["unsure" if unsure else "members"].append(
+                    [int(member.pid), float(target.create_time())])
+            except Exception:
+                out["unproven"] = True  # alive at the check, unidentifiable now
+                continue
+        if snap is None:
+            try:
+                out["members"].append([int(proc.pid),
+                                       float(psutil.Process(proc.pid).create_time())])
+            except Exception:
+                out["unproven"] = True
+        if not out["members"] and not out["unsure"]:
+            # The tree was alive at the final check but nothing in it can be re-identified: never
+            # read that as gone (Prism 28e1906cda71, 68af07493f6b). Hold to the run's deadline.
+            out["unproven"] = True
+        return out
+
+    @staticmethod
+    def _record_gated_refires(gates: list, since: dict) -> None:
+        """Persist one gated re-fire per survivor job: it fires once its members are gone or the
+        run's own script timeout (from the run's start) has passed. Never raises."""
+        import cron.scheduler as sched
+        from cron import script_runner_rearm as rearm_policy
+
+        rows = []
+        now = time.time()
+        for key, members in gates:
+            try:
+                home = sched._inflight_home_path(key[0])
+                from cron.jobs import get_job
+                from cron.scheduler_provider import _profile_cron_scope
+
+                with _profile_cron_scope(home):
+                    timeout = int(sched._job_script_kwargs(get_job(key[1]) or {})
+                                  .get("timeout_seconds") or 0)
+                    if timeout <= 0:
+                        from cron.scheduler_script import _get_script_timeout
+                        timeout = int(_get_script_timeout())
+                started = since.get(key) or now
+                rows.append({"home": str(home), "job_id": key[1], "start": started,
+                             "until": max(started + timeout, now),
+                             "unsure_until": now + float(lanes.RUNNER_GATED_UNSURE_S),
+                             **members})
+            except Exception:
+                logger.error("script runner: gated re-fire for %s not recorded", key,
+                             exc_info=True)
+        rearm_policy.record_gated_refires(rows)
 
     @staticmethod
     def _skew_terminate(trees: list) -> list:
@@ -923,6 +1052,8 @@ def main(argv: Optional[list] = None) -> int:
         from cron import script_runner_rearm
 
         script_runner_rearm.apply_pending_requeues()
+        # Drain-killed runs whose tree outlived SIGKILL re-fire once it is gone (t_fa0b5cff).
+        script_runner_rearm.apply_gated_refires()
     stop = threading.Event()
     kwargs = runner.start_kwargs(stop)
     signal.signal(signal.SIGTERM, lambda *_a: runner.request_shutdown())
