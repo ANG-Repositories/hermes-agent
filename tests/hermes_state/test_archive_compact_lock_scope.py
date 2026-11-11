@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import hermes_state
+import hermes_state_messages
 from hermes_state import SessionDB
 
 
@@ -138,6 +139,35 @@ def test_concurrent_identity_edit_after_prescan_is_recomputed(db, monkeypatch):
                            "display_metadata, display_identity FROM messages WHERE id = ?", (target["id"],)).fetchone()
     assert row["content"] == "edited after prescan"
     assert row["display_identity"] == db._display_identity(db._display_dedupe_key(row))
+
+
+def test_drifted_prescan_is_not_reused_after_aba(db):
+    """Prism d7b6f8936a56: row holds A but stores H(B) (drift). After the prescan another writer turns it
+    into B and reconciles, restoring H(B). The stale prescan must not fold the row with a copy of A."""
+    _seed(db, 4)
+    rows = _display_columns(db)
+    r0, r2 = rows[0]["id"], rows[2]["id"]
+    with db._read_ctx() as conn:
+        a = conn.execute("SELECT content, timestamp FROM messages WHERE id = ?", (r0,)).fetchone()
+    db._write_rowcount("UPDATE messages SET content = ?, timestamp = ? WHERE id = ?", (a[0], a[1], r2))
+    db._execute_write(lambda conn: db._reconcile_display_orders(conn, "s"))
+    with db._read_ctx() as conn:
+        row = conn.execute(f"SELECT {hermes_state_messages._RECONCILE_KEY_COLUMNS} FROM messages WHERE id = ?",
+                           (r0,)).fetchone()
+    key_b = (*db._display_dedupe_key(row)[:1], "B content", *db._display_dedupe_key(row)[2:])
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE messages SET display_identity = ? WHERE id = ?", (db._display_identity(key_b), r0)))
+
+    stale = db._prescan_display_identities("s")
+    assert stale[r0][0] != stale[r0][1]  # drifted: stores H(B), holds A
+    db._write_rowcount("UPDATE messages SET content = ? WHERE id = ?", ("B content", r0))
+    db._execute_write(lambda conn: db._reconcile_display_orders(conn, "s"))  # restores H(B) on r0
+    assert dict((r[0], r[2]) for r in _display_columns(db))[r0] == stale[r0][0]
+
+    db._execute_write(lambda conn: db._reconcile_display_orders(conn, "s", stale))
+    after = {r[0]: (r[1], r[2]) for r in _display_columns(db)}
+    assert after[r0] == (r0, db._display_identity(key_b))
+    assert after[r2][0] == r2  # the copy of A is not folded under the row that now holds B
 
 
 def test_prescanned_refold_matches_a_full_recompute(db):

@@ -1459,8 +1459,9 @@ class SessionMessagesMixin:
         path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift.
 
         *prescan* (:meth:`_prescan_display_identities`) supplies identities hashed before the
-        transaction; one is used only while the row's stored ``display_identity`` still equals the
-        value read with it, so every row a concurrent writer inserted or edited is recomputed here."""
+        transaction; one is used only when the stored value read with it already equaled the hash AND
+        the row still stores that value, so drifted rows and every row a concurrent writer inserted or
+        edited are recomputed here."""
         prescan = prescan or {}
         listing: List[Tuple[int, Any, Any]] = []
         last_id = 0
@@ -1477,7 +1478,9 @@ class SessionMessagesMixin:
         misses = []
         for row_id, _order, stored in listing:
             cached = prescan.get(row_id)
-            if cached is not None and stored is not None and cached[0] == stored:
+            # A drifted stored value (cached[0] != cached[1]) is no watermark: a concurrent edit plus
+            # reconcile can restore exactly that value over different bytes (ABA), so recompute it here.
+            if cached is not None and stored is not None and cached[0] == stored == cached[1]:
                 identities[row_id] = cached[1]
             else:
                 misses.append(row_id)
