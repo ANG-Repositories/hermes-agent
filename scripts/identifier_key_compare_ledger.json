@@ -62,11 +62,6 @@
    "why": "GitHub owner/repository names are case-insensitive; mirror override keys intentionally share GitHub identity semantics.",
    "where": "hermes_cli/kanban_worktree_port.py:165 read_overrides"
   },
-  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::if slug.lower() in exclude:": {
-   "verdict": "kept",
-   "why": "GitHub repository exclusions must cover case aliases of the same repository, not task or session identifiers.",
-   "where": "hermes_cli/kanban_worktree_port.py:178 derived_route"
-  },
   "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::default, per_host = paths.get(slug.lower(), (None, {}))": {
    "verdict": "kept",
    "why": "GitHub repository names are case-insensitive; match the normalized override map.",
@@ -661,6 +656,21 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, pr) tuple IS the canonical PR identity for binding; byte-exact would let one PR fail to bind its own obligation.",
    "where": "hermes_cli/kanban_work_obligations.py:580 _identity"
+  },
+  "hermes_cli/kanban_worktree_port.py::read_overrides::fold::repo::pins[row[\"repo\"].lower()] = tuple(dict.fromkeys(h.strip().lower() for h in row[\"hosts\"]))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers.",
+   "where": "hermes_cli/kanban_worktree_port.py:249 read_overrides"
+  },
+  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::pinned = pins.get(slug.lower())": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers. Lookup matches the key normalized in read_overrides.",
+   "where": "hermes_cli/kanban_worktree_port.py:276 derived_route"
+  },
+  "hermes_cli/kanban_worktree_port.py::mint_rewrite::fold::slug::pinned = read_overrides(fleet_dir)[0].get(slug.lower())": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers. Lookup matches the key normalized in read_overrides.",
+   "where": "hermes_cli/kanban_worktree_port.py:780 mint_rewrite"
   }
  }
 }

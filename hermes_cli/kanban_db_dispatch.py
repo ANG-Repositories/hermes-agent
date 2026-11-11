@@ -5606,9 +5606,11 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
     wt_why: list = []
     if (row["workspace_kind"] or "scratch") == "worktree" and wt_hold_out is not None \
             and not (allowlisted and not linked and bind is None):
-        # Prism 68e6b44a555a: the port was never assessed because of a structural fact; _route_row names it.
+        # Prism 68e6b44a555a: a structural fact holds the card; _route_row names it.
         wt_hold_out[row["id"]] = "profile" if not allowlisted else ("linked" if linked else "workspace_bind")
-    if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
+    # A linked card is assessed too (t_20fa16c7): with no port, portable() names it workspace_kind (the
+    # checkout location) when the real holder is the lineage link; with one, the reason is linked:<edge>.
+    if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
         # t_1d2c5939: derived mode ports any GitHub repo to every pool host (no hand list), pushing an
         # unpushed card branch first; wt_why names why a card still stays local.
@@ -5808,11 +5810,11 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         # Linked worktrees reference the Studio's git common dir. Only the
         # mirror-backed clone route above can safely move their baseline.
         if wt_why:
-            # Derived mode (t_1d2c5939): the one named reason, e.g. unpushed_dirty_tree.
+            # The one named reason, always one of kanban_worktree_port.LOCAL_ONLY_REASONS (t_20fa16c7).
             return "local", f"not_portable:workspace_kind:{wt_why[0]}"
-        return "local", ("not_portable:workspace_kind:worktree is Studio-only without a safe mirror-backed "
-                         "clone; fleet/kanban-worktree-mirrors.json must list the repo and destination "
-                         "host, and the source must be an eligible anchor or clean pushed card worktree")
+        # No port was assessed (a pin to a host the port does not serve): there is no repo list (t_1d2c5939).
+        return "local", ("not_portable:workspace_kind:worktree card not portable to the pinned host; every "
+                         "GitHub repo ports to every pool host, so check the card's host: line")
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     if pin == _kwp.PIN_ANY and rule == _pr.LOCAL_FILES and lf_detail is not None:

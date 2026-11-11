@@ -202,9 +202,11 @@ def test_a_studio_worktree_with_studio_only_work_stays_local(studio_tree, damage
         _git("update-ref", "-d", f"refs/remotes/origin/wt/{tid}", cwd=repo)
     elif damage == "other_branch":
         _git("checkout", "-q", "-b", "side", cwd=wt)
-    if damage in ("ahead", "no_origin_ref"):
+        _commit(wt, "side-only")
+    if damage in ("ahead", "no_origin_ref", "other_branch"):
         # Committed work origin lacks: derived mode (the default since #176, t_1d2c5939) pushes the
-        # card branch then ports it; the hand list (its kill switch) still keeps it on the Studio.
+        # card branch then ports it; the hand list (its kill switch) still keeps it on the Studio. A tree on
+        # another branch whose HEAD contains the card branch (t_20fa16c7) pushes that HEAD as the card branch.
         with kb.connect_closing() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
             out: dict = {}
@@ -212,6 +214,7 @@ def test_a_studio_worktree_with_studio_only_work_stays_local(studio_tree, damage
         push = out[tid][4]
         assert push is not None and push[1] == f"wt/{tid}"
         assert push[2] == ("" if damage == "no_origin_ref" else _sha(repo, f"refs/remotes/origin/wt/{tid}"))
+        assert push[3] == _sha(wt, "HEAD")
         monkeypatch.setenv(kwt.DERIVED_ENV, "0")
     (route, _arg), rule = _route(tid)
     assert route == "local" and rule == "workspace_kind"

@@ -747,12 +747,18 @@ def test_worktree_card_held_by_a_structural_rule_is_recorded_not_waited(kanban_h
         if hold == "profile":
             conn.execute("UPDATE tasks SET assignee='nobody-serves-me' WHERE id=?", (tid,))
         elif hold == "linked":
-            monkeypatch.setattr(kbd, "_linked_ids", lambda conn, ids, mode: {i: "t_parent" for i in ids})
+            # _linked_ids' real shape: {id: (kind, other_id)}
+            monkeypatch.setattr(kbd, "_linked_ids", lambda conn, ids, mode: {i: ("blocks", "t_parent") for i in ids})
         else:
             monkeypatch.setattr(kbd, "_workspace_binds", lambda conn, rows: {r["id"]: ("bind", "t_x", None)
                                                                              for r in rows})
         route, rule, studio = _route(conn, tid)
     assert route[0] == "local", route
+    if hold == "linked":
+        # t_20fa16c7: a linked worktree card's port IS assessed, so portable() names the edge that holds it
+        assert studio == {"capability": "linked(blocks->t_parent)", "source": "card",
+                          "evidence": "linked(blocks->t_parent)", "kind": "structural"}, studio
+        return
     assert studio == {"capability": f"workspace_kind:{hold}", "source": "card", "evidence": str(anchor),
                       "kind": "structural"}, studio
 
