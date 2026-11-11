@@ -175,6 +175,22 @@ def test_library_renderer_is_used_when_present(monkeypatch, tmp_path):
     assert renderer == "library" and f"LIB {TASK}" in section
 
 
+def test_library_stdout_is_utf8_under_a_legacy_code_page(monkeypatch, tmp_path):
+    """Prism b3697fd74088: the parent decodes the helper's stdout as UTF-8, so the helper must write UTF-8 even where
+    the locale's encoding is a legacy code page (Windows cp1252). PYTHONIOENCODING=cp1252 in the parent env stands in
+    for that locale; without the child-env override, '·' arrives as U+FFFD."""
+    lib = tmp_path / "pr_intent.py"
+    lib.write_text("import json,sys\nd=json.load(open(sys.argv[3], encoding='utf-8'))\n"
+                   "print('%s\\n' + d['task']['title'] + '\\n%s')\n" % (pi.START, pi.END), encoding="utf-8")
+    monkeypatch.setattr(pi, "library_path", lambda: lib)
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+    card = dict(_card(), title="origin · séance — 漢")
+    section, renderer = pi.render(card, [])
+    assert renderer == "library"
+    assert "origin · séance — 漢" in section and "\ufffd" not in section
+
+
 # ---- rendering ---------------------------------------------------------------------------------------------------
 
 def test_card_without_acceptance_has_no_empty_heading():
