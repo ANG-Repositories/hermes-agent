@@ -766,6 +766,9 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         return None, "detached_head"
     if not _kwt._clean_on_branch(_P(repo), branch, runner):
         return None, "dirty_tree"
+    if _out("rev-parse", "-q", "--verify", "refs/stash") is not None:
+        # Prism 425d85646d96: a stash lives only in this .git; the re-clone would drop it.
+        return None, "stash_present"
     # Prism 38aae6c981c1/62448b5b6868/72087e167990/30ed122cf9a9: a re-clone cannot restore ignored files (datasets,
     # .env, built state). Operator F4: they are carried into the rebuilt clone (carry_clones), except regenerable
     # caches, which are dropped; listed one per FILE so the carry copies exactly these paths.
@@ -782,6 +785,10 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         head = _out("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or ""
         if branch in {"main", "master", head.split("/", 1)[-1]} - {""}:
             return None, "unpushed_commits_on_default_branch"
+        if not head:
+            # Prism ca6624b1adff: without origin/HEAD the default branch is unknown (a `trunk` would slip past the
+            # names above), so no push is authorized. A level clone (no push) still re-clones.
+            return None, "unpushed_commits_default_branch_unknown"
         if remote and _out("merge-base", "--is-ancestor", remote, local) is None:
             return None, "diverged_from_origin"
         push = (repo, branch, remote, local)
@@ -944,6 +951,13 @@ def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable
         return "HEAD unreadable"
     if getattr(cur, "returncode", 1) != 0 or (cur.stdout or "").strip() != sha:
         return f"HEAD moved off {str(sha)[:12]}"
+    try:
+        st = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True, text=True,
+                    encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return "stash unreadable"
+    if getattr(st, "returncode", 1) == 0:
+        return "has a stash"  # Prism 425d85646d96: written since routing; the re-clone would drop it
     return None
 
 
@@ -952,6 +966,9 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
     pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
     put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
     from hermes_cli import kanban_worktree_port as _kwt
+    # Every check runs for every clone before anything is pushed, rebuilt or copied (nothing half-carried).
+    staged = []
+    extra_bytes = extra_entries = 0
     for c in clones:
         dest = f"{workspace.rstrip('/')}/{c['rel'].strip('/')}"
         if not carry_path_safe(dest):
@@ -960,6 +977,25 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
         moved = clone_moved_since_routing(dest, c["branch"], c["sha"], runner)
         if moved:
             raise RuntimeError(f"carry to {host.name}: clone {c['rel']} {moved}")
+        # operator F4: the clone's ignored files (not regenerable caches) land at the same paths inside it. Listed
+        # afresh here, not from the routing's cached record: a file written since then is carried too.
+        ignored = clone_ignored_files(dest, runner)
+        if ignored is None:
+            raise RuntimeError(f"carry to {host.name}: cannot list the ignored files of {c['rel']}")
+        for ign in ignored:
+            try:
+                extra_bytes += os.lstat(os.path.join(dest, ign)).st_size
+            except OSError:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']} ignored file {ign!r} unreadable")
+            extra_entries += 1
+        staged.append((c, dest, ignored))
+    if extra_entries:
+        # Review F3 (22:1x): the spawn-time list gets the routing's caps again; a file that grew or appeared since
+        # routing can push the carry over, and then the spawn fails with the same named reason the wait line uses.
+        over = carry_split_fits(workspace, extra_bytes, extra_entries)
+        if over is not None:
+            raise RuntimeError(f"carry to {host.name}: {over}")
+    for c, dest, ignored in staged:
         if c.get("push") is not None:
             _kwt.push_card_branch(tuple(c["push"]), runner)
         route = _kwt.derived_route(c["slug"], fleet_dir, (host.name,))
@@ -967,11 +1003,6 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
             f"{_kwt.DERIVED_MIRROR_ROOT}/{c['slug']}.git"
         # the one allowlisted clone spawn, told to end on the Studio's commit (rc 5 otherwise: raises)
         _kwt.clone_on_host(host, dest, c["slug"], mirror, c["branch"], runner, sha=c["sha"], exact=True)
-        # operator F4: the clone's ignored files (not regenerable caches) land at the same paths inside it. Listed
-        # afresh here, not from the routing's cached record: a file written since then is carried too.
-        ignored = clone_ignored_files(dest, runner)
-        if ignored is None:
-            raise RuntimeError(f"carry to {host.name}: cannot list the ignored files of {c['rel']}")
         if ignored:
             ssh = _ssh_argv(host, "")[:-2]
             proc = runner(["rsync", "-a", "--from0", "--files-from=-", "-e", " ".join(shlex.quote(a) for a in ssh),

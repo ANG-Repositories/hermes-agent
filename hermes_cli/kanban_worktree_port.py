@@ -892,7 +892,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
            f"{{ git fetch -q origin {b} && git merge -q --ff-only {shlex.quote(sha)}; }} || exit 5; fi; "
            f"[ \"$(git rev-parse HEAD)\" = {shlex.quote(sha)} ] || exit 5" if sha and not exact else "")
         # t_9965b8d5: a re-cloned scratch clone lands on the Studio's exact commit, even behind the tip (rc 5 otherwise)
-        + (f"; s={shlex.quote(sha)}; [ \"$(git rev-parse HEAD)\" = \"$s\" ] || git reset -q --hard \"$s\"; "
+        # Prism 30f81cba3dfc: never reset away a reused clone's commits that no remote holds (rc 6)
+        + (f"; s={shlex.quote(sha)}; if [ \"$(git rev-parse HEAD)\" != \"$s\" ]; then "
+           "[ -z \"$(git rev-list -n 1 HEAD --not --remotes)\" ] || exit 6; git reset -q --hard \"$s\"; fi; "
            "[ \"$(git rev-parse HEAD)\" = \"$s\" ] || exit 5" if sha and exact else "")
     )
 

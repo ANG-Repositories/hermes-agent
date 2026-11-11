@@ -5313,10 +5313,11 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         studio_on = _studio_capability_on(caps, _studio_last_resort(_kb.kanban_home() / "fleet"))
     rules = rules_out if rules_out is not None else {}
     aff = affinity_out if affinity_out is not None else {}
+    wt_hold: dict = {}
     route = _route_row_base(conn, row, plan, default_assignee, native_cache, linked_ids, lineage_mode, aff,
                             unknown_out, caps, caps_out, rules, access_out, binds, held=held,
                             worktree_out=worktree_out, board=board, carry_out=carry_out, pause_cache=pause_cache,
-                            carry_budget=carry_budget, studio_on=studio_on)
+                            carry_budget=carry_budget, studio_on=studio_on, wt_hold_out=wt_hold)
     if not studio_on or route[0] != "local":
         return route
     tid = row["id"]
@@ -5337,6 +5338,16 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         elif tail in _WT_STRUCTURAL:
             why = {"capability": f"workspace_kind:{tail}", "source": "card", "evidence": row["workspace_path"],
                    "kind": "structural"}
+        elif tid in wt_hold:
+            # Prism 68e6b44a555a: profile / linked / bind kept the port from being assessed at all; those are the
+            # structural rules portable() would have named had workspace_kind not come first. Never a wait.
+            why = {"capability": f"workspace_kind:{wt_hold[tid]}", "source": "card",
+                   "evidence": row["workspace_path"], "kind": "structural"}
+        else:
+            # Prism 68e6b44a555a: a worktree the port refused (dirty submodule, over cap, ...) on a card that
+            # declares a Studio-only capability: the declared line establishes it, as it would for any card.
+            from hermes_cli import kanban_host_capabilities as _khc
+            why = _ksc.studio_capability(_khc.declared_words(row["body"]), skills, getattr(caps, "cmap", None))
     if why is not None:
         if studio_out is not None:
             studio_out[tid] = why
@@ -5395,7 +5406,8 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
                     board: Optional[str] = None,
                     carry_out: Optional[dict] = None,
                     pause_cache: Optional[dict] = None,
-                    carry_budget=None, *, studio_on: bool = False) -> "tuple[str, Optional[str]]":
+                    carry_budget=None, *, studio_on: bool = False,
+                    wt_hold_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5501,6 +5513,10 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
     # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
     wt_hosts = None
     wt_why: list = []
+    if (row["workspace_kind"] or "scratch") == "worktree" and wt_hold_out is not None \
+            and not (allowlisted and not linked and bind is None):
+        # Prism 68e6b44a555a: the port was never assessed because of a structural fact; _route_row names it.
+        wt_hold_out[row["id"]] = "profile" if not allowlisted else ("linked" if linked else "workspace_bind")
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
         # t_1d2c5939: derived mode ports any GitHub repo to every pool host (no hand list), pushing an
