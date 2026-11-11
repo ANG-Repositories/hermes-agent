@@ -1520,3 +1520,136 @@ def test_a_reused_clone_is_cleaned_before_the_fast_forward_to_a_new_head(kanban_
     assert _ref(ws, "HEAD") == h2
     assert _tree_state(ws) == _tree_state(wt)
     assert (ws / "base").read_text() == "edited again after H2" and not (ws / "doomed").exists()
+
+
+# ---- t_fbe8a067: an operator pin is a hard host set; a pinned card waits, never falls back to the Studio ----
+
+def _pin(home: Path, hosts, slug=SLUG):
+    fleet = home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "pins": [
+        {"repo": slug, "hosts": list(hosts), "why": "t_fbe8a067 test"}]}))
+
+
+def _pinned_plan():
+    """ace-ai full, ci-box free, the Studio with allowance and the pool-refused last resort ON (default_remote)."""
+    p = _plan(hosts=[_host("ace-ai", slots=0), _host("ci-box", slots=2)], band="admitting")
+    p.default_remote = True
+    return p
+
+
+def test_a_pinned_card_whose_pin_host_is_full_waits_named_never_on_the_studio(kanban_home, anchor, monkeypatch):
+    """Prism 7a74ce926bd4 (finding input): pins [{repo, hosts:[ace-ai]}], an otherwise portable worktree card,
+    ace-ai at capacity, a free Studio allowance. It waits, named; never the Studio, never ci-box."""
+    _pin(kanban_home, ["ace-ai"])
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: None)
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _pinned_plan(), worktree_out=out) == ("portable", None)
+        assert out[tid][2] == ("ace-ai",)
+        res, spawned = _tick(conn, spillover=_pinned_plan(), spawn_limit=4)
+    assert spawned == [], spawned
+    assert res.placement_waits[tid].startswith("worktree_pin (ace-ai"), res.placement_waits[tid]
+
+
+def test_a_pinned_card_whose_pin_names_no_pool_host_waits_named(kanban_home, anchor, monkeypatch):
+    """Second case: the pin names a host outside the pool. It waits, named (was a local route, then the Studio)."""
+    _pin(kanban_home, ["nas-fleet"])
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        rules: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _pinned_plan(), rules_out=rules, studio_on=False)
+        assert route == ("wait", "worktree_pin (nas-fleet: no pool host in the pin)"), route
+        assert rules[tid] == "workspace_kind"
+        res, spawned = _tick(conn, spillover=_pinned_plan(), spawn_limit=4)
+    assert spawned == [] and res.placement_waits[tid].startswith("worktree_pin (nas-fleet")
+
+
+def test_a_pin_naming_the_studio_still_runs_on_the_studio(kanban_home, anchor):
+    """The Studio is allowed only when the pin names it."""
+    _pin(kanban_home, ["mac-studio"])
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        res, spawned = _tick(conn, spillover=_pinned_plan(), spawn_limit=4)
+    assert spawned == [(tid, None)], spawned
+
+
+def test_a_pin_naming_the_studio_and_a_full_pool_host_keeps_the_studio_last_resort(kanban_home, anchor, monkeypatch):
+    _pin(kanban_home, ["ace-ai", "mac-studio"])
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: None)
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        res, spawned = _tick(conn, spillover=_pinned_plan(), spawn_limit=4)
+    assert spawned == [(tid, None)], spawned
+
+
+def test_operator_pin_naming_the_studio_is_structural_under_studio_capability_only(kanban_home, anchor):
+    """Prism 8dacc17e0687 (finding input): studio_on=True, pins [{repo, hosts:[mac-studio]}], pool (ci-box,),
+    a clean worktree card with no requires: line -> local, not wait."""
+    _pin(kanban_home, ["mac-studio"])
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        studio: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _plan(hosts=[_host("ci-box")]), studio_on=True,
+                               studio_out=studio)
+    assert route == ("local", "not_portable:workspace_kind:operator_pin"), route
+    assert studio[tid]["capability"] == "workspace_kind:operator_pin" and studio[tid]["kind"] == "structural"
+
+
+def test_origin_not_ours_is_structural_under_studio_capability_only(kanban_home, anchor, no_ambient_git_config):
+    """Prism 8dacc17e0687: origin_not_ours runs on the Studio, where the unpushed work is; never a wait."""
+    _commit(anchor, "base")
+    _git("remote", "set-url", "origin", "git@github.com:NousResearch/hermes-agent.git", cwd=anchor)
+    kwt._origin_cache.clear()
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        _git("branch", f"wt/{tid}", cwd=anchor)
+        _git("checkout", "-q", f"wt/{tid}", cwd=anchor)
+        _commit(anchor, "studio-only")
+        _git("checkout", "-q", "main", cwd=anchor)
+        studio: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True, studio_out=studio)
+    assert route == ("local", "not_portable:workspace_kind:origin_not_ours"), route
+    assert studio[tid]["kind"] == "structural"
+
+
+def test_wt_structural_lists_no_retired_reason():
+    """Prism 8dacc17e0687: every structural name is a reason the port can still give."""
+    assert kbd._WT_STRUCTURAL <= set(kwt.LOCAL_ONLY_REASONS)
+    assert {"operator_pin", "origin_not_ours"} <= kbd._WT_STRUCTURAL
+
+
+def test_an_uninitialized_own_tree_whose_head_is_ahead_of_the_card_branch_stays_local(studio_card, anchor):
+    """Prism 34f9c3bc9c4c (finding input): `git worktree add --no-checkout --detach <path> B`, B ahead of the card
+    branch A: no index, nothing but `.git`. Its HEAD is read before the tree is dropped: own_tree_off_branch."""
+    tid, wt, bare, calls = studio_card
+    _git("checkout", "-q", "--detach", cwd=wt)
+    _commit(wt, "b-only")
+    b = _ref(wt, "HEAD")
+    assert b != _ref(anchor, f"refs/heads/wt/{tid}")
+    _git("worktree", "remove", "--force", str(wt), cwd=anchor)
+    _git("worktree", "add", "-q", "--no-checkout", "--detach", str(wt), b, cwd=anchor)
+    assert [p.name for p in wt.iterdir()] == [".git"] and _ref(wt, "HEAD") == b
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == (
+            "local", "not_portable:workspace_kind:own_tree_off_branch")
+    assert tid not in out and not calls
+
+
+def test_an_uninitialized_own_tree_at_an_ancestor_of_the_card_branch_still_ports(studio_card, anchor):
+    """The same no-index tree at the card branch tip's parent holds nothing the branch lacks: ports as before."""
+    tid, wt, bare, calls = studio_card
+    base = _ref(anchor, f"refs/heads/wt/{tid}")
+    _commit(wt, "on-the-branch")
+    _git("worktree", "remove", "--force", str(wt), cwd=anchor)
+    _git("worktree", "add", "-q", "--no-checkout", "--detach", str(wt), base, cwd=anchor)
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out)[0] == "portable"

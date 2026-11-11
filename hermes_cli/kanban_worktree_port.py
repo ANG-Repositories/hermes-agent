@@ -108,7 +108,9 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
     WHY_NOT_GITHUB: "origin is not a GitHub repo, so no pool host can clone it",
     WHY_NOT_REPO: "the workspace path is not a git checkout (nothing to clone)",
     WHY_DIVERGED: "origin's card branch has commits the Studio lacks; a push would drop them",
-    WHY_PINNED: "an operator pin row in fleet/kanban-worktree-mirrors.json names the hosts (explicit, nightly-listed)",
+    WHY_PINNED: "an operator pin row in fleet/kanban-worktree-mirrors.json names the hosts (explicit, nightly-listed) "
+                "and no pool host is among them; the card runs on the Studio only when the row names it, else it "
+                "waits, named (t_fbe8a067)",
     WHY_CONCRETE: "a path that is neither a repo root nor this card's own .worktrees/<id> (another card's tree, "
                   "a sub-directory), or the host_preference kanban switch is off (Studio not last resort)",
     WHY_NOT_CHECKOUT: "the card's .worktrees/<id> holds files but is not a git checkout, or has no index: git "
@@ -267,6 +269,11 @@ def read_overrides(fleet_dir: Path) -> Tuple[Dict[str, Tuple[str, ...]], Dict[st
     return pins, out
 
 
+def pin_names_studio(pinned) -> bool:
+    """An operator pin row admits the Studio only when it names it (t_fbe8a067)."""
+    return bool({str(h).lower() for h in (pinned or ())} & {"mac-studio", "studio"})
+
+
 def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str]] = None
                   ) -> Optional[Tuple[str, Tuple[str, ...], Dict[str, str]]]:
     """``(mirror, hosts, {host: mirror})`` for ``slug`` in derived mode: every pool host (or the hosts an operator
@@ -281,7 +288,7 @@ def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str
     if pinned is not None:
         hosts = tuple(h for h in hosts if h in pinned)
         if not hosts:
-            _why(why, WHY_PINNED)  # pinned to hosts outside the pool (the Studio, say): explicit, listed nightly
+            _why(why, WHY_PINNED)  # pinned to hosts outside the pool: local only when the pin names the Studio
             return None
     default, per_host = paths.get(slug.lower(), (None, {}))
     return (default or f"{DERIVED_MIRROR_ROOT}/{slug}.git"), hosts, dict(per_host)
@@ -468,6 +475,15 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
             if not _only_git(own_tree):
                 _why(why, WHY_NOT_CHECKOUT)
                 return None, None
+            # Its HEAD may still hold commits (Prism 34f9c3bc9c4c: `worktree add --no-checkout --detach <p> B`,
+            # B ahead of the card branch): drop it only when HEAD is the card branch tip or an ancestor of it.
+            off = _uninitialized_head_off_branch(own_tree, b, runner)
+            if off is None:
+                _why(why, WHY_PROBE_FAILED)
+                return None, None
+            if off:
+                _why(why, WHY_OFF_BRANCH)
+                return None, None
             own_tree = None
     carry = False
     off_head = None
@@ -646,6 +662,24 @@ def _tree_initialized(tree: Path, runner: Callable) -> Optional[bool]:
     except OSError:
         return None
     return True
+
+
+def _uninitialized_head_off_branch(tree: Path, branch: str, runner: Callable) -> Optional[bool]:
+    """False when the no-index tree's HEAD is ``branch``'s tip or an ancestor of it (nothing the branch lacks),
+    True when it is not (or the branch does not exist), None when git cannot read it (unknown, never False)."""
+    head = _tree_head(tree, runner)
+    tip = _tree_git(tree, runner, "rev-parse", "-q", "--verify", f"refs/heads/{branch}")
+    if not head or tip is None:
+        return None
+    tip_sha = (tip.stdout or "").strip() if getattr(tip, "returncode", 1) == 0 else ""
+    if not tip_sha:
+        return True
+    if head == tip_sha:
+        return False
+    anc = _tree_git(tree, runner, "merge-base", "--is-ancestor", head, tip_sha)
+    if anc is None or getattr(anc, "returncode", 1) not in (0, 1):
+        return None
+    return anc.returncode != 0
 
 
 def _tree_head(tree: Path, runner: Callable) -> str:
@@ -994,9 +1028,13 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
              fleet_dir: Path, runner: Callable = subprocess.run, *,
              branch: Optional[str] = None,
              allow_studio_tree: bool = False,
-             pool_hosts=None, why: Optional[List[str]] = None) -> Optional[tuple]:
+             pool_hosts=None, why: Optional[List[str]] = None,
+             pin_out: Optional[list] = None) -> Optional[tuple]:
     """``(owner/repo, mirror, hosts, {host: mirror}, push)`` when this worktree card
     may run on a pool host, else None (:func:`mirror_for` picks the path).
+
+    ``pin_out`` gets the hosts of the repo's operator pin row once the repo is known (t_fbe8a067): a pinned card
+    runs only on those hosts, the Studio included, whatever route this returns.
 
     Derived mode (:func:`derived_enabled`): any GitHub repo, every host in ``pool_hosts``, ``push`` set when
     the card branch must be pushed first. Hand-list mode: the file's rows only, ``push`` always None."""
@@ -1010,6 +1048,8 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
         if not slug:
             _why(why, WHY_NOT_GITHUB)
             return None
+        if pin_out is not None:
+            pin_out.extend(read_overrides(fleet_dir)[0].get(slug.lower(), ()))
         if push is not None and not _own_destination(_origin_url(repo, runner)):
             # Named at routing, not a spawn wall (t_20fa16c7): the Studio's work cannot be published to an
             # upstream we do not own, so the card runs where the work is. push_card_branch still re-checks.

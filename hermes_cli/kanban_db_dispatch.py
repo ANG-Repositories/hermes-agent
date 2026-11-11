@@ -5373,9 +5373,36 @@ def _studio_capability_on(caps, last_resort: bool) -> bool:
 
 
 # portable()/_route_row rules a worktree card stays local under that NAME a Studio-only fact holds (an operator's
-# concrete path, a non-GitHub origin, an excluded repo, no pool): recorded as structural, never waited.
-_WT_STRUCTURAL = frozenset({"concrete_target_path", "not_a_repo", "origin_not_github", "excluded", "no_pool_host",
-                            "overrides_file_malformed"})
+# concrete path, a non-GitHub origin, no pool, unpushed work on an upstream we do not own, an operator pin that names
+# the Studio): recorded as structural, never waited. A pin that does not name the Studio waits (t_fbe8a067).
+_WT_STRUCTURAL = frozenset({"concrete_target_path", "not_a_repo", "origin_not_github", "no_pool_host",
+                            "origin_not_ours", "operator_pin"})
+
+
+def _pinned_route(row, route, pins, port, caps_out):
+    """t_fbe8a067 (Prism 7a74ce926bd4): a worktree card whose repo has an operator pin row runs only on a host the
+    pin names. A pin that does not name the Studio turns a local route into a named wait, and limits a portable
+    route to the pin's pool hosts with no local slot and no Studio last resort (the capability ``only`` set does
+    both, in the spawn loop and the door publisher alike)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    from hermes_cli import kanban_worktree_port as _kwt
+    if not pins or _kwt.pin_names_studio(pins):
+        return route
+    named = ",".join(pins)
+    tid = row["id"]
+    if route[0] == "local":
+        tail = (route[1] or "").rsplit(":", 1)[-1]
+        return "wait", _pr.worktree_pin(named, "no pool host in the pin" if tail == _kwt.WHY_PINNED
+                                        else route[1] or "local route")
+    if route[0] == "portable" and port is not None and caps_out is not None:
+        only = caps_out.setdefault("only", {})
+        hosts = tuple(port[2]) if tid not in only else tuple(
+            h for h in only[tid] if str(h).lower() in {p.lower() for p in port[2]})
+        if not hosts:
+            return "wait", _pr.worktree_pin(named, "no pool host in the pin serves the card's capability")
+        only[tid] = hosts
+        caps_out.setdefault("wt_pin", {})[tid] = named  # the spawn loop names the pin when the pool refuses
+    return route
 
 
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
@@ -5405,10 +5432,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     rules = rules_out if rules_out is not None else {}
     aff = affinity_out if affinity_out is not None else {}
     wt_hold: dict = {}
+    wt_pins: dict = {}
+    wt_out = worktree_out if worktree_out is not None else {}
     route = _route_row_base(conn, row, plan, default_assignee, native_cache, linked_ids, lineage_mode, aff,
                             unknown_out, caps, caps_out, rules, access_out, binds, held=held,
-                            worktree_out=worktree_out, board=board, carry_out=carry_out, pause_cache=pause_cache,
-                            carry_budget=carry_budget, studio_on=studio_on, wt_hold_out=wt_hold)
+                            worktree_out=wt_out, board=board, carry_out=carry_out, pause_cache=pause_cache,
+                            carry_budget=carry_budget, studio_on=studio_on, wt_hold_out=wt_hold,
+                            wt_pins_out=wt_pins)
+    route = _pinned_route(row, route, wt_pins.get(row["id"]), wt_out.get(row["id"]), caps_out)
     if not studio_on or route[0] != "local":
         return route
     tid = row["id"]
@@ -5498,7 +5529,8 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
                     carry_out: Optional[dict] = None,
                     pause_cache: Optional[dict] = None,
                     carry_budget=None, *, studio_on: bool = False,
-                    wt_hold_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+                    wt_hold_out: Optional[dict] = None,
+                    wt_pins_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5614,11 +5646,14 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         from hermes_cli import kanban_worktree_port as _kwt
         # t_1d2c5939: derived mode ports any GitHub repo to every pool host (no hand list), pushing an
         # unpushed card branch first; wt_why names why a card still stays local.
+        wt_pin: list = []
         port = _kwt.port_for(row["id"], row["workspace_path"],
                              _kwt.board_default_workdir(board), _fleet_dir,
                              branch=_kb._row_get(row, "branch_name"),
                              allow_studio_tree=last_resort,
-                             pool_hosts=tuple(plan.config.hosts or ()), why=wt_why)
+                             pool_hosts=tuple(plan.config.hosts or ()), why=wt_why, pin_out=wt_pin)
+        if wt_pin and wt_pins_out is not None:
+            wt_pins_out[row["id"]] = tuple(wt_pin)  # t_fbe8a067: the pin's hosts, held through dispatch
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -8236,7 +8271,9 @@ def _dispatch_once_locked(
                         f"{ADMIT_INELIGIBLE}: {force_host} is not eligible for this card ({_refusal})")
                     continue
                 if not _last_resort_allowed(route, local_free, _cap_only, spillover):
-                    result.placement_waits[row["id"]] = _refusal
+                    _wt_pin = _caps_out.get("wt_pin", {}).get(row["id"])
+                    result.placement_waits[row["id"]] = (_pr.worktree_pin(_wt_pin, _refusal) if _wt_pin
+                                                         else _refusal)
                     continue
             _dest_wait = _kph.destination_wait(placed_host.name, _pause_cache) if placed_host is not None else None
             if _dest_wait is not None:                     # belt: the chosen host is re-checked before any start
