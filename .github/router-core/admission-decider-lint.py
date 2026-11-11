@@ -345,7 +345,7 @@ def hits_in(text: str, lang: str = "py") -> int:
     """
     if not _MAY_COUNT.search(text):
         return 0   # t_89091ec3: nothing here can count; skip the per-line comment strip
-    lines = []
+    lines, bind_lines = [], []
     depth = 0
     for row, (code, bare, comment, clean) in enumerate(_code_lines(text, lang)):
         before_depth = depth
@@ -361,7 +361,11 @@ def hits_in(text: str, lang: str = "py") -> int:
             lines.append("")
         else:
             lines.append(code)
+        bind_lines.append(code)
     source = "\n".join(lines).replace("\\\n", " ")
+    # A waived line is not a comparison, but its assignment still binds a name (Prism c-399008e58416e4d9): binding
+    # discovery reads every line, so `busy = s.get("cpu_busy")  # waiver` then `if busy < 90:` still counts.
+    bind_source = "\n".join(bind_lines).replace("\\\n", " ")
     quotes = {}
     # Pair quote delimiters forward once; walking backwards from an operator
     # inside a literal must stop at its opener, not jump into another statement.
@@ -377,7 +381,8 @@ def hits_in(text: str, lang: str = "py") -> int:
     # inside that pair (a parenthesized multi-line condition) does not end the
     # expression. Only matched pairs count, so a stray bracket in prose cannot
     # shift every later line (a running depth counter drifts by file end).
-    may = bool(_MAY_COMPARE.search(source)) or (lang == "sh" and "load" in source)
+    may = bool(_MAY_COMPARE.search(source)) or (lang == "sh" and "load" in source) or (
+        bind_source != source and bool(_MAY_COMPARE.search(bind_source)))
     pairs, stack, i = {}, [], 0
     # Python: bracket tokens from the tokenizer (docstrings, f-strings and
     # prose cannot pair). Other languages, or untokenizable text: the scanner.
@@ -411,7 +416,7 @@ def hits_in(text: str, lang: str = "py") -> int:
     # (targets pair with top-level RHS items; a single RHS binds every target
     # only when it is a bare getloadavg() call).
     bound = set()
-    for assign in re.finditer(r"^[ \t]*([A-Za-z_][\w, \t]*?)[ \t]*=(?!=)[ \t]*([^\n]*)", source, re.M):
+    for assign in re.finditer(r"^[ \t]*([A-Za-z_][\w, \t]*?)[ \t]*=(?!=)[ \t]*([^\n]*)", bind_source, re.M):
         names = [n for n in re.split(r"[\s,]+", assign.group(1)) if n]
         rhs = assign.group(2)
         items, level, last, quote, escaped = [], 0, 0, None, False
@@ -457,7 +462,8 @@ def hits_in(text: str, lang: str = "py") -> int:
         # Shell `read` from /proc/loadavg (Prism c-c72ba317243173bb): `read -r one five fifteen _ < /proc/loadavg`
         # binds the three load fields; a read fed by a command that reads /proc/loadavg (`< <(ssh h 'read l _
         # </proc/loadavg; echo "$l $(nproc)"')`) binds its first name, the field the command echoes first.
-        for read in re.finditer(r"\bread\b((?:[ \t]+-[A-Za-z]+)*)((?:[ \t]+[A-Za-z_]\w*)+)[ \t]*(<[^\n]*)", source):
+        for read in re.finditer(r"\bread\b((?:[ \t]+-[A-Za-z]+)*)((?:[ \t]+[A-Za-z_]\w*)+)[ \t]*(<[^\n]*)",
+                                bind_source):
             # Slice by field position first, then drop `_` placeholders (Prism 3a5d25cf0633: filtering first shifted
             # `read _ _ _ procs pid` onto the load fields).
             names = read.group(2).split()
@@ -539,6 +545,25 @@ def hits_in(text: str, lang: str = "py") -> int:
 _JS_REGEX_PREV = re.compile(r"(?:^|[(,=:\[!&|?{};*%<>~^]|(?<![+\-])[+\-]|"
                             r"\b(?:return|typeof|case|do|else|in|of|new|delete|void|"
                             r"throw|instanceof|yield|await))\s*$")
+# A `)` closing a control-statement head (`if (ok) /re/.test(s)`) is followed by a statement, so a `/` there starts a
+# regex, not a division (Prism c-481aaa7c3b8a1df5 / c-825d17c9def9d4bc; fa048d07 counted the gate below it).
+_JS_CONTROL_HEAD = re.compile(r"(?<![.\w$])(?:if|while|for|with)\s*$")
+
+
+def _js_after_control_head(bare: str) -> bool:
+    """``bare`` (the line's code outside literals) ends with the `)` of an if/while/for/with head on this line."""
+    bare = bare.rstrip()
+    if not bare.endswith(")"):
+        return False
+    depth = 0
+    for k in range(len(bare) - 1, -1, -1):
+        depth += {")": 1, "(": -1}.get(bare[k], 0)
+        if depth == 0:
+            m = _JS_CONTROL_HEAD.search(bare, 0, k)
+            # `obj. if(x) / n` is a property call, not a control head (Prism c-dbaa89196860cb6c): `.`/`?.` may be
+            # separated from the keyword by whitespace.
+            return bool(m) and not bare[:m.start()].rstrip().endswith(".")
+    return False
 
 
 def _js_regex_end(line: str, i: int):
@@ -579,7 +604,7 @@ def _code_lines(text: str, lang: str) -> list:
     state = None                      # '"""' / "'''" (py), '*/' (block comment), '`' (go/js)
     for line in text.splitlines():
         opened = state
-        code, bare, comment, q = [], [], None, None
+        code, bare, comment, q, ansi = [], [], None, None, False
         i, n = 0, len(line)
         if lang in ("js", "ts", "tsx") and state is None and line.lstrip().startswith("#!"):
             out.append(("", "", line.lstrip()[2:], True))
@@ -596,7 +621,9 @@ def _code_lines(text: str, lang: str) -> list:
                 continue
             if state is not None or q is not None:
                 close = state or q
-                if c == "\\" and not (close == "`" and lang == "go") and not (close == "'" and lang == "sh"):
+                # Shell '...' has no escapes; ANSI-C $'...' does (Prism c-05e376818095d77a: `$'can\'t #'`).
+                if c == "\\" and not (close == "`" and lang == "go") and not (
+                        close == "'" and lang == "sh" and not ansi):
                     code.append(line[i:i + 2])
                     i += 2
                     continue
@@ -614,8 +641,12 @@ def _code_lines(text: str, lang: str) -> list:
                 state = c
             elif c in "'\"" or (c == "`" and lang == "sh"):
                 q = c
+                # `$` is escaped only by an ODD run of backslashes (Prism 5dd7adcb5739: `\\$'...'` is still ANSI-C).
+                ansi = (lang == "sh" and c == "'" and line[i - 1:i] == "$" and
+                        (len(line[:i - 1]) - len(line[:i - 1].rstrip("\\"))) % 2 == 0)
             elif (lang in ("js", "ts", "tsx") and c == "/" and line[i + 1:i + 2] not in ("/", "*") and
-                  _JS_REGEX_PREV.search("".join(code)) and (end := _js_regex_end(line, i)) is not None):
+                  (_JS_REGEX_PREV.search("".join(code)) or _js_after_control_head("".join(bare))) and
+                  (end := _js_regex_end(line, i)) is not None):
                 # A regex literal where an operand is expected (Prism 2bd37a842cdd): its body (`/[/*]/`) never opens a
                 # comment. Kept in ``code`` like any literal; an unclosed one falls through as a plain `/`.
                 code.append(line[i:end])
