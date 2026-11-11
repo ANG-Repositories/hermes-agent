@@ -807,7 +807,6 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
     pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
     put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
     from hermes_cli import kanban_worktree_port as _kwt
-    from hermes_cli.kanban_worker_pool import _ssh_argv
     for c in clones:
         if c.get("push") is not None:
             _kwt.push_card_branch(tuple(c["push"]), runner)
@@ -817,15 +816,8 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
         route = _kwt.derived_route(c["slug"], fleet_dir, (host.name,))
         mirror = _kwt.mirror_for((c["slug"], *route), host.name) if route else \
             f"{_kwt.DERIVED_MIRROR_ROOT}/{c['slug']}.git"
-        _kwt.clone_on_host(host, dest, c["slug"], mirror, c["branch"], runner)
-        sha = shlex.quote(c["sha"])
-        proc = runner(_ssh_argv(host, f"cd {shlex.quote(dest)} && {{ [ \"$(git rev-parse HEAD)\" = {sha} ] || "
-                                      f"git reset -q --hard {sha}; }} && [ \"$(git rev-parse HEAD)\" = {sha} ]"),
-                      capture_output=True, text=True, encoding="utf-8", errors="replace",
-                      timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
-        if getattr(proc, "returncode", 1) != 0:
-            raise RuntimeError(f"carry to {host.name}: clone {c['rel']} not at {c['sha'][:12]}: "
-                               f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        # the one allowlisted clone spawn, told to end on the Studio's commit (rc 5 otherwise: raises)
+        _kwt.clone_on_host(host, dest, c["slug"], mirror, c["branch"], runner, sha=c["sha"])
 
 
 def remote_workspace_has_content(placement_raw: Optional[str],

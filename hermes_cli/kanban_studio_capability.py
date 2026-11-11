@@ -112,6 +112,23 @@ def _rec(capability, source, evidence, kind="capability") -> dict:
     return {"capability": capability, "source": source, "evidence": evidence, "kind": kind}
 
 
+def studio_capability(requires, skills, cmap) -> Optional[dict]:
+    """The consumer-neutral decision (operator 2026-11-10 16:5x): given a unit of work's DECLARED requirements
+    (``requires:`` words) and skills, the Studio-only capability that justifies the Studio, or None. No kanban
+    inputs: the allocator, CI and Prism can call this as is. Returns ``{capability, source, evidence, kind}``."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    only = studio_only(cmap) or frozenset()
+    words = [w for w in (requires or ()) if w in only]
+    if words:
+        return _rec(words[0], "declared", "requires: " + ", ".join(words))
+    index = getattr(cmap, "index", None) or {}
+    for s in skills or ():
+        hit = [c for c in index.get(_khc.skill_key(s), ()) if c in only]
+        if hit:
+            return _rec(hit[0], "skill", s)
+    return None
+
+
 def justify(*, rule: Optional[str], affinity: Optional[Mapping], body: Optional[str], skills,
             assignee: Optional[str], cmap) -> Optional[dict]:
     """What established a ``local`` route, or None when nothing a pool host lacks did."""
@@ -137,16 +154,7 @@ def justify(*, rule: Optional[str], affinity: Optional[Mapping], body: Optional[
     if rule == "studio_body":
         return _rec("browser-session", "body", aff.get("matched_by") or rule)
     if rule == "host_studio":
-        only = studio_only(cmap) or frozenset()
-        words = [w for w in declared if w in only]
-        if words:
-            return _rec(words[0], "declared", "requires: " + ", ".join(words))
-        index = getattr(cmap, "index", None) or {}
-        for s in skills or ():
-            hit = [c for c in index.get(_khc.skill_key(s), ()) if c in only]
-            if hit:
-                return _rec(hit[0], "skill", s)
-        return None
+        return studio_capability(declared, skills, cmap)
     if rule.startswith(_STRUCTURAL):
         return _rec(rule, "assignee" if rule in ("profile", "native_command") else "card",
                     assignee if rule in ("profile", "native_command") else rule, kind="structural")

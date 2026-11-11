@@ -351,8 +351,8 @@ def test_carry_clones_rebuilds_the_clone_at_the_same_commit(kanban_home, tmp_pat
     subprocess.run(["git", "-C", str(src), "push", "-q", "origin", "main"], check=True, capture_output=True)
 
     real_clone_script = kwt.clone_script
-    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, m, b: real_clone_script(w, slug, m, b,
-                                                                                      url=str(origin)))
+    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, m, b, **kw: real_clone_script(w, slug, m, b,
+                                                                                            url=str(origin), **kw))
 
     def local(argv, **kw):
         if argv[0] == "ssh":
@@ -366,3 +366,13 @@ def test_carry_clones_rebuilds_the_clone_at_the_same_commit(kanban_home, tmp_pat
                           text=True).stdout.strip()
     assert head == first  # the Studio's commit, not origin's newer tip
     assert (ws / "repo" / "a.txt").read_text() == "1\n"
+
+
+def test_studio_capability_is_consumer_neutral():
+    """The one decision other consumers (allocator, CI, Prism) can call: declared requires + skills only."""
+    import inspect
+    from hermes_cli import kanban_studio_capability as ksc
+    assert list(inspect.signature(ksc.studio_capability).parameters) == ["requires", "skills", "cmap"]
+    assert ksc.studio_capability(["fleet-ssh"], (), _cmap()) is None  # a pool host has it
+    rec = ksc.studio_capability(["fleet-ssh", "studio-state"], (), _cmap())
+    assert rec["capability"] == "studio-state" and rec["source"] == "declared", rec
