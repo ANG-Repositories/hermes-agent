@@ -197,7 +197,8 @@ def test_no_capability_map_leaves_the_rule_off(kanban_home, carried):
 # -- 1b. over the carry limit: carry everything but the git clones, re-clone those (operator 2026-11-10 15:3x) -----
 # t_b41d322b ran on the Studio under local_files with a 1.1 GB scratch dir (four repo clones), over CARRY_MAX_BYTES.
 
-def _clone_in(ws, name="repo", *, dirty=False, ahead=False, ignored=False):
+def _clone_in(ws, name="repo", *, dirty=False, ahead=False, ignored=False, branch="main", pycache=False,
+              ignored_size=10):
     import subprocess
     from pathlib import Path
     repo = Path(ws) / name
@@ -213,16 +214,23 @@ def _clone_in(ws, name="repo", *, dirty=False, ahead=False, ignored=False):
     g("commit", "-q", "-m", "base")
     g("remote", "add", "origin", "https://github.com/acme/widget.git")
     g("update-ref", "refs/remotes/origin/main", "HEAD")
+    if branch != "main":
+        g("update-ref", f"refs/remotes/origin/{branch}", "HEAD")
+        g("checkout", "-q", "-b", branch)
     if ahead:
         (repo / "more.txt").write_text("unpushed\n")
         g("add", "more.txt")
         g("commit", "-q", "-m", "unpushed")
     if dirty:
         (repo / "wip.txt").write_text("uncommitted\n")
+    if ignored or pycache:
+        (repo / ".git" / "info" / "exclude").write_text("data/\n__pycache__/\n")
     if ignored:
-        (repo / ".git" / "info" / "exclude").write_text("data/\n")
         (repo / "data").mkdir()
-        (repo / "data" / "input.csv").write_text("only here\n")
+        (repo / "data" / "input.csv").write_bytes(b"only here\n" + b"z" * max(0, ignored_size - 10))
+    if pycache:
+        (repo / "pkg" / "__pycache__").mkdir(parents=True)
+        (repo / "pkg" / "__pycache__" / "m.cpython-311.pyc").write_bytes(b"\0" * 64)
     sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
                          text=True).stdout.strip()
     return sha
@@ -233,6 +241,7 @@ def small_carry(monkeypatch):
     """CARRY_MAX_BYTES scaled down: the 20 kB clone puts the dir over, notes.md alone fits."""
     kwh._carry_scan_cache.clear()
     getattr(kwh, "_carry_clone_cache", {}).clear()
+    getattr(kwh, "_clone_assess_cache", {}).clear()
     monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_bytes", 8192)
     if hasattr(kwh, "carry_split"):  # absent before the split (red-first run on the base)
         monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_bytes", 8192)
@@ -253,17 +262,80 @@ def test_over_limit_workspace_carries_without_its_clones(kanban_home, small_carr
         route, plan = _route_carry(conn, tid)
     assert route[0] != "wait" and route[0] != "local", route
     assert plan["exclude"] == ("repo",), plan
-    assert plan["clones"] == [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha, "push": None}]
+    assert plan["clones"] == [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha, "push": None,
+                               "ignored": ()}]
 
 
 def test_over_limit_clone_with_unpushed_commits_is_pushed_first(kanban_home, small_carry):
     with kb.connect_closing() as conn:
         tid, path = _card_with_files(conn)
-        sha = _clone_in(path, ahead=True)
+        sha = _clone_in(path, ahead=True, branch="feat/x")
         route, plan = _route_carry(conn, tid)
     assert route[0] != "wait", route
     push = plan["clones"][0]["push"]
-    assert push[1:] == ("main", push[2], sha) and push[2] and push[2] != sha, push
+    assert push[1:] == ("feat/x", push[2], sha) and push[2] and push[2] != sha, push
+
+
+@pytest.mark.parametrize("branch", ["main", "master", "trunk"])
+def test_over_limit_clone_ahead_on_the_default_branch_waits_and_never_pushes(kanban_home, small_carry,
+                                                                              monkeypatch, branch):
+    """Review F1: a scratch clone on origin's default branch with a local commit is never pushed by the dispatcher
+    (that would land on origin/<default> with no PR); the card waits, named. ``trunk`` is origin/HEAD's target."""
+    import subprocess
+    from hermes_cli import kanban_worktree_port as kwt
+    pushed = []
+    monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=None: pushed.append(push))
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        repo = __import__("pathlib").Path(path) / "repo"
+        _clone_in(path, branch=branch)
+        if branch == "trunk":
+            subprocess.run(["git", "-C", str(repo), "symbolic-ref", "refs/remotes/origin/HEAD",
+                            "refs/remotes/origin/trunk"], check=True)
+        (repo / "more.txt").write_text("unpushed\n")
+        subprocess.run(["git", "-C", str(repo), "add", "more.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                        "-m", "ahead"], check=True)
+        assert kwh.assess_clone(str(repo)) == (None, "unpushed_commits_on_default_branch")
+        route, plan = _route_carry(conn, tid)
+    assert plan is None and route[0] == "wait", route
+    assert "clone repo cannot be rebuilt from origin: unpushed_commits_on_default_branch" in route[1], route
+    assert pushed == []
+
+
+def test_clone_on_the_default_branch_level_with_origin_still_reclones(kanban_home, small_carry):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        sha = _clone_in(path)
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait" and plan["clones"][0]["push"] is None and plan["clones"][0]["sha"] == sha, route
+
+
+def test_clone_assessment_is_cached_per_head_for_the_census_ttl(tmp_path, monkeypatch):
+    """Review F3: the routing pass asks every tick; one assessment per clone path and HEAD per TTL."""
+    import subprocess
+    kwh._clone_assess_cache.clear()
+    _clone_in(tmp_path)
+    repo = str(tmp_path / "repo")
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        return subprocess.run(argv, **kw)
+    first = kwh.assess_clone_cached(repo, runner, now=1000.0)
+    n = len(calls)
+    assert first[0] is not None and n > 0
+    assert kwh.assess_clone_cached(repo, runner, now=1000.0 + kwh.CARRY_SCAN_TTL_SECONDS - 1) == first
+    assert len(calls) == n  # served from cache: no git subprocess
+    (tmp_path / "repo" / "more.txt").write_text("x\n")
+    subprocess.run(["git", "-C", repo, "add", "more.txt"], check=True)
+    subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "m"],
+                   check=True)
+    moved = kwh.assess_clone_cached(repo, runner, now=1001.0)
+    assert len(calls) > n and moved == (None, "unpushed_commits_on_default_branch")  # HEAD moved: re-assessed
+    m = len(calls)
+    kwh.assess_clone_cached(repo, runner, now=1001.0 + kwh.CARRY_SCAN_TTL_SECONDS + 1)
+    assert len(calls) > m  # TTL expired: re-assessed
 
 
 def test_over_limit_with_a_dirty_clone_waits_named(kanban_home, small_carry):
@@ -276,15 +348,80 @@ def test_over_limit_with_a_dirty_clone_waits_named(kanban_home, small_carry):
     assert "clone repo cannot be rebuilt from origin: dirty_tree" in route[1], route
 
 
-def test_over_limit_clone_with_ignored_files_waits_named(kanban_home, small_carry):
-    """Prism 38aae6c981c1/62448b5b6868: a re-clone cannot restore ignored files (data, .env), so a clone holding
-    any is never split off; the card waits with the reason named."""
+def test_over_limit_clone_with_only_pycache_reclones_and_is_not_refused(kanban_home, small_carry):
+    """Operator F4: regenerable caches are dropped, never a reason to wait."""
     with kb.connect_closing() as conn:
         tid, path = _card_with_files(conn)
-        _clone_in(path, ignored=True)
+        _clone_in(path, pycache=True)
         route, plan = _route_carry(conn, tid)
-    assert plan is None
-    assert route[0] == "wait" and "clone repo cannot be rebuilt from origin: ignored_files" in route[1], route
+    assert route[0] != "wait", route
+    assert plan["clones"][0]["ignored"] == (), plan
+
+
+def test_over_limit_clone_with_an_ignored_data_file_carries_it(kanban_home, small_carry):
+    """Prism 38aae6c981c1/62448b5b6868/72087e167990/30ed122cf9a9 + operator F4: an ignored data file is carried,
+    not refused, and counted toward the carry caps; the cache next to it is dropped."""
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path, ignored=True, pycache=True)
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait", route
+    assert plan["clones"][0]["ignored"] == ("data/input.csv",), plan
+
+
+def test_over_limit_clone_whose_ignored_files_break_the_cap_waits_naming_the_cap(kanban_home, small_carry):
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path, ignored=True, ignored_size=9000)  # 9 kB ignored file vs the 8 kB test cap
+        route, plan = _route_carry(conn, tid)
+    assert plan is None and route[0] == "wait", route
+    assert "over the carry byte cap with the clones' ignored files" in route[1], route
+    assert "ignored_files" not in route[1].replace("clones' ignored files", ""), route
+
+
+def test_regenerable_cache_list():
+    for rel in ("pkg/__pycache__/m.pyc", ".pytest_cache/v/x", ".ruff_cache/a", ".mypy_cache/a", ".ty_cache/a",
+                ".tox/py/bin/python", "sub/.DS_Store", "widget.egg-info/PKG-INFO"):
+        assert kwh.regenerable_cache(rel), rel
+    for rel in (".env", "data/input.csv", "build/out.bin", "results.egg-info"):
+        assert not kwh.regenerable_cache(rel), rel
+
+
+def test_carry_clones_lands_the_ignored_file_byte_equal_inside_the_rebuilt_clone(kanban_home, tmp_path,
+                                                                                   monkeypatch):
+    """Operator F4: the Studio clone's ignored data file ends byte-equal at the same path in the pool host's clone;
+    its __pycache__ is not carried. The pool host is a second local root: ssh/rsync targets are rewritten to it."""
+    import subprocess
+    import shutil
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    studio = tmp_path / "ws"
+    studio.mkdir()
+    sha = _clone_in(studio, ignored=True, pycache=True)
+    payload = (studio / "repo" / "data" / "input.csv").read_bytes()
+    pool = tmp_path / "pool"
+    host = _host()
+
+    def fake_clone(h, dest, slug, mirror, branch, runner=None, sha=None, exact=False):
+        shutil.copytree(str(studio / "repo"), str(pool) + dest, ignore=shutil.ignore_patterns("data", "__pycache__"))
+
+    monkeypatch.setattr(kwt, "clone_on_host", fake_clone)
+    rsyncs = []
+
+    def runner(argv, **kw):
+        if argv[0] == "rsync":
+            rsyncs.append(argv)
+            e = argv.index("-e")
+            argv = argv[:e] + argv[e + 2:]  # drop the ssh transport: the "host" is a local root
+            argv = [str(pool) + a.split(":", 1)[1] if a.startswith(f"{host.target}:") else a for a in argv]
+        return subprocess.run(argv, **{k: v for k, v in kw.items() if k != "stdin"})
+    kwh.carry_clones(host, str(studio), [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha,
+                                          "push": None, "ignored": ("data/input.csv",)}],
+                     kanban_home / "fleet", runner=runner)
+    landed = pool / str(studio / "repo" / "data" / "input.csv").lstrip("/")
+    assert landed.read_bytes() == payload
+    assert not (pool / str(studio / "repo" / "pkg" / "__pycache__").lstrip("/")).exists()
+    assert len(rsyncs) == 1 and "--files-from=-" in rsyncs[0], rsyncs
 
 
 def test_over_limit_without_clones_waits_named(kanban_home, small_carry):
