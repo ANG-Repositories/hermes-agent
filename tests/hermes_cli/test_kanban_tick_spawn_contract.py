@@ -381,6 +381,31 @@ def test_no_overlapping_background_sweeps(sweep_conn, monkeypatch):
     assert runs == [1]
 
 
+def test_a_failed_thread_start_leaves_no_job_and_the_next_due_tick_sweeps(sweep_conn, monkeypatch):
+    # Prism f83a6a86a55f: a Future registered before a start() that raised never finished and blocked every
+    # later sweep for the (home, board) until restart.
+    conn, clock = sweep_conn
+    runs = []
+    monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans", lambda c, board=None: runs.append(board) or {})
+    real_start = threading.Thread.start
+    failed = []
+
+    def start(self):
+        if self.name == "kanban-orphan-sweep" and not failed:
+            failed.append(1)
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default", defer_maintenance=True)
+    assert failed == [1]
+    assert kbd._ORPHAN_SWEEP_JOBS == {}, "a job stayed registered after its thread failed to start"
+    clock[0] += kbd.ORPHAN_SWEEP_INTERVAL_SECONDS
+    kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default", defer_maintenance=True)
+    _drain_sweeps()
+    assert runs == ["default"]
+
+
 # --------------------------------------------------------------------------- 3 (after-merge, batched)
 
 

@@ -780,7 +780,13 @@ def _orphan_sweep_off_tick(board: Optional[str]) -> dict:
             except BaseException as exc:
                 fut.set_exception(exc)
 
-        threading.Thread(target=_run, name="kanban-orphan-sweep", daemon=True).start()
+        try:
+            threading.Thread(target=_run, name="kanban-orphan-sweep", daemon=True).start()
+        except Exception as exc:
+            # A Future left behind by a start() that raised never finishes and would block this key until
+            # restart (Prism f83a6a86a55f); the next due tick tries again.
+            del _ORPHAN_SWEEP_JOBS[key]
+            _kb._log.warning("kanban orphan sweep thread did not start: %s", exc)
     return reaped
 
 
