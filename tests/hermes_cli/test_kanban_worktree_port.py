@@ -934,8 +934,8 @@ def _clone_locally(monkeypatch, tmp_path, bare, calls):
     """The real clone_on_host (clone + carry in one ssh call), with the clone pointed at the local origin and the
     ssh half run in a local sh."""
     real_script = kwt.clone_script
-    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, mirror, branch, url=None, sha=None: real_script(
-        w, slug, str(tmp_path / "no-mirror.git"), branch, url=str(bare), sha=sha))
+    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, mirror, branch, url=None, sha=None, **kw: real_script(
+        w, slug, str(tmp_path / "no-mirror.git"), branch, url=str(bare), sha=sha, **kw))
     real = kwt.clone_on_host
     monkeypatch.setattr(kwt, "clone_on_host", lambda host, w, slug, mirror, branch, runner=None, sha=None,
                         carry=None: real(host, w, slug, mirror, branch, runner=_local_ssh(calls), sha=sha,
@@ -945,8 +945,8 @@ def _clone_locally(monkeypatch, tmp_path, bare, calls):
 def _carry(ws, wt, head, calls, bare, tmp_path, runner=None):
     """Clone (or re-run on a reused clone) at ``head`` and carry ``wt``'s dirty state, one local 'ssh' call."""
     real_script = kwt.clone_script
-    sc = lambda w, slug, mirror, branch, url=None, sha=None: real_script(  # noqa: E731
-        w, slug, str(tmp_path / "no-mirror.git"), branch, url=str(bare), sha=sha)
+    sc = lambda w, slug, mirror, branch, url=None, sha=None, **kw: real_script(  # noqa: E731
+        w, slug, str(tmp_path / "no-mirror.git"), branch, url=str(bare), sha=sha, **kw)
     orig, kwt.clone_script = kwt.clone_script, sc
     try:
         census = kwt.dirty_census(wt)
@@ -1256,3 +1256,27 @@ def test_a_carried_file_head_ignores_does_not_survive_the_next_carry(kanban_home
     assert not (ws / "secret.txt").exists()
     assert (ws / "build" / "out.o").read_text() == "worker build output"
     assert _tree_state(ws) == _tree_state(wt)
+
+
+def test_a_reused_clone_is_cleaned_before_the_fast_forward_to_a_new_head(kanban_home, anchor, tmp_path,
+                                                                          monkeypatch):
+    """Apollo 20:4x F1: carry 1 at H1 leaves the clone dirty. The Studio then commits the carried files (H2) and
+    edits one again. The reused clone's fast-forward H1 -> H2 touches those same files, so git refused it over the
+    first carry's local changes (rc 5 on every retry). The previous carry is now undone BEFORE the fast-forward;
+    the clone ends at H2, byte-equal to the Studio tree."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    h1 = _ref(wt, "HEAD")
+    ws = tmp_path / "pool" / tid
+    calls: list = []
+    _carry(ws, wt, h1, calls, bare, tmp_path)
+    assert (ws / "base").read_text() == "edited" and (ws / "scratch.txt").exists()
+    _git("add", "-A", cwd=wt)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "carried work committed", cwd=wt)
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    h2 = _ref(wt, "HEAD")
+    (wt / "base").write_text("edited again after H2")
+    _carry(ws, wt, h2, calls, bare, tmp_path)
+    assert _ref(ws, "HEAD") == h2
+    assert _tree_state(ws) == _tree_state(wt)
+    assert (ws / "base").read_text() == "edited again after H2" and not (ws / "doomed").exists()

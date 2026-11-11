@@ -680,10 +680,18 @@ def carry_script(workspace: str, head: str, delete=()) -> str:
                      key=lambda d: (-d.count("/"), d))
     rmdir = (("rmdir -- " + " ".join(shlex.quote(d) for d in parents) + " 2>/dev/null || true; ")
              if parents else "")
-    m = shlex.quote(CARRY_MANIFEST)
     return (f"set -e; cd {w}; [ -d .git ] || exit 3; [ \"$(git rev-parse HEAD)\" = {shlex.quote(head)} ] || exit 5; "
-            f"if [ -f {m} ]; then xargs -0 rm -f -- < {m}; rm -f {m}; fi; "
-            f"git reset -q --hard HEAD; git clean -fdq; {rm}{rmdir}tar -xf -")
+            f"{_carry_undo()}{rm}{rmdir}tar -xf -")
+
+
+def _carry_undo() -> str:
+    """Remote sh (cwd = the clone): remove the paths the previous carry wrote (:data:`CARRY_MANIFEST`), then reset
+    the working tree to HEAD (``reset --hard`` + ``clean -fd``; other ignored files are kept). Run by
+    :func:`clone_script` BEFORE a reused clone's checkout and fast-forward (a carried file the new HEAD also
+    touches would refuse the merge, rc 5 on every retry; Apollo 20:4x), and again by :func:`carry_script`."""
+    m = shlex.quote(CARRY_MANIFEST)
+    return (f"if [ -f {m} ]; then xargs -0 rm -f -- < {m}; rm -f {m}; fi; "
+            "git reset -q --hard HEAD; git clean -fdq; ")
 
 
 class ForeignOriginPush(RuntimeError):
@@ -837,7 +845,7 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
 
 
 def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
-                 url: Optional[str] = None, sha: Optional[str] = None) -> str:
+                 url: Optional[str] = None, sha: Optional[str] = None, carried: bool = False) -> str:
     """Remote sh: clone origin into the (empty) workspace, then put HEAD on
     ``branch`` and PROVE it (rc 4 otherwise). The mirror only accelerates the
     clone: ``--dissociate`` copies what was borrowed, so a later mirror prune
@@ -849,7 +857,8 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     the checkout instead of returning early (Prism f43e48b43fc3). rc 3 = the
     workspace holds something else (never overwritten). ``sha`` (the pushed
     tip, Prism 3e2f8506c8ff): a reused checkout behind it is fetched and
-    fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise)."""
+    fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise). ``carried`` (a dirty carry follows,
+    t_894be273): an earlier carry's files are undone (:func:`_carry_undo`) before the checkout and fast-forward."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
     if mirror.startswith("~/"):
         # A derived per-host default (t_1d2c5939): the host's own $HOME, whatever user/OS it runs.
@@ -862,6 +871,7 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
         f"export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0={m}; "
         "if [ -d \"$w/.git\" ]; then "
         f"[ \"$(git -C \"$w\" remote get-url origin)\" = {url} ] || exit 3; "
+        + (f"( cd \"$w\" && {_carry_undo()}); " if carried else "") +
         "elif [ -n \"$(ls -A -- \"$w\")\" ]; then exit 3; "
         f"else if [ -d {m}/objects ]; then "
         f"git -c gc.auto=0 -c maintenance.auto=false -c fetch.prune=false --git-dir={m} "
@@ -887,7 +897,8 @@ def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
     ``(own tree, HEAD sha, digest)`` (t_894be273): the dirty tree's :func:`carry_payload` rides the SAME ssh call
     on stdin, applied by :func:`carry_script` once the clone is proved at that HEAD."""
     from hermes_cli.kanban_worker_pool import _ssh_argv
-    script = clone_script(workspace, slug, mirror, branch, sha=sha)
+    script = (clone_script(workspace, slug, mirror, branch, sha=sha, carried=True) if carry
+              else clone_script(workspace, slug, mirror, branch, sha=sha))
     io_kw: dict = {"stdin": subprocess.DEVNULL}
     timeout = CLONE_TIMEOUT_S
     if carry:
