@@ -10,10 +10,14 @@
   "hermes_cli/fleet_placement/placement.py"
  ],
  "files": {
-  "hermes_cli/kanban_admit.py": 3,
+  "gateway/shutdown_watchdog.py": 3,
+  "hermes_cli/kanban_admit.py": 1,
   "hermes_cli/kanban_load_gate.py": 2,
   "hermes_cli/kanban_wake_gate.py": 6,
-  "hermes_cli/kanban_worker_pool.py": 1,
-  "hermes_cli/placement_ledger.py": 1
+  "hermes_cli/kanban_worker_pool.py": 2,
+  "hermes_cli/placement_ledger.py": 1,
+  "hermes_cli/placement_policy.py": 1,
+  "plugins/platforms/discord/adapter.py": 1,
+  "scripts/bench_shell_hooks.py": 1
  }
 }

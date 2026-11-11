@@ -25,14 +25,18 @@ a ratchet:
 
 One lint, four repos (t_22955b73): hermes-home owns it; fleet-ops-scripts, prism-router and hermes-agent vendor it
 byte-identical under .github/router-core/ (PIN.json) with their own fleet/admission-decider-baseline.json. A baseline
-may carry `scan` (dirs, "." = whole tree) and `library` (repo paths of that repo's admission library copy); absent =
-hermes-home's defaults below. scripts/admission-decider-census.py sums the four baselines into one line.
+may carry `scan` (dirs, "." = whole tree); `library` is required (repo paths of that repo's admission library copy).
+Absent scan uses hermes-home's defaults below. scripts/admission-decider-census.py sums the four baselines into one line.
 
   admission-decider-lint.py [--root DIR] [--update] [--base-ref SHA]
+
+Count comparison operator occurrences, not statements. Literal metric keys count conservatively.
+Comments do not count; non-comparison load sizing shapes remain candidates.
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import re
@@ -49,11 +53,23 @@ BASELINE_REL = Path("fleet") / "admission-decider-baseline.json"
 SCAN = ("scripts", "fleet", "hooks", "bin", "cron")
 LIBRARY = frozenset({"scripts/lib/admission.py", "scripts/lib/admission_demand.py", "scripts/lib/placement.py",
                      "scripts/admission-decider-lint.py"})
-RX = re.compile(r"\b(cpu_busy|load1|load5|procs_running|runnable_ewma|occupancy|psi_cpu_some10|psi_cpu_some60|"
-                r"load_ratio|loadavg|getloadavg)\b[^\n=]{0,40}?(>=|<=|(?<![-=])>(?!>)|(?<!<)<(?![<=]))"
-                r"|\bncpu\s*//\s*\d|\bos\.getloadavg\(")
+LOAD_VARIABLE = r"\b(?:[A-Za-z_]\w*_)?load(?:[15]|_\w+)?\b"
+METRIC = (r"\b(?:cpu_busy|load1|load5|procs_running|runnable_ewma|occupancy|psi_cpu_some10|psi_cpu_some60|"
+          r"load_ratio|loadavg|getloadavg)\b")
+OP = r"(?:>=|<=|(?<![>=-])>(?!>)|(?<!<)<(?![<=])|\s-(?:gt|ge|lt|le)\s)"
+# Prism 56a668146742: a shift inside the operand (`(procs_running >> 1) > 8`) is not a comparison; only a lone
+# `<` / `>` ends the operand, a `>>` / `<<` pair is part of it.
+OPERAND = r"(?:[^\n=;<>]|>>|<<){0,40}?"
+# Textual shapes, not general dataflow: cores minus a load-named variable,
+# or awk's explicit load-variable binding followed by subtraction of that alias.
+SIZING = (r"\b(?:cores|ncpu|threads|n)\s*-\s*[\"$\\{]*" + LOAD_VARIABLE +
+          r"|\bawk\b[^\n]*?-v\s+(?P<load_alias>[A-Za-z_]\w*)\s*=\s*[\"$\\{]*" +
+          LOAD_VARIABLE + r"[^\n]*?\b(?:cores|ncpu|threads|n)\s*-\s*(?P=load_alias)\b")
+RX = re.compile(METRIC + OPERAND + OP + r"|" + OP + OPERAND + METRIC +
+                r"|\bncpu\s*//\s*\d|\bos\.getloadavg\(|" + SIZING +
+                r"|\$\{?" + LOAD_VARIABLE + r"\}?[\"']?\s*" + OP)
 SKIP = re.compile(r"(^|/)(tests?|fixtures|\.venv)/|(^|/)test_[^/]*$|_test\.py$|selftest"
-                  r"|\.(md|json|ya?ml|txt|golden|plist|service|timer|conf|nft|env)$")
+                  r"|\.(?:test|spec)\.[cm]?[jt]sx?$|\.(md|json|ya?ml|txt|golden|plist|service|timer|conf|nft|env)$")
 WAIVER = "admission-lint: not-a-decider"
 # the lint and its census, wherever a repo keeps them (their regex/doc text matches RX)
 SELF = frozenset({"scripts/admission-decider-lint.py", "scripts/admission-decider-census.py",
@@ -71,16 +87,19 @@ def _git_env():
     return {k: v for k, v in os.environ.items() if k not in _GIT_ENV}
 
 
-def tracked(root: Path, scan_dirs=SCAN):
+def tracked(root: Path, scan_dirs=SCAN, require_git=False):
     """git ls-files under SCAN when ``root`` IS the git worktree root; any other root (test-gate's synced remote tree,
     an export nested inside an unrelated checkout, Prism f121859a42a0) is walked."""
-    env = _git_env()
+    config({"scan": scan_dirs, "library": []})
+    env = dict(_git_env(), GIT_LITERAL_PATHSPECS="1")
     top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, env=env)
     same = top.returncode == 0 and Path(top.stdout.decode().strip()).resolve() == root.resolve()
     if same:
-        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *scan_dirs], capture_output=True, env=env)
+        out = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z", "--", *scan_dirs], capture_output=True, env=env)
         if out.returncode == 0:
             return [p for p in out.stdout.decode().split("\0") if p]
+    if same or require_git:
+        raise ScanError("git-tracked scan required; walk fallback is read-only")
     return walk(root, scan_dirs)
 
 
@@ -99,7 +118,7 @@ def walk(root: Path, scan_dirs=SCAN):
                 dirs.remove(".git")
             for f in files:
                 p = Path(dirpath) / f
-                if p.is_file() and not p.is_symlink():
+                if p.is_file():
                     out.append(p.relative_to(root).as_posix())
     if errs:
         e = errs[0]
@@ -108,31 +127,512 @@ def walk(root: Path, scan_dirs=SCAN):
     return sorted(out)
 
 
-def hits_in(text: str) -> int:
-    n = 0
-    for line in text.splitlines():
-        s = line.lstrip()
-        if s.startswith("#") or s.startswith("//") or WAIVER in line:
+def _waiver_owner(row, start_row, end_row, bare):
+    """Allow only a complete, single-statement physical line before a trailing comment.
+
+    All adapters use this rule. Standalone, multiline and compound/multiple
+    statements fail closed; punctuation inside literals is already blanked.
+    """
+    code = bare.strip().removesuffix(";").rstrip()
+    if (start_row == end_row == row and code and
+            not any(token in code for token in (";", "{", "}", "&&", "||", "\\")) and
+            (":" not in code or code.endswith(":"))):
+        return row
+    return None
+
+
+# The comparison OP is the unit of identity. Looking out from each operator
+# avoids non-overlapping regex matches consuming a neighbouring comparison.
+_COMPARISON = re.compile(OP)
+_METRIC_NAME = re.compile(METRIC + r"|(?<![.\w])" + LOAD_VARIABLE + r"(?!\s*\()")
+_BOUNDARY = re.compile(r"[;=]|(?<!>)>(?!>)|(?<!<)<(?!<)|&&|\|\||\b(?:and|or)\b")
+_SPECIAL = re.compile(r"\bncpu\s*//\s*\d|\bos\.getloadavg\(|" + SIZING)
+# t_27c11e86: Go exports struct fields (m.Load1, snap.CPUBusy), so a metric operand matches regardless of case and of
+# the snake_case underscore. The word boundaries still hold (m.Upload1, Load1Count do not match).
+_METRIC_ANY_CASE = re.compile(METRIC.replace("_", "_?"), re.IGNORECASE)
+# t_89091ec3: _METRIC_ANY_CASE without its word boundaries, so a match in any operand (a substring of source) is a
+# match of this in source. Every comparison hits_in counts names a metric (this), a shell load variable ("load"), a
+# bound name or an awk alias (each bound only from a metric read or a metric/load name). No match: no comparison can
+# count, and the tokenizer, bracket pairing and operand walks are skipped (#10384 made them ~3x the scan: 41 -> 115 s).
+_MAY_COMPARE = re.compile(METRIC.replace("_", "_?").replace(r"\b", ""), re.IGNORECASE)
+# Every count in hits_in (comparison, awk field, ncpu // n, getloadavg(), sizing) needs _MAY_COMPARE, a LOAD_VARIABLE
+# or `ncpu` in the comment-stripped source, which is built from substrings of the text: absent from the text, it is 0.
+_MAY_COUNT = re.compile(_MAY_COMPARE.pattern + "|" + LOAD_VARIABLE + "|ncpu", re.IGNORECASE)
+# t_27c11e86: an awk program reading /proc/loadavg compares load fields ($1..$3) inside one quoted literal, where no
+# metric name ever appears. Same command only: the file argument, `< /proc/loadavg`, or a pipe from it.
+_AWK_LOADAVG = re.compile(r"\bawk\b[^\n|;&]*?'(?P<a>[^'\n]*)'[^\n|;&]*?/proc/loadavg\b"
+                          r"|/proc/loadavg\b[^\n;&|]*\|\s*awk\b[^\n|;&']*'(?P<b>[^'\n]*)'")
+_AWK_LOAD_FIELD = re.compile(r"\$[123](?!\d)")
+
+
+# Word operators that join two atoms into ONE expression (`x as T`, `a in b`).
+_JOINING_WORD = r"(?:if|elif|while|until|return|test|and|or|not|as|satisfies|is|in|instanceof|typeof|await)"
+
+
+def _operand(source: str, pos: int, direction: int, quotes=None, nest=None, lang: str = "py", braces=()) -> str:
+    """Walk an operand to syntax boundaries, without truncating identifiers.
+
+    Balanced groups retain internal boolean fallbacks. Unmatched enclosing
+    delimiters, argument/statement separators and adjacent atoms end the walk;
+    literal atoms retain metric keys without exposing their punctuation. A
+    newline inside an open (/[ group (``nest``) continues the expression.
+    Python has no brace blocks or pipelines: there code braces (``braces``,
+    never an f-string replacement field) group like `()` (dict and set
+    displays) and `|` is bitwise OR, an operator inside the operand.
+    """
+    limit = 0 if direction < 0 else len(source)
+    cursor, depth = pos, 0
+    while cursor != limit:
+        index = cursor - 1 if direction < 0 else cursor
+        char = source[index]
+        if quotes and index in quotes:
+            other = quotes[index]
+            if (other - index) * direction < 0:
+                break
+            cursor = other if direction < 0 else other + 1
             continue
-        if RX.search(line):
-            n += 1
-    return n
+        opening, closing = (")]", "([") if direction < 0 else ("([", ")]")
+        if index in braces:
+            opening, closing = (opening + "}", closing + "{") if direction < 0 else (opening + "{", closing + "}")
+        if char in opening:
+            depth += 1
+        elif char in closing:
+            if depth == 0:
+                break
+            depth -= 1
+        if depth == 0:
+            if char == '\n' and not (nest and nest[index]):
+                fragment = source[index + 1:pos] if direction < 0 else source[pos:index]
+                if fragment.strip():
+                    break
+            if char in ',:;{}' and index not in braces or char == '|' and lang != "py":
+                break
+            if char.isspace():
+                # Only the nearest non-blank neighbours matter; never copy the
+                # whole prefix/suffix (quadratic on large files).
+                b_end = index
+                while b_end > 0 and source[b_end - 1].isspace():
+                    b_end -= 1
+                a_start = index + 1
+                while a_start < len(source) and source[a_start].isspace():
+                    a_start += 1
+                before = source[max(0, b_end - 16):b_end]
+                after = source[a_start:a_start + 16]
+                # Adjacent atoms are separate arguments/statements, not an
+                # arithmetic operand (e.g. `sed "...load..." 2>/dev/null`).
+                if (before and after and
+                        (before[-1].isalnum() or before[-1] in "_)]}\"'") and
+                        (after[0].isalnum() or after[0] in "_$\"'") and
+                        not re.search(r'\b' + _JOINING_WORD + r'$', before) and
+                        not re.match(_JOINING_WORD + r'\b', after)):
+                    break
+            boundary = _BOUNDARY.match(source, index)
+            if boundary is not None or source.startswith(('>=', '<='), index - 1):
+                break
+        cursor += direction
+    return source[cursor:pos] if direction < 0 else source[pos:cursor]
 
 
-def scan(root: Path, scan_dirs=SCAN, library=LIBRARY) -> dict:
+def _py_tokens(text: str, lines: list, source: str):
+    """(bracket pairs, string spans) as offsets into ``source``, from the
+    Python tokenizer over the ORIGINAL text, so docstrings, f-strings and
+    comments never pair; None when the text does not tokenize. ``lines`` are
+    the comment-stripped physical lines ``source`` was joined from (columns
+    before a stripped comment are unchanged; backslash-newline folds shift)."""
+    import io
+    import tokenize
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line) + 1)
+    joined = "\n".join(lines)
+    folds = [m.start() for m in re.finditer(r"\\\n", joined)]   # t_89091ec3: one regex pass, not a startswith per char
+
+    def offset(row, col, end=False):
+        if row - 1 >= len(lines):
+            return None
+        col = min(col, len(lines[row - 1])) if end else col
+        if col > len(lines[row - 1]) or (not end and col == len(lines[row - 1])):
+            return None
+        at = starts[row - 1] + col
+        return min(at - bisect.bisect_left(folds, at), len(source))
+
+    stack, pairs, strings, fstack = [], {}, [], []
+    f_start = {getattr(tokenize, n) for n in ("FSTRING_START", "TSTRING_START") if hasattr(tokenize, n)}
+    f_end = {getattr(tokenize, n) for n in ("FSTRING_END", "TSTRING_END") if hasattr(tokenize, n)}
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.OP and tok.string in "()[]":
+                at = offset(*tok.start)
+                at = at if at is not None and source[at:at + 1] == tok.string else None
+                if tok.string in "([":
+                    stack.append(at)
+                elif stack:
+                    start = stack.pop()
+                    if start is not None and at is not None:
+                        pairs[start] = at
+            elif tok.type == tokenize.STRING:
+                a, b = offset(*tok.start), offset(*tok.end, end=True)
+                if a is not None and b is not None:
+                    strings.append((a, b))
+            elif tok.type in f_start:
+                fstack.append(offset(*tok.start))
+            elif tok.type in f_end and fstack:
+                a, b = fstack.pop(), offset(*tok.end, end=True)
+                if a is not None and b is not None:
+                    strings.append((a, b))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return None
+    return pairs, sorted(strings)
+
+
+def hits_in(text: str, lang: str = "py") -> int:
+    """Count every host-load comparison occurrence, independent of statements.
+
+    Literal and computed metric names intentionally count too. This ratchet
+    tolerates conservative overcounting; unknown syntax must not hide a gate.
+    Only complete single-line trailing telemetry waivers can remove source.
+    """
+    if not _MAY_COUNT.search(text):
+        return 0   # t_89091ec3: nothing here can count; skip the per-line comment strip
+    lines = []
+    depth = 0
+    for row, line in enumerate(text.splitlines()):
+        comments = ("//", "#!") if lang == "js" else ("#", "//")
+        if line.lstrip().startswith(comments):
+            lines.append("")
+            continue
+        marker = "//" if lang in ("c", "go", "js", "ts", "tsx") else "#"
+        adapter = "c" if marker == "//" else lang
+        bare, _ = _blank_line(line, adapter, None)
+        prefix = line.split(marker, 1)
+        before_depth = depth
+        for char in bare:
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth = max(0, depth - 1)
+        if (before_depth == depth == 0 and not bare.rstrip().endswith("\\") and
+                len(prefix) == 2 and WAIVER in prefix[1] and
+                _blank_line(prefix[0], adapter, None)[0] == bare and
+                _blank_line(prefix[0] + " ADMISSION_COMMENT_BOUNDARY", adapter, None)[0].endswith(
+                    "ADMISSION_COMMENT_BOUNDARY") and
+                _waiver_owner(row, row, row, bare) is not None):
+            lines.append("")
+        else:
+            # Locate a real trailing comment without deleting literal metric keys.
+            # Reuse the quote adapter only to recognize comment boundaries.
+            code = line
+            for match in re.finditer(re.escape(marker), line):
+                before = line[:match.start()]
+                # An escaped slash in a JS regex is not a line-comment opener.
+                # Unknown slash syntax counts conservatively rather than hiding code.
+                if marker == "//" and before.endswith("\\"):
+                    continue
+                if _blank_line(before + " ADMISSION_COMMENT_BOUNDARY", adapter, None)[0].endswith(
+                        "ADMISSION_COMMENT_BOUNDARY"):
+                    if marker != "#" or adapter != "sh" or not before or before[-1] in " \t;(":
+                        code = before
+                        break
+            lines.append(code)
+    source = "\n".join(lines).replace("\\\n", " ")
+    quotes = {}
+    # Pair quote delimiters forward once; walking backwards from an operator
+    # inside a literal must stop at its opener, not jump into another statement.
+    # A shell parameter expansion `${...}` is one atom, like a literal: its
+    # braces are not the statement braces that end an operand.
+    atom = r'''"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\\n])*`'''
+    if lang == "sh":
+        atom = r"\$\{[^{}\n]*\}|" + atom
+    for literal in re.finditer(atom, source):
+        start, end = literal.start(), literal.end() - 1
+        quotes[start], quotes[end] = end, start
+    # Innermost MATCHED (/[ pair around each index, literals skipped: a newline
+    # inside that pair (a parenthesized multi-line condition) does not end the
+    # expression. Only matched pairs count, so a stray bracket in prose cannot
+    # shift every later line (a running depth counter drifts by file end).
+    may = bool(_MAY_COMPARE.search(source)) or (lang == "sh" and "load" in source)
+    pairs, stack, i = {}, [], 0
+    # Python: bracket tokens from the tokenizer (docstrings, f-strings and
+    # prose cannot pair). Other languages, or untokenizable text: the scanner.
+    toks = _py_tokens(text, lines, source) if lang == "py" and may else None
+    if toks is not None:
+        pairs.update(toks[0])
+        i = len(source)
+    skip = quotes
+    while may and i < len(source):
+        if i in skip and skip[i] > i:
+            i = skip[i] + 1
+            continue
+        char = source[i]
+        if char in "([":
+            stack.append(i)
+        elif char in ")]" and stack and source[stack[-1]] == "([" [")]".index(char)]:
+            pairs[stack.pop()] = i
+        i += 1
+    nest, open_until = [False] * len(source), []
+    for i in range(len(source) if may else 0):
+        while open_until and open_until[-1] < i:
+            open_until.pop()
+        if i in pairs:
+            open_until.append(pairs[i])
+        nest[i] = bool(open_until) and i not in pairs and open_until[-1] != i
+    count = 0
+    compared_spans = []
+    # A name bound straight from a load metric IS that metric in the file:
+    # `load = os.getloadavg()[0]`, `l1, l5, l15 = os.getloadavg()`, and in
+    # Python `cb = s.get("cpu_busy")` / `cb, run = s.get("cpu_busy"), x`
+    # (targets pair with top-level RHS items; a single RHS binds every target
+    # only when it is a bare getloadavg() call).
+    bound = set()
+    for assign in re.finditer(r"^[ \t]*([A-Za-z_][\w, \t]*?)[ \t]*=(?!=)[ \t]*([^\n]*)", source, re.M):
+        names = [n for n in re.split(r"[\s,]+", assign.group(1)) if n]
+        rhs = assign.group(2)
+        items, level, last, quote, escaped = [], 0, 0, None, False
+        for k, char in enumerate(rhs):
+            # `;` and `,` inside a string literal neither end the statement
+            # nor split tuple items: `label, busy = "host;cpu", s.get(...)`.
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char in "\"'":
+                quote = char
+                continue
+            level += char in "([{"
+            level -= char in ")]}"
+            if char == ";" and level == 0:
+                rhs = rhs[:k]   # the statement ends here; what follows binds nothing
+                break
+            if char == "," and level == 0:
+                items.append(rhs[last:k])
+                last = k + 1
+        items.append(rhs[last:])
+        loadavg = re.compile(r"^\s*(?:os\.)?getloadavg\(\)")
+        # The item IS a metric read: getloadavg(), or (Python) a keyed read of a
+        # metric optionally wrapped in a number cast: `s.get("cpu_busy")`,
+        # `float(d["load1"] or 0)`. Prose and expressions that merely MENTION
+        # a metric do not bind.
+        keyed = re.compile(r"^\s*(?:(?:float|int|_num)\()?[A-Za-z_][\w.]*(?:\.get\(\s*|\[\s*)[\"']" +
+                           METRIC + r"[\"']")
+        metric_read = lambda item: bool(loadavg.match(item) or (lang == "py" and keyed.match(item)) or  # noqa: E731
+                                        (lang == "sh" and re.search(r"/proc/loadavg|\bvm\.loadavg\b", item)))
+        if len(names) == 1:
+            bound.update(names if metric_read(rhs) else [])
+        elif len(items) == 1 and loadavg.match(rhs) and not rhs[loadavg.match(rhs).end():].strip():
+            bound.update(names)
+        elif len(items) == len(names):
+            bound.update(n for n, item in zip(names, items) if metric_read(item))
+    bound = {n for n in bound if len(n) > 1}   # `p`, `n`: loop scratch names get rebound
+    # Shell: an awk program is a literal, but `awk -v l="$load1" '... l < m ...'`
+    # compares the load under an alias. Aliases of a load variable (metric-named
+    # or bound above) count inside that awk command's own line.
+    awk_aliases = []
+    if lang == "sh":
+        for awk in re.finditer(r"\bawk\b[^\n]*", source):
+            names = [m.group(1) for m in re.finditer(
+                r"-v\s+([A-Za-z_]\w*)\s*=\s*[\"']?\$\{?([A-Za-z_]\w*)", awk.group())
+                if m.group(2) in bound or re.fullmatch(METRIC + "|" + LOAD_VARIABLE, m.group(2))]
+            if names:
+                awk_aliases.append((awk.start(), awk.end(), re.compile(
+                    r"(?<![\w$])(?:" + "|".join(map(re.escape, names)) + r")\b")))
+    # A bound name is code: it counts outside string literals only (unlike a
+    # literal metric KEY, which counts conservatively anywhere).
+    spans = []
+    for a, b in (toks[1] if toks is not None else sorted((a, b) for a, b in quotes.items() if b > a)):
+        if spans and a <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], b))   # f-string nesting: keep the outer span
+        else:
+            spans.append((a, b))
+    starts_ = [a for a, _ in spans]
+
+    def in_literal(at):
+        k = bisect.bisect_right(starts_, at) - 1
+        return k >= 0 and spans[k][0] <= at < spans[k][1]
+    braces = frozenset(i for i, char in enumerate(source)
+                       if char in "{}" and not in_literal(i)) if lang == "py" and may else frozenset()
+    bound_rx = re.compile(r"(?<![.\w])(?:" + "|".join(map(re.escape, sorted(bound))) + r")\b(?!\s*\()") if bound else None
+    counted_ops = set()
+    for op in _COMPARISON.finditer(source) if may else ():
+        if op.start() and source[op.start() - 1:op.start() + 1] in ('<<', '>>'):
+            continue  # <= matched at the second character of <<= is not relational
+        # Shell file-descriptor redirects are not relational operators.
+        if lang == 'sh' and (source[op.end():].lstrip().startswith(('/', '&', '<(', '>(')) or
+                (op.group() == '<' and source[op.end():].lstrip().startswith('(') and
+                 source[:op.start()].rstrip().endswith('<'))):
+            continue
+        # Boolean fallbacks inside a balanced operand are not separators.
+        left = _operand(source, op.start(), -1, quotes, nest, lang, braces)
+        right = _operand(source, op.end(), 1, quotes, nest, lang, braces)
+        if _METRIC_ANY_CASE.search(left) or _METRIC_ANY_CASE.search(right) or (lang == "sh" and
+                (_METRIC_NAME.search(left) or _METRIC_NAME.search(right))) or (
+                bound_rx and not in_literal(op.start()) and (bound_rx.search(left) or bound_rx.search(right))) or any(
+                start <= op.start() < end and (alias.search(left) or alias.search(right))
+                for start, end, alias in awk_aliases):
+            count += 1
+            compared_spans.append((op.start() - len(left), op.end() + len(right)))
+            counted_ops.add(op.start())
+    if lang == "sh":
+        for awk in _AWK_LOADAVG.finditer(source):
+            group = "a" if awk.group("a") is not None else "b"
+            program, base = awk.group(group), awk.start(group)
+            for op in _COMPARISON.finditer(program):
+                if base + op.start() in counted_ops:
+                    continue
+                left = _operand(program, op.start(), -1)
+                right = _operand(program, op.end(), 1)
+                if _AWK_LOAD_FIELD.search(left) or _AWK_LOAD_FIELD.search(right):
+                    count += 1
+    # Only a getloadavg() operand already represented by a counted comparison
+    # is redundant. Sizing signals remain independent of other comparisons.
+    for special in _SPECIAL.finditer(source):
+        if not (special.group().startswith('os.getloadavg(') and
+                any(start <= special.start() < end for start, end in compared_spans)):
+            count += 1
+    return count
+
+
+def _blank_line(code: str, lang: str, in_triple):
+    """(bare, in_triple') for one physical line: blanks quoted spans and the trailing comment for delimiter
+    counting, carrying Python triple-quote state across lines (053e4801af29).
+
+    Prism a21209b97e0e: one left-to-right scan of the whole line, so a triple quote opens wherever it sits
+    (after indentation, after `x = `, after a closed single-line string), never only at column zero."""
+    if lang != "py":
+        return _blank_quotes_and_comment(code, lang), None
+    out = []
+    q = None                     # open single-line quote char
+    i, n = 0, len(code)
+    while i < n:
+        if in_triple:
+            if code[i] == "\\":
+                i += 2
+                continue
+            if code.startswith(in_triple, i):
+                i, in_triple = i + 3, None
+                continue
+            i += 1
+            continue
+        c = code[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if code.startswith(("'''", '"""'), i):
+            in_triple = code[i:i + 3]
+            i += 3
+            continue
+        if c in ("'", '"'):
+            q = c
+            i += 1
+            continue
+        if c == "#":
+            break
+        out.append(c)
+        i += 1
+    return "".join(out), in_triple
+
+
+
+
+def _blank_quotes_and_comment(code: str, lang: str = "py") -> str:
+    """The line with every quoted span blanked and a trailing comment removed, for delimiter counting only (the
+    comparison regex still reads the real text). Quotes are matched per line: a quote that does not close on its
+    line blanks to EOL, which keeps a multi-line string from opening a join either.
+
+    Prism fba51c46ef6f / 7cfa74e7831e: the comment marker is per language. Python: `#` only (`//` is floor
+    division). Shell: `#` only when it starts a word (preceded by start/space/`;`/`(`), never inside `$#`,
+    `${#arr[@]}` or `foo#bar`. JS/TS/Go-style: `//`. A wrong marker ate the closing delimiter and opened a join."""
+    out = []
+    q = None
+    i = 0
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c in ("'", '"', '`'):
+            q = c
+            i += 1
+            continue
+        if lang == "py" and c == "#":
+            break
+        if lang == "sh" and c == "#" and (i == 0 or code[i - 1] in " \t;(") :
+            break
+        if lang in ("c", "go") and code.startswith("//", i):
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+_LANG_BY_SUFFIX = {".py": "py", ".sh": "sh", ".bash": "sh", ".zsh": "sh", ".js": "js", ".ts": "ts", ".go": "go",
+                   ".mjs": "js", ".cjs": "js", ".jsx": "js", ".tsx": "tsx"}
+
+
+def _lang_of_text(rel, raw: bytes) -> str:
+    """py / sh / c from the suffix, else from the shebang, else py (the conservative marker set: `#` only)."""
+    import os
+    suf = os.path.splitext(str(rel))[1].lower()
+    if suf in _LANG_BY_SUFFIX:
+        return _LANG_BY_SUFFIX[suf]
+    first = raw.split(b"\n", 1)[0].decode("utf-8", "replace")
+    if first.startswith("#!") and ("sh" in first.rsplit("/", 1)[-1] or "bash" in first):
+        return "sh"
+    return "py"
+    if first.startswith("#!") and ("sh" in first.split("/")[-1] or "bash" in first):
+        return "sh"
+    return "py"
+
+
+def index_blob(root: Path, rel: str) -> bytes:
+    """Missing tracked source is not a deletion until removed from the index."""
+    env = _git_env()
+    entry = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "--stage", "-z", "--", rel],
+                           capture_output=True, env=env)
+    records = entry.stdout.rstrip(b"\0").split(b"\0")
+    header, _, name = records[0].partition(b"\t")
+    fields = header.split()
+    if (entry.returncode or len(records) != 1 or len(fields) != 3 or fields[2] != b"0" or
+            name != rel.encode() or fields[0] not in (b"100644", b"100755")):
+        raise ScanError(f"{rel}: unreadable worktree file; no regular index blob (missing symlink target or conflict)")
+    blob = subprocess.run(["git", "-C", str(root), "cat-file", "blob", fields[1].decode("ascii")],
+                          capture_output=True, env=env)
+    if blob.returncode:
+        raise ScanError(f"{rel}: index blob not readable")
+    return blob.stdout
+
+
+def scan(root: Path, scan_dirs=SCAN, library=LIBRARY, require_git=False) -> dict:
     out = {}
-    for rel in tracked(root, scan_dirs):
+    for rel in tracked(root, scan_dirs, require_git=require_git):
         if rel in library or rel in SELF or SKIP.search(rel) or not is_live_source(rel):
             continue
         try:
             raw = (root / rel).read_bytes()
         except FileNotFoundError:
-            continue                  # tracked but deleted in the worktree: absent code, nothing to count
+            raw = index_blob(root, rel)
         except OSError as exc:
             raise ScanError(f"{rel}: unreadable ({exc})") from exc
         if b"\0" in raw[:2048]:
             continue
-        n = hits_in(raw.decode("utf-8", errors="replace"))
+        try:
+            n = hits_in(raw.decode("utf-8", errors="replace"), _lang_of_text(rel, raw))
+        except ScanError as exc:
+            raise ScanError(f"{rel}: {exc}") from exc
         if n:
             out[rel] = n
     return out
@@ -140,22 +640,57 @@ def scan(root: Path, scan_dirs=SCAN, library=LIBRARY) -> dict:
 
 def config(doc: dict):
     """(scan dirs, library paths) a baseline declares; hermes-home's defaults when absent."""
-    return tuple(doc.get("scan") or SCAN), frozenset(doc.get("library") or LIBRARY)
+    dirs = doc.get("scan", SCAN)
+    if not isinstance(dirs, (list, tuple)) or not dirs:
+        raise ScanError("scan must be a nonempty list of literal relative directories")
+    for d in dirs:
+        if (not isinstance(d, str) or not d or d.startswith("/") or
+                any(c in d for c in ":*?[]\\\n\r\0") or ".." in d.split("/") or
+                (d != "." and any(part in ("", ".") for part in d.split("/")))):
+            raise ScanError(f"scan path must be a literal relative directory: {d!r}")
+    library = doc.get("library")
+    if not isinstance(library, list) or not all(isinstance(p, str) for p in library):
+        raise ScanError("library is required and must be a list of repo-relative paths")
+    return tuple(dirs), frozenset(library)
 
 
-def _show(root: Path, ref: str, rel: str):
-    """File text at ref, None when the path is absent there; ScanError when the commit itself is unreadable."""
+def _show(root: Path, ref: str, rel: str, _seen=()):
+    """File text at ref; only a confirmed absent tree entry returns None. Unreadable objects abort."""
+    if rel in _seen or len(_seen) >= 40:
+        raise ScanError(f"--base-ref {ref}: symlink cycle at {rel}")
     env = _git_env()
     ok = subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"], capture_output=True, env=env)
     if ok.returncode != 0:
         raise ScanError(f"--base-ref {ref}: commit not readable (fetch it first)")
-    p = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{rel}"], capture_output=True, env=env)
-    return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else None
+    tree = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-tree", "-z", ref, "--", rel],
+                          capture_output=True, env=env)
+    if tree.returncode != 0:
+        raise ScanError(f"--base-ref {ref}: {rel}: tree not readable (fetch it first)")
+    if not tree.stdout:
+        return None
+    entries = tree.stdout.rstrip(b"\0").split(b"\0")
+    header, _, name = entries[0].partition(b"\t")
+    fields = header.split()
+    if len(entries) != 1 or len(fields) != 3 or fields[1] != b"blob" or name != rel.encode("utf-8"):
+        raise ScanError(f"--base-ref {ref}: {rel}: expected one blob entry")
+    p = subprocess.run(["git", "-C", str(root), "cat-file", "blob", fields[2].decode("ascii")],
+                       capture_output=True, env=env)
+    if p.returncode != 0:
+        raise ScanError(f"--base-ref {ref}: {rel}: blob not readable (fetch it first)")
+    text = p.stdout.decode("utf-8", errors="replace")
+    if fields[0] == b"120000":
+        import posixpath
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(rel), text))
+        if target.startswith(("/", "../")) or target == "..":
+            raise ScanError(f"--base-ref {ref}: symlink escapes tree: {rel}")
+        return _show(root, ref, target, (*_seen, rel))
+    return text
 
 
 def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
     """The baseline may only go DOWN against the PR base (t_22955b73). A row added or raised is allowed only up to the
     hits that file ALREADY had in the base tree (recording code that is on main, never code this PR adds)."""
+    config(head_doc)  # validate even when the base has no baseline yet
     raw = _show(root, ref, BASELINE_REL.as_posix())
     if raw is None:
         print(f"admission-decider-lint: no baseline at base {ref[:12]}: first baseline, nothing to compare")
@@ -165,6 +700,10 @@ def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
     except ValueError as exc:
         raise ScanError(f"baseline at base {ref[:12]} unparseable ({exc})") from exc
     bad = []
+    # Pre-migration home baselines omitted library; preserve the old fixed scope only
+    # for historical comparison. Current baselines must always declare it.
+    if "library" not in base_doc:
+        base_doc["library"] = sorted(LIBRARY)
     (b_scan, b_lib), (h_scan, h_lib) = config(base_doc), config(head_doc)
     if h_lib - b_lib:
         bad.append(f"library widened against base: {sorted(h_lib - b_lib)}")
@@ -176,7 +715,7 @@ def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
         if was is not None and n <= was:
             continue
         text = _show(root, ref, rel)
-        on_base = hits_in(text) if text is not None else 0
+        on_base = hits_in(text, _lang_of_text(rel, text.encode("utf-8", "replace"))) if text is not None else 0
         if n <= on_base:
             continue                  # code already on main, now recorded
         bad.append(f"{rel}: baseline row added ({n})" if was is None else f"{rel}: baseline raised {was} -> {n}")
@@ -196,11 +735,11 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"admission-decider-lint: FAIL baseline {bp} unreadable ({exc})")
         return 2
-    scan_dirs, library = config(doc)
     try:
+        scan_dirs, library = config(doc)
         if a.base_ref and set(a.base_ref) == {"0"}:
             raise ScanError(f"--base-ref {a.base_ref}: null sha")
-        now = scan(a.root, scan_dirs, library)
+        now = scan(a.root, scan_dirs, library, require_git=a.update)
         grew = baseline_drift(a.root, a.base_ref, doc) if a.base_ref else []
     except ScanError as exc:
         print(f"admission-decider-lint: FAIL scan aborted, baseline untouched: {exc}")
