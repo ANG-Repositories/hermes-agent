@@ -58,15 +58,9 @@ from .search_query import (
 from .message_content import normalize_content_value as _normalize_content_value
 from .storage_security import RowCipher, ensure_lcm_file_permissions
 from .tokens import count_message_tokens
+from .sqlite_util import StoreClosed, guard_connection  # noqa: F401  (StoreClosed re-exported)
 
 logger = logging.getLogger(__name__)
-
-
-class StoreClosed(sqlite3.Error):
-    """The store's connection was closed; the call never touched SQLite.
-
-    Subclasses ``sqlite3.Error`` so existing fail-open ``except sqlite3.Error`` callers keep working.
-    """
 
 
 def _open_conn(method):
@@ -392,7 +386,7 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = guard_connection(sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
