@@ -248,8 +248,10 @@ def render(card: dict, verification: list) -> tuple:
             args = [sys.executable or "python3", str(lib), "render", "--card-json", tmp[0]]
             if verification:
                 args += ["--verification", tmp[1]]
+            # Prism b3697fd74088: we decode UTF-8, so make the helper write UTF-8 whatever the locale's code page.
             proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                  timeout=_TIMEOUT_S, check=False)
+                                  timeout=_TIMEOUT_S, check=False,
+                                  env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"))
             section = (proc.stdout or "").strip("\n")
             if proc.returncode == 0 and section.startswith(START) and section.endswith(END):
                 return section, "library"
