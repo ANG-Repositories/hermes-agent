@@ -340,7 +340,12 @@ def stop_runtime_status_writers(timeout: float = 2.0) -> bool:
     # and would start it again after it stopped. Only when its worker already exists: with no
     # worker nothing is queued, and a submit would build a thread through a possibly patched
     # ``threading.Thread`` (tests/test_harness_bounds.py runs it inline, forever).
-    if getattr(_RUNTIME_STATUS_LANE, "_threads", None):
+    # Read under the executor's own lock: ``submit`` holds it from the enqueue through the
+    # worker start, so a job already enqueued is always seen here (Prism ab965620987b).
+    lane = _RUNTIME_STATUS_LANE
+    with getattr(lane, "_shutdown_lock", contextlib.nullcontext()):
+        lane_busy = bool(getattr(lane, "_threads", None)) or not lane._work_queue.empty()
+    if lane_busy:
         with contextlib.suppress(Exception):
             _RUNTIME_STATUS_LANE.submit(lambda: None).result(timeout=max(timeout, 0.0))
     stopped = True
