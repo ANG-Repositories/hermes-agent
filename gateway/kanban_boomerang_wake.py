@@ -976,11 +976,14 @@ def _verify_land_inherited(entry: dict, verdict: dict, kb: Any, conn: Any) -> Op
 _OWNER_COMMENT_NEWER = "owner comment newer than handback"
 
 
-def stale_surface_reason(entry: dict) -> Optional[str]:
+def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
 
     Keep the original event cursor across retries/restarts: a deadman event's timestamp
     is NOT the timestamp of the review handback it is summarizing.
+
+    ``fork_died``: skip ONLY the "owner comment newer than handback" rule (a dead fork's original
+    wake is still owed, t_525de3f0); the release/hold and merged-PR rules are still evaluated.
     """
     if os.environ.get("BOOMERANG_STALE_GUARD") == "0":
         return None
@@ -1008,7 +1011,11 @@ def stale_surface_reason(entry: dict) -> Optional[str]:
             if re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M):
                 return "owner release/hold line"
             if handback and newest.created_at > handback["created_at"]:
-                return _OWNER_COMMENT_NEWER
+                if not fork_died:
+                    return _OWNER_COMMENT_NEWER
+                logger.info("kanban boomerang-wake: stale rule bypassed task=%s reason=%s "
+                            "(fork died; original wake re-delivered) delegation=%s",
+                            entry.get("task_id"), _OWNER_COMMENT_NEWER, entry.get("delegation_id"))
         refs = []
         if handback:
             payload = json.loads(handback["payload"] or "{}")
@@ -1031,9 +1038,9 @@ def stale_surface_reason(entry: dict) -> Optional[str]:
     return None
 
 
-def _stale_refusal(entry: dict, stage: str) -> Optional[str]:
+def _stale_refusal(entry: dict, stage: str, *, fork_died: bool = False) -> Optional[str]:
     try:
-        reason = stale_surface_reason(entry)
+        reason = stale_surface_reason(entry, fork_died=fork_died)
     except Exception as exc:
         # An unavailable read is not evidence that a card is stale. Keep the existing
         # visible failure path, rather than silently losing an actionable wake.
@@ -1259,13 +1266,9 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
             for field in ("event_id", "assignee", "pr"):
                 if guard_entry.get(field) is None:
                     guard_entry[field] = claim.get(field)
-            why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one")
-            if why == _OWNER_COMMENT_NEWER and row.get("fork_died"):
-                # t_525de3f0: a dead fork's ORIGINAL wake is still owed; this one rule only.
-                logger.info("kanban boomerang-wake: stale rule bypassed task=%s reason=%s "
-                            "(fork died; original wake re-delivered) delegation=%s",
-                            row.get("task_id"), why, delegation_id)
-                why = None
+            # t_525de3f0: a dead fork's ORIGINAL wake skips the owner-comment rule only.
+            why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one",
+                                          fork_died=bool(row.get("fork_died")))
             if why:
                 await asyncio.to_thread(state.drop_handback, delegation_id)
                 return sent
@@ -1931,7 +1934,8 @@ async def _lost(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
         return
     # The re-surface commits with the terminal claim; a failed send stays pending for the next
     # reconcile drain instead of being dropped (t_525de3f0).
-    did, row = handback_row(entry, {}, turn_text=str(entry.get("wake_text") or ""))
+    # action "resurface" keeps the stale guard off this row, as before the queue (Prism f0e927560d38).
+    did, row = handback_row(entry, {"action": "resurface"}, turn_text=str(entry.get("wake_text") or ""))
     row["line"] = f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason})"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="lost",
                             reason=reason, resurfaced=True, resurface_delivered=False, handback=(did, row))
@@ -2054,7 +2058,7 @@ async def _superseded_by_terminal(runner: Any, entry: dict, reason: str, state: 
         # verdict known, delivery unconfirmed: deliver the child's finding once (never redispatch).
         # Quiet on success; a refused turn also owes one lost line (Prism af30fe379f6c). Both stay
         # pending in the handback queue until their receipt (t_525de3f0).
-        did, row = handback_row(entry, {}, turn_text=finding_text(entry, {"summary": summary}, "child surfaced"))
+        did, row = handback_row(entry, {"action": "resurface"}, turn_text=finding_text(entry, {"summary": summary}, "child surfaced"))
         row.update(parts=[PART_TURN], warn_on_failure=True,
                    line=f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason}); "
                         f"child surfaced: {str(summary)[:300]}")

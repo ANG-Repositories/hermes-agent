@@ -1281,6 +1281,31 @@ def test_lost_resurface_failed_send_is_queued_and_delivered_once_by_reconcile(en
     assert len(env["dispatched"]) == 1
 
 
+def test_queued_lost_resurface_is_not_dropped_by_a_newer_owner_comment(env):
+    """Prism f0e927560d38: a re-surface obligation (lost) is not a surface verdict; a newer owner
+    comment must not drop its queued turn or its lost line on the reconcile retry."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    ah.BoomerangWakeState().bump_retry(tid)
+    _kill(env, entry)
+    env["adapter"].fail_turns = 1
+    env["adapter"].fail_sends = 1
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    state = ah.BoomerangWakeState()
+    assert state.handbacks()[entry["delegation_id"]]["parts"] == [ah.PART_TURN, ah.PART_LINE]
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        handback_at = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? "
+                                   "AND kind = 'completed'", (tid,)).fetchone()[0]
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "worker", "owner note", handback_at + 60))
+    assert ah.stale_surface_reason(entry) == "owner comment newer than handback"
+    asyncio.run(ah.reconcile(env["runner"]))
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    assert env["adapter"].sent == [f"⚠️ boomerang-wake lost {tid} (reason: gateway restart, retry spent)"]
+    assert state.handbacks() == {}
+
+
 def test_superseded_surfaced_finding_failed_turn_is_queued_and_delivered_once(env):
     """t_525de3f0 item 1: the restart's surfaced-finding turn that gets no receipt is retried by the
     next reconcile (one warning line, one turn), instead of vanishing behind a terminal claim."""
@@ -1303,16 +1328,18 @@ def test_superseded_surfaced_finding_failed_turn_is_queued_and_delivered_once(en
     assert state.get_claim(entry["key"])["resurface_delivered"] is True
 
 
-@pytest.mark.parametrize("case", ["fork_died", "ordinary_surface"])
+@pytest.mark.parametrize("case", ["fork_died", "fork_died_pr_merged", "ordinary_surface"])
 def test_dead_fork_original_wake_bypasses_only_the_newer_owner_comment_rule(env, case):
     """t_525de3f0 item 2 (gateway.log 2026-11-09 18:29:58, t_3ec99a93): a fork that died on
     context_length_exceeded owes its ORIGINAL wake; a newer owner comment does not refuse that one
-    re-delivery. An ordinary surface handback under the same comment is still refused."""
+    re-delivery. The merged-PR rule still applies to it (Prism 48e96b19e34f), and an ordinary
+    surface handback under the same comment is still refused."""
     tid = _card(env)
-    _worker_close(tid)
+    _worker_close(tid, summary=f"PR {REPO}#72 ready")
     entry = _claimed_entry(env, tid)
     env["adapter"].fail_turns = 1
-    if case == "fork_died":
+    env["health"][(REPO, 72)] = {"state": "open"}
+    if case.startswith("fork_died"):
         _run(env, entry, "failed", "context_length_exceeded: This conversation has grown too long")
     else:
         _run(env, entry, "completed", _verdict(entry, "surface", summary="needs operator"))
@@ -1324,6 +1351,8 @@ def test_dead_fork_original_wake_bypasses_only_the_newer_owner_comment_rule(env,
         conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
                      (tid, "worker", "owner note", handback_at + 60))
     assert ah.stale_surface_reason(entry) == "owner comment newer than handback"
+    if case == "fork_died_pr_merged":
+        env["health"][(REPO, 72)] = {"state": "merged"}
     asyncio.run(ah.reconcile(env["runner"]))
     assert state.handbacks() == {}
     if case == "fork_died":
