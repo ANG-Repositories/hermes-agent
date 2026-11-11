@@ -72,7 +72,6 @@ class _RuntimeStatusWriter:
         self._last_error: Optional[BaseException] = None
         self._failure_logged = False
         self._thread: Optional[threading.Thread] = None
-        self._stopping = False
 
     def submit(self, path: Path, payload: dict[str, Any]) -> int:
         with self._condition:
@@ -80,14 +79,8 @@ class _RuntimeStatusWriter:
             generation = self._submitted_generation
             self._pending = (generation, path, copy.deepcopy(payload))
             if self._thread is None or not self._thread.is_alive():
-                # Reset only for a fresh thread: a submit racing stop() is still written by
-                # the stopping thread, which then exits instead of idling (t_3187cbec).
-                self._stopping = False
                 self._thread = threading.Thread(
                     target=self._run, daemon=True, name="gateway-runtime-status-writer")
-                # Found from the thread, not a module global: an importlib.reload(gateway.status)
-                # rebinds every global and would orphan a live writer (t_3187cbec).
-                self._thread.status_writer = self  # type: ignore[attr-defined]
                 self._thread.start()
             self._condition.notify_all()
             return generation
@@ -125,27 +118,10 @@ class _RuntimeStatusWriter:
             )
             return False if no_more_work else None
 
-    def stop(self, timeout: float = 2.0) -> bool:
-        """Persist what is pending, then end the writer thread; ``True`` once it has exited.
-
-        A later ``submit`` starts a fresh thread, so a stopped writer stays usable.
-        """
-        with self._condition:
-            self._stopping = True
-            self._condition.notify_all()
-            thread = self._thread
-        if thread is None:
-            return True
-        thread.join(timeout=max(timeout, 0.0))
-        return not thread.is_alive()
-
     def _run(self) -> None:
         while True:
             with self._condition:
                 while self._pending is None:
-                    if self._stopping:
-                        self._thread = None  # under the lock: a later submit starts a fresh thread
-                        return
                     self._condition.wait()
                 generation, path, payload = self._pending
                 self._pending = None
@@ -327,33 +303,6 @@ def flush_runtime_status(timeout: float = 2.0) -> bool:
     """Wait boundedly for all runtime-status updates submitted so far."""
     writer = _runtime_status_writer
     return True if writer is None else writer.flush(timeout=timeout)
-
-
-def stop_runtime_status_writers(timeout: float = 2.0) -> bool:
-    """Drain and end every runtime-status writer thread; ``True`` when none is left running.
-
-    The test suite's teardown: a write still in flight from one test must not land during
-    the next one (t_3187cbec). Reads no clock (each wait gets ``timeout``): it runs in
-    a test's teardown, where ``time.monotonic`` may still be monkeypatched.
-    """
-    # Drain the ordered lane first: its queued write_runtime_status jobs submit to the writer
-    # and would start it again after it stopped. Only when its worker already exists: with no
-    # worker nothing is queued, and a submit would build a thread through a possibly patched
-    # ``threading.Thread`` (tests/test_harness_bounds.py runs it inline, forever).
-    # Read under the executor's own lock: ``submit`` holds it from the enqueue through the
-    # worker start, so a job already enqueued is always seen here (Prism ab965620987b).
-    lane = _RUNTIME_STATUS_LANE
-    with getattr(lane, "_shutdown_lock", contextlib.nullcontext()):
-        lane_busy = bool(getattr(lane, "_threads", None)) or not lane._work_queue.empty()
-    if lane_busy:
-        with contextlib.suppress(Exception):
-            _RUNTIME_STATUS_LANE.submit(lambda: None).result(timeout=max(timeout, 0.0))
-    stopped = True
-    for thread in threading.enumerate():
-        writer = getattr(thread, "status_writer", None)
-        if writer is not None:
-            stopped = writer.stop(timeout=timeout) and stopped
-    return stopped
 
 
 async def flush_runtime_status_async(timeout: float = 2.0) -> bool:

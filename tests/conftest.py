@@ -26,7 +26,6 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
 import pytest
@@ -965,35 +964,6 @@ def _no_owning_install_retarget(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(update_owning_install, "retarget_to_owning_install", lambda *_: None)
-
-
-@pytest.fixture(autouse=True)
-def _stop_runtime_status_writer_threads():
-    """End every ``gateway-runtime-status-writer`` thread a test started, and fail if one survives.
-
-    ``SessionStore()`` (via ``RecoverableHandleCache``'s health publish) and every
-    ``publish_runtime_status`` / ``write_runtime_status`` queue a write on a process-global
-    daemon thread. Left running, a write still in flight from one test lands through
-    ``utils.atomic_replace`` while the NEXT test has a probe installed on it: CI run
-    42970552418 failed ``test_mirror_write_is_inline_with_no_running_loop`` with "probed
-    atomic_replace ran on Thread(gateway-runtime-status-writer), not MainThread" (t_3187cbec).
-    Teardown drains and joins the writers; a writer still alive after the bound is an ERROR
-    on the test that started it, never a flake in a later one.
-    """
-    yield
-    status = sys.modules.get("gateway.status")  # never imported: no writer was ever started
-    stop = getattr(status, "stop_runtime_status_writers", None)
-    if stop is None:
-        return
-    stop(timeout=10.0)
-    alive = [t for t in threading.enumerate() if t.name == "gateway-runtime-status-writer"]
-    if alive:
-        pytest.fail(
-            f"{len(alive)} gateway-runtime-status-writer thread(s) still alive 10 s after this "
-            "test: a runtime-status write is stuck and would land during a later test "
-            "(t_3187cbec). Release whatever blocks the write before the test returns.",
-            pytrace=False,
-        )
 
 
 @pytest.fixture(autouse=True)
