@@ -811,9 +811,10 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
     returns the error text (None = published) for the caller to log, and the next tick publishes again (Prism
     8397e82995e1).
 
-    Fire-and-forget (fault-taxonomy ruling 2026-11-05): the whole call spends at most PUBLISH_BUDGET_S across every
-    host (a host left when the budget is gone is skipped, not waited for), never raises, and is counted in
-    PUBLISH_STATS (ok / failed / skipped hosts)."""
+    Fire-and-forget (fault-taxonomy ruling 2026-11-05): the hosts are asked concurrently, each with its own
+    PUBLISH_BUDGET_S limit, so one slow host costs only itself (t_93618cb2); the call never raises and is counted in
+    PUBLISH_STATS (ok / failed / skipped hosts). A host that refuses for a missing publisher token is not a target
+    for the rest of the process (one log line names it); a pass where every remaining host succeeded returns None."""
     try:
         return _publish_ready_demand(queued, root)
     except Exception as exc:  # advisory: nothing here may fail the tick
@@ -823,10 +824,14 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
 
 PUBLISH_BUDGET_S = 1.0
 PUBLISH_STATS = {"ok": 0, "failed": 0, "skipped": 0}
+#: (fleet root, host) pairs that answered TOKENLESS_REFUSAL in this process: never asked again until a restart
+_TOKENLESS = set()
+TOKENLESS_REFUSAL = "provisioned demand publisher token required"
 
 
 def _publish_ready_demand(queued, root):
-    import time as _time
+    import contextvars
+    import threading
     from hermes_cli.fleet_placement import alloc_client as _ac
     from hermes_cli.fleet_placement import admission as _ad
     from hermes_cli.fleet_placement import placement as _pl
@@ -841,20 +846,51 @@ def _publish_ready_demand(queued, root):
     except Exception as exc:
         PUBLISH_STATS["failed"] += 1
         return f"{type(exc).__name__}: {exc}"
-    errors = []
-    deadline = _time.monotonic() + PUBLISH_BUDGET_S
+    fleet = str(_ac._fleet_root())
+    targets = []
     for hid in sorted(table.hosts):
-        left = deadline - _time.monotonic()
-        if left <= 0.01:
+        if (fleet, hid) in _TOKENLESS:
             PUBLISH_STATS["skipped"] += 1
-            errors.append(f"{hid}: skipped (publish budget {PUBLISH_BUDGET_S} s spent)")
-            continue
+        else:
+            targets.append(hid)
+    unified = unified_admit()
+    need = {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib}
+    results = {}                          # hid -> exception or None; written by each host's own thread
+
+    def ask(hid):
         try:
-            _ac.publish_queue(UNIFIED_WORKLOAD, hid, int(queued),
-                              {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib},
-                              unified=unified_admit(), timeout=left)
-            PUBLISH_STATS["ok"] += 1
+            _ac.publish_queue(UNIFIED_WORKLOAD, hid, int(queued), need, unified=unified, timeout=PUBLISH_BUDGET_S)
+            results[hid] = None
         except Exception as exc:
+            results[hid] = exc
+
+    # one short-lived thread per host for this pass only, each bounded by its own socket timeout; a host that has not
+    # answered by the shared deadline is reported unreachable and its thread ends on that timeout
+    threads = []
+    for hid in targets:
+        t = threading.Thread(target=contextvars.copy_context().run, args=(ask, hid),
+                             name=f"kanban-demand-publish:{hid}", daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.monotonic() + PUBLISH_BUDGET_S + 0.2
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    errors = []
+    for hid in targets:
+        if hid not in results:
+            PUBLISH_STATS["failed"] += 1
+            errors.append(f"{hid}: Unreachable: no answer within {PUBLISH_BUDGET_S} s")
+            continue
+        exc = results[hid]
+        if exc is None:
+            PUBLISH_STATS["ok"] += 1
+        elif (isinstance(exc, _ac.Refused) and not isinstance(exc, _ac.AuthorizeRefused)
+              and str(exc) == TOKENLESS_REFUSAL):
+            _TOKENLESS.add((fleet, hid))
+            PUBLISH_STATS["skipped"] += 1
+            _log.warning("kanban demand: %s has no demand publisher token (%s); not a publish target for the rest "
+                         "of this process", hid, TOKENLESS_REFUSAL)
+        else:
             PUBLISH_STATS["failed"] += 1
             errors.append(f"{hid}: {type(exc).__name__}: {exc}")
     return "; ".join(errors) or None

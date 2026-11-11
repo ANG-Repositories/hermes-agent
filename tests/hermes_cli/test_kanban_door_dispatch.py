@@ -408,3 +408,84 @@ def test_spawn_only_aggregate_publish_is_fire_and_forget(fleet, monkeypatch):
     assert err                                            # reported to the caller, not raised
     counted = {k: klg.PUBLISH_STATS[k] - before[k] for k in before}
     assert counted["ok"] == 0 and counted["failed"] + counted["skipped"] == len(doc["hosts"])
+
+
+def _spawn_only_fleet(fleet, monkeypatch, hosts, tokened):
+    """A spawn-only fleet table with ``hosts`` (sorted publish order) and a pair token for each name in ``tokened``."""
+    fleet.registry("spawn-only")
+    doc = json.loads(json.dumps(TABLE))
+    doc["hosts"] = {name: {**TABLE["hosts"]["mac-studio"], "aliases": []} for name in hosts}
+    doc["default_first"] = hosts[-1]
+    (fleet.root / "config" / "fleet-hosts.json").write_text(json.dumps(doc), encoding="utf-8")
+    d = fleet.root / alloc_client.TOKENS_REL
+    d.mkdir(parents=True, exist_ok=True)
+    for name in tokened:
+        (d / f"kanban@{name}").write_text("pair-token\n", encoding="utf-8")
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    return allocd
+
+
+def _queue_ok(blackholed=()):
+    def answer(path, body):
+        if body.get("host") in blackholed:
+            time.sleep(3.0)                               # longer than any per-host limit
+        return 200, {"schema": 1, "workload": body.get("workload"), "host": body.get("host"), "ok": True}
+    return answer
+
+
+def test_spawn_only_publish_one_blackholed_host_costs_only_itself(fleet, monkeypatch):
+    """Five hosts, the first (in publish order) blackholed: the other four are published, the fifth is named
+    unreachable, and the pass takes well under 1.5 s (each host has its own 1 s limit, run concurrently)."""
+    from hermes_cli import kanban_load_gate as klg
+    hosts = ["a-black", "h2", "h3", "h4", "h5"]
+    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
+    allocd.answer = _queue_ok(blackholed={"a-black"})
+    t0 = time.monotonic()
+    err = klg.publish_ready_demand(2)
+    took = time.monotonic() - t0
+    published = sorted(b["host"] for p, b in allocd.calls if p == "/demand/publish" and b["host"] != "a-black")
+    assert published == ["h2", "h3", "h4", "h5"], (published, err)
+    assert err and "a-black" in err and "unreachable" in err.lower(), err
+    assert all(h not in err for h in ("h2", "h3", "h4", "h5")), err
+    assert took < 1.5, took
+
+
+def test_spawn_only_publish_asks_a_tokenless_host_once_per_process(fleet, monkeypatch, caplog):
+    """A host refusing for the missing publisher token is dropped as a target for the process: later passes never
+    ask it, one log line names it, and a pass where every remaining host succeeded is a success."""
+    import logging
+    from hermes_cli import kanban_load_gate as klg
+    allocd = _spawn_only_fleet(fleet, monkeypatch, ["mbp-arm", "studio"], tokened=["studio"])
+    asked = []
+    real = alloc_client.publish_queue
+
+    def recording(workload, host, *a, **k):
+        asked.append(host)
+        return real(workload, host, *a, **k)
+    monkeypatch.setattr(alloc_client, "publish_queue", recording)
+    allocd.answer = _queue_ok()
+    with caplog.at_level(logging.INFO, logger=klg.__name__):
+        errs = [klg.publish_ready_demand(1) for _ in range(3)]
+    assert errs == [None, None, None], errs
+    assert asked.count("mbp-arm") == 1 and asked.count("studio") == 3, asked
+    named = [r for r in caplog.records if "mbp-arm" in r.getMessage()]
+    assert len(named) == 1, [r.getMessage() for r in caplog.records]
+
+
+def test_spawn_only_publish_logs_no_failed_line_when_every_host_answers(fleet, monkeypatch, caplog):
+    """All reachable and tokened: zero "failed" lines over several passes, and None (the gate tick's caller,
+    gateway/kanban_gate_tick.py publish_demand, logs "failed" only for a non-None return)."""
+    import logging
+    from hermes_cli import kanban_load_gate as klg
+    hosts = ["ace-ai", "mac-studio", "nas"]
+    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
+    allocd.answer = _queue_ok()
+    monkeypatch.setattr(klg, "unified_admit", lambda env=None: True)
+    errs = []
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            errs.append(klg.publish_ready_demand(4, root=fleet.root))
+    assert errs == [None, None, None], errs
+    assert not [r for r in caplog.records if "failed" in r.getMessage()], [r.getMessage() for r in caplog.records]
+    assert sorted(b["host"] for p, b in allocd.calls if p == "/demand/publish") == sorted(hosts * 3)
