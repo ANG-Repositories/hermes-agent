@@ -2090,6 +2090,7 @@ def _create_quick_snapshot_locked(
     if os.name != "nt":
         os.chmod(root, 0o700)
     staging_dir.mkdir(mode=0o700, exist_ok=False)
+    _sweep_stale_partials(root)  # runs even when this snapshot ends incomplete and skips the prune
     logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
@@ -2996,10 +2997,72 @@ def restore_cron_jobs_all_profiles(
     return restored
 
 
+_QUICK_PARTIAL_MAX_AGE_S = 12 * 3600
+_QUICK_PARTIAL_RE = re.compile(r"^\.(?P<id>.+)\.(?P<pid>\d+)\.partial$")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True  # exists but not ours, or unknown: treat as alive
+    return True
+
+
+def _newest_mtime(path: Path) -> Optional[float]:
+    """Newest lstat mtime over path and everything under it; None when any entry is unreadable."""
+    try:
+        newest = path.lstat().st_mtime
+        for dirpath, dirnames, filenames in os.walk(path, onerror=_raise_walk_error):
+            for name in dirnames + filenames:
+                newest = max(newest, os.lstat(os.path.join(dirpath, name)).st_mtime)
+    except OSError:
+        return None
+    return newest
+
+
+def _raise_walk_error(exc: OSError) -> None:
+    raise exc
+
+
+def _sweep_stale_partials(root: Path, max_age_s: float = _QUICK_PARTIAL_MAX_AGE_S, now: Optional[float] = None) -> int:
+    """Remove ``.<id>.<pid>.partial`` staging dirs left by a killed quick snapshot. Returns count deleted.
+
+    create_quick_snapshot only clears a staging dir with its own name, so a run killed mid-copy (SIGKILL,
+    reboot, OOM) leaves a full-size orphan nothing else removes: 14.6 GiB of fleetbk partials sat in the
+    Studio's state-snapshots for weeks (t_8ca3f9a1). A partial goes only when its writer pid is gone AND
+    nothing under it was written for ``max_age_s`` (default 12 h); an unreadable tree is kept.
+    """
+    if not root.is_dir():
+        return 0
+    now = time.time() if now is None else now
+    deleted = 0
+    for d in root.iterdir():
+        m = _QUICK_PARTIAL_RE.match(d.name)
+        if not m or d.is_symlink() or not d.is_dir():
+            continue
+        if _pid_alive(int(m.group("pid"))):
+            continue
+        newest = _newest_mtime(d)
+        if newest is None or now - newest < max_age_s:
+            continue
+        try:
+            shutil.rmtree(d)
+            deleted += 1
+            logger.info("Removed stale quick-snapshot staging dir %s", d.name)
+        except OSError as exc:
+            logger.warning("Failed to remove stale staging dir %s: %s", d.name, exc)
+    return deleted
+
+
 def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
-    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
+    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted.
+    Stale ``.partial`` staging dirs from killed runs are swept first (not counted)."""
     if not root.exists():
         return 0
+    _sweep_stale_partials(root)
 
     dirs = sorted(
         (

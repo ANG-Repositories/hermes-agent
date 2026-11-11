@@ -13,6 +13,7 @@ from hermes_cli.backup import (
     _atomic_output_path,
     _backup_operation_lock,
     _write_full_zip_backup,
+    _sweep_stale_partials,
     create_quick_snapshot,
     list_quick_snapshots,
 )
@@ -139,3 +140,59 @@ def test_failed_automatic_backup_preserves_previous_archive(tmp_path, monkeypatc
     assert _write_full_zip_backup(archive, home) is None
     assert archive.read_bytes() == b"previous-valid-backup"
     assert list(tmp_path.glob(".*.partial")) == []
+
+
+def _dead_pid() -> int:
+    pid = 2 ** 22 - 7
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return pid
+        except OSError:
+            pass
+        pid -= 1
+
+
+def _partial(root: Path, name: str, age_s: float, now: float) -> Path:
+    d = root / name
+    (d / "sub").mkdir(parents=True)
+    (d / "sub" / "state.db").write_bytes(b"x" * 64)
+    for p in (d / "sub" / "state.db", d / "sub", d):
+        os.utime(p, (now - age_s, now - age_s))
+    return d
+
+
+def test_stale_partial_from_killed_run_is_swept(tmp_path) -> None:
+    """t_8ca3f9a1: a SIGKILLed quick snapshot left .<id>.<pid>.partial dirs (14.6 GiB) that nothing removed."""
+    import time as _time
+
+    root = tmp_path / "state-snapshots"
+    root.mkdir()
+    now = _time.time()
+    dead = _dead_pid()
+    stale = _partial(root, f".20261019-102503-fleetbk.{dead}.partial", 13 * 3600, now)
+    young = _partial(root, f".20261110-100000-fleetbk.{dead}.partial", 2 * 3600, now)
+    live = _partial(root, f".20261019-102503-live.{os.getpid()}.partial", 48 * 3600, now)
+    deep_fresh = _partial(root, f".20261019-000000-deep.{dead}.partial", 48 * 3600, now)
+    os.utime(deep_fresh / "sub" / "state.db", (now, now))  # a write deep inside keeps it
+    published = _partial(root, "20261019-102503-fleetbk", 48 * 3600, now)  # never a partial
+    other = _partial(root, ".DS_Store.partial-ish", 48 * 3600, now)
+
+    assert _sweep_stale_partials(root, now=now) == 1
+    assert not stale.exists()
+    assert young.exists() and live.exists() and deep_fresh.exists()
+    assert published.exists() and other.exists()
+
+
+def test_quick_snapshot_sweeps_stale_partials(tmp_path, monkeypatch) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_bytes(b"model: {}\n")
+    import time as _time
+
+    root = home / "state-snapshots"
+    root.mkdir()
+    stale = _partial(root, f".20261009-000000-x.{_dead_pid()}.partial", 13 * 3600, _time.time())
+    assert create_quick_snapshot(hermes_home=home) is not None
+    assert not stale.exists()
