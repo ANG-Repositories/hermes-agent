@@ -382,23 +382,57 @@ def _write_gated(path: Path, rows: List[Dict[str, Any]]) -> None:
                       tmp_prefix=".script_runner_gated_", mode=0o600)
 
 
+GATED_SPILL_NAME = "script_runner_gated_refire.spill.json"
+
+
+def _merge_rows(current: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged = {(r.get("home"), r.get("job_id")): r for r in current}
+    for row in rows:
+        merged[(row.get("home"), row.get("job_id"))] = row
+    return list(merged.values())
+
+
+def _fold_gated_spill(path: Path) -> List[Dict[str, Any]]:
+    """Merge spill files into ``path``; caller holds ``_file_lock(path)``. Spills are removed only
+    after the merged file is written, so a failed write keeps them for the next pass."""
+    spills = sorted(path.parent.glob(GATED_SPILL_NAME + ".*"))
+    rows = _read_gated(path)
+    if not spills:
+        return rows
+    for spill in spills:
+        with contextlib.suppress(ValueError, OSError):
+            rows = _merge_rows(rows, _read_gated(spill))
+    _write_gated(path, rows)
+    for spill in spills:
+        with contextlib.suppress(FileNotFoundError):
+            spill.unlink()
+    return rows
+
+
 def record_gated_refires(rows: List[Dict[str, Any]]) -> None:
-    """``[{home, job_id, start, members: [[pid, create_time]...], until}]`` for runs the bounded
-    skew drain cut but whose tree outlived SIGKILL (t_fa0b5cff). Their re-fire used to be dropped
-    for good; now ``apply_gated_refires`` re-fires each once its members are gone or ``until``
-    (the run's start plus its own script timeout) has passed. Never raises."""
+    """``[{home, job_id, start, members, unsure, unproven, until, unsure_until}]`` for runs the
+    bounded skew drain cut but whose tree outlived SIGKILL (t_fa0b5cff). Their re-fire used to be
+    dropped for good; now ``apply_gated_refires`` re-fires each once its tree is gone or its
+    bounds pass. Written only under the lock; on a lock timeout the rows go to a spill file of
+    their own (atomic rename), folded in by the next locked pass (Prism 24de0198b435). Never
+    raises."""
     if not rows:
         return
     try:
         path = _gated_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with _file_lock(path) as locked:
-            if not locked:
-                logger.error("script runner: gated re-fire lock timed out; writing anyway")
-            current = {(r.get("home"), r.get("job_id")): r for r in _read_gated(path)}
-            for row in rows:
-                current[(row["home"], row["job_id"])] = row
-            _write_gated(path, list(current.values()))
+            if locked:
+                _write_gated(path, _merge_rows(_fold_gated_spill(path), rows))
+            else:
+                from utils import atomic_write_text
+
+                spill = path.with_name(f"{GATED_SPILL_NAME}.{os.getpid()}."
+                                       f"{threading.get_ident()}.{time.time_ns()}")
+                atomic_write_text(spill, json.dumps(rows, sort_keys=True) + "\n",
+                                  tmp_prefix=".script_runner_gated_spill_", mode=0o600)
+                logger.error("script runner: gated re-fire lock timed out; %d row(s) spilled",
+                             len(rows))
         logger.warning("script runner: %d re-fire(s) deferred until the surviving tree is gone: "
                        "%s", len(rows), ", ".join(sorted(r["job_id"] for r in rows)))
     except Exception:
@@ -428,7 +462,7 @@ def apply_gated_refires(now: Optional[float] = None) -> int:
     Cheap (one small file, a pid probe per member): safe on every runner cycle. Returns
     re-queued. Never raises."""
     path = _gated_path()
-    if not path.exists():
+    if not path.exists() and not any(path.parent.glob(GATED_SPILL_NAME + ".*")):
         return 0
     now = time.time() if now is None else now
     done = 0
@@ -440,11 +474,12 @@ def apply_gated_refires(now: Optional[float] = None) -> int:
             if not locked:
                 return 0
             keep = []
-            for row in _read_gated(path):
+            for row in _fold_gated_spill(path):
                 job_id = str(row["job_id"])
                 alive = (_members_alive(row.get("members")) and now < float(row.get("until") or 0)
                          ) or (_members_alive(row.get("unsure"))
-                               and now < float(row.get("unsure_until") or 0))
+                               and now < float(row.get("unsure_until") or 0)
+                         ) or (row.get("unproven") and now < float(row.get("until") or 0))
                 if alive:
                     keep.append(row)
                     continue

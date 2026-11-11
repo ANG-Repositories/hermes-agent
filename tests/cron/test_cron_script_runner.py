@@ -2681,3 +2681,72 @@ def test_t_fa0b_gated_refire_bounds_unsure_and_real_members(root):
     finally:
         sib.kill()
         sib.wait(timeout=10)
+
+
+def test_t_fa0b_unproven_survivor_holds_the_refire_to_the_deadline(root, monkeypatch):
+    """Prism 28e1906cda71 / 68af07493f6b: a survivor known only through a failed scan
+    (``_UnprovenMember``) produced an empty gate that read as "gone" and re-fired at once, beside a
+    copy that could not be ruled out. It now records ``unproven`` and holds until ``until``."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+    from cron import script_runner_rearm as rearm
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    job = _daily_job_run_now(root, "unproven", "u.sh")
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        key = sched._inflight_key(job["id"], root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_spent_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        monkeypatch.setattr(ss, "_script_run_token_members", lambda _p: [ss._UnprovenMember()])
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert sched._refire_withheld_job_ids == {key}
+        rows = rearm._read_gated(rearm._gated_path())
+        assert [r["job_id"] for r in rows] == [job["id"]] and rows[0]["unproven"] is True
+        until = float(rows[0]["until"])
+        assert rearm.apply_gated_refires(now=until - 1) == 0
+        assert not _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+        assert rearm.apply_gated_refires(now=until + 1) == 1
+        assert _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+    finally:
+        sched.clear_shutdown()
+        leader.wait(timeout=10)
+
+
+def test_t_fa0b_gated_record_never_writes_unlocked(root, monkeypatch):
+    """Prism 24de0198b435: on a lock timeout the record did an unlocked read-modify-write, which a
+    concurrent apply could overwrite or unlink, losing the row. It now spills to its own file and
+    the next locked pass folds it in."""
+    import contextlib as _cl
+    from cron import script_runner_rearm as rearm
+
+    a = _daily_job_run_now(root, "rowa", "a.sh")
+    b = _daily_job_run_now(root, "rowb", "b.sh")
+    now = time.time()
+    row = lambda j: {"home": str(root), "job_id": j["id"], "start": now, "members": [],  # noqa: E731
+                     "unsure": [], "unproven": True, "until": now + 3600,
+                     "unsure_until": now + 600}
+    rearm.record_gated_refires([row(a)])
+    real_lock = rearm._file_lock
+
+    @_cl.contextmanager
+    def timed_out(_path, timeout=5.0):
+        yield False
+
+    monkeypatch.setattr(rearm, "_file_lock", timed_out)
+    rearm.record_gated_refires([row(b)])
+    assert [r["job_id"] for r in rearm._read_gated(rearm._gated_path())] == [a["id"]]
+    monkeypatch.setattr(rearm, "_file_lock", real_lock)
+    assert rearm.apply_gated_refires(now=now) == 0  # both held; the spill is folded in
+    ids = sorted(r["job_id"] for r in rearm._read_gated(rearm._gated_path()))
+    assert ids == sorted([a["id"], b["id"]])
+    assert not list(rearm._gated_path().parent.glob(rearm.GATED_SPILL_NAME + ".*"))

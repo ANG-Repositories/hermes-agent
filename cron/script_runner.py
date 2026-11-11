@@ -868,12 +868,16 @@ class ScriptRunner:
         an unreadable environ that MAY be ours (on macOS every launchd job has ppid 1, so a long
         run collects unrelated ones; the likely source of 02:55's "12 survived"). They hold the
         re-fire only for ``RUNNER_GATED_UNSURE_S``; a real member holds it to the run's deadline.
-        A failed scan (``_UnprovenMember``) adds nothing: the deadline still bounds the wait."""
+        ``unproven``: a failed scan, or nothing re-identifiable in a tree that was alive; the
+        re-fire then waits for the run's deadline (``until``), never less."""
         import psutil
         from cron import scheduler_script as ss
 
-        out: Dict[str, list] = {"members": [], "unsure": []}
+        out: Dict[str, Any] = {"members": [], "unsure": [], "unproven": False}
         for member in snap or []:
+            if isinstance(member, ss._UnprovenMember):
+                out["unproven"] = True  # a failed scan: an escapee cannot be ruled out
+                continue
             unsure = isinstance(member, ss._UnreadableMember)
             target = getattr(member, "_process", member)
             try:
@@ -883,11 +887,18 @@ class ScriptRunner:
                 out["unsure" if unsure else "members"].append(
                     [int(member.pid), float(target.create_time())])
             except Exception:
+                out["unproven"] = True  # alive at the check, unidentifiable now
                 continue
         if snap is None:
-            with contextlib.suppress(Exception):
+            try:
                 out["members"].append([int(proc.pid),
                                        float(psutil.Process(proc.pid).create_time())])
+            except Exception:
+                out["unproven"] = True
+        if not out["members"] and not out["unsure"]:
+            # The tree was alive at the final check but nothing in it can be re-identified: never
+            # read that as gone (Prism 28e1906cda71, 68af07493f6b). Hold to the run's deadline.
+            out["unproven"] = True
         return out
 
     @staticmethod
