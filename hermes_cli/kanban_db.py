@@ -1234,7 +1234,11 @@ def kanban_home() -> Path:
         if kanban_sandbox_enabled():
             root = _sandbox_kanban_home(root)
         else:
-            _refuse_nested_non_profile_home(root)
+            # Once per dispatcher tick per (root, HERMES_HOME) (t_97a78e19): a realpath + live-root walk on every
+            # kanban_home() call was the largest leaf of the measured tick. A refusal is never cached.
+            from hermes_cli.kanban_tick_steps import tick_memo
+            tick_memo(("refuse_nested_home", str(root), os.environ.get("HERMES_HOME", "")),
+                      lambda: _refuse_nested_non_profile_home(root) or True)
     _refuse_live_kanban_root_in_isolation(root, "kanban_home()")
     return root
 

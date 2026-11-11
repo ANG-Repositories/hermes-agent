@@ -102,11 +102,6 @@
    "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
    "where": "hermes_cli/kanban.py:320 kanban_command"
   },
-  "hermes_cli/kanban_after_merge.py::_state::fold::repo::key = (id(query_fn), ref.repo.lower(), ref.number)": {
-   "verdict": "kept",
-   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
-   "where": "hermes_cli/kanban_after_merge.py:90 _state"
-  },
   "hermes_cli/kanban_db.py::_PrStateResolver.resolve::fold::repo::key = (repo.lower(), int(number))": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",

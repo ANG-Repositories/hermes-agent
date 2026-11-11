@@ -328,6 +328,10 @@ class DispatchResult:
     clone_ms: float = 0.0
     """Wall ms the tick itself spent on pool-host worktree clones (push + clone, or the prefetch check of a
     gateway tick that runs them in the background; t_915b8d2d, gate-ticks.jsonl)."""
+    steps_ms: dict = field(default_factory=dict)
+    """Wall ms per tick step (t_97a78e19, gate-ticks.jsonl ``steps_ms``). A key with no ``/`` is a
+    :class:`TickLockWindow` phase or a step outside the lock; together they partition the board tick. A
+    ``<phase>/<step>`` key is a sub-step inside that phase (every step that can spawn or walk the filesystem)."""
     portable_waiting: int = 0
     """Rows routed ``portable`` still in ``placement_waits`` at the end of the
     ready section (the I-0 query's input, spec v0.3 §3.6)."""
@@ -721,6 +725,63 @@ def _orphan_sweep_due(board: Optional[str], *, now: Optional[float] = None) -> b
             return False
         _ORPHAN_SWEEP_LAST[key] = t
         return True
+
+
+# Off the tick (t_97a78e19): py-spy 2026-11-10 put the sweep (a full process walk + realpath per orphan) in 7 of
+# 40 tick samples. A gateway tick (``defer_maintenance``) runs it on this pool on its own connection, at the same
+# cadence, and books what the last finished run reaped; at most one run per (home, board) at a time. A DAEMON thread
+# per run, never an executor: interpreter exit joins executor workers, and the sweep's cwd probe has no total
+# bound, so a running sweep would hold a gateway's SIGTERM exit until the SIGKILL.
+_ORPHAN_SWEEP_JOBS: dict = {}
+
+
+def _orphan_sweep_job(board: Optional[str]) -> dict:
+    conn = _kb.connect(board=board)
+    try:
+        return _kb.sweep_terminal_workspace_orphans(conn, board=board)
+    finally:
+        conn.close()
+
+
+def _orphan_sweep_off_tick(board: Optional[str]) -> dict:
+    """What a finished background sweep reaped (once), and a new run started when the cadence is due and none
+    runs. A sweep that raised is logged here, never raised into the tick."""
+    try:
+        key = (str(_kb.kanban_home()), board)
+    except Exception:
+        key = (None, board)
+    reaped: dict = {}
+    with _ORPHAN_SWEEP_LOCK:
+        fut = _ORPHAN_SWEEP_JOBS.get(key)
+        if fut is not None and fut.done():
+            del _ORPHAN_SWEEP_JOBS[key]
+            try:
+                reaped = fut.result() or {}
+            except Exception as exc:
+                _kb._log.warning("kanban orphan sweep failed: %s", exc)
+            fut = None
+        if fut is not None:
+            return reaped
+    if not _orphan_sweep_due(board):
+        return reaped
+    with _ORPHAN_SWEEP_LOCK:
+        if key in _ORPHAN_SWEEP_JOBS:
+            return reaped
+        # The tick thread's context rides along (Prism 9bb17d5fb49b): a ContextVar home override is the board
+        # this tick runs for; a bare thread would see the process default home.
+        import contextvars
+        from concurrent.futures import Future
+        fut = _ORPHAN_SWEEP_JOBS[key] = Future()
+        ctx = contextvars.copy_context()
+
+        def _run(fut=fut, ctx=ctx):
+            try:
+                fut.set_result(ctx.run(_orphan_sweep_job, board))
+            except BaseException as exc:
+                fut.set_exception(exc)
+
+        threading.Thread(target=_run, name="kanban-orphan-sweep", daemon=True).start()
+    return reaped
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -4193,7 +4254,18 @@ def _release_after_merge_edges(conn: sqlite3.Connection) -> None:
                          "continuing this tick", type(exc).__name__, exc)
 
 
-def dispatch_once(
+def dispatch_once(conn: sqlite3.Connection, **kwargs) -> DispatchResult:
+    """One dispatcher tick (:func:`_dispatch_once_steps`) inside a tick step scope (t_97a78e19): the result's
+    ``steps_ms`` is where this board's tick wall went, and an enclosing gateway tick scope receives the same steps."""
+    from hermes_cli import kanban_tick_steps as _kts
+    with _kts.scope() as steps:
+        result = _dispatch_once_steps(conn, **kwargs)
+    if result is not None:
+        result.steps_ms = {k: round(v, 3) for k, v in sorted(steps.items())}
+    return result
+
+
+def _dispatch_once_steps(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
@@ -4215,6 +4287,7 @@ def dispatch_once(
     max_new: Optional[int] = None,
     entry: str = "gateway",
     defer_pool_clone: bool = False,
+    defer_maintenance: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -4231,11 +4304,15 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    from hermes_cli import kanban_tick_steps as _kts
     _prefetch_t0 = time.monotonic()
-    pr_gate_prefetch = _kb._prefetch_pr_gates_for_tick(conn, dry_run=dry_run)
+    with _kts.step("pr_gate_prefetch"):
+        pr_gate_prefetch = _kb._prefetch_pr_gates_for_tick(conn, dry_run=dry_run)
     if not dry_run:
-        _release_after_merge_edges(conn)
+        with _kts.step("after_merge_release"):
+            _release_after_merge_edges(conn)
     _prefetch_s = time.monotonic() - _prefetch_t0
+    _lock_t0 = time.monotonic()
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
@@ -4263,10 +4340,12 @@ def dispatch_once(
             spillover=spillover,
             max_new=max_new,
             entry=entry,
+            defer_maintenance=defer_maintenance,
         )
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
+        _kts.add("lock", (time.monotonic() - _lock_t0) * 1000.0)
         if not held:
             result = DispatchResult(
                 skipped_locked=True, lock_holder=_kb._read_dispatch_lock_holder(db_path),
@@ -4298,6 +4377,7 @@ def dispatch_once(
                 entry=entry,
                 lock_window=window,
                 defer_pool_clone=defer_pool_clone,
+                defer_maintenance=defer_maintenance,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -4306,16 +4386,21 @@ def dispatch_once(
             _kbc._maybe_checkpoint_wal(conn, db_path)
             window.mark("checkpoint")
             _note_tick_lock(result, window, board=board, entry=entry)
+            for _phase, _s in window.phases.items():
+                if _phase != "pr_gate_prefetch.unlocked":   # booked above as pr_gate_prefetch + after_merge_release
+                    _kts.add(_phase, _s * 1000.0)
     # Outside the dispatch lock: stop resources (VM/container/unit) whose card finished
     # (t_2df204e5). Only the tick that held the lock sweeps; release_finished claims each resource in a
     # write txn before stopping it, so an overlapping sweep never stops the same one twice.
     if held and not dry_run:
-        _release_finished_resources(conn, board)
+        with _kts.step("release_resources"):
+            _release_finished_resources(conn, board)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
-    _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    with _kts.step("tick_hook"):
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
 
@@ -6378,6 +6463,7 @@ def _dispatch_once_locked(
     admit_floor=None,
     lock_window=None,
     defer_pool_clone: bool = False,
+    defer_maintenance: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -6423,16 +6509,22 @@ def _dispatch_once_locked(
     so a gate added to this loop later binds admit too. The review lane and the
     post-loop wait bookkeeping are skipped.
 
+    ``defer_maintenance`` (the long-lived gateway tick, t_97a78e19): the terminal-workspace orphan sweep runs on
+    a background thread at its cadence instead of inline; the tick books what the last finished sweep reaped.
+
     ``lock_window`` (:class:`TickLockWindow`, t_f60f502f): the tick hands the board lock back between a
     claim and the next decision (workspace resolve + spawn of that claimed run) and marks each phase.
     None = a window that releases nothing (timing only).
     """
     _lw = lock_window if lock_window is not None else _kbc.TickLockWindow(None, enabled=False)
     _admit = only_task is not None
+    from hermes_cli import kanban_tick_steps as _kts
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
-    exited_workers = [] if _admit else reap_worker_zombies()
-    result_reaped_terminal = [] if _admit else reap_terminal_workers(conn)
+    with _kts.step("reap/zombies"):
+        exited_workers = [] if _admit else reap_worker_zombies()
+    with _kts.step("reap/terminal_workers"):
+        result_reaped_terminal = [] if _admit else reap_terminal_workers(conn)
 
     result = DispatchResult()
     # Workers that outlived their closed run are terminated (upstream
@@ -6441,10 +6533,15 @@ def _dispatch_once_locked(
     if not dry_run and not _admit:
         # A worker that exited (cleanly or not) leaves its servers behind; reap them now, and sweep
         # init-parented strays in terminal cards' workspaces no retained handle can reach (fork t_446b6b99).
-        result.worker_leftovers_reaped = _kb.reap_exited_worker_leftovers(conn, exited_workers)
-        if _orphan_sweep_due(board):
+        with _kts.step("reap/worker_leftovers"):
+            result.worker_leftovers_reaped = _kb.reap_exited_worker_leftovers(conn, exited_workers)
+        if defer_maintenance:
+            with _kts.step("reap/orphan_sweep"):
+                result.orphans_reaped = _orphan_sweep_off_tick(board)
+        elif _orphan_sweep_due(board):
             try:
-                result.orphans_reaped = _kb.sweep_terminal_workspace_orphans(conn, board=board)
+                with _kts.step("reap/orphan_sweep"):
+                    result.orphans_reaped = _kb.sweep_terminal_workspace_orphans(conn, board=board)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban orphan sweep failed: %s", exc)
     _lw.mark("reap")
@@ -6508,7 +6605,8 @@ def _dispatch_once_locked(
                 )
             if not dry_run:
                 _kb._workspace_startup_scanned.add(startup_key)
-        result.crashed = detect_crashed_workers(conn, board=board)
+        with _kts.step("reclaim_promote/crashed"):
+            result.crashed = detect_crashed_workers(conn, board=board)
         if reconcile_orphans:
             # Orphaned-card reconciliation: requeue 'running' cards whose claim
             # bookkeeping is broken (no valid claim, dead/gone worker) that the
@@ -6561,22 +6659,25 @@ def _dispatch_once_locked(
         _crash_cohort = getattr(detect_crashed_workers, "_last_cohort_deaths", [])
         if _crash_cohort:
             result.cohort_deaths.extend(_crash_cohort)
-        result.timed_out = enforce_max_runtime(conn)
+        with _kts.step("reclaim_promote/max_runtime"):
+            result.timed_out = enforce_max_runtime(conn)
         if not dry_run:
             # A live worker whose tree outgrew the per-run cap (t_368e9873): the
             # reapers above only act once a worker is gone.
             try:
                 from hermes_cli.kanban_proc_bounds import enforce_worker_process_cap
-                result.process_capped = enforce_worker_process_cap(conn)
+                with _kts.step("reclaim_promote/process_cap"):
+                    result.process_capped = enforce_worker_process_cap(conn)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban process cap check failed: %s", exc)
         # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
         # gate is already satisfied becomes spawnable in the SAME tick rather
         # than waiting for the next one. Bounded + cached + fail-safe: see
         # hermes_cli.kanban_pr_gate for why every uncertain path is a no-op.
-        _kb._reevaluate_pr_gates_for_tick(
-            conn, result, dry_run=dry_run, prefetched=pr_gate_prefetch,
-        )
+        with _kts.step("reclaim_promote/pr_gate_reevaluate"):
+            _kb._reevaluate_pr_gates_for_tick(
+                conn, result, dry_run=dry_run, prefetched=pr_gate_prefetch,
+            )
         # Timed wakes BEFORE recompute_ready so a woken card whose parents are
         # done is spawnable this tick. Skipped under dry_run (the SAFE probe).
         if not dry_run:
@@ -6834,7 +6935,8 @@ def _dispatch_once_locked(
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
         _binds = _workspace_binds(conn, ready_rows, dry_run=dry_run)  # spec §2.4, per tick
-        _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
+        with _kts.step("route/capabilities"):
+            _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         spillover.continuation_dry_run = dry_run
         _carry_budget = _kb._kwh.CarryScanBudget()
         _route_t0 = time.monotonic()
@@ -6850,6 +6952,7 @@ def _dispatch_once_locked(
                                          carry_budget=_carry_budget)
                      for r in ready_rows}
         result.route_ms += (time.monotonic() - _route_t0) * 1000.0
+        _kts.add("route/route_rows", (time.monotonic() - _route_t0) * 1000.0)
         result.carry_scan_ms += _carry_budget.spent_s * 1000.0
         result.carry_scans_deferred += _carry_budget.deferred
         _caps_into_result(result, _caps, _caps_out)
@@ -7821,10 +7924,11 @@ def _dispatch_once_locked(
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
         guard_detail: dict = {}
-        guard_reason = check_respawn_guard(
-            conn, row["id"], pr_state_resolver=pr_state_resolver,
-            detail=guard_detail,
-        )
+        with _kts.step("decide/respawn_guard"):
+            guard_reason = check_respawn_guard(
+                conn, row["id"], pr_state_resolver=pr_state_resolver,
+                detail=guard_detail,
+            )
         stale_owners = guard_detail.pop("pr_owner_stale", None)
         if guard_reason is None and stale_owners:
             guard_reason = _kb._reassign_stale_pr_owners(
@@ -8001,6 +8105,7 @@ def _dispatch_once_locked(
             _ready = (_kwt.clone_ready(_ckey, _cjob, _clock) if defer_pool_clone
                       else not _kwt.clone_busy(_ckey, _clock))
             result.clone_ms += (time.monotonic() - _ct0) * 1000.0
+            _kts.add("decide/clone_check", (time.monotonic() - _ct0) * 1000.0)
             if not _ready:
                 spillover.release(placed_host, _rid)
                 result.placement_waits[row["id"]] = f"{_kwt.CLONE_PENDING}:{placed_host.name}"
