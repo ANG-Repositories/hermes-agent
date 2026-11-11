@@ -4241,13 +4241,32 @@ def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -
     return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
 
 
+def fleet_admission_active() -> bool:
+    """True when ``kanban.admission`` is ``utilization``: the fleet admission path
+    (``admission.admit_class("kanban")`` through the load gate / allocd) decides
+    how many workers start, so the two upstream small-VM memory guards below
+    (the derived ``max_in_progress`` default and ``_memory_pressure_level``)
+    stand down (t_2158f095, Apollo ruling t_2158f095-round4-integration 2; Ace
+    msg 1569308234441949345: "only fwa is the guard/gate"). Absent, unreadable
+    or any other value = False: upstream behaviour unchanged.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        kanban_cfg = (load_config_readonly() or {}).get("kanban") or {}
+    except Exception:
+        return False
+    return isinstance(kanban_cfg, Mapping) and kanban_cfg.get("admission") == "utilization"
+
+
 def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     """Effective global concurrency cap: explicit config wins, else the
-    memory-derived default. All config-parsing callers route through this so
-    both paths agree.
+    memory-derived default (none under fleet admission). All config-parsing
+    callers route through this so both paths agree.
     """
     if configured is not None:
         return configured
+    if fleet_admission_active():
+        return None
     return derive_default_max_in_progress()
 
 
@@ -4312,8 +4331,11 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     Reuses :func:`gateway.memory_status.classify_pressure` so "critical" matches
     the dashboard banner and lifecycle-ledger OOM heuristics. ``unknown``
     (non-Linux, read failure) imposes no restriction — never brick dispatch
-    where /proc is unavailable.
+    where /proc is unavailable. Also ``unknown`` under fleet admission
+    (:func:`fleet_admission_active`): FWA prices memory, this guard does not.
     """
+    if fleet_admission_active():
+        return "unknown"
     if sample is None:
         sample = _system_memory_sample()
     if not sample:
