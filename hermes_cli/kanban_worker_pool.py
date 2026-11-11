@@ -1489,11 +1489,6 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
 
 # -- probe + plan -----------------------------------------------------------
 
-def host_threshold(ncpu: int, capacity_pct: float) -> float:
-    """Remote load1 bar: ONE encoding (I-7)."""
-    return capacity_pct * ncpu
-
-
 def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if host.ssh_port != 22:
@@ -2378,8 +2373,9 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
          signal: Optional[TargetSignal] = None,
          workspace_paths: Optional[Mapping[str, Sequence[str]]] = None) -> SpilloverPlan:
     """ONE plan per gateway tick. A host takes work only when it is active,
-    enabled, under its slots and probed under ``capacity_pct x ncpu`` (I-3).
-    A host with no free slot or not active is not probed.
+    enabled, under its slots and reachable by the probe (I-3). There is no
+    private load bar (t_2158f095): FWA admits each take. A host with no free
+    slot or not active is not probed.
 
     With ``signal`` the load bar is the host's published pressure band
     instead (admit_class's verdict, t_5d7e7171): a host is refused when its
@@ -2440,8 +2436,8 @@ def _plan_v01(hosts, running_by_host, *, probe, disabled, planned_at, config,
                 load1, ncpu, boards = sample.load1, sample.ncpu, sample.boards
             else:
                 load1, ncpu = sample
-            if load1 >= host_threshold(ncpu, h.capacity_pct):
-                free = 0
+            # No private load bar (t_2158f095, Ace msg 1569529863298359387): FWA is the ONE guard. load1/ncpu are
+            # reported in the plan detail only; a reachable host is admitted per take by may_start/allocd.
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": running, "load1": load1, "ncpu": ncpu,

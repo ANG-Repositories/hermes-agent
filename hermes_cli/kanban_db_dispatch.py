@@ -4249,13 +4249,17 @@ def fleet_admission_active() -> bool:
     stand down (t_2158f095, Apollo ruling t_2158f095-round4-integration 2; Ace
     msg 1569308234441949345: "only fwa is the guard/gate"). Absent, unreadable
     or any other value = False: upstream behaviour unchanged.
+
+    ONE reader (Apollo ruling t_2158f095-round5-integration item 11): the same
+    ``placement.admission_mode()`` (fleet-root config.yaml) that decides whether
+    the load gate / unified admission runs, so the guards never stand down
+    while the fleet path is off, or the reverse.
     """
     try:
-        from hermes_cli.config import load_config_readonly
-        kanban_cfg = (load_config_readonly() or {}).get("kanban") or {}
+        from hermes_cli.fleet_placement import placement as _placement
+        return _placement.admission_mode() == "utilization"
     except Exception:
         return False
-    return isinstance(kanban_cfg, Mapping) and kanban_cfg.get("admission") == "utilization"
 
 
 def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:

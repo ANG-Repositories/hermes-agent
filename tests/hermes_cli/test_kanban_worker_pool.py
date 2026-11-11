@@ -516,12 +516,15 @@ def test_probe_reports_online_cores_not_cgroup_quota():
     assert p.budget == 3  # the quota'd ncpu=8 put the line at 6.4 and refused this host
 
 
-def test_plan_threshold_is_capacity_times_ncpu():
-    assert kwp.host_threshold(16, 0.8) == pytest.approx(12.8)
+def test_plan_has_no_private_load_bar():
+    """t_2158f095 (Ace msg 1569529863298359387; Apollo ruling t_2158f095-round5-integration item 10): the
+    v0.1 `load1 >= capacity_pct x ncpu` bar is gone; FWA admits each take. An unreachable host still takes nothing."""
+    assert not hasattr(kwp, "host_threshold")
     cold = kwp.plan([_host(slots=4)], {"ace-ai": 1}, probe=lambda h: (12.7, 16))
-    hot = kwp.plan([_host(slots=4)], {"ace-ai": 1}, probe=lambda h: (12.8, 16))
+    hot = kwp.plan([_host(slots=4)], {"ace-ai": 1}, probe=lambda h: (500.0, 16))
     down = kwp.plan([_host(slots=4)], {}, probe=lambda h: None)
-    assert (cold.budget, hot.budget, down.budget) == (3, 0, 0)
+    assert (cold.budget, hot.budget, down.budget) == (3, 3, 0)
+    assert hot.detail["ace-ai"]["load1"] == 500.0          # still reported, never a refusal
     assert down.detail["ace-ai"]["reachable"] is False
 
 

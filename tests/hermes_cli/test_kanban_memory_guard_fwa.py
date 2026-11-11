@@ -22,12 +22,20 @@ GIB = 1024 * 1024  # KiB per GiB
 LOW = {"mem_available_kib": 32 * 1024, "mem_total_kib": 1 * GIB}
 
 
-def _home(tmp_path, monkeypatch, admission):
+def _home(tmp_path, monkeypatch, admission, profile_admission=None):
+    """``admission`` goes in the FLEET-ROOT config.yaml (PLACEMENT_HOME, what placement.admission_mode reads);
+    ``profile_admission`` (default: the same) in the profile's HERMES_HOME config.yaml."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    root = tmp_path / "fleet-root"
+    root.mkdir()
+    profile_admission = admission if profile_admission is None else profile_admission
     if admission is not None:
-        (home / "config.yaml").write_text(f"kanban:\n  admission: {admission}\n")
+        (root / "config.yaml").write_text(f"kanban:\n  admission: {admission}\n")
+    if profile_admission is not None:
+        (home / "config.yaml").write_text(f"kanban:\n  admission: {profile_admission}\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PLACEMENT_HOME", str(root))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: dict(LOW))
     kb.init_db()
@@ -78,3 +86,15 @@ def test_without_fleet_admission_upstream_guards_unchanged(
 def test_explicit_max_in_progress_still_wins_under_fleet_admission(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch, "utilization")
     assert kbd.resolve_max_in_progress(5) == 5
+
+
+@pytest.mark.real_memory_guard
+@pytest.mark.parametrize("fleet,profile", [("legacy", "utilization"), ("utilization", "legacy")])
+def test_one_reader_the_fleet_root_mode_decides(tmp_path, monkeypatch, fleet, profile):
+    """Round 6 item 11: fleet_admission_active() answers exactly what placement.admission_mode() answers (the
+    fleet-root config.yaml that turns the fleet admission path on), whatever the profile config says."""
+    from hermes_cli.fleet_placement import placement
+
+    _home(tmp_path, monkeypatch, fleet, profile_admission=profile)
+    assert placement.admission_mode() == fleet
+    assert kbd.fleet_admission_active() is (fleet == "utilization")
