@@ -52,9 +52,6 @@ _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple, Opt
 
 logger = logging.getLogger(__name__)
 
-# Every writer ever built (weakly), so ``stop_runtime_status_writers`` reaches test-built ones too.
-_RUNTIME_STATUS_WRITERS: "weakref.WeakSet[_RuntimeStatusWriter]" = weakref.WeakSet()
-
 
 class _RuntimeStatusWriter:
     """Persist the latest complete status snapshot on one daemon thread.
@@ -76,17 +73,21 @@ class _RuntimeStatusWriter:
         self._failure_logged = False
         self._thread: Optional[threading.Thread] = None
         self._stopping = False
-        _RUNTIME_STATUS_WRITERS.add(self)
 
     def submit(self, path: Path, payload: dict[str, Any]) -> int:
         with self._condition:
             self._submitted_generation += 1
             generation = self._submitted_generation
             self._pending = (generation, path, copy.deepcopy(payload))
-            self._stopping = False
             if self._thread is None or not self._thread.is_alive():
+                # Reset only for a fresh thread: a submit racing stop() is still written by
+                # the stopping thread, which then exits instead of idling (t_3187cbec).
+                self._stopping = False
                 self._thread = threading.Thread(
                     target=self._run, daemon=True, name="gateway-runtime-status-writer")
+                # Found from the thread, not a module global: an importlib.reload(gateway.status)
+                # rebinds every global and would orphan a live writer (t_3187cbec).
+                self._thread.status_writer = self  # type: ignore[attr-defined]
                 self._thread.start()
             self._condition.notify_all()
             return generation
@@ -335,9 +336,15 @@ def stop_runtime_status_writers(timeout: float = 2.0) -> bool:
     the next one (t_3187cbec).
     """
     deadline = time.monotonic() + max(timeout, 0.0)
+    # Drain the ordered lane first: its queued write_runtime_status jobs submit to the writer
+    # and would start it again after it stopped.
+    with contextlib.suppress(Exception):
+        _RUNTIME_STATUS_LANE.submit(lambda: None).result(timeout=max(timeout, 0.0))
     stopped = True
-    for writer in list(_RUNTIME_STATUS_WRITERS):
-        stopped = writer.stop(timeout=max(deadline - time.monotonic(), 0.0)) and stopped
+    for thread in threading.enumerate():
+        writer = getattr(thread, "status_writer", None)
+        if writer is not None:
+            stopped = writer.stop(timeout=max(deadline - time.monotonic(), 0.0)) and stopped
     return stopped
 
 
