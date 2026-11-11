@@ -426,51 +426,51 @@ def _spawn_only_fleet(fleet, monkeypatch, hosts, tokened):
     return allocd
 
 
-def _queue_ok(blackholed=()):
+def _queue_ok(slow=(), delay=1.5):
     def answer(path, body):
-        if body.get("host") in blackholed:
-            time.sleep(3.0)                               # longer than any per-host limit
+        if body.get("host") in slow:
+            time.sleep(delay)                             # the local door's write outlasts the pass budget
         return 200, {"schema": 1, "workload": body.get("workload"), "host": body.get("host"), "ok": True}
     return answer
 
 
-def test_spawn_only_publish_one_blackholed_host_costs_only_itself(fleet, monkeypatch):
-    """Five hosts, the first (in publish order) blackholed: the other four are published, the fifth is named
-    unreachable, and the pass takes well under 1.5 s (each host has its own 1 s limit, run concurrently)."""
-    from hermes_cli import kanban_load_gate as klg
-    hosts = ["a-black", "h2", "h3", "h4", "h5"]
-    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
-    allocd.answer = _queue_ok(blackholed={"a-black"})
-    t0 = time.monotonic()
-    err = klg.publish_ready_demand(2)
-    took = time.monotonic() - t0
-    published = sorted(b["host"] for p, b in allocd.calls if p == "/demand/publish" and b["host"] != "a-black")
-    assert published == ["h2", "h3", "h4", "h5"], (published, err)
-    assert err and "a-black" in err and "unreachable" in err.lower(), err
-    assert all(h not in err for h in ("h2", "h3", "h4", "h5")), err
-    assert took < 1.5, took
-
-
-def test_spawn_only_publish_asks_a_tokenless_host_once_per_process(fleet, monkeypatch, caplog):
-    """A host refusing for the missing publisher token is dropped as a target for the process: later passes never
-    ask it, one log line names it, and a pass where every remaining host succeeded is a success."""
+def test_spawn_only_publish_tokenless_host_is_not_a_failure_and_is_asked_again_once_tokened(fleet, monkeypatch,
+                                                                                            caplog):
+    """A host with no local publisher token next to a tokened one: every pass returns None, one log line names it,
+    and it is still checked every pass, so a token written between pass 2 and pass 3 is published on pass 3 with
+    no restart and no reset of module state."""
     import logging
     from hermes_cli import kanban_load_gate as klg
     allocd = _spawn_only_fleet(fleet, monkeypatch, ["mbp-arm", "studio"], tokened=["studio"])
-    asked = []
-    real = alloc_client.publish_queue
-
-    def recording(workload, host, *a, **k):
-        asked.append(host)
-        return real(workload, host, *a, **k)
-    monkeypatch.setattr(alloc_client, "publish_queue", recording)
     allocd.answer = _queue_ok()
+    errs = []
     with caplog.at_level(logging.INFO, logger=klg.__name__):
-        errs = [klg.publish_ready_demand(1) for _ in range(3)]
+        for _ in range(3):
+            errs.append(klg.publish_ready_demand(1))
     assert errs == [None, None, None], errs
-    assert asked.count("mbp-arm") == 1 and asked.count("studio") == 3, asked
     named = [r for r in caplog.records if "mbp-arm" in r.getMessage()]
     assert len(named) == 1, [r.getMessage() for r in caplog.records]
+    # provision it now: token file + protected marker, as alloc_client._token requires
+    (fleet.root / alloc_client.TOKENS_REL / "kanban@mbp-arm").write_text("pair-token\n", encoding="utf-8")
+    marker = fleet.root / alloc_client.PROTECTED_REL / "kanban@mbp-arm"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    assert klg.publish_ready_demand(1) is None
+    published = [b["host"] for p, b in allocd.calls if p == "/demand/publish"]
+    assert published.count("mbp-arm") == 1 and published.count("studio") == 4, published
+
+
+def test_spawn_only_publish_slow_door_text_is_unchanged(fleet, monkeypatch):
+    """The first write outlasts the 1.0 s budget: the hosts after it read "skipped (publish budget 1.0 s spent)",
+    exactly as on main (the publish stays sequential on one shared budget)."""
+    from hermes_cli import kanban_load_gate as klg
+    hosts = ["a-slow", "h2", "h3"]
+    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
+    allocd.answer = _queue_ok(slow={"a-slow"})
+    err = klg.publish_ready_demand(2)
+    assert err and err.startswith("a-slow: Unreachable"), err
+    for h in ("h2", "h3"):
+        assert f"{h}: skipped (publish budget {klg.PUBLISH_BUDGET_S} s spent)" in err, err
 
 
 def test_spawn_only_publish_logs_no_failed_line_when_every_host_answers(fleet, monkeypatch, caplog):
