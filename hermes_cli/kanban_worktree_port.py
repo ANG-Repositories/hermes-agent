@@ -30,15 +30,25 @@ may hold a prior run's work).
 DERIVED mode (t_1d2c5939, default; ``KANBAN_MIRROR_DERIVED=0`` or a file
 ``"derived": false`` restores the hand list above): every GitHub repo a card
 anchors on ports to EVERY pool host; there is no per-repo allowlist. The
-file is only an override: schema 2 ``{"schema": 2, "exclude": [slug],
-"mirror_paths": {slug: path | {"*": path, host: path}}}`` (schema 1 rows are
-still read as mirror paths; their ``hosts`` are ignored). A repo with no
-mirror path uses ``~/.hermes/mirrors/<owner>/<repo>.git`` on the host; the
-clone is ``--reference-if-able``, so an absent mirror is a slower clone,
-never a refusal. A card branch with commits origin lacks is PUSHED at spawn
-(``--force-with-lease``) and then ported (:func:`push_card_branch`); only a
-card whose own Studio tree has uncommitted or untracked work stays local,
-named ``unpushed_dirty_tree``.
+file is only an override: schema 2 ``{"schema": 2, "pins": [{"repo": slug,
+"hosts": [host, ...], "why": "..."}], "mirror_paths": {slug: path | {"*":
+path, host: path}}}`` (schema 1 rows are still read as mirror paths; their
+``hosts`` are ignored). ``pins`` ships EMPTY (Ace 2026-11-10, t_20fa16c7): a
+row is an explicit operator choice of named hosts, never a default. The
+retired ``exclude`` list and a malformed row are ignored with one loud log
+line, never a silent Studio pin. A repo with no mirror path uses
+``~/.hermes/mirrors/<owner>/<repo>.git`` on the host; the clone is
+``--reference-if-able``, so an absent mirror is a slower clone, never a
+refusal. A card branch with commits origin lacks is PUSHED at spawn
+(``--force-with-lease``) and then ported (:func:`push_card_branch`). A card
+whose own Studio tree (``.worktrees/<id>``, a prior run's too, t_20fa16c7)
+is dirty ports as well: its changed files ride the clone's ssh call as a tar
+(t_894be273, :func:`carry_payload`); nothing uncommitted is pushed anywhere,
+and the Studio tree is left as it is. A tree off its branch whose HEAD
+contains the branch has that HEAD pushed as the card branch tip.
+The reasons a GitHub worktree card may still stay on the Studio are
+:data:`LOCAL_ONLY_REASONS`, each with its justification;
+``scripts/check_worktree_local_reasons.py`` fails CI on any other.
 """
 
 from __future__ import annotations
@@ -68,20 +78,50 @@ DERIVED_ENV = "KANBAN_MIRROR_DERIVED"
 DERIVED_MIRROR_ROOT = "~/.hermes/mirrors"
 PUSH_TIMEOUT_S = 120
 # Named local-only reasons (``why`` of :func:`assess`), the tail of not_portable:workspace_kind:<why>.
-WHY_DIRTY = "unpushed_dirty_tree"
-WHY_OFF_BRANCH = "own_tree_off_branch"
+WHY_DIRTY = "unpushed_dirty_tree"          # hand-list mode / carry kill switch only
+WHY_OFF_BRANCH = "own_tree_off_branch"     # hand-list mode / carry kill switch only
 WHY_CONCRETE = "concrete_target_path"
 WHY_NOT_REPO = "not_a_repo"
 WHY_NOT_GITHUB = "origin_not_github"
-WHY_EXCLUDED = "excluded"
+WHY_FOREIGN_ORIGIN = "origin_not_ours"
 WHY_NO_POOL = "no_pool_host"
-WHY_BAD_OVERRIDES = "overrides_file_malformed"
+WHY_PINNED = "operator_pin"
+WHY_DIVERGED = "diverged_from_origin"
+WHY_UNPUSHED = "unpushed_commits"          # hand-list mode only
+WHY_NOT_CHECKOUT = "own_tree_not_a_checkout"
+WHY_DERIVED_OFF = "derived_mode_off"
 # A dirty own tree is carried to the clone (t_894be273) except in these cases, where the card stays local:
 WHY_NESTED_REPO = "dirty_submodule_or_nested_repo"   # a modified submodule or an embedded repository
 WHY_CARRY_SIZE = "dirty_tree_over_cap"               # more than DIRTY_CARRY_MAX_BYTES of changed files
 WHY_BASE_MOVED = "origin_tip_not_studio_head"        # the clone would not start at the tree's HEAD
 WHY_SYMLINK_PARENT = "dirty_path_through_symlink"     # a changed path under a symlinked directory (Prism 9e03f1e94c2d)
 WHY_SPECIAL_FILE = "dirty_path_not_plain_file"        # a changed path that is not a regular file or a symlink
+# Every reason a GitHub worktree card may stay on the Studio, with why it must. The lint
+# (scripts/check_worktree_local_reasons.py) keeps its own copy of the keys: adding a reason
+# changes both, so it shows in review (t_20fa16c7, Ace 2026-11-10: "All machines can make any checkout always").
+LOCAL_ONLY_REASONS: Dict[str, str] = {
+    WHY_NO_POOL: "no pool host is configured or reachable this tick; the Studio is the only host left",
+    WHY_FOREIGN_ORIGIN: "the card branch needs a push and origin is an upstream we do not own (t_eac2768a): "
+                        "nothing can publish the Studio's commits, so it runs where the work is",
+    WHY_NOT_GITHUB: "origin is not a GitHub repo, so no pool host can clone it",
+    WHY_NOT_REPO: "the workspace path is not a git checkout (nothing to clone)",
+    WHY_DIVERGED: "origin's card branch has commits the Studio lacks; a push would drop them",
+    WHY_PINNED: "an operator pin row in fleet/kanban-worktree-mirrors.json names the hosts (explicit, nightly-listed)",
+    WHY_CONCRETE: "a path that is neither a repo root nor this card's own .worktrees/<id> (another card's tree, "
+                  "a sub-directory), or the host_preference kanban switch is off (Studio not last resort)",
+    WHY_NOT_CHECKOUT: "the card's .worktrees/<id> holds files but is not a git checkout: git cannot carry them",
+    WHY_OFF_BRANCH: "the Studio tree is off its branch and its HEAD does not contain the card branch's commits "
+                    "(putting the branch at it would drop them), or the carry kill switch / hand-list mode is on",
+    WHY_NESTED_REPO: "a modified submodule or an embedded repository: git status cannot see the work inside it",
+    WHY_CARRY_SIZE: "the changed files exceed the 25 MiB carry cap (the survivor-capture cap for the same content)",
+    WHY_BASE_MOVED: "origin's live card branch is not the tree's HEAD, so the carried changes have no base there",
+    WHY_SYMLINK_PARENT: "a changed path under a symlinked directory would read files from outside the tree",
+    WHY_SPECIAL_FILE: "a changed path is a FIFO, socket or device; tar cannot carry it faithfully",
+    WHY_DIRTY: "kill switch (KANBAN_DIRTY_CARRY=0 / dirty_carry: false, or hand-list mode), or git status of "
+               "the tree failed: uncommitted work in the Studio tree",
+    WHY_UNPUSHED: "hand-list mode only (derived: false): committed work origin lacks",
+    WHY_DERIVED_OFF: "hand-list mode (derived: false / KANBAN_MIRROR_DERIVED=0) and the repo has no row",
+}
 PORTED_EVENT = "worktree_ported"
 # portable() bind rule of a ported card: it runs where its clone is.
 PORT_BIND_RULE = "worktree_port"
@@ -159,55 +199,83 @@ def derived_enabled(fleet_dir: Path) -> bool:
     return not (isinstance(doc, dict) and doc.get("derived") is False)
 
 
-def read_overrides(fleet_dir: Path) -> Optional[Tuple[frozenset, Dict[str, Tuple[Optional[str], Dict[str, str]]]]]:
-    """Derived-mode overrides: ``(excluded slugs (lower), {slug (lower): (default mirror | None, {host: mirror})})``.
+_fault_logged: Dict[str, str] = {}
 
-    Absent file = no overrides. A file that exists but cannot be read, or a malformed schema 2 entry, is None
-    (fail closed: nothing ports, the same as a broken hand list). Schema 1 rows count as mirror paths only."""
+
+def _config_fault(fleet_dir: Path, what: str) -> None:
+    """One loud log line per distinct fault (t_20fa16c7): a bad override row is IGNORED, never a Studio pin."""
+    key = str(fleet_dir)
+    if _fault_logged.get(key + what) is None:
+        if len(_fault_logged) > 256:
+            _fault_logged.clear()
+        _fault_logged[key + what] = what
+        _log.error("kanban worktree port: fleet/%s config fault, IGNORED (no repo is pinned by it): %s",
+                   MIRRORS_FILE, what)
+
+
+def read_overrides(fleet_dir: Path) -> Tuple[Dict[str, Tuple[str, ...]], Dict[str, Tuple[Optional[str], Dict[str, str]]]]:
+    """Derived-mode overrides: ``({slug (lower): pinned hosts}, {slug (lower): (default mirror | None, {host: mirror})})``.
+
+    Absent file = no overrides. A file that cannot be read, the retired ``exclude`` list, schema-1 ``hosts``,
+    and any malformed row are config faults: logged once, loudly, and ignored, so the repo ports to every pool
+    host (Ace 2026-11-10, t_20fa16c7: "my default no pins"). Schema 1 rows count as mirror paths only."""
     doc = _read_doc(fleet_dir)
     if doc is None:
-        return frozenset(), {}
+        return {}, {}
     if doc is False:
-        return None
+        _config_fault(fleet_dir, "unreadable or not a JSON object")
+        return {}, {}
     if doc.get("schema") == 1:
-        return frozenset(), {s: (row[0], row[2]) for s, row in read_mirrors(fleet_dir).items()}
+        _config_fault(fleet_dir, "schema 1 per-repo `hosts` are retired (read as mirror paths only)")
+        return {}, {s: (row[0], row[2]) for s, row in read_mirrors(fleet_dir).items()}
     if doc.get("schema") != 2:
-        return None
-    exclude, paths = doc.get("exclude", []), doc.get("mirror_paths", {})
-    if not isinstance(exclude, list) or not all(isinstance(s, str) and "/" in s for s in exclude):
-        return None
-    if not isinstance(paths, dict):
-        return None
+        _config_fault(fleet_dir, f"schema {doc.get('schema')!r} (want 2)")
+        return {}, {}
+    if doc.get("exclude"):
+        _config_fault(fleet_dir, "`exclude` is retired; use a `pins` row naming hosts")
+    pins: Dict[str, Tuple[str, ...]] = {}
+    rows = doc.get("pins", [])
+    for row in rows if isinstance(rows, list) else [rows]:
+        ok = (isinstance(row, dict) and isinstance(row.get("repo"), str) and "/" in row["repo"]
+              and isinstance(row.get("hosts"), list) and row["hosts"]
+              and all(isinstance(h, str) and h.strip() for h in row["hosts"])
+              and isinstance(row.get("why"), str) and row["why"].strip())
+        if not ok:
+            _config_fault(fleet_dir, f"pin row without repo / non-empty hosts / why: {str(row)[:120]}")
+            continue
+        pins[row["repo"].lower()] = tuple(dict.fromkeys(h.strip().lower() for h in row["hosts"]))
+    paths = doc.get("mirror_paths", {})
     out: Dict[str, Tuple[Optional[str], Dict[str, str]]] = {}
-    for slug, val in paths.items():
-        if not isinstance(slug, str) or "/" not in slug:
-            return None
+    for slug, val in (paths.items() if isinstance(paths, dict) else ()):
         if isinstance(val, str):
             val = {"*": val}
-        if not isinstance(val, dict) or not val or not all(
+        if not (isinstance(slug, str) and "/" in slug and isinstance(val, dict) and val and all(
                 isinstance(h, str) and h and isinstance(p, str) and (p.startswith("/") or p.startswith("~/"))
-                for h, p in val.items()):
-            return None
+                for h, p in val.items())):
+            _config_fault(fleet_dir, f"mirror_paths row ignored: {str(slug)[:80]}")
+            continue
         out[slug.lower()] = (val.get("*"), {h.lower(): p for h, p in val.items() if h != "*"})
-    return frozenset(s.lower() for s in exclude), out
+    if not isinstance(paths, dict):
+        _config_fault(fleet_dir, "mirror_paths is not an object")
+    return pins, out
 
 
 def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str]] = None
                   ) -> Optional[Tuple[str, Tuple[str, ...], Dict[str, str]]]:
-    """``(mirror, hosts, {host: mirror})`` for ``slug`` in derived mode: every pool host, the override path or
-    ``~/.hermes/mirrors/<slug>.git``. None (reason appended to ``why``) when excluded / no pool / bad file."""
-    ov = read_overrides(fleet_dir)
-    if ov is None:
-        _why(why, WHY_BAD_OVERRIDES)
-        return None
-    exclude, paths = ov
-    if slug.lower() in exclude:
-        _why(why, WHY_EXCLUDED)
-        return None
+    """``(mirror, hosts, {host: mirror})`` for ``slug`` in derived mode: every pool host (or the hosts an operator
+    pin row names), the override path or ``~/.hermes/mirrors/<slug>.git``. None (reason appended to ``why``)
+    when no pool host is left."""
+    pins, paths = read_overrides(fleet_dir)
     hosts = tuple(dict.fromkeys(str(h).lower() for h in (pool_hosts or ()) if h))
     if not hosts:
         _why(why, WHY_NO_POOL)
         return None
+    pinned = pins.get(slug.lower())
+    if pinned is not None:
+        hosts = tuple(h for h in hosts if h in pinned)
+        if not hosts:
+            _why(why, WHY_PINNED)  # pinned to hosts outside the pool (the Studio, say): explicit, listed nightly
+            return None
     default, per_host = paths.get(slug.lower(), (None, {}))
     return (default or f"{DERIVED_MIRROR_ROOT}/{slug}.git"), hosts, dict(per_host)
 
@@ -248,8 +316,9 @@ def _clean_on_branch(tree: Path, branch: str, runner: Callable) -> bool:
     nothing that only this tree holds."""
     def _out(*args):
         try:
-            proc = runner(["git", "-C", str(tree), *args], capture_output=True, text=True, encoding="utf-8",
-                          timeout=10, stdin=subprocess.DEVNULL)
+            # --no-optional-locks: a status probe never refreshes the Studio tree's index.
+            proc = runner(["git", "--no-optional-locks", "-C", str(tree), *args], capture_output=True, text=True,
+                          encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             return None
         return proc.stdout if getattr(proc, "returncode", 1) == 0 else None
@@ -308,14 +377,19 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
     """``(anchor repo | None, push)``: :func:`anchor_repo`'s checks, with the reason a card stays local
     appended to ``why``. ``push_ok`` (derived mode, t_1d2c5939): a card branch whose commits origin lacks is
     no longer a refusal; ``push`` = ``(repo, branch, expected origin sha or "", assessed local sha)`` and the spawn pushes it
-    (:func:`push_card_branch`) before the clone. Still local: an own tree with uncommitted/untracked work
-    (``unpushed_dirty_tree``), and a branch that diverged from origin (a push would drop origin's commits).
+    (:func:`push_card_branch`) before the clone. Still local: a branch that diverged from origin (a push would
+    drop origin's commits).
 
-    ``carry_out`` (with ``push_ok``, t_894be273): a dirty own tree on the card branch no longer stays local. Its
-    changed files are copied straight from the Studio into the pool clone (:func:`carry_dirty`), never pushed
-    anywhere; ``(own tree, HEAD sha)`` is appended to ``carry_out`` and the clone is pinned to that HEAD. Still
-    local, named: a modified submodule or nested repository, changed files over the 25 MiB cap, or
-    origin's live card branch (``ls-remote``) not at the tree's HEAD (nor about to be, by the leased push)."""
+    ``carry_out`` (with ``push_ok``, t_894be273): a dirty own tree no longer stays local. Its changed files are
+    copied straight from the Studio into the pool clone (:func:`carry_payload`), never pushed anywhere;
+    ``(own tree, HEAD sha, digest)`` is appended to ``carry_out`` and the clone is pinned to that HEAD. Still
+    local, named: a modified submodule or nested repository, changed files over the 25 MiB cap, or origin's
+    live card branch (``ls-remote``) not at the tree's HEAD (nor about to be, by the leased push).
+
+    t_20fa16c7 (Ace: "All machines can make any checkout always"): a PRIOR RUN's own ``.worktrees/<id>`` is no
+    longer a pin by itself; it is assessed like any own tree. An own tree OFF the card branch (detached, or on
+    another branch) ports when its HEAD contains the card branch's commits: that HEAD's COMMITS become the
+    pushed branch tip (committed work, like any unpushed card branch), its uncommitted files ride the carry."""
     from hermes_cli import kanban_db_workspace as _kbw
     from hermes_cli.kanban_tick_steps import tick_memo
 
@@ -358,24 +432,37 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
             return None, None
     elif (top / ".worktrees" / task_id).exists():
         own_tree = top / ".worktrees" / task_id
-        if not (allow_studio_tree and _is_linked_worktree_checkout(own_tree)
-                and _git_toplevel(own_tree) == own_tree.resolve()):
+        if not allow_studio_tree:
             _why(why, WHY_CONCRETE)
-            return None, None  # a prior run's local worktree: its work stays where it is
+            return None, None  # host_preference off: a prior run's local worktree keeps the card (old rule)
+        if not (_is_linked_worktree_checkout(own_tree) and _git_toplevel(own_tree) == own_tree.resolve()):
+            if not _dir_empty(own_tree):
+                _why(why, WHY_NOT_CHECKOUT)
+                return None, None
+            own_tree = None  # an empty leftover directory holds no work: port, leave it where it is
+    if own_tree is not None and not _tree_initialized(own_tree, runner):
+        # `git worktree add` never finished (t_20fa16c7's own first spawn timed out): no run ever worked in it,
+        # and its `git status` would read as "every file deleted". Nothing to carry: port, leave it as it is.
+        own_tree = None
     carry = False
+    off_head = None
     if own_tree is not None and not _clean_on_branch(own_tree, b, runner):
-        # uncommitted or untracked work only the Studio has: carried into the clone when allowed (t_894be273)
-        if not _on_branch(own_tree, b, runner):
-            _why(why, WHY_OFF_BRANCH)
-            return None, None
+        # uncommitted/untracked work, or off its branch: carried into the clone when allowed (t_894be273)
+        on_branch = _on_branch(own_tree, b, runner)
         if carry_out is None or not push_ok:
-            _why(why, WHY_DIRTY)
+            _why(why, WHY_DIRTY if on_branch else WHY_OFF_BRANCH)
             return None, None
+        if not on_branch:
+            off_head = _tree_head(own_tree, runner)
+            if not off_head:
+                _why(why, WHY_OFF_BRANCH)
+                return None, None
         census = dirty_census(own_tree, runner)
         if isinstance(census, str):
             _why(why, census)
             return None, None
-        carry = carry_digest(own_tree, census)
+        if census != ((), ()):
+            carry = carry_digest(own_tree, census)
 
     def _git(*args):
         try:
@@ -408,10 +495,20 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
     if remote is None or local is None:
         _why(why, WHY_NOT_REPO)
         return None, None
+    if off_head is not None:
+        # The tree's HEAD becomes the card branch tip: it must contain what the branch holds, locally and on
+        # origin, or the push would drop commits (t_20fa16c7). The Studio's own branch ref is left as it is.
+        for base, reason in ((local, WHY_OFF_BRANCH), (remote, WHY_DIVERGED)):
+            if base and base != off_head:
+                anc = _git("merge-base", "--is-ancestor", base, off_head)
+                if anc is None or getattr(anc, "returncode", 1) != 0:
+                    _why(why, reason)
+                    return None, None
+        local = off_head
     if carry:
-        # The carried files are changes against the tree's HEAD (= local, it is on the branch): the clone must
-        # start exactly there. The tracking ref may be stale or the branch pushed from elsewhere, so read origin's
-        # real tip: it must be local already, or be the lease's expected sha (the push then puts it at local).
+        # The carried files are changes against the tree's HEAD (= local): the clone must start exactly there.
+        # The tracking ref may be stale or the branch pushed from elsewhere, so read origin's real tip: it must
+        # be local already, or be the lease's expected sha (the push then puts it at local).
         top_ret, push = _assess_branch(top, b, remote, local, push_ok, why, _git, own_tree)
         if top_ret is None:
             return None, None
@@ -428,7 +525,7 @@ def _assess_branch(top: Path, b: str, remote: str, local: str, push_ok: bool, wh
                    _git: Callable, own_tree: Optional[Path]):
     """The branch half of :func:`assess`: ``(top, push)`` from the local and origin-tracking shas of ``b``."""
     if own_tree is not None and not remote and not push_ok:
-        _why(why, "unpushed_commits")
+        _why(why, WHY_UNPUSHED)
         return None, None  # the tree's commits must be on origin: no origin ref = local only
     if not local:
         return top, None  # no local branch at all: the clone makes it
@@ -439,12 +536,12 @@ def _assess_branch(top: Path, b: str, remote: str, local: str, push_ok: bool, wh
     if remote and (ahead.stdout or "").strip() == "0":
         return top, None  # in step with origin
     if not push_ok:
-        _why(why, "unpushed_commits")
+        _why(why, WHY_UNPUSHED)
         return None, None  # local commits (or no origin ref): only the Studio has the baseline
     if remote:
         anc = _git("merge-base", "--is-ancestor", remote, local)
         if anc is None or getattr(anc, "returncode", 1) != 0:
-            _why(why, "diverged_from_origin")
+            _why(why, WHY_DIVERGED)
             return None, None  # origin has commits the Studio lacks: a push would drop them
     return top, (str(top), b, remote, local)
 
@@ -474,6 +571,42 @@ def _ref_table(top: Path) -> Optional[Dict[str, str]]:
 
     table = _kts.tick_memo(("wt_refs", str(top)), _read, inner=True)
     return dict(table) if table is not None else None
+
+
+def _dir_empty(path: Path) -> bool:
+    try:
+        return not any(path.iterdir())
+    except OSError:
+        return False
+
+
+def _tree_git(tree: Path, runner: Callable, *args):
+    """``git --no-optional-locks -C tree args``: never refreshes or locks the tree's own index."""
+    try:
+        return runner(["git", "--no-optional-locks", "-C", str(tree), *args], capture_output=True, text=True,
+                      encoding="utf-8", errors="replace", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_path(tree: Path, runner: Callable, name: str) -> Optional[Path]:
+    proc = _tree_git(tree, runner, "rev-parse", "--path-format=absolute", "--git-path", name)
+    if proc is None or getattr(proc, "returncode", 1) != 0 or not (proc.stdout or "").strip():
+        return None
+    return Path(proc.stdout.strip())
+
+
+def _tree_initialized(tree: Path, runner: Callable) -> bool:
+    """The worktree's checkout completed: it has an index. ``worktree add`` writes the index last (via
+    ``index.lock``), so a killed add leaves none. Its ``initializing`` lock is not the signal: an operator may
+    finish such a tree by hand and work in it."""
+    index = _git_path(tree, runner, "index")
+    return index is not None and index.exists()
+
+
+def _tree_head(tree: Path, runner: Callable) -> str:
+    proc = _tree_git(tree, runner, "rev-parse", "-q", "--verify", "HEAD")
+    return (proc.stdout or "").strip() if proc is not None and getattr(proc, "returncode", 1) == 0 else ""
 
 
 def _on_branch(tree: Path, branch: str, runner: Callable) -> bool:
@@ -833,6 +966,11 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
         if not slug:
             _why(why, WHY_NOT_GITHUB)
             return None
+        if push is not None and not _own_destination(_origin_url(repo, runner)):
+            # Named at routing, not a spawn wall (t_20fa16c7): the Studio's work cannot be published to an
+            # upstream we do not own, so the card runs where the work is. push_card_branch still re-checks.
+            _why(why, WHY_FOREIGN_ORIGIN)
+            return None
         route = derived_route(slug, fleet_dir, pool_hosts, why)
         if not route:
             return None
@@ -840,12 +978,24 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
         return (slug, route[0], route[1], route[2], push) + ((carry[0],) if carry else ())
     mirrors = read_mirrors(fleet_dir)
     if not mirrors:
+        _why(why, WHY_DERIVED_OFF)
         return None
     repo = anchor_repo(task_id, workspace_path, board_default, branch, runner,
                        allow_studio_tree=allow_studio_tree)
     slug = origin_slug(repo, runner) if repo is not None else None
     row = mirrors.get(slug.lower()) if slug else None
+    if row is None:
+        _why(why, WHY_DERIVED_OFF)
     return (slug, row[0], row[1], row[2], None) if row else None
+
+
+def _origin_url(repo: Path, runner: Callable) -> str:
+    try:
+        proc = runner(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True,
+                      encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (proc.stdout or "").strip() if getattr(proc, "returncode", 1) == 0 else ""
 
 
 def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], fleet_dir: Path,
@@ -872,15 +1022,16 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
     top = _git_toplevel(repo) if repo.is_dir() else None
     slug = origin_slug(top, runner) if top is not None else None
     if slug and derived_enabled(fleet_dir):
-        # t_1d2c5939: every GitHub repo ports to every pool host (minus the file's exclusions).
+        # t_1d2c5939: every GitHub repo ports to every pool host (an operator pin narrows the hosts).
         excl: List[str] = []
-        row = derived_route(slug, fleet_dir, ("every pool host",), excl)
+        pinned = read_overrides(fleet_dir)[0].get(slug.lower())
+        row = derived_route(slug, fleet_dir, pinned or ("every pool host",), excl)
         if row is None:
             return workspace_path, f"worktree card stays Studio-local: {slug} {excl[0] if excl else 'not portable'}"
     else:
         row = read_mirrors(fleet_dir).get(slug.lower()) if slug else None
     if row is None:
-        why = (f"{slug} has no row in fleet/{MIRRORS_FILE}" if slug
+        why = (f"{slug}: derived mode is off (kill switch) and the frozen rollback list has no row for it" if slug
                else f"{workspace_path} is not a GitHub repo checkout")
         return workspace_path, f"worktree card stays Studio-local: {why}"
     hosts = ", ".join(row[1])

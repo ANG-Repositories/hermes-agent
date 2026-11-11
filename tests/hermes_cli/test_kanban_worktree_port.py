@@ -55,9 +55,7 @@ def test_worktree_card_without_a_mirror_row_stays_local(kanban_home, anchor, mon
         rules: dict = {}
         route, reason = kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules)
         assert route == "local"
-        assert "worktree is Studio-only" in reason
-        assert "kanban-worktree-mirrors.json" in reason
-        assert "clean pushed" in reason
+        assert reason == "not_portable:workspace_kind:derived_mode_off"
         assert rules[tid] == "workspace_kind"
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         assert spawned == []
@@ -364,36 +362,52 @@ def test_derived_schema1_rows_are_mirror_paths_and_hosts_are_ignored(kanban_home
     assert out[tid][1] == "/srv/ci/git-mirrors/hermes-home-mirror.git" and out[tid][2] == ("ace-ai",)
 
 
-def test_derived_overrides_exclude_and_per_host_paths(tmp_path):
-    (tmp_path / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "exclude": ["acme/Secret"],
+def test_derived_pins_and_per_host_paths(tmp_path):
+    """t_20fa16c7 amendment (Ace 12:51): one `pins` list, empty by default; a row names hosts, never a default."""
+    (tmp_path / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2,
+        "pins": [{"repo": "acme/Secret", "hosts": ["ACE-AI"], "why": "needs the GPU"},
+                 {"repo": "acme/studio", "hosts": ["mac-studio"], "why": "reads the vault"}],
         "mirror_paths": {SLUG: {"*": "/srv/m.git", "mbp-2026": "/Users/Shared/m.git"},
                          "acme/plain": "~/m/plain.git"}}))
+    assert kwt.derived_route("ACME/secret", tmp_path, ("ci-box", "ace-ai"))[1] == ("ace-ai",)
     why: list = []
-    assert kwt.derived_route("ACME/secret", tmp_path, ("ci-box",), why) is None and why == ["excluded"]
+    assert kwt.derived_route("acme/studio", tmp_path, ("ci-box", "ace-ai"), why) is None and why == ["operator_pin"]
     assert kwt.derived_route(SLUG, tmp_path, ("ci-box", "MBP-2026")) == (
         "/srv/m.git", ("ci-box", "mbp-2026"), {"mbp-2026": "/Users/Shared/m.git"})
     assert kwt.derived_route("acme/plain", tmp_path, ("ci-box",))[0] == "~/m/plain.git"
     why = []
     assert kwt.derived_route("acme/x", tmp_path, (), why) is None and why == ["no_pool_host"]
-    # A hand list cannot come back through schema 2: a malformed file ports nothing (fail closed).
-    for bad in ({"schema": 2, "exclude": "acme/x"}, {"schema": 2, "mirror_paths": {SLUG: "rel/x.git"}},
-                {"schema": 3}):
-        (tmp_path / kwt.MIRRORS_FILE).write_text(json.dumps(bad))
-        why = []
-        assert kwt.derived_route(SLUG, tmp_path, ("ci-box",), why) is None
-        assert why == ["overrides_file_malformed"]
-    (tmp_path / kwt.MIRRORS_FILE).write_text("{not json")
-    assert kwt.derived_route(SLUG, tmp_path, ("ci-box",)) is None
 
 
-def test_derived_excluded_repo_stays_local_named(kanban_home, anchor):
+@pytest.mark.parametrize("doc", [
+    {"schema": 2, "exclude": [SLUG]},                                     # retired list
+    {"schema": 2, "exclude": "acme/x"},
+    {"schema": 2, "pins": [{"repo": SLUG, "hosts": ["mac-studio"]}]},   # no why
+    {"schema": 2, "pins": [{"repo": SLUG, "hosts": [], "why": "x"}]},   # no hosts
+    {"schema": 2, "mirror_paths": {SLUG: "rel/x.git"}},
+    {"schema": 3}, "{not json",
+    {"schema": 1, "repos": {SLUG: {"mirror": "/srv/m.git", "hosts": ["ace-media"]}}},  # schema-1 hosts
+])
+def test_a_config_fault_is_ignored_loudly_never_a_studio_pin(tmp_path, doc, caplog):
+    """t_20fa16c7: an override file can no longer make a repo Studio-only by accident: every pool host, one log."""
+    kwt._fault_logged.clear()
+    (tmp_path / kwt.MIRRORS_FILE).write_text(doc if isinstance(doc, str) else json.dumps(doc))
+    why: list = []
+    with caplog.at_level("ERROR"):
+        route = kwt.derived_route(SLUG, tmp_path, ("ci-box", "ace-ai"), why)
+        kwt.derived_route(SLUG, tmp_path, ("ci-box", "ace-ai"))
+    assert route is not None and route[1] == ("ci-box", "ace-ai") and why == []
+    faults = [r for r in caplog.records if "config fault" in r.getMessage()]
+    assert len(faults) == 1  # loud, once
+
+
+def test_retired_exclude_row_no_longer_keeps_the_card_local(kanban_home, anchor):
     fleet = kanban_home / "fleet"
     fleet.mkdir(parents=True, exist_ok=True)
     (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "exclude": [SLUG]}))
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
-        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2)) == (
-            "local", "not_portable:workspace_kind:excluded")
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2)) == ("portable", None)
 
 
 def test_kill_switch_file_or_env_restores_the_hand_list(kanban_home, anchor, monkeypatch):
@@ -550,9 +564,10 @@ def test_refusal_redacts_credentials_in_the_rewritten_url(anchor, no_ambient_git
     assert not [c for c in calls if "push" in c]
 
 
-def test_derived_unpushed_branch_on_upstream_origin_blocks_without_push(kanban_home, anchor, monkeypatch,
-                                                                       no_ambient_git_config):
-    """The Studio case (t_6dde6d1e): checkout origin = NousResearch, card branch has an unpushed commit."""
+def test_derived_unpushed_branch_on_upstream_origin_stays_local_named_without_push(
+        kanban_home, anchor, monkeypatch, no_ambient_git_config):
+    """The Studio case (t_6dde6d1e): checkout origin = NousResearch, card branch has an unpushed commit. Named at
+    routing (t_20fa16c7: origin_not_ours, counted, pages nobody), never a push, never a blocked card."""
     _commit(anchor, "base")
     _git("remote", "set-url", "origin", "git@github.com:NousResearch/hermes-agent.git", cwd=anchor)
     pushes, clones = [], []
@@ -571,12 +586,12 @@ def test_derived_unpushed_branch_on_upstream_origin_blocks_without_push(kanban_h
         _git("checkout", "-q", f"wt/{tid}", cwd=anchor)
         _commit(anchor, "studio-only")
         _git("checkout", "-q", "main", cwd=anchor)
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2)) == (
+            "local", "not_portable:workspace_kind:origin_not_ours")
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         row = _row(conn, tid)
     assert not pushes and not clones and not spawned
-    assert tid in res.auto_blocked  # first failure, not a transient retry
-    assert row["status"] == "blocked"
-    assert "git@github.com:NousResearch/hermes-agent.git" in (row["last_failure_error"] or "")
+    assert tid not in res.auto_blocked and row["status"] == "ready"
 
 
 def test_push_lease_refuses_a_branch_moved_on_origin(anchor, tmp_path):
@@ -599,6 +614,9 @@ def test_derived_dirty_own_tree_stays_local_named(kanban_home, anchor, monkeypat
     _commit(anchor, "base")
     monkeypatch.setenv(kwt.DIRTY_CARRY_ENV, "0")
     monkeypatch.setattr(kbd, "_studio_last_resort", lambda fleet_dir: True)
+    fleet = kanban_home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwt.MIRRORS_FILE).write_text(json.dumps({"schema": 2, "pins": []}))
     with kb.connect_closing() as conn:
         tid = _worktree_card(conn, anchor)
         wt = anchor / ".worktrees" / tid
@@ -608,12 +626,119 @@ def test_derived_dirty_own_tree_stays_local_named(kanban_home, anchor, monkeypat
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules) == (
             "local", "not_portable:workspace_kind:unpushed_dirty_tree")
         assert rules[tid] == "workspace_kind"
-        # committed (still unpushed): portable, with a push
+        # committed (still unpushed): portable, with a plain push
         _git("add", "scratch.txt", cwd=wt)
         _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c", cwd=wt)
         out: dict = {}
         assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
         assert out[tid][4][1:] == (f"wt/{tid}", "", _ref(wt, "HEAD"))
+
+
+# ---- t_20fa16c7: a dirty or prior-run Studio tree is CARRIED, never a Studio pin ----
+
+def _snapshot(tree: Path) -> dict:
+    """Every file under the worktree (bytes) plus its git admin state: index, HEAD, the card branch ref."""
+    files = {str(p.relative_to(tree)): p.read_bytes() for p in sorted(tree.rglob("*"))
+             if p.is_file() and ".git" not in p.relative_to(tree).parts}
+    gitdir = Path(subprocess.run(["git", "-C", str(tree), "rev-parse", "--absolute-git-dir"],
+                                 check=True, capture_output=True, text=True).stdout.strip())
+    admin = {n: (gitdir / n).read_bytes() for n in ("index", "HEAD") if (gitdir / n).exists()}
+    refs = subprocess.run(["git", "-C", str(tree), "for-each-ref", "--format=%(refname) %(objectname)"],
+                          check=True, capture_output=True, text=True).stdout
+    return {"files": files, "admin": admin, "refs": refs}
+
+
+@pytest.fixture
+def studio_card(kanban_home, anchor, tmp_path, monkeypatch):
+    """A card whose Studio ``.worktrees/<id>`` was made by a prior run; origin is a local bare repo we own. The
+    clone runs for real (its ssh half in a local sh, :func:`_clone_locally`)."""
+    bare = _origin_with_push(anchor, tmp_path)
+    monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: SLUG)
+    monkeypatch.setattr(kbd, "_studio_last_resort", lambda fleet_dir: True)
+    _commit(anchor, "base")
+    calls: list = []
+    _clone_locally(monkeypatch, tmp_path, bare, calls)
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+    wt = anchor / ".worktrees" / tid
+    _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+    return tid, wt, bare, calls
+
+
+@pytest.mark.parametrize("persisted", ["anchor", "own_tree"])
+@pytest.mark.parametrize("state", ["dirty", "untracked_only", "committed_and_dirty", "off_branch"])
+def test_dirty_or_prior_run_studio_tree_ports_and_its_work_reaches_the_clone(studio_card, tmp_path, persisted,
+                                                                             state):
+    """Acceptance 1+2 (t_20fa16c7, on #219's carry): a prior run's own tree, dirty, holding unpushed commits, or
+    off its branch, ports. Its committed work is pushed as the card branch tip; its uncommitted files reach the
+    pool clone byte-equal and are pushed nowhere; the Studio tree is byte-unchanged (files, index, HEAD, refs)."""
+    tid, wt, bare, calls = studio_card
+    (wt / "base").write_text("edited in the Studio tree")
+    (wt / "new dir").mkdir()
+    (wt / "new dir" / "notes.md").write_text("untracked work")
+    if state == "untracked_only":
+        _git("checkout", "--", "base", cwd=wt)
+    if state == "off_branch":  # detached, then committed on: the card branch lags the tree's HEAD
+        _git("checkout", "-q", "--detach", cwd=wt)
+    if state in ("committed_and_dirty", "off_branch"):
+        _git("stash", "-q", "-u", cwd=wt)
+        _commit(wt, "committed-only-here")
+        _git("stash", "pop", "-q", cwd=wt)
+    head = _ref(wt, "HEAD")
+    with kb.connect_closing() as conn:
+        if persisted == "own_tree":  # a prior run persisted the concrete path
+            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(wt), tid))
+            conn.commit()
+        before, studio = _snapshot(wt), _tree_state(wt)
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
+    port = out[tid]
+    assert port[5][:2] == (str(wt), head)  # a carry, pinned to the tree's HEAD
+    ws = tmp_path / "pool" / tid
+    _key, job, _lock = kbd._pool_clone_job(tid, f"wt/{tid}", _host("ace-ai"), port, ws)
+    job()
+    assert len(calls) == 1 and _ref(ws, "HEAD") == head
+    assert _tree_state(ws) == studio                           # the work reached the clone, byte-equal
+    on_origin = _ref(bare, f"refs/heads/wt/{tid}")
+    assert on_origin == head  # the card branch tip on origin is the tree's HEAD: its commits, nothing else
+    history = subprocess.run(["git", "-C", str(bare), "log", "--all", "-p"], capture_output=True, text=True).stdout
+    assert "untracked work" not in history and "edited in the Studio tree" not in history  # nothing uncommitted
+    assert _snapshot(wt) == before                             # the Studio tree is left byte-unchanged
+
+
+def test_a_clean_pushed_prior_run_tree_ports_without_a_carry(studio_card):
+    tid, wt, bare, calls = studio_card
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=wt)
+    _git("fetch", "-q", "origin", cwd=wt)
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
+    assert out[tid][4] is None and len(out[tid]) == 5  # nothing to push, nothing to carry
+
+
+def test_an_unfinished_worktree_add_is_not_work_and_ports(studio_card):
+    """t_20fa16c7's own first spawn: `git worktree add` timed out, leaving no index (every file reads deleted)."""
+    tid, wt, bare, calls = studio_card
+    gitdir = Path(subprocess.run(["git", "-C", str(wt), "rev-parse", "--absolute-git-dir"],
+                                 check=True, capture_output=True, text=True).stdout.strip())
+    (gitdir / "index").unlink()
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out) == ("portable", None)
+    assert len(out[tid]) == 5  # no carry of "deleted" files
+    assert (wt / "base").exists()
+
+
+def test_an_off_branch_tree_that_drops_branch_commits_stays_local_named(studio_card):
+    """Putting the card branch at the tree's HEAD would drop the branch's own commits: an enumerated reason."""
+    tid, wt, bare, calls = studio_card
+    _commit(wt, "on-the-branch-only")
+    _git("checkout", "-q", "--detach", "HEAD~1", cwd=wt)
+    (wt / "dirty").write_text("x")
+    with kb.connect_closing() as conn:
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2)) == (
+            "local", "not_portable:workspace_kind:own_tree_off_branch")
+    assert "own_tree_off_branch" in kwt.LOCAL_ONLY_REASONS
 
 
 def test_derived_diverged_branch_stays_local_and_ahead_branch_pushes(anchor):
