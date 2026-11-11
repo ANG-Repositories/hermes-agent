@@ -237,6 +237,9 @@ def check_dispatch(path: Path) -> list:
     tree = ast.parse(path.read_text(encoding="utf-8-sig"), str(path))
     errors = []
     in_fstring = {id(v) for n in ast.walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values}
+    # `x.startswith("not_portable:workspace_kind:")` reads a reason, it does not make one (#216's _route_row)
+    in_fstring |= {id(a) for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == "startswith" for a in n.args}
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in in_fstring \
                 and node.value.startswith("not_portable:workspace_kind:"):
