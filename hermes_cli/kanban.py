@@ -1118,6 +1118,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 home_fallback=bool(boomerang) and not is_dispatcher_owned_worker_context())
             from hermes_cli.kanban_boomerang_default import wake_route
             route = wake_route(conn, task_id)
+            from hermes_cli.kanban_create_placement import preview_line
+            placement_line = None if getattr(args, "json", False) else preview_line(conn, task_id)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1168,6 +1170,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
         for _note in _placement_notes:
             print(f"placement: {task_id}: {_note}", file=sys.stderr)
+        if placement_line:  # t_0a5740f3: where the card will run and which line decided it
+            print(f"placement: {task_id}: {placement_line}", file=sys.stderr)
 
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
