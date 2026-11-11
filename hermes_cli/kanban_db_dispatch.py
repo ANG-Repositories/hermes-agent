@@ -5385,7 +5385,8 @@ def _wt_pin_hosts(row, board) -> "Optional[tuple]":
         return None
     from hermes_cli import kanban_worktree_port as _kwt
     try:
-        return _kwt.repo_pin(row["workspace_path"], _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet")
+        return _kwt.repo_pin(row["id"], row["workspace_path"], _kwt.board_default_workdir(board),
+                             _kb.kanban_home() / "fleet")
     except Exception as exc:  # never stops the tick; an unreadable pin is a config fault, logged
         _kb._log.warning("kanban: worktree pin for %s not read: %s", row["id"], exc)
         return None

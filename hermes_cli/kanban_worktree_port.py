@@ -274,37 +274,92 @@ def pin_names_studio(pinned) -> bool:
     return bool({str(h).lower() for h in (pinned or ())} & {"mac-studio", "studio"})
 
 
-def repo_pin(workspace_path: Optional[str], board_default: Optional[str], fleet_dir: Path,
+def repo_pin(task_id: str, workspace_path: Optional[str], board_default: Optional[str], fleet_dir: Path,
              runner: Callable = subprocess.run) -> Optional[Tuple[str, ...]]:
     """The hosts of the operator pin row for the repo a worktree card's workspace is in, or None (t_fbe8a067).
 
-    Read from the workspace alone, before and independently of :func:`assess` (Prism 345896e571e6): an early
-    refusal there (off-branch tree, failed probe, not a checkout) must not drop the pin. The repo is the git
-    toplevel of the workspace path (a linked worktree shares its repo's ``origin``), or of the repo a
-    not-yet-made ``<repo>/.worktrees/<id>`` names. When no repo can be resolved (no path, not a git checkout, a
-    non-GitHub origin) there is no pin row to read and the card routes as it does without one."""
+    Read before and independently of the rest of :func:`assess` (Prism 345896e571e6): an early refusal there
+    (off-branch tree, failed probe, not a checkout) must not drop the pin. The repo is :func:`workspace_repo`'s,
+    the same one the port reads (Prism 881a62c60cff: an own linked worktree is re-anchored to its parent repo, whose
+    ``origin`` is the one ported). When no repo can be resolved (no path, not a git checkout, a non-GitHub origin)
+    there is no pin row to read and the card routes as it does without one."""
     if not derived_enabled(fleet_dir):
         return None  # hand-list mode has no pin rows (its rows name mirror hosts only)
     pins = read_overrides(fleet_dir)[0]
     if not pins:
         return None
+    repo = workspace_repo(task_id, workspace_path, board_default, allow_studio_tree=True)[0]
+    slug = origin_slug(repo, runner) if repo is not None else None
+    return pins.get(slug.lower()) if slug else None
+
+
+def _toplevel(path: Path) -> Optional[Path]:
+    # Once per board tick per path (t_97a78e19): N worktree cards on one repo forked 3 git each per tick.
+    from hermes_cli import kanban_db_workspace as _kbw
+    from hermes_cli.kanban_tick_steps import tick_memo
+    return tick_memo(("wt_toplevel", str(path)), lambda: _kbw._git_toplevel(path), inner=True)
+
+
+def _linked(path: Path) -> bool:
+    from hermes_cli import kanban_db_workspace as _kbw
+    from hermes_cli.kanban_tick_steps import tick_memo
+    return tick_memo(("wt_linked", str(path)), lambda: _kbw._is_linked_worktree_checkout(path), inner=True)
+
+
+def _main_tree(top: Path) -> Path:
+    """A linked worktree's main working tree (its common dir's parent, read from the repo config git itself keeps,
+    so a worktree-local url rewrite cannot change the answer), else ``top`` (not linked, bare, unreadable)."""
+    if not _linked(top):
+        return top
+    from hermes_cli import kanban_db_workspace as _kbw
+    common = _kbw._git_common_dir(top)
+    main = common.parent if common is not None and common.name == ".git" else None
+    return main if main is not None and _toplevel(main) == main.resolve() else top
+
+
+def workspace_repo(task_id: str, workspace_path: Optional[str], board_default: Optional[str], *,
+                   allow_studio_tree: bool = False) -> Tuple[Optional[Path], Optional[Path], Optional[str]]:
+    """THE answer to "which repo is this worktree card's workspace in" (t_fbe8a067, Prism 881a62c60cff):
+    ``(repo | None, own linked tree | None, refusal | None)``. :func:`assess` (the port) and :func:`repo_pin` (the
+    pin) both call it, so they read ``origin`` from the same repo. ``repo`` does not depend on
+    ``allow_studio_tree``; only ``refusal`` (the reason :func:`assess` keeps the card local) does.
+
+    A not-yet-made ``<repo>/.worktrees/<x>`` is its repo (t_e604c0f9; refused unless it is this card's and the
+    knob allows it, Prism 7eba47409a75). The card's own linked ``<repo>/.worktrees/<id>`` is its parent repo
+    (refused with the knob off). Any other concrete path or linked worktree: the repo it is in, refused."""
     raw = (workspace_path or "").strip() or (board_default or "").strip()
     if not raw:
-        return None
+        return None, None, WHY_NOT_REPO
     p = Path(raw).expanduser()
     target = worktree_target_anchor(p)
     if target is not None:
-        p = target
+        try:
+            repo = _toplevel(target) if target.is_dir() else None
+        except OSError:
+            repo = None
+        if repo is None:
+            return None, None, WHY_NOT_REPO
+        if not (allow_studio_tree and p.name == task_id):
+            return repo, None, WHY_NOT_REPO  # knob off or another card's target: today's Studio pin
+        if repo != target.resolve() or _linked(repo):
+            return repo, None, WHY_CONCRETE
+        return repo, None, None
     try:
         if not p.is_absolute() or not p.is_dir():
-            return None
+            return None, None, WHY_NOT_REPO
     except OSError:
-        return None
-    from hermes_cli import kanban_db_workspace as _kbw
-    from hermes_cli.kanban_tick_steps import tick_memo
-    top = tick_memo(("wt_toplevel", str(p)), lambda: _kbw._git_toplevel(p), inner=True)
-    slug = origin_slug(top, runner) if top is not None else None
-    return pins.get(slug.lower()) if slug else None
+        return None, None, WHY_NOT_REPO
+    top = _toplevel(p)
+    if top is None:
+        return None, None, WHY_NOT_REPO
+    if top != p.resolve() or _linked(top):
+        if not (top == p.resolve() and top.name == task_id and top.parent.name == ".worktrees" and _linked(top)):
+            return _main_tree(top), None, WHY_CONCRETE
+        anchor = top.parent.parent.resolve()
+        if _toplevel(anchor) != anchor or _linked(anchor):
+            return _main_tree(top), None, WHY_CONCRETE
+        return anchor, top, None if allow_studio_tree else WHY_CONCRETE
+    return top, None, None
 
 
 def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str]] = None
@@ -444,52 +499,18 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
     longer a pin by itself; it is assessed like any own tree. An own tree OFF the card branch (detached, or on
     another branch) ports when its HEAD contains the card branch's commits: that HEAD's COMMITS become the
     pushed branch tip (committed work, like any unpushed card branch), its uncommitted files ride the carry."""
-    from hermes_cli import kanban_db_workspace as _kbw
-    from hermes_cli.kanban_tick_steps import tick_memo
-
-    # Once per board tick per path (t_97a78e19): N worktree cards on one repo forked 3 git each here per tick.
-    def _git_toplevel(path):
-        return tick_memo(("wt_toplevel", str(path)), lambda: _kbw._git_toplevel(path), inner=True)
-
-    def _is_linked_worktree_checkout(path):
-        return tick_memo(("wt_linked", str(path)), lambda: _kbw._is_linked_worktree_checkout(path), inner=True)
-
-    raw = (workspace_path or "").strip() or (board_default or "").strip()
-    if not raw:
-        _why(why, WHY_NOT_REPO)
-        return None, None
-    p = Path(raw).expanduser()
-    # <repo>/.worktrees/<id> not made yet: the repo is the anchor (t_e604c0f9). Only under the same switch as
-    # the own-tree port: with host_preference off a concrete target keeps today's Studio pin (Prism 7eba47409a75).
-    target = worktree_target_anchor(p, task_id) if allow_studio_tree else None
-    if target is not None:
-        p = target
-    if not p.is_absolute() or not p.is_dir():
-        _why(why, WHY_NOT_REPO)
-        return None, None
-    top = _git_toplevel(p)
-    if top is None:
-        _why(why, WHY_NOT_REPO)
+    top, own_tree, refusal = workspace_repo(task_id, workspace_path, board_default,
+                                            allow_studio_tree=allow_studio_tree)
+    if refusal is not None or top is None:
+        _why(why, WHY_CONCRETE if refusal == WHY_CONCRETE else WHY_NOT_REPO)  # workspace_repo's two refusals
         return None, None
     b = (branch or "").strip() or f"wt/{task_id}"
-    own_tree = None
-    if top != p.resolve() or _is_linked_worktree_checkout(top):
-        # A concrete target or a linked worktree: local, unless it is this
-        # card's own pushed .worktrees/<id> and the knob allows the port.
-        if not (allow_studio_tree and top == p.resolve() and top.name == task_id
-                and top.parent.name == ".worktrees" and _is_linked_worktree_checkout(top)):
-            _why(why, WHY_CONCRETE)
-            return None, None
-        own_tree, top = top, top.parent.parent.resolve()
-        if _git_toplevel(top) != top or _is_linked_worktree_checkout(top):
-            _why(why, WHY_CONCRETE)
-            return None, None
-    elif (top / ".worktrees" / task_id).exists():
+    if own_tree is None and (top / ".worktrees" / task_id).exists():
         own_tree = top / ".worktrees" / task_id
         if not allow_studio_tree:
             _why(why, WHY_CONCRETE)
             return None, None  # host_preference off: a prior run's local worktree keeps the card (old rule)
-        if not (_is_linked_worktree_checkout(own_tree) and _git_toplevel(own_tree) == own_tree.resolve()):
+        if not (_linked(own_tree) and _toplevel(own_tree) == own_tree.resolve()):
             if not _dir_empty(own_tree):
                 _why(why, WHY_NOT_CHECKOUT)
                 return None, None

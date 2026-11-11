@@ -1692,3 +1692,56 @@ def test_an_unpinned_worktree_card_on_a_tick_with_no_pool_plan_still_runs_locall
         tid = _worktree_card(conn, anchor)
         res, spawned = _tick(conn, spillover=None, spawn_limit=4)
     assert spawned == [(tid, None)], spawned
+
+
+def _own_tree_with_local_url_rewrite(conn, anchor):
+    """The card's own clean linked ``.worktrees/<id>``, persisted, whose worktree-local config rewrites origin away
+    from GitHub (``extensions.worktreeConfig``): its own origin reads as no GitHub repo, the anchor's as SLUG."""
+    _commit(anchor, "base")
+    tid = _worktree_card(conn, anchor)
+    wt = anchor / ".worktrees" / tid
+    _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+    _git("config", "extensions.worktreeConfig", "true", cwd=anchor)
+    _git("config", "--worktree", "url.https://mirror.example/.insteadOf", "https://github.com/", cwd=wt)
+    conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(wt), tid))
+    conn.commit()
+    kwt._origin_cache.clear()
+    assert kwt.origin_slug(wt) is None and kwt.origin_slug(anchor) == SLUG
+    return tid, wt
+
+
+def test_a_pin_is_read_from_the_repo_the_port_reads_not_the_worktree_config(kanban_home, anchor, monkeypatch):
+    """Prism 881a62c60cff (finding input): anchor repo pinned to [ace-ai], a clean own linked worktree with a
+    worktree-local `url.<x>.insteadOf` rewrite, pool plan present. The port reads the anchor's origin; so does the
+    pin, so the card is limited to ace-ai and never reaches the Studio."""
+    _pin(kanban_home, ["ace-ai"])
+    monkeypatch.setattr(kbd, "_studio_last_resort", lambda fleet_dir: True)
+    with kb.connect_closing() as conn:
+        tid, wt = _own_tree_with_local_url_rewrite(conn, anchor)
+        out: dict = {}
+        caps: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _pinned_plan(), worktree_out=out, caps_out=caps,
+                               studio_on=False)
+    assert route[0] != "local", route
+    if route[0] == "portable":
+        assert out[tid][0] == SLUG and out[tid][2] == ("ace-ai",)
+        assert caps["only"][tid] == ("ace-ai",), caps
+    else:
+        assert route[0] == "wait" and route[1].startswith("worktree_pin (ace-ai"), route
+
+
+def test_the_port_and_the_pin_resolve_one_repo(kanban_home, anchor, monkeypatch):
+    """One resolver answers "which repo is this card's workspace in" for the port and the pin: the anchor path,
+    an existing own linked worktree (even with a worktree-local url rewrite), and a not-yet-made .worktrees/<id>."""
+    _pin(kanban_home, ["ace-ai"])
+    with kb.connect_closing() as conn:
+        tid, wt = _own_tree_with_local_url_rewrite(conn, anchor)
+    repo = anchor.resolve()
+    for path in (str(anchor), str(wt), str(anchor / ".worktrees" / "t_notmade0")):
+        tid_for = "t_notmade0" if path.endswith("t_notmade0") else tid
+        assert kwt.workspace_repo(tid_for, path, None, allow_studio_tree=True)[0] == repo, path
+        assert kwt.workspace_repo(tid_for, path, None, allow_studio_tree=False)[0] == repo, path
+        assert kwt.repo_pin(tid_for, path, None, kanban_home / "fleet") == ("ace-ai",), path
+    assert kwt.workspace_repo(tid, str(wt), None, allow_studio_tree=True)[1] == wt.resolve()
+    ported, _push = kwt.assess(tid, str(wt), None, f"wt/{tid}", allow_studio_tree=True, push_ok=True, carry_out=[])
+    assert ported == repo
