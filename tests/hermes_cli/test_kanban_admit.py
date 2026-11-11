@@ -8,6 +8,7 @@ or the kill switch; every admission writes an ``admission_override`` event.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 from pathlib import Path
 
@@ -714,6 +715,39 @@ def _browser_spawn(task, workspace, *, board=None, placement=None, browser_env=N
     return 4242
 
 
+def _clone_pending(m, ctx):
+    """Cards ``ctx["tids"]`` become worktree cards pinned to ace-ai whose repo ports there (t_915b8d2d), and a
+    clone of each workspace is pending: every tick, deferred or synchronous, waits them clone_pending."""
+    from hermes_cli import kanban_worktree_port as kwt
+
+    with kb.connect_closing() as conn:
+        for tid in ctx["tids"]:
+            conn.execute("UPDATE tasks SET body='host: ace-ai', workspace_kind='worktree', workspace_path=? "
+                         "WHERE id=?", (str(kb.workspaces_root() / tid), tid))
+    m.setattr(kwt, "port_for", lambda *a, **k: ("acme/r", "m", ("ace-ai",), {"ace-ai": "m"}, None))
+    m.setattr(kwt, "clone_busy", lambda key, lock: True)
+    m.setattr(kwt, "clone_ready", lambda key, job, lock: False)
+    ctx["measure_remote_fn"] = _remote()
+
+
+def test_admit_names_a_pending_pool_host_clone_and_leaves_the_card_ready(board, monkeypatch, capsys):
+    """t_27d980af: a worktree card whose clone on its pool host is still pending (t_915b8d2d) is held by the
+    dispatcher's ``continue: not _ready`` site. ``kanban admit`` refuses with that wait, naming the host, and
+    neither claims nor spawns the card."""
+    _hot_local(monkeypatch, load1=10.0)
+    tid = _card()
+    ctx: dict = {"tids": [tid]}
+    _clone_pending(monkeypatch, ctx)
+    SPAWNS.clear()
+    monkeypatch.setattr(ka, "admit", functools.partial(ka.admit, spawn_fn=_spawn,
+                                                       measure_remote_fn=ctx["measure_remote_fn"]))
+    ns = argparse.Namespace(task_id=tid, host="ace-ai", reason="Ace: proceed")
+    assert ka.cmd_admit(ns) == 1
+    err = capsys.readouterr().err
+    assert f"kanban admit: REFUSED {tid}: held: clone_pending:ace-ai" in err, err
+    assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
+
+
 def _site_triggers():
     """site key -> trigger(m, ctx) that puts the card(s) ``ctx["tids"]`` (or
     the board) into the state that fires that site. It returns ``(host, kind,
@@ -946,6 +980,14 @@ def _site_triggers():
         ctx["plan"] = None
         return "studio", "twin", f"pause_hold \\({LOCAL_NAME}:fwa:.*stage=destination\\)"
 
+    def clone_pending(m, ctx):
+        # t_915b8d2d: a worktree card placed on a pool host whose clone of that workspace is still pending
+        # (this process or another dispatcher holds the clone lock) waits clone_pending, its slot released. Kind
+        # `admit` like layer0b: only admit's forced take places on ace-ai here (the tick's take has no remote
+        # pressure, so its twin stops at pin_host_unknown before the clone check).
+        _clone_pending(m, ctx)
+        return "ace-ai", "admit", "held: clone_pending:ace-ai"
+
     def claim(m, ctx):
         m.setattr(kb, "claim_task", lambda conn, task_id, **k: None)
         return "studio", "twin", "did not spawn"
@@ -1133,6 +1175,7 @@ def _site_triggers():
         "continue: _dest_wait is not None": fwa_dest_belt,
         "continue: _local_wait is not None": fwa_local_held,
         "continue: _gap is not None": layer0b,
+        "continue: not _ready": clone_pending,
         "continue: claimed is None": claim,
         "fail: except _kph.PauseHeld (try: _kb.claim_task)": claim_pause,
         "continue: except Exception (try: _kb.apply_lane_model_override)": lane_route,
