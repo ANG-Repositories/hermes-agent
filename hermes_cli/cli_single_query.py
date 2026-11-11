@@ -221,6 +221,11 @@ def _raise_worker_exit(cli, result, code: int):
     exc.code = int(code)
     if os.environ.get("HERMES_KANBAN_TASK"):
         with suppress(Exception):
+            # rc=130 alone reads as a signal; an in-process stop (turn lease, liveness watchdog)
+            # names itself here so the worker log says who stopped the turn (t_61a89317).
+            reason = result.get("turn_exit_reason") if isinstance(result, dict) and result.get("interrupted") else None
+            if reason:
+                print(f"\n[kanban-worker-exit] interrupted: {reason}", file=sys.stderr, flush=True)
             print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
     raise exc
 
