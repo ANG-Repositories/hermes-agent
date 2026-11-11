@@ -22,7 +22,7 @@ import os
 import re
 import shlex
 import subprocess
-from typing import Callable, Dict, Mapping, MutableMapping, Optional
+from typing import Callable, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
 
@@ -531,6 +531,8 @@ CARRIED_EVENT = "workspace_carried"
 # (custody, independent of placement.continuation); the Studio original is never run against or carried again.
 CARRY_BIND_RULE = "workspace_carry"
 _carry_scan_cache: Dict[tuple, tuple] = {}
+_carry_clone_cache: Dict[tuple, tuple] = {}  # skip_clones census key -> clone paths it skipped (t_9965b8d5)
+_carry_split_usage: Dict[object, tuple] = {}  # root -> (bytes, entries, caps) of the last skip_clones census (F4)
 _carry_waiting: Dict[tuple, tuple] = {}  # cache key -> (budget generation first deferred, last asked); FIFO
 _carry_gen = 0
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
@@ -638,7 +640,7 @@ class CarryScanBudget:
 def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                   max_entries: int = CARRY_MAX_ENTRIES, now: Optional[float] = None,
                   budget: Optional[CarryScanBudget] = None,
-                  max_seconds: float = CARRY_SCAN_MAX_SECONDS) -> bool:
+                  max_seconds: float = CARRY_SCAN_MAX_SECONDS, skip_clones: bool = False) -> bool:
     """True when the LOCAL workspace is small enough to carry (bytes and entries, symlinks not followed) and its
     path is :func:`carry_path_safe`. Any scan error is False (the card keeps the old rule). Cached per path and
     limits for ``CARRY_SCAN_TTL_SECONDS`` from the END of the walk: the dispatcher asks every tick.
@@ -657,7 +659,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     except (OSError, RuntimeError, ValueError):
         return False
     clock = budget.clock if budget is not None else _time.monotonic
-    key = (root, max_bytes, max_entries)
+    key = (root, max_bytes, max_entries) + (("skip_clones",) if skip_clones else ())
     t = clock() if now is None else now
     hit = _carry_scan_cache.get(key)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
@@ -676,6 +678,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     # never recurse, including links to directories and dangling links.
     import stat
     pending = [root]
+    clones: List[str] = []
     try:
         while pending and ok:
             current = pending.pop()
@@ -691,6 +694,11 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                         ok = False
                         break
                     if stat.S_ISDIR(info.st_mode):
+                        if skip_clones and os.path.isdir(os.path.join(entry.path, ".git")) \
+                                and not os.path.islink(os.path.join(entry.path, ".git")):
+                            # t_9965b8d5: a git clone is re-cloned on the pool host, never copied or counted
+                            clones.append(os.path.relpath(entry.path, root))
+                            continue
                         pending.append(entry.path)
                     if entries % 256 == 0 and clock() >= stop:
                         ok, timed_out = False, True
@@ -709,14 +717,204 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     if timed_out:
         _log.info("carry census of %s refused: walk passed %.1fs at %d entries", root, max_seconds, entries)
     _carry_scan_cache[key] = (end if now is None else now, ok)
+    if skip_clones:
+        _carry_clone_cache[key] = tuple(sorted(clones)) if ok else ()
+        _carry_split_usage[root] = (total, entries, max_bytes, max_entries)
     return ok
+
+
+def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None,
+                max_bytes: int = CARRY_MAX_BYTES, max_entries: int = CARRY_MAX_ENTRIES) -> Optional[Tuple[str, ...]]:
+    """t_9965b8d5 (operator 2026-11-10 15:3x): a workspace over the carry limit is carried WITHOUT its git clones,
+    which the pool host re-clones from origin at the same branch and commit. Returns the clone paths (relative to
+    the workspace, non-empty) when everything else fits the limits, else None (nothing to split, still over, scan
+    refused or deferred). A clone path must be shell-inert like the workspace itself."""
+    if not carry_size_ok(path, budget=budget, max_bytes=max_bytes, max_entries=max_entries, skip_clones=True):
+        return None
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        root = canon(path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    clones = _carry_clone_cache.get((root, max_bytes, max_entries, "skip_clones"), ())
+    if not clones or not all(carry_path_safe(f"{str(root).rstrip('/')}/{c}") for c in clones):
+        return None
+    return clones
+
+
+def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional[dict], Optional[str]]:
+    """``(record, None)`` when the clone at ``repo`` can be rebuilt from origin on a pool host, else
+    ``(None, reason)``. The rules are the worktree port's (t_1d2c5939): a GitHub origin, on a branch, nothing
+    uncommitted or untracked; its ignored files (minus regenerable caches) are listed in ``ignored`` and carried; a branch origin has or is behind (``push`` then carries the unpushed commits,
+    force-with-lease pinned to the origin sha seen here); a branch that diverged from origin is refused."""
+    from pathlib import Path as _P
+    from hermes_cli import kanban_worktree_port as _kwt
+
+    def _out(*args):
+        try:
+            proc = runner(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8",
+                          timeout=10, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (proc.stdout or "").strip() if getattr(proc, "returncode", 1) == 0 else None
+
+    slug = _kwt.origin_slug(_P(repo), runner)
+    if not slug:
+        return None, "origin_not_github"
+    branch = _out("branch", "--show-current")
+    if not branch:
+        return None, "detached_head"
+    if not _kwt._clean_on_branch(_P(repo), branch, runner):
+        return None, "dirty_tree"
+    if _out("rev-parse", "-q", "--verify", "refs/stash") is not None:
+        # Prism 425d85646d96: a stash lives only in this .git; the re-clone would drop it.
+        return None, "stash_present"
+    # Prism 38aae6c981c1/62448b5b6868/72087e167990/30ed122cf9a9: a re-clone cannot restore ignored files (datasets,
+    # .env, built state). Operator F4: they are carried into the rebuilt clone (carry_clones), except regenerable
+    # caches, which are dropped; listed one per FILE so the carry copies exactly these paths.
+    ignored = clone_ignored_files(repo, runner)
+    if ignored is None:
+        return None, "dirty_tree"
+    local = _out("rev-parse", "-q", "--verify", f"refs/heads/{branch}")
+    if not local:
+        return None, "no_local_branch"
+    remote = _out("rev-parse", "-q", "--verify", f"refs/remotes/origin/{branch}") or ""
+    push = None
+    if remote != local:
+        # Review F1: the dispatcher never pushes a scratch clone's commits to origin's default branch (no PR there).
+        head = _out("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or ""
+        if branch in {"main", "master", head.split("/", 1)[-1]} - {""}:
+            return None, "unpushed_commits_on_default_branch"
+        if not head:
+            # Prism ca6624b1adff: without origin/HEAD the default branch is unknown (a `trunk` would slip past the
+            # names above), so no push is authorized. A level clone (no push) still re-clones.
+            return None, "unpushed_commits_default_branch_unknown"
+        if remote and _out("merge-base", "--is-ancestor", remote, local) is None:
+            return None, "diverged_from_origin"
+        push = (repo, branch, remote, local)
+    return {"slug": slug, "branch": branch, "sha": local, "push": push, "ignored": ignored}, None
+
+
+# Operator F4 (2026-11-10 20:5x): ignored paths a re-clone may DROP because a run regenerates them. Anything else
+# ignored is carried. Matched on any path component (a directory name, or a file name for .DS_Store).
+REGENERABLE_CACHE_NAMES = frozenset({
+    "__pycache__",    # CPython bytecode, rewritten on import
+    ".pytest_cache",  # pytest cache (lastfailed, nodeids), rebuilt on the next run
+    ".ruff_cache",    # ruff lint cache
+    ".mypy_cache",    # mypy incremental cache
+    ".ty_cache",      # ty incremental cache
+    ".tox",           # tox envs, rebuilt by tox
+    ".DS_Store",      # Finder metadata, no content
+})
+
+
+def clone_ignored_files(repo: str, runner: Callable = subprocess.run) -> Optional[Tuple[str, ...]]:
+    """The clone-relative git-ignored FILES of ``repo`` a re-clone would lose, regenerable caches left out
+    (operator F4); None when git cannot list them."""
+    try:
+        proc = runner(["git", "-C", repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+                      capture_output=True, text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    return tuple(sorted(p for p in (proc.stdout or "").split("\0") if p and not regenerable_cache(p)))
+
+
+def regenerable_cache(rel: str) -> bool:
+    """True when the clone-relative ignored path ``rel`` lies in a regenerable cache (operator F4): any component in
+    :data:`REGENERABLE_CACHE_NAMES`, or a ``*.egg-info`` directory (setuptools metadata, rebuilt by an install)."""
+    parts = rel.strip("/").split("/")
+    return any(p in REGENERABLE_CACHE_NAMES for p in parts) or any(p.endswith(".egg-info") for p in parts[:-1])
+
+
+def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int) -> Optional[str]:
+    """None when the split carry's remainder (the last :func:`carry_split` census of ``path``, against the caps that
+    census used) PLUS the clones' carried ignored files (``extra_*``) stays within the caps, else the reason naming
+    the cap (operator F4)."""
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        root = canon(path)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return "carry census unavailable"
+    used = _carry_split_usage.get(root)
+    if used is None:
+        return "carry census unavailable"
+    total, entries = used[0] + extra_bytes, used[1] + extra_entries
+    if total > used[2]:
+        return f"over the carry byte cap with the clones' ignored files: {total} > {used[2]} bytes"
+    if entries > used[3]:
+        return f"over the carry entry cap with the clones' ignored files: {entries} > {used[3]} entries"
+    return None
+
+
+_clone_assess_cache: Dict[tuple, tuple] = {}  # (canonical path, HEAD key) -> (monotonic at, (record, reason))
+
+
+def _clone_head_key(repo: str) -> Optional[tuple]:
+    """A no-subprocess fingerprint of the clone's HEAD (review F3): the ``.git/HEAD`` text, the sha its branch ref
+    holds (loose ref, else packed-refs) and the index mtime. None (do not cache) when any part cannot be read."""
+    git = os.path.join(repo, ".git")
+    try:
+        with open(os.path.join(git, "HEAD"), encoding="utf-8-sig") as f:
+            head = f.read().strip()
+        sha = head
+        if head.startswith("ref: "):
+            ref = head[5:]
+            loose = os.path.join(git, *ref.split("/"))
+            if os.path.isfile(loose):
+                with open(loose, encoding="utf-8-sig") as f:
+                    sha = f.read().strip()
+            else:
+                sha = ""
+                with open(os.path.join(git, "packed-refs"), encoding="utf-8-sig") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) == 2 and parts[1] == ref:
+                            sha = parts[0]
+                            break
+                if not sha:
+                    return None
+        index = os.stat(os.path.join(git, "index")).st_mtime_ns if os.path.exists(os.path.join(git, "index")) else 0
+        return (head, sha, index)
+    except (OSError, UnicodeError):
+        return None
+
+
+def assess_clone_cached(repo: str, runner: Callable = subprocess.run,
+                        now: Optional[float] = None) -> Tuple[Optional[dict], Optional[str]]:
+    """:func:`assess_clone` cached for ``CARRY_SCAN_TTL_SECONDS`` per clone path and HEAD (review F3): the routing
+    pass asks every tick under the dispatch lock, and one assessment is several git subprocesses including
+    ``git status --ignored --untracked-files=all``. A clone whose HEAD, branch ref or index moved is re-assessed."""
+    import time as _time
+    key = _clone_head_key(repo)
+    if key is None:
+        return assess_clone(repo, runner)
+    try:
+        ck = (os.path.realpath(repo),) + key
+    except (OSError, ValueError):
+        return assess_clone(repo, runner)
+    t = _time.monotonic() if now is None else now
+    hit = _clone_assess_cache.get(ck)
+    if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
+        rec, why = hit[1]
+        return (dict(rec) if rec is not None else None), why
+    rec, why = assess_clone(repo, runner)
+    # ``git status`` may refresh (rewrite) the index: store under the fingerprint as the assessment LEFT it.
+    after = _clone_head_key(repo)
+    if after is not None:
+        if len(_clone_assess_cache) > 4096:
+            _clone_assess_cache.clear()
+        _clone_assess_cache[(ck[0],) + after] = (t, ((dict(rec) if rec is not None else None), why))
+    return rec, why
 
 
 def _raise(exc: OSError) -> None:
     raise exc
 
 
-def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subprocess.run) -> None:
+def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subprocess.run,
+                    exclude: Tuple[str, ...] = ()) -> None:
     """Copy the local ``workspace`` to the same path on ``host`` (rsync -a over the pool ssh options); raise on any
     failure. Never deletes on the target: an existing remote file of the same name is overwritten, others stay."""
     src = workspace.rstrip("/") or "/"
@@ -726,13 +924,95 @@ def carry_workspace(host: PoolHost, workspace: str, runner: Callable = subproces
     # reservation take() booked for this card on this host, so it places no work of its own.
     prepare_remote_workspace(host, src, runner)
     ssh = _ssh_argv(host, "")[:-2]  # the ssh options, without target and command
-    proc = runner(["rsync", "-a", "-e", " ".join(shlex.quote(a) for a in ssh), "--", f"{src}/",
+    # ``exclude``: workspace-relative clone paths the host re-clones instead (t_9965b8d5), anchored at the root.
+    excl = [f"--exclude=/{rel.strip('/')}/" for rel in exclude]
+    proc = runner(["rsync", "-a", *excl, "-e", " ".join(shlex.quote(a) for a in ssh), "--", f"{src}/",
                    f"{host.target}:{src}/"],
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
     if getattr(proc, "returncode", 1) != 0:
         raise RuntimeError(f"carry to {host.name}: rsync {src} rc={getattr(proc, 'returncode', '?')}: "
                            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+
+
+def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable = subprocess.run) -> Optional[str]:
+    """None when the Studio clone at ``repo`` is still clean on ``branch`` with HEAD at ``sha``, else the reason
+    (review F2, 22:1x). Uncached on purpose: the routing record may come from :func:`assess_clone_cached`, whose
+    key cannot see an unstaged edit or a new untracked file, and the file carry excludes the clone, so rebuilding
+    a clone that changed since routing would lose that work."""
+    from pathlib import Path as _P
+    from hermes_cli import kanban_worktree_port as _kwt
+    if not _kwt._clean_on_branch(_P(repo), branch, runner):
+        return f"is no longer clean on {branch}"
+    try:
+        cur = runner(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8",
+                     timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return "HEAD unreadable"
+    if getattr(cur, "returncode", 1) != 0 or (cur.stdout or "").strip() != sha:
+        return f"HEAD moved off {str(sha)[:12]}"
+    try:
+        st = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True, text=True,
+                    encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return "stash unreadable"
+    if getattr(st, "returncode", 1) == 0:
+        return "has a stash"  # Prism 425d85646d96: written since routing; the re-clone would drop it
+    return None
+
+
+def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run) -> None:
+    """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
+    pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
+    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
+    from hermes_cli import kanban_worktree_port as _kwt
+    # Every check runs for every clone before anything is pushed, rebuilt or copied (nothing half-carried).
+    staged = []
+    extra_bytes = extra_entries = 0
+    for c in clones:
+        dest = f"{workspace.rstrip('/')}/{c['rel'].strip('/')}"
+        if not carry_path_safe(dest):
+            raise RuntimeError(f"carry to {host.name}: refused, clone path {dest!r} is not shell-inert")
+        # Review F2 (22:1x): uncached re-check before anything is pushed or rebuilt (see clone_moved_since_routing).
+        moved = clone_moved_since_routing(dest, c["branch"], c["sha"], runner)
+        if moved:
+            raise RuntimeError(f"carry to {host.name}: clone {c['rel']} {moved}")
+        # operator F4: the clone's ignored files (not regenerable caches) land at the same paths inside it. Listed
+        # afresh here, not from the routing's cached record: a file written since then is carried too.
+        ignored = clone_ignored_files(dest, runner)
+        if ignored is None:
+            raise RuntimeError(f"carry to {host.name}: cannot list the ignored files of {c['rel']}")
+        for ign in ignored:
+            try:
+                extra_bytes += os.lstat(os.path.join(dest, ign)).st_size
+            except OSError:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']} ignored file {ign!r} unreadable")
+            extra_entries += 1
+        staged.append((c, dest, ignored))
+    if extra_entries:
+        # Review F3 (22:1x): the spawn-time list gets the routing's caps again; a file that grew or appeared since
+        # routing can push the carry over, and then the spawn fails with the same named reason the wait line uses.
+        over = carry_split_fits(workspace, extra_bytes, extra_entries)
+        if over is not None:
+            raise RuntimeError(f"carry to {host.name}: {over}")
+    for c, dest, ignored in staged:
+        if c.get("push") is not None:
+            _kwt.push_card_branch(tuple(c["push"]), runner)
+        route = _kwt.derived_route(c["slug"], fleet_dir, (host.name,))
+        mirror = _kwt.mirror_for((c["slug"], *route), host.name) if route else \
+            f"{_kwt.DERIVED_MIRROR_ROOT}/{c['slug']}.git"
+        # the one allowlisted clone spawn, told to end on the Studio's commit (rc 5 otherwise: raises)
+        _kwt.clone_on_host(host, dest, c["slug"], mirror, c["branch"], runner, sha=c["sha"], exact=True)
+        if ignored:
+            ssh = _ssh_argv(host, "")[:-2]
+            proc = runner(["rsync", "-a", "--from0", "--files-from=-", "-e", " ".join(shlex.quote(a) for a in ssh),
+                           "--", f"{dest}/", f"{host.target}:{dest}/"],
+                          input="\0".join(ignored) + "\0", capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=CARRY_TIMEOUT_SECONDS)
+            if getattr(proc, "returncode", 1) != 0:
+                raise RuntimeError(f"carry to {host.name}: ignored files of {c['rel']} rc="
+                                   f"{getattr(proc, 'returncode', '?')}: "
+                                   f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
 
 
 def remote_workspace_has_content(placement_raw: Optional[str],

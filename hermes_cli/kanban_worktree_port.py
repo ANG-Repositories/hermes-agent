@@ -894,7 +894,8 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
 
 
 def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
-                 url: Optional[str] = None, sha: Optional[str] = None, carried: bool = False) -> str:
+                 url: Optional[str] = None, sha: Optional[str] = None, exact: bool = False,
+                 carried: bool = False) -> str:
     """Remote sh: clone origin into the (empty) workspace, then put HEAD on
     ``branch`` and PROVE it (rc 4 otherwise). The mirror only accelerates the
     clone: ``--dissociate`` copies what was borrowed, so a later mirror prune
@@ -906,8 +907,12 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     the checkout instead of returning early (Prism f43e48b43fc3). rc 3 = the
     workspace holds something else (never overwritten). ``sha`` (the pushed
     tip, Prism 3e2f8506c8ff): a reused checkout behind it is fetched and
-    fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise). ``carried`` (a dirty carry follows,
-    t_894be273): an earlier carry's files are undone (:func:`_carry_undo`) before the checkout and fast-forward."""
+    fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise). ``exact``
+    (a fresh re-clone of a carried scratch clone, t_9965b8d5): reset to
+    ``sha`` even when it is behind the branch tip, then PROVE it (rc 5); a reused clone with uncommitted edits
+    (rc 7) or commits no remote holds (rc 6) is refused before the reset, nothing reset. ``carried`` (a dirty carry follows,
+    t_894be273): an earlier carry's files are undone (:func:`_carry_undo`) before the checkout and fast-forward.
+    The two combine: a reused clone is undone, then put on the exact ``sha``."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
     if mirror.startswith("~/"):
         # A derived per-host default (t_1d2c5939): the host's own $HOME, whatever user/OS it runs.
@@ -935,19 +940,31 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
         f"[ \"$(git branch --show-current)\" = {b} ] || exit 4"
         + (f"; if [ \"$(git rev-parse HEAD)\" != {shlex.quote(sha)} ]; then "
            f"{{ git fetch -q origin {b} && git merge -q --ff-only {shlex.quote(sha)}; }} || exit 5; fi; "
-           f"[ \"$(git rev-parse HEAD)\" = {shlex.quote(sha)} ] || exit 5" if sha else "")
+           f"[ \"$(git rev-parse HEAD)\" = {shlex.quote(sha)} ] || exit 5" if sha and not exact else "")
+        # t_9965b8d5: a re-cloned scratch clone lands on the Studio's exact commit, even behind the tip (rc 5 otherwise)
+        # Prism 30f81cba3dfc: never reset away a reused clone's commits that no remote holds (rc 6)
+        # Apollo F1 01:0x: nor its uncommitted edits (tracked changes, untracked non-ignored files: rc 7)
+        + (f"; s={shlex.quote(sha)}; if [ \"$(git rev-parse HEAD)\" != \"$s\" ]; then "
+           "[ -z \"$(git status --porcelain)\" ] || exit 7; "
+           "[ -z \"$(git rev-list -n 1 HEAD --not --remotes)\" ] || exit 6; git reset -q --hard \"$s\"; fi; "
+           "[ \"$(git rev-parse HEAD)\" = \"$s\" ] || exit 5" if sha and exact else "")
     )
 
 
 def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
                   runner: Callable = subprocess.run, sha: Optional[str] = None,
-                  carry: Optional[tuple] = None) -> None:
+                  carry: Optional[tuple] = None, exact: bool = False) -> None:
     """Run :func:`clone_script` on ``host`` (a ``PoolHost``); raise on failure. ``carry`` = the port's
     ``(own tree, HEAD sha, digest)`` (t_894be273): the dirty tree's :func:`carry_payload` rides the SAME ssh call
-    on stdin, applied by :func:`carry_script` once the clone is proved at that HEAD."""
+    on stdin, applied by :func:`carry_script` once the clone is proved at that HEAD. ``exact`` (t_9965b8d5): the
+    clone lands on ``sha`` even behind the branch tip (see :func:`clone_script`)."""
     from hermes_cli.kanban_worker_pool import _ssh_argv
-    script = (clone_script(workspace, slug, mirror, branch, sha=sha, carried=True) if carry
-              else clone_script(workspace, slug, mirror, branch, sha=sha))
+    kw: dict = {"sha": sha}
+    if carry:
+        kw["carried"] = True
+    if exact:
+        kw["exact"] = True
+    script = clone_script(workspace, slug, mirror, branch, **kw)
     io_kw: dict = {"stdin": subprocess.DEVNULL}
     timeout = CLONE_TIMEOUT_S
     if carry:

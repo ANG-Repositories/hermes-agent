@@ -50,6 +50,11 @@ _FIXES = (
     ("requires:",
      "the capability the card requires is on no pool host it may use. Fix: correct the "
      "`requires:` line, or pin the host that serves it."),
+    ("studio_capability_only:",
+     "the card was kept off the pool but names no Studio-only capability, so it waits instead of running "
+     "on the Studio (t_9965b8d5). Fix: if it needs the Studio, add `requires: <studio-only capability>` "
+     "(studio-state, control-plane, browser-session, obsidian-vault, ...); else fix what the detail names "
+     "(commit/push the worktree, drop the shared workspace) so it ports."),
     ("not_portable:linked",
      "a link to a live card (named in the detail) holds it off the pool, so its `host:` pin "
      "is not honoured while that edge is live. Fix: drop the pin, or relink the edge "

@@ -1040,6 +1040,40 @@ def test_carry_runs_on_every_port_and_a_reused_clone_ends_byte_equal(kanban_home
     assert len(calls) == 2
 
 
+def test_exact_and_carried_combine_on_a_reused_clone_behind_the_tip(kanban_home, anchor, tmp_path, monkeypatch):
+    """Merge of #219 (carried) and #216 (exact), operator F1 22:1x: a reused clone that sits at the branch tip,
+    with a carry attached and an exact sha BEHIND that tip, ends on the exact commit with the carried files in
+    place. Without ``exact`` the fast-forward path leaves HEAD on the tip and the call fails rc 5."""
+    with kb.connect_closing() as conn:
+        bare, tid, wt = _dirty_tree(conn, anchor, tmp_path, monkeypatch)
+    head = _ref(wt, "HEAD")
+    # origin's card branch moves past the Studio head (another pusher)
+    other = tmp_path / "other"
+    _git("clone", "-q", "-b", f"wt/{tid}", str(bare), str(other), cwd=tmp_path)
+    _commit(other, "ahead")
+    _git("push", "-q", "origin", f"wt/{tid}", cwd=other)
+    tip = _ref(other, "HEAD")
+    assert tip != head
+    ws = tmp_path / "pool" / tid
+    real_script = kwt.clone_script
+    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, mirror, branch, url=None, sha=None, **kw: real_script(
+        w, slug, str(tmp_path / "no-mirror.git"), branch, url=str(bare), sha=sha, **kw))
+    # the reused clone: an earlier run left it at origin's tip
+    assert subprocess.run(["sh", "-c", kwt.clone_script(str(ws), SLUG, "m", f"wt/{tid}", sha=tip)]).returncode == 0
+    assert _ref(ws, "HEAD") == tip
+    calls: list = []
+    carry = (str(wt), head, kwt.carry_digest(wt, kwt.dirty_census(wt)))
+    with pytest.raises(RuntimeError, match="rc=5"):
+        kwt.clone_on_host(_host("ace-ai"), str(ws), SLUG, "m", f"wt/{tid}", runner=_local_ssh(calls), sha=head,
+                          carry=carry)
+    kwt.clone_on_host(_host("ace-ai"), str(ws), SLUG, "m", f"wt/{tid}", runner=_local_ssh(calls), sha=head,
+                      carry=carry, exact=True)
+    assert _ref(ws, "HEAD") == head                          # the exact commit, behind origin's tip
+    assert _tree_state(ws) == _tree_state(wt)                # the carried files in place, deletion applied
+    assert (ws / "scratch.txt").read_text() == "uncommitted" and not (ws / "doomed").exists()
+    assert not (ws / "ahead").exists()
+
+
 def test_dirty_submodule_or_nested_repo_keeps_the_card_local(kanban_home, anchor, tmp_path, monkeypatch):
     """Apollo F3 / Prism 136fb02e9f5e, 571037abe277: status cannot see inside an embedded repository or a
     submodule, so a tree holding either stays local with a named reason."""

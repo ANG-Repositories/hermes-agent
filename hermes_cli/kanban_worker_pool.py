@@ -1085,7 +1085,8 @@ def mint_studio_pin_note(body: Optional[str], fleet_dir: Path,
             return None
         from hermes_cli import kanban_host_capabilities as _khc
         cmap = _khc.load_map(fleet_dir)
-        reasons = studio_map_reasons(cmap)
+        from hermes_cli import kanban_studio_capability as _ksc
+        reasons = _ksc.create_reasons(cmap)  # dispatch's vocabulary (t_9965b8d5)
         if skills_need_studio(skills, cmap, reasons):
             return None
     except Exception:
