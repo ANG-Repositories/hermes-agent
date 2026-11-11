@@ -12450,7 +12450,7 @@ def complete_task(
             summary = f"External: {external} (watcher {watcher} reopens on upstream close)."
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata, superseded=content_survivors)
     if acceptance is False:
         return False
     with write_txn(conn):
