@@ -217,6 +217,7 @@ def _clone_in(ws, name="repo", *, dirty=False, ahead=False, ignored=False, branc
     g("commit", "-q", "-m", "base")
     g("remote", "add", "origin", "https://github.com/acme/widget.git")
     g("update-ref", "refs/remotes/origin/main", "HEAD")
+    g("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")  # as `git clone` leaves it
     if branch != "main":
         g("update-ref", f"refs/remotes/origin/{branch}", "HEAD")
         g("checkout", "-q", "-b", branch)
@@ -418,6 +419,7 @@ def test_carry_clones_lands_the_ignored_file_byte_equal_inside_the_rebuilt_clone
             argv = argv[:e] + argv[e + 2:]  # drop the ssh transport: the "host" is a local root
             argv = [str(pool) + a.split(":", 1)[1] if a.startswith(f"{host.target}:") else a for a in argv]
         return subprocess.run(argv, **{k: v for k, v in kw.items() if k != "stdin"})
+    assert kwh.carry_split(str(studio)) == ("repo",)  # the routing's census, which the spawn re-check reads (F3)
     kwh.carry_clones(host, str(studio), [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha,
                                           "push": None, "ignored": ("data/input.csv",)}],
                      kanban_home / "fleet", runner=runner)
@@ -517,6 +519,7 @@ def test_carry_clones_rebuilds_the_clone_at_the_same_commit(kanban_home, tmp_pat
     ws.mkdir()
     # Studio and pool host are one local path here: the Studio-side re-check (review F2) has no Studio clone to read
     monkeypatch.setattr(kwh, "clone_moved_since_routing", lambda *a, **k: None)
+    monkeypatch.setattr(kwh, "clone_ignored_files", lambda *a, **k: ())
     kwh.carry_clones(_host(), str(ws), [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": first,
                                          "push": None}], kanban_home / "fleet", runner=local)
     head = subprocess.run(["git", "-C", str(ws / "repo"), "rev-parse", "HEAD"], check=True, capture_output=True,
@@ -576,3 +579,147 @@ def test_studio_capability_is_consumer_neutral():
     assert ksc.studio_capability(["fleet-ssh"], (), _cmap()) is None  # a pool host has it
     rec = ksc.studio_capability(["fleet-ssh", "studio-state"], (), _cmap())
     assert rec["capability"] == "studio-state" and rec["source"] == "declared", rec
+
+
+# -- review round 22:1x F3 + Prism round 2 at b9dc0429 ----------------------------------------------------------
+
+def test_carry_clones_reapplies_the_caps_to_ignored_files_that_grew_since_routing(kanban_home, small_carry,
+                                                                                  monkeypatch):
+    """Review F3 (22:1x): the ignored files are listed again at spawn and the routing's caps apply to that list.
+    A file that grew past the cap after routing fails the spawn naming the cap; nothing is pushed or cloned."""
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    pushed, cloned = [], []
+    monkeypatch.setattr(kwt, "push_card_branch", lambda push, runner=None: pushed.append(push))
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path, ignored=True)
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait" and plan["clones"][0]["ignored"] == ("data/input.csv",), route
+    grown = __import__("pathlib").Path(path) / "repo" / "data" / "input.csv"
+    grown.write_bytes(b"z" * 9000)  # over the 8 kB test cap, written after routing
+    with pytest.raises(RuntimeError, match="over the carry byte cap with the clones' ignored files"):
+        kwh.carry_clones(_host(), path, plan["clones"], kanban_home / "fleet")
+    assert pushed == [] and cloned == []
+
+
+def test_clone_ahead_without_origin_head_never_pushes(kanban_home, small_carry, monkeypatch):
+    """Prism ca6624b1adff: origin/HEAD absent and the branch named `trunk` (the real default): the name check
+    cannot see it, so no push is authorized. A level clone on the same branch still re-clones."""
+    import subprocess
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        repo = str(__import__("pathlib").Path(path) / "repo")
+        sha = _clone_in(path, branch="trunk")
+        subprocess.run(["git", "-C", repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"], check=True)
+        assert kwh.assess_clone(repo)[0]["push"] is None  # level: re-clones
+        (__import__("pathlib").Path(repo) / "more.txt").write_text("x\n")
+        subprocess.run(["git", "-C", repo, "add", "more.txt"], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "a"],
+                       check=True)
+        assert kwh.assess_clone(repo) == (None, "unpushed_commits_default_branch_unknown")
+        subprocess.run(["git", "-C", repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+                       check=True)
+        rec, why = kwh.assess_clone(repo)  # origin/HEAD known and not trunk: a feature branch, pushed as before
+    assert why is None and rec["push"][1:3] == ("trunk", sha), (rec, why)
+
+
+def test_clone_with_a_stash_is_refused_at_routing_and_at_spawn(kanban_home, tmp_path, monkeypatch):
+    """Prism 425d85646d96: a stash lives only in the Studio clone's .git and a re-clone drops it."""
+    import subprocess
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sha = _clone_in(ws)
+    repo = str(ws / "repo")
+    rec, why = kwh.assess_clone(repo)
+    assert why is None
+    (ws / "repo" / "big.bin").write_bytes(b"stashed edit")
+    subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", "stash", "-q"], check=True)
+    assert kwh.assess_clone(repo) == (None, "stash_present")
+    cloned = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
+    clone = [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha, "push": None}]
+    with pytest.raises(RuntimeError, match="has a stash"):
+        kwh.carry_clones(_host(), str(ws), clone, kanban_home / "fleet")
+    assert cloned == []
+
+
+def test_exact_reset_refuses_to_drop_unpushed_commits_on_a_reused_pool_clone(tmp_path):
+    """Prism 30f81cba3dfc: the exact reset on a reused clone exits 6 when the clone holds a commit no remote has;
+    a reused clone whose commits are all on origin is reset to the exact sha as before."""
+    import subprocess
+    from hermes_cli import kanban_worktree_port as kwt
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    w = tmp_path / "w"
+    subprocess.run(["git", "clone", "-q", str(origin), str(w)], check=True, capture_output=True)
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(w), "-c", "user.email=t@t", "-c", "user.name=t", *a], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    up = ("pu" + "sh", "-q", "origin", "HEAD:refs/heads/main")
+    (w / "a.txt").write_text("1\n")
+    g("add", "a.txt")
+    g("commit", "-q", "-m", "one")
+    g(*up)
+    first = g("rev-parse", "HEAD")
+    (w / "a.txt").write_text("2\n")
+    g("commit", "-q", "-am", "two")
+    g(*up)
+    g("fetch", "-q", "origin")
+    (w / "a.txt").write_text("3\n")
+    g("commit", "-q", "-am", "local only")
+    local = g("rev-parse", "HEAD")
+
+    def run():
+        return subprocess.run(["sh", "-c", kwt.clone_script(str(w), "acme/widget", str(tmp_path / "nomirror"),
+                                                            "main", url=str(origin), sha=first, exact=True)],
+                              capture_output=True, text=True)
+    assert run().returncode == 6
+    assert g("rev-parse", "HEAD") == local  # the unpushed commit is still the branch tip
+    g("reset", "-q", "--hard", "origin/main")  # nothing local-only left
+    proc = run()
+    assert proc.returncode == 0, proc.stderr
+    assert g("rev-parse", "HEAD") == first
+
+
+@pytest.mark.parametrize("hold", ["profile", "linked", "workspace_bind"])
+def test_worktree_card_held_by_a_structural_rule_is_recorded_not_waited(kanban_home, anchor, monkeypatch, hold):
+    """Prism 68e6b44a555a: portable() names workspace_kind before profile / linked / a bind, so the port was never
+    assessed. That card used to wait forever under the rule; it stays local, recorded as structural."""
+    from tests.hermes_cli.test_kanban_worktree_port import _commit, _worktree_card
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        if hold == "profile":
+            conn.execute("UPDATE tasks SET assignee='nobody-serves-me' WHERE id=?", (tid,))
+        elif hold == "linked":
+            monkeypatch.setattr(kbd, "_linked_ids", lambda conn, ids, mode: {i: "t_parent" for i in ids})
+        else:
+            monkeypatch.setattr(kbd, "_workspace_binds", lambda conn, rows: {r["id"]: ("bind", "t_x", None)
+                                                                             for r in rows})
+        route, rule, studio = _route(conn, tid)
+    assert route[0] == "local", route
+    assert studio == {"capability": f"workspace_kind:{hold}", "source": "card", "evidence": str(anchor),
+                      "kind": "structural"}, studio
+
+
+def test_worktree_the_port_refuses_with_a_declared_studio_only_capability_runs_on_the_studio(kanban_home, anchor,
+                                                                                               monkeypatch):
+    """Prism 68e6b44a555a: a worktree the port refuses for a non-structural reason, on a card that declares
+    `requires: control-plane`: the declared line establishes the Studio placement, it does not wait."""
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worktree_port import _commit, _git, _worktree_card
+    monkeypatch.setenv(kwt.DIRTY_CARRY_ENV, "0")
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor, body="requires: control-plane")
+        tree = anchor / ".worktrees" / tid
+        _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(tree), cwd=anchor)
+        (tree / "a.txt").write_text("x")
+        route, rule, studio = _route(conn, tid)
+    assert route[0] == "local", route
+    assert studio["capability"] == "control-plane" and studio["source"] == "declared", studio
