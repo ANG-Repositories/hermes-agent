@@ -484,11 +484,16 @@ class HoldStore:
         """``(key, path, stat)`` of every record of ``name``, newest write first."""
         cands = [(LEGACY, self.consumer_path(name))]
         sub = self.consumers_dir / _consumer_filename(name)[:-5]
+        # os.scandir, not Path.glob: glob swallows EACCES/EIO and yields nothing,
+        # which reads as "no other publisher" (Prism 7ef91f0ded22). Only a missing
+        # directory is empty; any other failure propagates so readers fail closed.
         try:
-            cands += [(p.name[:-5], p) for p in sub.glob("*.json")
-                      if not p.name.startswith(".") and _INSTANCE_RE.fullmatch(p.name[:-5])]
-        except OSError:
-            pass
+            with os.scandir(sub) as it:
+                names = [e.name for e in it]
+        except (FileNotFoundError, NotADirectoryError):
+            names = []
+        cands += [(n[:-5], sub / n) for n in names
+                  if n.endswith(".json") and not n.startswith(".") and _INSTANCE_RE.fullmatch(n[:-5])]
         out = []
         for key, path in cands:
             try:
@@ -567,7 +572,10 @@ class HoldStore:
         and the two mtimes are compared, so writer/reader wall-clock skew never
         enters. None when either mtime cannot be read (inconclusive)."""
         if instance is None:
-            paths = self._record_paths(name)
+            try:
+                paths = self._record_paths(name)
+            except OSError:
+                return None  # unlistable: inconclusive, never fresh
             path = paths[0][1] if paths else self.consumer_path(name)
         else:
             path = self.consumer_path(name, instance)
@@ -1086,21 +1094,41 @@ def _not_live_why(store: HoldStore, name: str, rec: Mapping[str, Any],
     return None if pid_alive(rec.get("pid")) else "publishing pid is not alive"
 
 
+def _acked_idle_under_freeze(rec: Mapping[str, Any], hold: HoldState) -> bool:
+    """The record's last write acknowledged THIS freeze epoch with zero work,
+    zero tickets and no evidence errors. Freeze refuses every admission, so
+    that publisher cannot have admitted work since: its record may drop out
+    on lease expiry alone."""
+    work, tickets = rec.get("active_work"), rec.get("tickets")
+    return (hold.mode == "freeze" and rec.get("hold_epoch") == hold.epoch
+            and not rec.get("hold_error") and not rec.get("active_work_error")
+            and isinstance(work, int) and not isinstance(work, bool) and work == 0
+            and isinstance(tickets, list) and not tickets)
+
+
 def _publisher_gone(store: HoldStore, name: str, key: str, rec: Mapping[str, Any], *,
-                    host: str, pid_alive: Callable[[int], bool]) -> bool:
+                    host: str, pid_alive: Callable[[int], bool],
+                    hold: Optional[HoldState] = None) -> bool:
     """True only on POSITIVE evidence that this record's publisher no longer
-    publishes: a released or expired lease (store clock), or a legacy
-    untokened record of a dead pid on this host. Unverifiable age, a foreign
-    host's untokened record or a malformed record is NOT gone: it is judged,
-    and judged UNKNOWN."""
+    publishes AND holds no work: a released lease; an expired lease (store
+    clock) whose last write acknowledged the current freeze idle; or a writer
+    the pid-identity check shows cannot write again (dead, another boot, a
+    reused pid). An expired lease alone only proves the publisher stopped
+    renewing: a SIGSTOPped one still holds its tickets (Prism 706463591712).
+    Unverifiable age, a foreign host's record or a malformed record is NOT
+    gone: it is judged, and judged UNKNOWN."""
     if rec.get("schema") != SCHEMA or rec.get("consumer") != name:
         return False
     if _is_leased(rec):
         if rec.get("lease_released"):
             return True
-        return _lease_fresh(store, name, rec, key) is False
-    # Legacy untokened record: the same pid-identity check a publisher applies
-    # (dead pid, another boot, a reused pid) decides; inconclusive stays live.
+        if _lease_fresh(store, name, rec, key) is not False:
+            return False
+        if hold is not None and _acked_idle_under_freeze(rec, hold):
+            return True
+    # Legacy untokened record, or an expired lease that may still hold work:
+    # the same pid-identity check a publisher applies decides; inconclusive
+    # stays live.
     if rec.get("host") != host:
         return False
     pid = rec.get("pid")
@@ -1119,7 +1147,7 @@ def _name_verdict(name: str, recs: list, hold: HoldState, *, now: float, stale_a
     if not recs:
         return _consumer_verdict(name, None, hold, **kw)
     live = [(k, r) for k, r in recs
-            if not _publisher_gone(store, name, k, r, host=host, pid_alive=pid_alive)]
+            if not _publisher_gone(store, name, k, r, host=host, pid_alive=pid_alive, hold=hold)]
     if len(live) > 1:
         return {"consumer": name, "state": UNKNOWN, "work": None, "publishers": len(live),
                 "instances": [r.get("instance") for _k, r in live],

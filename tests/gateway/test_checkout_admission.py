@@ -1418,6 +1418,81 @@ def test_mixed_fleet_legacy_shared_record_and_per_publisher_record_are_judged_to
     assert store.consumer_path(SERVE).exists(), "the legacy file is never removed by new code"
 
 
+def _frozen_live_publisher(store, name):
+    """A same-name publisher whose pid is ALIVE with its genuine identity (a
+    SIGSTOPped process): only its lease says anything about it."""
+    a = _gate(store, name)
+    a.pid = os.getppid()
+    a.start_offset = ca._start_offset(a.pid)
+    a.time_ns = ca._time_ns_id() if a.start_offset is not None else None
+    a.create_time = ca._create_time(a.pid)
+    return a
+
+
+def test_expired_lease_of_a_frozen_busy_publisher_never_drops_out(store):
+    """Prism 706463591712 repro: publisher A admits work, then stops publishing
+    past its lease expiry (SIGSTOP); B starts under the same name and
+    acknowledges idle. An expired lease does not prove A's work finished, so
+    evaluate must not drop A and judge B alone."""
+    store.hold("op", [SERVE], mode="freeze")
+    a = _frozen_live_publisher(store, SERVE)
+    with a.locked():
+        a._tickets["t"] = ca.Ticket("t", "turn", True, time.time(), a)  # admitted before the hold
+    a.publish()
+    _age_record(store, SERVE, 3600, instance=a.instance)
+    _gate(store, SERVE).publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN, rep
+
+
+def test_expired_lease_that_never_acked_the_hold_never_drops_out(store):
+    """Same shape, A idle at its last write but that write predates the hold:
+    it may have admitted work after it, so its expiry proves nothing."""
+    a = _frozen_live_publisher(store, SERVE)
+    a.publish()  # no hold yet
+    store.hold("op", [SERVE], mode="freeze")
+    _age_record(store, SERVE, 3600, instance=a.instance)
+    _gate(store, SERVE).publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN, rep
+
+
+def test_expired_idle_ack_under_freeze_drops_out(store):
+    """Control: A's last write acknowledged this freeze with zero work (freeze
+    admits nothing after that), so its expired lease clears it."""
+    store.hold("op", [SERVE], mode="freeze")
+    a = _frozen_live_publisher(store, SERVE)
+    a.publish()
+    _age_record(store, SERVE, 3600, instance=a.instance)
+    _gate(store, SERVE).publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
+                    reason="needs POSIX directory permissions enforced (non-root)")
+def test_unreadable_publisher_dir_fails_closed_never_hides_a_busy_publisher(store):
+    """Prism 7ef91f0ded22: the per-publisher directory of a name cannot be
+    listed (EACCES, EIO). Mixed fleet: an idle legacy record is readable, a
+    BUSY new publisher's record sits in that directory. A scan that treats the
+    unlistable directory as empty judges the idle legacy record alone and reads
+    QUIESCENT over live work; it must read UNKNOWN."""
+    store.hold("op", [SERVE], mode="freeze")
+    old = _gate(store, SERVE)
+    store.consumer_path(SERVE).parent.mkdir(parents=True, exist_ok=True)
+    ca._atomic_write_json(store.consumer_path(SERVE), old.snapshot())  # legacy, idle, live
+    busy_work = Work()
+    busy_work.n = 1
+    busy = AdmissionGate(store, SERVE, active_work=busy_work)
+    busy.publish()
+    sub = store.consumer_path(SERVE, busy.instance).parent
+    os.chmod(sub, 0)
+    try:
+        rep = ca.evaluate(store)
+    finally:
+        os.chmod(sub, 0o755)
+    assert rep["verdict"] == UNKNOWN, rep
+
+
 def test_dead_publisher_record_is_pruned_only_after_its_lease(store):
     """One record per process start must not pile up: a same-name publisher
     removes another instance's record once its lease has expired AND its pid
