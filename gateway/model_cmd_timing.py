@@ -5,7 +5,7 @@ and 3.6 s cold; nothing said where the rest went. The handler marks each stage b
 :func:`phase` (one line per boundary, so the long handler body is not re-indented); the time from one
 boundary to the next belongs to the earlier phase; ``confirm`` includes adapter delivery::
 
-    PHASE=model_cmd session=<key> outcome=ok save=ok lock_wait_s=0.000 config_s=0.002 ...
+    PHASE=model_cmd session=<key> path=background outcome=ok save=ok lock_wait_s=0.000 config_s=0.002 ...
         record_s=4.210 record_get_session_s=0.020 record_update_model_s=4.100 ... reply_s=0.090 total_s=4.300
 
 The reply goes out before the save (t_2ab07928), so the line is logged when the save settles, not
@@ -16,6 +16,9 @@ the first one and between delivery and the first save stage). ``record_s`` is de
 the ``record_*`` phases, one per DB/store call. ``durable_*`` fields are nested spans inside
 ``record_durable`` (config write, override clear, override write-through) and are not added again.
 A phase the command never reached prints ``-``.
+``path`` names how the command reached the handler (t_2bf22375): ``background`` (the adapter's own
+session task), ``inline_bypass`` (a busy session, dispatched inline), ``callback`` (a picker or
+confirm callback that renders its own reply) or ``direct`` (any other caller).
 Telemetry only: every entry point swallows its own errors, so it can never change the reply.
 """
 
@@ -44,6 +47,7 @@ _current: contextvars.ContextVar[Optional["ModelCmdTiming"]] = contextvars.Conte
 class ModelCmdTiming:
     def __init__(self) -> None:
         self.session = "-"
+        self.path = "-"
         self.t0 = time.monotonic()
         self.phase: Optional[str] = None
         self.phase_t0 = self.t0
@@ -65,7 +69,7 @@ class ModelCmdTiming:
             value = table.get(name)
             return f"{name}_s=" + ("-" if value is None else f"{value:.3f}")
 
-        fields = [f"PHASE=model_cmd session={self.session} outcome={outcome} save={self.save_outcome or '-'}"]
+        fields = [f"PHASE=model_cmd session={self.session} path={self.path} outcome={outcome} save={self.save_outcome or '-'}"]
         fields += [_fmt(name, self.phases) for name in PHASES]
         reached = [self.phases[n] for n in RECORD_PHASES if n in self.phases]
         fields.append("record_s=" + (f"{sum(reached):.3f}" if reached else "-"))
@@ -112,12 +116,15 @@ def finish(timing: Optional[ModelCmdTiming], outcome: str = "ok") -> None:
         pass
 
 
-def annotate(*, session: Optional[str] = None) -> None:
-    """Name the session key on the active timer once the handler knows it. Never raises."""
+def annotate(*, session: Optional[str] = None, path: Optional[str] = None) -> None:
+    """Name the session key / dispatch path on the active timer. Never raises."""
     try:
         timing = _current.get()
-        if timing is not None and not timing.finished and session:
-            timing.session = str(session)
+        if timing is not None and not timing.finished:
+            if session:
+                timing.session = str(session)
+            if path:
+                timing.path = str(path)
     except Exception:
         pass
 

@@ -4637,14 +4637,26 @@ class BasePlatformAdapter(ABC):
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
-        if log_cmd is not None:
-            text, _ = self._unwrap_ephemeral(response)
-            if text:
-                logger.info("[%s] Sending command '/%s' response (%d chars) to %s%s", self.name, log_cmd,
-                            len(text), event.source.chat_id,
-                            " (via deferred interaction)" if getattr(event, "suppress_public_echo", False) else "")
-        await self._deliver_inline_command_reply(event, response, thread_meta=thread_meta)
+        # Work the handler wants to run after its reply is sent (a /model save, t_2bf22375). Not
+        # offered for a deferred native interaction: its reply is published by the caller only
+        # after this returns, so "after the send" would still be before the reply.
+        after_reply: list = []
+        if not getattr(event, "suppress_public_echo", False):
+            with contextlib.suppress(Exception):
+                event._inline_after_reply = after_reply
+        try:
+            response = await self._message_handler(event)
+            if log_cmd is not None:
+                text, _ = self._unwrap_ephemeral(response)
+                if text:
+                    logger.info("[%s] Sending command '/%s' response (%d chars) to %s%s", self.name, log_cmd,
+                                len(text), event.source.chat_id,
+                                " (via deferred interaction)" if getattr(event, "suppress_public_echo", False) else "")
+            await self._deliver_inline_command_reply(event, response, thread_meta=thread_meta)
+        finally:
+            # Runs even when the send failed: the hook owns resources (the /model switch lock).
+            for hook in after_reply:
+                await hook()
 
     async def _deliver_inline_command_reply(self, event: MessageEvent, response: Any, *, thread_meta: Any) -> None:
         """Publish an INLINE command-dispatch reply (not an agent turn). When the event came from a
