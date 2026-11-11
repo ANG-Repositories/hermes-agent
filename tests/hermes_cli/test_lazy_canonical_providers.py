@@ -456,8 +456,13 @@ DUP_DRIVER = textwrap.dedent(
     slugs = [p.slug for p in models.CANONICAL_PROVIDERS]
     avail = [row["id"] for row in models.list_available_providers()]
     rep = lambda xs: sorted(s for s, n in collections.Counter(xs).items() if n > 1)
+    probe = sys.argv[2]
     print("PROBE_JSON " + json.dumps({"slugs": slugs, "repeated": rep(slugs),
-                                      "avail": avail, "avail_repeated": rep(avail)}))
+                                      "avail": avail, "avail_repeated": rep(avail),
+                                      "label": models._PROVIDER_LABELS.get(probe),
+                                      "in_known_names": probe in models._KNOWN_PROVIDER_NAMES,
+                                      "parsed": list(models.parse_model_input(
+                                          probe + ":probe-model-a", "openrouter"))}))
     """
 )
 
@@ -486,7 +491,7 @@ def test_plugin_only_provider_is_listed_once(tmp_path, order):
     env[PROBE_KEY_ENV] = "sk-laz...robe"
 
     proc = subprocess.run(
-        [sys.executable, str(driver), order],
+        [sys.executable, str(driver), order, PLUGIN_NAME],
         cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=300,
     )
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("PROBE_JSON ")]
@@ -502,3 +507,8 @@ def test_plugin_only_provider_is_listed_once(tmp_path, order):
     assert result["avail_repeated"] == [], (
         f"[{order}] list_available_providers repeats {result['avail_repeated']}"
     )
+    # The label / parser backfill must not depend on which writer appended the row
+    # (Prism c26fac2582c4): a self-listing plugin is still selectable as ``slug:model``.
+    assert result["label"] == "Lazy Canonical Probe", (order, result["label"])
+    assert result["in_known_names"], f"[{order}] {PLUGIN_NAME} missing from _KNOWN_PROVIDER_NAMES"
+    assert result["parsed"] == [PLUGIN_NAME, "probe-model-a"], (order, result["parsed"])
