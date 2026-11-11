@@ -316,7 +316,16 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
     anywhere; ``(own tree, HEAD sha)`` is appended to ``carry_out`` and the clone is pinned to that HEAD. Still
     local, named: a modified submodule or nested repository, changed files over the 25 MiB cap, or
     origin's live card branch (``ls-remote``) not at the tree's HEAD (nor about to be, by the leased push)."""
-    from hermes_cli.kanban_db_workspace import _git_toplevel, _is_linked_worktree_checkout
+    from hermes_cli import kanban_db_workspace as _kbw
+    from hermes_cli.kanban_tick_steps import tick_memo
+
+    # Once per board tick per path (t_97a78e19): N worktree cards on one repo forked 3 git each here per tick.
+    def _git_toplevel(path):
+        return tick_memo(("wt_toplevel", str(path)), lambda: _kbw._git_toplevel(path), inner=True)
+
+    def _is_linked_worktree_checkout(path):
+        return tick_memo(("wt_linked", str(path)), lambda: _kbw._is_linked_worktree_checkout(path), inner=True)
+
     raw = (workspace_path or "").strip() or (board_default or "").strip()
     if not raw:
         _why(why, WHY_NOT_REPO)
@@ -375,7 +384,12 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
         except (OSError, subprocess.SubprocessError):
             return None
 
+    # The real runner only (the module-load default): an injected runner is a test seam and reads per ref.
+    refs = _ref_table(top) if runner is _DEFAULT_RUNNER else None
+
     def _sha(ref):
+        if refs is not None:
+            return refs.get(ref, "")
         proc = _git("rev-parse", "-q", "--verify", ref)
         if proc is None:
             return None
@@ -425,6 +439,33 @@ def _assess_branch(top: Path, b: str, remote: str, local: str, push_ok: bool, wh
             _why(why, "diverged_from_origin")
             return None, None  # origin has commits the Studio lacks: a push would drop them
     return top, (str(top), b, remote, local)
+
+
+_DEFAULT_RUNNER = subprocess.run
+
+
+def _ref_table(top: Path) -> Optional[Dict[str, str]]:
+    """``{refname: sha}`` of ``top``'s local branches and origin's remote-tracking refs, read with ONE
+    ``for-each-ref`` per repo per board tick (t_97a78e19) instead of two ``rev-parse`` per card. None outside a
+    tick, or when git fails (the caller then reads per ref, as before). A missing ref is ``""``, as ``rev-parse
+    -q --verify`` answers it."""
+    from hermes_cli import kanban_tick_steps as _kts
+    if not _kts.active():
+        return None
+
+    def _read():
+        try:
+            proc = subprocess.run(["git", "-C", str(top), "for-each-ref", "--format=%(objectname) %(refname)",
+                                   "refs/heads", "refs/remotes/origin"], capture_output=True, text=True,
+                                  encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        return dict(line.split(" ", 1)[::-1] for line in (proc.stdout or "").splitlines() if " " in line)
+
+    table = _kts.tick_memo(("wt_refs", str(top)), _read, inner=True)
+    return dict(table) if table is not None else None
 
 
 def _on_branch(tree: Path, branch: str, runner: Callable) -> bool:

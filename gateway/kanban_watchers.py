@@ -4177,6 +4177,8 @@ class GatewayKanbanWatchersMixin:
             connection handle or accidentally claim across each other.
             """
             conn = None
+            from hermes_cli import kanban_tick_steps as _kts
+            _open_t0 = time.monotonic()
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
             if disabled_entry is not None:
@@ -4203,6 +4205,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 conn = _kb.connect(board=slug)
                 _requeue_host_transient_on(conn, slug, requeue_note)
+                _kts.add("board_open", (time.monotonic() - _open_t0) * 1000.0)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -4226,6 +4229,8 @@ class GatewayKanbanWatchersMixin:
                     spillover=spillover,
                     # The long-lived gateway tick runs pool-host clones in the background (t_915b8d2d).
                     defer_pool_clone=True,
+                    # ...and the orphan sweep (t_97a78e19).
+                    defer_maintenance=True,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -4278,8 +4283,10 @@ class GatewayKanbanWatchersMixin:
             # Tick-series cost (spec v0.3 §3.6 / I-7): the WHOLE tick, build()
             # through the end of the board loop, on this thread's CPU clock.
             _t_cpu0, _t_wall0 = time.thread_time(), time.perf_counter()
-            with _kbc_tick.count_statements() as _queries:
+            from hermes_cli import kanban_tick_steps as _kts
+            with _kbc_tick.count_statements() as _queries, _kts.scope() as _steps:
                 out = _tick_body(boards)
+            _series_tick["steps"] = _steps
             _write_gate_series(boards, out, time.thread_time() - _t_cpu0,
                                time.perf_counter() - _t_wall0, _queries[0])
             return out
@@ -4296,7 +4303,9 @@ class GatewayKanbanWatchersMixin:
             # that have spawnable work, rotating the first pick every tick
             # (t_f78d1938: consumed in fixed board order, default first, the
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
-            _tick = _gate_ticks.build(boards)
+            from hermes_cli import kanban_tick_steps as _kts
+            with _kts.step("gate_build"):
+                _tick = _gate_ticks.build(boards)
             _series_tick["tick"] = _tick
             _series_tick["pool_budget"] = (
                 None if _tick.remote_plan is None else _tick.remote_plan.budget)
@@ -4307,6 +4316,7 @@ class GatewayKanbanWatchersMixin:
             _requeue_note = _host_recovery_note(load_gate)
             _tick_spawned = 0
             _demand: list[tuple[str, int]] = []
+            _demand_t0 = time.monotonic()
             if _allowance is not None and not _spawn_paused:
                 _review_on = _kbd.review_dispatch_enabled()
                 for b in _kb.enumerating_each(boards):
@@ -4340,6 +4350,7 @@ class GatewayKanbanWatchersMixin:
                             except Exception:
                                 pass
                     _demand.append((slug, _n))
+            _kts.add("demand_scan", (time.monotonic() - _demand_t0) * 1000.0)
             _quotas = _klg.split_allowance(
                 _allowance, _demand, start=_board_rr["tick"],
             )
@@ -4445,7 +4456,7 @@ class GatewayKanbanWatchersMixin:
                     local_spawned=int(_series_tick.get("local") or 0),
                     results=results, tick_ms_cpu=cpu_s * 1000.0,
                     tick_ms_wall=wall_s * 1000.0, boards=len(boards or ()),
-                    queries=queries,
+                    queries=queries, steps=_series_tick.get("steps"),
                 )
                 _gate_series.append_record(_gate_series.series_path(_kb.kanban_home()), rec)
             except Exception as exc:
