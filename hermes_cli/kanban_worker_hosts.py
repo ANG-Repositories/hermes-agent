@@ -849,18 +849,18 @@ def _clone_head_key(repo: str) -> Optional[tuple]:
     holds (loose ref, else packed-refs) and the index mtime. None (do not cache) when any part cannot be read."""
     git = os.path.join(repo, ".git")
     try:
-        with open(os.path.join(git, "HEAD"), encoding="utf-8") as f:
+        with open(os.path.join(git, "HEAD"), encoding="utf-8-sig") as f:
             head = f.read().strip()
         sha = head
         if head.startswith("ref: "):
             ref = head[5:]
             loose = os.path.join(git, *ref.split("/"))
             if os.path.isfile(loose):
-                with open(loose, encoding="utf-8") as f:
+                with open(loose, encoding="utf-8-sig") as f:
                     sha = f.read().strip()
             else:
                 sha = ""
-                with open(os.path.join(git, "packed-refs"), encoding="utf-8") as f:
+                with open(os.path.join(git, "packed-refs"), encoding="utf-8-sig") as f:
                     for line in f:
                         parts = line.split()
                         if len(parts) == 2 and parts[1] == ref:
