@@ -1745,3 +1745,87 @@ def test_the_port_and_the_pin_resolve_one_repo(kanban_home, anchor, monkeypatch)
     assert kwt.workspace_repo(tid, str(wt), None, allow_studio_tree=True)[1] == wt.resolve()
     ported, _push = kwt.assess(tid, str(wt), None, f"wt/{tid}", allow_studio_tree=True, push_ok=True, carry_out=[])
     assert ported == repo
+
+
+# ---- t_7bb031b1 (Prism cf6083fccb97): an own worktree and its anchor must share one git common dir ----
+
+def test_a_worktree_of_repo_a_inside_repo_b_reads_a_s_pin_and_does_not_port(kanban_home, anchor, tmp_path,
+                                                                           monkeypatch):
+    """Finding input: repos A and B, A's worktree at B/.worktrees/<id>, A pinned to [ace-ai]. The pin is A's (the
+    worktree's real repo, its common dir's main tree), and the card does not port B's contents."""
+    _pin(kanban_home, ["ace-ai"])
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: None)
+    monkeypatch.setattr(kbd, "_studio_last_resort", lambda fleet_dir: True)
+    _commit(anchor, "base")
+    other = tmp_path / "other"
+    other.mkdir()
+    _git("init", "-q", "-b", "main", cwd=other)
+    _git("remote", "add", "origin", "https://github.com/ANG-Ventures/other-repo.git", cwd=other)
+    _commit(other, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        wt = other / ".worktrees" / tid
+        _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(wt), tid))
+        conn.commit()
+        kwt._origin_cache.clear()
+        repo, own, why = kwt.workspace_repo(tid, str(wt), None, allow_studio_tree=True)
+        assert repo == anchor.resolve() and own is None and why == "own_tree_repo_mismatch", (repo, own, why)
+        assert kwt.repo_pin(tid, str(wt), None, kanban_home / "fleet") == ("ace-ai",)
+        out: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _pinned_plan(), worktree_out=out, studio_on=False)
+    assert route[0] != "portable" and tid not in out, (route, out)
+    assert route[0] == "wait" and route[1].startswith("worktree_pin (ace-ai"), route
+
+
+def test_an_unpinned_worktree_of_repo_a_inside_repo_b_stays_local_with_the_studio_capability_on(
+        kanban_home, anchor, tmp_path, monkeypatch):
+    """No pin, studio_on (production): the mismatched tree's work exists only on the Studio, so the card stays
+    local, named own_tree_repo_mismatch; it neither ports B nor waits forever."""
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: None)
+    _commit(anchor, "base")
+    other = tmp_path / "other"
+    other.mkdir()
+    _git("init", "-q", "-b", "main", cwd=other)
+    _git("remote", "add", "origin", "https://github.com/ANG-Ventures/other-repo.git", cwd=other)
+    _commit(other, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        wt = other / ".worktrees" / tid
+        _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(wt), tid))
+        conn.commit()
+        kwt._origin_cache.clear()
+        out: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out, studio_on=True)
+    assert tid not in out, out
+    assert route == ("local", "not_portable:workspace_kind:own_tree_repo_mismatch"), route
+
+
+@pytest.mark.parametrize("form", ["worktree", "anchor"])
+def test_a_clean_worktree_of_repo_a_inside_repo_b_never_ports_b_in_either_persisted_form(
+        kanban_home, anchor, tmp_path, monkeypatch, form):
+    """Prism b7d84f5e8135: A's clean wt/<id> worktree at B/.worktrees/<id>, B without that branch. Whether
+    workspace_path names (a) the worktree or (b) B, the card is not portable, named own_tree_repo_mismatch, and the
+    pin is read from A (one check, :func:`_own_tree_of`, decides for workspace_repo and assess's discovery)."""
+    _pin(kanban_home, ["ace-ai"])
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: None)
+    _commit(anchor, "base")
+    other = tmp_path / "other"
+    other.mkdir()
+    _git("init", "-q", "-b", "main", cwd=other)
+    _git("remote", "add", "origin", "https://github.com/ANG-Ventures/other-repo.git", cwd=other)
+    _commit(other, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+    wt = other / ".worktrees" / tid
+    _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+    path = str(wt if form == "worktree" else other)
+    kwt._origin_cache.clear()
+    repo, own, refusal = kwt.workspace_repo(tid, path, None, allow_studio_tree=True)
+    assert (repo, own, refusal) == (anchor.resolve(), None, "own_tree_repo_mismatch")
+    why: list = []
+    assert kwt.assess(tid, path, None, f"wt/{tid}", allow_studio_tree=True, push_ok=True, why=why,
+                      carry_out=[]) == (None, None)
+    assert why == ["own_tree_repo_mismatch"], why
+    assert kwt.repo_pin(tid, path, None, kanban_home / "fleet") == ("ace-ai",)

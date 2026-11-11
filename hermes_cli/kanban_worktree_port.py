@@ -90,6 +90,7 @@ WHY_DIVERGED = "diverged_from_origin"
 WHY_UNPUSHED = "unpushed_commits"          # hand-list mode only
 WHY_NOT_CHECKOUT = "own_tree_not_a_checkout"
 WHY_PROBE_FAILED = "own_tree_probe_failed"
+WHY_REPO_MISMATCH = "own_tree_repo_mismatch"
 WHY_DERIVED_OFF = "derived_mode_off"
 # A dirty own tree is carried to the clone (t_894be273) except in these cases, where the card stays local:
 WHY_NESTED_REPO = "dirty_submodule_or_nested_repo"   # a modified submodule or an embedded repository
@@ -117,6 +118,10 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
                       "cannot see or carry them",
     WHY_PROBE_FAILED: "git could not read whether the card's own Studio tree has an index (error or timeout): "
                       "unknown state is never read as an empty tree",
+    WHY_REPO_MISMATCH: "the card's .worktrees/<id> belongs to another repo than the directory it sits in (its git "
+                       "common dir differs, a hand-made `worktree add` into a foreign tree): porting the parent would "
+                       "clone the wrong repo, so the pin is read from the worktree's own repo and the card stays "
+                       "(Prism cf6083fccb97)",
     WHY_OFF_BRANCH: "the Studio tree is off its branch and its HEAD does not contain the card branch's commits "
                     "(putting the branch at it would drop them), or the carry kill switch / hand-list mode is on",
     WHY_NESTED_REPO: "a modified submodule or an embedded repository: git status cannot see the work inside it",
@@ -306,6 +311,31 @@ def _linked(path: Path) -> bool:
     return tick_memo(("wt_linked", str(path)), lambda: _kbw._is_linked_worktree_checkout(path), inner=True)
 
 
+def _common_dir(path: Path) -> Optional[Path]:
+    """``path``'s resolved git common dir, or None (unreadable); memoized per tick like :func:`_toplevel`."""
+    from hermes_cli import kanban_db_workspace as _kbw
+    from hermes_cli.kanban_tick_steps import tick_memo
+
+    def _read() -> Optional[Path]:
+        common = _kbw._git_common_dir(path)
+        return common.resolve() if common is not None else None
+    return tick_memo(("wt_common", str(path)), _read, inner=True)
+
+
+def _own_tree_of(tree: Path, anchor: Path) -> Optional[str]:
+    """THE check that ``tree`` is a card's own tree of the repo ``anchor`` (Prism cf6083fccb97, b7d84f5e8135):
+    None when it is a linked worktree, its own toplevel, with ``anchor``'s git common dir. Else the reason:
+    :data:`WHY_NOT_CHECKOUT` (not a linked checkout of its own) or :data:`WHY_REPO_MISMATCH` (a worktree of
+    another repo placed at ``anchor/.worktrees/<id>``; an unreadable common dir is never read as a match).
+    :func:`workspace_repo` (both persisted-path forms) and :func:`assess`'s discovery call it, nothing else."""
+    if not (_linked(tree) and _toplevel(tree) == tree.resolve()):
+        return WHY_NOT_CHECKOUT
+    common = _common_dir(tree)
+    if common is None or common != _common_dir(anchor):
+        return WHY_REPO_MISMATCH
+    return None
+
+
 def _main_tree(top: Path) -> Path:
     """A linked worktree's main working tree (its common dir's parent, read from the repo config git itself keeps,
     so a worktree-local url rewrite cannot change the answer), else ``top`` (not linked, bare, unreadable)."""
@@ -358,7 +388,15 @@ def workspace_repo(task_id: str, workspace_path: Optional[str], board_default: O
         anchor = top.parent.parent.resolve()
         if _toplevel(anchor) != anchor or _linked(anchor):
             return _main_tree(top), None, WHY_CONCRETE
+        bad = _own_tree_of(top, anchor)
+        if bad is not None:
+            # A worktree of repo A placed at B/.worktrees/<id> (Prism cf6083fccb97): the repo is A, never B.
+            return _main_tree(top), None, WHY_REPO_MISMATCH if bad == WHY_REPO_MISMATCH else WHY_CONCRETE
         return anchor, top, None if allow_studio_tree else WHY_CONCRETE
+    own = top / ".worktrees" / task_id
+    if own.exists() and _own_tree_of(own, top) == WHY_REPO_MISMATCH:
+        # The path names B and B/.worktrees/<id> is A's (Prism b7d84f5e8135): the repo is A here too.
+        return _main_tree(own), None, WHY_REPO_MISMATCH
     return top, None, None
 
 
@@ -502,7 +540,8 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
     top, own_tree, refusal = workspace_repo(task_id, workspace_path, board_default,
                                             allow_studio_tree=allow_studio_tree)
     if refusal is not None or top is None:
-        _why(why, WHY_CONCRETE if refusal == WHY_CONCRETE else WHY_NOT_REPO)  # workspace_repo's two refusals
+        _why(why, WHY_CONCRETE if refusal == WHY_CONCRETE else  # workspace_repo's three refusals
+             WHY_REPO_MISMATCH if refusal == WHY_REPO_MISMATCH else WHY_NOT_REPO)
         return None, None
     b = (branch or "").strip() or f"wt/{task_id}"
     if own_tree is None and (top / ".worktrees" / task_id).exists():
@@ -510,7 +549,11 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
         if not allow_studio_tree:
             _why(why, WHY_CONCRETE)
             return None, None  # host_preference off: a prior run's local worktree keeps the card (old rule)
-        if not (_linked(own_tree) and _toplevel(own_tree) == own_tree.resolve()):
+        bad = _own_tree_of(own_tree, top)
+        if bad == WHY_REPO_MISMATCH:
+            _why(why, WHY_REPO_MISMATCH)
+            return None, None
+        if bad is not None:
             if not _dir_empty(own_tree):
                 _why(why, WHY_NOT_CHECKOUT)
                 return None, None
