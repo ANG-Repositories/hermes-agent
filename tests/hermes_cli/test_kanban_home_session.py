@@ -942,19 +942,49 @@ def _is_guarded(node):
     )
 
 
+# Generic column writers (``UPDATE tasks SET {column}``) whose column is checked
+# against an allowlist INSIDE the function. Not an exemption: each is routed only
+# while test_column_allowlisted_writers_refuse_guarded_columns proves the
+# allowlist excludes every guarded column and the function refuses one at runtime.
+_GUARDED_COLUMNS = frozenset({"status", "assignee", "priority", "session_id"})
+COLUMN_ALLOWLISTED = {
+    "_set_task_column": ("hermes_cli.kanban_db_workspace", "_SET_TASK_COLUMN_ALLOWED"),
+}
+
+
+def test_column_allowlisted_writers_refuse_guarded_columns():
+    import importlib
+    import sqlite3
+
+    for fn_name, (mod_name, allow_name) in COLUMN_ALLOWLISTED.items():
+        mod = importlib.import_module(mod_name)
+        allowed = getattr(mod, allow_name)
+        assert allowed and not (allowed & _GUARDED_COLUMNS), (fn_name, sorted(allowed))
+        fn = getattr(mod, fn_name)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, "
+                     "priority INTEGER, session_id TEXT)")
+        conn.execute("INSERT INTO tasks VALUES ('t_1', 'ready', 'a', 1, 's')")
+        for col in sorted(_GUARDED_COLUMNS):
+            with pytest.raises(ValueError):
+                fn(conn, "t_1", col, "x")
+        assert conn.execute("SELECT status, assignee, priority, session_id FROM tasks").fetchone() == (
+            "ready", "a", 1, "s")
+
+
 def test_every_status_writer_goes_through_the_guard():
     writers = _writers()
     assert len(writers) > 10, "writer scan found nothing: the scanner is broken"
     unrouted = sorted(
         n for n, node in writers.items()
-        if not _is_guarded(node) and n not in EXECUTION_LANE
+        if not _is_guarded(node) and n not in EXECUTION_LANE and n not in COLUMN_ALLOWLISTED
     )
     assert not unrouted, (
         f"status/assignee/priority/session_id or dispatch-intent writers without "
         f"@_home_session_guarded: {unrouted}. Guard them, or add them to "
         f"EXECUTION_LANE with the reason no chat surface can reach them."
     )
-    stale = sorted(set(EXECUTION_LANE) - set(writers))
+    stale = sorted((set(EXECUTION_LANE) | set(COLUMN_ALLOWLISTED)) - set(writers))
     assert not stale, f"EXECUTION_LANE lists non-writers: {stale}"
     both = sorted(n for n in EXECUTION_LANE if _is_guarded(writers[n]))
     assert not both, f"guarded AND listed as execution lane: {both}"
