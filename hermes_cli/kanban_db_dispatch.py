@@ -5456,9 +5456,63 @@ def _studio_capability_on(caps, last_resort: bool) -> bool:
 
 
 # portable()/_route_row rules a worktree card stays local under that NAME a Studio-only fact holds (an operator's
-# concrete path, a non-GitHub origin, an excluded repo, no pool): recorded as structural, never waited.
-_WT_STRUCTURAL = frozenset({"concrete_target_path", "not_a_repo", "origin_not_github", "excluded", "no_pool_host",
-                            "overrides_file_malformed"})
+# concrete path, a non-GitHub origin, no pool, unpushed work on an upstream we do not own, an operator pin that names
+# the Studio): recorded as structural, never waited. A pin that does not name the Studio waits (t_fbe8a067).
+_WT_STRUCTURAL = frozenset({"concrete_target_path", "not_a_repo", "origin_not_github", "no_pool_host",
+                            "origin_not_ours", "operator_pin"})
+
+
+def _wt_pin_hosts(row, board) -> "Optional[tuple]":
+    """The operator pin row's hosts for a worktree card's repo, or None (no pin, or no repo to read one from)."""
+    if (row["workspace_kind"] or "scratch") != "worktree":
+        return None
+    from hermes_cli import kanban_worktree_port as _kwt
+    try:
+        return _kwt.repo_pin(row["id"], row["workspace_path"], _kwt.board_default_workdir(board),
+                             _kb.kanban_home() / "fleet")
+    except Exception as exc:  # never stops the tick; an unreadable pin is a config fault, logged
+        _kb._log.warning("kanban: worktree pin for %s not read: %s", row["id"], exc)
+        return None
+
+
+def _pinned_route(row, route, pins, port, caps_out, *, planned: bool = True):
+    """t_fbe8a067 (Prism 7a74ce926bd4, 345896e571e6, 1a0b618f832f): a worktree card whose repo has an operator pin
+    row runs only on a host the pin names. ``pins`` is read from the workspace (:func:`_wt_pin_hosts`), never from
+    the port assessment, so an assessment that refused early still carries it. A pin that does not name the Studio:
+    a local route, or a portable/local route on a tick with no pool plan, becomes the named wait ``worktree_pin``;
+    a pin/origin route to a host outside the pin waits (one inside it stands); a portable route is limited to the pin's pool hosts with no local slot and
+    no Studio last resort (the capability ``only`` set, read by the spawn loop and the door publisher alike). A
+    wait stays the wait it is. Idempotent: :func:`_route_row` and the dispatcher's last pass both apply it."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    from hermes_cli import kanban_worktree_port as _kwt
+    if not pins or _kwt.pin_names_studio(pins):
+        return route
+    kind, arg = route
+    if kind == "wait":
+        return route
+    named = ",".join(pins)
+    tid = row["id"]
+    if kind in ("pin", "origin"):
+        if str(arg or "").lower() in {p.lower() for p in pins}:
+            return route
+        return "wait", _pr.worktree_pin(named, f"{kind} {arg} is not in the pin")
+    if not planned:
+        return "wait", _pr.worktree_pin(named, "no pool plan this tick" + (f"; {arg}" if kind == "local" and arg
+                                                                          else ""))
+    if kind == "local":
+        tail = (arg or "").rsplit(":", 1)[-1]
+        return "wait", _pr.worktree_pin(named, "no pool host in the pin" if tail == _kwt.WHY_PINNED
+                                        else arg or "local route")
+    if kind == "portable" and caps_out is not None:
+        allowed = {p.lower() for p in (port[2] if port is not None else pins)} & {p.lower() for p in pins}
+        only = caps_out.setdefault("only", {})
+        hosts = tuple(h for h in (only[tid] if tid in only else (port[2] if port is not None else pins))
+                      if str(h).lower() in allowed)
+        if not hosts:
+            return "wait", _pr.worktree_pin(named, "no pool host in the pin serves the card's capability")
+        only[tid] = hosts
+        caps_out.setdefault("wt_pin", {})[tid] = named  # the spawn loop names the pin when the pool refuses
+    return route
 
 
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
@@ -5488,10 +5542,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     rules = rules_out if rules_out is not None else {}
     aff = affinity_out if affinity_out is not None else {}
     wt_hold: dict = {}
+    wt_out = worktree_out if worktree_out is not None else {}
     route = _route_row_base(conn, row, plan, default_assignee, native_cache, linked_ids, lineage_mode, aff,
                             unknown_out, caps, caps_out, rules, access_out, binds, held=held,
-                            worktree_out=worktree_out, board=board, carry_out=carry_out, pause_cache=pause_cache,
+                            worktree_out=wt_out, board=board, carry_out=carry_out, pause_cache=pause_cache,
                             carry_budget=carry_budget, studio_on=studio_on, wt_hold_out=wt_hold)
+    route = _pinned_route(row, route, _wt_pin_hosts(row, board), wt_out.get(row["id"]), caps_out)
     if not studio_on or route[0] != "local":
         return route
     tid = row["id"]
@@ -7290,6 +7346,16 @@ def _dispatch_once_locked(
                    pool=spillover.config if spillover is not None else None, caps=_caps)
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
     _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
+    # Worktree operator pins (t_fbe8a067), the last writer of row_route before the door and the spawn loop, plan or
+    # no plan: a pin that leaves out the Studio never spawns there. _route_row already applied it on a planned
+    # tick (re-applying is a no-op); this pass covers the no-plan branch, the continuation origin route and the
+    # pause hold's resume pins. A card whose repo cannot be resolved has no pin row to read and routes as before.
+    for r in ready_rows:
+        _pins = _wt_pin_hosts(r, board)
+        if _pins:
+            _rt = row_route.get(r["id"], ("local", None))
+            row_route[r["id"]] = _pinned_route(r, _rt, _pins, _worktree_ports.get(r["id"]), _caps_out,
+                                               planned=spillover is not None)
     # Publish before pressure-gated spawn budgets can hide hot-host demand.
     from hermes_cli import kanban_priority as _priority
     from hermes_cli import kanban_priority_door as _door
@@ -8319,7 +8385,9 @@ def _dispatch_once_locked(
                         f"{ADMIT_INELIGIBLE}: {force_host} is not eligible for this card ({_refusal})")
                     continue
                 if not _last_resort_allowed(route, local_free, _cap_only, spillover):
-                    result.placement_waits[row["id"]] = _refusal
+                    _wt_pin = _caps_out.get("wt_pin", {}).get(row["id"])
+                    result.placement_waits[row["id"]] = (_pr.worktree_pin(_wt_pin, _refusal) if _wt_pin
+                                                         else _refusal)
                     continue
             _dest_wait = _kph.destination_wait(placed_host.name, _pause_cache) if placed_host is not None else None
             if _dest_wait is not None:                     # belt: the chosen host is re-checked before any start
