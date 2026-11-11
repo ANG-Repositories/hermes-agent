@@ -152,16 +152,25 @@ def _extend_canonical_from_plugins() -> None:
             pass
         _canonical_extend_active = True
         added: list[ProviderEntry] = []
+        plugin_labels: dict[str, str] = {}
         try:
             from providers import list_providers as _list_providers_for_canonical
+            # Discovery FIRST, then read what is listed: plugins imported by this
+            # call (and the post-discovery catalog sync) list their own rows, and
+            # a ``known`` captured before them re-appended every plugin-only slug.
+            _profiles = _list_providers_for_canonical()
             known = {p.slug for p in provider_seam.current().CANONICAL_PROVIDERS}
-            for _pp in _list_providers_for_canonical():
-                if _pp.name in known:
-                    continue
+            for _pp in _profiles:
                 # Admission is by slug, not auth_type (upstream #102421, parity 2026-10-01): an
                 # out-of-tree external-process / OAuth profile must reach every shared picker;
                 # visibility is gated downstream by credentials (``_provider_has_credentials``).
                 _label = _pp.display_name or _pp.name
+                # Label / parser backfill covers EVERY profile, including one that
+                # listed its own row during discovery: it never depends on whether
+                # this pass is the one that appends the row (t_169d0cee, Prism c26fac2582c4).
+                plugin_labels.setdefault(_pp.name, _label)
+                if _pp.name in known:
+                    continue
                 _desc = _pp.description or f"{_label} (direct API)"
                 entry = ProviderEntry(_pp.name, _label, _desc)
                 known.add(_pp.name)
@@ -170,20 +179,22 @@ def _extend_canonical_from_plugins() -> None:
             pass
         finally:
             _canonical_extend_active = False
-        if added:
-            # One generation swap for all three surfaces, so a plugin provider
-            # is never on the canonical list without its label / parser
-            # membership. The derived surfaces are defined below this function
-            # in the module body; a read that reaches here before they exist
-            # extends the list alone.
-            delta: dict = {"CANONICAL_PROVIDERS": added}
-            if "_PROVIDER_LABELS" in globals():
-                labels = provider_seam.current()._PROVIDER_LABELS
-                delta["_PROVIDER_LABELS"] = {
-                    e.slug: e.label for e in added if e.slug not in labels
-                }
-            if "_KNOWN_PROVIDER_NAMES" in globals():
-                delta["_KNOWN_PROVIDER_NAMES"] = {e.slug for e in added}
+        # One generation swap for all three surfaces, so a plugin provider
+        # is never on the canonical list without its label / parser
+        # membership. The derived surfaces are defined below this function
+        # in the module body; a read that reaches here before they exist
+        # extends the list alone.
+        delta: dict = {"CANONICAL_PROVIDERS": added} if added else {}
+        cur = provider_seam.current()
+        if "_PROVIDER_LABELS" in globals():
+            new_labels = {s: lb for s, lb in plugin_labels.items() if s not in cur._PROVIDER_LABELS}
+            if new_labels:
+                delta["_PROVIDER_LABELS"] = new_labels
+        if "_KNOWN_PROVIDER_NAMES" in globals():
+            new_names = set(plugin_labels) - set(cur._KNOWN_PROVIDER_NAMES)
+            if new_names:
+                delta["_KNOWN_PROVIDER_NAMES"] = new_names
+        if delta:
             try:
                 provider_seam.publish(delta)
             except provider_seam.SeamCollision:
@@ -950,13 +961,16 @@ def list_available_providers() -> list[dict[str, str]]:
     aliases_for: dict[str, list[str]] = {}
     for alias, canonical in g._PROVIDER_ALIASES.items():
         aliases_for.setdefault(canonical, []).append(alias)
+    slugs = [p.slug for p in g.CANONICAL_PROVIDERS]
+    if "custom" not in slugs:  # the bundled ``custom`` plugin may already list it
+        slugs.append("custom")
     return [
         {
             "id": pid,
             "label": _PROVIDER_LABELS.get(pid, pid),
             "aliases": aliases_for.get(pid, []),
             "authenticated": _provider_has_credentials(pid)}
-        for pid in [p.slug for p in g.CANONICAL_PROVIDERS] + ["custom"]]
+        for pid in slugs]
 
 
 def parse_model_input(
