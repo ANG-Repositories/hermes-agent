@@ -386,24 +386,54 @@ GATED_SPILL_NAME = "script_runner_gated_refire.spill.json"
 
 
 def _merge_rows(current: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Union by ``(home, job_id)``; on a clash the row of the NEWER run (larger ``start``) wins, so
+    a spill folded late can never replace a later kill's gate with an older one (Prism
+    65ed2a0864c8)."""
     merged = {(r.get("home"), r.get("job_id")): r for r in current}
     for row in rows:
-        merged[(row.get("home"), row.get("job_id"))] = row
+        key = (row.get("home"), row.get("job_id"))
+        old = merged.get(key)
+        if old is None or float(row.get("start") or 0) >= float(old.get("start") or 0):
+            merged[key] = row
     return list(merged.values())
 
 
+def _read_gated_or_quarantine(path: Path) -> Optional[List[Dict[str, Any]]]:
+    """``_read_gated``; a file that is not JSON is moved to ``<name>.bad`` (kept for the
+    operator, logged ERROR) and None is returned. An OSError propagates: the caller keeps it."""
+    try:
+        return _read_gated(path)
+    except ValueError:
+        bad = path.with_name(path.name + ".bad")
+        logger.error("script runner: gated re-fire file %s is not JSON; moved to %s", path, bad)
+        with contextlib.suppress(OSError):
+            path.replace(bad)
+        return None
+
+
 def _fold_gated_spill(path: Path) -> List[Dict[str, Any]]:
-    """Merge spill files into ``path``; caller holds ``_file_lock(path)``. Spills are removed only
-    after the merged file is written, so a failed write keeps them for the next pass."""
+    """Merge spill files into ``path``; caller holds ``_file_lock(path)``. A spill is removed only
+    after the merged file holding its rows is written; one that cannot be read is kept (an
+    OSError) or quarantined as ``.bad`` (not JSON), never silently dropped (Prism
+    fd3f1ffbf3c5)."""
     spills = sorted(path.parent.glob(GATED_SPILL_NAME + ".*"))
-    rows = _read_gated(path)
-    if not spills:
+    spills = [s for s in spills if not s.name.endswith(".bad")]
+    rows = _read_gated_or_quarantine(path) or []
+    folded = []
+    for spill in spills:
+        try:
+            got = _read_gated_or_quarantine(spill)
+        except OSError:
+            logger.error("script runner: gated re-fire spill %s unreadable; kept", spill,
+                         exc_info=True)
+            continue
+        if got is not None:
+            rows = _merge_rows(rows, got)
+            folded.append(spill)
+    if not folded:
         return rows
-    for spill in spills:
-        with contextlib.suppress(ValueError, OSError):
-            rows = _merge_rows(rows, _read_gated(spill))
     _write_gated(path, rows)
-    for spill in spills:
+    for spill in folded:
         with contextlib.suppress(FileNotFoundError):
             spill.unlink()
     return rows

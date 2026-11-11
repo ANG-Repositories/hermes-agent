@@ -648,7 +648,7 @@ def test_recovery_runs_once_per_home_only_when_gated_in(root, monkeypatch):
     prof = _make_profile(root, "p1")
     seen = []
     monkeypatch.setattr(InProcessCronScheduler, "recover_interrupted",
-                        lambda self: seen.append(__import__("hermes_constants").get_hermes_home()) or 0)
+                        lambda self, **_kw: seen.append(__import__("hermes_constants").get_hermes_home()) or 0)
     gate = {"default": "knob_disabled", "p1": "home_gateway_not_delegating"}
     monkeypatch.setattr(script_runner, "runner_gate_reason", lambda name, home: gate[name])
     r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root), ("p1", prof)])
@@ -2750,3 +2750,36 @@ def test_t_fa0b_gated_record_never_writes_unlocked(root, monkeypatch):
     ids = sorted(r["job_id"] for r in rearm._read_gated(rearm._gated_path()))
     assert ids == sorted([a["id"], b["id"]])
     assert not list(rearm._gated_path().parent.glob(rearm.GATED_SPILL_NAME + ".*"))
+
+
+def test_t_fa0b_gated_fold_keeps_bad_spills_and_the_newest_row(root):
+    """Prism fd3f1ffbf3c5: a spill that could not be read was swallowed and then unlinked, losing
+    its re-fire; now a non-JSON spill is quarantined as ``.bad`` and only folded spills are
+    removed. Prism 65ed2a0864c8: a spill folded late replaced a newer gate for the same job; on a
+    clash the row with the later ``start`` wins."""
+    from cron import script_runner_rearm as rearm
+
+    path = rearm._gated_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    newer = {"home": str(root), "job_id": "j1", "start": now, "unproven": True,
+             "members": [], "unsure": [], "until": now + 3600, "unsure_until": now}
+    older = dict(newer, start=now - 86400, until=now - 1)
+    path.write_text(json.dumps([newer]), encoding="utf-8")
+    good = path.with_name(rearm.GATED_SPILL_NAME + ".1.1.1")
+    good.write_text(json.dumps([older]), encoding="utf-8")
+    bad = path.with_name(rearm.GATED_SPILL_NAME + ".2.2.2")
+    bad.write_text("{not json", encoding="utf-8")
+    locked = path.with_name(rearm.GATED_SPILL_NAME + ".3.3.3")
+    locked.write_text(json.dumps([dict(newer, job_id="j2")]), encoding="utf-8")
+    locked.chmod(0)  # unreadable (an OSError): kept for the next pass, never unlinked
+    try:
+        with rearm._file_lock(path):
+            rows = rearm._fold_gated_spill(path)
+        assert locked.exists()
+    finally:
+        locked.chmod(0o600)
+    assert [r["start"] for r in rows] == [now]  # the stale spill did not replace the newer gate
+    assert not good.exists()
+    assert not bad.exists() and bad.with_name(bad.name + ".bad").exists()
+    assert rearm.apply_gated_refires(now=now) == 0  # still held to the newer run's deadline
