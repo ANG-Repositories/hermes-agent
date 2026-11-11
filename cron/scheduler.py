@@ -1151,6 +1151,11 @@ _refire_withheld_job_ids: set = set()
 # recorded as a failure and flagged for its one re-fire whatever its exit status: a script that
 # traps TERM and exits 0 or 143 was cut off all the same. Guarded by ``_script_procs_lock``.
 _skew_interrupted_job_ids: set = set()
+# The subset of ``_refire_withheld_job_ids`` withheld BEFORE the bounded skew kill because their
+# re-fire is spent on a failing streak (t_af461294): never re-fired. A tree that merely outlives
+# the kill is withheld in-process but re-fired later through a gated row (t_fa0b5cff). Read by
+# the run's failure text. Guarded by ``_script_procs_lock``.
+_refire_spent_withheld_job_ids: set = set()
 
 
 def signal_shutdown(reason: str = "") -> None:

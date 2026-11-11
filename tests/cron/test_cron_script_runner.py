@@ -2440,3 +2440,244 @@ def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypat
     r.enumerate_homes()
     assert not marker.exists() and not r.tripped
     assert r._rearmed and r._rearmed["trips_24h"] == 2
+
+
+# --- t_fa0b5cff: a drain-killed long script is re-fired once, promptly; a row may ask to finish ---
+
+def _job_rec(root: Path, job_id: str) -> dict:
+    from cron.runtime_state import merged_jobs
+
+    return {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job_id]
+
+
+def _daily_job_run_now(root: Path, name: str, script: str) -> dict:
+    """A daily ``30 2 * * *`` job fired now the way ``hermes cron run`` does (``trigger_job``): a
+    hand-set ``next_run_at`` on a cron row is re-anchored by the due scan's stale-edit guard."""
+    from cron.jobs import trigger_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    job = _job(root, name, script, schedule="30 2 * * *", due_now=False)
+    with _profile_cron_scope(root):
+        trigger_job(job["id"])
+    return job
+
+
+def _long_once_script(root: Path, tmp_path: Path) -> tuple:
+    """First run: records its pid and sleeps (the long backup); any later run: touches ``done``."""
+    spid, first, done = tmp_path / "s.pid", tmp_path / "first", tmp_path / "done"
+    _script(root, "backup.sh", f"if [ -e {first} ]; then touch {done}; exit 0; fi\n"
+                               f"touch {first}\necho $$ > {spid}\nsleep 300")
+    return spid, done
+
+
+@pytest.mark.slow_test(240, reason="three real runner subprocesses: a drain kill, a restart, a re-fire")
+def test_t_fa0b_drain_killed_daily_job_refires_once_after_an_extra_restart(root, tmp_path, procs):
+    """2026-11-11 02:52: the code-skew drain killed sub-vps-backup (a daily ``30 2 * * *`` script) at
+    22 of 26 hosts. The run must re-fire once, promptly, after the runner is back, and that must
+    survive a second restart in between (03:06 and 03:15 that night): runner 1 drains and kills,
+    runner 2 starts on still-skewed code and drains at once, runner 3 runs the re-fire."""
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    spid, done = _long_once_script(root, tmp_path)
+    skew = tmp_path / "skew"
+    job = _daily_job_run_now(root, "backup", "backup.sh")
+    log = tmp_path / "runner.log"
+    r1 = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_SKEW=skew,
+                       RUNNER_HARNESS_SKEW_DRAIN_S=2)
+    s_pid = int(_wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script"))
+    skew.touch()
+    assert r1.wait(timeout=60) == 0, log.read_text(encoding="utf-8")[-3000:]
+    assert _group_gone(s_pid)
+    rec = _job_rec(root, job["id"])
+    assert rec.get(RESTART_REQUEUE_KEY), rec
+    assert "will re-run once" in (rec.get("last_error") or ""), rec
+    # The extra restart: still skewed, nothing in flight, so it drains and exits at once.
+    r2 = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_SKEW=skew,
+                       RUNNER_HARNESS_SKEW_DRAIN_S=2)
+    assert r2.wait(timeout=60) == 0, log.read_text(encoding="utf-8")[-3000:]
+    assert _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY), "marker lost across a restart"
+    assert not done.exists()
+    skew.unlink()
+    r3 = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1)
+    try:
+        _wait_for(done.exists, 90, step=0.2, what="the one re-fire")
+        _wait_for(lambda: _job_rec(root, job["id"]).get("last_status") == "ok", 30,
+                  what="re-fire recorded ok")
+        rec = _job_rec(root, job["id"])
+        assert not rec.get(RESTART_REQUEUE_KEY), rec
+    finally:
+        r3.send_signal(signal.SIGTERM)
+        assert r3.wait(timeout=30) == 0, log.read_text(encoding="utf-8")[-3000:]
+
+
+@pytest.mark.slow_test(180, reason="real runner subprocess")
+def test_t_fa0b_drain_lets_a_finish_flagged_job_complete(root, tmp_path, procs):
+    """A row with ``drain_finish_s`` is not terminated at RUNNER_SKEW_DRAIN_MAX_S: the drain waits
+    for it (up to that many seconds of run time) and the run completes ``ok`` with no re-fire."""
+    from cron.jobs import DRAIN_FINISH_KEY, RESTART_REQUEUE_KEY, update_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    spid, done, termed = tmp_path / "s.pid", tmp_path / "done", tmp_path / "termed"
+    skew = tmp_path / "skew"
+    _script(root, "finish.sh", f"trap 'touch {termed}; exit 143' TERM\necho $$ > {spid}\n"
+                               f"sleep 8 & wait $!\ntouch {done}")
+    job = _daily_job_run_now(root, "finish", "finish.sh")
+    with _profile_cron_scope(root):
+        update_job(job["id"], {DRAIN_FINISH_KEY: 600})
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_SKEW=skew,
+                           RUNNER_HARNESS_SKEW_DRAIN_S=1)
+    _wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script")
+    skew.touch()
+    try:
+        rc = runner.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("runner never exited after the script ended: "
+                             + log.read_text(encoding="utf-8")[-3000:])
+    text = log.read_text(encoding="utf-8")
+    assert rc == 0, text[-3000:]
+    assert done.exists() and not termed.exists(), text[-3000:]
+    assert "drain waiting: finish requested, " + job["id"] in text, text[-3000:]
+    assert "drain bounded" not in text, text
+    rec = _job_rec(root, job["id"])
+    assert rec.get("last_status") == "ok" and not rec.get(RESTART_REQUEUE_KEY), rec
+
+
+def test_t_fa0b_finish_window_is_bounded_by_the_row(root, monkeypatch):
+    """The finish window is the row's own maximum, measured from the run's start: inside it the
+    run holds the drain; past it the run is terminated like any other (one re-fire). A job
+    without the field keeps today's behaviour (never holds)."""
+    import cron.scheduler as sched
+    from cron import script_runner
+    from cron.jobs import DRAIN_FINISH_KEY, update_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    flagged = _job(root, "flagged", "x.sh", schedule="30 2 * * *", due_now=False)
+    plain = _job(root, "plain", "y.sh", schedule="30 2 * * *", due_now=False)
+    with _profile_cron_scope(root):
+        update_job(flagged["id"], {DRAIN_FINISH_KEY: 1800})
+    kf, kp = sched._inflight_key(flagged["id"], root), sched._inflight_key(plain["id"], root)
+    now = time.time()
+    for started, holds in ((now - 1320, True), (now - 1900, False)):  # 22 min in / past 30 min
+        with sched._running_lock:
+            sched._running_job_ids.update({kf, kp})
+            sched._running_since[kf] = started
+            sched._running_since[kp] = started
+        try:
+            spent, _failed = script_runner._inflight_refire_status()
+            finishing = script_runner._inflight_finish_requested()
+        finally:
+            with sched._running_lock:
+                sched._running_job_ids.difference_update({kf, kp})
+                sched._running_since.pop(kf, None)
+                sched._running_since.pop(kp, None)
+        assert spent == []
+        assert [j for j, _e, _m in finishing] == ([flagged["id"]] if holds else [])
+
+
+@pytest.mark.parametrize("raw,expected", [(None, None), (0, None), (-5, None), ("x", None),
+                                          (True, None), (600, 600), ("900", 900)])
+def test_t_fa0b_drain_finish_seconds_parses_the_row(raw, expected):
+    from cron.jobs import DRAIN_FINISH_KEY, drain_finish_seconds
+
+    job = {} if raw is None else {DRAIN_FINISH_KEY: raw}
+    assert drain_finish_seconds(job) == expected
+
+
+def test_t_fa0b_refire_eta_text_names_the_next_run():
+    """The delivered failure says whether and when the job runs again, so a reader knows if a
+    night was lost: one re-fire when the runner is back, else the next scheduled run."""
+    from cron.scheduler_script import drain_kill_followup
+
+    job = {"id": "j", "schedule": {"kind": "cron", "expr": "30 2 * * *"},
+           "next_run_at": "2026-11-12T02:30:00-08:00"}
+    assert "will re-run once" in drain_kill_followup(job, refire=True)
+    assert "not at its next scheduled time" in drain_kill_followup(job, refire=True)
+    text = drain_kill_followup(job, refire=False)
+    assert "NOT be re-fired" in text and "2026-11-12T02:30:00-08:00" in text
+
+
+def test_t_fa0b_survivor_tree_defers_the_refire_instead_of_dropping_it(root, monkeypatch):
+    """The 2026-11-11 root cause: ``12 script tree(s) survived SIGKILL``, so every cut run's re-fire
+    was withheld and, before this change, never requested: sub-vps-backup ended at 22 of 26 hosts
+    with no re-run. A survivor now leaves a gated row; the re-fire is requested once the surviving
+    member is gone (a real member) and survives a restart in between (the row is on disk)."""
+    import psutil
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+    from cron import script_runner_rearm as rearm
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    job = _daily_job_run_now(root, "survivor", "s.sh")
+    survivor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        key = sched._inflight_key(job["id"], root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_spent_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        # The run is cut (a real member alive), and the member outlives TERM and KILL.
+        monkeypatch.setattr(ss, "_script_run_token_members",
+                            lambda _p: [psutil.Process(survivor.pid)])
+        monkeypatch.setattr(ss, "_signal_script_tree", lambda *_a: None)
+        with sched._running_lock:
+            sched._running_since[key] = time.time() - 1320
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert sched._refire_withheld_job_ids == {key}  # never beside the live copy
+        assert key not in sched._refire_spent_withheld_job_ids
+        rows = rearm._read_gated(rearm._gated_path())
+        assert [r["job_id"] for r in rows] == [job["id"]]
+        assert rows[0]["members"] and rows[0]["until"] > time.time()
+        # Next runner start, the tree still alive: kept, no re-fire yet.
+        assert rearm.apply_gated_refires() == 0
+        assert not _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+        survivor.kill()
+        survivor.wait(timeout=10)
+        assert rearm.apply_gated_refires() == 1
+        assert _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+        assert not rearm._gated_path().exists()
+    finally:
+        sched.clear_shutdown()
+        with sched._running_lock:
+            sched._running_since.pop(sched._inflight_key(job["id"], root), None)
+        with contextlib.suppress(Exception):
+            survivor.kill()
+        leader.wait(timeout=10)
+
+
+def test_t_fa0b_gated_refire_bounds_unsure_and_real_members(root):
+    """An unsure member (unreadable environ, may not be ours) holds the re-fire only until
+    ``unsure_until``; a real member until ``until`` (the run's own script deadline)."""
+    from cron import script_runner_rearm as rearm
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    a = _daily_job_run_now(root, "unsure", "u.sh")
+    b = _daily_job_run_now(root, "real", "r.sh")
+    sib = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        import psutil
+
+        me = [[sib.pid, psutil.Process(sib.pid).create_time()]]
+        now = time.time()
+        rearm.record_gated_refires([
+            {"home": str(root), "job_id": a["id"], "start": now - 100, "members": [],
+             "unsure": me, "until": now + 3600, "unsure_until": now + 50},
+            {"home": str(root), "job_id": b["id"], "start": now - 100, "members": me,
+             "unsure": [], "until": now + 100, "unsure_until": now + 50}])
+        assert rearm.apply_gated_refires(now=now) == 0
+        assert rearm.apply_gated_refires(now=now + 60) == 1  # unsure bound passed
+        assert _job_rec(root, a["id"]).get(RESTART_REQUEUE_KEY)
+        assert not _job_rec(root, b["id"]).get(RESTART_REQUEUE_KEY)
+        assert rearm.apply_gated_refires(now=now + 120) == 1  # the run's deadline passed
+        assert _job_rec(root, b["id"]).get(RESTART_REQUEUE_KEY)
+    finally:
+        sib.kill()
+        sib.wait(timeout=10)

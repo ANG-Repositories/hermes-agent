@@ -356,6 +356,117 @@ def apply_pending_requeues() -> int:
     return done
 
 
+GATED_NAME = "script_runner_gated_refire.json"
+
+
+def _gated_path() -> Path:
+    return trips_path().with_name(GATED_NAME)
+
+
+def _read_gated(path: Path) -> List[Dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return []
+    return [r for r in raw if isinstance(r, dict) and r.get("job_id")] if isinstance(raw, list) else []
+
+
+def _write_gated(path: Path, rows: List[Dict[str, Any]]) -> None:
+    from utils import atomic_write_text
+
+    if not rows:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return
+    atomic_write_text(path, json.dumps(rows, sort_keys=True) + "\n",
+                      tmp_prefix=".script_runner_gated_", mode=0o600)
+
+
+def record_gated_refires(rows: List[Dict[str, Any]]) -> None:
+    """``[{home, job_id, start, members: [[pid, create_time]...], until}]`` for runs the bounded
+    skew drain cut but whose tree outlived SIGKILL (t_fa0b5cff). Their re-fire used to be dropped
+    for good; now ``apply_gated_refires`` re-fires each once its members are gone or ``until``
+    (the run's start plus its own script timeout) has passed. Never raises."""
+    if not rows:
+        return
+    try:
+        path = _gated_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _file_lock(path) as locked:
+            if not locked:
+                logger.error("script runner: gated re-fire lock timed out; writing anyway")
+            current = {(r.get("home"), r.get("job_id")): r for r in _read_gated(path)}
+            for row in rows:
+                current[(row["home"], row["job_id"])] = row
+            _write_gated(path, list(current.values()))
+        logger.warning("script runner: %d re-fire(s) deferred until the surviving tree is gone: "
+                       "%s", len(rows), ", ".join(sorted(r["job_id"] for r in rows)))
+    except Exception:
+        logger.error("script runner: gated re-fire write failed", exc_info=True)
+
+
+def _members_alive(members) -> bool:
+    try:
+        import psutil
+    except ImportError:
+        return False
+    for item in members or []:
+        try:
+            pid, created = int(item[0]), float(item[1])
+            proc = psutil.Process(pid)
+            if abs(proc.create_time() - created) < 1.0 and proc.status() != psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            continue
+        except Exception:
+            return True  # cannot tell: keep waiting (the deadline still bounds it)
+    return False
+
+
+def apply_gated_refires(now: Optional[float] = None) -> int:
+    """Re-queue each gated row whose tree is gone or whose deadline passed; keep the rest.
+    Cheap (one small file, a pid probe per member): safe on every runner cycle. Returns
+    re-queued. Never raises."""
+    path = _gated_path()
+    if not path.exists():
+        return 0
+    now = time.time() if now is None else now
+    done = 0
+    try:
+        from cron.jobs import request_restart_requeue
+        from cron.scheduler_provider import _profile_cron_scope
+
+        with _file_lock(path) as locked:
+            if not locked:
+                return 0
+            keep = []
+            for row in _read_gated(path):
+                job_id = str(row["job_id"])
+                alive = (_members_alive(row.get("members")) and now < float(row.get("until") or 0)
+                         ) or (_members_alive(row.get("unsure"))
+                               and now < float(row.get("unsure_until") or 0))
+                if alive:
+                    keep.append(row)
+                    continue
+                try:
+                    with _profile_cron_scope(Path(row["home"])):
+                        if _finished_after(job_id, float(row.get("start") or 0)):
+                            logger.warning("Job '%s': finished or already re-queued after the "
+                                           "drain kill; gated re-fire dropped", job_id)
+                        elif request_restart_requeue(
+                                job_id, "script killed by the runner code-skew drain"):
+                            done += 1
+                            logger.warning("Job '%s': drain-killed tree gone or past its "
+                                           "deadline; re-queued to fire once", job_id)
+                except Exception:
+                    logger.warning("gated re-fire of %s failed; kept", job_id, exc_info=True)
+                    keep.append(row)
+            _write_gated(path, keep)
+    except Exception:
+        logger.error("script runner: gated re-fire apply failed", exc_info=True)
+    return done
+
+
 def trip_summary(entry: Dict[str, Any]) -> str:
     holder = (entry.get("ledger") or {}).get("lock_holder") or {}
     held = (f"; ledger lock held by {holder.get('thread')} in {holder.get('label')} "
