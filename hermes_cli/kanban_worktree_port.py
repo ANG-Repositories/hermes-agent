@@ -49,6 +49,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 import subprocess
 import threading
 import time
@@ -75,6 +76,12 @@ WHY_NOT_GITHUB = "origin_not_github"
 WHY_EXCLUDED = "excluded"
 WHY_NO_POOL = "no_pool_host"
 WHY_BAD_OVERRIDES = "overrides_file_malformed"
+# A dirty own tree is carried to the clone (t_894be273) except in these cases, where the card stays local:
+WHY_NESTED_REPO = "dirty_submodule_or_nested_repo"   # a modified submodule or an embedded repository
+WHY_CARRY_SIZE = "dirty_tree_over_cap"               # more than DIRTY_CARRY_MAX_BYTES of changed files
+WHY_BASE_MOVED = "origin_tip_not_studio_head"        # the clone would not start at the tree's HEAD
+WHY_SYMLINK_PARENT = "dirty_path_through_symlink"     # a changed path under a symlinked directory (Prism 9e03f1e94c2d)
+WHY_SPECIAL_FILE = "dirty_path_not_plain_file"        # a changed path that is not a regular file or a symlink
 PORTED_EVENT = "worktree_ported"
 # portable() bind rule of a ported card: it runs where its clone is.
 PORT_BIND_RULE = "worktree_port"
@@ -296,12 +303,19 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
 def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[str],
            branch: Optional[str] = None, runner: Callable = subprocess.run, *,
            allow_studio_tree: bool = False, push_ok: bool = False,
-           why: Optional[List[str]] = None) -> Tuple[Optional[Path], Optional[Tuple[str, str, str, str]]]:
+           why: Optional[List[str]] = None,
+           carry_out: Optional[list] = None) -> Tuple[Optional[Path], Optional[Tuple[str, str, str, str]]]:
     """``(anchor repo | None, push)``: :func:`anchor_repo`'s checks, with the reason a card stays local
     appended to ``why``. ``push_ok`` (derived mode, t_1d2c5939): a card branch whose commits origin lacks is
     no longer a refusal; ``push`` = ``(repo, branch, expected origin sha or "", assessed local sha)`` and the spawn pushes it
     (:func:`push_card_branch`) before the clone. Still local: an own tree with uncommitted/untracked work
-    (``unpushed_dirty_tree``), and a branch that diverged from origin (a push would drop origin's commits)."""
+    (``unpushed_dirty_tree``), and a branch that diverged from origin (a push would drop origin's commits).
+
+    ``carry_out`` (with ``push_ok``, t_894be273): a dirty own tree on the card branch no longer stays local. Its
+    changed files are copied straight from the Studio into the pool clone (:func:`carry_dirty`), never pushed
+    anywhere; ``(own tree, HEAD sha)`` is appended to ``carry_out`` and the clone is pinned to that HEAD. Still
+    local, named: a modified submodule or nested repository, changed files over the 25 MiB cap, or
+    origin's live card branch (``ls-remote``) not at the tree's HEAD (nor about to be, by the leased push)."""
     from hermes_cli.kanban_db_workspace import _git_toplevel, _is_linked_worktree_checkout
     raw = (workspace_path or "").strip() or (board_default or "").strip()
     if not raw:
@@ -339,10 +353,20 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
                 and _git_toplevel(own_tree) == own_tree.resolve()):
             _why(why, WHY_CONCRETE)
             return None, None  # a prior run's local worktree: its work stays where it is
+    carry = False
     if own_tree is not None and not _clean_on_branch(own_tree, b, runner):
-        # uncommitted or untracked work only the Studio has
-        _why(why, WHY_DIRTY if _on_branch(own_tree, b, runner) else WHY_OFF_BRANCH)
-        return None, None
+        # uncommitted or untracked work only the Studio has: carried into the clone when allowed (t_894be273)
+        if not _on_branch(own_tree, b, runner):
+            _why(why, WHY_OFF_BRANCH)
+            return None, None
+        if carry_out is None or not push_ok:
+            _why(why, WHY_DIRTY)
+            return None, None
+        census = dirty_census(own_tree, runner)
+        if isinstance(census, str):
+            _why(why, census)
+            return None, None
+        carry = carry_digest(own_tree, census)
 
     def _git(*args):
         try:
@@ -362,6 +386,25 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
     if remote is None or local is None:
         _why(why, WHY_NOT_REPO)
         return None, None
+    if carry:
+        # The carried files are changes against the tree's HEAD (= local, it is on the branch): the clone must
+        # start exactly there. The tracking ref may be stale or the branch pushed from elsewhere, so read origin's
+        # real tip: it must be local already, or be the lease's expected sha (the push then puts it at local).
+        top_ret, push = _assess_branch(top, b, remote, local, push_ok, why, _git, own_tree)
+        if top_ret is None:
+            return None, None
+        live = _origin_tip(top, b, runner)
+        if not local or live is None or live != (push[2] if push is not None else local):
+            _why(why, WHY_BASE_MOVED)
+            return None, None
+        carry_out.append((str(own_tree), local, carry))
+        return top_ret, push
+    return _assess_branch(top, b, remote, local, push_ok, why, _git, own_tree)
+
+
+def _assess_branch(top: Path, b: str, remote: str, local: str, push_ok: bool, why: Optional[List[str]],
+                   _git: Callable, own_tree: Optional[Path]):
+    """The branch half of :func:`assess`: ``(top, push)`` from the local and origin-tracking shas of ``b``."""
     if own_tree is not None and not remote and not push_ok:
         _why(why, "unpushed_commits")
         return None, None  # the tree's commits must be on origin: no origin ref = local only
@@ -391,6 +434,264 @@ def _on_branch(tree: Path, branch: str, runner: Callable) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return getattr(proc, "returncode", 1) == 0 and (proc.stdout or "").strip() == branch
+
+
+def _origin_tip(repo: Path, branch: str, runner: Callable) -> Optional[str]:
+    """Origin's current sha of ``refs/heads/<branch>``, read from the remote itself ("" = absent), None on error."""
+    try:
+        proc = runner(["git", "-C", str(repo), "ls-remote", "origin", f"refs/heads/{branch}"], capture_output=True,
+                      text=True, encoding="utf-8", errors="replace", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    return ((proc.stdout or "").split() or [""])[0]
+
+
+# Dirty-tree carry (t_894be273): the card's own dirty Studio tree is copied, as a tar stream over the pool ssh
+# path, straight into the pool clone. Nothing is pushed to GitHub. Cap: the changed files' bytes may not exceed
+# kanban_db.KANBAN_ATTACHMENT_MAX_BYTES (25 MiB), the cap the survivor capture applies to the same content.
+DIRTY_CARRY_ENV = "KANBAN_DIRTY_CARRY"
+DIRTY_CARRY_TIMEOUT_S = 300
+DIRTY_CARRY_MAX_DELETE_ARGV = 64 * 1024
+
+
+def _carry_cap() -> int:
+    from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES
+    return KANBAN_ATTACHMENT_MAX_BYTES
+
+
+def dirty_carry_enabled(fleet_dir: Path) -> bool:
+    """Kill switch: ``"dirty_carry": false`` in the overrides file, or ``KANBAN_DIRTY_CARRY=0``. Off = a dirty own
+    tree stays local as ``unpushed_dirty_tree``, exactly as before."""
+    if os.environ.get(DIRTY_CARRY_ENV, "").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    doc = _read_doc(fleet_dir)
+    return not (isinstance(doc, dict) and doc.get("dirty_carry") is False)
+
+
+def dirty_census(tree: Path, runner: Callable = subprocess.run):
+    """``(copy, delete)`` relative paths that make a clean checkout of ``tree``'s HEAD byte-equal to ``tree`` for
+    every path git reports changed (ignored files excepted), or a ``WHY_*`` string when the tree cannot be carried:
+    a modified submodule or an embedded repository (``git status`` cannot see inside it), or more changed bytes
+    than the cap. A path present in the tree is copied; one absent is deleted."""
+    try:
+        proc = runner(["git", "-C", str(tree), "status", "--porcelain=v2", "-z", "--untracked-files=all",
+                       "--ignore-submodules=none"], capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return WHY_DIRTY
+    if getattr(proc, "returncode", 1) != 0:
+        return WHY_DIRTY
+    out = proc.stdout if isinstance(proc.stdout, bytes) else (proc.stdout or "").encode("utf-8", "surrogateescape")
+    fields = out.split(b"\0")
+    paths: List[str] = []
+    i = 0
+    while i < len(fields):
+        rec = fields[i].decode("utf-8", "surrogateescape")
+        i += 1
+        if not rec:
+            continue
+        kind = rec[0]
+        if kind in ("1", "2", "u"):
+            parts = rec.split(" ", {"1": 8, "2": 9, "u": 10}[kind])
+            if len(parts) < 3 or parts[2] != "N...":
+                return WHY_NESTED_REPO        # a submodule entry (S...): its own work is not in this status
+            paths.append(parts[-1])
+            if kind == "2" and i < len(fields):  # rename/copy: the original path follows
+                paths.append(fields[i].decode("utf-8", "surrogateescape"))
+                i += 1
+        elif kind == "?":
+            p = rec[2:]
+            if p.endswith("/"):
+                return WHY_NESTED_REPO        # an embedded repository: git lists the directory, not its files
+            paths.append(p)
+    copy, delete, total = [], [], 0
+    try:
+        root = tree.resolve()
+    except OSError:
+        return WHY_DIRTY
+    for rel in dict.fromkeys(paths):
+        if not rel or rel.startswith("/") or any(c in ("", ".", "..", ".git") for c in rel.split("/")):
+            return WHY_NESTED_REPO
+        # No parent component may be a symlink (Prism 9e03f1e94c2d): lstat follows a symlinked PARENT, so a
+        # tracked dir replaced by a link to elsewhere would read files from outside the tree. A parent that is
+        # absent or a plain file (a tracked dir replaced by a file) means the path itself is gone: a deletion.
+        gone = False
+        for i in range(1, len(rel.split("/"))):
+            try:
+                pst = (tree / "/".join(rel.split("/")[:i])).lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                gone = True
+                break
+            except OSError:
+                return WHY_DIRTY
+            if stat.S_ISLNK(pst.st_mode):
+                return WHY_SYMLINK_PARENT
+            if not stat.S_ISDIR(pst.st_mode):
+                gone = True
+                break
+        if gone:
+            delete.append(rel)
+            continue
+        try:
+            st = (tree / rel).lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            delete.append(rel)
+            continue
+        except OSError:
+            return WHY_DIRTY
+        try:
+            (tree / rel).parent.resolve().relative_to(root)
+        except (OSError, ValueError):
+            return WHY_SYMLINK_PARENT
+        if stat.S_ISDIR(st.st_mode):
+            # git lists files, never a directory (an untracked dir or embedded repo was refused above): a
+            # directory here replaced the listed tracked file; its own files are listed on their own.
+            delete.append(rel)
+            continue
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+            return WHY_SPECIAL_FILE
+        total += st.st_size
+        if total > _carry_cap():
+            return WHY_CARRY_SIZE
+        copy.append(rel)
+    if 2 * sum(len(p.encode("utf-8", "surrogateescape")) + 3 for p in delete) > DIRTY_CARRY_MAX_DELETE_ARGV:
+        return WHY_CARRY_SIZE                 # the deletions (and their parents) ride the remote command line
+    return tuple(copy), tuple(delete)
+
+
+def carry_digest(tree: Path, census: tuple) -> str:
+    """A digest of a :func:`dirty_census` result: each copied path with its lstat size, mtime_ns, ctime_ns, mode
+    and inode, and each deleted path. Part of :func:`clone_key` via the port's carry tuple (Prism b4ca10cadc5b):
+    a prefetched clone whose carried files changed since is a different key, so it is never collected and the
+    clone job (which carries the files as they are then) runs again."""
+    h = hashlib.sha256()
+    copy, delete = census
+    for rel in copy:
+        try:
+            st = (tree / rel).lstat()
+            sig = (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode, st.st_ino)
+        except OSError:
+            sig = None
+        h.update(f"c\0{rel}\0{sig}\0".encode("utf-8", "surrogateescape"))
+    for rel in delete:
+        h.update(f"d\0{rel}\0".encode("utf-8", "surrogateescape"))
+    return h.hexdigest()
+
+
+def carry_payload(own_tree: str, head: str, runner: Callable = subprocess.run) -> Tuple[bytes, tuple]:
+    """``(tar bytes, deleted paths)`` that bring a clean checkout of ``head`` to ``own_tree``'s current state
+    (t_894be273). :func:`clone_on_host` sends them in the clone's own ssh call (one admitted spawn site; the
+    carry adds none). The census is taken here, so files changed since routing are carried as they are now.
+    Raises (a spawn failure; nothing on the Studio is touched) when the tree is off ``head`` or not carriable.
+
+    Snapshot race (Prism d9d8d2d38b45): HEAD is read before the census AND after the tar is built, and the census
+    digest (paths, sizes, mtimes, inodes) is compared across the build. A commit, or any listed path changing or
+    changing shape (a dir swapped for a symlink, a file appearing or going) while the tar is built, raises instead
+    of sending a tar that does not match the clone's pinned HEAD."""
+    tree = Path(own_tree)
+
+    def _head_is(where: str) -> None:
+        cur = runner(["git", "-C", own_tree, "rev-parse", "HEAD"], capture_output=True, text=True,
+                     encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+        if getattr(cur, "returncode", 1) != 0 or (cur.stdout or "").strip() != head:
+            raise RuntimeError(f"dirty carry of {own_tree}: HEAD moved off {head[:12]} {where}")
+
+    _head_is("since routing")
+    census = dirty_census(tree, runner)
+    if isinstance(census, str):
+        raise RuntimeError(f"dirty carry of {own_tree}: {census}")
+    before = carry_digest(tree, census)
+    payload = _carry_tar(tree, census[0])
+    _head_is("while the carry was built")
+    after = dirty_census(tree, runner)
+    if isinstance(after, str) or after != census or carry_digest(tree, after) != before:
+        raise RuntimeError(f"dirty carry of {own_tree}: the tree changed while the carry was built")
+    return payload, census[1]
+
+
+# The clone-side record of what the last carry wrote (Prism 23f7819e68e3): NUL-separated relative paths, carried
+# as the tar's first member. The next carry removes exactly those before its reset, so a carried file that HEAD
+# ignores never survives, and a worker's own ignored build output is never touched.
+CARRY_MANIFEST = ".git/kanban-carry.manifest"
+
+
+def _carry_tar(tree: Path, copy) -> bytes:
+    """An uncompressed tar of ``copy`` (paths relative to ``tree``; symlinks stored as links, modes kept), led by
+    :data:`CARRY_MANIFEST` listing them. Members are opened without following a symlink in any parent component
+    (the census already refused one; this closes the window between census and read). Bounded by the census cap,
+    so it is built in memory."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        listing = b"".join(rel.encode("utf-8", "surrogateescape") + b"\0" for rel in copy)
+        info = tarfile.TarInfo(CARRY_MANIFEST)
+        info.size, info.mode, info.mtime = len(listing), 0o600, int(time.time())
+        tar.addfile(info, io.BytesIO(listing))
+        for rel in copy:
+            _tar_add_nofollow(tar, tree, rel)
+    return buf.getvalue()
+
+
+def _tar_add_nofollow(tar, tree: Path, rel: str) -> None:
+    """Add ``tree/rel`` to ``tar``, walking each parent with O_NOFOLLOW|O_DIRECTORY so no symlinked parent is
+    traversed. A symlink member is stored as a link; a regular file is read through its own O_NOFOLLOW fd."""
+    import io
+    import tarfile
+    parts = rel.split("/")
+    flags_dir = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(tree), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for comp in parts[:-1]:
+            nfd = os.open(comp, flags_dir, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        st = os.lstat(parts[-1], dir_fd=fd)
+        info = tar.tarinfo(rel)
+        info.mode, info.mtime, info.uid, info.gid = stat.S_IMODE(st.st_mode), int(st.st_mtime), 0, 0
+        if stat.S_ISLNK(st.st_mode):
+            info.type, info.linkname = tarfile.SYMTYPE, os.readlink(parts[-1], dir_fd=fd)
+            tar.addfile(info)
+            return
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"dirty carry: {rel} is not a regular file or a symlink")
+        ffd = os.open(parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
+        with os.fdopen(ffd, "rb") as fh:
+            data = fh.read()
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    finally:
+        os.close(fd)
+
+
+def carry_script(workspace: str, head: str, delete=()) -> str:
+    """Remote sh of :func:`carry_dirty`. Inside the clone (a git checkout, rc 3 otherwise; HEAD proved to be
+    ``head``, rc 5 otherwise): the paths the previous carry wrote (:data:`CARRY_MANIFEST`) are removed, the
+    working tree is reset to HEAD (``reset --hard`` + ``clean -fd``; other ignored files are kept), the Studio's
+    deleted paths are removed and then their now-empty parent directories, deepest first (a tracked directory the
+    Studio replaced by a file), and the tar on stdin is unpacked. So the clone's non-ignored state equals the
+    Studio tree's on every port, including a REUSED clone that an earlier carry left dirty (Prism 6d57e664864b,
+    23f7819e68e3). The reset never costs a worker's work: a clone a run has used belongs to a card already
+    converted to ``scratch``, which is never ported (or carried) again."""
+    w = shlex.quote(workspace.rstrip("/"))
+    rm = (("rm -f -- " + " ".join(shlex.quote(p) for p in delete) + "; ") if delete else "")
+    parents = sorted({"/".join(p.split("/")[:i]) for p in delete for i in range(1, len(p.split("/")))},
+                     key=lambda d: (-d.count("/"), d))
+    rmdir = (("rmdir -- " + " ".join(shlex.quote(d) for d in parents) + " 2>/dev/null || true; ")
+             if parents else "")
+    return (f"set -e; cd {w}; [ -d .git ] || exit 3; [ \"$(git rev-parse HEAD)\" = {shlex.quote(head)} ] || exit 5; "
+            f"{_carry_undo()}{rm}{rmdir}tar -xf -")
+
+
+def _carry_undo() -> str:
+    """Remote sh (cwd = the clone): remove the paths the previous carry wrote (:data:`CARRY_MANIFEST`), then reset
+    the working tree to HEAD (``reset --hard`` + ``clean -fd``; other ignored files are kept). Run by
+    :func:`clone_script` BEFORE a reused clone's checkout and fast-forward (a carried file the new HEAD also
+    touches would refuse the merge, rc 5 on every retry; Apollo 20:4x), and again by :func:`carry_script`."""
+    m = shlex.quote(CARRY_MANIFEST)
+    return (f"if [ -f {m} ]; then xargs -0 rm -f -- < {m}; rm -f {m}; fi; "
+            "git reset -q --hard HEAD; git clean -fdq; ")
 
 
 class ForeignOriginPush(RuntimeError):
@@ -474,8 +775,9 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
     Derived mode (:func:`derived_enabled`): any GitHub repo, every host in ``pool_hosts``, ``push`` set when
     the card branch must be pushed first. Hand-list mode: the file's rows only, ``push`` always None."""
     if pool_hosts is not None and derived_enabled(fleet_dir):
+        carry: Optional[list] = [] if dirty_carry_enabled(fleet_dir) else None
         repo, push = assess(task_id, workspace_path, board_default, branch, runner,
-                            allow_studio_tree=allow_studio_tree, push_ok=True, why=why)
+                            allow_studio_tree=allow_studio_tree, push_ok=True, why=why, carry_out=carry)
         if repo is None:
             return None
         slug = origin_slug(repo, runner)
@@ -483,7 +785,10 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
             _why(why, WHY_NOT_GITHUB)
             return None
         route = derived_route(slug, fleet_dir, pool_hosts, why)
-        return (slug, route[0], route[1], route[2], push) if route else None
+        if not route:
+            return None
+        # A 6th element only for a dirty own tree to carry (t_894be273): (own tree, HEAD sha, census digest).
+        return (slug, route[0], route[1], route[2], push) + ((carry[0],) if carry else ())
     mirrors = read_mirrors(fleet_dir)
     if not mirrors:
         return None
@@ -540,7 +845,8 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
 
 
 def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
-                 url: Optional[str] = None, sha: Optional[str] = None, exact: bool = False) -> str:
+                 url: Optional[str] = None, sha: Optional[str] = None, exact: bool = False,
+                 carried: bool = False) -> str:
     """Remote sh: clone origin into the (empty) workspace, then put HEAD on
     ``branch`` and PROVE it (rc 4 otherwise). The mirror only accelerates the
     clone: ``--dissociate`` copies what was borrowed, so a later mirror prune
@@ -554,7 +860,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     tip, Prism 3e2f8506c8ff): a reused checkout behind it is fetched and
     fast-forwarded, and HEAD is PROVED to be it (rc 5 otherwise). ``exact``
     (a fresh re-clone of a carried scratch clone, t_9965b8d5): reset to
-    ``sha`` even when it is behind the branch tip, then PROVE it (rc 5)."""
+    ``sha`` even when it is behind the branch tip, then PROVE it (rc 5). ``carried`` (a dirty carry follows,
+    t_894be273): an earlier carry's files are undone (:func:`_carry_undo`) before the checkout and fast-forward.
+    The two combine: a reused clone is undone, then put on the exact ``sha``."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
     if mirror.startswith("~/"):
         # A derived per-host default (t_1d2c5939): the host's own $HOME, whatever user/OS it runs.
@@ -567,6 +875,7 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
         f"export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0={m}; "
         "if [ -d \"$w/.git\" ]; then "
         f"[ \"$(git -C \"$w\" remote get-url origin)\" = {url} ] || exit 3; "
+        + (f"( cd \"$w\" && {_carry_undo()}); " if carried else "") +
         "elif [ -n \"$(ls -A -- \"$w\")\" ]; then exit 3; "
         f"else if [ -d {m}/objects ]; then "
         f"git -c gc.auto=0 -c maintenance.auto=false -c fetch.prune=false --git-dir={m} "
@@ -589,17 +898,34 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
 
 
 def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
-                  runner: Callable = subprocess.run, sha: Optional[str] = None, exact: bool = False) -> None:
-    """Run :func:`clone_script` on ``host`` (a ``PoolHost``); raise on failure."""
+                  runner: Callable = subprocess.run, sha: Optional[str] = None,
+                  carry: Optional[tuple] = None, exact: bool = False) -> None:
+    """Run :func:`clone_script` on ``host`` (a ``PoolHost``); raise on failure. ``carry`` = the port's
+    ``(own tree, HEAD sha, digest)`` (t_894be273): the dirty tree's :func:`carry_payload` rides the SAME ssh call
+    on stdin, applied by :func:`carry_script` once the clone is proved at that HEAD. ``exact`` (t_9965b8d5): the
+    clone lands on ``sha`` even behind the branch tip (see :func:`clone_script`)."""
     from hermes_cli.kanban_worker_pool import _ssh_argv
-    proc = runner(_ssh_argv(host, clone_script(workspace, slug, mirror, branch, sha=sha, exact=exact)
-                            if exact else clone_script(workspace, slug, mirror, branch, sha=sha)),
-                  capture_output=True, text=True, encoding="utf-8", errors="replace",
-                  timeout=CLONE_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    kw: dict = {"sha": sha}
+    if carry:
+        kw["carried"] = True
+    if exact:
+        kw["exact"] = True
+    script = clone_script(workspace, slug, mirror, branch, **kw)
+    io_kw: dict = {"stdin": subprocess.DEVNULL}
+    timeout = CLONE_TIMEOUT_S
+    if carry:
+        if sha != carry[1]:
+            raise RuntimeError(f"dirty carry of {carry[0]}: clone pinned to {str(sha)[:12]}, tree at {carry[1][:12]}")
+        payload, delete = carry_payload(carry[0], carry[1], runner)
+        # the clone half never reads stdin; the carry's tar -xf - gets all of it
+        script = f"{{ {script}; }} </dev/null; {carry_script(workspace, carry[1], delete)}"
+        io_kw, timeout = {"input": payload}, CLONE_TIMEOUT_S + DIRTY_CARRY_TIMEOUT_S
+    proc = runner(_ssh_argv(host, script), capture_output=True, timeout=timeout, **io_kw)
     rc = getattr(proc, "returncode", 1)
     if rc != 0:
-        raise RuntimeError(f"worktree clone of {slug} on {host.name} failed rc={rc}: "
-                           f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        err = getattr(proc, "stderr", "") or ""
+        err = err.decode("utf-8", "replace") if isinstance(err, bytes) else err
+        raise RuntimeError(f"worktree clone of {slug} on {host.name} failed rc={rc}: {err.strip()[:200]}")
 
 
 # Pool-host clone off the dispatcher tick (t_915b8d2d). A gateway tick measured 5 of 6 py-spy samples in
@@ -625,9 +951,11 @@ _prefetch_pool: Optional[ThreadPoolExecutor] = None
 
 
 def clone_key(task_id: str, host_name: str, workspace: str, slug: str, mirror: str, branch: str,
-              push: Optional[tuple] = None) -> tuple:
-    """``push`` = :func:`assess`'s push plan (repo, branch, origin sha, source tip sha) or None."""
-    return (task_id, host_name, str(workspace), slug, mirror, branch, tuple(push) if push else None)
+              push: Optional[tuple] = None, carry: Optional[tuple] = None) -> tuple:
+    """``push`` = :func:`assess`'s push plan (repo, branch, origin sha, source tip sha) or None. ``carry`` = the
+    dirty own tree to copy in (t_894be273), so a clone made without it is never collected for a carry."""
+    return (task_id, host_name, str(workspace), slug, mirror, branch, tuple(push) if push else None) + (
+        (tuple(carry),) if carry else ())
 
 
 def clone_lock_path(lock_dir: Path, key: tuple) -> Path:
