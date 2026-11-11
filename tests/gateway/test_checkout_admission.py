@@ -354,12 +354,17 @@ def test_unclean_restart_defers_for_at_most_three_leases(store):
     """A predecessor that died without releasing (SIGKILL) is indistinguishable
     from a live peer until its lease expires: UNKNOWN for 3*lease_s, then clear."""
     store.hold("op", [GW], mode="freeze")
-    _gate(store, GW).publish()  # killed: no stop_lease
+    dead = _gate(store, GW)
+    dead.publish()  # killed: no stop_lease
     mono = _Mono()
     new = AdmissionGate(store, GW, active_work=Work(), monotonic=mono)
     assert new.publish().get("shared_with")
+    assert ca.evaluate(store)["verdict"] == UNKNOWN
     mono.t += ca.LEASE_EXPIRY_FACTOR * ca.DEFAULT_LEASE_S
     assert "shared_with" not in new.publish()
+    # The same 3 leases pass on the store clock: the dead record's lease expires
+    # for a reader too (t_3275003d: its own file, no longer overwritten by ours).
+    _age_record(store, GW, ca.LEASE_EXPIRY_FACTOR * ca.DEFAULT_LEASE_S, instance=dead.instance)
     assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
@@ -819,6 +824,17 @@ def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
     assert "shared" in rep["consumers"][0]["why"]
 
 
+def _clear_records(store, name):
+    """Remove every record of ``name``. Pre-t_3275003d a write REPLACED the
+    one shared record; helpers that model "the record of this name is now X"
+    clear first, so earlier gates' live records cannot make a shared-name
+    assertion pass on their own."""
+    import shutil
+
+    store.consumer_path(name).unlink(missing_ok=True)
+    shutil.rmtree(store.consumers_dir / ca._consumer_filename(name)[:-5], ignore_errors=True)
+
+
 def _foreign_record(store, name, **fields):
     """Publish under ``name`` as another instance whose pid (our parent) is
     alive on this host; ``fields`` override the start-identity fields. A
@@ -835,6 +851,7 @@ def _foreign_record(store, name, **fields):
     rec.update({"token": ..., "lease_s": ...})
     rec.update(fields)
     rec = {k: v for k, v in rec.items() if v is not ...}
+    _clear_records(store, name)
     store.write_consumer(name, rec)
 
 
@@ -1080,9 +1097,13 @@ class _Mono:
         return self.t
 
 
-def _age_record(store, name, seconds):
-    """Move the record's mtime (the store's lease clock) ``seconds`` into the past."""
-    p = store.consumer_path(name)
+def _age_record(store, name, seconds, instance=None):
+    """Move a record's mtime (the store's lease clock) ``seconds`` into the past
+    (``instance``'s record; default the newest record of ``name``)."""
+    if instance is None:
+        p = store._record_paths(name)[0][1]
+    else:
+        p = store.consumer_path(name, instance)
     st = os.stat(p)
     os.utime(p, (st.st_atime - seconds, st.st_mtime - seconds))
 
@@ -1097,6 +1118,7 @@ def _leased_leftover(store, name, *, age):
     other.start_offset = ca._start_offset(other.pid)
     other.time_ns = ca._time_ns_id() if other.start_offset is not None else None
     other.create_time = ca._create_time(other.pid)
+    _clear_records(store, name)
     store.write_consumer(name, other.snapshot())
     _age_record(store, name, age)
     return other
@@ -1156,7 +1178,7 @@ def test_lease_unverifiable_age_is_not_liveness_for_listed(store, monkeypatch):
     store.hold("op", [SERVE], mode="freeze")
     _gate(store, SERVE).publish()
     assert ca.evaluate(store)["verdict"] == QUIESCENT
-    monkeypatch.setattr(type(store), "record_age", lambda self, name: None)
+    monkeypatch.setattr(type(store), "record_age", lambda self, name, *a, **k: None)
     assert ca.evaluate(store)["verdict"] == UNKNOWN
 
 
@@ -1188,6 +1210,9 @@ def test_lease_killed_publisher_expires_after_three_leases(store):
     assert me.publish().get("shared_with")
     mono.t += 2
     assert "shared_with" not in me.publish()
+    assert ca.evaluate(store)["verdict"] == UNKNOWN  # reader: the peer's own record is still fresh
+    # kill -9 was 151 s ago on the store clock too: the peer's own record expired.
+    _age_record(store, SERVE, 151, instance=peer.instance)
     assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
@@ -1207,13 +1232,17 @@ def test_lease_released_publisher_clears_at_once(store):
 
 
 def test_lease_release_never_overwrites_a_successor(store):
+    store.hold("op", [SERVE], mode="freeze")
     old = _gate(store, SERVE)
     old.publish()
     new = _gate(store, SERVE)
     new.publish()
     old.stop_lease()
-    rec = store.read_consumer(SERVE)
+    rec = store.read_consumer(SERVE, new.instance)
     assert rec["token"] == new.token and not rec.get("lease_released")
+    assert store.read_consumer(SERVE, old.instance)["lease_released"] is True
+    new.publish()  # the successor alone, judged on its own intact record
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
 def test_lease_live_publisher_under_clock_step_stays_live(store):
@@ -1258,6 +1287,247 @@ def test_lease_thread_renews_while_serving_loop_is_stalled(store):
         g.stop_lease()
 
 
+class _WriteStall:
+    """Park one named thread's next consumer-record write between computing the
+    record and putting it on disk: the window a descheduled, SIGSTOPped or
+    debugger-held publisher sits in. Patches the module's one atomic writer, so
+    it works whichever file layout the store uses."""
+
+    def __init__(self, monkeypatch, thread_name):
+        self.thread_name = thread_name
+        self.parked, self.release = threading.Event(), threading.Event()
+        real = ca._atomic_write_json
+
+        def write(path, payload):
+            if threading.current_thread().name == self.thread_name and not self.release.is_set():
+                self.parked.set()
+                assert self.release.wait(30), "stalled writer never released"
+            return real(path, payload)
+
+        monkeypatch.setattr(ca, "_atomic_write_json", write)
+
+
+def test_interleaved_same_name_publish_never_hides_a_live_peer(store, monkeypatch):
+    """t_3275003d shape 1 (intermittent ACE-AI / ACE-MEDIA red of the killed-9 test
+    below, ``'QUIESCENT' == 'UNKNOWN'``): two live publishers under one name. A
+    computes its record, is descheduled before the write; B publishes; A's write
+    lands last. A's record was computed before B existed, so if A's write can
+    replace B's, nothing on disk says the name is shared and evaluate reads
+    QUIESCENT with both processes live."""
+    store.hold("op", [SERVE], mode="freeze")
+    a = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    b = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    a.publish()
+    stall = _WriteStall(monkeypatch, "publisher-a")
+    ta = threading.Thread(target=a.publish, name="publisher-a")
+    ta.start()
+    assert stall.parked.wait(10)
+    b.publish()
+    stall.release.set()
+    ta.join(10)
+    assert not ta.is_alive()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN, rep
+    assert "shared" in rep["consumers"][0]["why"], rep
+
+
+def test_suspended_publisher_never_stalls_or_hides_a_live_peer(store, monkeypatch):
+    """t_3275003d shape 2 (PR 218 Prism round 1): a same-name publisher frozen in
+    the middle of its lease renewal (SIGSTOP, debugger, descheduled) must not
+    block a healthy BUSY peer's renewals, publishes or shutdown release; while
+    it is frozen, and after it resumes with the record it computed before
+    freezing, the name never reads QUIESCENT while the peer has work."""
+    store.hold("op", [SERVE], mode="freeze")
+    frozen = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    work = Work()
+    healthy = AdmissionGate(store, SERVE, active_work=work, lease_s=30)
+    frozen.publish()
+    stall = _WriteStall(monkeypatch, "frozen")
+    tf = threading.Thread(target=frozen.renew_lease, name="frozen", daemon=True)
+    tf.start()
+    assert stall.parked.wait(10)
+    try:
+        work.n = 1
+        for step in (healthy.publish, healthy.renew_lease, healthy.publish):
+            t = threading.Thread(target=step, name="healthy", daemon=True)
+            t.start()
+            t.join(10)
+            assert not t.is_alive(), f"{step.__name__} blocked behind a frozen peer"
+            assert ca.evaluate(store)["verdict"] == UNKNOWN
+    finally:
+        stall.release.set()
+        tf.join(10)
+    assert not tf.is_alive()
+    rep = ca.evaluate(store)  # frozen resumed and wrote; healthy is still busy
+    assert rep["verdict"] == UNKNOWN, rep
+    t = threading.Thread(target=healthy.stop_lease, name="healthy", daemon=True)
+    t.start()
+    t.join(10)
+    assert not t.is_alive(), "shutdown release blocked behind a peer"
+    # Control: healthy stopped cleanly, frozen is idle and alone -> QUIESCENT, no sticky flag.
+    frozen.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_resumed_publisher_never_overwrites_a_busy_peer(store, monkeypatch):
+    """t_3275003d shape 3 (PR 218 Prism round 2, c-075793e661cc4372): an idle
+    publisher computes its record, is suspended; meanwhile a BUSY same-name peer
+    keeps publishing and renewing. The idle one resumes and writes the record it
+    computed before the peer's writes. That write must not replace the busy
+    peer's evidence: the verdict stays non-QUIESCENT while the peer has work."""
+    store.hold("op", [SERVE], mode="freeze")
+    idle = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    busy_work = Work()
+    busy = AdmissionGate(store, SERVE, active_work=busy_work, lease_s=30)
+    idle.publish()
+    stall = _WriteStall(monkeypatch, "idle")
+    ti = threading.Thread(target=idle.publish, name="idle")
+    ti.start()
+    assert stall.parked.wait(10)
+    busy_work.n = 1
+    for _ in range(3):
+        busy.publish()
+        busy.renew_lease()
+        assert ca.evaluate(store)["verdict"] != QUIESCENT
+    stall.release.set()  # the idle publisher resumes with its stale record
+    ti.join(10)
+    assert not ti.is_alive()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] != QUIESCENT, rep
+    assert rep["verdict"] == UNKNOWN, rep
+
+
+def test_mixed_fleet_legacy_shared_record_and_per_publisher_record_are_judged_together(store):
+    """t_3275003d deploy window: a pre-t_3275003d process still writes the shared
+    consumers/<name>.json while a restarted one writes its own record. Both are
+    live, so the name is shared -> UNKNOWN; once the old process releases its
+    lease (clean stop) the new one is judged alone."""
+    store.hold("op", [SERVE], mode="freeze")
+    old = _gate(store, SERVE)
+    old_rec = old.snapshot()
+    old_rec["tickets"] = [{"identity": "turn", "internal": False, "age": 1.0}]
+    store.consumer_path(SERVE).parent.mkdir(parents=True, exist_ok=True)
+    ca._atomic_write_json(store.consumer_path(SERVE), old_rec)  # the legacy file, as old code writes it
+    new = _gate(store, SERVE)
+    assert new.publish().get("shared_with")
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN and "shared" in rep["consumers"][0]["why"], rep
+    ca._atomic_write_json(store.consumer_path(SERVE), dict(old_rec, tickets=[], lease_released=True))
+    assert "shared_with" not in new.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+    assert store.consumer_path(SERVE).exists(), "the legacy file is never removed by new code"
+
+
+def _frozen_live_publisher(store, name):
+    """A same-name publisher whose pid is ALIVE with its genuine identity (a
+    SIGSTOPped process): only its lease says anything about it."""
+    a = _gate(store, name)
+    a.pid = os.getppid()
+    a.start_offset = ca._start_offset(a.pid)
+    a.time_ns = ca._time_ns_id() if a.start_offset is not None else None
+    a.create_time = ca._create_time(a.pid)
+    return a
+
+
+def test_expired_lease_of_a_frozen_busy_publisher_never_drops_out(store):
+    """Prism 706463591712 repro: publisher A admits work, then stops publishing
+    past its lease expiry (SIGSTOP); B starts under the same name and
+    acknowledges idle. An expired lease does not prove A's work finished, so
+    evaluate must not drop A and judge B alone."""
+    store.hold("op", [SERVE], mode="freeze")
+    a = _frozen_live_publisher(store, SERVE)
+    with a.locked():
+        a._tickets["t"] = ca.Ticket("t", "turn", True, time.time(), a)  # admitted before the hold
+    a.publish()
+    _age_record(store, SERVE, 3600, instance=a.instance)
+    _gate(store, SERVE).publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN, rep
+
+
+def test_expired_lease_that_never_acked_the_hold_never_drops_out(store):
+    """Same shape, A idle at its last write but that write predates the hold:
+    it may have admitted work after it, so its expiry proves nothing."""
+    a = _frozen_live_publisher(store, SERVE)
+    a.publish()  # no hold yet
+    store.hold("op", [SERVE], mode="freeze")
+    _age_record(store, SERVE, 3600, instance=a.instance)
+    _gate(store, SERVE).publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN, rep
+
+
+def test_expired_idle_ack_under_freeze_drops_out(store):
+    """Control: A's last write acknowledged this freeze with zero work (freeze
+    admits nothing after that), so its expired lease clears it."""
+    store.hold("op", [SERVE], mode="freeze")
+    a = _frozen_live_publisher(store, SERVE)
+    a.publish()
+    _age_record(store, SERVE, 3600, instance=a.instance)
+    _gate(store, SERVE).publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
+                    reason="needs POSIX directory permissions enforced (non-root)")
+def test_unreadable_publisher_dir_fails_closed_never_hides_a_busy_publisher(store):
+    """Prism 7ef91f0ded22: the per-publisher directory of a name cannot be
+    listed (EACCES, EIO). Mixed fleet: an idle legacy record is readable, a
+    BUSY new publisher's record sits in that directory. A scan that treats the
+    unlistable directory as empty judges the idle legacy record alone and reads
+    QUIESCENT over live work; it must read UNKNOWN."""
+    store.hold("op", [SERVE], mode="freeze")
+    old = _gate(store, SERVE)
+    store.consumer_path(SERVE).parent.mkdir(parents=True, exist_ok=True)
+    ca._atomic_write_json(store.consumer_path(SERVE), old.snapshot())  # legacy, idle, live
+    busy_work = Work()
+    busy_work.n = 1
+    busy = AdmissionGate(store, SERVE, active_work=busy_work)
+    busy.publish()
+    sub = store.consumer_path(SERVE, busy.instance).parent
+    os.chmod(sub, 0)
+    try:
+        rep = ca.evaluate(store)
+    finally:
+        os.chmod(sub, 0o755)
+    assert rep["verdict"] == UNKNOWN, rep
+
+
+def test_dead_publisher_record_is_pruned_only_after_its_lease(store):
+    """One record per process start must not pile up: a same-name publisher
+    removes another instance's record once its lease has expired AND its pid
+    is provably dead (same boot, same pid namespace); never sooner."""
+    import subprocess
+    import sys as _sys
+
+    if ca._pid_ns_id() is None or ca._host_boot_id() is None:
+        pytest.skip("needs /proc boot_id and pid namespace")
+    child = subprocess.Popen([_sys.executable, "-c", "pass"])
+    child.wait()
+    gone = _gate(store, SERVE)
+    gone.pid = child.pid
+    gone.publish()
+    path = store.consumer_path(SERVE, gone.instance)
+    me = _gate(store, SERVE)
+    me.publish()
+    assert path.exists(), "pruned before its lease could expire"
+    _age_record(store, SERVE, ca.LEASE_EXPIRY_FACTOR * ca.DEFAULT_LEASE_S + 1, instance=gone.instance)
+    me.publish()
+    assert not path.exists()
+    assert store.consumer_path(SERVE, me.instance).exists()
+    # a clean stop's released record is pruned the same way (one file per restart must not pile up)
+    stopped = _gate(store, SERVE)
+    stopped.pid = child.pid
+    stopped.publish()
+    stopped.stop_lease()
+    released = store.consumer_path(SERVE, stopped.instance)
+    me.publish()
+    assert released.exists(), "pruned before its lease could expire"
+    _age_record(store, SERVE, ca.LEASE_EXPIRY_FACTOR * ca.DEFAULT_LEASE_S + 1, instance=stopped.instance)
+    me.publish()
+    assert not released.exists()
+
+
 def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
     """Real process: a second publisher under our name, then SIGKILL. Its
     lease expires after 3*lease_s and the shared flag clears."""
@@ -1265,7 +1535,7 @@ def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
     import subprocess
     import sys
 
-    lease_s = 0.3
+    lease_s = 1.0  # expiry 3 s; a live 0.3 s lease measured >0.9 s stale under load (t_3275003d probe: max 1.15 s at load1 ~215)
     store.hold("op", [SERVE], mode="freeze")
     ready = tmp_path / "ready"
     code = (
