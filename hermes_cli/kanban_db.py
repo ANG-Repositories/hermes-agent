@@ -10835,6 +10835,8 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            if _dead_claim_release_voided(conn, row["id"], termination):
+                continue    # late worker evidence: the next sweep re-judges it (t_bf2c4ade)
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -11059,10 +11061,9 @@ def reclaim_task(
     held_status = row["status"]
     preserve_status = held_status in ("blocked", "triage", "scheduled")
     with write_txn(conn):
-        if termination.get("operator_override") and (
-            _dead_claimer_release_at(conn, task_id)[1] != "launch_bound"
-        ):
-            # The override was granted on "no worker evidence". Worker evidence
+        if _dead_claim_release_voided(conn, task_id, termination):
+            # The override (and every dead-claimer release at the bound,
+            # t_bf2c4ade) was granted on "no worker evidence". Worker evidence
             # (a ``spawned``/``heartbeat`` event) that landed after that check
             # voids it: re-read it under the write lock (FleetReview
             # 8a8140b0725a on #1404).
@@ -20237,6 +20238,47 @@ def _dead_claimer_hold_only(worker_pid: Optional[int], termination: dict) -> boo
     )
 
 
+def _reclaim_hold_expires(now: int, termination: dict) -> int:
+    """``claim_expires`` for a claim a reclaim path just HELD instead of releasing.
+
+    A dead-claimer hold has a known end (``dead_claimer_hold_until``, the launch
+    bound): the lease runs to exactly that point, so the TTL sweep re-judges the
+    claim the moment the bound passes and releases it there. A flat
+    ``now + RECLAIM_DEFER_GRACE_SECONDS`` both SHORTENED the lease inside the
+    bound (a refused manual ``reclaim`` made the sweep fire early and defer
+    ``ttl_expired_worker_alive``) and pushed it past the bound (t_bf2c4ade).
+    Every other hold keeps the flat grace."""
+    hold_until = termination.get("dead_claimer_hold_until")
+    if isinstance(hold_until, int) and hold_until > now:
+        return hold_until
+    return now + RECLAIM_DEFER_GRACE_SECONDS
+
+
+def _dead_claim_release_voided(
+    conn: sqlite3.Connection, task_id: str, termination: dict,
+) -> bool:
+    """Call UNDER the write lock that releases the claim. True when a release
+    granted on "no worker evidence" for a pid-less, dead-claimer claim is void
+    because evidence landed after the verdict: a stamped worker pid, a
+    ``spawned``/``heartbeat`` row that moved (or replaced) the bound, or a
+    changed basis. Every path that releases a claim at the dead-claimer bound
+    calls this one helper (t_bf2c4ade, Apollo P1 8ffc317b3093). Verdicts not
+    made on the dead-claimer path return False."""
+    basis = termination.get("dead_claimer_release_basis")
+    if not termination.get("host_local") or termination.get("prev_pid") or basis is None:
+        return False
+    cur = conn.execute("SELECT worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if cur is not None and cur["worker_pid"]:
+        return True
+    release_at, basis_now, _ = _dead_claimer_release_at(conn, task_id)
+    if basis == "operator_claim_no_worker":
+        return basis_now != basis
+    if termination.get("operator_override"):
+        # Granted inside the bound on "no evidence at all" (FleetReview 8a8140b0725a).
+        return basis_now != "launch_bound"
+    return basis_now != basis or release_at is None or int(time.time()) < release_at
+
+
 def _host_process_mentions_task(task_id: str) -> bool:
     """True if any other process on this host carries ``task_id`` in argv.
 
@@ -20356,7 +20398,7 @@ def _refuse_reclaim_unproven_death(
     this call just refused to release.
     """
     now = int(time.time())
-    grace = now + RECLAIM_DEFER_GRACE_SECONDS
+    grace = _reclaim_hold_expires(now, termination)
     with write_txn(conn):
         run_id = _current_run_id(conn, task_id)
         cur = conn.execute(
@@ -20536,6 +20578,8 @@ def detect_progress_stalls(
         escalate = attempts >= 2
         reason = f"worker progress stalled for {age}s; {evidence['signals']}; heartbeat age {evidence['heartbeat_age_seconds']}s"
         with write_txn(conn):
+            if _dead_claim_release_voided(conn, row["id"], termination):
+                continue    # late worker evidence: the next pass re-judges it (t_bf2c4ade)
             status = "blocked" if escalate else _kdb.requeue_status(
                 conn, _retry_status_for_run(conn, row["id"]))
             cur = conn.execute(

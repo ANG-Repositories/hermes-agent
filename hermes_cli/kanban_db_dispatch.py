@@ -1298,7 +1298,7 @@ def _defer_reclaim_for_live_worker(
     The next tick retries the kill; not spawning a duplicate is what lets the
     throttled worker finally die.
     """
-    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
+    grace = _kb._reclaim_hold_expires(now, termination)
     with _kb.write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
@@ -1864,6 +1864,8 @@ def detect_stale_running(
             continue
 
         with _kb.write_txn(conn):
+            if _kb._dead_claim_release_voided(conn, tid, termination):
+                continue    # late worker evidence: the next tick re-judges it (t_bf2c4ade)
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -3090,6 +3092,7 @@ def _record_task_failure(
     infrastructure: bool = False,
     run_metadata_extra: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
+    precondition: Optional[Callable[[sqlite3.Connection], bool]] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -3149,6 +3152,10 @@ def _record_task_failure(
         # transaction, so a successor run that claimed it meanwhile is never reset (Prism 606e8aff45d3).
         if expected_run_id is not None and (row["status"] != "running"
                                             or row["current_run_id"] != int(expected_run_id)):
+            return None
+        # ``precondition``: a caller-owned re-check that must hold UNDER this write lock
+        # (t_bf2c4ade: admit releases its own claim only while the run has no worker evidence).
+        if precondition is not None and not precondition(conn):
             return None
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
