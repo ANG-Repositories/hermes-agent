@@ -748,6 +748,38 @@ def test_admit_names_a_pending_pool_host_clone_and_leaves_the_card_ready(board, 
     assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
 
 
+def _worktree_pinned(m, ctx):
+    """Cards ``ctx["tids"]`` become worktree cards whose repo has an operator pin row naming ace-ai only, not the
+    Studio (t_fbe8a067): the dispatcher's last ``row_route`` pass (``_pinned_route``) waits them worktree_pin on a
+    tick with no pool plan instead of letting them fall back to a local Studio spawn."""
+    from hermes_cli import kanban_worktree_port as kwt
+
+    with kb.connect_closing() as conn:
+        for tid in ctx["tids"]:
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=? WHERE id=?",
+                         (str(kb.workspaces_root() / tid), tid))
+    m.setattr(kwt, "repo_pin", lambda *a, **k: ("ace-ai",))
+    ctx["plan"] = None
+
+
+def test_admit_names_a_worktree_pin_without_the_studio_and_leaves_the_card_ready(board, monkeypatch, capsys):
+    """t_1d9bf2a7: a worktree card whose repo is pinned to ace-ai only (t_fbe8a067) is held by the dispatcher's
+    ``route: _pinned_route`` site on a tick with no pool plan. ``kanban admit`` to the Studio refuses with that wait,
+    naming the pin, and neither claims nor spawns the card."""
+    _hot_local(monkeypatch, load1=10.0)
+    tid = _card()
+    ctx: dict = {"tids": [tid]}
+    _worktree_pinned(monkeypatch, ctx)
+    monkeypatch.setattr(ka, "_dispatcher_plan", lambda c: (None, board / "fleet"))
+    SPAWNS.clear()
+    monkeypatch.setattr(ka, "admit", functools.partial(ka.admit, spawn_fn=_spawn))
+    ns = argparse.Namespace(task_id=tid, host="studio", reason="Ace: proceed")
+    assert ka.cmd_admit(ns) == 1
+    err = capsys.readouterr().err
+    assert f"kanban admit: REFUSED {tid}: held: worktree_pin (ace-ai: no pool plan this tick)" in err, err
+    assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
+
+
 def _site_triggers():
     """site key -> trigger(m, ctx) that puts the card(s) ``ctx["tids"]`` (or
     the board) into the state that fires that site. It returns ``(host, kind,
@@ -988,6 +1020,12 @@ def _site_triggers():
         _clone_pending(m, ctx)
         return "ace-ai", "admit", "held: clone_pending:ace-ai"
 
+    def worktree_pinned(m, ctx):
+        # t_fbe8a067: the last row_route pass applies a worktree card's operator pin, plan or no plan. A pin that
+        # leaves out the Studio turns the no-plan local route into the named wait, never a Studio spawn.
+        _worktree_pinned(m, ctx)
+        return "studio", "twin", "worktree_pin \\(ace-ai: no pool plan this tick"
+
     def claim(m, ctx):
         m.setattr(kb, "claim_task", lambda conn, task_id, **k: None)
         return "studio", "twin", "did not spawn"
@@ -1176,6 +1214,7 @@ def _site_triggers():
         "continue: _local_wait is not None": fwa_local_held,
         "continue: _gap is not None": layer0b,
         "continue: not _ready": clone_pending,
+        "route: _pinned_route": worktree_pinned,
         "continue: claimed is None": claim,
         "fail: except _kph.PauseHeld (try: _kb.claim_task)": claim_pause,
         "continue: except Exception (try: _kb.apply_lane_model_override)": lane_route,
@@ -1209,15 +1248,22 @@ def _norm(text: str, tid: str) -> str:
     return text.replace(tid, "<card>")
 
 
-def test_every_dispatcher_decision_site_has_a_trigger():
+@pytest.mark.parametrize("site", sorted(_decision_sites()))
+def test_every_dispatcher_decision_site_has_a_trigger(site):
     """Built from the dispatcher's source: a site with no trigger and no
-    recorded reason fails here, so the next seam cannot be missed."""
-    sites = _decision_sites()
-    triggers = _site_triggers()
-    assert not sites - set(triggers) - set(NOT_A_CARD_REFUSAL), (
-        f"dispatcher decision site(s) with no admit trigger: {sorted(sites - set(triggers) - set(NOT_A_CARD_REFUSAL))}")
-    stale = (set(triggers) | set(NOT_A_CARD_REFUSAL)) - sites
-    assert not stale, f"trigger(s) for sites the dispatcher no longer has: {sorted(stale)}"
+    recorded reason fails here, so the next seam cannot be missed. One test id
+    PER SITE (t_1d9bf2a7): a PR that adds an unregistered site fails under an id
+    naming that site, which main does not have, so it can never be read as a red
+    inherited from main (#212 and #241 both merged that way under one shared id)."""
+    assert site in _site_triggers() or site in NOT_A_CARD_REFUSAL, (
+        f"dispatcher decision site with no admit trigger: {site!r}")
+
+
+@pytest.mark.parametrize("site", sorted(set(_site_triggers()) | set(NOT_A_CARD_REFUSAL)))
+def test_every_registered_site_is_still_a_dispatcher_decision_site(site):
+    """No stale excuses: a trigger or NOT_A_CARD_REFUSAL key the dispatcher no
+    longer has is red, under an id naming that key."""
+    assert site in _decision_sites(), f"trigger for a site the dispatcher no longer has: {site!r}"
 
 
 @pytest.mark.parametrize("site", sorted(_site_triggers()))
