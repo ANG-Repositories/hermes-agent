@@ -1900,3 +1900,24 @@ def test_a_half_built_tree_locked_for_another_reason_is_left_alone(studio_card):
         route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
     assert "own_tree_not_a_checkout" in (route[1] or ""), route
     assert wt.is_dir() and (gitdir / "locked").read_text(encoding="utf-8").strip() == "operator hold"
+
+
+def test_a_half_built_own_tree_that_holds_work_gets_a_fix_that_never_force_removes(studio_card):
+    """Prism #265 P1 1: a tree the cleanup keeps because it holds work waits under its OWN code, and the posted fix
+    for that code never suggests `worktree remove -f -f` (which would delete the work)."""
+    from hermes_cli import kanban_placement_starvation as kps
+    tid, wt, bare, calls = studio_card
+    gitdir = _make_half_built(wt, age_s=3600)
+    (wt / "notes.md").write_text("written into the dead tree", encoding="utf-8")   # untracked: work, whatever its mtime
+    import os
+    import time
+    old = time.time() - 3600
+    os.utime(wt / "notes.md", (old, old))
+    with kb.connect_closing() as conn:
+        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
+    assert route == ("wait", "half_built_worktree_holds_work "
+                             "(not_portable:workspace_kind:own_tree_half_built_holds_work)"), route
+    fix = kps.fix_for(route[1].split(" (", 1)[0])
+    assert fix is not None and "-f -f" not in fix and "remove -f" not in fix, fix
+    assert "-f -f" in kps.fix_for("half_built_worktree")              # the no-work code keeps its fix
+    assert wt.is_dir() and (wt / "notes.md").is_file() and gitdir.is_dir()

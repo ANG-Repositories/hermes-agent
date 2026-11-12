@@ -50,12 +50,22 @@ _FIXES = (
     ("requires:",
      "the capability the card requires is on no pool host it may use. Fix: correct the "
      "`requires:` line, or pin the host that serves it."),
+    # Longest prefix first: a tree that holds work must never get the forced-remove fix (Prism #265 P1 1).
+    ("half_built_worktree_holds_work",
+     "the card's own `.worktrees/<id>` is a `git worktree add` that was killed mid-checkout (locked "
+     "`initializing`, no index) and it HOLDS WORK: a file written after the add died, an untracked file, content "
+     "that is not HEAD's, or a detached HEAD no ref contains (the dispatcher log line "
+     "PHASE=kanban_half_built_worktree_held names it; t_f609a5a0). Never remove it with -f. Fix, touching no "
+     "file: `git -C <repo>/.worktrees/<id> reset -q` (writes the index from HEAD) then `git -C <repo> worktree "
+     "unlock <repo>/.worktrees/<id>`; the tree is then an ordinary dirty checkout that ports with its work. For a "
+     "detached HEAD first pin it: `git -C <repo> branch keep/<id> <sha>`."),
     ("half_built_worktree",
      "the card's own `.worktrees/<id>` is a `git worktree add` that was killed mid-checkout (locked "
-     "`initializing`, no index) and placement could not clear it (its lock is younger than 10 min, it is on "
-     "another branch, or the removal failed; the dispatcher log line PHASE=kanban_half_built_worktree_held "
-     "names which; t_f609a5a0). Fix: `git -C <repo> worktree remove -f -f <repo>/.worktrees/<id>`, then delete "
-     "`wt/<id>` only if it has no commits of its own."),
+     "`initializing`, no index), holds no work (every file is HEAD's content, none written after the add died), "
+     "and placement could not clear it (its lock is younger than 12 min, it is on another branch, or the "
+     "removal failed; the dispatcher log line PHASE=kanban_half_built_worktree_held names which; t_f609a5a0). "
+     "Fix, once the lock is 12 min old: `git -C <repo> worktree remove -f -f <repo>/.worktrees/<id>`, then "
+     "delete `wt/<id>` only if it has no commits of its own."),
     ("studio_capability_only:",
      "the card was kept off the pool but names no Studio-only capability, so it waits instead of running "
      "on the Studio (t_9965b8d5). Fix: if it needs the Studio, add `requires: <studio-only capability>` "

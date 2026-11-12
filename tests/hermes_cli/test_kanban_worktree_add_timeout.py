@@ -131,7 +131,8 @@ def test_a_lock_reason_other_than_initializing_is_never_touched(repo):
     rep = kwr.remove_failed_add(repo, target, pre={"absent": True, "admins": []}, branch="wt/t_keep",
                                 created_branch=True, base_sha=git(repo, "rev-parse", "HEAD"), timed_out=True)
     assert rep["kept"] and not rep["removed"] and not rep["branch_deleted"]
-    assert kwr.drain_half_built(repo, target, branch="wt/t_keep", delete_branch=True)["kept"]
+    assert kwr.drain_half_built(repo, target, branch="wt/t_keep",
+                                branch_sha=git(repo, "rev-parse", "wt/t_keep"))["kept"]
     assert target.is_dir() and admin.is_dir()
     assert git(repo, "branch", "--list", "wt/t_keep") != ""
 
@@ -435,3 +436,147 @@ def test_spawn_reusing_a_finished_locked_tree_releases_the_stale_lock(repo):
     target, admin = _finished_locked(repo, "t_reuse", 10_000)
     kbw._ensure_git_worktree(repo, target, "wt/t_reuse")
     assert kwr.lock_reason(admin) is None and git(target, "branch", "--show-current") == "wt/t_reuse"
+
+
+# --- review r3 (Prism #265 @3ea42c70, 5 P1s): nothing the cleanup cannot prove is residue is ever deleted --------
+
+
+def test_p1_2_an_untracked_file_with_an_early_mtime_keeps_the_tree(repo):
+    """An mtime inside the add's window does not prove git wrote the file: an untracked one is work."""
+    target = repo / ".worktrees" / "t_untr"
+    admin = _half_built(repo, target, "wt/t_untr", age_s=10_000)
+    (target / "mine.txt").write_text("a person's note, written right after the kill\n", encoding="utf-8")
+    _age_tree(target, admin, 10_000)                                # backdated: the mtime test alone passes it
+    assert kwr.written_after_add(target, admin) is None
+    res = kwr.clear_half_built(repo, target, branch="wt/t_untr")
+    assert res["cleared"] is False and res["holds_work"] is True and "untracked" in res["why"], res
+    assert kwr.drain_half_built(repo, target, branch="wt/t_untr", branch_sha="")["kept"]
+    assert (target / "mine.txt").is_file()
+
+
+def test_p1_2_a_tracked_file_whose_content_differs_from_head_keeps_the_tree(repo):
+    target = repo / ".worktrees" / "t_diff"
+    admin = _half_built(repo, target, "wt/t_diff", age_s=10_000)
+    (target / "f1.slow").write_text("edited, not HEAD's\n", encoding="utf-8")
+    _age_tree(target, admin, 10_000)
+    res = kwr.clear_half_built(repo, target, branch="wt/t_diff")
+    assert res["cleared"] is False and res["holds_work"] is True and "differs from HEAD" in res["why"], res
+    assert kwr.drain_half_built(repo, target, branch="wt/t_diff", branch_sha="")["kept"]
+    assert (target / "f1.slow").read_text(encoding="utf-8-sig") == "edited, not HEAD's\n"
+
+
+def test_p1_2_a_partial_checkout_of_head_content_is_still_residue(repo):
+    """Positive control: a SUBSET of HEAD's files, byte-equal, is what a killed add leaves: cleared."""
+    target = repo / ".worktrees" / "t_part"
+    admin = _half_built(repo, target, "wt/t_part", age_s=10_000)
+    (target / "f2.slow").unlink()
+    assert kwr.differs_from_head(repo, target, admin) is None
+    assert kwr.clear_half_built(repo, target, branch="wt/t_part")["cleared"] is True
+    assert not target.exists()
+
+
+def test_p1_3_drain_deletes_the_branch_only_at_the_sha_the_audit_approved(repo):
+    target = repo / ".worktrees" / "t_stale"
+    admin = _half_built(repo, target, "wt/t_stale", age_s=10_000)
+    approved = git(repo, "rev-parse", "wt/t_stale")
+    # Between attribution and drain the branch gains an unpushed commit (written from another tree).
+    other = repo.parent / "other"
+    git(repo, "worktree", "add", "-q", "--detach", str(other), approved)
+    (other / "late.txt").write_text("late\n", encoding="utf-8")
+    git(other, "add", "late.txt")
+    git(other, "commit", "-qm", "late unpushed commit")
+    moved = git(other, "rev-parse", "HEAD")
+    git(repo, "update-ref", "refs/heads/wt/t_stale", moved)
+    git(repo, "worktree", "remove", str(other))
+    # The half-built tree's HEAD now names the moved tip: write that content so it is still pure residue.
+    (target / "late.txt").write_text("late\n", encoding="utf-8")
+    _age_tree(target, admin, 10_000)
+
+    rep = kwr.drain_half_built(repo, target, branch="wt/t_stale", branch_sha=approved)
+
+    assert rep["removed"] is True and rep["branch_deleted"] is False, rep
+    assert git(repo, "rev-parse", "wt/t_stale") == moved             # the new commit survives
+
+
+def test_p1_3_audit_drain_passes_the_tip_it_read(repo, tmp_path, monkeypatch):
+    """The audit hands drain_half_built the tip it attributed, never a re-read."""
+    import importlib.util
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, branch_name TEXT)")
+    c.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT)")
+    c.execute("INSERT INTO tasks VALUES ('t_0000abcd', 'done', NULL)")
+    c.commit()
+    c.close()
+    _with_remote(repo, tmp_path)
+    target = repo / ".worktrees" / "t_0000abcd"
+    _half_built(repo, target, "wt/t_0000abcd", age_s=10_000)
+    tip = git(repo, "rev-parse", "wt/t_0000abcd")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
+    spec = importlib.util.spec_from_file_location("kwr_audit_t", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    seen = {}
+    real = mod.kwr.drain_half_built
+
+    def spy(repo_root, tgt, *, branch, branch_sha=""):
+        seen["sha"] = branch_sha
+        return real(repo_root, tgt, branch=branch, branch_sha=branch_sha)
+    monkeypatch.setattr(mod.kwr, "drain_half_built", spy)
+    assert mod.main(["--repo", str(repo), "--db", str(db), "--drain", "--execute"]) == 0
+    assert seen["sha"] == tip and not target.exists()
+    assert git(repo, "branch", "--list", "wt/t_0000abcd") == ""     # the trunk has it: deleted at that tip
+
+
+def _detached_half_built(repo, target, age_s=10_000):
+    """A half-built DETACHED tree whose HEAD is a commit no ref contains."""
+    git(repo, "worktree", "add", "-q", "--detach", str(target), "HEAD")
+    (target / "d.txt").write_text("detached work\n", encoding="utf-8")
+    git(target, "add", "d.txt")
+    git(target, "commit", "-qm", "detached commit")
+    sha = git(target, "rev-parse", "HEAD")
+    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
+    (admin / "index").unlink()
+    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
+    _age_tree(target, admin, age_s)
+    return admin, sha
+
+
+def test_p1_4_clear_half_built_refuses_a_detached_head_no_ref_contains(repo):
+    target = repo / ".worktrees" / "t_det"
+    admin, sha = _detached_half_built(repo, target)
+    assert kwr.differs_from_head(repo, target, admin) is None       # pure HEAD content: only the commit is at stake
+    res = kwr.clear_half_built(repo, target, branch="wt/t_det")
+    assert res["cleared"] is False and res["holds_work"] is True and sha in res["why"], res
+    assert admin.is_dir() and (admin / "HEAD").read_text(encoding="utf-8-sig").strip() == sha
+    assert git(repo, "cat-file", "-t", sha) == "commit"
+
+
+def test_p1_4_a_detached_head_some_branch_contains_is_still_cleared(repo):
+    target = repo / ".worktrees" / "t_det2"
+    admin, sha = _detached_half_built(repo, target)
+    git(repo, "branch", "keep/t_det2", sha)                          # pinned: removing the admin dir loses nothing
+    assert kwr.clear_half_built(repo, target, branch="wt/t_det2")["cleared"] is True
+    assert git(repo, "rev-parse", "keep/t_det2") == sha
+
+
+def test_p1_5_audit_drain_keeps_a_detached_tree_whose_commit_no_ref_contains(repo, tmp_path):
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, branch_name TEXT)")
+    c.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT)")
+    c.execute("INSERT INTO tasks VALUES ('t_0000de7a', 'done', NULL)")
+    c.commit()
+    c.close()
+    target = repo / ".worktrees" / "t_0000de7a"
+    admin, sha = _detached_half_built(repo, target)
+    dry = _audit("--repo", str(repo), "--db", str(db), "--drain")
+    assert "would remove" not in dry.stdout, dry.stdout
+    run = _audit("--repo", str(repo), "--db", str(db), "--drain", "--execute")
+    assert run.returncode == 0 and target.is_dir() and admin.is_dir()
+    assert kwr.drain_half_built(repo, target, branch="", branch_sha="")["kept"]
+    assert git(repo, "cat-file", "-t", sha) == "commit" and admin.is_dir()
+    tab = _audit("--repo", str(repo), "--db", str(db))
+    assert "detached HEAD" in tab.stdout and sha in tab.stdout

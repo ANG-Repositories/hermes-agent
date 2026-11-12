@@ -328,9 +328,116 @@ def written_after_add(target: Path, admin: Path, slack_s: float = _SLACK_S) -> O
     return None
 
 
-def branch_has_own_commits(repo_root: Path, branch: str) -> Optional[bool]:
-    """True when ``refs/heads/<branch>`` holds a commit no remote-tracking ref has; None = unknown."""
-    tip = rev(repo_root, f"refs/heads/{branch}")
+def _admin_head_sha(repo_root: Path, admin: Path) -> tuple:
+    """``(sha, branch)`` the admin dir's HEAD names: a branch ref resolved, or the detached sha. ``("", "")`` =
+    unreadable / unresolvable."""
+    head = (_read(admin / "HEAD") or "").strip()
+    if head.startswith("ref: refs/heads/"):
+        b = head[len("ref: refs/heads/"):]
+        return rev(repo_root, f"refs/heads/{b}"), b
+    if head.startswith("ref: "):
+        return rev(repo_root, head[len("ref: "):]), ""
+    return (rev(repo_root, head) if head else ""), ""
+
+
+def _blob_sha(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def differs_from_head(repo_root: Path, target: Path, admin: Path) -> Optional[str]:
+    """A file under ``target`` that is NOT the content of the tree's HEAD commit, else None (Prism #265 P1 2).
+
+    An early mtime does not prove git wrote a file; content does. Every file must be a path of HEAD's tree with
+    the same type and the same blob id (``git hash-object`` with the path's filters, so an eol / smudge filter
+    reads as the checkout wrote it); an untracked file, a changed file, or a type change is work. A half-built
+    add has written a SUBSET of HEAD's files, so a missing file is not work. Unknown (HEAD unresolvable, git
+    error) is treated as work (returned)."""
+    sha, _ = _admin_head_sha(repo_root, admin)
+    if not sha:
+        return f"HEAD of {admin} unresolvable"
+    lt = _git(repo_root, "ls-tree", "-r", "-z", "--full-tree", sha, timeout=300)
+    if lt is None or lt.returncode != 0:
+        return f"ls-tree {sha} failed"
+    want = {}
+    for ent in lt.stdout.split("\0"):
+        if not ent:
+            continue
+        meta, _, path = ent.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3:
+            want[path] = (parts[0], parts[2])
+    regular = []
+    try:
+        for root, dirs, files in os.walk(target):
+            if root == str(target):
+                dirs[:] = [d for d in dirs if d != ".git"]
+            for name in list(files) + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+                if name == ".git" and root == str(target):
+                    continue  # the gitfile is git's, not work
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, str(target)).replace(os.sep, "/")
+                if rel not in want:
+                    return f"untracked: {full}"
+                mode, blob = want[rel]
+                if os.path.islink(full):
+                    if mode != "120000" or _blob_sha(os.fsencode(os.readlink(full))) != blob:
+                        return f"differs from HEAD: {full}"
+                elif mode not in ("100644", "100755") or not os.path.isfile(full):
+                    return f"differs from HEAD (type): {full}"
+                else:
+                    regular.append((rel, blob, full))
+    except OSError as exc:
+        return f"unreadable: {exc}"
+    if not regular:
+        return None
+    ho = subprocess.run(["git", "--git-dir", str(admin), "--work-tree", str(target), "hash-object", "--stdin-paths"],
+                        cwd=str(target), input="\n".join(r for r, _, _ in regular) + "\n", capture_output=True,
+                        text=True, encoding="utf-8", errors="replace", timeout=600, check=False) \
+        if all("\n" not in r for r, _, _ in regular) else None
+    if ho is None or ho.returncode != 0:
+        return "hash-object failed"
+    got = ho.stdout.split()
+    if len(got) != len(regular):
+        return "hash-object output short"
+    for (rel, blob, full), h in zip(regular, got):
+        if h != blob:
+            return f"differs from HEAD: {full}"
+    return None
+
+
+def holds_work(repo_root: Path, target: Path, admin: Path) -> Optional[str]:
+    """Why ``target`` is work, never residue, else None: a file written after the add died
+    (:func:`written_after_add`, cheap, first) or a file that is not HEAD's content (:func:`differs_from_head`).
+    The gate every destructive half-built cleanup passes (clear, drain)."""
+    late = written_after_add(target, admin)
+    if late is not None:
+        return f"a file was written after the add died ({late})"
+    diff = differs_from_head(repo_root, target, admin)
+    if diff is not None:
+        return f"the tree holds what its HEAD does not ({diff})"
+    return None
+
+
+def detached_unreachable(repo_root: Path, admin: Path) -> Optional[str]:
+    """The detached HEAD sha of ``admin`` when NO branch, tag or remote-tracking ref contains it (removing the
+    admin dir would lose that commit with its HEAD and reflog), else None. A HEAD on a branch is None (the branch
+    ref keeps it). Unresolvable detached HEAD = returned as unknown (Prism #265 P1 4/5)."""
+    head = (_read(admin / "HEAD") or "").strip()
+    if not head or head.startswith("ref: "):
+        return None
+    sha = rev(repo_root, head)
+    if not sha:
+        return head or "unresolvable"
+    p = _git(repo_root, "for-each-ref", "--contains", sha, "--count=1", "--format=%(refname)",
+             "refs/heads/", "refs/tags/", "refs/remotes/", timeout=60)
+    if p is None or p.returncode != 0 or p.stdout.strip() == "":
+        return sha
+    return None
+
+
+def sha_has_own_commits(repo_root: Path, tip: str) -> Optional[bool]:
+    """True when ``tip`` is a commit no remote-tracking ref has; None = unknown."""
     if not tip:
         return False
     p = _git(repo_root, "for-each-ref", "--contains", tip, "--count=1", "--format=%(refname)", "refs/remotes/",
@@ -340,10 +447,18 @@ def branch_has_own_commits(repo_root: Path, branch: str) -> Optional[bool]:
     return p.stdout.strip() == ""
 
 
-def drain_half_built(repo_root: Path, target: Path, *, branch: str, delete_branch: bool) -> dict:
+def branch_has_own_commits(repo_root: Path, branch: str) -> Optional[bool]:
+    """True when ``refs/heads/<branch>`` holds a commit no remote-tracking ref has; None = unknown."""
+    return sha_has_own_commits(repo_root, rev(repo_root, f"refs/heads/{branch}"))
+
+
+def drain_half_built(repo_root: Path, target: Path, *, branch: str, branch_sha: str = "") -> dict:
     """Operator drain (``scripts/kanban_worktree_residue_audit.py --drain --execute``) of ONE tree the audit already
-    attributed: removed only while exactly one registration names it and that one is still add residue (locked
-    ``initializing``, no index); the branch only when ``delete_branch`` and it still sits at the tip read here."""
+    attributed: removed only while exactly one registration names it, that one is still add residue (locked
+    ``initializing``, no index), the tree holds no work (:func:`holds_work`) and its HEAD is not an unreachable
+    detached commit (:func:`detached_unreachable`), all re-checked here. The branch is deleted only at
+    ``branch_sha``, the tip the audit approved (atomic ``update-ref -d <ref> <sha>``): a branch that moved since is
+    kept. Empty ``branch_sha`` = keep the branch."""
     rep = {"removed": False, "admin_dropped": [], "branch_deleted": False, "kept": []}
     try:
         common = common_dir(repo_root)
@@ -351,10 +466,19 @@ def drain_half_built(repo_root: Path, target: Path, *, branch: str, delete_branc
         if len(admins) != 1 or not _init_residue(admins[0]):
             rep["kept"].append(f"{len(admins)} registrations / not add residue any more")
             return rep
-        tip = rev(repo_root, f"refs/heads/{branch}") if branch else ""
+        work = holds_work(repo_root, target, admins[0])
+        if work is not None:
+            rep["kept"].append(work)
+            return rep
+        det = detached_unreachable(repo_root, admins[0])
+        if det is not None:
+            rep["kept"].append(f"detached HEAD {det} is on no branch, tag or remote ref")
+            return rep
         _drop_tree(repo_root, common, target, admins[0], rmtree_path=True, report=rep)
-        if delete_branch and rep["removed"]:
-            rep["branch_deleted"] = _delete_branch_at(repo_root, common, branch, tip)
+        if branch and branch_sha and rep["removed"]:
+            rep["branch_deleted"] = _delete_branch_at(repo_root, common, branch, branch_sha)
+            if not rep["branch_deleted"]:
+                rep["kept"].append(f"branch {branch} no longer at the approved {branch_sha[:12]}: kept")
     except Exception as exc:
         rep["kept"].append(f"cleanup error: {exc}")
     return rep
@@ -379,8 +503,10 @@ def clear_half_built(repo_root: Path, target: Path, *, branch: str, min_age_s: i
     """Clear a card's own leftover half-built tree (placement, t_f609a5a0). ``{"cleared", "why", ...}``.
 
     Ownership: the caller passes the card's canonical ``<repo>/.worktrees/<id>`` and its branch. Refused when the
-    tree is not half-built (:func:`half_built`), younger than ``min_age_s`` (an add may still be running), on another
-    branch, or written into after the add died.
+    tree is not half-built (:func:`half_built`), younger than ``min_age_s`` (an add may still be running), holds
+    work (:func:`holds_work`: a late write, an untracked file, content that is not HEAD's), has a detached HEAD no
+    ref contains (:func:`detached_unreachable`), or is on another branch. ``holds_work: True`` marks the two
+    refusals no forced remove may override.
 
     The LOCAL branch is deleted only when the remote trunk already contains its tip (it has no commits of its own,
     so the next spawn's ``-b <branch> <trunk>`` loses nothing). Otherwise it is kept, including a branch whose work
@@ -392,12 +518,16 @@ def clear_half_built(repo_root: Path, target: Path, *, branch: str, min_age_s: i
         return {"cleared": False, "why": "not a half-built tree"}
     if hb["age_s"] < min_age_s:
         return {"cleared": False, "why": f"initializing lock is {hb['age_s']}s old (< {min_age_s}s)", **hb}
+    admin = Path(hb["admin"])
+    work = holds_work(repo_root, target, admin)
+    if work is not None:
+        return {"cleared": False, "holds_work": True, "why": work, **hb}
+    det = detached_unreachable(repo_root, admin)
+    if det is not None:
+        return {"cleared": False, "holds_work": True,
+                "why": f"detached HEAD {det} is on no branch, tag or remote ref", **hb}
     if hb["branch"] and hb["branch"] != branch:
         return {"cleared": False, "why": f"tree is on {hb['branch']}, not {branch}", **hb}
-    admin = Path(hb["admin"])
-    late = written_after_add(target, admin)
-    if late is not None:
-        return {"cleared": False, "why": f"a file was written after the add died ({late})", **hb}
     common = common_dir(repo_root)
     rep = {"removed": False, "admin_dropped": [], "branch_deleted": False, "kept": []}
     try:

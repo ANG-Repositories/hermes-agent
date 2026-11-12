@@ -5645,6 +5645,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             # could not clear yet (young, another branch, or a failed cleanup): name it; the starvation reporter
             # posts the fix once, never an unbounded silent wait.
             return "wait", f"half_built_worktree ({route[1]})"
+        if tail == "own_tree_half_built_holds_work":
+            # ... and it holds work: its own code, so the fix the reporter posts never suggests a forced remove.
+            return "wait", f"half_built_worktree_holds_work ({route[1]})"
         if kind != "worktree":
             why = {"capability": f"workspace_kind:{kind}", "source": "card", "evidence": row["workspace_path"],
                    "kind": "structural"}

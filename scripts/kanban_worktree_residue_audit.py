@@ -20,9 +20,13 @@ The drain removes a tree only when every one of these holds (anything else is li
   * the lock reason is exactly ``initializing`` and the admin dir has no index;
   * the path is a dispatcher spawn: ``<repo>/.worktrees/t_<8 hex>``, and that card exists on the board;
   * the card is ``done`` or ``archived``, or it never spawned a worker (no ``spawned`` event);
-  * the tree's branch is the card's (``wt/<id>`` or its ``branch_name``) or HEAD is detached;
+  * the tree's branch is the card's (``wt/<id>`` or its ``branch_name``), or HEAD is detached at a commit some
+    branch, tag or remote-tracking ref contains (an unreachable detached commit is kept);
+  * the tree holds no work: no file written after the add died, every file is HEAD's content (no untracked file,
+    no changed file); re-checked at drain time;
   * the lock is older than ``--min-age-h``.
-The branch is deleted only when it has no commit that a remote-tracking ref lacks; else it is kept and named.
+The branch is deleted only when it has no commit that a remote-tracking ref lacks, and only at the tip the audit
+read (a branch that moved since is kept); else it is kept and named.
 Removal is ``git worktree remove -f -f <path>``, else the ONE admin dir whose ``gitdir`` names that path. Never a
 repo-wide ``worktree prune``.
 
@@ -107,7 +111,10 @@ def attribute(repo: Path, conn, min_age_s: int, now: float) -> list:
         shape = "dispatcher:.worktrees/<card>" if dispatcher else (
             f".worktrees/{name}" if path.parent.name == ".worktrees" else str(path.parent))
         branch = wt.get("branch") or ""
-        own = kwr.branch_has_own_commits(repo, branch) if branch else False
+        # The tip read HERE is the one the drain may delete at (Prism #265 P1 3): a branch that moves between this
+        # read and the drain is kept by the drain's atomic `update-ref -d <ref> <tip>`.
+        tip = kwr.rev(repo, f"refs/heads/{branch}") if branch else ""
+        own = kwr.sha_has_own_commits(repo, tip) if branch else False
         card = card_row(conn, name) if dispatcher else None
         why = []
         state = ("unknown" if admin is None else
@@ -126,9 +133,16 @@ def attribute(repo: Path, conn, min_age_s: int, now: float) -> list:
             why.append(f"card {card['status']} and it ran")
         if dispatcher and branch and branch not in (f"wt/{name}", (card or {}).get("branch_name") or ""):
             why.append(f"branch {branch} is not the card's")
-        late = kwr.written_after_add(path, admin) if admin is not None and path.is_dir() else None
-        if late is not None:
-            why.append(f"written after the add died: {late}")
+        if state == "half-built" and path.is_dir():
+            # Only a tree that could drain pays for the content check (ls-tree + hash-object).
+            work = kwr.holds_work(repo, path, admin)
+            if work is not None:
+                why.append(work)
+        if admin is not None and not branch:
+            # Prism #265 P1 5: a detached HEAD bypasses the branch check above; its commit must be on some ref.
+            det = kwr.detached_unreachable(repo, admin)
+            if det is not None:
+                why.append(f"detached HEAD {det} is on no branch, tag or remote ref")
         if age is None or age < min_age_s:
             why.append(f"lock age {age}s < {min_age_s}s")
         rows.append({"path": str(path), "state": state, "shape": shape, "branch": branch, "head": wt.get("head", ""),
@@ -136,7 +150,7 @@ def attribute(repo: Path, conn, min_age_s: int, now: float) -> list:
                      "card_status": (card or {}).get("status") if card and card.get("exists") else
                      ("missing" if card else None),
                      "card_spawned": (card or {}).get("spawned"), "lock_age_h": round(age / 3600, 1) if age else age,
-                     "branch_own_commits": own, "admin": str(admin) if admin else None,
+                     "branch_own_commits": own, "branch_tip": tip, "admin": str(admin) if admin else None,
                      "drain": not why, "keep_reason": "; ".join(why)})
     return rows
 
@@ -188,7 +202,8 @@ def main(argv=None) -> int:
                       + (f"; would delete branch {b}" if b and r["branch_own_commits"] is False else
                          f"; keep branch {b} (own commits: {r['branch_own_commits']})" if b else ""))
                 continue
-            rep = kwr.drain_half_built(repo, p, branch=b, delete_branch=r["branch_own_commits"] is False)
+            rep = kwr.drain_half_built(repo, p, branch=b,
+                                       branch_sha=r["branch_tip"] if r["branch_own_commits"] is False else "")
             print(f"removed={rep['removed']} admin_dropped={len(rep['admin_dropped'])} "
                   f"branch_deleted={rep['branch_deleted']} {p}" + (f" kept={rep['kept']}" if rep["kept"] else ""))
         after = git(repo, "worktree", "list", "--porcelain").count("\nworktree ") + 1

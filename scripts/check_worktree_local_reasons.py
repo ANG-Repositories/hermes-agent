@@ -34,6 +34,7 @@ ENUMERATED = frozenset({
     "operator_pin", "concrete_target_path", "own_tree_not_a_checkout", "own_tree_off_branch",
     "own_tree_probe_failed", "own_tree_repo_mismatch",
     "own_tree_half_built_add",  # a killed `worktree add`, cleared by placement (t_f609a5a0)
+    "own_tree_half_built_holds_work",  # ... that holds work: never cleared (t_f609a5a0)
     # the dirty-tree carry's own refusals (t_894be273)
     "dirty_submodule_or_nested_repo", "dirty_tree_over_cap", "origin_tip_not_studio_head",
     "dirty_path_through_symlink", "dirty_path_not_plain_file",
