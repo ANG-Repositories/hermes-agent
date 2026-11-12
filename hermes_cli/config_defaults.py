@@ -2448,6 +2448,13 @@ DEFAULT_CONFIG = {
                       # Studio last resort. Active only while placement-policy makes the Studio last resort
                       # and the capability map reads. false = the behaviour before t_9965b8d5 (kill switch).
                       "studio_capability_only": True,
+                      # prose_pins_advisory (t_c82eded0; read per tick from the ROOT config): a Studio need read
+                      # from card PROSE (CARD_NEEDS / studio_needs, the legacy body list, a capability sniffed from
+                      # the body or inferred from a skill NAMED in the body) never holds a card on the Studio; it
+                      # is recorded as the placement event's `advisory` plus one card comment, and the card starts
+                      # on a pool host. A `requires:` line, an attached skill or a structural fact still holds it.
+                      # false = the hold before t_c82eded0 (kill switch).
+                      "prose_pins_advisory": True,
                       # studio_default_deny (t_062a5948; ROOT config, read per tick): on top of the rule above, a
                       # Studio-only capability also needs to be in `allow` or carry a live operator override
                       # (`hermes kanban studio-override`), else the card waits studio_default_deny:<cap>.

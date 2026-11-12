@@ -63,7 +63,10 @@ def fleet(home):
 
 
 def _mode(monkeypatch, mode="enforce", **extra):
-    pl = {"capabilities": mode, **extra}
+    # These cases pin the prose-derived holds (body sniff, named skill, CARD_NEEDS); they run with
+    # t_c82eded0's kill switch off, which keeps those routes byte-identical. The default (on) is
+    # covered in test_kanban_prose_pins_advisory.py.
+    pl = {"capabilities": mode, khc.PROSE_KNOB: False, **extra}
     monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": pl})
 
 

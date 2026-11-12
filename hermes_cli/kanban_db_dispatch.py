@@ -5313,7 +5313,8 @@ def _placement_rule(route: str, arg: Optional[str], rule: Optional[str], placed:
 
 def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional[str],
                        placed_host, plan, entry: str, gate: dict,
-                       take_refusal: Optional[str] = None, studio: Optional[dict] = None) -> dict:
+                       take_refusal: Optional[str] = None, studio: Optional[dict] = None,
+                       advisory: Optional[list] = None) -> dict:
     """The ``placement`` event payload, every key present (spec §4.1).
 
     Control-Plane Protection v0.3 §3.1 adds the fields the I-1 / AC-2 queries
@@ -5353,6 +5354,9 @@ def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional
         # t_9965b8d5: what established a Studio placement ({capability, source, evidence, kind}); None = rule off
         # this tick, or a pool placement. One query audits it: placement rows on the Studio with this null.
         "studio_capability": studio if not placed else None,
+        # t_c82eded0: Studio signals read from the card's prose (body words, a skill named in the body) that
+        # placed nothing: [{source, rule, need|capability, evidence}]; None = none matched or the knob is off.
+        "advisory": advisory or None,
     }
 
 
@@ -5409,7 +5413,8 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
     # whose caps cover them (t_aea826a9); never widen ``_only``.
     _need_hosts = _kwp_take.needs_allowed_hosts(
         row["body"], plan.config,
-        honor_declared=caps is not None and not caps.legacy_body)
+        honor_declared=caps is not None and not caps.legacy_body,
+        prose_advisory=_prose_on(plan, caps))
     if _need_hosts is not None:
         _only = _need_hosts if _only is None else tuple(
             h for h in _only if h.lower() in {n.lower() for n in _need_hosts})
@@ -5453,6 +5458,42 @@ def _studio_capability_on(caps, last_resort: bool) -> bool:
     from hermes_cli import kanban_studio_capability as _ksc
     return (_ksc.active(_root_kanban_cfg(), last_resort)
             and _ksc.studio_only(getattr(caps, "cmap", None)) is not None)
+
+
+def _prose_on(plan, caps) -> bool:
+    """t_c82eded0: ``kanban.placement.prose_pins_advisory`` this tick. The tick stamps it on the plan once;
+    a caller with no stamp (tests, ``kanban admit``) reads the capability tick or the root config."""
+    val = getattr(plan, "prose_advisory", None)
+    if val is not None:
+        return bool(val)
+    if caps is not None:
+        return bool(getattr(caps, "prose_advisory", False))
+    from hermes_cli import kanban_host_capabilities as _khc
+    return _khc.read_prose_advisory(_root_kanban_cfg())
+
+
+def _prose_advisories(row, plan, verdict, prose_on: bool, legacy_body: bool) -> list:
+    """What a prose-only Studio signal matched on this card (t_c82eded0): ``[{source, rule, need|capability,
+    evidence}]``. Recorded on the placement event and in one card comment; it never holds the card."""
+    if not prose_on:
+        return []
+    from hermes_cli import kanban_worker_pool as _kwp
+    out = []
+    body = row["body"]
+    if legacy_body:
+        m = _kwp.STUDIO_BODY_RE.search(body or "")
+        if m:
+            out.append({"source": "body", "rule": "studio_body", "capability": "browser-session",
+                        "evidence": m.group(0)})
+    if _kwp.needs_allowed_hosts(body, plan.config, honor_declared=not legacy_body) == ():
+        for need, ev in sorted(_kwp.card_need_evidence(body).items()):
+            out.append({"source": "body", "rule": _kwp.STUDIO_NEEDS_RULE, "need": need, "evidence": ev})
+    if verdict is not None:
+        from hermes_cli import kanban_host_capabilities as _khc
+        for r in verdict.body_ignored:
+            if r.matched_by in _khc.PROSE_SOURCES:
+                out.append({"source": r.matched_by, "rule": r.rule, "capability": r.cap, "evidence": r.term})
+    return out
 
 
 # portable()/_route_row rules a worktree card stays local under that NAME a Studio-only fact holds (an operator's
@@ -5532,7 +5573,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                pause_cache: Optional[dict] = None,
                carry_budget=None,
                studio_on: Optional[bool] = None,
-               studio_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               studio_out: Optional[dict] = None,
+               advisory_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """:func:`_route_row_base`, then t_9965b8d5: a ``local`` route stands only with a named Studio-only
     capability or structural fact (``studio_out[id]`` records it for the placement event); else it WAITS,
     ``studio_capability_only:<rule> (...)``. ``studio_on`` None = read the knob here (tests, one-off callers)."""
@@ -5546,7 +5588,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     route = _route_row_base(conn, row, plan, default_assignee, native_cache, linked_ids, lineage_mode, aff,
                             unknown_out, caps, caps_out, rules, access_out, binds, held=held,
                             worktree_out=wt_out, board=board, carry_out=carry_out, pause_cache=pause_cache,
-                            carry_budget=carry_budget, studio_on=studio_on, wt_hold_out=wt_hold)
+                            carry_budget=carry_budget, studio_on=studio_on, wt_hold_out=wt_hold,
+                            advisory_out=advisory_out)
     route = _pinned_route(row, route, _wt_pin_hosts(row, board), wt_out.get(row["id"]), caps_out)
     if not studio_on or route[0] != "local":
         return route
@@ -5667,7 +5710,8 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
                     carry_out: Optional[dict] = None,
                     pause_cache: Optional[dict] = None,
                     carry_budget=None, *, studio_on: bool = False,
-                    wt_hold_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+                    wt_hold_out: Optional[dict] = None,
+                    advisory_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -5812,14 +5856,20 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
             if caps_out is not None:
                 caps_out.setdefault("reasons", {})[row["id"]] = [verdict.wait]
             return "wait", verdict.wait
+    prose_on = _prose_on(plan, caps)
+    legacy_body = caps is None or caps.legacy_body
+    if advisory_out is not None:
+        _adv = _prose_advisories(row, plan, verdict, prose_on, legacy_body)
+        if _adv:
+            advisory_out[row["id"]] = _adv
     _portable_kw = dict(
         workspace_kind=row["workspace_kind"], has_links=linked, workspace_bind=bind,
         assignee=assignee, body=row["body"],
         skills=skills, pool=plan.config,
         native_command=native, manifest=manifest, targets=targets,
         requires=verdict.for_portable() if verdict is not None else None,
-        body_signals=caps is None or caps.legacy_body,
-        worktree_hosts=wt_hosts, studio_reasons=studio_reasons,
+        body_signals=legacy_body,
+        worktree_hosts=wt_hosts, studio_reasons=studio_reasons, prose_advisory=prose_on,
     )
     # Only content the remote cannot reproduce binds (t_e7c03f48): a clean, pushed checkout plus logs/patches does
     # not. ``lf_detail`` names the first binding path for the reason; a placed run starts fresh on the pool host
@@ -5967,7 +6017,8 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         # Work bound to the Studio's state (t_3e6c9b2b): runs here or waits,
         # named, never spills. ``portable()`` only reaches these rules when
         # no explicit pin decided the route.
-        hit = _kwp.studio_affinity(row["body"], skills, plan.config, manifest=manifest)
+        hit = _kwp.studio_affinity(row["body"], skills, plan.config, manifest=manifest,
+                                   prose_advisory=prose_on)
         if affinity_out is not None:
             affinity_out[row["id"]] = {"host": _kwp.STUDIO_HOST, "rule": rule,
                                        "matched_by": hit[1] if hit else rule}
@@ -7248,6 +7299,7 @@ def _dispatch_once_locked(
     _worktree_ports: dict = {}  # worktree card -> (repo, mirror, hosts) (t_6d9e7d90)
     _carry_rows: dict = {}  # local_files card -> True: local while the gate admits, else carried (t_e604c0f9)
     _studio_why: dict = {}  # card -> the capability that justified its local route (t_9965b8d5)
+    _prose_adv: dict = {}   # card -> prose-only Studio signals recorded, not enforced (t_c82eded0)
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
     # ran the classifier on every one of them) and, of those, the ones the
     # spawn loop reached: the affinity event log reconciles against both.
@@ -7276,6 +7328,7 @@ def _dispatch_once_locked(
         # t_9965b8d5, read ONCE per tick: the Studio runs a card only for a named Studio-only capability.
         _studio_on = _studio_capability_on(_caps, _studio_last_resort(_kb.kanban_home() / "fleet"))
         spillover.studio_capability_only = _studio_on
+        spillover.prose_advisory = _prose_on(None, _caps)  # t_c82eded0, read ONCE per tick
         _carry_budget = _kb._kwh.CarryScanBudget()
         _route_t0 = time.monotonic()
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
@@ -7288,7 +7341,8 @@ def _dispatch_once_locked(
                                          worktree_out=_worktree_ports, board=board,
                                          carry_out=_carry_rows, pause_cache=_pause_cache,
                                          carry_budget=_carry_budget,
-                                         studio_on=_studio_on, studio_out=_studio_why)
+                                         studio_on=_studio_on, studio_out=_studio_why,
+                                         advisory_out=_prose_adv)
                      for r in ready_rows}
         result.route_ms += (time.monotonic() - _route_t0) * 1000.0
         _kts.add("route/route_rows", (time.monotonic() - _route_t0) * 1000.0)
@@ -8747,7 +8801,7 @@ def _dispatch_once_locked(
                     run_id=claimed.current_run_id, route=route, arg=route_arg,
                     rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
                     entry=entry, gate=tick_gate, take_refusal=_take_refusal,
-                    studio=_studio_why.get(claimed.id),
+                    studio=_studio_why.get(claimed.id), advisory=_prose_adv.get(claimed.id),
                 ),
             )
             _lw.mark("spawn")
@@ -8845,6 +8899,9 @@ def _dispatch_once_locked(
         _drop_foreign(conn, _caps_out.get("pin_lacks") or {}, default_assignee)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
+        _adv_own = dict(_prose_adv)
+        _drop_foreign(conn, _adv_own, default_assignee)
+        _khc.record_prose_advisories(conn, _adv_own)
         _held_own = dict(_held)
         _drop_foreign(conn, _held_own, default_assignee)
         _khc.notify_held(conn, board, list(_held_own.items()))

@@ -402,7 +402,10 @@ def _git_binding(repo: str, rel: str, runner: Callable, t: float) -> Optional[st
     from hermes_cli._subprocess_compat import noninteractive_git_env
 
     env = noninteractive_git_env(os.environ)
-    env.update({"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+    # Every call here asks what THIS checkout holds. In a partial clone a tip the store lacks would otherwise be
+    # fetched object by object from the promisor (t_3833cb99: 12 of 5,078 tips answered in 120 s); missing is the
+    # answer (`_remote_contains` -> None), never a reason to fetch.
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C", "GIT_NO_LAZY_FETCH": "1"})
     for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
         env.pop(k, None)
 
