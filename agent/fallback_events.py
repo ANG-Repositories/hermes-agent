@@ -1233,6 +1233,24 @@ def fable_allowance(headers: Any) -> Optional[dict]:
         return None
 
 
+def relay_next_seat_in_s(headers: Any) -> Optional[float]:
+    """Seconds until the relay's next seat recovers, else None.
+
+    A relay ``quota_seat`` carries ``Retry-After = next_seat_in_s`` (claude-pool
+    ``_quota_class``, spec D2): the pool is out only until that seat frees. Any
+    other class, or no/junk Retry-After, -> None. Never raises."""
+    try:
+        h = _lower_headers(headers)
+        if (h.get("x-relay-error-class") or "").strip() != "quota_seat":
+            return None
+        from agent.retry_utils import parse_retry_after_seconds
+
+        s = parse_retry_after_seconds(h.get("retry-after"))
+        return float(s) if s is not None and 0 < s < float("inf") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def pool_eligible(headers: Any) -> Optional[int]:
     """Eligible seat count the relay stated with a failed call
     (``x-pool-other-eligible``: seats other than the one that failed, sent on
@@ -1467,6 +1485,9 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         elig = pool_eligible(headers)
         if elig is not None and "pool_eligible" not in row:
             row["pool_eligible"] = elig
+        nxt = relay_next_seat_in_s(headers)
+        if nxt is not None and trigger_class == "quota_seat" and "next_seat_in_s" not in row:
+            row["next_seat_in_s"] = nxt   # notice only (t_18148399)
         fa = fable_allowance(headers)
         if fa is not None and "fable_allowance" not in row:
             row["fable_allowance"] = fa   # notice only, not a ledger column
