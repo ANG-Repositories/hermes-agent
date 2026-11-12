@@ -1281,6 +1281,13 @@ def test_spawn_checks_every_clone_before_the_workspace_is_copied(kanban_home, sm
 # Proving who owns a shared stash entry blocked 86% of the home repo's worktrees. Now: rebuild, then carry every entry
 # not older than the checkout's creation line (all of them for a clone or a separate-git-dir repo), host to host.
 
+@pytest.fixture
+def stash_carry(monkeypatch):
+    """kanban.placement.worktree_stash_carry on (operator split 07:20 11-12: default off): the stash-carry tests below
+    exercise the code kept behind the knob."""
+    monkeypatch.setattr(kwh, "stash_carry_on", lambda kcfg=None: True)
+
+
 def _age_stash(common_git, seconds=60):
     """Move every stash reflog entry ``seconds`` into the past (made before a checkout created afterwards)."""
     from pathlib import Path
@@ -1350,6 +1357,7 @@ def test_stash_dated_before_the_worktree_by_committer_date_is_carried(tmp_path):
     assert [e[2] for e in got] == ["On feat/wt: back-dated"], got
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_refs_stash_without_its_reflog_is_unreadable_not_empty(tmp_path):
     """Advisory 03:2x: refs/stash with its reflog removed lists as empty (rc 0) while the ref still holds a stash.
     That is stash_unreadable (the rebuild is refused), never an empty carry."""
@@ -1364,6 +1372,7 @@ def test_refs_stash_without_its_reflog_is_unreadable_not_empty(tmp_path):
     assert kwh.assess_clone(str(repo)) == (None, "stash_unreadable")
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_worktree_with_a_stash_is_rebuilt_and_carries_it(kanban_home, wt_carry):
     """A stash made on the worktree's own branch no longer keeps it from being rebuilt: the record carries it."""
     from pathlib import Path
@@ -1453,6 +1462,7 @@ def _carry_one(kanban_home, ws, rel, runner):
     return rec
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_rebuilt_clone_on_the_pool_host_lists_the_carried_stash_and_apply_restores(kanban_home, tmp_path,
                                                                                   monkeypatch):
     """End to end over a local "pool host": the rebuilt clone lists the Studio's stash entries with their original
@@ -1473,6 +1483,7 @@ def test_rebuilt_clone_on_the_pool_host_lists_the_carried_stash_and_apply_restor
     assert _g(repo, "stash", "list", "--format=%H %gs") == before
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_pathspec_stash_after_a_symbolic_ref_branch_switch_restores(kanban_home, tmp_path, monkeypatch):
     """Operator case 5: a pathspec stash (no reset line) in a linked worktree, the branch left by ``git
     symbolic-ref``, another checkout takes the branch. The worktree is rebuilt and the stash restores there."""
@@ -1516,6 +1527,7 @@ def test_carry_stash_ssh_runs_under_the_card_reservation(kanban_home):
 
 
 @pytest.mark.parametrize("where", ["bundle", "store"])
+@pytest.mark.usefixtures("stash_carry")
 def test_a_failed_stash_bundle_or_store_refuses_naming_the_entry(kanban_home, tmp_path, monkeypatch, where):
     """The only stash wait left: the bundle fails at the spawn-time check (nothing rebuilt or copied yet), or the
     store fails on the pool host. Either refusal names the entry; the Studio original is untouched."""
@@ -1548,6 +1560,7 @@ def test_a_failed_stash_bundle_or_store_refuses_naming_the_entry(kanban_home, tm
                                        text=True, encoding="utf-8").stdout
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_t94bd2ec4_shape_repo_worktree_with_a_shared_stash_is_rebuilt(kanban_home, wt_carry, tmp_path):
     """The operator's replay on t_94bd2ec4 at 2119cc07, as a fixture: ``repo`` is a linked worktree of a home repo
     outside the workspace whose shared stash list holds older entries and newer ones with no branch evidence;
@@ -1634,6 +1647,7 @@ def test_stash_bundle_holds_no_main_commit_when_the_stash_base_is_ahead_of_head(
     assert len(commits) <= 2, commits  # the stash commit and its index commit
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_stash_bundle_on_a_worktree_behind_main_restores_on_the_pool_clone(kanban_home, tmp_path, monkeypatch):
     """End to end: the main-excluding bundle is stored on the rebuilt clone (which has main from origin) and the
     stash applies there."""
@@ -1648,6 +1662,7 @@ def test_stash_bundle_on_a_worktree_behind_main_restores_on_the_pool_clone(kanba
     assert (dest / "a.txt").read_text() == "stashed on main tip\n"
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_bundle_prerequisite_the_pool_clone_cannot_get_refuses_naming_the_entry(kanban_home, tmp_path,
                                                                                    monkeypatch):
     """Constraint (b): the Studio's origin default-branch ref names a commit origin does not hold (the tracking ref
@@ -1670,6 +1685,7 @@ def test_bundle_prerequisite_the_pool_clone_cannot_get_refuses_naming_the_entry(
     assert _g(dest, "stash", "list") == ""
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_stash_bundle_timeout_waits_the_card_named(kanban_home, wt_carry, monkeypatch):
     """Operator item 3: a bundle build over STASH_BUNDLE_TIMEOUT_SECONDS raises StashBundleTimeout (a
     WorkspaceUnavailable: the dispatcher releases the claim and refunds, no failure charged), and the next routing
@@ -1731,6 +1747,7 @@ def _staged_studio(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("change", ["stash", "head"])
+@pytest.mark.usefixtures("stash_carry")
 def test_staged_carry_refuses_when_the_checkout_changed_during_the_copy(kanban_home, tmp_path, monkeypatch, change):
     """Advisory 03:2x: the staged result was taken before carry_workspace copied. A stash written, or a commit made,
     during the copy refuses the spawn naming it; nothing is rebuilt and the bundle is not rebuilt."""
@@ -1757,6 +1774,7 @@ def test_staged_carry_refuses_when_the_checkout_changed_during_the_copy(kanban_h
     assert cloned == [] and bundles == [], (cloned, bundles)
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_staged_carry_with_nothing_changed_proceeds(kanban_home, tmp_path, monkeypatch):
     """The cheap re-check passes when nothing moved: the rebuild runs on the staged result."""
     from tests.hermes_cli.test_kanban_worker_pool import _host
@@ -1767,6 +1785,7 @@ def test_staged_carry_with_nothing_changed_proceeds(kanban_home, tmp_path, monke
     assert len(cloned) == 1, cloned
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_no_reservation_refuses_at_the_check_before_any_copy(kanban_home, tmp_path, monkeypatch):
     """Advisory 03:2x: a stash to carry with no reservation refuses in carry_clones_check, before the bundle is
     built and before carry_workspace copies anything. A clone with no stash needs none."""
@@ -1789,6 +1808,7 @@ def test_no_reservation_refuses_at_the_check_before_any_copy(kanban_home, tmp_pa
     assert not any("bundle" in a for a in argvs), argvs
 
 
+@pytest.mark.usefixtures("stash_carry")
 def test_stash_already_reachable_from_head_carries_with_an_empty_payload(kanban_home, tmp_path, monkeypatch):
     """Advisory 03:2x P2: a clean checkout on a branch created at stash@{0}: every stash commit is reachable from
     HEAD, so ``git bundle create`` would refuse an empty bundle. stash_bundle returns b"", and the store script only
@@ -1869,8 +1889,8 @@ def test_stash_carry_off_rebuilds_with_no_stash_step_on_either_host(kanban_home,
     from tests.hermes_cli.test_kanban_worker_pool import _host
     origin, ws, pool = _studio_and_origin(tmp_path)
     repo = ws / "repo"
-    for msg in ("one", "two"):
-        (repo / "a.txt").write_text(f"{msg}\n")
+    for msg in ("first", "second"):
+        (repo / "a.txt").write_text(f"{msg} edit\n")
         _g(repo, "stash", "push", "-q", "-m", msg)
     runner, seen = _pool_runner(ws, pool, origin, monkeypatch)
     argvs = []
