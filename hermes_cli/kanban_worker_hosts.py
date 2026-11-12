@@ -1124,7 +1124,8 @@ def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.ru
                 raise RuntimeError(f"stash carry of {repo}: {what} rc={getattr(proc, 'returncode', '?')}: "
                                    f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
         _git("init", "-q", "--bare", bare, what="bundle repo")
-        with open(os.path.join(bare, "objects", "info", "alternates"), "w", encoding="utf-8") as f:
+        alt = os.path.join(bare, "objects", "info", "alternates")
+        with open(alt, "w", encoding="utf-8") as f:  # windows-footgun: ok — a write; a BOM breaks the path
             f.write(objects + "\n")
         refs = []
         for i, e in enumerate(entries):

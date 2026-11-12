@@ -1473,7 +1473,7 @@ def test_a_failed_stash_bundle_or_store_refuses_naming_the_entry(kanban_home, tm
         kwh.carry_clones(_host(), str(ws), [{"rel": "repo", **rec}], kanban_home / "fleet", runner=failing)
     assert cloned == []
     assert "keep me" in subprocess.run(["git", "-C", str(repo), "stash", "list"], capture_output=True,
-                                       text=True).stdout
+                                       text=True, encoding="utf-8").stdout
 
 
 def test_t94bd2ec4_shape_repo_worktree_with_a_shared_stash_is_rebuilt(kanban_home, wt_carry, tmp_path):
