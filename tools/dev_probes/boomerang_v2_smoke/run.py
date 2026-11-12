@@ -65,14 +65,16 @@ PASS, FAIL, SKIP, INCOMPLETE = "PASS", "FAIL", "SKIP", "INCOMPLETE"
 BOARD_RE = re.compile(r"^bv2-smoke(?:-[a-z0-9][a-z0-9-]*)?$")
 
 # --- contract strings (spec 5.5 / 5.7 / 7, INV-6, INV-2, task body) ---------------------------
-# The spec writes an em dash and a warning emoji; the card body writes "-" and "warning". Both
-# spellings are accepted so a harmless rendering choice in P3 cannot fail the smoke.
-_DASH = r"\s*[-\u2013\u2014]\s*"
+# The spec writes a warning emoji; the card body writes "warning". Both spellings are accepted so
+# a harmless rendering choice in P3 cannot fail the smoke.
 _WARN = r"(?:\u26a0\ufe0f?|warning)\s*"
 
 
 def re_boomerang_wake_line(card: str) -> re.Pattern:
-    return re.compile(r"\[boomerang-wake\]\s*" + re.escape(card) + _DASH + r"(?P<outcome>\S.*)")
+    """The passive handback line the gateway posts to the origin chat once a child handled the card:
+    ``boomerang handled <card> (<row>): <summary>`` (gateway/kanban_boomerang_wake.py handback_row).
+    The spec's ``[boomerang-wake] <card> - <outcome>`` has not been posted since 2fb5b2dca4 (2026-11-02)."""
+    return re.compile(r"boomerang handled " + re.escape(card) + r" \((?P<kind>[^)\s]+)\):\s*(?P<outcome>\S.*)")
 
 
 def re_failed_line(card: str) -> re.Pattern:
@@ -580,7 +582,7 @@ def step1(ctx: Ctx) -> StepReport:
             ctx.force(rep, "inject_failure", card=fail_card)
 
     hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(done_card)), win)
-    rep.check(f"origin chat: `[boomerang-wake] {done_card} - <Outcome>`", PASS if hit else FAIL,
+    rep.check(f"origin chat: `boomerang handled {done_card} (<kind>): <summary>`", PASS if hit else FAIL,
               hit.content if hit else f"absent after {win:.0f}s")
     if hit:
         rep.raw.append(f"--- chat match\n{hit.content}")
@@ -595,7 +597,7 @@ def step1(ctx: Ctx) -> StepReport:
     def ni_auto():
         return find_chat(chat, re_boomerang_wake_line(ni_card))
     neg = ctx.poll(ni_auto, ctx.tick_window)  # live: waits the whole window for a line that must not come
-    rep.check(f"needs_input card {ni_card}: no `[boomerang-wake]` line", FAIL if neg else PASS,
+    rep.check(f"needs_input card {ni_card}: no `boomerang handled` line", FAIL if neg else PASS,
               neg.content if neg else f"none ({ctx.window_label()})")
     ni_log = find_log(log, re_notifier_line(ni_card))
     ni_disp = re_notifier_line(ni_card).search(ni_log).group("disp") if ni_log else None
@@ -793,7 +795,7 @@ def step2(ctx: Ctx) -> StepReport:
                 rep.notes.append(f"fork_enabled: event forced {iso(t)}, downgrade logged {iso(ts)} "
                                  f"({ts - t:.1f}s; tick {ctx.tick:.0f}s)")
         hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.timeout)
-        rep.check(f"origin chat: `[boomerang-wake] {card}` still posts (summary-mode child)",
+        rep.check(f"origin chat: `boomerang handled {card}` still posts (summary-mode child)",
                   PASS if hit else FAIL, hit.content if hit else "absent")
 
     # (b) the stop file: the next wake on a boomerang-wake card is NOT handled by a child.
@@ -1170,8 +1172,77 @@ def _prespend_retry(ctx: Ctx, rep: StepReport, card: str) -> bool:
     return readback == 1
 
 
+def _active_agents(state_path: Path) -> int:
+    try:
+        return int(json.loads(state_path.read_text(encoding="utf-8-sig")).get("active_agents") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def _s4_hold_home_turn(ctx: Ctx, rep: StepReport, arm: str, card: str, pid_path: Path) -> bool:
+    """t_409de482: make the restart's drain TIME OUT on a running boomerang child.
+
+    The shutdown drain waits on session turns only; a boomerang child is not one, so with an idle home
+    session the drain finishes at once (`active_at_start=0`) and the process exit kills the child (the
+    hard-kill path, not the interrupt #283 fixed). The interrupt reaches a child only through its
+    parent: ``_interrupt_running_agents`` hard-interrupts each agent in ``_running_agents`` and
+    ``interrupt()`` fans out to that agent's ``_active_children``. A child dispatched while the home
+    session's agent is cached is attached to that same agent (fork mode, or the summary snapshot, which
+    shares the list), so a home turn still running at the drain deadline is what interrupts the child.
+
+    Order: wait for the child's first model call (agent.log, tagged with the child's session id), send
+    the hold turn (``plan.commands.s4_hold_turn``: a foreground ``sleep`` longer than the drain), wait
+    until the scratch gateway counts it as active work (``gateway_state.json`` ``active_agents``)."""
+    hold = ctx.plan.get("commands", {}).get("s4_hold_turn")
+    shown = "$ " + shlex.join(fill(hold or ["<plan.commands.s4_hold_turn>"], chat=ctx.chat_id, card=card))
+    if not ctx.live:
+        rep.commands.append(shown + "   # dry-run: not executed")
+        return True
+    if not hold:
+        rep.check(f"{arm}: home-session turn held open across the restart", INCOMPLETE,
+                  "plan has no commands.s4_hold_turn: the drain will not wait on anything, so the child is "
+                  "killed with the process instead of interrupted")
+        return True
+    path = wake_state_path(ctx.live)
+    claim = ctx.poll(lambda: _claim_running(path, card), ctx.timeout) if path else None
+    child_sid = (claim or {}).get("child_session") or ""
+    rep.check(f"{arm}: child session recorded on the claim", PASS if child_sid else FAIL,
+              child_sid or f"no running claim with child_session in {path}")
+    if not child_sid:
+        return False
+    agent_log = _LogFile(gateway_log_path(True).with_name("agent.log"), True)
+    re_call = re.compile(ctx.plan["expect"].get("child_model_call_log_regex",
+                                                r"\[{child}\] agent\.conversation_loop: API call #\d+")
+                         .format(child=re.escape(child_sid)))
+    call = ctx.poll(lambda: next((ln.strip() for ln in agent_log.lines() if re_call.search(ln)), None), ctx.timeout)
+    rep.check(f"{arm}: child {child_sid} made a model call before the hold", PASS if call else FAIL,
+              call or f"no line matching /{re_call.pattern}/ in {agent_log.path}")
+    if not call:
+        return False
+    rep.raw.append(f"--- agent.log match ({arm})\n{call}")
+    argv = [os.path.expanduser(a) for a in fill(hold, chat=ctx.chat_id, card=card)]
+    print(shown, flush=True)
+    try:
+        # puppet.py posts, then polls for a reply until --wait; the hold turn will not reply in time,
+        # so its exit code is ignored. The SENT id is the evidence.
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=120, stdin=subprocess.DEVNULL)
+        out = (proc.stdout or "") + (proc.stderr or "")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        out = f"{type(exc).__name__}: {exc}"
+    sent = re.search(r"SENT id=(\d+)", out)
+    rep.commands.append(shown + f"   # hold turn, {sent.group(0) if sent else 'not sent'}")
+    rep.raw.append(f"--- s4_hold_turn\n{out.strip()[-2000:]}")
+    state_path = pid_path.with_name("gateway_state.json")
+    busy = ctx.poll(lambda: _active_agents(state_path) or None, 120.0) if sent else None
+    rep.check(f"{arm}: home-session turn held open before the restart", PASS if busy else FAIL,
+              f"{sent.group(0)}; {state_path.name} active_agents={busy}" if sent and busy
+              else (f"{sent.group(0)}; active_agents stayed 0 for 120s" if sent else "hold turn not sent"))
+    return bool(busy)
+
+
 def _s4_cut_child(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path: Path, role: str, title: str,
-                  arm: str, prespend: bool) -> tuple[str, float | None, str] | None:
+                  arm: str, prespend: bool, hold: bool = False) -> tuple[str, float | None, str] | None:
     """Mint a card, get its boomerang-wake child running, have the gateway restarted under it.
     Returns (card, restart_ts, original delegation) once the restart provably cut a live child."""
     card = ctx.make_card(rep, role, title)
@@ -1190,6 +1261,8 @@ def _s4_cut_child(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path: Pa
     m = re.search(r"delegation=(\S+)", dispatched)
     first_delegation = m.group(1) if m else ""
     if prespend and not _prespend_retry(ctx, rep, card):
+        return None
+    if hold and not _s4_hold_home_turn(ctx, rep, arm, card, pid_path):
         return None
 
     boot_before = _boot_id(pid_path)
@@ -1214,7 +1287,7 @@ def _s4_cut_child(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path: Pa
     early = find_chat(chat, re_boomerang_wake_line(card))
     if ctx.live and early and (early.ts is None or restart_ts is None or early.ts < restart_ts):
         rep.check(f"{arm}: child was still in flight at restart", INCOMPLETE,
-                  f"`[boomerang-wake] {card}` posted before the restart; the drill did not cut a live child, re-run")
+                  f"`boomerang handled {card}` posted before the restart; the drill did not cut a live child, re-run")
         return None
     return card, restart_ts, first_delegation
 
@@ -1241,7 +1314,8 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
     child finishes the card. One INFO line, zero `lost` lines in the origin chat."""
     arm = "redispatch arm"
     cut = _s4_cut_child(ctx, rep, log, chat, pid_path, "s4_restart",
-                        "bv2 smoke s4: child in flight across a gateway restart (redispatch)", arm, prespend=False)
+                        "bv2 smoke s4: child in flight across a gateway restart (redispatch)", arm, prespend=False,
+                        hold=True)
     if not cut:
         return
     card, restart_ts, first = cut
@@ -1252,8 +1326,8 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
     cut_line = find_log(log, re_cut)
     rep.check(f"{arm}: old boot logged `{card} child interrupted by gateway shutdown` (drain timeout cut it)",
               PASS if cut_line else INCOMPLETE,
-              cut_line or "absent: the drain did not time out on the child (set the scratch gateway's "
-                          "restart_drain_timeout below the child's runtime), so this run did not cover the case")
+              cut_line or "absent: the drain did not time out with the child attached to a running home turn "
+                          "(read the old boot's `drain done ... timed_out=` line), so this run did not cover the case")
     if cut_line:
         rep.raw.append(f"--- log match ({arm})\n{cut_line}")
     failed = find_chat(chat, re_failed_line(card))
@@ -1278,7 +1352,7 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
     if handled:
         rep.raw.append(f"--- log match ({arm})\n{handled}")
     done = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card), after_ts=after), ctx.timeout)
-    rep.check(f"{arm}: origin chat `[boomerang-wake] {card} - <Outcome>` after the restart",
+    rep.check(f"{arm}: origin chat `boomerang handled {card} (<kind>): <summary>` after the restart",
               PASS if done else FAIL, done.content if done else "absent")
     if done:
         rep.raw.append(f"--- chat match ({arm})\n{done.content}")
@@ -1317,7 +1391,7 @@ def _s4_fallback_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path:
     # Prism b2a4a7e824f7: watch for a stale child's late completion for a FULL tick window after the
     # lost-warning, not a single read; a post one second after the last read must still fail the drill.
     late = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.tick_window)
-    rep.check(f"{arm}: no late `[boomerang-wake] {card}` within {ctx.window_label()} after the re-surface",
+    rep.check(f"{arm}: no late `boomerang handled {card}` within {ctx.window_label()} after the re-surface",
               FAIL if late else PASS, late.content if late else "none")
 
 
