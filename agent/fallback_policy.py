@@ -1614,6 +1614,13 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
         floors.extend(hit)
     body = _seat_absent_words(row, body)
     reset = row.get("quota_reset_at")
+    nxt = _next_seat_clause(row)
+    if nxt:
+        # t_18148399: the relay said when the next seat frees; the upstream
+        # (weekly) reset is when the LAST one does, so it would mislead here.
+        m = _TRAILING_WINDOW_RE.search(body)
+        body = f"{body[:m.start()]}{nxt}{body[m.start():]}" if m else body + nxt
+        reset = None
     if (row.get("trigger_class") in ("quota_model", "quota_seat")
             and isinstance(reset, (int, float)) and not isinstance(reset, bool)
             and "reset" not in body):
@@ -1629,6 +1636,18 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
 
 
 _TRAILING_WINDOW_RE = re.compile(r", (?:\d\d:\d\d:\d\d[-:\d]*|time \?)$")
+
+
+def _next_seat_clause(row: Mapping[str, Any]) -> str:
+    """``; no seat for ~6 min`` when a relay quota_seat row carries the relay's
+    ``next_seat_in_s`` (its Retry-After, spec D2), else ``""``."""
+    s = row.get("next_seat_in_s")
+    if (row.get("trigger_class") != "quota_seat" or isinstance(s, bool)
+            or not isinstance(s, (int, float)) or not 0 < s < float("inf")):
+        return ""
+    mins = max(1, round(float(s) / 60))
+    span = f"~{mins} min" if mins < 90 else f"~{round(float(s) / 3600)} h"
+    return f"; no seat for {span}"
 
 
 def _cause_wait_clause(row: Mapping[str, Any]) -> str:
