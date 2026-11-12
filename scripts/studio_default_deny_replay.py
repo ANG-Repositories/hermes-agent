@@ -12,8 +12,9 @@ For every run that STARTED on the Mac Studio (``placement`` event whose host is 
                 placement after it (0 when a pool host had a free slot that tick)
   override      a Studio-only capability (or structural fact) NOT on the allowlist: the card has no host at all
                 and waits for an operator ``hermes kanban studio-override`` (one per run with --once)
-  unknown       a ``host_studio`` placement with no ``studio_capability`` record (it predates the record): the
-                replay cannot say what held it, so it is neither a move nor an override (Prism 9fec6c08b569)
+  unknown       a ``host_studio`` placement, or a review-lane placement, with no ``studio_capability`` record (it
+                predates the record): the replay cannot say what held it, so it is neither a move nor an override
+                (Prism 9fec6c08b569, c-0d4f28b3daf38893)
 
 Output: a markdown report (per-capability table with proposed keep/deny, the per-day override count, the moved
 cards and their estimated waits, and every card that would have been stuck).
@@ -93,7 +94,9 @@ def capability_of(p: dict):
     if isinstance(sc, dict) and sc.get("capability"):
         return str(sc["capability"]), str(sc.get("source") or "?")
     if p.get("entry") == "review":
-        return "review_lane", "review"  # the live rule holds a review start under this stand-in
+        # The live gate resolves a declared or attached-skill capability before the review_lane stand-in, and the
+        # review placement records it since t_5d63270d. A record without it cannot say which (Prism c-0d4f28b3daf38893).
+        return None, "review_unrecorded"
     rule = str(p.get("rule") or "")
     if rule.startswith("access_bound:"):
         return rule.split(":", 1)[1], "access-rule"
@@ -130,8 +133,9 @@ def studio_only_cap(cap, studio_only, pool_hosts=None) -> bool:
         return True  # body words meant a Studio resource (t_c82eded0 removes it); the review lane never leaves
     if any(x in studio_only for x in ps):
         return True
-    # every part exists somewhere in the pool; it still needs one host that has them all
-    return pool_hosts is not None and len(ps) > 1 and not any(set(ps) <= set(h) for h in pool_hosts)
+    # it still needs ONE pool host that has every part, a single part included: a capability no pool host has
+    # (one since removed from the map, so it is in neither row) does not move (Prism c-eecd8df36c880d40)
+    return pool_hosts is not None and bool(ps) and not any(set(ps) <= set(h) for h in pool_hosts)
 
 
 def replay(dbs, studio_only, allow, since, now, pool_hosts=None):
@@ -145,6 +149,10 @@ def replay(dbs, studio_only, allow, since, now, pool_hosts=None):
         cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
         nw = "no_worker" if "no_worker" in cols else "0"
         tasks = {r["id"]: r for r in con.execute(f"SELECT id, title, assignee, {nw} AS no_worker FROM tasks")}
+        # the run's own profile, not the card's current assignee: a reassignment must not rewrite history
+        # (Prism c-f8d72eda4b367716). The assignee is the fallback only for a record with no run id.
+        has_runs = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
+        run_profile = ({r[0]: r[1] for r in con.execute("SELECT id, profile FROM task_runs")} if has_runs else {})
         for ev in con.execute("SELECT task_id, run_id, created_at, payload FROM task_events WHERE kind='placement' "
                               "AND created_at >= ? AND created_at < ? ORDER BY created_at", (since, now)):
             try:
@@ -158,11 +166,14 @@ def replay(dbs, studio_only, allow, since, now, pool_hosts=None):
             t = tasks.get(ev["task_id"])
             cap, src = capability_of(p)
             # byte-exact, as the live rule compares (kanban_studio_allowlist.operator_only; Prism 2b96aecfa7f7)
-            assignee = str((t["assignee"] if t else "") or "")
+            if ev["run_id"] is not None and ev["run_id"] in run_profile:
+                assignee = str(run_profile[ev["run_id"]] or "")
+            else:
+                assignee = str((t["assignee"] if t else "") or "")
             if t is not None and (t["no_worker"] or assignee in OPERATOR_PROFILES):
                 verdict = "exempt"
-            elif cap is None and src == "host_studio":
-                verdict = "unknown"  # pre-capability Studio pin: no record of what held it (Prism 9fec6c08b569)
+            elif cap is None and src in ("host_studio", "review_unrecorded"):
+                verdict = "unknown"  # no record of what held it (Prism 9fec6c08b569, c-0d4f28b3daf38893)
             elif studio_only_cap(cap, studio_only, pool_hosts):
                 verdict = "allowlisted" if covered(cap, allow) else "override"
             else:
@@ -197,7 +208,7 @@ def report(rows, moved, stuck, allow, days, out=sys.stdout):
     w(f"Allowlist replayed: {', '.join(sorted(allow)) or '(empty)'}\n\n")
     w(f"Studio-started runs: {total}. allowlisted {by['allowlisted']}, exempt {by['exempt']}, "
       f"moves to a pool host {by['moves']}, needs an operator override (no host at all) {by['override']}, "
-      f"unknown (pre-capability Studio pin, rule host_studio) {by['unknown']}.\n\n")
+      f"unknown (no capability record: rule host_studio, or a review start before t_5d63270d) {by['unknown']}.\n\n")
     w("## Capabilities that started a run on the Studio\n\n| capability | runs | cards | sources | proposal | why |\n"
       "|---|---|---|---|---|---|\n")
     caps = collections.defaultdict(list)
@@ -211,10 +222,12 @@ def report(rows, moved, stuck, allow, days, out=sys.stdout):
         why = "; ".join(f"{x}: {v[1]}" for x, v in zip(parts, verdicts))
         srcs = ",".join(sorted({r["source"] for r in rs}))
         w(f"| {cap} | {len(rs)} | {len({r['task_id'] for r in rs})} | {srcs} | {'keep' if keep else 'deny'} | {why} |\n")
-    unk = [r for r in rows if r["verdict"] == "unknown"]
-    if unk:
-        w(f"| host_studio (no capability record) | {len(unk)} | {len({r['task_id'] for r in unk})} | legacy | unknown "
-          f"| placed before the studio_capability record existed: counted neither as a move nor as an override |\n")
+    for src, label in (("host_studio", "host_studio (no capability record)"),
+                       ("review_unrecorded", "review lane (no capability record)")):
+        unk = [r for r in rows if r["verdict"] == "unknown" and r["source"] == src]
+        if unk:
+            w(f"| {label} | {len(unk)} | {len({r['task_id'] for r in unk})} | legacy | unknown "
+              f"| placed before the studio_capability record existed: counted neither as a move nor as an override |\n")
     w("\n## Overrides per day (runs the operator would have had to override)\n\n| day | overrides | distinct cards |"
       " capabilities |\n|---|---|---|---|\n")
     per = collections.defaultdict(list)
