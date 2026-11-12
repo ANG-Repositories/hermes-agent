@@ -439,7 +439,7 @@ class ScriptRunner:
         """Called from ``main``'s 0.5 s stop poll: evaluate the drain bound once, the moment it is
         crossed. The ticker cycle (``RUNNER_CYCLE_S`` = 60) alone can land a few ms short of it and
         hold the drain another whole cycle (t_af461294 drill: 180 s, not 120 s)."""
-        if self.draining and not self.sigterm and isinstance(self._land_hold, subprocess.Popen):
+        if self.draining and not self.sigterm and self._land_hold not in (None, True):
             # A land hold is running: proceed within 0.5 s of the helper's exit (t_3c08d829).
             if self._land_hold.poll() is not None or time.monotonic() >= self._land_hold_deadline:
                 self._check_skew_bound()
@@ -545,7 +545,7 @@ class ScriptRunner:
         """Kill a still-running land-hold helper on exit (the drain ended without a kill). Its
         restart-pending record names this pid, so the tick ignores it once the runner is gone."""
         hold = self._land_hold
-        if isinstance(hold, subprocess.Popen) and hold.poll() is None:
+        if hold not in (None, True) and hold.poll() is None:
             with contextlib.suppress(Exception):
                 os.killpg(hold.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
 
