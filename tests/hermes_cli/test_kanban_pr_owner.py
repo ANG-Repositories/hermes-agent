@@ -273,6 +273,36 @@ def test_open_pr_still_holds_a_bare_ref_child(kanban_home, head_at):
         assert detail["owner"] == parent
 
 
+def _counting_gh(monkeypatch, box: dict) -> list:
+    calls: list = []
+    monkeypatch.setattr(kpo, "_gh_json", lambda path: calls.append(path) or box["pr"])
+    return calls
+
+
+def test_reopened_pr_holds_again_on_the_next_call(kanban_home, head_at, monkeypatch):
+    """A closed-unmerged state is not cached: a reopen is seen on the very next guard call."""
+    _counting_gh(monkeypatch, head_at)
+    head_at["pr"] = {"state": "closed", "merged": False}
+    with kb.connect() as conn:
+        parent, child = _bare_ref_child_under_running_parent(conn)
+        assert kb.check_respawn_guard(conn, child) != kpo.GUARD_REASON
+        head_at["pr"] = {"state": "open", "merged": False}
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
+        assert detail["owner"] == parent
+
+
+def test_merged_pr_state_is_cached(kanban_home, head_at, monkeypatch):
+    """GitHub cannot reopen a merged PR, so merged is final and read once per 5 min."""
+    calls = _counting_gh(monkeypatch, head_at)
+    head_at["pr"] = {"state": "closed", "merged": True}
+    with kb.connect() as conn:
+        _, child = _bare_ref_child_under_running_parent(conn)
+        assert kb.check_respawn_guard(conn, child) != kpo.GUARD_REASON
+        assert kb.check_respawn_guard(conn, child) != kpo.GUARD_REASON
+    assert len([p for p in calls if p.endswith("/pulls/1624")]) == 1
+
+
 def test_unreadable_pr_state_still_holds(kanban_home, head_at):
     """Fail open to the old behaviour only when the PR state cannot be read."""
     head_at["pr"] = None
