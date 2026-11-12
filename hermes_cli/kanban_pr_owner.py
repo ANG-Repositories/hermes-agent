@@ -70,6 +70,7 @@ _META_KEYS = ("pr_url", "pr_urls", "pr")
 _GH_TIMEOUT_SECONDS = 10
 _HEAD_CACHE_TTL = 300
 _HEAD_CACHE: dict = {}
+_STATE_CACHE: dict = {}
 
 HeadCommitFn = Callable[[str, int], Optional[int]]
 
@@ -159,6 +160,8 @@ def running_owners(conn: sqlite3.Connection, targets: set, *, exclude: str = "")
             continue  # an operator `claim --review` never pushes
         heartbeat = max((int(h) for h in (row[6], row[7]) if h), default=None)
         for target in sorted(targets & card_pr_targets(conn, row[0])):
+            if pr_state(*target) == "closed":
+                continue  # merged/closed PR: nothing left to compete for (t_032a0e6f)
             out.append({"task_id": row[0], "assignee": row[1], "since": row[3] or row[2],
                         "run_id": row[5], "last_heartbeat_at": heartbeat,
                         "pr": fmt_pr(target), "repo": target[0], "number": target[1]})
@@ -227,6 +230,23 @@ def pr_head_committed_at(repo: str, number: int, *, refresh: bool = False) -> Op
             when = None
     _HEAD_CACHE[key] = (time.time(), when)
     return when
+
+
+def pr_state(repo: str, number: int) -> Optional[str]:
+    """``"open"`` / ``"closed"`` (merged counts as closed) via REST, memoized 5 min. None = unknown.
+
+    Incident 2026-11-11 (t_032a0e6f): t_dcf6920a was held ``pr_owner_busy`` for
+    15 min on hermes-home#10552, merged hours earlier. A closed PR has no
+    competing writer; an unreadable state keeps the hold.
+    """
+    key = (repo.lower(), int(number))
+    hit = _STATE_CACHE.get(key)
+    if hit and time.time() - hit[0] < _HEAD_CACHE_TTL:
+        return hit[1]
+    state = (_gh_json(f"repos/{repo}/pulls/{number}") or {}).get("state")
+    state = state if state in ("open", "closed") else None
+    _STATE_CACHE[key] = (time.time(), state)
+    return state
 
 
 def owner_is_stale(owner: dict, *, now: Optional[int] = None,
