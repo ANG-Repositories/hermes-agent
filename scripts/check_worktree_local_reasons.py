@@ -33,7 +33,6 @@ ENUMERATED = frozenset({
     "no_pool_host", "origin_not_ours", "origin_not_github", "not_a_repo", "diverged_from_origin",
     "operator_pin", "concrete_target_path", "own_tree_not_a_checkout", "own_tree_off_branch",
     "own_tree_probe_failed", "own_tree_repo_mismatch",
-    "own_tree_half_built_add",  # a killed `worktree add`, named, never removed (t_f609a5a0)
     # the dirty-tree carry's own refusals (t_894be273)
     "dirty_submodule_or_nested_repo", "dirty_tree_over_cap", "origin_tip_not_studio_head",
     "dirty_path_through_symlink", "dirty_path_not_plain_file",

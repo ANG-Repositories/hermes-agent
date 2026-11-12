@@ -16,7 +16,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 from hermes_cli.worktree_ops import release_lsp_clients
-from hermes_cli import kanban_worktree_residue as _kwr
+from hermes_cli import kanban_worktree_add as _kwa
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 _REMOVABLE_KINDS = ("scratch", "worktree")
@@ -871,23 +871,6 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _hold_half_built(repo_root: Path, target: Path) -> None:
-    """Raise ``WorkspaceUnavailable`` when ``target`` is a tree a killed add left half-built (t_f609a5a0): never
-    reused, never removed here (ruling:t_f609a5a0-no-automatic-deletion). Held, named; an operator inspects it
-    before removing it. Every path that hands a worker an existing linked checkout calls this first."""
-    hb = _kwr.half_built(repo_root, target) if target.exists() else None
-    if hb is not None:
-        from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
-        if hb.get("lock") == "unreadable":
-            raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is locked and its lock file cannot be read; "
-                                       f"unknown state is held, never reused; left as it is")
-        if hb.get("lock") == "unassessed":
-            raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} could not be assessed ({hb.get('why')}); "
-                                       f"unknown state is held, never reused; left as it is")
-        raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is a killed `git worktree add` (locked "
-                                   f"initializing, no index, lock {hb['age_s']}s old); left as git left it")
-
-
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``.
 
@@ -900,12 +883,14 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     branch if needed) so the reused checkout matches the requested branch.
     """
     target = target.expanduser()
-    _hold_half_built(repo_root, target)
     repo_common = _git_common_dir(repo_root)
     if (
         target.exists() and repo_common is not None
         and _path_key(_git_common_dir(target)) == _path_key(repo_common)
     ):
+        # ruling:t_f609a5a0-cut-plus-proven-usable-gate: a linked tree is reused only when proven finished; a
+        # group-killed add's half-built tree is held, never handed over (or checked out into).
+        _kwa.hold_unless_proven(target)
         if _git_current_branch(target) == branch_name:
             return
         # Reused worktree is on the wrong branch — realign it.
@@ -946,11 +931,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if target_occupied(repo_root, target):
         raise dead_stub_hold(repo_root, target)
     # t_f609a5a0: own process group, killed whole on timeout, so no git child outlives the spawn. Nothing is removed
-    # after a failed or timed-out add (ruling:t_f609a5a0-no-automatic-deletion): what git left is logged with its
-    # path, the spawn fails, and the next placement names the tree.
+    # after a timed-out add (ruling:t_f609a5a0-no-automatic-deletion): what git left is logged with its path.
     try:
-        result = _kwr.run_git_group(["git", "-C", str(repo_root), *args], timeout=_kwr.ADD_TIMEOUT_S)
-    except _kwr.WorktreeAddTimeout as exc:
+        result = _kwa.run_git_group(["git", "-C", str(repo_root), *args], timeout=_kwa.ADD_TIMEOUT_S)
+    except _kwa.WorktreeAddTimeout as exc:
         _kb._log.warning(
             "PHASE=kanban_worktree_add_timeout %s (branch %s): %s; left as git left it, path exists: %s",
             target, branch_name, exc, os.path.lexists(str(target)),
@@ -1015,10 +999,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
-            # Prism #265 P1 c-53aef5301a38d84d: this early return hands the immediate-spawn and review lanes an
-            # existing checkout; a half-built one is held here exactly as in _ensure_git_worktree. Only when this
-            # card would USE the tree (Prism #265 P2 @7acad872): a sibling on another branch falls back below.
-            _hold_half_built(requested, requested)
+            _kwa.hold_unless_proven(requested)  # t_f609a5a0: handed over only when proven finished
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
@@ -1033,7 +1014,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
-        _hold_half_built(requested, requested)
+        _kwa.hold_unless_proven(requested)  # t_f609a5a0: handed over only when proven finished
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)

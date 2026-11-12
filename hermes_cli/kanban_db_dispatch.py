@@ -5720,10 +5720,6 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     if why is None and rule == "workspace_kind":
         tail = (route[1] or "").rsplit(":", 1)[-1] if (route[1] or "").startswith("not_portable:workspace_kind:") \
             else None
-        if tail == "own_tree_half_built_add":
-            # t_f609a5a0: not a Studio capability question. The card's own tree is a killed `worktree add`, never
-            # removed automatically: name it; the starvation reporter posts it once, never an unbounded silent wait.
-            return "wait", f"half_built_worktree ({route[1]})"
         if kind != "worktree":
             why = {"capability": f"workspace_kind:{kind}", "source": "card", "evidence": row["workspace_path"],
                    "kind": "structural"}

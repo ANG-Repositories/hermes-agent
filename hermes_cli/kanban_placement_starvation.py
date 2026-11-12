@@ -50,13 +50,6 @@ _FIXES = (
     ("requires:",
      "the capability the card requires is on no pool host it may use. Fix: correct the "
      "`requires:` line, or pin the host that serves it."),
-    # t_f609a5a0: describes the state only. No command: any remove/reset advice can discard work a person
-    # wrote into the tree (Prism #265 P1 c-114ad0675e2813c2, c-b0d012564a15447c).
-    ("half_built_worktree",
-     "the card's own `.worktrees/<id>` is a `git worktree add` that was killed mid-checkout (locked "
-     "`initializing`, no index). The dispatcher never removes it, so the card waits until it is cleared (the "
-     "dispatcher log line PHASE=kanban_half_built_worktree_held names the path, lock age and branch; t_f609a5a0). "
-     "Operator: inspect before removing: it may hold files someone wrote after the add died, or commits."),
     ("studio_default_deny:",
      "the card needs a capability only the Mac Studio has, and it is not on the Studio allowlist "
      "(kanban.placement.studio_default_deny.allow), so it waits instead of starting there (t_062a5948). Fix: the "
