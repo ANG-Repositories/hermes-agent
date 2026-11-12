@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "后台审查"
   notice:
     uncompressed_context_overflow: "⚠️ 会话上下文（约 {tokens} 个 token）在压缩已禁用（compression.enabled: false）的情况下超出了模型上下文窗口（约 {context_length} 个 token）。请使用 /compact 压缩历史记录，或在 config.yaml 中启用压缩。"
+    compression_store_unavailable: "⚠️ 上下文已超过压缩阈值（约 {tokens} 个 token >= {threshold}），但压缩无法运行：压缩存储已损坏（数据库错误）。/compress 使用同一存储，无法解决。请使用 /new 开始新会话。"
 explainer:
   no_reply_prefix: "⚠️ 无回复："
   empty_response: "{model} 这次即使重试后也没有生成回复。发送 `continue` 重试，或用 /model 切换模型。"

@@ -1145,6 +1145,7 @@ def _doctor_repair_schema_stamp_apply_text(engine) -> str:
         ])
 
     conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA checkpoint_fullfsync=ON")  # t_6314cc2f: every lcm.db writer
     try:
         result = remediate_interim_schema_stamp(conn, apply=True)
     except sqlite3.Error as exc:

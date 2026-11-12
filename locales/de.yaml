@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "Hintergrund-Review"
   notice:
     uncompressed_context_overflow: "⚠️ Der Sitzungskontext (~{tokens} Tokens) überschreitet das Kontextfenster des Modells (~{context_length} Tokens), während die Komprimierung deaktiviert ist (compression.enabled: false). Verwenden Sie /compact, um den Verlauf zu komprimieren, oder aktivieren Sie die Komprimierung in config.yaml."
+    compression_store_unavailable: "⚠️ Der Kontext liegt über der Komprimierungsschwelle (~{tokens} Tokens >= {threshold}), aber die Komprimierung kann nicht laufen: Der Komprimierungsspeicher ist beschädigt (Datenbankfehler). /compress nutzt denselben Speicher und hilft nicht. Verwenden Sie /new, um eine neue Sitzung zu starten."
 explainer:
   no_reply_prefix: "⚠️ Keine Antwort: "
   empty_response: "{model} hat diesmal auch nach mehreren Versuchen keine Antwort erzeugt. Senden Sie `continue`, um es erneut zu versuchen, oder wechseln Sie das Modell mit /model."

@@ -3680,6 +3680,7 @@ display:
     aux_failure_label: "background review"
   notice:
     uncompressed_context_overflow: "⚠️ Session context (~{tokens} tokens) exceeds the model context window (~{context_length} tokens) with compression disabled (compression.enabled: false). Use /compact to compress history or enable compression in config.yaml."
+    compression_store_unavailable: "⚠️ Context is over the compression threshold (~{tokens} tokens >= {threshold}) but compression cannot run: the compaction store is damaged (database error). /compress uses the same store and will not help. Run /new to start a fresh session."
 
 explainer:
   # Turn-completion explanations and file-mutation footers (agent/turn_explainers.py). Appended to
