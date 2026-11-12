@@ -146,6 +146,8 @@ def _launchctl_supervised_pid(label: str) -> int | None:
     the answer. Domain-agnostic on purpose: ``launchctl print`` domain probes fail on macOS-26 per-user
     domains, which is why the invoking profile verifies through this and not ``_launchd_print_service_pid``."""
     try:
+        if (Path("/Library/LaunchDaemons") / f"{label}.plist").is_file():
+            return _gw()._launchd_print_service_pid("system", label)[1]
         result = subprocess.run(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
     except (subprocess.TimeoutExpired, OSError):
         return None

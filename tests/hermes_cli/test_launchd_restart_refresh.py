@@ -88,6 +88,7 @@ def test_system_daemon_restart_never_refreshes_or_degrades(monkeypatch, tmp_path
         if not loaded:
             raise gateway_cli.subprocess.CalledProcessError(113, cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(ld.os, "geteuid", lambda: 501)
     monkeypatch.setattr(ld.subprocess, "run", run)
     assert gateway_cli.get_launchd_plist_path() == ld.Path(f"/Library/LaunchDaemons/{label}.plist")
     assert gateway_cli._launchd_domain() == "system"
@@ -97,6 +98,16 @@ def test_system_daemon_restart_never_refreshes_or_degrades(monkeypatch, tmp_path
         with pytest.raises(gateway_cli.subprocess.CalledProcessError):
             gateway_cli.launchd_restart()
     assert calls == [["sudo", "-n", "launchctl", "kickstart", "-k", f"system/{label}"]]
+
+
+def test_system_daemon_supervision_is_domain_explicit(monkeypatch):
+    from hermes_cli import gateway_launchd as ld
+    monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p).startswith("/Library/LaunchDaemons/"))
+    seen = []
+    monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", lambda domain, label: seen.append((domain, label)) or (True, 123))
+    assert gateway_cli._launchctl_supervised_pid("ai.hermes.gateway-mercury") == 123
+    assert gateway_cli._locate_launchd_gateway_service("ai.hermes.gateway-mercury") == ("system", 123)
+    assert seen == [("system", "ai.hermes.gateway-mercury")] * 2
 
 
 def test_stale_plist_is_refreshed_before_any_kickstart(monkeypatch, launchd_seam):
