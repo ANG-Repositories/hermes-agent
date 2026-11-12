@@ -224,6 +224,27 @@ def half_built(repo_root: Path, target: Path, now: Optional[float] = None) -> Op
     return {"admin": str(admin), "age_s": int(age), "branch": branch}
 
 
+def written_after_add(target: Path, admin: Path, slack_s: float = 120.0) -> Optional[str]:
+    """A file under ``target`` modified after the add that made it could have been running, else None.
+
+    The add writes its checkout between taking the ``initializing`` lock and its kill (at most its timeout), so a
+    file newer than ``lock + ADD_TIMEOUT_S + slack`` was written by someone else into the dead tree: that tree is
+    work, never residue. Unreadable = treated as work (returned)."""
+    try:
+        limit = (admin / "locked").stat().st_mtime + ADD_TIMEOUT_S + slack_s
+        for root, dirs, files in os.walk(target):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for name in files:
+                if name == ".git" and root == str(target):
+                    continue  # the gitfile is git's, not work
+                p = os.path.join(root, name)
+                if os.lstat(p).st_mtime > limit:
+                    return p
+    except OSError as exc:
+        return f"unreadable: {exc}"
+    return None
+
+
 def branch_has_own_commits(repo_root: Path, branch: str) -> Optional[bool]:
     """True when ``refs/heads/<branch>`` holds a commit no remote-tracking ref has; None = unknown."""
     tip = rev(repo_root, f"refs/heads/{branch}")
@@ -250,6 +271,9 @@ def clear_half_built(repo_root: Path, target: Path, *, branch: str, min_age_s: i
         return {"cleared": False, "why": f"initializing lock is {hb['age_s']}s old (< {min_age_s}s)", **hb}
     if hb["branch"] and hb["branch"] != branch:
         return {"cleared": False, "why": f"tree is on {hb['branch']}, not {branch}", **hb}
+    late = written_after_add(target, Path(hb["admin"]))
+    if late is not None:
+        return {"cleared": False, "why": f"a file was written after the add died ({late})", **hb}
     own = branch_has_own_commits(repo_root, branch)
     tip = rev(repo_root, f"refs/heads/{branch}")
     rep = remove_failed_add(repo_root, target, branch=branch, created_branch=own is False and bool(tip),

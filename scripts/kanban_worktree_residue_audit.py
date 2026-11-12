@@ -122,6 +122,9 @@ def attribute(repo: Path, conn, min_age_s: int, now: float) -> list:
             why.append(f"card {card['status']} and it ran")
         if dispatcher and branch and branch not in (f"wt/{name}", (card or {}).get("branch_name") or ""):
             why.append(f"branch {branch} is not the card's")
+        late = kwr.written_after_add(path, admin) if admin is not None and path.is_dir() else None
+        if late is not None:
+            why.append(f"written after the add died: {late}")
         if age is None or age < min_age_s:
             why.append(f"lock age {age}s < {min_age_s}s")
         rows.append({"path": str(path), "shape": shape, "branch": branch, "head": wt.get("head", ""),

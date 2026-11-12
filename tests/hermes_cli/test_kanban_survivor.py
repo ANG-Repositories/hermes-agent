@@ -187,6 +187,12 @@ def test_workspace_deletion_has_one_choke_point():
         # the mirror flock, never a workspace. Resuming them in place instead
         # promoted a killed fetch's tmp_pack residue into the precious mirror.
         ("kanban_clone.py", "_discard_dead_builds"),
+        # Reviewed exception (t_f609a5a0): undoes a `git worktree add` that failed or was killed mid-checkout
+        # (locked `initializing`, no index). Only the add's own target, empty before the add, or a card's own
+        # half-built tree older than an add can run with no file written after it died; a branch only when it
+        # has no commit of its own. Such a tree has no index, so the survivor capture would read every file as
+        # a staged delete; it holds no work to preserve.
+        ("kanban_worktree_residue.py", "remove_failed_add"),
     }
 
 

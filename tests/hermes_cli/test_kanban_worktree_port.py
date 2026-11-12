@@ -1843,7 +1843,8 @@ def _make_half_built(wt: Path, age_s: int) -> Path:
     _git("worktree", "lock", "--reason", kwr.INIT_LOCK, str(wt), cwd=wt)
     if age_s:
         old = time.time() - age_s
-        os.utime(gitdir / "locked", (old, old))
+        for p in [gitdir / "locked", *(q for q in wt.rglob("*") if ".git" not in q.parts and q.is_file())]:
+            os.utime(p, (old, old))
     return gitdir
 
 

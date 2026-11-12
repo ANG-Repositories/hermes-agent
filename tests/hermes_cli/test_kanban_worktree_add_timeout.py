@@ -108,9 +108,15 @@ def _half_built(repo, target, branch, reason=kwr.INIT_LOCK, age_s=0):
     (admin / "index").unlink()
     git(repo, "worktree", "lock", "--reason", reason, str(target))
     if age_s:
-        old = time.time() - age_s
-        os.utime(admin / "locked", (old, old))
+        _age_tree(target, admin, age_s)
     return admin
+
+
+def _age_tree(target: Path, admin: Path, age_s: int) -> None:
+    """A real dead add: its lock and every file it checked out are as old as the kill."""
+    old = time.time() - age_s
+    for p in [admin / "locked", *(q for q in target.rglob("*") if ".git" not in q.parts and q.is_file())]:
+        os.utime(p, (old, old))
 
 
 def test_a_lock_reason_other_than_initializing_is_never_touched(repo):
@@ -140,8 +146,7 @@ def test_a_half_built_tree_is_cleared_but_a_branch_with_its_own_commits_is_kept(
     admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
     (admin / "index").unlink()
     git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
-    old = time.time() - 10_000
-    os.utime(admin / "locked", (old, old))
+    _age_tree(target, admin, 10_000)
 
     res = kwr.clear_half_built(repo, target, branch="wt/t_own")
 
@@ -213,3 +218,12 @@ def test_audit_drain_removes_only_dispatcher_trees_of_finished_cards(repo, tmp_p
 def test_audit_check_is_silent_when_clean(repo):
     r = _audit("--repo", str(repo), "--check")
     assert r.returncode == 0 and r.stdout == ""
+
+
+def test_a_half_built_tree_someone_wrote_into_after_the_add_died_is_kept(repo):
+    target = repo / ".worktrees" / "t_late"
+    _half_built(repo, target, "wt/t_late", age_s=10_000)
+    (target / "notes.txt").write_text("written into the dead tree by hand\n", encoding="utf-8")
+    res = kwr.clear_half_built(repo, target, branch="wt/t_late")
+    assert res["cleared"] is False and "written after the add died" in res["why"]
+    assert (target / "notes.txt").is_file()
