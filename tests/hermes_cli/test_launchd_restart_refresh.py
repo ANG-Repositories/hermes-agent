@@ -132,6 +132,12 @@ def test_system_daemon_supervision_is_domain_explicit(monkeypatch):
     assert seen == [("system", "ai.hermes.gateway-mercury")] * 2
 
 
+def test_daemon_does_not_change_launchagents_directory_api(monkeypatch):
+    from hermes_cli import gateway_launchd as ld
+    monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p).startswith("/Library/LaunchDaemons/"))
+    assert gateway_cli.get_launchd_plist_path().parent.name == "LaunchAgents"
+
+
 @pytest.mark.parametrize("live_domain", ["gui/501", "user/501"])
 def test_unloaded_daemon_does_not_shadow_user_service(monkeypatch, live_domain):
     from hermes_cli import gateway_launchd as ld
