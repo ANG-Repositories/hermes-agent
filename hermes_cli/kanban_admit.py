@@ -175,13 +175,23 @@ def _fwa_inputs(table, word: str, consumer_need, *, now: float):
     """``(hid, limits, need, leases, error)`` for ``word``: the placement-table row's
     limits (``placement._limits``, the same the router uses), this card's estimate
     on that host, and the shared ledger's live leases. ``table`` None is re-read
-    from the file. A truly absent table is no row: default limits, the caller's
-    estimate, no leases. A table or ledger that exists but cannot be read is an
+    from the file. A truly absent table (or no row) is default limits and the
+    caller's estimate; the live ledger's leases still count. A table or ledger that exists but cannot be read is an
     error (fail closed, naming the file; Prism a6c5f61c871f, d16d6de8bc5b)."""
     from hermes_cli.fleet_placement import admission as _ad
     from hermes_cli.fleet_placement import placement as pl
 
     path = pl.fleet_root() / pl.TABLE_REL
+    lpath = pl.fleet_root() / pl.RESERVATIONS_REL
+
+    def _no_row(tbl):
+        # No table row is default limits, never "no leases": the live ledger still binds, and an unreadable one
+        # fails closed (Prism 891b269f644d / 5e9e08ea372d).
+        try:
+            return word, _ad.Limits(), consumer_need, tuple(pl.ledger_leases(lpath, now=now, table=tbl)), None
+        except Exception as exc:
+            return word, None, None, (), f"reservation ledger {lpath} unreadable: {exc}"
+
     try:
         if table is None:
             try:
@@ -189,14 +199,13 @@ def _fwa_inputs(table, word: str, consumer_need, *, now: float):
             except FileNotFoundError:
                 # Only a truly absent table is "no row"; exists() would also
                 # say False on PermissionError (py3.14), Prism d16d6de8bc5b.
-                return word, _ad.Limits(), consumer_need, (), None
+                return _no_row(None)
             table = pl.load_hosts(path)
     except Exception as exc:
         return word, None, None, (), f"placement table {path} unreadable: {exc}"
     hid = table.resolve(word)
     if not hid:
-        return word, _ad.Limits(), consumer_need, (), None
-    lpath = pl.fleet_root() / pl.RESERVATIONS_REL
+        return _no_row(table)
     try:
         leases = tuple(pl.ledger_leases(lpath, now=now, table=table))
         need = consumer_need

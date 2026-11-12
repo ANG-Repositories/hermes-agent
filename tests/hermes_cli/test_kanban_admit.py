@@ -652,6 +652,25 @@ def test_placement_table_under_an_unsearchable_dir_is_nan_not_zero(board, monkey
     assert ka._fwa_inputs(None, "local", need, now=1.0) == ("local", ad.Limits(), need, (), None)
 
 
+def test_fwa_inputs_without_a_table_row_still_counts_the_ledger(board):
+    """Prism 891b269f644d / 5e9e08ea372d: no table (or no row) is default limits, never an empty ledger. A live
+    lease still binds, and an unreadable ledger fails closed."""
+    from hermes_cli.fleet_placement import admission as ad
+    from hermes_cli.fleet_placement import placement as pl
+
+    lpath = pl.fleet_root() / pl.RESERVATIONS_REL
+    lpath.parent.mkdir(parents=True, exist_ok=True)
+    pl.reserve("local", "prism", pl.Footprint(ram_gb=8.0, threads=1), ttl_s=600.0, job_id="j1", path=lpath, now=1.0)
+    need = ad.Estimate(cpus=1.0, ram_gb=3.0)
+    assert not (pl.fleet_root() / pl.TABLE_REL).exists()
+    hid, limits, got, leases, err = ka._fwa_inputs(None, "local", need, now=2.0)
+    assert err is None and limits == ad.Limits() and got == need
+    assert [(lease.host, lease.need.ram_gb) for lease in leases] == [("local", 8.0)]
+    lpath.write_text("not json")
+    hid, limits, got, leases, err = ka._fwa_inputs(None, "local", need, now=2.0)
+    assert limits is None and err is not None and str(lpath) in err
+
+
 # -- r7 (Apollo invariant): admit == the dispatcher's own route and refusal, host admission off --
 
 def _decision_sites() -> set:

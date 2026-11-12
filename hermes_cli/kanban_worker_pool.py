@@ -2482,7 +2482,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         active = h.enabled and h.state == "active"
         free = count_free(h, running) if active else 0
         # allocd on: probe a host past its count too, so _take_allocd (structural_free) can ask allocd for it.
-        # plan.slots keeps the real count for every take that does not ask allocd (t_2158f095, Prism cba00e400ff4).
+        # `free` stays the real count for every take that does not ask allocd (t_2158f095, Prism cba00e400ff4).
         ask = free > 0 or (active and signal.allocd == "on")
         sample = _probe_states(probe, h, ask, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
