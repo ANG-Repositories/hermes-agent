@@ -1983,3 +1983,105 @@ def test_routed_mechanical_wake_on_boomerang_card_is_one_child_routed_to_the_rec
     assert len(env["dispatched"]) == 1, env["dispatched"]
     d = env["dispatched"][0]
     assert d["row"] == "mechanical_wake" and str(d["route"]["chat_id"]) == other, d
+
+
+# --- t_a256e37c: the restart retry budget is per WAKE, the crash budget per card ------------------
+
+
+def _new_completed_event(tid) -> None:
+    """A later wake on the same card (a fresh ``completed`` event to claim)."""
+    with kb.connect_closing() as conn, kb.write_txn(conn), \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb._append_event(conn, tid, "completed", {"summary": "again"})  # noqa: SLF001
+
+
+def test_restart_retry_resets_after_a_handled_wake(env, caplog):
+    """Restart cut -> redispatch -> child handles; a second restart cut on the same card is
+    redispatched again, quietly."""
+    tid = _card(env)
+    _worker_close(tid)
+    first = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _kill(env, first)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    redo = env["dispatched"][-1]
+    state = ah.BoomerangWakeState()
+    assert state.retries(tid) == 1 and state.restart_spent(tid) == 1
+    _run(env, state.get_claim(redo["key"]), "completed", _verdict(redo, "complete"))
+    assert state.get_claim(redo["key"])["outcome"] == "complete"
+    assert state.retries(tid) == 0 and state.restart_spent(tid) == 0, "a handled wake kept the restart spent"
+    sent_before = list(env["adapter"].sent)
+    _new_completed_event(tid)
+    second = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _kill(env, second)
+    with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
+        assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    old = state.get_claim(second["key"])
+    assert old["state"] == ah.STATE_TERMINAL and old["outcome"] == "redispatched_after_restart"
+    assert env["dispatched"][-1]["key"] == old["redispatched_as"]
+    assert env["adapter"].sent == sent_before and env["adapter"].handled == [], "a chat line was posted"
+    assert " lost reason=" not in caplog.text
+
+
+def test_retry_child_cut_again_is_lost_once_with_per_wake_budget(env):
+    """Restart cut -> redispatch -> the retry child is cut too: one lost line, wake re-delivered."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _kill(env, entry)
+    asyncio.run(ah.reconcile(env["runner"]))
+    redo = env["dispatched"][-1]
+    _kill(env, redo)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert env["dispatched"][-1] is redo and len(env["dispatched"]) == 2
+    assert [s for s in env["adapter"].sent if "boomerang-wake lost" in s] == [
+        f"⚠️ boomerang-wake lost {tid} (reason: gateway restart, retry spent)"]
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    state = ah.BoomerangWakeState()
+    assert state.get_claim(redo["key"])["outcome"] == "lost"
+    assert state.restart_spent(tid) == 1, "a lost wake refunded the restart retry"
+
+
+def test_crash_budget_stays_per_card_after_a_handled_wake(env):
+    """Crash -> retry child (handled, verdict accepted) -> crash again: the second crash surfaces."""
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn), \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb._append_event(conn, tid, "crashed", {"error": "boom"})  # noqa: SLF001
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+    state = ah.BoomerangWakeState()
+    disp = ah.classify_event("crashed", {}, task, state.retries(tid))
+    assert disp.verdict == "auto" and disp.row == "crash_first_occurrence"
+    entry = _claimed_entry(env, tid, row="crash_first_occurrence", kind="crashed")
+    assert state.retries(tid) == 1 and state.restart_spent(tid) == 0
+    _run(env, state.get_claim(entry["key"]), "completed", _verdict(entry, "retry"))
+    claim = state.get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "retry", claim
+    assert state.retries(tid) == 1, "a handled wake refunded the crash retry"
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+    assert ah.classify_event("crashed", {}, task, state.retries(tid)).verdict != "auto"
+
+
+def test_bare_retries_file_still_loads_and_refunds_restart_claims(tmp_path):
+    """A pre-t_a256e37c file: ``retries`` only. Counters read as before; a card whose count came from a
+    ``#restartN`` claim is refundable, a crash-only card is not."""
+    path = tmp_path / "kanban_boomerang_wake.json"
+    path.write_text(json.dumps({
+        "retries": {"t_r": 1, "t_c": 1},
+        "claims": {"b|t_r|7": {"task_id": "t_r", "state": "terminal", "outcome": "redispatched_after_restart"},
+                   "b|t_r|7#restart1": {"task_id": "t_r", "state": "running"},
+                   "b|t_r|9": {"task_id": "t_r", "state": "running"},
+                   "b|t_c|3": {"task_id": "t_c", "state": "running"}}}))
+    state = ah.BoomerangWakeState(path)
+    assert state.retries("t_r") == 1 and state.retries("t_c") == 1
+    assert state.restart_spent("t_r") == 1 and state.restart_spent("t_c") == 0
+    state.update_claim("b|t_c|3", state=ah.STATE_TERMINAL, outcome="complete")
+    assert state.retries("t_c") == 1
+    state.update_claim("b|t_r|9", state=ah.STATE_TERMINAL, outcome="failed")
+    assert state.retries("t_r") == 1
+    state.update_claim("b|t_r|7#restart1", state=ah.STATE_TERMINAL, outcome="acknowledge")
+    assert state.retries("t_r") == 0 and state.retries("t_c") == 1
+    doc = json.loads(path.read_text())
+    assert doc["restart_spent"] == {} and doc["retries"] == {"t_c": 1}

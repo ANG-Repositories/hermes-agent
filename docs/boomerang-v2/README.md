@@ -163,7 +163,7 @@ Each `auto` row may carry `mode: fork|summary` (default `fork`, subject to §2 e
 Retries (D-13): a crash-class event gets one automatic retry. The count is persisted per card in
 `kanban_boomerang_wake.json` (`retries[task_id]`), survives restarts, and resets when the card
 reaches `completed`/`archived` or when Ace surfaces-and-acts on it. The second occurrence
-surfaces.
+surfaces. The crash-class budget is per card lifetime; the restart budget below is per wake.
 
 ## 4. The boomerang wake level
 
@@ -261,6 +261,16 @@ gets one INFO line `kanban boomerang-wake: <card> redispatched after gateway res
 delegation=<new>`. Otherwise the entry is lost as above, with the reason saying which condition
 failed. The restart spent the budget, so the redispatched child's own failure, a second restart,
 or a later crash-class event on the card surfaces (no second automatic retry).
+
+**The restart budget is per wake (t_a256e37c).** A restart redispatch also records the retry in
+`restart_spent[task_id]`. When any claim on the card goes terminal with a handled outcome
+(`complete`, `request_changes`, `redispatch`, `retry`, `handled`, `land_inherited`, `acknowledge`,
+`comment_why_waits`, `surfaced`, `stale`, `superseded`, `superseded-by-terminal`), that restart
+part is subtracted from `retries[task_id]` and cleared, so the next restart cut on the card is
+redispatched quietly again. `failed`, `lost`, `stopped` and `dispatch_failed` refund nothing. The
+crash-class retry (D-13) is never refunded: a worker that crashes, is retried by a child, and
+crashes again still surfaces. A state file from before this change (a bare `retries` map) loads
+as is; its refundable part is seeded from the card's `<key>#restartN` claims.
 
 **`[boomerang-wake cancelled; ignored]`**
 A handoff that arrived from a child after the reconciler cancelled it. It is tagged and not

@@ -10,6 +10,9 @@ automatic retries a crash-class wake has already spent on a card (spec §5.4, D-
 ``wake_disposition`` reads it (one retry, then surface); the dispatcher bumps it when it
 dispatches a crash retry. It survives a gateway restart, and it resets when the card reaches
 ``completed``/``archived`` (or when Ace surfaces-and-acts on it: :meth:`reset`).
+``restart_spent[task_id]`` is the part of that count a gateway-restart redispatch spent; a handled
+wake (``HANDLED_OUTCOMES``) refunds it, so the restart retry is per wake while the crash-class retry
+stays per card lifetime (t_a256e37c).
 
 Writes go through write-temp + ``os.replace`` under a process-wide lock: both wake paths
 run on threads of the ONE gateway process that owns this ``HERMES_HOME`` (spec §5.4,
@@ -34,6 +37,14 @@ STATE_FILENAME = "kanban_boomerang_wake.json"
 LEGACY_STATE_FILENAME = "kanban_auto_handle.json"
 # Events after which a card's retry budget starts over.
 RESET_KINDS = frozenset({"completed", "archived"})
+# t_a256e37c: a claim that goes terminal with one of these outcomes HANDLED its wake (the executor
+# accepted the child's verdict, or the wake was correctly dropped). It refunds the restart part of
+# the card's retry counter (``restart_spent``), so the next restart cut gets its quiet redispatch
+# again. ``failed``/``lost``/``stopped``/``dispatch_failed``/``redispatched_after_restart`` do not.
+HANDLED_OUTCOMES = frozenset({
+    "complete", "request_changes", "redispatch", "retry", "handled", "land_inherited", "acknowledge",
+    "comment_why_waits", "surfaced", "stale", "superseded", "superseded-by-terminal",
+})
 
 _LOCK = threading.Lock()
 
@@ -128,15 +139,72 @@ class BoomerangWakeState:
             self._write(data)
             return retries[str(task_id)]
 
+    def bump_restart_retry(self, task_id: str) -> int:
+        """A restart redispatch: one more retry on ``task_id``, recorded as restart-spent in the
+        same write (refunded by the next handled wake); returns the new ``retries`` count."""
+        with _LOCK:
+            data = self._read()
+            retries, spent = self._retries_of(data), self._restart_spent_of(data)
+            tid = str(task_id)
+            retries[tid] = retries.get(tid, 0) + 1
+            spent[tid] = spent.get(tid, 0) + 1
+            data["retries"], data["restart_spent"] = retries, spent
+            self._write(data)
+            return retries[tid]
+
+    @staticmethod
+    def _restart_spent_of(data: dict) -> dict:
+        raw = data.get("restart_spent")
+        if not isinstance(raw, dict):
+            # Pre-t_a256e37c file (a bare ``retries`` map): every restart redispatch left a
+            # ``<key>#restartN`` claim, so seed the refundable part from those, capped by the counter.
+            retries, seed = BoomerangWakeState._retries_of(data), {}
+            for k, v in BoomerangWakeState._claims_of(data).items():
+                if "#restart" in str(k) and isinstance(v, dict) and v.get("task_id"):
+                    tid = str(v["task_id"])
+                    seed[tid] = seed.get(tid, 0) + 1
+            return {t: min(n, retries.get(t, 0)) for t, n in seed.items() if retries.get(t, 0) > 0}
+        out = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def restart_spent(self, task_id: str) -> int:
+        with _LOCK:
+            return self._restart_spent_of(self._read()).get(str(task_id), 0)
+
+    def _refund_restart(self, data: dict, task_id: str) -> None:
+        """Caller holds _LOCK and writes ``data``: give back the restart-spent retries only. The
+        crash-class part of ``retries`` stays per card lifetime (D-13)."""
+        spent = self._restart_spent_of(data)
+        n = spent.pop(str(task_id), 0)
+        if not n:
+            return
+        retries = self._retries_of(data)
+        left = max(0, retries.get(str(task_id), 0) - n)
+        if left:
+            retries[str(task_id)] = left
+        else:
+            retries.pop(str(task_id), None)
+        data["retries"], data["restart_spent"] = retries, spent
+
     def reset(self, task_id: str) -> bool:
         """Drop ``task_id``'s counter; True when one existed."""
         with _LOCK:
             data = self._read()
             retries = self._retries_of(data)
+            spent = self._restart_spent_of(data)
+            spent_had = spent.pop(str(task_id), None) is not None
             if str(task_id) not in retries:
+                if spent_had:
+                    data["restart_spent"] = spent
+                    self._write(data)
                 return False
             del retries[str(task_id)]
-            data["retries"] = retries
+            data["retries"], data["restart_spent"] = retries, spent
             self._write(data)
             return True
 
@@ -203,6 +271,9 @@ class BoomerangWakeState:
                 if handback is not None:
                     self._write(data)
                 return None
+            if (fields.get("state") == STATE_TERMINAL and entry.get("state") != STATE_TERMINAL
+                    and fields.get("outcome") in HANDLED_OUTCOMES and entry.get("task_id")):
+                self._refund_restart(data, entry["task_id"])   # t_a256e37c: per-wake restart budget
             entry = {**entry, **fields}
             claims[key] = entry
             data["claims"] = claims
@@ -2353,7 +2424,7 @@ async def _restart_redispatch_or_lost(runner: Any, entry: dict, state: Boomerang
     if why:
         await _lost(runner, entry, f"gateway restart, {why}", state)
         return
-    spent = await asyncio.to_thread(state.bump_retry, entry["task_id"])
+    spent = await asyncio.to_thread(state.bump_restart_retry, entry["task_id"])
     new_key = f"{entry['key']}#restart{spent}"
     try:
         await dispatch(runner, board=entry.get("board"), key=new_key,
