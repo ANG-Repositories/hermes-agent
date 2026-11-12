@@ -12,6 +12,8 @@ For every run that STARTED on the Mac Studio (``placement`` event whose host is 
                 placement after it (0 when a pool host had a free slot that tick)
   override      a Studio-only capability (or structural fact) NOT on the allowlist: the card has no host at all
                 and waits for an operator ``hermes kanban studio-override`` (one per run with --once)
+  unknown       a ``host_studio`` placement with no ``studio_capability`` record (it predates the record): the
+                replay cannot say what held it, so it is neither a move nor an override (Prism 9fec6c08b569)
 
 Output: a markdown report (per-capability table with proposed keep/deny, the per-day override count, the moved
 cards and their estimated waits, and every card that would have been stuck).
@@ -81,7 +83,8 @@ def load_caps(path: Path):
              for h, v in (doc.get("hosts") or {}).items()}
     studio = hosts.pop("studio", set())
     pool = set().union(*hosts.values()) if hosts else set()
-    return (studio - pool) | {"control-plane-read"}, pool
+    # per-host sets, not the union: a card needing a AND b moves only if ONE pool host has both (Prism e528d5a843f6)
+    return (studio - pool) | {"control-plane-read"}, list(hosts.values())
 
 
 def capability_of(p: dict):
@@ -117,7 +120,7 @@ def covered(cap, allow) -> bool:
     return bool(ps) and all(x in allow or head(x) in allow for x in ps)
 
 
-def studio_only_cap(cap, studio_only) -> bool:
+def studio_only_cap(cap, studio_only, pool_hosts=None) -> bool:
     if cap is None:
         return False
     ps = [x.strip() for x in cap.split(",") if x.strip()]
@@ -125,17 +128,20 @@ def studio_only_cap(cap, studio_only) -> bool:
         return True
     if cap in ("studio-needs", "review_lane"):
         return True  # body words meant a Studio resource (t_c82eded0 removes it); the review lane never leaves
-    return any(x in studio_only for x in ps)
+    if any(x in studio_only for x in ps):
+        return True
+    # every part exists somewhere in the pool; it still needs one host that has them all
+    return pool_hosts is not None and len(ps) > 1 and not any(set(ps) <= set(h) for h in pool_hosts)
 
 
-def replay(dbs, studio_only, allow, since, now):
+def replay(dbs, studio_only, allow, since, now, pool_hosts=None):
     rows, moved, stuck = [], [], []
     for db in dbs:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         pool_times = [r[0] for r in con.execute(
-            "SELECT created_at FROM task_events WHERE kind='worker_placed' AND created_at >= ? ORDER BY created_at",
-            (since,))]
+            "SELECT created_at FROM task_events WHERE kind='worker_placed' AND created_at >= ? AND created_at < ? "
+            "ORDER BY created_at", (since, now))]  # bounded like the Studio query (Prism 6c3aa1e6038d)
         cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
         nw = "no_worker" if "no_worker" in cols else "0"
         tasks = {r["id"]: r for r in con.execute(f"SELECT id, title, assignee, {nw} AS no_worker FROM tasks")}
@@ -155,7 +161,9 @@ def replay(dbs, studio_only, allow, since, now):
             assignee = str((t["assignee"] if t else "") or "")
             if t is not None and (t["no_worker"] or assignee in OPERATOR_PROFILES):
                 verdict = "exempt"
-            elif studio_only_cap(cap, studio_only):
+            elif cap is None and src == "host_studio":
+                verdict = "unknown"  # pre-capability Studio pin: no record of what held it (Prism 9fec6c08b569)
+            elif studio_only_cap(cap, studio_only, pool_hosts):
                 verdict = "allowlisted" if covered(cap, allow) else "override"
             else:
                 verdict = "moves"
@@ -188,7 +196,8 @@ def report(rows, moved, stuck, allow, days, out=sys.stdout):
     w(f"# Studio default-deny replay: last {days} days\n\n")
     w(f"Allowlist replayed: {', '.join(sorted(allow)) or '(empty)'}\n\n")
     w(f"Studio-started runs: {total}. allowlisted {by['allowlisted']}, exempt {by['exempt']}, "
-      f"moves to a pool host {by['moves']}, needs an operator override (no host at all) {by['override']}.\n\n")
+      f"moves to a pool host {by['moves']}, needs an operator override (no host at all) {by['override']}, "
+      f"unknown (pre-capability Studio pin, rule host_studio) {by['unknown']}.\n\n")
     w("## Capabilities that started a run on the Studio\n\n| capability | runs | cards | sources | proposal | why |\n"
       "|---|---|---|---|---|---|\n")
     caps = collections.defaultdict(list)
@@ -202,6 +211,10 @@ def report(rows, moved, stuck, allow, days, out=sys.stdout):
         why = "; ".join(f"{x}: {v[1]}" for x, v in zip(parts, verdicts))
         srcs = ",".join(sorted({r["source"] for r in rs}))
         w(f"| {cap} | {len(rs)} | {len({r['task_id'] for r in rs})} | {srcs} | {'keep' if keep else 'deny'} | {why} |\n")
+    unk = [r for r in rows if r["verdict"] == "unknown"]
+    if unk:
+        w(f"| host_studio (no capability record) | {len(unk)} | {len({r['task_id'] for r in unk})} | legacy | unknown "
+          f"| placed before the studio_capability record existed: counted neither as a move nor as an override |\n")
     w("\n## Overrides per day (runs the operator would have had to override)\n\n| day | overrides | distinct cards |"
       " capabilities |\n|---|---|---|---|\n")
     per = collections.defaultdict(list)
@@ -249,13 +262,13 @@ def main(argv=None) -> int:
     ap.add_argument("--now", type=int, default=None)
     a = ap.parse_args(argv)
     now = a.now or int(time.time())
-    studio_only, _pool = load_caps(Path(a.caps).expanduser())
+    studio_only, pool_hosts = load_caps(Path(a.caps).expanduser())
     if a.allow is None:
         allow = {k for k, (v, _w) in PROPOSED.items() if v == "keep"}
     else:
         allow = {x.strip() for x in a.allow.split(",") if x.strip()}
     rows, moved, stuck = replay([str(Path(d).expanduser()) for d in a.db], studio_only, allow,
-                                now - a.days * 86400, now)
+                                now - a.days * 86400, now, pool_hosts)
     report(rows, moved, stuck, allow, a.days)
     return 0
 
