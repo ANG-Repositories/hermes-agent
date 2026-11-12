@@ -89,6 +89,7 @@ WHY_PINNED = "operator_pin"
 WHY_DIVERGED = "diverged_from_origin"
 WHY_UNPUSHED = "unpushed_commits"          # hand-list mode only
 WHY_NOT_CHECKOUT = "own_tree_not_a_checkout"
+WHY_HALF_BUILT = "own_tree_half_built_add"   # t_f609a5a0: a killed `worktree add` left it locked `initializing`
 WHY_PROBE_FAILED = "own_tree_probe_failed"
 WHY_REPO_MISMATCH = "own_tree_repo_mismatch"
 WHY_DERIVED_OFF = "derived_mode_off"
@@ -116,6 +117,9 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
                   "a sub-directory), or the host_preference kanban switch is off (Studio not last resort)",
     WHY_NOT_CHECKOUT: "the card's .worktrees/<id> holds files but is not a git checkout, or has no index: git "
                       "cannot see or carry them",
+    WHY_HALF_BUILT: "the card's .worktrees/<id> is a `git worktree add` that was killed mid-checkout (locked "
+                    "`initializing`, no index): cleared on the next tick once it is older than an add can run and "
+                    "its branch has no commits of its own; held, named, until then (t_f609a5a0)",
     WHY_PROBE_FAILED: "git could not read whether the card's own Studio tree has an index (error or timeout): "
                       "unknown state is never read as an empty tree",
     WHY_REPO_MISMATCH: "the card's .worktrees/<id> belongs to another repo than the directory it sits in (its git "
@@ -544,6 +548,9 @@ def assess(task_id: str, workspace_path: Optional[str], board_default: Optional[
              WHY_REPO_MISMATCH if refusal == WHY_REPO_MISMATCH else WHY_NOT_REPO)
         return None, None
     b = (branch or "").strip() or f"wt/{task_id}"
+    if _half_built_held(top, own_tree or top / ".worktrees" / task_id, b):
+        _why(why, WHY_HALF_BUILT)
+        return None, None
     if own_tree is None and (top / ".worktrees" / task_id).exists():
         own_tree = top / ".worktrees" / task_id
         if not allow_studio_tree:
@@ -712,6 +719,30 @@ def _ref_table(top: Path) -> Optional[Dict[str, str]]:
 
     table = _kts.tick_memo(("wt_refs", str(top)), _read, inner=True)
     return dict(table) if table is not None else None
+
+
+def _half_built_held(repo: Path, tree: Path, branch: str) -> bool:
+    """True when ``tree`` (the card's own ``.worktrees/<id>``) is a half-built add that still holds the card.
+
+    A killed ``git worktree add`` (t_f609a5a0) leaves the tree locked ``initializing`` with no index; it used to
+    read as :data:`WHY_NOT_CHECKOUT` and park the card silently. Old enough, it is cleared here under the
+    ownership rule of :func:`kanban_worktree_residue.clear_half_built` (this card's path and branch only; the
+    branch is kept when it holds commits no remote has) and the card ports as if the tree had never been made.
+    One log line per clear or hold. Never raises."""
+    from hermes_cli import kanban_worktree_residue as _kwr
+    try:
+        if not tree.exists() or _kwr.half_built(repo, tree) is None:
+            return False
+        res = _kwr.clear_half_built(repo, tree, branch=branch)
+    except Exception as exc:  # the dispatcher tick: unknown state holds the card, named
+        _log.warning("kanban worktree port: half-built tree %s not assessed: %s", tree, exc)
+        return True
+    if res.get("cleared"):
+        _log.warning("PHASE=kanban_half_built_worktree_cleared %s (lock age %ss, branch %s %s)", tree,
+                     res.get("age_s"), branch, "kept" if res.get("branch_kept") else "deleted")
+        return False
+    _log.warning("PHASE=kanban_half_built_worktree_held %s: %s", tree, res.get("why"))
+    return True
 
 
 def _dir_empty(path: Path) -> bool:

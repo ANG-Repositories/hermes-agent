@@ -50,6 +50,12 @@ _FIXES = (
     ("requires:",
      "the capability the card requires is on no pool host it may use. Fix: correct the "
      "`requires:` line, or pin the host that serves it."),
+    ("half_built_worktree",
+     "the card's own `.worktrees/<id>` is a `git worktree add` that was killed mid-checkout (locked "
+     "`initializing`, no index) and placement could not clear it (its lock is younger than 10 min, it is on "
+     "another branch, or the removal failed; the dispatcher log line PHASE=kanban_half_built_worktree_held "
+     "names which; t_f609a5a0). Fix: `git -C <repo> worktree remove -f -f <repo>/.worktrees/<id>`, then delete "
+     "`wt/<id>` only if it has no commits of its own."),
     ("studio_capability_only:",
      "the card was kept off the pool but names no Studio-only capability, so it waits instead of running "
      "on the Studio (t_9965b8d5). Fix: if it needs the Studio, add `requires: <studio-only capability>` "
