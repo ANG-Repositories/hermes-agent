@@ -457,10 +457,10 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
    "where": "hermes_cli/kanban_pr_owner.py:92 _refs"
   },
-  "hermes_cli/kanban_pr_owner.py::pr_cards::sql::title LIKE::\"SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND (\"": {
+  "hermes_cli/kanban_pr_owner.py::pr_cards::sql::title LIKE::\"SELECT id, status, assignee, created_at, rowid FROM tasks WHERE status != 'archived' AND (\"": {
    "verdict": "kept",
    "why": "title/metadata LIKE is a candidate prefilter; pr_cards keeps only rows whose exact (repo, number) is in card_pr_targets(), so the LIKE cannot admit a wrong card.",
-   "where": "hermes_cli/kanban_pr_owner.py:300 pr_cards"
+   "where": "hermes_cli/kanban_pr_owner.py:338 pr_cards"
   },
   "hermes_cli/kanban_pr_owner.py::pr_head_committed_at::fold::repo::key = (repo.lower(), int(number))": {
    "verdict": "kept",
