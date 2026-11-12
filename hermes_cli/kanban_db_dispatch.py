@@ -10128,12 +10128,13 @@ def _default_spawn(
     )
     spawned_at = time.time()
     spawned_boot = _kb._boot_evidence()
+    # No PATH pre-check for the launched argv: with ``limits_prefix`` Popen
+    # finds the launcher, and a worker argv that cannot be exec'd makes the
+    # launcher exit 127, which the reaper already classifies as
+    # ``infra_unavailable`` (requeue, no failure counted; KANBAN_INFRA_EXIT_CODES),
+    # the same remedy as the taskpolicy prefix. A bare Popen still raises
+    # FileNotFoundError -> the RuntimeError below.
     try:
-        if limits_prefix and cmd:
-            import shutil
-            if not shutil.which(cmd[0], path=env.get("PATH")):
-                # The launcher would exit 127; keep Popen's not-found contract.
-                raise FileNotFoundError(cmd[0])
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             spawn_cmd,
             cwd=_kb._kwh.worker_spawn_cwd(workspace),
