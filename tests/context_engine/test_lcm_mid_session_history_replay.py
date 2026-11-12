@@ -500,3 +500,108 @@ class TestGatewayRestartResumeWithDiscordNote:
         eng._store.append_batch(SESSION, [dict(r) for r in stored])
         _rebuilt_agent_ingest(tmp_path, history)
         assert _count(tmp_path, history[idx]["content"]) == 1
+
+
+# Head row of the history the gateway resumed session 20261024_..._9b06a4 from at
+# the 10:39:22 boot (state.db, loaded by load_transcript); trimmed goal text.
+_RESUMED_SCAFFOLD_HEAD = {
+    "role": "user",
+    "content": (
+        "[Current user objective preserved from compacted history]\n"
+        "[Thu 2026-11-12 08:45:04 PST] [Continuing toward your standing goal]\n"
+        "Goal: Every open item of this session's lineage is finished and proven."
+    ),
+}
+
+
+class TestRestartResumeOfCompactedSession:
+    """t_17732be2 send-back: 13 of 18 sessions at the 10:39 boot resumed from a
+    compacted transcript, [preserved-objective scaffold] + the stored tail. The
+    reconcile returned cursor 1 ("skipped scaffold-only prefix") and never ran
+    the anchored walk, so every row after the scaffold was stored again."""
+
+    def test_scaffold_head_then_stored_tail_appends_only_the_new_row(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        fresh = _rebuilt_agent_ingest(tmp_path, [dict(_RESUMED_SCAFFOLD_HEAD)] + history)
+        assert fresh._last_ingest_reconciliation["reason"] == "replayed history anchored on stored tool calls"
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_scaffold_head_then_gap_row_is_stored(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        history[idx] = {"role": "user", "content": history[idx]["content"] + " (edited)"}
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        _rebuilt_agent_ingest(tmp_path, [dict(_RESUMED_SCAFFOLD_HEAD)] + history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
+
+
+def _persisted_marker(path, preview):
+    # The host form of a spilled tool result (session ..63465a4e,
+    # toolu_018BRyyoksKKzPxJwMuPpDrS at the 10:39 boot).
+    return (
+        "<persisted-output>\nThis tool result was too large (104,100 characters, 101.7 KB).\n"
+        f"Full output saved to: {path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        f"Preview (first 1500 chars):\n{preview}\n...\n</persisted-output>"
+    )
+
+
+class TestRestartResumeOfPersistedOutputMarker:
+    """t_17732be2 send-back: session ..63465a4e (live 678 re-stored at the 10:39
+    boot). With large-output externalization off, the store's write path adds a
+    "[LCM persisted-output marker identity: preview_sha256=...]" line to a
+    spilled tool result; the resumed history holds the marker without it, so
+    the anchored walk ended at that row."""
+
+    def _shape(self, tmp_path, host_preview):
+        spill = tmp_path / "spillover" / "toolu_018BRyyoksKKzPxJwMuPpDrS.txt"
+        spill.parent.mkdir()
+        spill.write_text('{"success": true, "name": "session-card-overview"}' + "x" * 104_100)
+        cfg = _cfg(tmp_path)
+        cfg.large_output_externalization_enabled = False
+        stored, history = _restart_resume_shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "tool" and i > 30)
+        s_idx = next(i for i, r in enumerate(stored) if r.get("tool_call_id") == history[idx]["tool_call_id"])
+        preview = '{"success": true, "name": "session-card-overview"}'
+        stored[s_idx] = dict(stored[s_idx], content=_persisted_marker(spill, preview))
+        history[idx] = dict(history[idx], content=_persisted_marker(spill, host_preview))
+        eng = LCMEngine(config=cfg, hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng.ingest([dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        assert "[LCM persisted-output marker identity:" in "".join(
+            r[0] for r in sqlite3.connect(str(tmp_path / "lcm.db")).execute(
+                "SELECT content FROM messages WHERE session_id=? AND role='tool'", (SESSION,)))
+        fresh = LCMEngine(config=cfg, hermes_home=str(tmp_path))
+        fresh.on_session_start(SESSION, platform="discord")
+        fresh.ingest([dict(m) for m in history])
+        return n0, history[idx]
+
+    def test_marker_without_write_path_lines_appends_only_the_new_row(self, tmp_path):
+        n0, _ = self._shape(tmp_path, '{"success": true, "name": "session-card-overview"}')
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_marker_with_another_preview_is_stored(self, tmp_path):
+        n0, row = self._shape(tmp_path, '{"success": true, "name": "another-skill"}')
+        assert _rows(tmp_path) > n0 + 1
+
+
+def test_first_ingest_after_rebind_logs_one_info_line(tmp_path, caplog):
+    # A restart is judged from agent.log: one INFO line per session per rebuild.
+    stored, history = _restart_resume_shape()
+    eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+    eng.on_session_start(SESSION, platform="discord")
+    eng._store.append_batch(SESSION, [dict(r) for r in stored])
+    caplog.set_level("INFO", logger="plugins.context_engine.lcm.engine")
+    fresh = _rebuilt_agent_ingest(tmp_path, history)
+    fresh.ingest([dict(m) for m in history] + [{"role": "assistant", "content": "ok"}])
+    lines = [r.getMessage() for r in caplog.records if "first ingest after rebind" in r.getMessage()]
+    assert len(lines) == 1
+    assert f"session={SESSION}" in lines[0] and f"incoming={len(history)}" in lines[0]
+    assert "reason=replayed history anchored on stored tool calls" in lines[0] and "appended=1" in lines[0]
