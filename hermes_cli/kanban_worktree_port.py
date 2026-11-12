@@ -1590,8 +1590,11 @@ def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts,
     from hermes_cli import kanban_db as _kb
     tid, old = row["id"], row["workspace_path"]
     port_id, port = _newest_event(conn, tid, PORTED_EVENT)
-    held = (f"{STRANDED_PREFIX}:{host_name} ({old}: {{why}}; the card needs {', '.join(missing)}, which {host_name} "
-            f"cannot serve. Push or drop that clone's work and the next tick hands the card over to a fresh clone)")
+    # no str.format: a brace in the path, host or a capability must not raise inside the tick (Prism 1ca2affda3f7)
+    def held(why: str) -> str:
+        return (f"{STRANDED_PREFIX}:{host_name} ({old}: {why}; the card needs {', '.join(missing)}, which "
+                f"{host_name} cannot serve. Push or drop that clone's work and the next tick hands the card over to a "
+                f"fresh clone)")
     memo = _probe_memo.get((tid, port_id))
     if memo is not None and time.monotonic() - memo[0] < PROBE_RETRY_S:
         return memo[1]
@@ -1601,7 +1604,7 @@ def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts,
     if ok and os.path.lexists(new):
         ok, got = False, f"hand-over target {new} already exists here; it is never reused"
     if not ok:
-        reason = held.format(why=got)
+        reason = held(got)
         _probe_memo[(tid, port_id)] = (time.monotonic(), reason)
         return reason
     if dry_run:
@@ -1614,7 +1617,7 @@ def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts,
                            "THEN NULL ELSE origin_host END WHERE id=? AND workspace_path IS ? AND claim_lock IS NULL",
                            (new, host_name.lower(), tid, old))
         if cur.rowcount != 1:
-            return held.format(why="the card changed under the hand-over; retried next tick")
+            return held("the card changed under the hand-over; retried next tick")
         _kb._append_event(conn, tid, HANDOVER_EVENT, payload)
     return None
 

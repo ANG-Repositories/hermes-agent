@@ -382,6 +382,111 @@ def test_probe_timeout_or_refused_admit_is_not_proven(monkeypatch):
     assert not ok and "all_closed" in why and ran == []
 
 
+def _granted(monkeypatch):
+    from hermes_cli.fleet_placement import alloc_client
+    monkeypatch.setattr(alloc_client, "admit", lambda consumer, **kw: _Grant())
+    monkeypatch.setattr(alloc_client, "release", lambda rid, consumer: True)
+
+
+class _Failed:
+    returncode, stdout, stderr = 13, "", "dirty, ignored or untracked work\n"
+
+
+def test_a_failed_clone_proof_is_not_proven(monkeypatch):
+    """Operator send-back 14:24 (mutant M3: ``if proc.returncode != 0`` -> ``if False``): rc 13 is not proven."""
+    _granted(monkeypatch)
+    assert kwt.probe_clone(_pool_host(), "/w/t", lambda argv, **kw: _Failed()) == (
+        False, "dirty, ignored or untracked work")
+
+
+def test_full_tick_over_a_failed_clone_proof_never_hands_over(kanban_home, monkeypatch):
+    """The real probe_clone (ssh runner stubbed to rc 13) inside a full tick: the card stays port_stranded on its
+    clone path and no worktree_handed_over is written."""
+    _cfg(kanban_home, True, [])
+    _granted(monkeypatch)
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    real = kwt.probe_clone
+    monkeypatch.setattr(kwt, "probe_clone",
+                        lambda host, path, runner=None: real(host, path, lambda argv, **kw: _Failed()))
+    kwt._probe_memo.clear()
+    with kb.connect_closing() as conn:
+        tid, path = _ported_card(conn)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=2)
+        still = conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        handed = conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind=?",
+                              (tid, kwt.HANDOVER_EVENT)).fetchone()[0]
+    assert tid not in [t for t, _h in spawned], spawned
+    assert res.placement_waits[tid].startswith(f"port_stranded:ace-ai ({path}: dirty, ignored or untracked work;")
+    assert still == path and handed == 0
+
+
+def test_the_remote_proof_check_mode_against_real_repos(tmp_path):
+    """kanban_survivor._REMOTE_PROOF in check mode, local python, temp git repos (no ssh): clean and pushed gives rc 0
+    and HEAD; an uncommitted edit, a stash, an unpushed commit give rc 13; a missing path gives rc 0 and no output.
+    Check mode never removes the directory."""
+    import os
+    import subprocess
+    import sys
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    root = tmp_path.resolve()
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+    def git(repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True,
+                              env=env).stdout.strip()
+
+    def proof(path):
+        return subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(path), "check"], capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    def clone(name):
+        d = root / name
+        git(root, "clone", "-q", str(root / "remote.git"), str(d))
+        return d
+
+    git(root, "init", "-q", "--bare", "remote.git")
+    seed = clone("seed")
+    (seed / "f.txt").write_text("one\n")
+    git(seed, "add", "f.txt")
+    git(seed, "commit", "-qm", "one")
+    git(seed, "push", "-q", "origin", "HEAD")
+
+    clean = clone("clean")
+    r = proof(clean)
+    assert (r.returncode, r.stdout.strip()) == (0, git(clean, "rev-parse", "HEAD")), r.stderr
+
+    dirty = clone("dirty")
+    (dirty / "f.txt").write_text("edited\n")
+    stashed = clone("stashed")
+    (stashed / "f.txt").write_text("stashed\n")
+    git(stashed, "stash", "-q")
+    unpushed = clone("unpushed")
+    (unpushed / "f.txt").write_text("two\n")
+    git(unpushed, "commit", "-qam", "two")
+    for d in (dirty, stashed, unpushed):
+        r = proof(d)
+        assert r.returncode == 13 and r.stdout == "", (d.name, r.returncode, r.stdout, r.stderr)
+    for d in (clean, dirty, stashed, unpushed):
+        assert (d / ".git").is_dir() and (d / "f.txt").is_file(), d
+
+    r = proof(root / "gone")
+    assert (r.returncode, r.stdout) == (0, ""), r
+
+
+def test_a_brace_in_the_clone_path_does_not_break_the_held_reason(kanban_home, monkeypatch):
+    """Prism P2 1ca2affda3f7: the held reason was built with an f-string and then .format(why=...); a brace in the
+    path, the host or a capability raised inside the tick."""
+    monkeypatch.setattr(kwt, "probe_clone", lambda host, path, runner=None: (False, "stashes"))
+    kwt._probe_memo.clear()
+    with kb.connect_closing() as conn:
+        tid, path = _ported_card(conn)
+        braced = path + "-{x}{0}"
+        reason = kwt.release_port_bind(conn, {"id": tid, "workspace_path": braced}, "ace-ai", ["cap{y}"],
+                                       [_pool_host()])
+    assert reason.startswith(f"port_stranded:ace-ai ({braced}: stashes; the card needs cap{{y}},"), reason
+
+
 def test_a_handed_over_card_never_materializes_on_a_pool_host(kanban_home, clean_clone):
     """Prism d6cfdbb53981: a pool start would leave its clone with no port binding. The hand-over is Studio-only."""
     _cfg(kanban_home, True, [])
