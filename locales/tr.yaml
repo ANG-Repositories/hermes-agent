@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "arka plan incelemesi"
   notice:
     uncompressed_context_overflow: "⚠️ Oturum bağlamı (~{tokens} token) sıkıştırma devre dışıyken (compression.enabled: false) modelin bağlam penceresini (~{context_length} token) aşıyor. Geçmişi sıkıştırmak için /compact kullanın veya config.yaml içinde sıkıştırmayı etkinleştirin."
+    compression_store_unavailable: "⚠️ Bağlam sıkıştırma eşiğinin üzerinde (~{tokens} token >= {threshold}) ancak sıkıştırma çalışamıyor: sıkıştırma deposu hasarlı (veritabanı hatası). /compress aynı depoyu kullanır ve yardımcı olmaz. Yeni bir oturum başlatmak için /new kullanın."
 explainer:
   no_reply_prefix: "⚠️ Yanıt yok: "
   empty_response: "{model} bu kez, yeniden denemelere rağmen bir yanıt üretmedi. Tekrar denemek için `continue` gönderin veya /model ile model değiştirin."

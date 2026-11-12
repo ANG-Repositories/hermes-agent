@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "фоновое ревью"
   notice:
     uncompressed_context_overflow: "⚠️ Контекст сеанса (~{tokens} токенов) превышает контекстное окно модели (~{context_length} токенов), а сжатие отключено (compression.enabled: false). Используйте /compact, чтобы сжать историю, или включите сжатие в config.yaml."
+    compression_store_unavailable: "⚠️ Контекст превышает порог сжатия (~{tokens} токенов >= {threshold}), но сжатие не может выполниться: хранилище сжатия повреждено (ошибка базы данных). /compress использует то же хранилище и не поможет. Используйте /new, чтобы начать новый сеанс."
 explainer:
   no_reply_prefix: "⚠️ Нет ответа: "
   empty_response: "{model} в этот раз не дала ответа даже после повторных попыток. Отправьте `continue`, чтобы попробовать ещё раз, или смените модель через /model."
