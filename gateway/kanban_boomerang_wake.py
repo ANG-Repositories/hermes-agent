@@ -191,8 +191,11 @@ class BoomerangWakeState:
         with _LOCK:
             return self._restart_spent_of(self._read()).get(str(task_id), 0)
 
-    def reset(self, task_id: str) -> bool:
-        """Drop ``task_id``'s counters (``retries`` and ``restart_spent``); True when one existed."""
+    def reset_counters(self, task_id: str) -> bool:
+        """Drop ``task_id``'s counters (``retries`` and ``restart_spent``); True when one existed.
+
+        Not ``reset``: the loop-reachability gate binds calls by name, so ``ContextVar.reset``
+        in ``_deliver_one`` resolved here and read as an on-loop fsync (t_630c5160)."""
         with _LOCK:
             data = self._read()
             retries, spent = self._retries_of(data), self._restart_spent_of(data)
@@ -207,7 +210,7 @@ class BoomerangWakeState:
     def observe_event(self, task_id: str, kind: str) -> bool:
         """Reset the counter when ``kind`` ends the card's retry budget (completed/archived)."""
         if str(kind or "") in RESET_KINDS:
-            return self.reset(task_id)
+            return self.reset_counters(task_id)
         return False
 
     # --- single-owner claims (P3b, spec §5.4 pass-1 B3 / pass-2 RC-4) -----------------
