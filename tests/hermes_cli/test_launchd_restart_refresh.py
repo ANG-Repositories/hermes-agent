@@ -81,6 +81,7 @@ def test_system_daemon_restart_never_refreshes_or_degrades(monkeypatch, tmp_path
     original_is_file = ld.Path.is_file
     monkeypatch.setattr(ld.Path, "is_file", lambda p: True if str(p) == f"/Library/LaunchDaemons/{label}.plist" else original_is_file(p))
     monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+    monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", lambda domain, label: (domain == "system", None))
     monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: pytest.fail("must not rewrite a system plist"))
     calls = []
     def run(cmd, **kw):
@@ -90,7 +91,8 @@ def test_system_daemon_restart_never_refreshes_or_degrades(monkeypatch, tmp_path
         return SimpleNamespace(returncode=0, stdout="", stderr="")
     monkeypatch.setattr(ld.os, "geteuid", lambda: 501)
     monkeypatch.setattr(ld.subprocess, "run", run)
-    assert gateway_cli.get_launchd_plist_path() == ld.Path(f"/Library/LaunchDaemons/{label}.plist")
+    assert gateway_cli.get_launchd_service_plist() == ld.Path(f"/Library/LaunchDaemons/{label}.plist")
+    assert gateway_cli.get_launchd_plist_path().parent.name == "LaunchAgents"
     assert gateway_cli._launchd_domain() == "system"
     if loaded:
         gateway_cli.launchd_restart()
@@ -128,6 +130,41 @@ def test_system_daemon_supervision_is_domain_explicit(monkeypatch):
     assert gateway_cli._launchctl_supervised_pid("ai.hermes.gateway-mercury") == 123
     assert gateway_cli._locate_launchd_gateway_service("ai.hermes.gateway-mercury") == ("system", 123)
     assert seen == [("system", "ai.hermes.gateway-mercury")] * 2
+
+
+@pytest.mark.parametrize("live_domain", ["gui/501", "user/501"])
+def test_unloaded_daemon_does_not_shadow_user_service(monkeypatch, live_domain):
+    from hermes_cli import gateway_launchd as ld
+    monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p).startswith("/Library/LaunchDaemons/"))
+    monkeypatch.setattr(ld.os, "getuid", lambda: 501)
+    monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+    seen = []
+
+    def probe(domain, label):
+        seen.append(domain)
+        return (domain == live_domain, 123 if domain == live_domain else None)
+
+    monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", probe)
+    assert gateway_cli._locate_launchd_gateway_service("ai.hermes.gateway") == (live_domain, 123)
+    assert seen[0] == "system"
+    assert gateway_cli._launchd_domain() == live_domain
+    assert gateway_cli._launchctl_supervised_pid("ai.hermes.gateway") == 123
+
+
+@pytest.mark.parametrize("verb", ["launchd_start", "launchd_install", "refresh_launchd_plist_if_needed"])
+def test_operator_daemon_refuses_definition_writers(monkeypatch, tmp_path, verb):
+    from hermes_cli import gateway_launchd as ld
+    daemon = "/Library/LaunchDaemons/ai.hermes.gateway.plist"
+    monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p) == daemon)
+    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "missing.plist")
+    monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: pytest.fail("must refuse before generating"))
+    monkeypatch.setattr(ld.subprocess, "run", lambda *a, **kw: pytest.fail("must not bootstrap operator daemon"))
+    with pytest.raises(SystemExit) as exc:
+        getattr(gateway_cli, verb)()
+    assert daemon in str(exc.value)
+    assert "operator-owned" in str(exc.value)
+    assert not (tmp_path / "missing.plist").exists()
 
 
 def test_stale_plist_is_refreshed_before_any_kickstart(monkeypatch, launchd_seam):

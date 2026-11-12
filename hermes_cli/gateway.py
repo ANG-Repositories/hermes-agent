@@ -1553,10 +1553,15 @@ def _launchd_service_registered(label: str, *, timeout: int = 5) -> bool:
 
 
 def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]:
-    """``(domain, pid)`` for ``label``, probing ``gui/<uid>`` then ``user/<uid>``. Never uses the current
-    profile's cached ``_launchd_domain()`` — a fleet can mix domains. ``TimeoutExpired`` propagates."""
+    """``(domain, pid)`` for ``label``: an existing daemon first, then gui/user.
+
+    Never uses the current profile's cached domain; a plist is only a probe hint,
+    not evidence that the job is loaded. ``TimeoutExpired`` propagates.
+    """
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    domains = ("system",) if (Path("/Library/LaunchDaemons") / f"{label}.plist").is_file() else (f"gui/{uid}", f"user/{uid}")
+    domains = (f"gui/{uid}", f"user/{uid}")
+    if (Path("/Library/LaunchDaemons") / f"{label}.plist").is_file():
+        domains = ("system",) + domains
     for domain in domains:
         loaded, pid = _launchd_print_service_pid(domain, label)
         if loaded:
@@ -1566,7 +1571,7 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
 
 def _probe_launchd_service_running() -> bool:
     """True when the plist exists AND launchd is running a process for the current label."""
-    return get_launchd_plist_path().exists() and _launchctl_label_supervising_process(get_launchd_label())
+    return get_launchd_service_plist().exists() and _launchctl_label_supervising_process(get_launchd_label())
 
 
 def _s6_gateway_snapshot(gateway_pids: tuple[int, ...]) -> GatewayRuntimeSnapshot | None:
@@ -3025,12 +3030,19 @@ def get_launchd_plist_path() -> Path:
     import pwd
     suffix = _profile_suffix()
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
-    daemon = Path("/Library/LaunchDaemons") / f"{name}.plist"
-    if daemon.is_file():
-        return daemon
     # Real account home: profile mode may point HOME at a profile dir.
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     return home / "Library" / "LaunchAgents" / f"{name}.plist"
+
+
+def get_launchd_service_plist() -> Path:
+    """Existing operator daemon definition, otherwise the account's LaunchAgent path.
+
+    This is not a writable install path or a directory for enumerating user agents.
+    Loaded-domain discovery still probes launchctl; a plist alone is not a loaded job.
+    """
+    daemon = Path("/Library/LaunchDaemons") / f"{get_launchd_label()}.plist"
+    return daemon if daemon.is_file() else get_launchd_plist_path()
 
 
 def launchd_gateway_labels_for_install() -> list[str]:

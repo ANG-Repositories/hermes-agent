@@ -33,7 +33,9 @@ def _probe_launchd_domain_for_label(label: str) -> str:
     (Background/SSH), else the ``launchctl managername`` heuristic. Sibling profiles may live in
     different domains, so never reuse the cached ``_launchd_domain()`` for another label."""
     if (Path("/Library/LaunchDaemons") / f"{label}.plist").is_file():
-        return "system"
+        domain, _pid = _gw()._locate_launchd_gateway_service(label)
+        if domain is not None:
+            return domain
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     gui_domain, user_domain = f"gui/{uid}", f"user/{uid}"
 
@@ -147,7 +149,7 @@ def _launchctl_supervised_pid(label: str) -> int | None:
     domains, which is why the invoking profile verifies through this and not ``_launchd_print_service_pid``."""
     try:
         if (Path("/Library/LaunchDaemons") / f"{label}.plist").is_file():
-            return _gw()._launchd_print_service_pid("system", label)[1]
+            return _gw()._locate_launchd_gateway_service(label)[1]
         result = subprocess.run(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -548,9 +550,17 @@ def _spawn_deferred_launchd_reload(
     return True
 
 
+def _refuse_operator_daemon_write() -> None:
+    """CLI generators must never replace or bootstrap an operator-owned daemon."""
+    daemon = Path("/Library/LaunchDaemons") / f"{_gw().get_launchd_label()}.plist"
+    if daemon.is_file():
+        raise SystemExit(f"Refusing to modify operator-owned daemon {daemon}; manage it with the operator's launchd tooling.")
+
+
 def refresh_launchd_plist_if_needed() -> bool:
     """Rewrite the installed plist when the generated one differs, then bootout/bootstrap so launchd
     re-reads it immediately."""
+    _refuse_operator_daemon_write()
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
         return False
@@ -624,6 +634,7 @@ def refresh_launchd_plist_if_needed() -> bool:
 
 
 def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_path: bool = False):
+    _refuse_operator_daemon_write()
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
@@ -718,6 +729,7 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    _refuse_operator_daemon_write()
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
 
