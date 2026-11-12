@@ -74,6 +74,7 @@ def replay(runs, n, t0, t1):
     i = 0
     now = t0
     full_since = None
+    ep = {"id": 0, "open": False, "paged": set()}
 
     def mark(t):
         nonlocal at_ceiling, full_since
@@ -91,8 +92,12 @@ def replay(runs, n, t0, t1):
             while queue and len(running) < n:
                 arr, dur = queue.pop(0)
                 waits.append(now - arr)
+                if now - arr >= 3600:
+                    ep["paged"].add(ep["id"])
                 heapq.heappush(running, now + dur)
                 intervals.append((now, now + dur))
+            if not queue and ep["open"]:
+                ep["open"] = False
             mark(now)
             continue
         now = next_arr
@@ -103,6 +108,9 @@ def replay(runs, n, t0, t1):
             intervals.append((now, now + dur))
             waits.append(0.0)
         else:
+            if not queue and not ep["open"]:
+                ep["id"] += 1
+                ep["open"] = True
             queue.append((now, dur))
         mark(now)
     if full_since is not None:
@@ -117,6 +125,7 @@ def replay(runs, n, t0, t1):
         "wait_p95_min": round(sorted(delayed)[int(len(delayed) * 0.95)] / 60.0, 1) if delayed else 0.0,
         "longest_wait_min": round(max(delayed) / 60.0, 1) if delayed else 0.0,
         "waits_over_60min": sum(1 for w in delayed if w > 3600),
+        "wait_episodes": ep["id"], "paging_episodes": len(ep["paged"]),
         "mean_running": round(mean, 2), "peak_running": peak,
     }
 
