@@ -56,7 +56,7 @@ def archived_rows(conn: sqlite3.Connection, task_id: str, *, state_type: str | N
     if state_type is not None and state_type not in ("status", "outcome"):
         raise ValueError("state_type must be 'status' or 'outcome'")
     path = _archive_path(conn)
-    if path is None or not path.is_file():
+    if path is None or not path.exists():   # only MISSING is absent; a dir/non-file must fail (t_78dbef10)
         return {"comments": [], "runs": []}
     run_where, run_params = ("", ()) if state_type is None else (" AND %s = ?" % state_type, (state_name,))
     arch = None
@@ -80,7 +80,7 @@ class ArchiveUnreadable(RuntimeError):
 
 def _connect_ro(conn: sqlite3.Connection) -> sqlite3.Connection | None:
     path = _archive_path(conn)
-    if path is None or not path.is_file():
+    if path is None or not path.exists():   # only MISSING is absent; a dir/non-file must fail (t_78dbef10)
         return None
     try:
         return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=_TIMEOUT_S)

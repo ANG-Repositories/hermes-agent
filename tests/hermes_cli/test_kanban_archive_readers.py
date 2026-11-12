@@ -131,3 +131,29 @@ def test_unreadable_archive_raises(conn, monkeypatch):
     finally:
         holder.execute("ROLLBACK")
         holder.close()
+
+
+def test_non_file_at_archive_path_is_unreadable_not_absent(conn):
+    # Only a MISSING archive is absent; a directory there must reach sqlite and fail loudly (t_78dbef10).
+    tid = _done_card(conn)
+    main = next(p for _s, n, p in conn.execute("PRAGMA database_list") if n == "main")
+    (Path(main).parent / kar.ARCHIVE_NAME).mkdir()
+    with pytest.raises(kar.ArchiveUnreadable):
+        kar.full_rows(conn, "task_runs", tid)
+    with pytest.raises(kar.ArchiveUnreadable):
+        po.pr_cards(conn, TARGET)
+    assert kar.archived_rows(conn, tid).get("error")
+
+
+def test_pr_cards_survives_a_move_between_archive_and_live_reads(conn, monkeypatch):
+    # R8 lands its move right after the archive read: the live read must already have the card (t_78dbef10).
+    tid = _done_card(conn)
+    real = kar.task_ids_with_run_metadata_like
+
+    def archive_then_move(c, patterns):
+        out = real(c, patterns)
+        _move_out(c, tid)
+        return out
+
+    monkeypatch.setattr(kar, "task_ids_with_run_metadata_like", archive_then_move)
+    assert [c[0] for c in po.pr_cards(conn, TARGET)] == [tid]
