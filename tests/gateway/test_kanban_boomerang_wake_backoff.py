@@ -142,6 +142,31 @@ def test_permanent_send_error_dead_letters_after_one_attempt_with_one_comment(en
     assert len(notes) == 1 and "(delegation del-b)" in notes[0]
 
 
+def test_permanent_send_error_matches_the_discord_code_not_a_digit_substring():
+    """Prism b36991a3b989: a channel id that contains ``10003`` is not a Discord 10003."""
+    p = ah._permanent_send_error
+    assert not p("HTTP 503 while posting to channel 110003123456789012", "server_error")
+    assert not p("HTTP 503 while posting to channel 110003123456789012", None)
+    assert not p("timeout after 100030 ms", None)
+    assert p("Unknown Channel 1535189663533506600 (deleted; cached 404 10003)", None)
+    assert p("Unknown Channel 1535189663533506600 (deleted; cached 404 10003)", "not_found")
+    assert p("anything", "not_found")
+
+
+def test_dead_letter_merges_reasons_across_parts(env, clock):  # noqa: F811
+    """Prism 4f3cc0c30033: a line dead first and a turn dead later keep BOTH reasons."""
+    state = ah.BoomerangWakeState()
+    state.put_handback("del-m", {"parts": [ah.PART_LINE, ah.PART_TURN]})
+    state.dead_letter("del-m", {"parts": [ah.PART_LINE], "reasons": {ah.PART_LINE: "404 10003"},
+                                "dead_at": T0}, left=[ah.PART_TURN])
+    state.dead_letter("del-m", {"parts": [ah.PART_TURN], "reasons": {ah.PART_TURN: "no live home session"},
+                                "dead_at": T0 + 1}, left=[])
+    dead = state.dead_letters()["del-m"]
+    assert dead["parts"] == sorted([ah.PART_LINE, ah.PART_TURN])
+    assert dead["reasons"] == {ah.PART_LINE: "404 10003", ah.PART_TURN: "no live home session"}
+    assert state.handbacks() == {}
+
+
 # (c) ------------------------------------------------------------------------------------------
 
 def test_row_that_becomes_deliverable_is_delivered_exactly_once(env, clock):  # noqa: F811

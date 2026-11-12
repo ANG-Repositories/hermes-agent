@@ -276,7 +276,9 @@ class BoomerangWakeState:
             raw = data.get("dead_letters")
             dead = dict(raw) if isinstance(raw, dict) else {}
             prev = dead.get(delegation_id) if isinstance(dead.get(delegation_id), dict) else {}
-            dead[delegation_id] = {**prev, **record,
+            reasons = {**(prev.get("reasons") if isinstance(prev.get("reasons"), dict) else {}),
+                       **(record.get("reasons") if isinstance(record.get("reasons"), dict) else {})}
+            dead[delegation_id] = {**prev, **record, "reasons": reasons,
                                    "parts": sorted(set(prev.get("parts") or []) | set(record.get("parts") or []))}
             if len(dead) > DEAD_LETTER_KEEP:
                 order = sorted(dead, key=lambda k: float((dead[k] or {}).get("dead_at") or 0) if isinstance(dead[k], dict) else 0)
@@ -1349,7 +1351,12 @@ def _due(row: dict, now: float) -> bool:
 
 def _permanent_send_error(error: str, kind: Optional[str]) -> bool:
     """A send the route can never take: the target chat/thread is gone (Discord 404 10003)."""
-    return kind == "not_found" or "10003" in (error or "")
+    return kind == "not_found" or bool(_DISCORD_UNKNOWN_CHANNEL.search(error or ""))
+
+
+# Discord's own shape: HTTP status 404 then JSON code 10003, as whole tokens (a channel id that
+# merely contains the digits "10003" must not read as permanent; Prism b36991a3b989).
+_DISCORD_UNKNOWN_CHANNEL = re.compile(r"(?<!\d)404\D{1,20}?(?<!\d)10003(?!\d)")
 
 
 def _dead_letter_comment(row: dict, delegation_id: str, body: str) -> None:
