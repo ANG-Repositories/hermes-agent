@@ -14665,8 +14665,9 @@ def configured_review_hold_assignee() -> Optional[str]:
 
 
 def is_review_hold_assignee(assignee: Optional[str]) -> bool:
+    # Byte-exact: every writer of the holder (resolve_reviewer, the open-PR route) stores the configured value.
     hold = configured_review_hold_assignee()
-    return bool(hold and isinstance(assignee, str) and assignee.strip().lower() == hold)
+    return bool(hold and assignee == hold)
 
 
 def _review_hold_handoff_source(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -14868,7 +14869,7 @@ def resolve_reviewer(
     if is_human_reviewer(raw):
         return raw.casefold(), None
     if is_review_hold_assignee(raw):
-        return raw.lower(), None   # t_54f4fde6: the configured machine holder, a deliberate non-spawnable lane
+        return raw, None   # t_54f4fde6: the configured machine holder, a deliberate non-spawnable lane
 
     try:
         canonical = _canonical_assignee(raw)
