@@ -79,6 +79,26 @@ def refusal(body: Optional[str]) -> Optional[str]:
         return None
 
 
+def studio_refusal(body: Optional[str]) -> Optional[str]:
+    """The hook's studio-requires-reason refusal for this create body, or None (t_4743853f).
+
+    Delegates to the hook module's ``create_refusal(body, root)`` (hermes-home#10978), which owns
+    the verdict and its kill switch ``STUDIO_REQUIRES_REASON=0``. Fail open on no module, an older
+    module without that entry point, or a raise. The access-bound off-marker does not disarm it."""
+    if not body:
+        return None
+    root = _fleet_root()
+    mod = _load_hook(root)
+    fn = getattr(mod, "create_refusal", None) if mod is not None else None
+    if fn is None:
+        return None
+    try:
+        return fn(body, root)
+    except Exception:
+        _log.debug("studio-requires-reason: create_refusal raised; failing open", exc_info=True)
+        return None
+
+
 # ── aegis-no-apollo-handoff on the REAL parsed assignee (t_d26f1385) ──────────────────────────────
 # The hook decides from the command text, so `A=human; B=apollo; ... "$A:$B"` or an assignee a
 # script computes reaches the board unread. create/assign/reassign hold the parsed value; the hook
