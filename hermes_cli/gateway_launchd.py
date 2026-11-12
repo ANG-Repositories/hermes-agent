@@ -10,6 +10,7 @@ from pathlib import Path
 import contextlib
 import json
 import os
+import plistlib
 import shlex
 import subprocess
 import sys
@@ -845,16 +846,24 @@ def launchd_restart():
     from gateway.status import get_running_pid
     try:
         pid = get_running_pid()
-        if pid is not None and _gw()._request_gateway_self_restart(pid):
+        cooperative_restart = True
+        if domain == "system":
+            # Only unconditional KeepAlive guarantees revival after a self-exit.
+            # Otherwise skip SIGUSR1 and use kickstart without changing the operator plist.
+            cooperative_restart = False
+            with contextlib.suppress(OSError, ValueError, plistlib.InvalidFileException):
+                with _gw().get_launchd_service_plist().open("rb") as plist_file:
+                    cooperative_restart = plistlib.load(plist_file).get("KeepAlive") is True
+        if pid is not None and cooperative_restart and _gw()._request_gateway_self_restart(pid):
             _launchd_ok("✓ Service restart requested")
             return
-        if pid is not None and _gw().probe_gateway_loop_liveness(pid) == _gw().GATEWAY_LOOP_WEDGED:
+        if pid is not None and cooperative_restart and _gw().probe_gateway_loop_liveness(pid) == _gw().GATEWAY_LOOP_WEDGED:
             # Event loop provably dead: it can't process a graceful shutdown, so a full drain wait
             # only stalls the restart (and `hermes update`). Bounded SIGTERM → SIGKILL, ~10s.
             print(f"⚠ Gateway PID {pid} event loop is unresponsive — " "skipping drain and forcing a bounded stop...")
             _gw()._escalate_wedged_gateway(pid)
             pid = None
-        if pid is not None:
+        if pid is not None and cooperative_restart:
             # Graceful in-band restart via SIGUSR1 (mirrors systemd); the budget covers both the idle wait
             # and the drain. A bare SIGTERM would lose the resume_pending handoff. Announce BEFORE waiting:
             # surfaces with no other feedback (desktop updater) read silence as "update stuck".
