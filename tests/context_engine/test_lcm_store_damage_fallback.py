@@ -7,6 +7,8 @@ hit the provider wall.
 """
 import sqlite3
 
+import pytest
+
 from plugins.context_engine.lcm.config import LCMConfig
 from plugins.context_engine.lcm.engine import LCMEngine
 from plugins.context_engine.lcm.tokens import count_messages_tokens
@@ -146,3 +148,49 @@ def test_malformed_store_fallback_failure_under_model_limit_degrades(tmp_path, m
 
     assert returned is messages
     assert engine._last_fail_open_fallback_status == "failed"
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["database is locked", "database table is locked", "disk I/O error", "unable to open database file",
+     "attempt to write a readonly database", "database or disk is full"],
+)
+def test_transient_store_error_over_threshold_keeps_degrade_unchanged(tmp_path, monkeypatch, message):
+    """Prism 824ad63e76fb: only corruption is store damage. A retryable sqlite error must not
+    trigger the lossy store-free fallback at the compaction threshold."""
+    engine = _engine(tmp_path)
+    messages = _messages()
+    fallback = _RecordingFallback([messages[0]])
+    monkeypatch.setattr(engine, "_build_fail_open_fallback_compressor", lambda: fallback)
+
+    def _raise(*_a, **_k):
+        raise sqlite3.OperationalError(message)
+
+    monkeypatch.setattr(engine, "_ingest_messages", _raise)
+
+    returned = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+    assert returned is messages
+    assert fallback.calls == 0
+    assert engine.last_compress_store_unavailable is False
+
+
+def test_store_damage_classifier_uses_sqlite_errorcode():
+    locked = sqlite3.OperationalError("weird text, malformed")
+    locked.sqlite_errorcode = 5  # SQLITE_BUSY: the code wins over the text
+    corrupt = sqlite3.DatabaseError("some text")
+    corrupt.sqlite_errorcode = 11  # SQLITE_CORRUPT
+    notadb = sqlite3.DatabaseError("x")
+    notadb.sqlite_errorcode = 26  # SQLITE_NOTADB
+    assert LCMEngine._is_store_damage_error(locked) is False
+    assert LCMEngine._is_store_damage_error(corrupt) is True
+    assert LCMEngine._is_store_damage_error(notadb) is True
+    assert LCMEngine._is_store_damage_error(RuntimeError("database disk image is malformed")) is False
+
+
+def test_real_corrupt_file_is_classified_as_store_damage(tmp_path):
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"SQLite format 3\x00" + b"\xff" * 4096)
+    with pytest.raises(sqlite3.DatabaseError) as info:
+        sqlite3.connect(bad).execute("select * from sqlite_master").fetchall()
+    assert LCMEngine._is_store_damage_error(info.value) is True

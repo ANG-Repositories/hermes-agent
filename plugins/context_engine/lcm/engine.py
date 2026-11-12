@@ -2593,12 +2593,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     @staticmethod
     def _is_store_damage_error(exc: BaseException) -> bool:
-        """True for a store error that a retry cannot fix (e.g. ``database disk
-        image is malformed``). Locked/busy are transient and keep the old path."""
+        """True only for a store error that a retry cannot fix: SQLITE_CORRUPT /
+        SQLITE_NOTADB (``database disk image is malformed``, ``file is not a
+        database``). Every other sqlite error (locked, busy, I/O, cantopen,
+        readonly, full, ...) may be transient and keeps the old degrade path."""
         if not isinstance(exc, sqlite3.DatabaseError):
             return False
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int):
+            return (code & 0xFF) in (11, 26)  # SQLITE_CORRUPT, SQLITE_NOTADB
         text = str(exc).lower()
-        return "locked" not in text and "busy" not in text
+        return "malformed" in text or "not a database" in text
 
     def _record_fail_open_degraded(
         self,
