@@ -311,3 +311,32 @@ class TestUserRowGapIsNotSkipped:
         assert host[8]["role"] == "user"
         _rebuilt_agent_ingest(tmp_path, host)
         assert _count(tmp_path, "[kanban] a different wake") == 1
+
+
+def _same_text_turn(i):
+    # Same prompt every turn, only the timestamp prefix differs (goal-
+    # continuation prompts); the reply differs per turn.
+    return [
+        {"role": "user", "content": f"[Thu 2026-11-12 01:{i - 100:02d}:00 PST] proceed"},
+        {"role": "assistant", "content": f"Done step {i}."},
+    ]
+
+
+class TestRerenderMatchedUserRowIsProvisional:
+    """Operator review at 3c0079bde214: a gap turn's user row equals the next
+    stored turn's under the re-render key; the cursor must not pass it when
+    the run then ends on its reply."""
+
+    def test_gap_of_one_same_text_turn_is_stored(self, tmp_path):
+        turns = [_turn(i) for i in range(4)] + [_same_text_turn(i) for i in range(100, 112)] + [_turn(i) for i in range(4, 6)]
+        keys = list(range(4)) + list(range(100, 112)) + list(range(4, 6))
+        rows = [{"role": "system", "content": "You are Apollo."}]
+        for key, turn in zip(keys, turns):
+            if key != 105:
+                rows.extend(turn)
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        _rebuilt_agent_ingest(tmp_path, [m for turn in turns for m in turn])
+        assert _count(tmp_path, "[Thu 2026-11-12 01:05:00 PST] proceed") >= 1
+        assert _count(tmp_path, "Done step 105.") >= 1

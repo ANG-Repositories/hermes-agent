@@ -1042,7 +1042,10 @@ class ReconcileMixin:
         alignment between host rows and stored rows. From host row 0 the rows
         are then compared position by position: assistant/tool/system rows must
         be identical, user rows must be equal under ``_user_row_rerender_key``
-        (the host re-renders them). The run ends at the first row that does not
+        (the host re-renders them). A user row matched only through that key
+        (or emptied) is provisional: the cursor passes it only when a later row
+        in the run matches by full identity, so a run that ends right after it
+        leaves it to be appended. The run ends at the first row that does not
         match, so the cursor never passes a row that is not shown to be stored:
         a gap in the store (rows the host holds that were never written, e.g.
         the store-free compaction fallback marks its raw tail ingested) ends
@@ -1051,6 +1054,12 @@ class ReconcileMixin:
         reused call id with new arguments fails on its assistant row. Two
         distinct tool-call ids must be matched inside the run, so a short delta
         keeps dup-over-loss.
+
+        Accepted limit: a gap row is still skipped when its user row equals its
+        stored neighbour's apart from the re-render variance AND the rows after
+        it are identical to the neighbour's (same prompt, same reply, e.g. a
+        repeated "[<timestamp>] proceed" answered identically). Nothing in the
+        rows tells such a turn from a re-render of the stored one.
         """
         stored_ids = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
         stored_tool_pos: dict[tuple[Any, ...], int] = {}
@@ -1076,11 +1085,13 @@ class ReconcileMixin:
             if role != str(stored_rows[pos].get("role") or ""):
                 break
             identity = self._message_replay_identity(msg)
-            if identity != stored_ids[pos] and not (
-                role == "user" and self._user_row_rerender_key(identity[1]) in (
+            if identity != stored_ids[pos]:
+                if role == "user" and self._user_row_rerender_key(identity[1]) in (
                     "", self._user_row_rerender_key(stored_ids[pos][1]),
-                )
-            ):
+                ):
+                    # Provisional: the cursor passes it only when a later row
+                    # in the run matches by full identity.
+                    continue
                 break
             if role == "tool" and msg.get("tool_call_id"):
                 matched_ids.add(str(msg.get("tool_call_id")))
