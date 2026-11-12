@@ -1928,6 +1928,8 @@ def test_stash_carry_off_changed_stash_during_the_copy_does_not_refuse(kanban_ho
     staged = kwh.carry_clones_check(_host(), str(ws), clones, runner)
     (repo / "a.txt").write_text("late\n")
     _g(repo, "stash", "push", "-q", "-m", "late")
+    (repo / ".git" / "logs" / "refs" / "stash").unlink()  # unreadable stash: still no precondition with the knob off
+    assert kwh.clone_moved_since_routing(str(repo), rec["branch"], rec["sha"], runner) is None
     cloned = []
     monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
     kwh.carry_clones(_host(), str(ws), clones, kanban_home / "fleet", runner=runner, staged=staged)
