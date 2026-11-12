@@ -5591,6 +5591,14 @@ def _pinned_route(row, route, pins, port, caps_out, *, planned: bool = True):
     return route
 
 
+def _served_ssh_root(caps) -> frozenset:
+    """ssh-root aliases an enforced pool capability serves this tick (t_79c2259b); empty without a map."""
+    if caps is None:
+        return frozenset()
+    from hermes_cli import kanban_host_capabilities as _khc
+    return _khc.served_ssh_root(caps)
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5657,11 +5665,41 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             from hermes_cli import kanban_host_capabilities as _khc
             why = _ksc.studio_capability(_khc.declared_words(row["body"]), skills, getattr(caps, "cmap", None))
     if why is not None:
+        # t_062a5948: default-deny. A named capability also needs the allowlist or a live operator override
+        # (ROOT config, read here every tick; default off).
+        from hermes_cli import kanban_studio_allowlist as _ksa
+        _deny_on, _allow = _ksa.config(_root_kanban_cfg())
+        held = _ksa.decide(conn, row, why, enabled=_deny_on, allow=_allow, assignee=row["assignee"] or default_assignee)
+        if held is not None:
+            return "wait", held
         if studio_out is not None:
             studio_out[tid] = why
         return route
     return "wait", _ksc.wait_reason(rule, route[1], task_id=tid, workspace_path=row["workspace_path"],
                                     board_default=_board_default_safe(board) if kind == "worktree" else None)
+
+
+def _studio_deny_unrouted(conn, row, ctx: dict, lane: str, default_assignee: Optional[str] = None) -> Optional[str]:
+    """Studio default-deny for a LOCAL start ``_route_row`` never saw (no pool plan; the review lane). ``ctx`` caches
+    this tick's switch, capability map and t_9965b8d5 state, read once and only when the switch is on."""
+    from hermes_cli import kanban_studio_allowlist as _ksa
+    if "on" not in ctx:
+        kcfg = _root_kanban_cfg()
+        ctx["kcfg"] = kcfg
+        ctx["on"] = _ksa.config(kcfg)[0]
+        if ctx["on"]:
+            from hermes_cli import kanban_worker_pool as _kwp
+            try:
+                pool = _kwp.read_pool(_kb.kanban_home() / "fleet", kanban_cfg=kcfg)
+            except Exception:
+                pool = None
+            ctx["caps"] = _capability_tick(pool)
+            ctx["studio_on"] = _studio_capability_on(ctx["caps"], _studio_last_resort(_kb.kanban_home() / "fleet"))
+    if not ctx["on"]:
+        return None
+    stand_in = {"review": _ksa.REVIEW_CAP, "browser_join": _ksa.BROWSER_JOIN_CAP}.get(lane, _ksa.NO_PLAN_CAP)
+    return _ksa.unrouted_hold(conn, row, ctx.get("caps"), studio_on=ctx.get("studio_on", False), kcfg=ctx["kcfg"],
+                              stand_in=stand_in, default_assignee=default_assignee)
 
 
 def _carry_split_plan(workspace_path, carry_budget):
@@ -5890,6 +5928,7 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         requires=verdict.for_portable() if verdict is not None else None,
         body_signals=legacy_body,
         worktree_hosts=wt_hosts, studio_reasons=studio_reasons, prose_advisory=prose_on,
+        access_served=_served_ssh_root(caps),
     )
     # Only content the remote cannot reproduce binds (t_e7c03f48): a clean, pushed checkout plus logs/patches does
     # not. ``lf_detail`` names the first binding path for the reason; a placed run starts fresh on the pool host
@@ -7441,6 +7480,16 @@ def _dispatch_once_locked(
                     caps=_capability_tick(_unplanned_pool),
                 )
                 row_route[r["id"]] = _origin_route or ('local', None)
+    # t_062a5948 (Prism 827ad8491946): with no pool plan every other card defaults to a local start that
+    # _route_row never classified. Studio default-deny holds those too; inert unless its switch is on.
+    _deny_ctx: dict = {}
+    if spillover is None:
+        for r in ready_rows:
+            if r["id"] in _pause_held or row_route.get(r["id"], ("local", None))[0] != "local":
+                continue
+            _held = _studio_deny_unrouted(conn, r, _deny_ctx, "ready", default_assignee)
+            if _held is not None:
+                row_route[r["id"]] = ("wait", _held)
     # Fleet pause hold, layer 1 (t_133d6efd, spec §5.8): after BOTH routing branches, before any spawn. The
     # pre-route holds win over anything a no-plan branch wrote; the post-route pass applies resume pins and
     # catches a row whose manifest appeared mid-tick.
@@ -8514,6 +8563,10 @@ def _dispatch_once_locked(
             # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
             # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
             _local_wait = _kph.local_destination_wait(_pause_cache)
+            if _local_wait is None and force_host is None and route == "portable":
+                # t_062a5948 (Prism 827ad8491946 r2): a portable row starts locally only when its browser join was
+                # cut for the Studio (_portable_goes_remote keeps it here); _route_row never classified it.
+                _local_wait = _studio_deny_unrouted(conn, row, _deny_ctx, "browser_join", default_assignee)
             if _local_wait is not None:
                 result.placement_waits[row["id"]] = _local_wait
                 continue
@@ -8950,6 +9003,7 @@ def _dispatch_once_locked(
             _kb._log.warning("kanban unknown-pin park failed: %s", exc)
     _tick_routes(result, ready_rows, row_route, row_rules, spillover is not None, dry_run)
 
+    _review_deny_waits: dict = {}  # t_062a5948: review-lane default-deny holds, persisted + notified after the loop
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
     # creating a PR.  The dispatcher spawns a review agent (loading
@@ -9048,6 +9102,13 @@ def _dispatch_once_locked(
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
+        if _review_origin_host is None:
+            # t_062a5948 (Prism 827ad8491946): a review run starts locally; Studio default-deny holds it too.
+            _deny_wait = _studio_deny_unrouted(conn, row, _deny_ctx, "review", default_assignee)
+            if _deny_wait is not None:
+                result.placement_waits[row['id']] = _deny_wait
+                _review_deny_waits[row['id']] = _deny_wait
+                continue
         _dest_wait = (_kph.destination_wait(_review_origin_host.name, _pause_cache) if _review_origin_host is not None
                       else _kph.local_destination_wait(_pause_cache))
         if _dest_wait is not None:                         # FWA destination fence, review lane (fe6a1ad69c44)
@@ -9273,6 +9334,20 @@ def _dispatch_once_locked(
     _lw.mark("review_decide")
     _lw.hold()
     if not dry_run:
+        # t_062a5948 (Prism 03ee93f37df3 / 8ba6f0531198): after BOTH lanes have collected their waits. A review-lane
+        # hold gets its own placement_wait row (the ready-lane writer ran before the review loop), then one
+        # wake per hold episode and one page at 60 min, as a ready-lane hold does.
+        if _review_deny_waits and not _review_dry:
+            import types as _types
+            _record_placement_waits(conn, _types.SimpleNamespace(placement_waits=_review_deny_waits,
+                                                                 placement_affinity={}, spawned=[]),
+                                    {}, dry_run)
+        if result.placement_waits:
+            try:
+                from hermes_cli.kanban_studio_allowlist import notify_holds
+                notify_holds(conn, result.placement_waits)
+            except Exception as exc:  # never break a dispatcher tick
+                _kb._log.warning("kanban studio default-deny notify failed: %s", exc)
         try:
             starved = find_priority_starved(conn, now=_tick_now)
             result.priority_starved = [

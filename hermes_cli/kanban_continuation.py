@@ -121,7 +121,9 @@ def origin_hard_refusal(conn, row, pool, host: str, caps=None) -> Optional[str]:
         # here too, with or without a capability map. A Studio-only access
         # never runs on the origin host.
         from hermes_cli import kanban_worker_pool as kwp
-        access = kwp.access_bound_for(row["body"], pool)
+        from hermes_cli import kanban_host_capabilities as khc
+        # A served ssh-root (t_79c2259b) was checked above as a hard capability on ``host``.
+        access = kwp.access_bound_for(row["body"], pool, served=khc.served_ssh_root(caps))
         if access is not None:
             reason = f"access {access} is Studio-only; state is on {host}"
     if reason is None:

@@ -50,6 +50,12 @@ _FIXES = (
     ("requires:",
      "the capability the card requires is on no pool host it may use. Fix: correct the "
      "`requires:` line, or pin the host that serves it."),
+    ("studio_default_deny:",
+     "the card needs a capability only the Mac Studio has, and it is not on the Studio allowlist "
+     "(kanban.placement.studio_default_deny.allow), so it waits instead of starting there (t_062a5948). Fix: the "
+     "operator runs `hermes kanban studio-override <card> --capability <cap> --why \"<reason>\"` (one run), or "
+     "allowlists the capability, or a pool host gains it; if the card does not really need it, correct its "
+     "`requires:` line."),
     ("studio_capability_only:",
      "the card was kept off the pool but names no Studio-only capability, so it waits instead of running "
      "on the Studio (t_9965b8d5). Fix: if it needs the Studio, add `requires: <studio-only capability>` "

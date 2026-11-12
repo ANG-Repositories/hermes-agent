@@ -2454,7 +2454,12 @@ DEFAULT_CONFIG = {
                       # is recorded as the placement event's `advisory` plus one card comment, and the card starts
                       # on a pool host. A `requires:` line, an attached skill or a structural fact still holds it.
                       # false = the hold before t_c82eded0 (kill switch).
-                      "prose_pins_advisory": True},
+                      "prose_pins_advisory": True,
+                      # studio_default_deny (t_062a5948; ROOT config, read per tick): on top of the rule above, a
+                      # Studio-only capability also needs to be in `allow` or carry a live operator override
+                      # (`hermes kanban studio-override`), else the card waits studio_default_deny:<cap>.
+                      # Operator-assignee and no_worker cards are exempt. Default off; the operator arms it.
+                      "studio_default_deny": {"enabled": False, "allow": []}},
         # Admission predicate of the shared placement scorer and unified_filter (t_da6f84f7): legacy = the
         # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
         # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).
