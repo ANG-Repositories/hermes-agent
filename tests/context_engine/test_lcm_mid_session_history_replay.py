@@ -175,3 +175,58 @@ class TestMidSessionHistoryReplay:
             ]
         _rebuilt_agent_ingest(tmp_path, new_turn)
         assert _rows(tmp_path) == n0 + len(new_turn)
+
+
+def _gap_store(tmp_path, gap):
+    rows = [{"role": "system", "content": "You are Apollo."}]
+    for i in range(60):
+        if i not in gap:
+            rows.extend(_turn(i))
+    eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+    eng.on_session_start(SESSION, platform="discord")
+    eng._store.append_batch(SESSION, [dict(r) for r in rows])
+    host = [m for i in range(30, 60) for m in _turn(i)]
+    host.append({"role": "user", "content": "[kanban] a genuinely new wake"})
+    return host
+
+
+class TestStoreGapIsNotSkipped:
+    """Turns the host holds but the store lacks, with later turns stored
+    (operator probe on #275): the fallback may skip only rows it has shown
+    to be stored, so the gap turns must still land."""
+
+    def test_gap_of_five_turns_mid_history_is_stored(self, tmp_path):
+        host = _gap_store(tmp_path, set(range(40, 45)))
+        _rebuilt_agent_ingest(tmp_path, host)
+        for i in range(40, 45):
+            assert _count(tmp_path, f"Card {i} is in review; nothing to do.") >= 1
+        assert _count(tmp_path, "[kanban] a genuinely new wake") == 1
+
+    def test_gap_of_one_turn_near_the_end_is_stored(self, tmp_path):
+        host = _gap_store(tmp_path, {58})
+        _rebuilt_agent_ingest(tmp_path, host)
+        assert _count(tmp_path, "Card 58 is in review; nothing to do.") >= 1
+        assert _count(tmp_path, "[kanban] a genuinely new wake") == 1
+
+    def test_reused_call_ids_with_same_results_but_new_arguments_are_appended(self, tmp_path):
+        # Prism 26ffb81d7a83: ids call_0/call_1 reused, results identical
+        # ("OK"), only the assistant's tool arguments differ.
+        def calls(n):
+            out = []
+            for j in range(2):
+                out += [
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": f"call_{j}", "type": "function",
+                        "function": {"name": "terminal", "arguments": f'{{"n": {n}}}'},
+                    }]},
+                    {"role": "tool", "tool_call_id": f"call_{j}", "content": "OK"},
+                ]
+            return out
+        rows = [{"role": "system", "content": "You are Apollo."}] + calls(0)
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        n0 = _rows(tmp_path)
+        new_turn = calls(1)
+        _rebuilt_agent_ingest(tmp_path, new_turn)
+        assert _rows(tmp_path) == n0 + len(new_turn)

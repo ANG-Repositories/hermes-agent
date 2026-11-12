@@ -1027,7 +1027,7 @@ class ReconcileMixin:
         messages: List[Dict[str, Any]],
         stored_rows: List[Dict[str, Any]],
     ) -> int:
-        """Cursor past host history whose tool results are already stored.
+        """Cursor past the leading host rows proven to be stored, row by row.
 
         A rebuilt agent's first ingest hands LCM the host's in-memory history:
         a trailing slice of the session that starts mid-turn, has no system row
@@ -1036,46 +1036,49 @@ class ReconcileMixin:
         so each agent rebuild re-appended the whole slice under fresh
         timestamps (t_73572f17: one session 552,644 rows / 10,848 contents).
 
-        A tool result's call id is unique per provider call. If the store
-        already holds the result for the call at ``messages[j]``, the host had
-        ``messages[:j + 1]`` when that row was stored, so those rows were
-        already offered for ingest. Anchor on the LAST such row, then extend
-        while the following rows equal the stored rows after it. Rows past
-        that point are new and get appended. Two distinct stored call ids are
-        required, so a short delta keeps the dup-over-loss default, and an
-        anchor must match the stored row's full identity, not just its call
-        id, so a provider that reuses ids cannot hide a new result.
+        The first host tool result whose full identity is stored fixes the
+        alignment between host rows and stored rows. From host row 0 the rows
+        are then compared position by position: assistant/tool/system rows must
+        be identical, user rows only need the same role (the host rewrites
+        them). The cursor stops after the last identical row before the first
+        mismatch, so it never passes a row that is not shown to be stored: a
+        gap in the store (rows the host holds that were never written, e.g. the
+        store-free compaction fallback marks its raw tail ingested) shifts the
+        alignment and ends the run there, and a reused call id with new
+        arguments fails on its assistant row. Two distinct tool-call ids must
+        be matched inside the run, so a short delta keeps dup-over-loss.
         """
-        stored_call_pos: dict[str, list[int]] = {}
-        for pos, row in enumerate(stored_rows):
-            call_id = str(row.get("tool_call_id") or "")
-            if str(row.get("role") or "") == "tool" and call_id:
-                stored_call_pos.setdefault(call_id, []).append(pos)
-        anchor = -1
-        anchor_pos = -1
-        anchored_ids: set[str] = set()
+        stored_ids = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
+        stored_tool_pos: dict[tuple[Any, ...], int] = {}
+        for pos, (row, identity) in enumerate(zip(stored_rows, stored_ids)):
+            if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
+                stored_tool_pos[identity] = pos
+        offset = None
         for idx, msg in enumerate(messages):
-            call_id = str(msg.get("tool_call_id") or "")
-            if str(msg.get("role") or "") != "tool" or call_id not in stored_call_pos:
-                continue
-            identity = self._message_replay_identity(msg)
-            for pos in reversed(stored_call_pos[call_id]):
-                if self._message_replay_identity(stored_rows[pos], stored_row=True) == identity:
-                    anchored_ids.add(call_id)
-                    anchor, anchor_pos = idx, pos
+            if str(msg.get("role") or "") == "tool" and msg.get("tool_call_id"):
+                pos = stored_tool_pos.get(self._message_replay_identity(msg))
+                if pos is not None:
+                    offset = pos - idx
                     break
-        if anchor < 0 or len(anchored_ids) < 2:
+        if offset is None or offset < 0:
             return 0
-        cursor = anchor + 1
-        stored_pos = anchor_pos + 1
-        while (
-            cursor < len(messages)
-            and stored_pos < len(stored_rows)
-            and self._message_replay_identity(messages[cursor])
-            == self._message_replay_identity(stored_rows[stored_pos], stored_row=True)
-        ):
-            cursor += 1
-            stored_pos += 1
+        cursor = 0
+        matched_ids: set[str] = set()
+        for idx, msg in enumerate(messages):
+            pos = idx + offset
+            if pos >= len(stored_rows):
+                break
+            role = str(msg.get("role") or "")
+            if role != str(stored_rows[pos].get("role") or ""):
+                break
+            if self._message_replay_identity(msg) == stored_ids[pos]:
+                if role == "tool" and msg.get("tool_call_id"):
+                    matched_ids.add(str(msg.get("tool_call_id")))
+                cursor = idx + 1
+            elif role != "user":
+                break
+        if len(matched_ids) < 2:
+            return 0
         return cursor
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
