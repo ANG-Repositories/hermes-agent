@@ -1651,7 +1651,15 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
         assert browser in [h["task_id"] for h in kpv._held(conn)]
 
 
-def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):
+@pytest.fixture
+def prose_pins_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The legacy body list (``STUDIO_BODY_RE``) binds only with t_c82eded0's kill switch off
+    (``kanban.placement.prose_pins_advisory: false``); the default is covered in
+    test_kanban_prose_pins_advisory.py."""
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"prose_pins_advisory": False}})
+
+
+def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home, prose_pins_off):
     with kb.connect_closing() as conn:
         (cdp,) = _make(conn, 1, body="attach CDP to :9222 on the Studio")
         res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=1)
@@ -1659,7 +1667,7 @@ def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):
     assert res.placement_affinity[cdp]["matched_by"] == "body::9222"
 
 
-def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_home):
+def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_home, prose_pins_off):
     """A bound card waits, then a tick evaluates it with no wait but it does
     not spawn (per-profile cap), then it waits again for the same reason:
     three episodes, three events (Prism 1ccf2233 / 5a51e524 on #1877)."""
@@ -1749,7 +1757,7 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         assert _events(conn, plain, "placement_affinity") == []
 
 
-def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home):
+def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home, prose_pins_off):
     """The studio-affinity branch in ``_route_row`` sits AFTER the remote-pin
     return and is reached for an unpinned bound card: the route carries
     ``studio_affinity:<rule>`` and the affinity map is filled (refutes Prism
@@ -1772,7 +1780,7 @@ def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home):
         assert pinned not in out
 
 
-def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home):
+def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home, prose_pins_off):
     with kb.connect_closing() as conn:
         (cdp,) = _make(conn, 1, body="signed-in browser task")
         res = kbd.dispatch_once(conn, dry_run=True, max_spawn=8, spillover=None,
@@ -1782,7 +1790,7 @@ def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home):
         assert _events(conn, cdp, "placement_affinity") == []
 
 
-def test_dry_run_prose_host_line_is_not_a_pin(kanban_home):
+def test_dry_run_prose_host_line_is_not_a_pin(kanban_home, prose_pins_off):
     """A ``host: example.com`` header is prose, not a pin: affinity still shows."""
     with kb.connect_closing() as conn:
         (cdp,) = _make(conn, 1, body="host: example.com\nattach CDP :9222")
