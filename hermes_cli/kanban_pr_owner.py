@@ -51,6 +51,7 @@ import time
 from datetime import datetime
 from typing import Callable, Iterable, Optional
 
+from hermes_cli import kanban_archive_read as _kar
 from hermes_cli import kanban_pr_gate as _prg
 from hermes_cli.kanban_open_pr import FLEET_OWNERS
 
@@ -121,13 +122,18 @@ def targets_from(title: Optional[str], idempotency_key: Optional[str],
 _BARE_TITLE_RE = re.compile(r"(?<![\w/#])#(\d+)\b")
 
 
-def card_pr_targets(conn: sqlite3.Connection, task_id: str, _depth: int = 0) -> set:
+def card_pr_targets(conn: sqlite3.Connection, task_id: str, _depth: int = 0, *, archived: bool = False) -> set:
+    """``archived=True`` also reads run metadata R8 moved to kanban-archive.db (PR -> card lookups,
+    t_589fb988). The dispatcher's running-owner scan stays live-only: R8 only moves cards done > 14 d."""
     row = conn.execute("SELECT title, idempotency_key FROM tasks WHERE id = ?",
                        (task_id,)).fetchone()
     if row is None:
         return set()
-    metas = [r[0] for r in conn.execute(
-        "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL", (task_id,))]
+    if archived:
+        metas = _kar.run_metadatas(conn, task_id)
+    else:
+        metas = [r[0] for r in conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL", (task_id,))]
     out = targets_from(row[0], row[1], metas)
     # A bare ``#N`` in the title is the parent's PR when a parent card targets
     # a PR numbered N (live 10-03: t_31fb6cad "#1624 residual: ..." under
@@ -137,7 +143,7 @@ def card_pr_targets(conn: sqlite3.Connection, task_id: str, _depth: int = 0) -> 
     if bare and _depth < 3:
         for (parent,) in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?",
                                       (task_id,)).fetchall():
-            out.update(t for t in card_pr_targets(conn, parent, _depth + 1) if t[1] in bare)
+            out.update(t for t in card_pr_targets(conn, parent, _depth + 1, archived=archived) if t[1] in bare)
     return out
 
 
@@ -167,7 +173,12 @@ def running_owners(conn: sqlite3.Connection, targets: set, *, exclude: str = "")
                         "pr": fmt_pr(target), "repo": target[0], "number": target[1]})
     out.sort(key=lambda o: (o["since"] or 0, o["task_id"]))
     for o in out:
-        o["pr_owner"] = pr_owner_card(conn, (o["repo"], o["number"])) or o["task_id"]
+        try:
+            o["pr_owner"] = pr_owner_card(conn, (o["repo"], o["number"])) or o["task_id"]
+        except _kar.ArchiveUnreadable as exc:
+            # A display label on the spawn-guard path: the running card stands in; the guard still holds.
+            _log.warning("pr_owner label for %s: %s", fmt_pr((o["repo"], o["number"])), exc)
+            o["pr_owner"] = o["task_id"]
     return out
 
 
@@ -185,9 +196,7 @@ def pr_owner_card(conn: sqlite3.Connection, target: tuple) -> Optional[str]:
         [c[0] for c in cards])}
     principal = [c[0] for c in cards if not keys.get(c[0], "").lower().startswith("rebase:")]
     for tid in principal:
-        metas = [r[0] for r in conn.execute(
-            "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL", (tid,))]
-        if target in targets_from(None, None, metas):
+        if target in targets_from(None, None, _kar.run_metadatas(conn, tid)):
             return tid
     return (principal or [cards[0][0]])[0]
 
@@ -322,20 +331,25 @@ def spawn_owners(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] =
 def pr_cards(conn: sqlite3.Connection, target: tuple) -> list:
     """Every non-archived card working on ``target``, oldest first: ``[(id, status, assignee)]``."""
     repo, n = target
+    meta_like = (f"%{repo}#{n}%", f"%{repo}/pull/{n}%")
+    # R8 moves a long-done card's runs to kanban-archive.db; its tasks row stays (t_589fb988).
+    archived = sorted(_kar.task_ids_with_run_metadata_like(conn, meta_like))
     rows = conn.execute(
         "SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND ("
         "title LIKE ? OR idempotency_key LIKE ? OR id IN (SELECT task_id FROM task_runs "
+        "WHERE metadata LIKE ? OR metadata LIKE ?)"
+        + (" OR id IN (%s)" % ",".join("?" * len(archived)) if archived else "")
         # rowid, not id: ids are random hex, so a same-second tie on id is a coin flip.
-        "WHERE metadata LIKE ? OR metadata LIKE ?)) ORDER BY created_at, rowid",
-        (f"%#{n}%", f"rebase:{repo}#{n}@%", f"%{repo}#{n}%", f"%{repo}/pull/{n}%"),
+        + ") ORDER BY created_at, rowid",
+        (f"%#{n}%", f"rebase:{repo}#{n}@%", *meta_like, *archived),
     ).fetchall()
-    return [(r[0], r[1], r[2]) for r in rows if target in card_pr_targets(conn, r[0])]
+    return [(r[0], r[1], r[2]) for r in rows if target in card_pr_targets(conn, r[0], archived=True)]
 
 
 def pr_card_map(conn: sqlite3.Connection, task_id: str) -> dict:
     """``{"repo#n": [{"id", "status", "assignee"}, ...]}`` for the card's PRs, the card excluded."""
     out = {}
-    for target in sorted(card_pr_targets(conn, task_id)):
+    for target in sorted(card_pr_targets(conn, task_id, archived=True)):
         out[fmt_pr(target)] = [{"id": i, "status": s, "assignee": a}
                                for i, s, a in pr_cards(conn, target) if i != task_id]
     return out
