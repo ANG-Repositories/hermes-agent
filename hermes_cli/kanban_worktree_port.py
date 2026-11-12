@@ -1500,3 +1500,118 @@ def ported_host(conn, task_id: str, workspace_path: Optional[str]) -> Optional[s
     if not isinstance(host, str) or not host or doc.get("workspace") != workspace_path:
         return None
     return host.lower()
+
+
+# -- hand-over off a port host that cannot serve the card any more (t_f914c529) ---------------------------------
+# t_cf13ff3b (2026-11-12): ported to ci-box, blocked kind=capability there, re-routed with `requires: studio-state`.
+# The port bind kept it on ci-box, which cannot serve studio-state, so it waited not_portable:requires:studio-state
+# for 4.5 h and never reached the Studio default-deny check (no studio_default_deny code, no wake, admit/override
+# inert). The bind ends ONLY for that case: a hard requirement the bound host cannot serve. And only after the clone
+# there is proven clean and fully pushed (the remote-GC predicate, kanban_survivor._REMOTE_PROOF in check mode): the
+# card is re-pointed to a FRESH local scratch path, which the spawn fills from origin at the clone's head
+# (:func:`materialize_handover`). A clone with local work keeps the card held, named, on that host.
+HANDOVER_EVENT = "worktree_handed_over"
+STRANDED_PREFIX = "port_stranded"
+PROBE_RETRY_S = 300
+_probe_memo: Dict[tuple, tuple] = {}   # (task id, port event id) -> (monotonic, wait reason)
+
+
+def handover_url(slug: str) -> str:
+    return f"https://github.com/{slug}.git"
+
+
+def _newest_event(conn, task_id: str, kind: str):
+    row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+                       (task_id, kind)).fetchone()
+    if row is None:
+        return None, {}
+    try:
+        doc = json.loads(row[1] or "{}")
+    except (TypeError, ValueError):
+        doc = {}
+    return row[0], doc if isinstance(doc, dict) else {}
+
+
+def hard_missing(row, caps, host: str) -> List[str]:
+    """The card's HARD capability requirements ``host`` cannot serve ([] with no capability map: the bind stands)."""
+    if caps is None or getattr(caps, "cmap", None) is None:
+        return []
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_host_capabilities as _khc
+    skills = [s for s in (_kb._json_or(row["skills"]) or []) if isinstance(s, str)]
+    reqs, _none = _khc.derive(row["body"], skills, caps.cmap)
+    return sorted({r.cap for r in reqs if r.strength == "hard" and not _khc._satisfied(r.cap, caps, host)})
+
+
+def probe_clone(host, path: str, runner: Callable = subprocess.run) -> Tuple[bool, str]:
+    """``(True, head sha or "" when the path is gone)`` when the clone on ``host`` passes remote GC's proof (clean,
+    no stash, every local commit on a remote, HEAD on a remote ref), else ``(False, why)``. Read-only."""
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    from hermes_cli.kanban_worker_pool import _ssh_argv
+    cmd = "python3 -c " + shlex.quote(_REMOTE_PROOF) + " " + shlex.quote(path) + " check"
+    try:
+        proc = runner(_ssh_argv(host, cmd), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except Exception as exc:  # unreachable host, timeout: held, named
+        return False, f"probe failed: {exc}"[:200]
+    if proc.returncode != 0:
+        return False, ((proc.stderr or "").strip() or f"probe rc={proc.returncode}")[:200]
+    return True, (proc.stdout or "").strip()
+
+
+def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts, *, dry_run: bool = False,
+                      runner: Callable = subprocess.run) -> Optional[str]:
+    """Hand a ported card back from ``host_name``, which cannot serve ``missing``. None = handed over (re-pointed,
+    ``worktree_handed_over`` written; simulated under ``dry_run``), else the wait reason that keeps it held."""
+    from hermes_cli import kanban_db as _kb
+    tid, old = row["id"], row["workspace_path"]
+    port_id, port = _newest_event(conn, tid, PORTED_EVENT)
+    held = (f"{STRANDED_PREFIX}:{host_name} ({old}: {{why}}; the card needs {', '.join(missing)}, which {host_name} "
+            f"cannot serve. Push or drop that clone's work and the next tick hands the card over to a fresh clone)")
+    memo = _probe_memo.get((tid, port_id))
+    if memo is not None and time.monotonic() - memo[0] < PROBE_RETRY_S:
+        return memo[1]
+    host = next((h for h in pool_hosts or () if h.name.lower() == host_name.lower()), None)
+    ok, got = (False, "port host is not in the worker registry") if host is None else probe_clone(host, old, runner)
+    new = f"{old}-from-{host_name.lower()}"
+    if ok and os.path.lexists(new):
+        ok, got = False, f"hand-over target {new} already exists here; it is never reused"
+    if not ok:
+        reason = held.format(why=got)
+        _probe_memo[(tid, port_id)] = (time.monotonic(), reason)
+        return reason
+    if dry_run:
+        return None
+    payload = {"from_host": host_name, "workspace": old, "path": new, "repo": port.get("repo"),
+               "mirror": port.get("mirror"), "branch": port.get("branch") or f"wt/{tid}", "head": got or None,
+               "missing": missing}
+    with _kb.write_txn(conn):
+        cur = conn.execute("UPDATE tasks SET workspace_path=?, origin_host=CASE WHEN lower(COALESCE(origin_host,''))=? "
+                           "THEN NULL ELSE origin_host END WHERE id=? AND workspace_path IS ? AND claim_lock IS NULL",
+                           (new, host_name.lower(), tid, old))
+        if cur.rowcount != 1:
+            return held.format(why="the card changed under the hand-over; retried next tick")
+        _kb._append_event(conn, tid, HANDOVER_EVENT, payload)
+    return None
+
+
+def materialize_handover(conn, task, workspace: str, placed_host=None, runner: Callable = subprocess.run) -> bool:
+    """Fill a handed-over card's fresh workspace with its branch at the head the port clone held, once (no ``spawned``
+    after the hand-over). On ``placed_host`` over ssh, else here. Raises on failure (a spawn failure). True = cloned."""
+    ev_id, doc = _newest_event(conn, task.id, HANDOVER_EVENT)
+    if ev_id is None or doc.get("path") != task.workspace_path or not doc.get("repo"):
+        return False
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='spawned' AND id>? LIMIT 1",
+                    (task.id, ev_id)).fetchone():
+        return False
+    mirror, branch, sha = doc.get("mirror") or "/nonexistent-mirror", doc.get("branch") or f"wt/{task.id}", doc.get("head")
+    if placed_host is not None:
+        clone_on_host(placed_host, workspace, doc["repo"], mirror, branch, runner, sha=sha, exact=bool(sha))
+        return True
+    script = clone_script(workspace, doc["repo"], mirror, branch, url=handover_url(doc["repo"]), sha=sha,
+                          exact=bool(sha))
+    proc = runner(["sh", "-c", script], capture_output=True, text=True, timeout=CLONE_TIMEOUT_S,
+                  stdin=subprocess.DEVNULL)
+    if proc.returncode != 0:
+        raise RuntimeError(f"hand-over clone of {doc['repo']} into {workspace} failed rc={proc.returncode}: "
+                           f"{(proc.stderr or '').strip()[:200]}")
+    return True

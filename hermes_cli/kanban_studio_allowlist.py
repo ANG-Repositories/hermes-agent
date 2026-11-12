@@ -202,14 +202,27 @@ def resolved_capability(row, caps, stand_in: str) -> dict:
     return why
 
 
-def _held_this_episode(conn, task_id: str) -> bool:
+def _cap_of(reason: str) -> str:
+    return str(reason or "")[len(WAIT_PREFIX) + 1:].split(" (", 1)[0] if str(reason or "").startswith(
+        WAIT_PREFIX + ":") else ""
+
+
+def _held_this_episode(conn, task_id: str, reason: Optional[str] = None) -> bool:
     """True when the current wait episode already woke the operator: a ``mechanical_wake`` from this source with no
-    episode-ending event after it."""
+    episode-ending event after it. With ``reason``, only a wake for the SAME held capability counts (t_f914c529:
+    t_17732be2 went from studio-state to workspace_kind:origin_not_ours, and an override names one capability)."""
+    want = _cap_of(reason) if reason is not None else None
     for kind, _created, p in _episode_events(conn, task_id, (WAKE_EVENT,)):
         if kind != WAKE_EVENT:
             return False
         if p.get("source") == HOLD_WAKE_SOURCE:
-            return True
+            if want is None:
+                return True
+            got = p.get("capability")
+            if got is None:  # a wake from before the field: its text quotes the reason
+                got = _cap_of(str(p.get("text") or "").split("default-deny: ", 1)[-1])
+            if got == want:
+                return True
     return False
 
 
@@ -236,9 +249,11 @@ def _episode_events(conn, task_id: str, kinds):
 
 
 def wake_text(task_id: str, reason: str) -> str:
+    cmd = override_command(task_id, reason) or \
+        f'hermes kanban studio-override {task_id} --capability <cap> --why "<reason>"'
     return (f"{task_id} is held off the Mac Studio by default-deny: {reason}. No pool host can take it. "
-            f"If it truly needs the Studio, run `hermes kanban studio-override {task_id} --capability <cap> "
-            f"--why \"<reason>\"` (one run), or add the capability to kanban.placement.studio_default_deny.allow. "
+            f"If it truly needs the Studio, run `{cmd}` (one run), or add the capability to "
+            f"kanban.placement.studio_default_deny.allow. "
             f"Otherwise fix the gap (a pool host that advertises it, or a card that does not need it).")
 
 
@@ -289,10 +304,11 @@ def notify_holds(conn, waits: Mapping[str, str], *, now: Optional[int] = None, p
         if not str(reason or "").startswith(WAIT_PREFIX + ":"):
             continue
         try:
-            if not _held_this_episode(conn, tid):
+            if not _held_this_episode(conn, tid, reason):
                 with _kb.write_txn(conn):
                     _kb._append_event(conn, tid, WAKE_EVENT,
-                                      {"source": HOLD_WAKE_SOURCE, "text": wake_text(tid, reason)})
+                                      {"source": HOLD_WAKE_SOURCE, "capability": _cap_of(reason),
+                                       "text": wake_text(tid, reason)})
                 woke.append(tid)
                 continue
             start = _episode_start(conn, tid)
@@ -377,15 +393,19 @@ def override(conn, task_id: str, capability: str, why: str, *, once: bool = True
         payload["ledger_error"] = str(exc)
     last = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
                         "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
-    held = None
+    held = other = None
     if last:
         try:
-            reason = (json.loads(last[0] or "{}") or {}).get("reason") or ""
+            doc = json.loads(last[0] or "{}") or {}
+            reason = "" if doc.get("cleared") else (doc.get("reason") or "")
         except (TypeError, ValueError, AttributeError):
             reason = ""
         if reason.startswith(WAIT_PREFIX + ":"):
             held = reason[len(WAIT_PREFIX) + 1:].split(" (", 1)[0]
+        elif reason:
+            other = reason  # t_f914c529: a different rule holds it; the override cannot release that
     payload["held_capability"] = held
+    payload["held_by_other"] = other
     return payload
 
 
@@ -408,4 +428,8 @@ def cmd_studio_override(args) -> int:
     if held and p["capability"] not in set(held) | {head(x) for x in held}:  # live_override's match
         print(f"kanban studio-override: WARNING {args.task_id} is held for {p['held_capability']}, not "
               f"{p['capability']}: this override does not release it", file=sys.stderr)
+    if p.get("held_by_other"):
+        print(f"kanban studio-override: WARNING {args.task_id}'s latest placement wait is {p['held_by_other']}, "
+              f"not a studio_default_deny hold: this override does not release it. Read "
+              f"`hermes kanban placement {args.task_id}` for the rule that holds it", file=sys.stderr)
     return 0
