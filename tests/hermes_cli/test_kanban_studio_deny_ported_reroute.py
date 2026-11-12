@@ -270,3 +270,127 @@ def test_override_on_a_non_deny_hold_says_it_does_not_release(operator, capsys):
     err = capsys.readouterr().err
     assert rc == 0
     assert "not_portable:requires:studio-state" in err and "does not release" in err, err
+
+
+# -- 6. send-back 13:18 / 13:36: stranded-clone notice, Studio-only hand-over, gated short probe ------------------
+
+def test_full_tick_on_a_stranded_clone_wakes_the_home_session_once(kanban_home, monkeypatch):
+    """Operator send-back 2 (13:18): a card held over a stranded clone notifies its home session, once."""
+    _cfg(kanban_home, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    monkeypatch.setattr(kwt, "probe_clone", lambda host, path, runner=None: (False, "local commits not on any remote"))
+    kwt._probe_memo.clear()
+    with kb.connect_closing() as conn:
+        tid, path = _ported_card(conn)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=2)
+        _tick(conn, spillover=_plan(free=2), spawn_limit=2)
+        wakes = [json.loads(p) for (p,) in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='mechanical_wake'", (tid,))]
+    assert tid not in [t for t, _h in spawned], spawned
+    assert res.placement_waits[tid].startswith("port_stranded:ace-ai ("), res.placement_waits
+    assert len(wakes) == 1, wakes
+    assert wakes[0]["capability"] == "port_stranded:ace-ai"
+    text = wakes[0]["text"]
+    assert "ace-ai" in text and path in text and "push" in text, text
+
+
+def test_stranded_hold_pages_after_an_hour(kanban_home):
+    reason = "port_stranded:ace-ai (/w/t: local commits not on any remote; the card needs studio-state, ...)"
+    pages = []
+
+    class Pager:
+        def page(self, key, text):
+            pages.append((key, text))
+            return "sent"
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="x", assignee="alpha", body="requires: studio-state")
+        assert ksa.notify_holds(conn, {tid: reason}, pager_factory=Pager) == [tid]
+        t0 = conn.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='mechanical_wake'",
+                          (tid,)).fetchone()[0]
+        ksa.notify_holds(conn, {tid: reason}, now=t0 + 59 * 60, pager_factory=Pager)
+        assert pages == []
+        ksa.notify_holds(conn, {tid: reason}, now=t0 + 61 * 60, pager_factory=Pager)
+        ksa.notify_holds(conn, {tid: reason}, now=t0 + 90 * 60, pager_factory=Pager)
+    assert len(pages) == 1 and pages[0][0] == f"held:{tid}" and "/w/t" in pages[0][1], pages
+
+
+def test_a_hard_requirement_another_pool_host_serves_keeps_the_bind(kanban_home, clean_clone):
+    """Operator ruling 13:36 (Prism d6cfdbb53981): the hand-over goes to the Studio only. A requirement the port host
+    lacks but another POOL host serves keeps today's bind: no pool-to-pool hand-over."""
+    import re
+    from hermes_cli import kanban_host_capabilities as khc
+    allcaps = ("gpu", "studio-state")
+    cmap = khc.CapabilityMap(capabilities=allcaps,
+                             hosts={khc.STUDIO_ROW: frozenset({"studio-state"}), "ace-ai": frozenset(),
+                                    "ace-media": frozenset({"gpu"})},
+                             sniff=(("studio-state", re.compile(r"(?!x)x")),), soft={c: False for c in allcaps})
+    caps = khc.CapabilityTick(cmap, khc.ENFORCE, allcaps, ("ace-ai", "ace-media"))
+    _cfg(kanban_home, True, [])
+    with kb.connect_closing() as conn:
+        tid, path = _ported_card(conn, body="requires: gpu\nrender it")
+        row = _row(conn, tid)
+        assert kwt.hard_missing(row, caps, "ace-ai") == []
+        kbd._route_row(conn, row, _plan(free=2), caps=caps, rules_out={}, carry_out={}, studio_out={})
+        assert conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (tid,)).fetchone()[0] == path
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind=?",
+                            (tid, kwt.HANDOVER_EVENT)).fetchone()[0] == 0
+    assert clean_clone == []
+
+
+class _Grant:
+    def __init__(self, host="ace-ai", rid="r-1", reason=""):
+        self.host, self.reservation_id, self.reason, self.consumer = host, rid, reason, "kanban"
+
+
+def _pool_host():
+    from hermes_cli.kanban_worker_pool import PoolHost
+    return PoolHost("ace-ai", "ace-ai", "kanbanw", 4, 100.0, "wait", (), "active", True, 0)
+
+
+def test_probe_runs_under_a_router_reservation_with_a_short_timeout(monkeypatch):
+    from hermes_cli.fleet_placement import alloc_client
+    released, calls = [], []
+    monkeypatch.setattr(alloc_client, "admit", lambda consumer, **kw: _Grant())
+    monkeypatch.setattr(alloc_client, "release", lambda rid, consumer: released.append(rid) or True)
+
+    class Proc:
+        returncode, stdout, stderr = 0, "abc123\n", ""
+
+    def runner(argv, **kw):
+        calls.append(kw)
+        return Proc()
+    assert kwt.probe_clone(_pool_host(), "/w/t", runner) == (True, "abc123")
+    assert calls[0]["env"]["ALLOC_RESERVATION"] == "r-1"
+    assert calls[0]["timeout"] <= 10 and calls[0]["encoding"] == "utf-8"
+    assert released == ["r-1"]
+
+
+def test_probe_timeout_or_refused_admit_is_not_proven(monkeypatch):
+    import subprocess
+    from hermes_cli.fleet_placement import alloc_client
+    released = []
+    monkeypatch.setattr(alloc_client, "release", lambda rid, consumer: released.append(rid) or True)
+
+    def slow(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, kw["timeout"])
+    monkeypatch.setattr(alloc_client, "admit", lambda consumer, **kw: _Grant())
+    ok, why = kwt.probe_clone(_pool_host(), "/w/t", slow)
+    assert not ok and "probe failed" in why and released == ["r-1"]
+    ran = []
+    monkeypatch.setattr(alloc_client, "admit", lambda consumer, **kw: _Grant(host=None, rid=None, reason="all_closed"))
+    ok, why = kwt.probe_clone(_pool_host(), "/w/t", lambda argv, **kw: ran.append(argv))
+    assert not ok and "all_closed" in why and ran == []
+
+
+def test_a_handed_over_card_never_materializes_on_a_pool_host(kanban_home, clean_clone):
+    """Prism d6cfdbb53981: a pool start would leave its clone with no port binding. The hand-over is Studio-only."""
+    _cfg(kanban_home, True, [])
+    ran = []
+    with kb.connect_closing() as conn:
+        tid, path = _ported_card(conn)
+        _route(conn, tid)
+        task = kb.get_task(conn, tid)
+        with pytest.raises(RuntimeError, match="Studio only"):
+            kwt.materialize_handover(conn, task, task.workspace_path, _pool_host(),
+                                     runner=lambda argv, **kw: ran.append(argv))
+    assert task.workspace_path == f"{path}-from-ace-ai" and ran == []

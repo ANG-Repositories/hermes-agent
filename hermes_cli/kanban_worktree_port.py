@@ -1513,6 +1513,8 @@ def ported_host(conn, task_id: str, workspace_path: Optional[str]) -> Optional[s
 HANDOVER_EVENT = "worktree_handed_over"
 STRANDED_PREFIX = "port_stranded"
 PROBE_RETRY_S = 300
+PROBE_TIMEOUT_S = 10.0  # the whole probe ssh, connect included: it runs inside the tick (operator 11-12 13:36)
+PROBE_LEASE_S = 60.0    # the router lease one clone probe runs under (released after; the TTL bounds a leak)
 _probe_memo: Dict[tuple, tuple] = {}   # (task id, port event id) -> (monotonic, wait reason)
 
 
@@ -1533,26 +1535,49 @@ def _newest_event(conn, task_id: str, kind: str):
 
 
 def hard_missing(row, caps, host: str) -> List[str]:
-    """The card's HARD capability requirements ``host`` cannot serve ([] with no capability map: the bind stands)."""
+    """The card's HARD capability requirements that ``host`` cannot serve AND no pool host serves, i.e. only the
+    Studio can ([] with no capability map: the bind stands). Operator ruling 11-12 13:36 (Prism d6cfdbb53981): the
+    hand-over goes to the Studio only; a requirement some other pool host serves keeps the bind (no pool-to-pool
+    hand-over: all 179 placement_rerouted events of the 7 days before named to_host studio)."""
     if caps is None or getattr(caps, "cmap", None) is None:
         return []
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_host_capabilities as _khc
     skills = [s for s in (_kb._json_or(row["skills"]) or []) if isinstance(s, str)]
     reqs, _none = _khc.derive(row["body"], skills, caps.cmap)
-    return sorted({r.cap for r in reqs if r.strength == "hard" and not _khc._satisfied(r.cap, caps, host)})
+    pool = tuple(getattr(caps, "pool_hosts", ()) or ()) + (host,)
+    return sorted({r.cap for r in reqs if r.strength == "hard" and not _khc._satisfied(r.cap, caps, host)
+                   and not any(r.cap in _khc._host_caps(caps, h.lower()) for h in pool)})
 
 
 def probe_clone(host, path: str, runner: Callable = subprocess.run) -> Tuple[bool, str]:
     """``(True, head sha or "" when the path is gone)`` when the clone on ``host`` passes remote GC's proof (clean,
-    no stash, every local commit on a remote, HEAD on a remote ref), else ``(False, why)``. Read-only."""
+    no stash, every local commit on a remote, HEAD on a remote ref), else ``(False, why)``. Read-only.
+
+    The ssh runs under a router reservation on ``host`` (zero footprint, short TTL, released after): the router sees
+    every ssh the fleet opens on a host (spawn-site lint). A refusal keeps the card held, named."""
+    from hermes_cli.fleet_placement import alloc_client
     from hermes_cli.kanban_survivor import _REMOTE_PROOF
     from hermes_cli.kanban_worker_pool import _ssh_argv
     cmd = "python3 -c " + shlex.quote(_REMOTE_PROOF) + " " + shlex.quote(path) + " check"
     try:
-        proc = runner(_ssh_argv(host, cmd), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        grant = alloc_client.admit("kanban", job_id=f"port-probe:{host.name}:{path}", ttl_s=PROBE_LEASE_S,
+                                   footprint={"ram_gb": 0.0, "threads": 0.0}, candidates=[host.name])
+    except Exception as exc:  # Refused (token), a table with no such host: held, named
+        return False, f"probe not admitted: {exc}"[:200]
+    if not grant.host or not grant.reservation_id:
+        return False, f"probe not admitted on {host.name}: {grant.reason or 'refused'}"[:200]
+    env = dict(os.environ, ALLOC_RESERVATION=str(grant.reservation_id))
+    try:
+        proc = runner(_ssh_argv(host, cmd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                      timeout=PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL, env=env)
     except Exception as exc:  # unreachable host, timeout: held, named
         return False, f"probe failed: {exc}"[:200]
+    finally:
+        try:
+            alloc_client.release(grant.reservation_id, consumer=grant.consumer or "kanban")
+        except Exception as exc:  # the TTL bounds an unreleased probe lease
+            _log.warning("kanban port probe: release of %s failed: %s", grant.reservation_id, exc)
     if proc.returncode != 0:
         return False, ((proc.stderr or "").strip() or f"probe rc={proc.returncode}")[:200]
     return True, (proc.stdout or "").strip()
@@ -1596,7 +1621,7 @@ def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts,
 
 def materialize_handover(conn, task, workspace: str, placed_host=None, runner: Callable = subprocess.run) -> bool:
     """Fill a handed-over card's fresh workspace with its branch at the head the port clone held, once (no ``spawned``
-    after the hand-over). On ``placed_host`` over ssh, else here. Raises on failure (a spawn failure). True = cloned."""
+    after the hand-over), here on the Studio. Raises on failure or a pool placement (a spawn failure). True = cloned."""
     ev_id, doc = _newest_event(conn, task.id, HANDOVER_EVENT)
     if ev_id is None or doc.get("path") != task.workspace_path or not doc.get("repo"):
         return False
@@ -1605,12 +1630,13 @@ def materialize_handover(conn, task, workspace: str, placed_host=None, runner: C
         return False
     mirror, branch, sha = doc.get("mirror") or "/nonexistent-mirror", doc.get("branch") or f"wt/{task.id}", doc.get("head")
     if placed_host is not None:
-        clone_on_host(placed_host, workspace, doc["repo"], mirror, branch, runner, sha=sha, exact=bool(sha))
-        return True
+        # The hand-over is to the Studio only (hard_missing: no pool host serves the need; operator ruling 13:36,
+        # Prism d6cfdbb53981). A pool placement here would leave no port binding for its clone: refuse it.
+        raise RuntimeError(f"hand-over of {task.id} is to the Studio only; refusing a start on {placed_host.name}")
     script = clone_script(workspace, doc["repo"], mirror, branch, url=handover_url(doc["repo"]), sha=sha,
                           exact=bool(sha))
-    proc = runner(["sh", "-c", script], capture_output=True, text=True, timeout=CLONE_TIMEOUT_S,
-                  stdin=subprocess.DEVNULL)
+    proc = runner(["sh", "-c", script], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  timeout=CLONE_TIMEOUT_S, stdin=subprocess.DEVNULL)
     if proc.returncode != 0:
         raise RuntimeError(f"hand-over clone of {doc['repo']} into {workspace} failed rc={proc.returncode}: "
                            f"{(proc.stderr or '').strip()[:200]}")

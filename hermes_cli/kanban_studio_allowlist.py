@@ -202,9 +202,23 @@ def resolved_capability(row, caps, stand_in: str) -> dict:
     return why
 
 
+# t_f914c529: a ported card whose clone on the port host still holds work waits ``port_stranded:<host> (...)``
+# (kanban_worktree_port.STRANDED_PREFIX). It takes the same wake + 60-minute page as a default-deny hold.
+STRANDED_PREFIX = "port_stranded"
+
+
 def _cap_of(reason: str) -> str:
-    return str(reason or "")[len(WAIT_PREFIX) + 1:].split(" (", 1)[0] if str(reason or "").startswith(
-        WAIT_PREFIX + ":") else ""
+    """The held key: ``<cap>`` for a default-deny hold, ``port_stranded:<host>`` for a stranded clone, else ''."""
+    r = str(reason or "")
+    if r.startswith(WAIT_PREFIX + ":"):
+        return r[len(WAIT_PREFIX) + 1:].split(" (", 1)[0]
+    if r.startswith(STRANDED_PREFIX + ":"):
+        return r.split(" (", 1)[0]
+    return ""
+
+
+def _held_reason(reason) -> bool:
+    return str(reason or "").startswith((WAIT_PREFIX + ":", STRANDED_PREFIX + ":"))
 
 
 def _held_this_episode(conn, task_id: str, reason: Optional[str] = None) -> bool:
@@ -249,6 +263,12 @@ def _episode_events(conn, task_id: str, kinds):
 
 
 def wake_text(task_id: str, reason: str) -> str:
+    if str(reason or "").startswith(STRANDED_PREFIX + ":"):
+        host = _cap_of(reason)[len(STRANDED_PREFIX) + 1:]
+        return (f"{task_id} is held: its clone on {host} still holds work and that host cannot serve the card "
+                f"any more: {reason}. On {host}, push that clone's commits (and commit or drop any uncommitted "
+                f"or stashed work); the next dispatcher tick then hands the card over to a fresh clone. Nothing "
+                f"starts elsewhere until then.")
     cmd = override_command(task_id, reason) or \
         f'hermes kanban studio-override {task_id} --capability <cap> --why "<reason>"'
     return (f"{task_id} is held off the Mac Studio by default-deny: {reason}. No pool host can take it. "
@@ -301,7 +321,7 @@ def notify_holds(conn, waits: Mapping[str, str], *, now: Optional[int] = None, p
     pager = None
     woke = []
     for tid, reason in (waits or {}).items():
-        if not str(reason or "").startswith(WAIT_PREFIX + ":"):
+        if not _held_reason(reason):
             continue
         try:
             if not _held_this_episode(conn, tid, reason):
@@ -318,9 +338,12 @@ def notify_holds(conn, waits: Mapping[str, str], *, now: Optional[int] = None, p
                 pager = factory()
             if pager is None:
                 continue
-            text = (f"🔒 Studio default-deny: {tid} held {(now - start) // 60} min, no pool host can take it. "
-                    f"{reason}. Decide: `hermes kanban studio-override {tid} --capability <cap> --why \"...\"`, "
-                    f"allowlist the capability, or fix the gap.")
+            if str(reason).startswith(STRANDED_PREFIX + ":"):
+                text = (f"🔒 Stranded clone: {tid} held {(now - start) // 60} min. {reason}.")
+            else:
+                text = (f"🔒 Studio default-deny: {tid} held {(now - start) // 60} min, no pool host can take it. "
+                        f"{reason}. Decide: `hermes kanban studio-override {tid} --capability <cap> --why \"...\"`, "
+                        f"allowlist the capability, or fix the gap.")
             outcome = pager.page(f"held:{tid}", text)
             if outcome != "failed":
                 with _kb.write_txn(conn):
