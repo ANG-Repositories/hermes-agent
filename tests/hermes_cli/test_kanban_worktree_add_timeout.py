@@ -107,10 +107,10 @@ def _killed_add(repo, tmp_path, tid):
     return target, Path(git(target, "rev-parse", "--absolute-git-dir"))
 
 
-def _finished(repo, tid, lock=None, age_s=0):
+def _finished(repo, tid, lock=None, age_s=0, branch=None):
     """A finished linked tree (index written), optionally locked ``lock`` with a lock ``age_s`` old."""
     target = repo / ".worktrees" / tid
-    git(repo, "worktree", "add", "-q", "-b", f"wt/{tid}", str(target), "HEAD")
+    git(repo, "worktree", "add", "-q", "-b", branch or f"wt/{tid}", str(target), "HEAD")
     admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
     if lock:
         git(repo, "worktree", "lock", "--reason", lock, str(target))
@@ -273,6 +273,74 @@ def test_identity_is_by_inode_not_spelling(repo, tmp_path):
     assert "rule 2" in kwa.unproven(target) and "names another tree" in kwa.unproven(target)
 
 
+def test_a_gitfile_linked_into_another_directory_is_held(repo, tmp_path):
+    """Prism #265 r9 P1 :134: a symlinked or hardlinked copy of a finished tree's gitfile in another directory names
+    the same admin dir and the same .git inode, but that directory is not the tree. Rule 1 refuses the symlink by
+    lstat; rule 2 refuses the hardlink by the directory's own identity."""
+    target, _ = _finished(repo, "t_src")
+    sym, hard = tmp_path / "sym", tmp_path / "hard"
+    sym.mkdir()
+    hard.mkdir()
+    (sym / ".git").symlink_to(target / ".git")
+    os.link(target / ".git", hard / ".git")
+    assert kwa.unproven(sym).startswith("rule 1") and "not a regular file" in kwa.unproven(sym)
+    assert kwa.unproven(hard).startswith("rule 2") and "names another tree" in kwa.unproven(hard)
+    for d in (sym, hard):
+        with pytest.raises(WorkspaceUnavailable, match=kwa.UNPROVEN_HELD):
+            kwa.hold_unless_proven(d)
+    assert kwa.unproven(target) is None
+
+
+def test_a_tree_whose_name_ends_in_a_space_is_handed_over(repo):
+    """Prism #265 r9 P2 :129: only line terminators are stripped from the gitfile and the gitdir backlink (git's
+    read_gitfile strips only \\n and \\r). git sanitises the admin name it picks (`t_sp ` -> `t_sp-`), so the
+    entry that ends in a space here is an admin dir renamed by hand, which git itself still reads."""
+    target, admin = _finished(repo, "t_sp ", branch="wt/t_sp")         # a ref name cannot end in a space
+    assert target.name.endswith(" ") and kwa.unproven(target) is None
+    spaced = admin.with_name(admin.name + " ")
+    admin.rename(spaced)
+    (target / ".git").write_bytes(b"gitdir: " + os.fsencode(spaced) + b"\n")
+    out = subprocess.run(["git", "-C", str(target), "rev-parse", "--absolute-git-dir"], capture_output=True,
+                         check=True).stdout
+    assert out == os.fsencode(spaced) + b"\n"                                   # git accepts the trailing space
+    assert kwa.unproven(target) is None
+    got, _ = kbw._resolve_worktree_workspace(_task("t_sp", target, "wt/t_sp"))
+    assert Path(got) == target.resolve()
+
+
+def test_a_running_add_is_held_on_rule_3_at_every_sample(repo, tmp_path):
+    """Prism #265 r9 P1 :165, Apollo's measurement repeated wherever CI runs it (Linux runners, and the pool hosts
+    run git 2.53.0): while a real slow add checks out, the gate never hands the tree over; once the gitfile and
+    backlink exist it holds on rule 3 (no index / index.lock) until the add ends, then proves the finished tree."""
+    git(repo, "config", "filter.slow.smudge", "sh -c 'sleep 1; cat'")
+    target = repo / ".worktrees" / "t_run"
+    proc = subprocess.Popen(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "wt/t_run", str(target), "HEAD"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    samples = []
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            running = proc.poll() is None
+            why = kwa.unproven(target)
+            if not running:
+                break
+            samples.append(why)
+            time.sleep(0.1)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+    assert proc.returncode == 0, proc.stderr.read()
+    rule3 = [w for w in samples if w and w.startswith("rule 3")]
+    assert len(rule3) >= 10, samples                       # ~3 s of checkout at 0.1 s per sample
+    # every sample taken while git was running holds; a None can only be the instant after the unlock, before exit
+    held = [w is not None for w in samples]
+    assert all(held[: len(held) - 1]), samples
+    first3 = next(i for i, w in enumerate(samples) if w and w.startswith("rule 3"))
+    assert all(w.startswith(("rule 3", "rule 4")) for w in samples[first3:] if w), samples
+    assert kwa.unproven(target) is None
+
+
 # --- the gate: anything not proven holds, naming the rule -------------------------------------------------------
 
 
@@ -334,7 +402,7 @@ _DESTRUCTIVE = ("rmtree", "rmdir", "os.remove", ".unlink(", '"-d"', '"-D"', '"pr
                 ".write_", '"w"', '"wb"', '"a"')
 
 
-def test_the_add_module_and_the_spawn_remove_nothing():
+def test_the_add_module_and_the_spawn_remove_nothing():  # noqa: source-proxy structural no-deletion ruling, not behaviour
     srcs = {"kanban_worktree_add.py": Path(kwa.__file__).read_text(encoding="utf-8-sig"),
             "_ensure_git_worktree": textwrap.dedent(inspect.getsource(kbw._ensure_git_worktree))}
     for name, src in srcs.items():

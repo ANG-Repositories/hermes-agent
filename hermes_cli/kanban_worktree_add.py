@@ -84,17 +84,26 @@ def run_git_group(argv: Sequence[str], timeout: float) -> subprocess.CompletedPr
 # paged once per episode by the dispatcher's refusal path). Nothing here deletes, unlocks or writes.
 #
 # Proof (all four, in order):
-#   1. <tree>/.git is a readable gitfile naming an admin dir;
-#   2. os.path.samefile(<admin>/gitdir's path, <tree>/.git): identity by device and inode, never a string compare
-#      (the r8 bypass was a path spelled differently from git's registration);
+#   1. <tree>/.git is a REGULAR file by lstat (a symlink is not proven) and a readable gitfile naming an admin dir;
+#   2. os.path.samefile(<admin>/gitdir's path, <tree>/.git) AND os.path.samefile(dirname(<admin>/gitdir's path),
+#      <tree>): identity of the gitfile and of the directory, by device and inode, never a string compare (the r8
+#      bypass was a path spelled differently from git's registration; a hard- or symlinked gitfile in another
+#      directory passes the first compare and fails the second);
 #   3. <admin>/index exists and <admin>/index.lock does not;
 #   4. <admin>/locked is absent, OR its reason is not `initializing`, OR its mtime is older than 2 x ADD_TIMEOUT_S.
-# Rule 4: index present + `initializing` is not proof while an add could still be writing (an external add in a long
-# post-checkout hook). Every add this dispatcher runs is group-killed at ADD_TIMEOUT_S, so a lock older than twice
-# that has no live writer of ours; with the index present and no index.lock its checkout finished. That covers the
-# 150 finished-but-locked legacy trees on the Studio. A younger `initializing` lock holds.
+# Rule 3 is the proof that the checkout finished. `git worktree add` writes the admin dir's index through
+# index.lock: for the whole checkout the admin dir has index.lock and no index, and the index appears (by rename)
+# only once every file is written (measured: Studio git 2.53.0, a smudge filter sleeping per file, the admin dir
+# sampled every 0.5 s; test_a_running_add_is_held_on_rule_3_at_every_sample repeats it in CI on Linux, and the
+# pool hosts ace-ai, ace-media and ci-box run git 2.53.0). What can remain after rule 3 holds is the unlock of
+# `initializing`; rule 4's age is margin for that instant between the index rename and the unlock, not the proof.
+# A tree with an index, no index.lock and an old `initializing` lock is one whose add was killed in that instant
+# (the 150 finished-but-locked legacy trees on the Studio). Limit: the gate reasons about adds this dispatcher runs;
+# an add started by another tool with a post-checkout hook that runs longer than 2 x ADD_TIMEOUT_S is not covered.
+# A leftover index.lock holds its tree with no age-out (git itself refuses to work there): that hold needs an
+# operator.
 # Any read error, including "does not exist" on a file a rule needs, is not proof. A main checkout (.git is a
-# directory) is not a linked tree: main's behaviour is kept.
+# directory by lstat) is not a linked tree: main's behaviour is kept.
 
 UNPROVEN_HELD = "unproven_worktree_held"
 INIT_LOCK = b"initializing"
@@ -108,7 +117,7 @@ def _err(exc: OSError) -> str:
 
 def _pointed(base: str, raw: bytes) -> str:
     """The path in a gitfile / gitdir entry; a relative entry is relative to ``base`` (``--relative-paths``)."""
-    p = os.fsdecode(raw.strip())
+    p = os.fsdecode(raw.rstrip(b"\r\n"))       # line terminators only: a path may end in a space
     return p if os.path.isabs(p) else os.path.join(base, p)
 
 
@@ -120,22 +129,25 @@ def unproven(tree: "os.PathLike[str] | str") -> "str | None":
     tree = os.fspath(tree)
     dot = os.path.join(tree, ".git")
     try:
-        if _stat.S_ISDIR(os.stat(dot).st_mode):
+        mode = os.lstat(dot).st_mode
+        if _stat.S_ISDIR(mode):
             return None                                             # a main checkout: main's guards apply
+        if not _stat.S_ISREG(mode):
+            return f"rule 1: {dot} is not a regular file"
         with open(dot, "rb") as fh:
             raw = fh.read()
     except OSError as exc:
         return f"rule 1: {dot} unreadable ({_err(exc)})"
-    raw = raw.lstrip(b"\xef\xbb\xbf").strip()
-    if not raw.startswith(b"gitdir:") or not raw[len(b"gitdir:"):].strip():
+    raw = raw.lstrip(b"\xef\xbb\xbf").rstrip(b"\r\n")
+    if not raw.startswith(b"gitdir: ") or not raw[len(b"gitdir: "):]:      # git's own read_gitfile format
         return f"rule 1: {dot} is not a gitfile"
-    admin = _pointed(tree, raw[len(b"gitdir:"):])
+    admin = _pointed(tree, raw[len(b"gitdir: "):])
 
     backlink = os.path.join(admin, "gitdir")
     try:
         with open(backlink, "rb") as fh:
             back = _pointed(admin, fh.read())
-        same = os.path.samefile(back, dot)
+        same = os.path.samefile(back, dot) and os.path.samefile(os.path.dirname(back), tree)
     except OSError as exc:
         return f"rule 2: backlink {backlink} unresolvable ({_err(exc)})"
     if not same:
