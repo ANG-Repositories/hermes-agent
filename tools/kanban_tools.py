@@ -14,6 +14,7 @@ import os
 import contextlib
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from agent.redact import redact_sensitive_json, redact_sensitive_text
@@ -23,7 +24,7 @@ from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
-    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENT_READ_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
@@ -1448,6 +1449,80 @@ def _handle_attachments(args: dict, **kw) -> str:
                 _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
 
 
+# One read returns at most this many bytes. Base64 of 64 KiB is ~87K chars, under the
+# 100K-char default tool-result budget, so the reply is never spilled to a host file
+# a pool-host worker cannot open (t_0fc58360).
+KANBAN_ATTACHMENT_READ_MAX_BYTES = 64 * 1024
+
+
+def _readable_task_ids(kb, conn, own_tid: str) -> set[str]:
+    """Cards a dispatcher-owned worker may read attachment bytes from: its own card
+    and its direct parents (handoff files)."""
+    return {own_tid, *kb.parent_ids(conn, own_tid)}
+
+
+@_kanban_handler("kanban_attachment_read")
+def _handle_attachment_read(args: dict, **kw) -> str:
+    """Return one attachment's bytes through the board connection, so a worker whose
+    terminal runs on a pool host can read what it cannot reach by ``stored_path``.
+    The file is located from the DB row only; no caller path is ever opened."""
+    import base64
+    import hashlib
+    raw_id = args.get("attachment_id")
+    try:
+        att_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise _Reject("attachment_id is required (an integer from kanban_attachments)")
+    encoding = str(args.get("encoding") or "auto").strip().lower()
+    _check(encoding in ("auto", "base64"), "encoding must be 'auto' or 'base64'")
+    tid = _require_task_id(args)
+    owned = _owned_worker_task_id()
+    with _board(args.get("board"), verb="attachment_read", card_ids=(tid,)) as (kb, conn):
+        _existing_task(kb, conn, tid)
+        if owned:
+            allowed = _readable_task_ids(kb, conn, owned)
+            _check(tid in allowed,
+                   f"kanban_attachment_read refused: a worker on {owned} may read attachments of its "
+                   f"own card and its parents ({', '.join(sorted(allowed))}), not {tid}")
+        att = kb.get_attachment(conn, att_id)
+        _check(att is not None and att.task_id == tid,
+               f"attachment {att_id} is not an attachment of {tid}")
+        # The row's path must resolve inside the card's own attachments dir.
+        base = kb.task_attachments_dir(tid).resolve()
+        try:
+            path = Path(att.stored_path).resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise _Reject(f"attachment {att_id} of {tid}: stored file is missing on the board host")
+        _check(path.is_relative_to(base) and path.is_file(),
+               f"attachment {att_id} of {tid}: stored file is not inside the card's attachments "
+               "directory; refusing to read it")
+    size = path.stat().st_size
+    cap = KANBAN_ATTACHMENT_READ_MAX_BYTES
+    _check(size <= cap,
+           f"attachment {att_id} ({att.filename}) is {size} bytes, over the "
+           f"{cap}-byte kanban_attachment_read cap; nothing returned")
+    with open(path, "rb") as fh:
+        data = fh.read(cap + 1)
+    _check(len(data) <= cap,
+           f"attachment {att_id} ({att.filename}) is {len(data)}+ bytes, over the "
+           f"{cap}-byte kanban_attachment_read cap; nothing returned")
+    out: dict[str, Any] = {
+        "task_id": tid, "attachment_id": att_id, "filename": att.filename,
+        "content_type": att.content_type, "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest()}
+    text = None
+    if encoding == "auto":
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+    if text is not None:
+        out.update(encoding="utf-8", text=text)
+    else:
+        out.update(encoding="base64", content_base64=base64.b64encode(data).decode("ascii"))
+    return _ok(**out)
+
+
 def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
     """Return a session id only when it is present in this profile's state.db."""
     if not session_id:
@@ -1963,6 +2038,7 @@ _TOOLS = (
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
+    ("kanban_attachment_read", KANBAN_ATTACHMENT_READ_SCHEMA, _handle_attachment_read, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _with_mutation_actor(_handle_unblock), "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _with_mutation_actor(_handle_link), "🔗"))
