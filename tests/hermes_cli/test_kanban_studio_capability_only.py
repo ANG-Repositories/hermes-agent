@@ -441,22 +441,32 @@ def test_over_limit_without_clones_waits_named(kanban_home, small_carry):
 
 def test_over_limit_spawn_carries_minus_clones_then_reclones_on_the_host(kanban_home, small_carry, monkeypatch):
     monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
-    calls = []
+    calls, rids = [], []
     monkeypatch.setattr(kwh, "carry_workspace",
                         lambda host, ws, runner=None, exclude=(): calls.append(("carry", host.name, ws, exclude)))
     monkeypatch.setattr(kwh, "carry_clones",
-                        lambda host, ws, clones, fleet_dir, runner=None: calls.append(
-                            ("clone", host.name, ws, [c["rel"] for c in clones])))
+                        lambda host, ws, clones, fleet_dir, runner=None, reservation=None: (calls.append(
+                            ("clone", host.name, ws, [c["rel"] for c in clones])), rids.append(reservation)))
     with kb.connect_closing() as conn:
         tid, path = _card_with_files(conn)
         sha = _clone_in(path)
         plan = _plan(free=2)
         plan.default_remote = True
+        real_take = plan.take
+
+        def take(*a, **k):  # this fixture has no placement table, so book a stand-in reservation id
+            host = real_take(*a, **k)
+            if host is not None:
+                plan.last_reservation = "rid-booked-by-take"
+            return host
+        plan.take = take
         _res, spawned = _tick(conn, spillover=plan, spawn_limit=2)
         ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
                           (tid, kwh.CARRIED_EVENT)).fetchone()
     assert (tid, "ace-ai") in spawned and (tid, None) not in spawned, spawned
     assert calls == [("carry", "ace-ai", path, ("repo",)), ("clone", "ace-ai", path, ["repo"])], calls
+    # t_d2f06cf6: the rebuild (and its stash ssh) runs under the reservation take() booked for this spawn
+    assert rids == ["rid-booked-by-take"], rids
     assert json.loads(ev[0])["recloned"] == [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha}]
 
 
@@ -1398,7 +1408,8 @@ def _carry_one(kanban_home, ws, rel, runner):
     from tests.hermes_cli.test_kanban_worker_pool import _host
     rec, why = kwh.assess_clone(str(ws / rel), runner)
     assert why is None, why
-    kwh.carry_clones(_host(), str(ws), [{"rel": rel, **rec}], kanban_home / "fleet", runner=runner)
+    kwh.carry_clones(_host(), str(ws), [{"rel": rel, **rec}], kanban_home / "fleet", runner=runner,
+                     reservation="r-test")
     return rec
 
 
@@ -1444,6 +1455,26 @@ def test_pathspec_stash_after_a_symbolic_ref_branch_switch_restores(kanban_home,
     assert (dest / "a.txt").read_text() == "pathspec edit\n"
 
 
+def test_carry_stash_ssh_runs_under_the_card_reservation(kanban_home):
+    """The stash-store ssh is a spawn on the pool host: it carries the card's reservation (ALLOC_RESERVATION in its
+    env, the id take() booked) and takes none of its own. With no reservation it refuses before any ssh."""
+    from types import SimpleNamespace
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    seen = []
+
+    def runner(argv, **kw):
+        seen.append((argv, kw))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    entries = [("a" * 40, 0, "On main: keep")]
+    kwh.carry_stash(_host(), "/ws/repo", "/ws/repo", entries, "b" * 40, runner, bundle=b"x", reservation="r-123")
+    assert len(seen) == 1 and seen[0][0][0] == "ssh", seen
+    assert seen[0][1]["env"]["ALLOC_RESERVATION"] == "r-123"
+    seen.clear()
+    with pytest.raises(RuntimeError, match="no placement reservation"):
+        kwh.carry_stash(_host(), "/ws/repo", "/ws/repo", entries, "b" * 40, runner, bundle=b"x")
+    assert seen == []
+
+
 @pytest.mark.parametrize("where", ["bundle", "store"])
 def test_a_failed_stash_bundle_or_store_refuses_naming_the_entry(kanban_home, tmp_path, monkeypatch, where):
     """The only stash wait left: the bundle fails at the spawn-time check (nothing rebuilt or copied yet), or the
@@ -1470,7 +1501,8 @@ def test_a_failed_stash_bundle_or_store_refuses_naming_the_entry(kanban_home, tm
     rec, why = kwh.assess_clone(str(repo), runner)
     assert why is None, why
     with pytest.raises(RuntimeError, match="keep me"):
-        kwh.carry_clones(_host(), str(ws), [{"rel": "repo", **rec}], kanban_home / "fleet", runner=failing)
+        kwh.carry_clones(_host(), str(ws), [{"rel": "repo", **rec}], kanban_home / "fleet", runner=failing,
+                         reservation="r-test")
     assert cloned == []
     assert "keep me" in subprocess.run(["git", "-C", str(repo), "stash", "list"], capture_output=True,
                                        text=True, encoding="utf-8").stdout

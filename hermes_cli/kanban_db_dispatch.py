@@ -8703,7 +8703,7 @@ def _dispatch_once_locked(
                     if _split:
                         # t_9965b8d5: the clones the carry left out are rebuilt from origin, same branch + commit.
                         _kb._kwh.carry_clones(placed_host, str(workspace), _split["clones"],
-                                              _kb.kanban_home() / "fleet")
+                                              _kb.kanban_home() / "fleet", reservation=_rid)
                     with _kbc.write_txn(conn):
                         # "workspace" = the stored path at carry time, "path" = the spelling persisted just
                         # below; carried_host() binds on either (Prism 34bd0265a601).

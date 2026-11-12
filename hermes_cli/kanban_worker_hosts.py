@@ -1162,16 +1162,23 @@ def stash_store_script(dest: str, entries) -> str:
 
 
 def carry_stash(host: PoolHost, repo: str, dest: str, entries, head: str, runner: Callable = subprocess.run,
-                bundle: Optional[bytes] = None) -> None:
+                bundle: Optional[bytes] = None, reservation: Optional[str] = None) -> None:
     """Move the stash ``entries`` of the Studio checkout ``repo`` to the rebuilt clone at ``dest`` on ``host``:
     a bundle over the pool ssh (never GitHub), stored there with the original subjects, in order. Raises naming the
-    entries on any failure."""
+    entries on any failure.
+
+    ``reservation``: the id take() booked for this card on ``host`` (the dispatcher's ``_rid``). The store ssh runs
+    under it (ALLOC_RESERVATION in its env) and takes no reservation of its own; without one it refuses."""
     if not entries:
         return
+    if not reservation:
+        raise RuntimeError(f"stash carry to {host.name}: no placement reservation for this card; "
+                           f"{', '.join(map(_stash_label, entries))} not carried")
     payload = bundle if bundle is not None else stash_bundle(repo, entries, head, runner)
+    env = dict(os.environ, ALLOC_RESERVATION=str(reservation))
     try:
         proc = runner(_ssh_argv(host, stash_store_script(dest, entries)), input=payload, capture_output=True,
-                      timeout=CARRY_TIMEOUT_SECONDS)
+                      timeout=CARRY_TIMEOUT_SECONDS, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"stash carry to {host.name}: {', '.join(map(_stash_label, entries))}: {exc}")
     if getattr(proc, "returncode", 1) != 0:
@@ -1497,10 +1504,12 @@ def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable 
     return staged
 
 
-def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run) -> None:
+def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run,
+                 reservation: Optional[str] = None) -> None:
     """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
     pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
-    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
+    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run).
+    ``reservation``: the card's reservation on ``host``, threaded to :func:`carry_stash`."""
     from hermes_cli import kanban_worktree_port as _kwt
     staged = carry_clones_check(host, workspace, clones, runner)
     for c, dest, ignored, (entries, bundle) in staged:
@@ -1523,7 +1532,7 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
                                    f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
         if entries:
             # t_d2f06cf6: the Studio checkout's stash entries, stored on the rebuilt clone in their original order
-            carry_stash(host, dest, dest, entries, c["sha"], runner, bundle=bundle)
+            carry_stash(host, dest, dest, entries, c["sha"], runner, bundle=bundle, reservation=reservation)
 
 
 def remote_workspace_has_content(placement_raw: Optional[str],
