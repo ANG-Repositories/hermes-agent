@@ -791,6 +791,43 @@ def split_worktree_loss(workspace: str, recs, runner: Callable = subprocess.run)
     return None
 
 
+def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
+    """None, or the reason a set-aside path carried AS FILES would arrive with a dangling git dir (Prism 805c10f0cb3d,
+    78347eb52e27). The carry copies the workspace to the SAME path on the pool host minus the ``rebuilt`` rels, so a
+    linked worktree in ``carried`` keeps a working ``.git`` only when its gitdir and common dir sit inside the
+    workspace and outside every rebuilt rel. A gitdir that no longer exists on the Studio (a dead stub) loses nothing
+    by the copy. Anything unreadable fails closed."""
+    try:
+        ws = os.path.realpath(workspace).rstrip("/") + "/"
+        gone = tuple(os.path.realpath(os.path.join(workspace, r)).rstrip("/") + "/" for r in rebuilt)
+    except (OSError, ValueError):
+        return "workspace unreadable"
+
+    def _travels(p: str) -> bool:
+        p = p.rstrip("/") + "/"
+        return p.startswith(ws) and not any(p.startswith(g) for g in gone)
+    for rel in carried:
+        wt = os.path.join(workspace, rel)
+        if not _is_linked_worktree(wt):
+            continue
+        try:
+            with open(os.path.join(wt, ".git"), encoding="utf-8-sig") as f:
+                gitdir = os.path.realpath(os.path.join(wt, f.read(4096).strip()[8:]))
+            if not os.path.isdir(gitdir):
+                continue  # dead stub: git already cannot use it on the Studio; the files are all there is
+            common = gitdir
+            if os.path.isfile(os.path.join(gitdir, "commondir")):
+                with open(os.path.join(gitdir, "commondir"), encoding="utf-8-sig") as f:
+                    common = os.path.realpath(os.path.join(gitdir, f.read().strip()))
+        except (OSError, UnicodeError, ValueError):
+            return f"worktree {rel}: git dir unreadable"
+        for p in (gitdir, common):
+            if not _travels(p):
+                return (f"worktree {rel} is carried as files but its git dir {p} does not travel with it "
+                        f"(outside the workspace or in a rebuilt clone)")
+    return None
+
+
 def carry_split_setaside(path: Optional[str]) -> Tuple[str, ...]:
     """Every clone and linked-worktree rel the last split census of ``path`` set aside (operator F3: one that is
     not rebuilt is carried as files and counted, so the spawn re-check needs the whole list)."""
@@ -1210,6 +1247,9 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
     lost = split_worktree_loss(workspace, clones, runner)
     if lost is not None:
         raise RuntimeError(f"carry to {host.name}: {lost}")  # t_d2f06cf6: re-checked uncached, before any push
+    dangling = carried_gitdir_loss(workspace, sorted(set(carry_split_setaside(workspace)) - rebuilt), rebuilt)
+    if dangling is not None:
+        raise RuntimeError(f"carry to {host.name}: {dangling}")  # Prism 805c10f0cb3d: re-read before any push
     if extra_entries or set(carry_split_setaside(workspace)) - rebuilt:
         # Review F3 (22:1x): the spawn-time list gets the routing's caps again; a file that grew or appeared since
         # routing can push the carry over, and then the spawn fails with the same named reason the wait line uses.

@@ -5700,6 +5700,9 @@ def _carry_split_plan(workspace_path, carry_budget):
     lost = _kb._kwh.split_worktree_loss(workspace_path, recs)
     if lost is not None:
         return None, f"over the carry limit; {lost}"
+    dangling = _kb._kwh.carried_gitdir_loss(workspace_path, [c for c in clones if c not in rebuilt], rebuilt)
+    if dangling is not None:  # Prism 805c10f0cb3d / 78347eb52e27
+        return None, f"over the carry limit; {dangling}"
     return {"exclude": tuple(c for c in clones if c in rebuilt), "clones": recs}, None
 
 

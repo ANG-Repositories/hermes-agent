@@ -880,9 +880,10 @@ def test_unrecoverable_small_linked_worktree_of_a_rebuilt_clone_waits(kanban_hom
     assert "holds the git state of worktree mainwt" in route[1], route
 
 
-def test_unrecoverable_small_worktree_whose_clone_is_outside_is_carried_as_files(kanban_home, wt_carry, tmp_path):
-    """Its main checkout (and gitdir) stays on the Studio untouched; the dirty worktree's files ride the carry and
-    count, while the clone next to it is rebuilt."""
+def test_unrecoverable_small_worktree_whose_clone_is_outside_waits_dangling_gitdir(kanban_home, wt_carry, tmp_path):
+    """Prism 805c10f0cb3d: its gitdir stays on the Studio outside the workspace, so carried as files it would land on
+    the pool host with a ``.git`` naming a gitdir that is not there (index and history lost). The card waits,
+    named, even though a rebuildable clone next to it would have fit the caps."""
     import shutil
     import subprocess
     from pathlib import Path
@@ -897,8 +898,8 @@ def test_unrecoverable_small_worktree_whose_clone_is_outside_is_carried_as_files
         subprocess.run(["git", "-C", str(outside / "repo"), "worktree", "repair", str(Path(path) / "wt")],
                        check=True, capture_output=True)
         route, plan = _route_carry(conn, tid)
-    assert route[0] != "wait", route
-    assert plan["exclude"] == ("repo",) and [c["rel"] for c in plan["clones"]] == ["repo"], plan
+    assert plan is None and route[0] == "wait", route
+    assert "worktree wt is carried as files but its git dir" in route[1], route
 
 
 def test_linked_worktree_ahead_on_its_branch_is_pushed_first(kanban_home, wt_carry):
@@ -938,6 +939,8 @@ def test_spawn_recheck_counts_an_unrebuilt_worktree(kanban_home, wt_carry, monke
     assert "worktree mainwt" in (kwh.carry_split_fits(path, room, 0, rebuilt={"repo"}) or ""), "worktree not counted"
     monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: None)
     monkeypatch.setattr(kwh, "clone_ignored_files", lambda *a, **k: ())
+    # this test is the cap re-walk; the outside gitdir's own refusal is test_carry_clones_refuses_a_dangling_gitdir
+    monkeypatch.setattr(kwh, "carried_gitdir_loss", lambda *a, **k: None)
     clone = [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha, "push": None, "ignored": ()}]
     kwh.carry_clones(_host(), path, clone, kanban_home / "fleet")
     (Path(path) / "mainwt" / "grown.bin").write_bytes(b"g" * 40000)  # grew since routing: the spawn re-walk sees it
@@ -1121,3 +1124,79 @@ def test_unfinished_worktree_census_waits_with_a_resume_reason(kanban_home, wt_c
     monkeypatch.setattr(kwh, "worktree_usage", real)
     assert plan is None and route[0] == "wait", route
     assert "worktree mainwt (detached_head)" in route[1] and "resumes next tick" in route[1], route
+
+
+# -- 1e. Prism at c3349653f7b3: a worktree carried as files must not land with a dangling gitdir ---------------------
+# The carry copies the workspace to the SAME path on the pool host, minus the rebuilt rels. A worktree carried as files
+# keeps a working .git only when its gitdir and common dir travel with it: inside the workspace, not in a rebuilt clone.
+
+def test_dirty_clone_and_its_dirty_worktree_both_carried_keep_their_gitdir(kanban_home, small_carry, monkeypatch):
+    """Prism 78347eb52e27: a dirty clone and its dirty linked worktree, both carried as files. The worktree's gitdir
+    lies inside the carried clone's .git, at the same absolute path on the pool host, so nothing dangles: it moves
+    (a rebuildable clone beside them is rebuilt)."""
+    from pathlib import Path
+    monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_bytes", 1 << 20)
+    monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_bytes", 1 << 20)
+    kwh._worktree_usage_cache.clear()
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path, "big")
+        sub = Path(path) / "d"
+        sub.mkdir()
+        _clone_in(sub)
+        _worktree_of(sub, "w", dirty=True, size=10)
+        (sub / "repo" / "wip.txt").write_text("dirty\n")
+        assert kwh.carried_gitdir_loss(path, ["d/repo", "d/w"], set()) is None
+        # entry cap: the remainder plus the two carried checkouts fit, the rebuildable clone on top does not
+        kwh._carry_scan_cache.clear()
+        assert kwh.carry_split(path, max_entries=100000) is not None
+        root = __import__("hermes_cli.kanban_db_workspace", fromlist=["canon"]).canon(path)
+        rest = kwh._carry_split_usage[root][1]
+        carried = sum(kwh.worktree_usage(str(Path(path) / r), max_bytes=1 << 30, max_entries=1 << 30, fresh=True)[1]
+                      for r in ("d/repo", "d/w"))
+        cap = rest + carried + 5
+        assert not kwh.carry_size_ok(path, max_bytes=1 << 20, max_entries=cap)  # over without the split
+        kwh._carry_scan_cache.clear()
+        monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_entries", cap)
+        monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_entries", cap)
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait", route
+    assert [c["rel"] for c in plan["clones"]] == ["big"] and plan["exclude"] == ("big",), plan
+
+
+def test_dead_worktree_stub_is_carried_as_files(tmp_path):
+    """A worktree whose gitdir no longer exists on the Studio (the t_94bd2ec4 mainwt shape) is already unusable as a
+    checkout there; its files are all there is, so carrying them loses nothing and is not refused."""
+    import shutil
+    _clone_in(tmp_path)
+    _worktree_of(tmp_path, detached=True, size=10)
+    assert "mainwt" in (kwh.carried_gitdir_loss(str(tmp_path), ["mainwt"], {"repo"}) or "")
+    shutil.rmtree(tmp_path / "repo" / ".git" / "worktrees" / "mainwt")
+    assert kwh.carried_gitdir_loss(str(tmp_path), ["mainwt"], {"repo"}) is None
+
+
+def test_carry_clones_refuses_a_dangling_gitdir(kanban_home, wt_carry, monkeypatch, tmp_path):
+    """Prism 805c10f0cb3d at spawn: the uncached re-check refuses before anything is pushed or rebuilt."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    with kb.connect_closing() as conn:
+        _tid, path = _card_with_files(conn)
+        sha = _clone_in(path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        _clone_in(outside)
+        _worktree_of(outside, "wt-elsewhere", dirty=True, size=100)
+        shutil.move(str(outside / "wt-elsewhere"), str(Path(path) / "mainwt"))
+        subprocess.run(["git", "-C", str(outside / "repo"), "worktree", "repair", str(Path(path) / "mainwt")],
+                       check=True, capture_output=True)
+    assert kwh.carry_split(path) == ("mainwt", "repo")
+    rebuilt = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: rebuilt.append(a))
+    monkeypatch.setattr(kwh, "clone_ignored_files", lambda *a, **k: ())
+    clone = [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha, "push": None, "ignored": ()}]
+    with pytest.raises(RuntimeError, match="worktree mainwt is carried as files but its git dir"):
+        kwh.carry_clones(_host(), path, clone, kanban_home / "fleet")
+    assert rebuilt == []
