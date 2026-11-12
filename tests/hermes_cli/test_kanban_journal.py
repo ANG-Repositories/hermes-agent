@@ -463,6 +463,9 @@ def test_replay_upserts_a_replaced_placement_by_run(journal_env, tmp_path, monke
     # A run with no prior row still inserts.
     _journal_at(kanban_journal, monkeypatch, base + 21, "bp", "t_p", "placement", {"run_id": 35, "host": "x"},
                 run_id=35)
+    # Another card's record that carries the same run id never matches t_p's row (lookup keyed by task + run).
+    _journal_at(kanban_journal, monkeypatch, base + 22, "bp", "t_q", "placement", {"run_id": 34, "host": "y"},
+                run_id=34)
 
     out = tmp_path / "out.db"
     kanban_journal_replay.replay_into("bp", snapshot, out, since=base)
@@ -471,8 +474,11 @@ def test_replay_upserts_a_replaced_placement_by_run(journal_env, tmp_path, monke
 
     for db in (out, again):
         rc = sqlite3.connect(str(db))
-        rows = rc.execute("SELECT run_id, payload FROM task_events WHERE kind = 'placement' "
+        rows = rc.execute("SELECT run_id, payload FROM task_events WHERE kind = 'placement' AND task_id = 't_p' "
                           "ORDER BY run_id, id").fetchall()
+        other = rc.execute("SELECT run_id, payload FROM task_events WHERE kind = 'placement' AND task_id = 't_q'"
+                           ).fetchall()
         rc.close()
         assert [r[0] for r in rows] == [34, 35], rows
+        assert [(r[0], json.loads(r[1])["host"]) for r in other] == [(34, "y")], other
         assert json.loads(rows[0][1]) == full

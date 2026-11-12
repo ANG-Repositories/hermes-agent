@@ -188,6 +188,25 @@ def test_adopt_then_set_without_run_id_replaces_the_placeholder(conn, monkeypatc
     assert _payload(conn, run_id, "placement")["host"] == "ace-ai"
 
 
+
+def test_adopt_then_a_launch_with_no_pid_leaves_one_full_placement(conn, monkeypatch):
+    """Prism-direct P1 (operator 01:4x 11-12): a spawn that reports no pid appended its record after a worker's
+    ``unrecorded`` placeholder, so the run had two placement rows, the placeholder first."""
+    tid = kb.create_task(conn, title="worker adopted, spawn returned no pid", assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    run_id = claimed.current_run_id
+    monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
+    assert kbd.adopt_worker_pid(conn, tid, run_id, 3333) is True
+    assert _payload(conn, run_id, "placement")["reason"] == "unrecorded"
+    monkeypatch.setattr(kbd, "_book_local_start", lambda *a: None)
+    monkeypatch.setattr("hermes_cli.kanban_continuation.record_placement", lambda *a: True)
+    full = {"run_id": run_id, "host": "ace-ai", "route_class": "local", "reason": "policy", "entry": "dispatch"}
+    assert kbd._launch_claimed(conn, claimed, "/scratch", board=None, spawn=lambda *a, **k: None,
+                               spawn_kwargs={}, host=None, pool=None, placement_record=lambda: dict(full),
+                               state=kbd._LaunchState()) == kbd._LAUNCH_OK
+    assert _kinds(conn, run_id).count("placement") == 1
+    assert _payload(conn, run_id, "placement") == full
+
 @pytest.mark.parametrize("where", ["record", "commit"])
 def test_a_lost_claim_returns_false_even_when_its_record_cannot_be_written(conn, monkeypatch, where):
     """Prism 5c5caf4aae3d / operator c-b6a31ddd13a9c5e9: the losing verdict must not depend on the audit write.
