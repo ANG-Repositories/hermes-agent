@@ -1596,7 +1596,17 @@ def _run_child_delegate(parent: Any, goal: str, mode: str) -> tuple:
     # from the placeholder final_response (also used by watchdogs and provider failures).
     if res.get("status") == "interrupted" and res.get("interrupt_message") == _INTERRUPT_REASON_STOP:
         return "stopped", "stopped by /stop"
+    if res.get("status") == "interrupted":
+        # ``summary`` of an interrupted child is its partial output (t_abf5cae7: a reason read
+        # "child interrupted: **Delegation ID ...**"); the cause is the message or the placeholder.
+        return "interrupted", str(res.get("interrupt_message") or res.get("error") or "no interrupt reason recorded")
     return str(res.get("status") or "failed"), str(res.get("summary") or res.get("error") or "")
+
+
+def _gateway_stopping(runner: Any) -> bool:
+    """The gateway is draining for a stop/restart: an interrupt now is the shutdown's, not a fault."""
+    event = getattr(runner, "_shutdown_event", None)
+    return getattr(runner, "_draining", False) is True or bool(event is not None and event.is_set())
 
 
 def find_live_child(delegation_id: str) -> Optional[dict]:
@@ -1688,6 +1698,13 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
                                                 "closed_at": _now_iso(), "reason": "completed"})
     except Exception as exc:
         logger.debug("kanban boomerang-wake: ledger close failed: %s", exc)
+    if status == "interrupted" and _gateway_stopping(runner):
+        # The shutdown cut the child (t_abf5cae7): leave the claim OPEN so the next boot's
+        # reconcile takes _restart_redispatch_or_lost (one retry, one INFO line), as for a kill.
+        await asyncio.to_thread(state.update_claim, key, interrupted_by_shutdown=True)
+        logger.info("kanban boomerang-wake: %s child interrupted by gateway shutdown; claim left open for "
+                    "the next boot delegation=%s", live["task_id"], live.get("delegation_id"))
+        return
     if status != "completed":
         reason = "stopped by /stop" if status == "stopped" else f"child {status}: {_first_line(final, 200)}"
         await _fail(runner, live, reason, state, fork_died=status != "stopped")
@@ -1973,6 +1990,8 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
         await deliver_handbacks(runner, state)
     except Exception as exc:
         logger.warning("kanban boomerang-wake: handback drain failed: %s", exc)
+    if _gateway_stopping(runner):
+        return 0   # a draining gateway's open claims belong to the next boot (t_abf5cae7)
     now = _time.time() if now is None else now
     handled = 0
     claims = await asyncio.to_thread(state.claims)
