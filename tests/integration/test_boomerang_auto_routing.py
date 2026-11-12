@@ -133,6 +133,7 @@ def test_automatic_wake_dispatch_to_executor(monkeypatch, tmp_path, scenario):
                     turns.append(a[2])
                     return True
                 monkeypatch.setattr("gateway.kanban_owner_wake.deliver_turn", accept_turn)
+                monkeypatch.setattr(wake, "BACKOFF_BASE_S", 0.0)   # t_827d5940: retry on the next tick
                 for _ in range(2):
                     asyncio.run(wake.reconcile(runner, state=state))
                 assert turns == ["original owner obligation"] * 2

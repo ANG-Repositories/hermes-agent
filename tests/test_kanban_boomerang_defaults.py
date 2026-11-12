@@ -16,6 +16,9 @@ def owner_scope(monkeypatch):
     from gateway import kanban_owner_wake as ow
     home = SimpleNamespace(origin=SimpleNamespace(chat_id="42", platform="discord"))
     monkeypatch.setattr(ow, "resolve_owner", lambda *a: home)
+    # t_827d5940: these tests retry on the very next tick; pacing is covered in
+    # tests/gateway/test_kanban_boomerang_wake_backoff.py.
+    monkeypatch.setattr(bw, "BACKOFF_BASE_S", 0.0, raising=False)
 
 
 @pytest.mark.parametrize("configured,explicit,worker,expected", [
