@@ -882,6 +882,13 @@ def _site_triggers():
         ctx["plan"] = None
         return "studio", "twin", "requires_unsatisfied:docker"
 
+    def no_plan_studio_deny(m, ctx):
+        # t_062a5948: with no pool plan, Studio default-deny holds a local start _route_row never classified.
+        m.setattr(kbd, "_studio_deny_unrouted", lambda conn, row, c, lane, da=None:
+                  "studio_default_deny:pool_unavailable (dispatch: no pool plan this tick)")
+        ctx["plan"] = None
+        return "studio", "twin", "studio_default_deny:pool_unavailable"
+
     def no_plan_origin(m, ctx):
         upd("UPDATE tasks SET origin_host='ace-ai' WHERE id=?", ctx)
         m.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"continuation": "enforce"}})
@@ -1192,6 +1199,7 @@ def _site_triggers():
         "rows: _identity_only_unplanned": no_plan_identity,
         "route: row_route.setdefault": no_plan_identity,
         "route: _origin_route or ('local', None)": no_plan_origin,
+        "route: ('wait', _held)": no_plan_studio_deny,
         "continue: wait is not None": route_row,
         "continue: _default_assignee and _default_assignee_resolved": unassigned,
         "continue: except Exception (try: _kbc.write_txn)": default_assignee_write,

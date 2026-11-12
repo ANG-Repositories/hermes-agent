@@ -5611,9 +5611,9 @@ def _studio_deny_unrouted(conn, row, ctx: dict, lane: str, default_assignee: Opt
             ctx["studio_on"] = _studio_capability_on(ctx["caps"], _studio_last_resort(_kb.kanban_home() / "fleet"))
     if not ctx["on"]:
         return None
+    stand_in = {"review": _ksa.REVIEW_CAP, "browser_join": _ksa.BROWSER_JOIN_CAP}.get(lane, _ksa.NO_PLAN_CAP)
     return _ksa.unrouted_hold(conn, row, ctx.get("caps"), studio_on=ctx.get("studio_on", False), kcfg=ctx["kcfg"],
-                              stand_in=_ksa.REVIEW_CAP if lane == "review" else _ksa.NO_PLAN_CAP,
-                              default_assignee=default_assignee)
+                              stand_in=stand_in, default_assignee=default_assignee)
 
 
 def _carry_split_plan(workspace_path, carry_budget):
@@ -8450,6 +8450,10 @@ def _dispatch_once_locked(
             # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
             # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
             _local_wait = _kph.local_destination_wait(_pause_cache)
+            if _local_wait is None and force_host is None and route == "portable":
+                # t_062a5948 (Prism 827ad8491946 r2): a portable row starts locally only when its browser join was
+                # cut for the Studio (_portable_goes_remote keeps it here); _route_row never classified it.
+                _local_wait = _studio_deny_unrouted(conn, row, _deny_ctx, "browser_join", default_assignee)
             if _local_wait is not None:
                 result.placement_waits[row["id"]] = _local_wait
                 continue
@@ -8872,12 +8876,6 @@ def _dispatch_once_locked(
             notify_starved_holds(conn, result.placement_waits, int(time.time()))
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban placement-starved notify failed: %s", exc)
-        try:
-            # t_062a5948: a Studio default-deny hold wakes the card's home session once, pages once at 60 min.
-            from hermes_cli.kanban_studio_allowlist import notify_holds
-            notify_holds(conn, result.placement_waits)
-        except Exception as exc:  # never break a dispatcher tick
-            _kb._log.warning("kanban studio default-deny notify failed: %s", exc)
     if result.unknown_pins:
         try:
             from hermes_cli.kanban_unknown_pin import park_unknown_pins
@@ -8887,6 +8885,7 @@ def _dispatch_once_locked(
             _kb._log.warning("kanban unknown-pin park failed: %s", exc)
     _tick_routes(result, ready_rows, row_route, row_rules, spillover is not None, dry_run)
 
+    _review_deny_waits: dict = {}  # t_062a5948: review-lane default-deny holds, persisted + notified after the loop
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
     # creating a PR.  The dispatcher spawns a review agent (loading
@@ -8990,6 +8989,7 @@ def _dispatch_once_locked(
             _deny_wait = _studio_deny_unrouted(conn, row, _deny_ctx, "review", default_assignee)
             if _deny_wait is not None:
                 result.placement_waits[row['id']] = _deny_wait
+                _review_deny_waits[row['id']] = _deny_wait
                 continue
         _dest_wait = (_kph.destination_wait(_review_origin_host.name, _pause_cache) if _review_origin_host is not None
                       else _kph.local_destination_wait(_pause_cache))
@@ -9216,6 +9216,20 @@ def _dispatch_once_locked(
     _lw.mark("review_decide")
     _lw.hold()
     if not dry_run:
+        # t_062a5948 (Prism 03ee93f37df3 / 8ba6f0531198): after BOTH lanes have collected their waits. A review-lane
+        # hold gets its own placement_wait row (the ready-lane writer ran before the review loop), then one
+        # wake per hold episode and one page at 60 min, as a ready-lane hold does.
+        if _review_deny_waits and not _review_dry:
+            import types as _types
+            _record_placement_waits(conn, _types.SimpleNamespace(placement_waits=_review_deny_waits,
+                                                                 placement_affinity={}, spawned=[]),
+                                    {}, dry_run)
+        if result.placement_waits:
+            try:
+                from hermes_cli.kanban_studio_allowlist import notify_holds
+                notify_holds(conn, result.placement_waits)
+            except Exception as exc:  # never break a dispatcher tick
+                _kb._log.warning("kanban studio default-deny notify failed: %s", exc)
         try:
             starved = find_priority_starved(conn, now=_tick_now)
             result.priority_starved = [

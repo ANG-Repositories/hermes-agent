@@ -78,3 +78,33 @@ def test_structural_rule_with_parenthesized_detail_needs_an_override():
     assert src == "structural"
     assert sddr.studio_only_cap(cap, frozenset())
     assert sddr.covered(cap, {"linked"}) and not sddr.covered(cap, {"profile"})
+
+
+def test_operator_exemption_is_byte_exact_as_the_live_rule(tmp_path):
+    """Prism 2b96aecfa7f7: ``Apollo`` is not the operator profile ``apollo`` in the live rule; the replay agrees."""
+    db, caps = _board(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute("UPDATE tasks SET assignee='Apollo' WHERE id='t_op'")
+    con.commit()
+    con.close()
+    only, _ = sddr.load_caps(caps)
+    rows, _m, _s = sddr.replay([str(db)], only, {"obsidian-vault"}, T0, T0 + 2 * 86400)
+    assert {(r["task_id"], r["run_id"]): r["verdict"] for r in rows}[("t_op", 5)] == "override"
+
+
+def test_local_review_placement_counts_as_a_studio_start(tmp_path):
+    """Prism 14e388fdd6ab: the review lane records ``{route_class: local, entry: review}`` with no host."""
+    db, caps = _board(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO tasks VALUES ('t_rev', 'r', 'daedalus', 0)")
+    con.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+                ("t_rev", 7, "placement", json.dumps({"route_class": "local", "entry": "review"}), T0 + 60))
+    con.commit()
+    con.close()
+    only, _ = sddr.load_caps(caps)
+    rows, _m, stuck = sddr.replay([str(db)], only, {"obsidian-vault"}, T0, T0 + 2 * 86400)
+    r = next(r for r in rows if r["task_id"] == "t_rev")
+    assert (r["cap"], r["verdict"]) == ("review_lane", "override")
+    assert "t_rev" in [s["task_id"] for s in stuck]
+    rows, _m, _s = sddr.replay([str(db)], only, {"review_lane"}, T0, T0 + 2 * 86400)
+    assert next(r for r in rows if r["task_id"] == "t_rev")["verdict"] == "allowlisted"

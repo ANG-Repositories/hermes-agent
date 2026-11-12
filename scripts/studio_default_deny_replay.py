@@ -58,12 +58,21 @@ PROPOSED = {
     "workspace_kind": ("deny", "a worktree that could not port: fix the port, not the host"),
     "host_reach": ("deny", "a target no pool host reaches yet: give a pool host the reach"),
     "workspace_bind": ("deny", "bound workspace: carry/port it"),
+    "review_lane": ("deny", "review runs only locally today: let the review lane place on the pool"),
 }
 
 
 def is_studio(host) -> bool:
     h = str(host or "").lower()
     return h.startswith("mac-studio") or h == "studio" or h.startswith("studio")
+
+
+def studio_start(p: dict) -> bool:
+    """A placement that started on the Studio: its host is the Studio, or (the review lane's record) it names no
+    host and ``route_class: local`` (local = the dispatcher's own host, the Studio). Prism 14e388fdd6ab."""
+    if is_studio(p.get("host")):
+        return True
+    return not p.get("host") and p.get("route_class") == "local"
 
 
 def load_caps(path: Path):
@@ -80,6 +89,8 @@ def capability_of(p: dict):
     sc = p.get("studio_capability")
     if isinstance(sc, dict) and sc.get("capability"):
         return str(sc["capability"]), str(sc.get("source") or "?")
+    if p.get("entry") == "review":
+        return "review_lane", "review"  # the live rule holds a review start under this stand-in
     rule = str(p.get("rule") or "")
     if rule.startswith("access_bound:"):
         return rule.split(":", 1)[1], "access-rule"
@@ -112,8 +123,8 @@ def studio_only_cap(cap, studio_only) -> bool:
     ps = [x.strip() for x in cap.split(",") if x.strip()]
     if any(head(x) in STRUCTURAL and head(x) not in ("local_files",) for x in ps):
         return True
-    if cap == "studio-needs":
-        return True  # body words meant a Studio resource; t_c82eded0 removes this source
+    if cap in ("studio-needs", "review_lane"):
+        return True  # body words meant a Studio resource (t_c82eded0 removes it); the review lane never leaves
     return any(x in studio_only for x in ps)
 
 
@@ -136,11 +147,12 @@ def replay(dbs, studio_only, allow, since, now):
                     p = json.loads(p)
             except (TypeError, ValueError):
                 continue
-            if not isinstance(p, dict) or not is_studio(p.get("host")):
+            if not isinstance(p, dict) or not studio_start(p):
                 continue
             t = tasks.get(ev["task_id"])
             cap, src = capability_of(p)
-            assignee = str((t["assignee"] if t else "") or "").lower()
+            # byte-exact, as the live rule compares (kanban_studio_allowlist.operator_only; Prism 2b96aecfa7f7)
+            assignee = str((t["assignee"] if t else "") or "")
             if t is not None and (t["no_worker"] or assignee in OPERATOR_PROFILES):
                 verdict = "exempt"
             elif studio_only_cap(cap, studio_only):

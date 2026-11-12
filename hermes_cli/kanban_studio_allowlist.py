@@ -58,6 +58,9 @@ LEDGER_FILE = "overrides.jsonl"
 # capability does: an unplanned tick (pool disabled/refused/empty) and the review lane (always local).
 NO_PLAN_CAP = "pool_unavailable"
 REVIEW_CAP = "review_lane"
+BROWSER_JOIN_CAP = "browser_join"  # a portable row kept on the Studio because its browser join was cut there
+_STAND_IN_EVIDENCE = {NO_PLAN_CAP: "no pool plan this tick", REVIEW_CAP: "the review lane runs only locally",
+                      BROWSER_JOIN_CAP: "its browser join was cut for the Studio"}
 
 
 def config(kcfg: Optional[Mapping]) -> tuple:
@@ -173,8 +176,7 @@ def unrouted_hold(conn, row, caps, *, studio_on: bool, kcfg: Optional[Mapping], 
         skills = ()
     why = _ksc.studio_capability(_khc.declared_words(row["body"]), skills, getattr(caps, "cmap", None))
     if why is None:
-        why = {"capability": stand_in, "source": "dispatch",
-               "evidence": "no pool plan this tick" if stand_in == NO_PLAN_CAP else "the review lane runs only locally"}
+        why = {"capability": stand_in, "source": "dispatch", "evidence": _STAND_IN_EVIDENCE.get(stand_in, stand_in)}
     return decide(conn, row, why, enabled=enabled, allow=allow, assignee=row["assignee"] or default_assignee)
 
 

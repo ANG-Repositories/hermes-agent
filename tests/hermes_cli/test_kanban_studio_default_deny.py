@@ -361,3 +361,44 @@ def test_structural_capability_with_parenthesized_detail_is_matched():
     """e3e (Prism) on #251: ``linked(derived-from->t_x)`` is the ``linked`` rule."""
     assert ksa.allowed("linked(derived-from->t_1234abcd)", {"linked"})
     assert ksa.head("linked(derived-from->t_1)") == "linked"
+
+
+# -- Prism r2 on #251: review-lane holds notified + persisted, browser-joined local starts --------------------------
+
+def test_review_lane_hold_wakes_and_persists_its_wait(kanban_home, monkeypatch):
+    """03ee93f37df3 / 8ba6f0531198: the notify pass ran before the review loop collected its holds."""
+    _cfg(kanban_home, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        tid = _review_card(conn)
+        _tick(conn, spillover=_plan(free=2), spawn_limit=2)
+        kinds = [k for (k,) in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
+        wait = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' "
+                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    assert kinds.count("mechanical_wake") == 1, kinds
+    assert wait is not None and json.loads(wait[0])["reason"].startswith("studio_default_deny:studio-state"), kinds
+
+
+def test_browser_joined_portable_local_start_is_held(kanban_home, monkeypatch):
+    """827ad8491946 (r2): a portable row whose browser join was cut for the Studio starts locally, past _route_row."""
+    _cfg(kanban_home, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+
+    def gate(conn, ready_rows, result, row_route, dry_run, default_assignee=None, **kw):
+        for r in ready_rows:
+            result.browser_joins[r["id"]] = {"plans": [{"host": "ci-box"}], "source_host": "studio"}
+
+    monkeypatch.setattr(kbd, "_browser_gate", gate)
+    monkeypatch.setattr(kbd, "_browser_join_lease", lambda conn, claimed, join, placed_host: ({}, None))
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, placement=None, browser_env=None):
+        spawned.append((task.id, placement.name if placement else "studio"))
+        return 4242
+
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="fix the lint")
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4, spawn_paused=None,
+                                spillover=_plan(free=2), reconcile_orphans=False)
+    assert (tid, "studio") not in spawned, spawned
+    assert res.placement_waits[tid].startswith("studio_default_deny:browser_join"), res.placement_waits
