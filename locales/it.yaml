@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "revisione in background"
   notice:
     uncompressed_context_overflow: "⚠️ Il contesto della sessione (~{tokens} token) supera la finestra di contesto del modello (~{context_length} token) con la compressione disattivata (compression.enabled: false). Usa /compact per comprimere la cronologia o attiva la compressione in config.yaml."
+    compression_store_unavailable: "⚠️ Il contesto supera la soglia di compressione (~{tokens} token >= {threshold}) ma la compressione non può essere eseguita: l'archivio di compattazione è danneggiato (errore del database). /compress usa lo stesso archivio e non aiuterà. Usa /new per avviare una nuova sessione."
 explainer:
   no_reply_prefix: "⚠️ Nessuna risposta: "
   empty_response: "{model} non ha prodotto una risposta questa volta, nemmeno dopo i tentativi ripetuti. Invia `continue` per riprovare, oppure cambia modello con /model."

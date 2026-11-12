@@ -3889,6 +3889,7 @@ display:
     aux_failure_label: "revue en arrière-plan"
   notice:
     uncompressed_context_overflow: "⚠️ Le contexte de session (~{tokens} tokens) dépasse la fenêtre de contexte du modèle (~{context_length} tokens) alors que la compression est désactivée (compression.enabled: false). Utilisez /compact pour compresser l'historique ou activez la compression dans config.yaml."
+    compression_store_unavailable: "⚠️ Le contexte dépasse le seuil de compression (~{tokens} tokens >= {threshold}) mais la compression ne peut pas s'exécuter : le stockage de compaction est endommagé (erreur de base de données). /compress utilise le même stockage et n'aidera pas. Utilisez /new pour démarrer une nouvelle session."
 explainer:
   no_reply_prefix: "⚠️ Pas de réponse : "
   empty_response: "{model} n'a produit aucune réponse cette fois, même après plusieurs tentatives. Envoyez `continue` pour réessayer, ou changez de modèle avec /model."
