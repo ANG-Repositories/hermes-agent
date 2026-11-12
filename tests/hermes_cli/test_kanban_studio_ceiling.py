@@ -77,34 +77,26 @@ def test_no_ceiling_configured_is_unchanged(ctx):
 
 
 def test_ceiling_is_read_from_the_table_on_every_tick(tmp_path, monkeypatch):
-    """Deliver 1: config in the fleet host table, read per tick (no restart)."""
-    from hermes_cli.fleet_placement import placement as pl
-    real = Path(pl.__file__).resolve().parents[2] / "tests"
-    src = None
-    for cand in sorted(real.rglob("fleet-hosts.json")):
-        try:
-            doc = json.loads(cand.read_text())
-        except ValueError:
-            continue
-        if any("local" in (h.get("aliases") or []) for h in doc.get("hosts", {}).values()):
-            src = doc
-            break
-    if src is None:
-        pytest.skip("no fixture fleet-hosts.json with a local alias in this tree")
-    hid = next(h for h, v in src["hosts"].items() if "local" in (v.get("aliases") or []))
+    """Deliver 1: config in the fleet host table (hosts.<studio>.consumers.kanban), read per tick, no restart."""
     monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))
-    table = tmp_path / pl.TABLE_REL
-    table.parent.mkdir(parents=True)
+    (tmp_path / "config").mkdir()
+    table = tmp_path / "config" / "fleet-hosts.json"
 
-    def write(ceiling):
-        row = src["hosts"][hid].setdefault("consumers", {})
-        row["kanban"] = {"eligible": True, "ceiling": ceiling}
-        table.write_text(json.dumps(src))
+    def write(kanban_row):
+        table.write_text(json.dumps({
+            "schema": 1, "default_first": "studio", "saturate_to": 1.0,
+            "footprints": {"kanban": {"ram_gb": 3, "threads": 1, "scratch_gb": 0, "gpu_mb": 0}},
+            "hosts": {"studio": {"aliases": ["local"], "cores": 24, "threads": 32, "mem_total_gb": 512,
+                                 "mem_reserve_gb": 128, "cores_reserve": 0, "consumers": {"kanban": kanban_row}}},
+        }), encoding="utf-8")
 
-    write(8)
-    assert klg.utilization_context()["ceiling"] == 8
-    write(2)
+    write({"eligible": True, "ceiling": 8, "_ceiling_reason": "backstop t_103a4648"})
+    c = klg.utilization_context()
+    assert (c["host"], c["ceiling"], c["ceiling_reason"]) == ("studio", 8, "backstop t_103a4648")
+    write({"eligible": True, "ceiling": 2})
     assert klg.utilization_context()["ceiling"] == 2
+    write({"_ceiling_removed": "no ceiling"})                  # today's live row: no ceiling at all
+    assert klg.utilization_context()["ceiling"] is None
 
 
 # -- the wait page ---------------------------------------------------------------------------------------------------

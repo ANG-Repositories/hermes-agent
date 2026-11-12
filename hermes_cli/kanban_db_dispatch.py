@@ -7095,6 +7095,7 @@ def _dispatch_once_locked(
     # operator-set ``asap`` cards on the local route may use that room; every other card waits. kanban admit
     # (skip_host_admission) skips the ceiling with the rest of host admission.
     _exempt_left = 0 if skip_host_admission else max(0, int(ceiling_exempt or 0))
+    _ceiling_cut = _exempt_left > 0   # the ceiling bound this tick: a local card left waiting is held by it
     _exempt_rows: set = set()
     if spawn_paused:
         result.spawn_paused = str(spawn_paused)
@@ -8104,7 +8105,7 @@ def _dispatch_once_locked(
             result.placement_waits[row["id"]] = (
                 record_only if record_only != "wall"
                 else _wall_reason(route, route_arg, spillover))
-            if record_only == "wall" and _exempt_left and route == "local":
+            if record_only == "wall" and _ceiling_cut and route == "local":
                 result.ceiling_held.append(row["id"])
             continue
         if spawn_budget is not None and spawned >= spawn_budget:
@@ -8127,7 +8128,7 @@ def _dispatch_once_locked(
         if not local_free and _asap_exempt:
             local_free = True
             _exempt_rows.add(row["id"])
-        elif not local_free and _exempt_left and route == "local":
+        elif not local_free and _ceiling_cut and route == "local":
             result.ceiling_held.append(row["id"])
         if route == "portable" and local_free and not _caps_out.get("only", {}).get(row["id"]):
             _portable_room.add(row["id"])
