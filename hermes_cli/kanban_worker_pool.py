@@ -1489,6 +1489,11 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
 
 # -- probe + plan -----------------------------------------------------------
 
+def host_threshold(ncpu: int, capacity_pct: float) -> float:
+    """Remote load1 bar: ONE encoding (I-7)."""
+    return capacity_pct * ncpu
+
+
 def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if host.ssh_port != 22:
@@ -2373,9 +2378,8 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
          signal: Optional[TargetSignal] = None,
          workspace_paths: Optional[Mapping[str, Sequence[str]]] = None) -> SpilloverPlan:
     """ONE plan per gateway tick. A host takes work only when it is active,
-    enabled, under its slots and reachable by the probe (I-3). There is no
-    private load bar (t_2158f095): FWA admits each take. A host with no free
-    slot or not active is not probed.
+    enabled, under its slots and probed under ``capacity_pct x ncpu`` (I-3).
+    A host with no free slot or not active is not probed.
 
     With ``signal`` the load bar is the host's published pressure band
     instead (admit_class's verdict, t_5d7e7171): a host is refused when its
@@ -2436,8 +2440,8 @@ def _plan_v01(hosts, running_by_host, *, probe, disabled, planned_at, config,
                 load1, ncpu, boards = sample.load1, sample.ncpu, sample.boards
             else:
                 load1, ncpu = sample
-            # No private load bar (t_2158f095, Ace msg 1569529863298359387): FWA is the ONE guard. load1/ncpu are
-            # reported in the plan detail only; a reachable host is admitted per take by may_start/allocd.
+            if load1 >= host_threshold(ncpu, h.capacity_pct):
+                free = 0
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": running, "load1": load1, "ncpu": ncpu,
@@ -2475,10 +2479,14 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     probed: Dict[str, dict] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = (UNCOUNTED_TICK_FREE if signal.allocd == "on" else count_free(h, running)) if (h.enabled and h.state == "active") else 0
-        sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
+        active = h.enabled and h.state == "active"
+        free = count_free(h, running) if active else 0
+        # allocd on: probe a host past its count too, so _take_allocd (structural_free) can ask allocd for it.
+        # plan.slots keeps the real count for every take that does not ask allocd (t_2158f095, Prism cba00e400ff4).
+        ask = free > 0 or (active and signal.allocd == "on")
+        sample = _probe_states(probe, h, ask, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
+               "band": None, "band_reason": "", "why": "", "probed": ask, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             if signal.placement_table is not None:
