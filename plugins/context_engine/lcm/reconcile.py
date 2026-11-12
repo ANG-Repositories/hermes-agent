@@ -59,6 +59,11 @@ _USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{
 _USER_ROW_DISCORD_NOTE_PREFIX = re.compile(
     r"^\[Triggering message id: `[^`\n]*` — use as `message_id` for reply/react/pin via the discord tools\.\](?:\n\n)?"
 )
+# Lines ingest_protection adds before </persisted-output> on the write path.
+_INLINE_PERSISTED_OUTPUT_METADATA_LINES = re.compile(
+    r"\r?\n\[LCM persisted-output (?:marker identity: preview_sha256=[0-9a-f]{64}"
+    r"|file generation: size=\d+; mtime_ns=\d+; ctime_ns=\d+)\](?=\r?\n(?:\[LCM persisted-output [^\r\n]*\]\r?\n)*</persisted-output>\s*$)"
+)
 _USER_ROW_WRAPPER_PREFIXES = (
     _USER_ROW_SYSTEM_NOTE_PREFIX,
     _USER_ROW_TIMESTAMP_PREFIX,
@@ -946,6 +951,16 @@ class ReconcileMixin:
                 if not self._effective_replay_identities(messages[:cursor])
                 else "replayed durable tail"
             )
+            if reason == "skipped scaffold-only prefix":
+                # A restarted gateway resumes a compacted session as
+                # [preserved-objective scaffold] + the stored tail it kept
+                # (t_17732be2: 13 of 18 sessions at the 10:39 boot). The
+                # scaffold proves nothing about the rows after it, so prove
+                # those the same way as a scaffold-free resume.
+                anchored = self._tool_call_anchored_replay_cursor(messages[cursor:], stored_rows)
+                if anchored > 0:
+                    cursor += anchored
+                    reason = "replayed history anchored on stored tool calls"
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason=reason,
@@ -1074,7 +1089,10 @@ class ReconcileMixin:
         repeated "[<timestamp>] proceed" answered identically). Nothing in the
         rows tells such a turn from a re-render of the stored one.
         """
-        stored_ids = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
+        stored_ids = [
+            self._strip_inline_persisted_output_metadata(self._message_replay_identity(row, stored_row=True))
+            for row in stored_rows
+        ]
         id_uses: dict[str, int] = {}
         for row in stored_rows:
             if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
@@ -1090,7 +1108,9 @@ class ReconcileMixin:
         offset = None
         for idx, msg in enumerate(messages):
             if str(msg.get("role") or "") == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
-                pos = stored_tool_pos.get(self._message_replay_identity(msg))
+                pos = stored_tool_pos.get(
+                    self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
+                )
                 if pos is not None:
                     offset = pos - idx
                     break
@@ -1105,7 +1125,7 @@ class ReconcileMixin:
             role = str(msg.get("role") or "")
             if role != str(stored_rows[pos].get("role") or ""):
                 break
-            identity = self._message_replay_identity(msg)
+            identity = self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
             if identity != stored_ids[pos]:
                 if role == "user" and self._user_row_rerender_key(identity[1]) in (
                     "", self._user_row_rerender_key(stored_ids[pos][1]),
@@ -1120,6 +1140,27 @@ class ReconcileMixin:
         if len(matched_ids) < 2:
             return 0
         return cursor
+
+    @staticmethod
+    def _strip_inline_persisted_output_metadata(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        """A tool row's identity without the lines the store's write path adds.
+
+        With large-output externalization off, the write path appends
+        ``[LCM persisted-output marker identity: preview_sha256=...]`` (a digest
+        of the marker's own preview) and may append a file-generation line to a
+        persisted-output marker (ingest_protection.py). The history a restarted
+        gateway resumes from carries the marker without them (t_17732be2,
+        session ..63465a4e at the 10:39 boot), so the anchored walk compares
+        both sides with those lines removed. The marker text itself, preview
+        included, must still be identical.
+        """
+        role, content, tool_call_id, tool_calls = identity
+        if role != "tool" or not isinstance(content, str) or "</persisted-output>" not in content:
+            return identity
+        stripped = _INLINE_PERSISTED_OUTPUT_METADATA_LINES.sub("", content)
+        return (role, stripped, tool_call_id, tool_calls)
 
     @staticmethod
     def _user_row_rerender_key(content: Any) -> str:
