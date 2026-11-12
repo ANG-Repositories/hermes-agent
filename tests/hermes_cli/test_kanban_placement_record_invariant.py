@@ -86,6 +86,33 @@ def test_worker_adopted_pid_writes_a_placement_when_the_dispatcher_wrote_none(co
     assert placed is not None and placed["entry"] == "worker_registered"
 
 
+def test_worker_registering_after_its_run_was_closed_records_placement_and_clears_class(conn, monkeypatch):
+    """Prism f065138133fd: claim R, close R mid-spawn, dispatcher dies before _set_worker_pid, worker starts."""
+    tid = kb.create_task(conn, title="dispatcher died, run closed, worker started anyway", assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    run_id = claimed.current_run_id
+    assert kb.schedule_task(conn, tid, reason="operator hold", wake_at=2_000_000_000) is True
+    assert _cls(conn, run_id) == "refused"
+    monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
+    assert kbd.adopt_worker_pid(conn, tid, run_id, 9191) is False
+    kinds = _kinds(conn, run_id)
+    assert "worker_registered" in kinds and kinds.count("placement") == 1
+    placed = _payload(conn, run_id, "placement")
+    assert placed["entry"] == "worker_registered" and placed["claim_lost"] is True
+    assert _payload(conn, run_id, "worker_registered")["claim_lost"] is True
+    assert _cls(conn, run_id) is None
+    # The card's pid is not touched by a losing worker.
+    assert conn.execute("SELECT worker_pid FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
+
+
+def test_worker_with_a_run_id_of_another_task_records_nothing(conn):
+    tid = kb.create_task(conn, title="a", assignee="worker")
+    other = kb.create_task(conn, title="b", assignee="worker")
+    run_id = kb.claim_task(conn, other).current_run_id
+    assert kbd.adopt_worker_pid(conn, tid, run_id, 9292) is False
+    assert "placement" not in _kinds(conn, run_id)
+
+
 def test_placement_is_never_written_twice_for_one_run(conn, monkeypatch):
     tid = kb.create_task(conn, title="adopt after a normal spawn", assignee="worker")
     claimed = kb.claim_task(conn, tid)

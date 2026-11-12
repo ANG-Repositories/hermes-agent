@@ -3654,6 +3654,7 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
         row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
                            (task_id,)).fetchone()
         if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
+            _record_losing_worker(conn, task_id, int(run_id), int(pid), started_at)
             return False
         # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
         if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
@@ -3670,6 +3671,26 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
             _kb._append_event(conn, task_id, PLACEMENT_EVENT,
                               _unrecorded_placement(conn, int(run_id), entry="worker_registered"), run_id=int(run_id))
     return True
+
+
+def _record_losing_worker(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int, started_at: str) -> None:
+    """A worker started on a run that no longer holds its card (closed while the spawn was in flight, and the
+    launcher died before ``_set_worker_pid``; Prism f065138133fd). Inside the caller's txn: record that the
+    process existed and where, against its own run only, and drop the no-worker class the close stamped. The
+    card's pid is left alone: a successor may own it."""
+    if conn.execute("SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?", (run_id, task_id)).fetchone() is None:
+        return
+    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ('spawned', 'worker_registered') LIMIT 1",
+                    (run_id,)).fetchone() is None:
+        _kb._append_event(conn, task_id, "worker_registered",
+                          {"pid": pid, "started_at": started_at, "claim_lost": True}, run_id=run_id)
+    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
+                    (run_id, PLACEMENT_EVENT)).fetchone() is None:
+        _kb._append_event(conn, task_id, PLACEMENT_EVENT,
+                          {**_unrecorded_placement(conn, run_id, entry="worker_registered"), "claim_lost": True},
+                          run_id=run_id)
+    conn.execute("UPDATE task_runs SET no_worker_class = NULL WHERE id = ?", (run_id,))
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
