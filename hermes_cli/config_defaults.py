@@ -2498,8 +2498,9 @@ DEFAULT_CONFIG = {
         # Empty = post in the subscriber's chat.
         "lifecycle_channel": "",
         # Seconds to batch lifecycle_channel lines into one digest post
-        # (0 = one post per line). The wake is never delayed.
-        "lifecycle_digest_seconds": 0,
+        # (0 = one post per line). The wake is never delayed. 1800 since r143
+        # (2026-11-11): at 0 #logs carried 1,728 single lifecycle lines in 48 h.
+        "lifecycle_digest_seconds": 1800,
         # With lifecycle_channel set: "channel" (default, t_eb8c6fd7, Ace
         # 2026-10-17: receipts go to #logs) sends every done / ready-for-review
         # / blocked line to lifecycle_channel. "home" (opt-in, t_808bc8e6)
