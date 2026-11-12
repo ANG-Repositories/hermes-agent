@@ -430,6 +430,47 @@ def skips_quota_gate(cls: str) -> bool:
     return cls not in QUOTA_GATE_CLASSES
 
 
+# t_d780729d: on a pooled relay lane the relay owns every seat's quota state. A
+# quota class there is cached locally only until the relay's own stated reset
+# (its Retry-After / reset_at), else for this short, fixed lifetime; it never
+# doubles and never takes the 6 h -> 24 h open-ended default. After it the
+# restore gate asks the relay (/eligibility) again.
+RELAY_QUOTA_CACHE_S = 5 * MIN
+RELAY_QUOTA_CLASSES = frozenset({"quota_seat", "quota_model"})
+
+
+def _relay_pooled(provider: Optional[str]) -> bool:
+    from agent.relay_lanes import is_relay_pooled
+
+    return is_relay_pooled(provider)
+
+
+def relay_quota_cooldown_s(cls: str, *, stated_reset_s: Optional[float] = None,
+                           retry_after_s: Optional[float] = None,
+                           window: Optional[str] = None) -> float:
+    """The relay's reset for this seat/model, capped at the class ceiling, else
+    :data:`RELAY_QUOTA_CACHE_S`."""
+    reset = next((float(v) for v in (stated_reset_s, retry_after_s)
+                  if isinstance(v, (int, float)) and v > 0), None)
+    if reset is None:
+        return RELAY_QUOTA_CACHE_S
+    if window == "7d":
+        ceiling = WINDOW_CEILING_7D_S
+    elif cls == "quota_seat":
+        ceiling = COOLDOWN_TABLE["quota_seat"].ceiling_s
+    else:
+        ceiling = WINDOW_CEILING_DEFAULT_S
+    return min(reset, ceiling)
+
+
+def skips_legacy_arm(cls: str, provider: Optional[str]) -> bool:
+    """Whether the per-agent ``_rate_limited_until`` bench is skipped. Besides
+    the class rule (:func:`skips_quota_gate`), a quota class on a pooled relay
+    lane never arms it: that bench escalates to 4 h on this lane name alone,
+    while the relay rotates the pool (t_d780729d)."""
+    return skips_quota_gate(cls) or (cls in RELAY_QUOTA_CLASSES and _relay_pooled(provider))
+
+
 def _load(store: StickyStore, key: StickyKey) -> Optional[StickyState]:
     try:
         return _store_mod.get(key, store)
@@ -452,9 +493,13 @@ def arm_sticky(store: StickyStore, key: StickyKey, *, cls: str, now: float,
         return None
     prev = _load(store, key)
     n = next_n(prev, cls, now)
-    cooldown = compute_cooldown_s(cls, n, stated_reset_s=stated_reset_s,
-                                  retry_after_s=retry_after_s, window=window,
-                                  jitter=default_jitter() if jitter is None else jitter)
+    jit = default_jitter() if jitter is None else jitter
+    if cls in RELAY_QUOTA_CLASSES and _relay_pooled(key.primary_provider):
+        cooldown = relay_quota_cooldown_s(cls, stated_reset_s=stated_reset_s,
+                                          retry_after_s=retry_after_s, window=window) * jit
+    else:
+        cooldown = compute_cooldown_s(cls, n, stated_reset_s=stated_reset_s,
+                                      retry_after_s=retry_after_s, window=window, jitter=jit)
     state = dataclasses.replace(prev) if prev is not None else StickyState()
     was_active = bool(prev and prev.active)
     state.primary_provider, state.primary_model = key.primary_provider, key.primary_model
@@ -767,6 +812,7 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
 
 
 BOX_FULL_REASON = "warm_seat: bound box full"
+RELAY_MODEL_INELIGIBLE_REASON = "relay: no seat eligible for the model"
 
 
 def _box_full(elig: Optional[Eligibility], verdict: Optional[str]) -> bool:
@@ -923,6 +969,16 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
         # verdict == "cap" (primary warm copy expired/absent) does NOT return
         # here: the fallback copy may still be warm, and D6 waits for
         # fallback_cold/compaction below (t_e001a935; no cap_expiry branch).
+        if (state.cls in RELAY_QUOTA_CLASSES and _relay_pooled(provider)
+                and eligibility is not None and not is_direct_pin(provider)):
+            # t_d780729d: the episode's quota verdict was only a short local cache;
+            # past it the relay's answer for this model decides. A relay that says
+            # no seat can serve the model keeps the session on its fallback (the
+            # cold/compaction branches below would only replay the refusal).
+            # Unreachable / stale -> None -> the branches below, unchanged.
+            elig = eligibility()
+            if elig is not None and not (elig.model_eligible or elig.bound_eligible):
+                return Decision(False, None, RELAY_MODEL_INELIGIBLE_REASON, exp, warm)
     last_fb = state.last_fallback_call_epoch
     if last_fb is None:
         last_fb = state.entered_at
