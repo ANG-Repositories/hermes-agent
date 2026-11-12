@@ -52,10 +52,6 @@ _FORKING_MODULES = {"ptyprocess", "pexpect", "multiprocessing"}
 
 # (path, enclosing qualname, kind) -> why this launch must keep forking.
 ALLOWED: dict[tuple[str, str, str], str] = {
-    ("hermes_cli/kanban_db_dispatch.py", "_default_spawn", "kwarg:preexec_fn"):
-        "kanban worker spawn: the preexec sets nice/SCHED_IDLE + RLIMIT_NPROC in the child before exec "
-        "(kanban_db._build_worker_priority_preexec, kanban_proc_bounds.chain_preexec); posix_spawn has "
-        "no attribute for either. Follow-up card moves it to a wrapper exec (taskpolicy/ulimit argv).",
     ("agent/shell_hook_dispatcher.py", "_start", "call:os.fork"):
         "runs inside the warm shell-hook dispatcher CHILD process (agent/shell_hooks_batch.py starts it "
         "with plain Popen, which the hook covers); forking that small interpreter is the design "
