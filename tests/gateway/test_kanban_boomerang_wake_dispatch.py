@@ -790,13 +790,72 @@ def test_child_stop_attribution_preserves_wake(env, stop):
     status, final = ah._run_child_delegate(object(), "goal", "fork")
     _run(env, entry, status, final)
     expected = (f"boomerang-wake stopped {tid}: stopped by /stop" if stop else
-                f"⚠️ boomerang-wake failed {tid}: child interrupted: {result['summary']}")
+                f"⚠️ boomerang-wake failed {tid}: child interrupted: provider watchdog")
     assert env["adapter"].sent == [expected]
     assert [event.text for event in env["adapter"].handled] == [entry["wake_text"]]
     claim = ah.BoomerangWakeState().get_claim(entry["key"])
     assert claim is not None
     assert claim["outcome"] == ("stopped" if stop else "failed")
     assert claim["resurface_delivered"] is True
+
+
+@pytest.mark.parametrize("how", ["draining", "shutdown_event"])
+def test_shutdown_interrupted_child_leaves_claim_open_then_redispatches_on_next_boot(env, caplog, how):
+    """t_abf5cae7: a drain-timeout interrupt is the restart's, not a child fault. No warning line,
+    no re-delivered wake, the claim stays open; the next boot's reconcile redispatches it once."""
+    from tools import delegate_tool
+    from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART
+
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    result = {"status": "interrupted", "summary": "**Delegation ID `del-0001`** partial child output",
+              "interrupt_message": _INTERRUPT_REASON_GATEWAY_RESTART}
+    env["monkeypatch"].setattr(delegate_tool, "delegate_task", lambda **_kw: json.dumps({"results": [result]}))
+    status, final = ah._run_child_delegate(object(), "goal", "fork")
+    assert (status, final) == ("interrupted", _INTERRUPT_REASON_GATEWAY_RESTART)
+    runner = env["runner"]
+    if how == "draining":
+        runner._draining = True
+    else:
+        runner._shutdown_event = asyncio.Event()
+        runner._shutdown_event.set()
+    with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
+        _run(env, entry, status, final)
+        assert asyncio.run(ah.reconcile(runner)) == 0, "the draining gateway must leave the claim to the next boot"
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] in ah.OPEN_STATES and not claim["resurfaced"] and claim["interrupted_by_shutdown"]
+    assert env["adapter"].sent == [] and env["adapter"].handled == []
+    # next boot: fresh runner state, the child is gone from the in-process registry
+    runner._draining = False
+    runner._shutdown_event = asyncio.Event()
+    _kill(env, entry)
+    with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
+        assert asyncio.run(ah.reconcile(runner)) == 1
+    state = ah.BoomerangWakeState()
+    old = state.get_claim(entry["key"])
+    assert old["state"] == ah.STATE_TERMINAL and old["outcome"] == "redispatched_after_restart"
+    assert state.retries(tid) == 1 and len(env["dispatched"]) == 2
+    assert env["adapter"].sent == [] and env["adapter"].handled == []
+    assert sum("redispatched after gateway restart" in r.getMessage() for r in caplog.records) == 1
+    assert not any("del-0001" in str(v) for v in old.values())
+
+
+def test_interrupt_outside_shutdown_still_fails_without_partial_output(env):
+    """Watchdog/provider interrupts keep today's failed + warning path; the reason names the cause,
+    never the child's partial output, and is never empty."""
+    from tools import delegate_tool
+
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    result = {"status": "interrupted", "summary": "**Delegation ID `del-0002`** partial"}
+    env["monkeypatch"].setattr(delegate_tool, "delegate_task", lambda **_kw: json.dumps({"results": [result]}))
+    status, final = ah._run_child_delegate(object(), "goal", "fork")
+    _run(env, entry, status, final)
+    assert env["adapter"].sent == [f"⚠️ boomerang-wake failed {tid}: child interrupted: no interrupt reason recorded"]
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["outcome"] == "failed" and "del-0002" not in claim["reason"]
 
 
 def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):

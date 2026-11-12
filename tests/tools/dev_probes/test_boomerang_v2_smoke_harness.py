@@ -175,6 +175,21 @@ def test_step4_redispatch_arm_fails_without_the_redispatch_line(env, monkeypatch
     assert "redispatched after gateway restart` | FAIL" in text
 
 
+def test_step4_redispatch_arm_fails_on_a_failed_line(env, monkeypatch):
+    """t_abf5cae7: a drain-timeout interrupt recorded as `failed` posts a warning; the arm fails on it."""
+    rc, text = _step4_with(env, monkeypatch, add_chat=[
+        (1792379745.0, "\u26a0\ufe0f boomerang-wake failed t_5m0ce007: child interrupted: Gateway restarting")])
+    assert rc == 1
+    assert "ZERO `warning boomerang-wake failed t_5m0ce007` lines in the origin chat | FAIL" in text
+
+
+def test_step4_redispatch_arm_without_the_shutdown_interrupt_is_incomplete(env, monkeypatch):
+    """No `child interrupted by gateway shutdown` line = the drain never cut the child mid-call."""
+    rc, text = _step4_with(env, monkeypatch, drop_log=["t_5m0ce007 child interrupted by gateway shutdown"])
+    assert rc != 0
+    assert "child interrupted by gateway shutdown` (drain timeout cut it) | INCOMPLETE" in text
+
+
 def test_step4_redispatch_arm_fails_on_any_lost_line(env, monkeypatch):
     """t_870c1fba: a redispatched card posts NOTHING to chat; one `lost` line fails the arm."""
     rc, text = _step4_with(env, monkeypatch, add_chat=[

@@ -1246,6 +1246,19 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
         return
     card, restart_ts, first = cut
     after = restart_ts if ctx.live else None
+    # t_abf5cae7: a drain timeout interrupts the child mid-call. The old boot must leave its claim open
+    # (one INFO line, no `failed` warning) so the redispatch below is the restart path, not a hard kill.
+    re_cut = re.compile(ctx.plan["expect"]["shutdown_interrupt_log_regex"].format(card=re.escape(card)))
+    cut_line = find_log(log, re_cut)
+    rep.check(f"{arm}: old boot logged `{card} child interrupted by gateway shutdown` (drain timeout cut it)",
+              PASS if cut_line else INCOMPLETE,
+              cut_line or "absent: the drain did not time out on the child (set the scratch gateway's "
+                          "restart_drain_timeout below the child's runtime), so this run did not cover the case")
+    if cut_line:
+        rep.raw.append(f"--- log match ({arm})\n{cut_line}")
+    failed = find_chat(chat, re_failed_line(card))
+    rep.check(f"{arm}: ZERO `warning boomerang-wake failed {card}` lines in the origin chat",
+              FAIL if failed else PASS, failed.content if failed else "none")
     re_redis = re.compile(ctx.plan["expect"]["redispatch_log_regex"].format(card=re.escape(card)))
     redis = ctx.poll(lambda: find_log(log, re_redis, after_ts=after), _first_tick(ctx))
     rep.check(f"{arm}: gateway.log INFO `kanban boomerang-wake: {card} redispatched after gateway restart`",

@@ -33,6 +33,7 @@
     "restart_log_regex": "Gateway running with \\d+ platform",
     "resurface_log_regex": "kanban boomerang-wake: {card} lost reason=gateway restart, retry spent resurfaced delivered=(?P<delivered>\\w+)",
     "redispatch_log_regex": "kanban boomerang-wake: {card} redispatched after gateway restart \\(retry \\d+/\\d+\\) delegation=(?P<delegation>\\S+)",
+    "shutdown_interrupt_log_regex": "kanban boomerang-wake: {card} child interrupted by gateway shutdown; claim left open",
     "handled_log_regex": "kanban boomerang-wake: {card} handled action=\\S+ delegation=(?P<delegation>\\S+)",
     "resurface_wake_log_regex": "inbound message: .*msg=.\\[kanban\\] Task {card}\\b"
   },
