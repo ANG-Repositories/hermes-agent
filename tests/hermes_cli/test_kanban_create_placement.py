@@ -66,6 +66,24 @@ def test_a_structural_studio_reason_is_named(kanban_home, pool):
     assert "rule profile" in line, line
 
 
+def test_a_fleet_pause_hold_says_the_card_waits_not_a_host(kanban_home, pool, monkeypatch):
+    """A held route never reaches _route_row's origin step; the line says it is held, not a host it won't run on."""
+    from hermes_cli import kanban_pause_hold as kph
+    seen = {}
+
+    def held(rows, cache):
+        seen["ids"] = [r["id"] for r in rows]
+        return {r["id"]: ("wait", "fleet_pause:ace-ai") for r in rows}
+
+    monkeypatch.setattr(kph, "held_routes", held)
+    with kb.connect_closing() as conn:
+        tid, line = _line(conn, "host: ace-ai\nfix the lint")
+    assert seen["ids"] == [tid]
+    assert line.startswith("will wait (fleet_pause:ace-ai)"), line
+    assert "fleet pause hold" in line, line
+    assert "will run on" not in line, line
+
+
 def test_preview_never_raises_and_writes_no_event(kanban_home, pool, monkeypatch):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="alpha", body="fix")

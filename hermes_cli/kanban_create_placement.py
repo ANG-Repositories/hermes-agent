@@ -84,12 +84,19 @@ def preview_line(conn, task_id: str) -> Optional[str]:
         caps = kbd._capability_tick(cfg)
         last_resort = kbd._studio_last_resort(kb.kanban_home() / "fleet")
         studio_on = kbd._studio_capability_on(caps, last_resort)
+        # Fleet pause hold first, as the dispatcher does (t_133d6efd): a held card is never handed to a route
+        # entry, and the line says it is held instead of naming a host it will not run on.
+        from hermes_cli import kanban_pause_hold as kph
+        pause_cache: dict = {}
+        held = kph.held_routes([row], pause_cache)
+        if task_id in held:
+            return f"will wait ({held[task_id][1]}), decided by: fleet pause hold"
         rules: dict = {}
         studio: dict = {}
         route, arg = kbd._route_row(
             conn, row, plan, None, {}, None, None, {}, unknown_out={}, caps=caps, caps_out={},
-            rules_out=rules, access_out={}, binds=kbd._workspace_binds(conn, [row], dry_run=True),
-            worktree_out={}, carry_out={}, pause_cache={}, studio_on=studio_on, studio_out=studio)
+            rules_out=rules, access_out={}, binds=kbd._workspace_binds(conn, [row], dry_run=True), held=held,
+            worktree_out={}, carry_out={}, pause_cache=pause_cache, studio_on=studio_on, studio_out=studio)
         body = row["body"] or ""
         rule = rules.get(task_id)
         if route == "portable":
