@@ -848,12 +848,18 @@ def launchd_restart():
         pid = get_running_pid()
         cooperative_restart = True
         if domain == "system":
-            # Only unconditional KeepAlive guarantees revival after a self-exit.
-            # Otherwise skip SIGUSR1 and use kickstart without changing the operator plist.
+            # Disk and loaded policy must both guarantee revival after a self-exit.
+            # Otherwise use kickstart without changing the operator plist.
             cooperative_restart = False
-            with contextlib.suppress(OSError, ValueError, plistlib.InvalidFileException):
+            with contextlib.suppress(OSError, ValueError, plistlib.InvalidFileException, subprocess.TimeoutExpired):
                 with _gw().get_launchd_service_plist().open("rb") as plist_file:
-                    cooperative_restart = plistlib.load(plist_file).get("KeepAlive") is True
+                    if plistlib.load(plist_file).get("KeepAlive") is True:
+                        output = _gw()._launchd_print_service_output(domain, label)
+                        cooperative_restart = any(
+                            line.strip().startswith("properties = ")
+                            and "keepalive" in {token.strip() for token in line.split("=", 1)[1].split("|")}
+                            for line in (output or "").splitlines()
+                        )
         if pid is not None and cooperative_restart and _gw()._request_gateway_self_restart(pid):
             _launchd_ok("✓ Service restart requested")
             return
