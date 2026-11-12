@@ -260,6 +260,29 @@ def replay_into(
             import json as _json
 
             pl = _json.dumps(payload, ensure_ascii=False) if payload else None
+            run_id = record.get("run_id")
+            if kind == "placement" and run_id is not None:
+                # One placement row per run, as ``_write_placement`` keeps it (t_4b313c15, Prism 12234d70b060):
+                # a full record replaces an ``unrecorded`` placeholder in place, any other prior record stands,
+                # and a run with no row gets one. A (task, kind, second) dedup would keep the placeholder or
+                # append a second row.
+                prior = conn.execute(
+                    "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? AND kind = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (int(run_id), kind),
+                ).fetchone()
+                if prior is not None:
+                    if prior[1] == "unrecorded" and payload.get("reason") != "unrecorded":
+                        conn.execute("UPDATE task_events SET payload = ? WHERE id = ?", (pl, prior[0]))
+                        result.events_restored += 1
+                    continue
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (task_id, run_id, kind, pl, int(ts)),
+                )
+                result.events_restored += 1
+                continue
             dupe = conn.execute(
                 "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
                 "AND created_at = ?",
