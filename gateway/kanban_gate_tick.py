@@ -117,6 +117,8 @@ class GateTick:
     local_allowance: Optional[int]   # None ONLY when the gate is disabled
     spawn_paused: Optional[str]
     remote_plan: Optional[kwp.SpilloverPlan]
+    # t_103a4648: local spawns the Studio kanban ceiling cut from utilization's admit (asap cards may use them)
+    ceiling_exempt: int = 0
 
 
 class _Every5Min:
@@ -331,7 +333,8 @@ class GateTickBuilder:
             allowance, paused = 0, "gate_unreadable"
         plan = self.plan_pool(boards, remote_by_host)
         return GateTick(band=gate.band, spill_reason=gate.spill_reason,
-                        local_allowance=allowance, spawn_paused=paused, remote_plan=plan)
+                        local_allowance=allowance, spawn_paused=paused, remote_plan=plan,
+                        ceiling_exempt=int(getattr(gate, "ceiling_exempt", 0) or 0))
 
     def _tick_connect(self, board=None):
         """``self._connect`` that remembers a board whose open raised, so the demand read does not re-open it."""

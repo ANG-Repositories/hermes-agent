@@ -340,6 +340,11 @@ class DispatchResult:
     local allowance had room at their turn (spec v0.3 I-0 per-board key, Momus
     pass 3 R1). Any cap on the last-resort spawn makes this non-zero; quota
     stranded by the board split does not (that is ``stranded_allowance``)."""
+    ceiling_held: list = field(default_factory=list)
+    """Local-route ready cards that waited this tick while the Studio kanban ceiling cut local spawns
+    (``ceiling_exempt`` > 0, t_103a4648). The gateway's ceiling-wait page reads it."""
+    ceiling_exempt_spawned: int = 0
+    """Operator ``asap`` cards spawned locally through the ceiling this tick (t_103a4648)."""
     take_refusals: dict = field(default_factory=dict)
     """task id -> the take() refusal of a portable row spawned locally as the
     last resort this tick (dry run included), for the printer and the record."""
@@ -4377,6 +4382,7 @@ def _dispatch_once_steps(
     entry: str = "gateway",
     defer_pool_clone: bool = False,
     defer_maintenance: bool = False,
+    ceiling_exempt: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -4430,6 +4436,7 @@ def _dispatch_once_steps(
             max_new=max_new,
             entry=entry,
             defer_maintenance=defer_maintenance,
+            ceiling_exempt=ceiling_exempt,
         )
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -4467,6 +4474,7 @@ def _dispatch_once_steps(
                 lock_window=window,
                 defer_pool_clone=defer_pool_clone,
                 defer_maintenance=defer_maintenance,
+                ceiling_exempt=ceiling_exempt,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -6768,6 +6776,7 @@ def _dispatch_once_locked(
     lock_window=None,
     defer_pool_clone: bool = False,
     defer_maintenance: bool = False,
+    ceiling_exempt: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7081,10 +7090,16 @@ def _dispatch_once_locked(
     local_budget: Optional[int] = None if spawn_limit is None else max(0, int(spawn_limit))
     if spillover is not None:
         result.spillover = spillover.summary()
+    # Studio kanban ceiling backstop (t_103a4648): ``ceiling_exempt`` = the LOCAL spawns the host table's
+    # consumers.kanban.ceiling cut from what utilization admitted this tick (LoadGate.ceiling_exempt). Only
+    # operator-set ``asap`` cards on the local route may use that room; every other card waits. kanban admit
+    # (skip_host_admission) skips the ceiling with the rest of host admission.
+    _exempt_left = 0 if skip_host_admission else max(0, int(ceiling_exempt or 0))
+    _exempt_rows: set = set()
     if spawn_paused:
         result.spawn_paused = str(spawn_paused)
         local_budget = 0
-        if (spillover is None or spillover.budget <= 0) and not route_first:
+        if (spillover is None or spillover.budget <= 0) and not route_first and not _exempt_left:
             return result
 
     running_count = 0
@@ -8084,10 +8099,13 @@ def _dispatch_once_locked(
     for row_index, row in enumerate(ready_rows):
         _hold_lock()        # every decision below runs under the board lock (t_f60f502f)
         route, route_arg = row_route.get(row["id"], ("local", None))
-        if record_only is not None:
+        _asap_exempt = _exempt_left > 0 and route == "local" and bool(row["asap"])
+        if record_only is not None and not (record_only == "wall" and _asap_exempt):
             result.placement_waits[row["id"]] = (
                 record_only if record_only != "wall"
                 else _wall_reason(route, route_arg, spillover))
+            if record_only == "wall" and _exempt_left and route == "local":
+                result.ceiling_held.append(row["id"])
             continue
         if spawn_budget is not None and spawned >= spawn_budget:
             ready_scan_complete = False
@@ -8106,6 +8124,11 @@ def _dispatch_once_locked(
             result.placement_waits[row["id"]] = _pr.total(budget_gate or _pr.TOTAL_MAX_SPAWN)
             continue
         local_free = local_budget is None or local_spawned + _ahead < local_budget
+        if not local_free and _asap_exempt:
+            local_free = True
+            _exempt_rows.add(row["id"])
+        elif not local_free and _exempt_left and route == "local":
+            result.ceiling_held.append(row["id"])
         if route == "portable" and local_free and not _caps_out.get("only", {}).get(row["id"]):
             _portable_room.add(row["id"])
         pool_free = spillover is not None and spillover.budget > 0
@@ -8441,6 +8464,9 @@ def _dispatch_once_locked(
                 result.placed.append((row["id"], placed_host.name))
             else:
                 local_spawned += 1
+                if row["id"] in _exempt_rows:
+                    _exempt_left -= 1
+                    result.ceiling_exempt_spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -8732,6 +8758,9 @@ def _dispatch_once_locked(
                 result.placed.append((claimed.id, placed_host.name))
             else:
                 local_spawned += 1
+                if claimed.id in _exempt_rows:
+                    _exempt_left -= 1
+                    result.ceiling_exempt_spawned += 1
             result.spawn_routes[claimed.id] = _kb.effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = route_source
             charge_pool(claimed.id, claimed.current_run_id)
@@ -10243,7 +10272,8 @@ def run_daemon(
                 tick = gate_ticks.build(live_boards())
                 gate_kwargs = {"spawn_paused": tick.spawn_paused,
                                "spawn_limit": tick.local_allowance,
-                               "spillover": tick.remote_plan}
+                               "spillover": tick.remote_plan,
+                               "ceiling_exempt": tick.ceiling_exempt}
                 if load_gate.host_recovered():
                     with contextlib.closing(_kbc.connect()) as _rconn:
                         _kb.requeue_host_transient_blocks(

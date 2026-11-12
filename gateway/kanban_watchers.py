@@ -4084,6 +4084,18 @@ class GatewayKanbanWatchersMixin:
 
         _proc_paged = {"episode": False}
 
+        # t_103a4648: ONE #alerts page per episode when a Studio card waits at the kanban ceiling too long.
+        from hermes_cli import kanban_studio_ceiling as _ksc
+        _ceiling_watch = _ksc.CeilingWaitWatch(_ksc.episode_pager_sender(_kb.kanban_home()))
+
+        def _observe_ceiling_wait(held) -> None:
+            try:
+                _ceiling_watch.observe(
+                    held, now=time.time(), minutes=_ksc.page_minutes(_kanban_cfg_now()),
+                    ceiling=(load_gate.util or {}).get("ceiling"), running=load_gate.running)
+            except Exception:
+                logger.debug("kanban studio ceiling watch failed", exc_info=True)
+
         def _finish_gate_tick(spawned: int) -> None:
             load_gate.finish_tick(spawned, logger=logger)
             if load_gate.state != "proc_paused":
@@ -4167,7 +4179,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None, spillover=None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None, spillover=None, ceiling_exempt: int = 0) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -4227,6 +4239,7 @@ class GatewayKanbanWatchersMixin:
                     reconcile_orphans=reconcile_orphans,
                     budget_cache=budget_cache,
                     spillover=spillover,
+                    ceiling_exempt=ceiling_exempt,
                     # The long-lived gateway tick runs pool-host clones in the background (t_915b8d2d).
                     defer_pool_clone=True,
                     # ...and the orphan sweep (t_97a78e19).
@@ -4364,6 +4377,8 @@ class GatewayKanbanWatchersMixin:
                 else max(0, _allowance - sum(q or 0 for q in _quotas.values()))
             )
             _board_stats: dict = {}
+            _ceiling_left = int(getattr(_tick, "ceiling_exempt", 0) or 0)
+            _ceiling_held: list = []
             # Enumeration extent spans the whole per-board tick body, not just
             # the fingerprint's path resolve: `_tick_once_for_board` also calls
             # `connect(board=slug)`, which re-resolves internally. Scoping only
@@ -4387,8 +4402,13 @@ class GatewayKanbanWatchersMixin:
                     None if _allowance is None else (0 if _paused else _limit),
                     requeue_note=_requeue_note,
                     spillover=_tick.remote_plan,
+                    ceiling_exempt=_ceiling_left,
                 )
                 out.append((slug, res))
+                if res is not None:
+                    # t_103a4648: asap room the ceiling cut is ONE pool across boards, like the allowance
+                    _ceiling_left = max(0, _ceiling_left - int(getattr(res, "ceiling_exempt_spawned", 0) or 0))
+                    _ceiling_held.extend(getattr(res, "ceiling_held", None) or ())
                 _res_placed = list(getattr(res, "placed", None) or []) if res is not None else []
                 _placed.extend(_res_placed)
                 # Local spawns only (by id, never spawned - placed): the
@@ -4435,6 +4455,7 @@ class GatewayKanbanWatchersMixin:
                 logger.info("%s", format_tick_line(load_gate, _tick, _tick_spawned, _placed))
             _gate_ticks.record_placements(_placed)
             _finish_gate_tick(_tick_spawned)
+            _observe_ceiling_wait(_ceiling_held)
             _series_tick.update(allowance=_allowance, paused=_spawn_paused,
                                 local=_tick_spawned)
             return out

@@ -263,6 +263,9 @@ class LoadGate:
         # {slug: {ready, quota, spawned, starved_since}}.
         self.boards: dict = {}
         self.util: dict = {}
+        # t_103a4648: local spawns the kanban ceiling alone cut this tick (asap cards may use them)
+        self.ceiling_exempt = 0
+        self.ceiling_bound = False
 
     def update_procs(
         self, procs: Optional[int], proc_limit: Optional[int]
@@ -330,6 +333,7 @@ class LoadGate:
         pause (either missing = no process gate).
         """
         self.pool = {"planned": False, "reason": "not_needed"}
+        self.ceiling_exempt, self.ceiling_bound = 0, False
         if not self.enabled:
             self.state, self.allowance, self.last_reason = "disabled", None, None
             self.band, self.spill_reason, self.remote_allowed = "admitting", None, True
@@ -397,6 +401,7 @@ class LoadGate:
             allowance += 1
             leases.append(_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=now))
         ceiling, why = ctx["ceiling"], None
+        admitted = allowance
         if ceiling is not None and self.running is None:
             # a CEILING on running workers with the count unknown fails closed (Prism 710b1c8865a5)
             allowance, why = 0, f"ceiling: running count unknown under kanban ceiling {ceiling}"
@@ -405,11 +410,16 @@ class LoadGate:
             if room < allowance:
                 allowance = room
                 why = f"ceiling: {self.running} running of kanban ceiling {ceiling} ({ctx['ceiling_reason']})"
+        # t_103a4648: what the ceiling (and only the ceiling) cut from utilization's admit. The dispatcher lets
+        # operator-set asap cards use exactly this room; nothing else bypasses the ceiling.
+        self.ceiling_exempt = max(0, admitted - allowance)
+        self.ceiling_bound = self.ceiling_exempt > 0
         if allowance == 0 and why is None:
             why = f"utilization: {verdict.reason} (binding {verdict.binding})" if verdict else "utilization: no room"
         self.util = {"rule": "admit_class" if unified else "admit", "host": ctx["host"],
                      "need": {"cpus": ctx["need"].cpus, "ram_gb": ctx["need"].ram_gb, "source": ctx["need"].source},
-                     "ceiling": ceiling, "leases": len(leases) - allowance,
+                     "ceiling": ceiling, "ceiling_exempt": self.ceiling_exempt,
+                     "leases": len(leases) - allowance,
                      "binding": verdict.binding if verdict else None,
                      "free": {k: round(float(x), 3) for k, x in (verdict.free if verdict else {}).items()}}
         self.allowance = allowance

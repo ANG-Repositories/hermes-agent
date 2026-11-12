@@ -1,0 +1,269 @@
+"""Studio kanban ceiling backstop (t_103a4648).
+
+The LoadGate already caps LOCAL spawns at ``hosts.<studio>.consumers.kanban.ceiling`` (fleet host table, read on
+every admit). This file pins what t_103a4648 adds on top:
+
+1. the ceiling is read from the table file on EVERY tick (an edit applies without a restart);
+2. operator-set ``asap`` cards are exempt from the ceiling only: the gate publishes how many spawns the ceiling cut
+   (``ceiling_exempt``) and the dispatcher lets ``asap`` Studio-bound rows use exactly that room; a plain card waits
+   with the ceiling named; the exemption is never wider than utilization admission;
+3. a Studio card held at the ceiling for ``ceiling_wait_page_minutes`` (default 60) pages ONCE per episode through
+   episode_pager; the episode clears when nothing is held at the ceiling.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_load_gate as klg
+from hermes_cli import kanban_studio_ceiling as ksc
+from hermes_cli.fleet_placement import admission as ad
+
+
+# -- the gate -------------------------------------------------------------------------------------------------------
+
+@pytest.fixture
+def ctx(monkeypatch):
+    c = {"host": "mac-studio", "ceiling": 3, "ceiling_reason": "backstop",
+         "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"),
+         "limits": ad.Limits(mem_reserve_gb=128.0), "mem_available_gb": 360.0, "mem_total_gb": 512.0}
+    monkeypatch.setattr(klg, "utilization_context", lambda: dict(c))
+    monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
+                                                    "psi_io_some10": 0.0})
+    monkeypatch.setattr(klg, "shared_leases", lambda host: [])
+    return c
+
+
+def _gate():
+    return klg.LoadGate({"max_spawn_per_tick": 4}, 32)
+
+
+def test_gate_publishes_the_room_the_ceiling_cut(ctx):
+    g = _gate()
+    a, why = g.admit(10.0, now=1000.0, running=3, cpu_busy=0.10)
+    assert a == 0 and why.startswith("ceiling: 3 running of kanban ceiling 3 (backstop)")
+    assert g.ceiling_bound is True and g.ceiling_exempt == 4      # utilization alone admits max_spawn_per_tick
+    assert g.snapshot()["util"]["ceiling_exempt"] == 4
+
+
+def test_gate_partial_room_cuts_the_rest(ctx):
+    g = _gate()
+    a, why = g.admit(10.0, now=1000.0, running=2, cpu_busy=0.10)
+    assert (a, g.ceiling_bound, g.ceiling_exempt) == (1, True, 3)
+
+
+def test_gate_under_the_ceiling_cuts_nothing(ctx):
+    ctx["ceiling"] = 20
+    g = _gate()
+    a, _ = g.admit(10.0, now=1000.0, running=2, cpu_busy=0.10)
+    assert (a, g.ceiling_bound, g.ceiling_exempt) == (4, False, 0)
+
+
+def test_exemption_is_never_wider_than_utilization(ctx):
+    g = _gate()
+    a, why = g.admit(10.0, now=1000.0, running=3, cpu_busy=0.97)   # host saturated AND at the ceiling
+    assert a == 0 and g.ceiling_exempt == 0 and g.ceiling_bound is False and "saturated:cpu" in why
+
+
+def test_no_ceiling_configured_is_unchanged(ctx):
+    ctx["ceiling"] = None
+    g = _gate()
+    a, why = g.admit(10.0, now=1000.0, running=50, cpu_busy=0.10)
+    assert (a, why, g.ceiling_bound, g.ceiling_exempt) == (4, None, False, 0)
+
+
+def test_ceiling_is_read_from_the_table_on_every_tick(tmp_path, monkeypatch):
+    """Deliver 1: config in the fleet host table, read per tick (no restart)."""
+    from hermes_cli.fleet_placement import placement as pl
+    real = Path(pl.__file__).resolve().parents[2] / "tests"
+    src = None
+    for cand in sorted(real.rglob("fleet-hosts.json")):
+        try:
+            doc = json.loads(cand.read_text())
+        except ValueError:
+            continue
+        if any("local" in (h.get("aliases") or []) for h in doc.get("hosts", {}).values()):
+            src = doc
+            break
+    if src is None:
+        pytest.skip("no fixture fleet-hosts.json with a local alias in this tree")
+    hid = next(h for h, v in src["hosts"].items() if "local" in (v.get("aliases") or []))
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))
+    table = tmp_path / pl.TABLE_REL
+    table.parent.mkdir(parents=True)
+
+    def write(ceiling):
+        row = src["hosts"][hid].setdefault("consumers", {})
+        row["kanban"] = {"eligible": True, "ceiling": ceiling}
+        table.write_text(json.dumps(src))
+
+    write(8)
+    assert klg.utilization_context()["ceiling"] == 8
+    write(2)
+    assert klg.utilization_context()["ceiling"] == 2
+
+
+# -- the wait page ---------------------------------------------------------------------------------------------------
+
+class _Pager:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, verb, text):
+        self.calls.append((verb, text))
+        return True
+
+
+def test_59_minutes_is_silent_60_pages_once_and_a_second_card_does_not_repage():
+    pager = _Pager()
+    w = ksc.CeilingWaitWatch(pager=pager)
+    t0 = 1_000_000.0
+    w.observe(["t_a"], now=t0, minutes=60, ceiling=8, running=8)
+    w.observe(["t_a"], now=t0 + 59 * 60, minutes=60, ceiling=8, running=8)
+    assert pager.calls == []
+    w.observe(["t_a"], now=t0 + 60 * 60, minutes=60, ceiling=8, running=8)
+    assert [c[0] for c in pager.calls] == ["page"]
+    assert "t_a" in pager.calls[0][1] and "ceiling 8" in pager.calls[0][1] and "60 min" in pager.calls[0][1]
+    w.observe(["t_a", "t_b"], now=t0 + 61 * 60, minutes=60, ceiling=8, running=8)
+    w.observe(["t_b"], now=t0 + 125 * 60, minutes=60, ceiling=8, running=8)   # t_b itself crosses 60 min here
+    assert [c[0] for c in pager.calls] == ["page"]
+
+
+def test_episode_clears_once_when_nothing_is_held_and_a_new_episode_pages_again():
+    pager = _Pager()
+    w = ksc.CeilingWaitWatch(pager=pager)
+    t0 = 1_000_000.0
+    w.observe(["t_a"], now=t0, minutes=60, ceiling=8, running=8)
+    w.observe(["t_a"], now=t0 + 3600, minutes=60, ceiling=8, running=8)
+    w.observe([], now=t0 + 3700, minutes=60, ceiling=8, running=5)
+    w.observe([], now=t0 + 3800, minutes=60, ceiling=8, running=5)
+    assert [c[0] for c in pager.calls] == ["page", "clear"]
+    w.observe(["t_c"], now=t0 + 4000, minutes=60, ceiling=8, running=8)
+    w.observe(["t_c"], now=t0 + 4000 + 3600, minutes=60, ceiling=8, running=8)
+    assert [c[0] for c in pager.calls] == ["page", "clear", "page"]
+
+
+def test_a_card_that_left_the_ceiling_restarts_its_clock():
+    pager = _Pager()
+    w = ksc.CeilingWaitWatch(pager=pager)
+    t0 = 1_000_000.0
+    w.observe(["t_a"], now=t0, minutes=60, ceiling=8, running=8)
+    w.observe([], now=t0 + 1800, minutes=60, ceiling=8, running=7)       # it spawned
+    w.observe(["t_a"], now=t0 + 1900, minutes=60, ceiling=8, running=8)   # held again (a retry)
+    w.observe(["t_a"], now=t0 + 3700, minutes=60, ceiling=8, running=8)   # 30 min into this wait
+    assert pager.calls == []
+
+
+def test_a_failed_send_retries_next_tick():
+    calls = []
+    w = ksc.CeilingWaitWatch(pager=lambda verb, text: calls.append(verb) and False)
+    t0 = 1_000_000.0
+    w.observe(["t_a"], now=t0, minutes=60, ceiling=8, running=8)
+    w.observe(["t_a"], now=t0 + 3600, minutes=60, ceiling=8, running=8)
+    w.observe(["t_a"], now=t0 + 3660, minutes=60, ceiling=8, running=8)
+    assert calls == ["page", "page"]
+
+
+def test_threshold_is_config():
+    assert ksc.page_minutes({"dispatch_load_gate": {"ceiling_wait_page_minutes": 15}}) == 15
+    assert ksc.page_minutes({}) == ksc.DEFAULT_PAGE_MINUTES == 60
+    assert ksc.page_minutes({"dispatch_load_gate": {"ceiling_wait_page_minutes": "x"}}) == 60
+    assert ksc.page_minutes({"dispatch_load_gate": {"ceiling_wait_page_minutes": 0}}) is None   # 0 = page off
+
+
+def test_episode_pager_argv(tmp_path, monkeypatch):
+    script = tmp_path / "scripts" / "lib" / "episode_pager.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    seen = []
+
+    class R:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(ksc.subprocess, "run", lambda argv, **kw: seen.append(argv) or R())
+    send = ksc.episode_pager_sender(tmp_path)
+    assert send("page", "held") is True
+    assert send("clear", "back under") is True
+    page, clear = seen
+    assert page[2:4] == ["page", "--producer"] and "kanban-studio-ceiling" in page
+    assert page[page.index("--text") + 1] == "held" and "--remind-h" in page
+    assert clear[2] == "clear" and clear[clear.index("--resolve-text") + 1] == "back under"
+    assert ksc.episode_pager_sender(tmp_path / "nowhere")("page", "x") is False
+
+
+# -- the dispatcher: asap is exempt, a plain card waits naming the ceiling ------------------------------------------
+
+@pytest.fixture
+def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(kb, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+def _tick(conn, **kw):
+    order: list[str] = []
+
+    def _spawn(task, workspace, **_):
+        order.append(task.id)
+        return None
+
+    res = kb.dispatch_once(conn, spawn_fn=_spawn, max_spawn=64, **kw)
+    return order, res
+
+
+CEILING_WHY = "ceiling: 8 running of kanban ceiling 8 (backstop)"
+
+
+def test_plain_card_waits_at_the_ceiling_and_is_listed_held(board):
+    with kb.connect_closing() as conn:
+        t = kb.create_task(conn, title="plain", assignee="daedalus")
+        order, res = _tick(conn, spawn_paused=CEILING_WHY, spawn_limit=0, ceiling_exempt=4)
+    assert order == []
+    assert res.ceiling_held == [t]
+    assert res.ceiling_exempt_spawned == 0
+
+
+def test_asap_card_spawns_through_the_ceiling(board):
+    with kb.connect_closing() as conn:
+        plain = kb.create_task(conn, title="plain", assignee="daedalus", priority=99)
+        urgent = kb.create_task(conn, title="urgent", assignee="daedalus")
+        conn.execute("UPDATE tasks SET asap = 1 WHERE id = ?", (urgent,))
+        conn.commit()
+        order, res = _tick(conn, spawn_paused=CEILING_WHY, spawn_limit=0, ceiling_exempt=4)
+    assert order == [urgent]
+    assert res.ceiling_held == [plain]
+    assert res.ceiling_exempt_spawned == 1
+
+
+def test_asap_exemption_is_bounded_by_the_room_the_ceiling_cut(board):
+    with kb.connect_closing() as conn:
+        ids = []
+        for i in range(3):
+            ids.append(kb.create_task(conn, title=f"u{i}", assignee="daedalus", priority=10 - i))
+            conn.execute("UPDATE tasks SET asap = 1 WHERE id = ?", (ids[-1],))
+        conn.commit()
+        order, res = _tick(conn, spawn_paused=CEILING_WHY, spawn_limit=0, ceiling_exempt=2)
+    assert order == ids[:2] and res.ceiling_exempt_spawned == 2 and res.ceiling_held == [ids[2]]
+
+
+def test_no_exemption_when_the_ceiling_is_not_what_binds(board):
+    """A utilization refusal (ceiling_exempt 0) binds asap cards too: the exemption is the ceiling's only."""
+    with kb.connect_closing() as conn:
+        urgent = kb.create_task(conn, title="urgent", assignee="daedalus")
+        conn.execute("UPDATE tasks SET asap = 1 WHERE id = ?", (urgent,))
+        conn.commit()
+        order, res = _tick(conn, spawn_paused="utilization: saturated:cpu", spawn_limit=0)
+    assert order == [] and res.ceiling_exempt_spawned == 0
