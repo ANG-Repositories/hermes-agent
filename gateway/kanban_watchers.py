@@ -1313,6 +1313,21 @@ def _needs_input_cards(results, include_dependency: bool = False
     return cards, observed_boards
 
 
+_NEEDS_INPUT_GROUP_LIST_CAP = 8
+
+
+def _needs_input_reason_text(item: dict) -> str:
+    """The reason as a page prints it: whitespace-collapsed, 300 chars."""
+    return " ".join(str(item.get("reason") or "").split())[:300]
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class _NeedsInputPager(_GuardStuckNotifier):
     """Page once per ``(board, card, reason-hash)``; re-page "still waiting"
     every 2 h while the card stays blocked. A new reason is a new page. The
@@ -1371,27 +1386,49 @@ class _NeedsInputPager(_GuardStuckNotifier):
             start = self._rotation % len(cards)
             cards = cards[start:] + cards[:start]
             self._rotation += 1
+        # t_98cdaa01: one tick sends ONE line per (board, reason, home,
+        # still-waiting) group that lists its card ids, not one line per card
+        # (5 of 13 #alerts lines on 2026-11-12 were one tick paging the same
+        # "pin host lacks studio-state" reason for 5 cards). Distinct reasons
+        # stay distinct lines; the ledger stays per card.
+        groups: "dict[tuple, list]" = {}
         for board, item in cards:
             key = self._key(board, item)
             last = self._sent.get(key)
             if last is not None and now - last < self._remind:
                 continue
+            gkey = (str(board), _needs_input_reason_text(item),
+                    str(item.get("channel") or ""), str(item.get("session_id") or ""),
+                    last is not None)
+            groups.setdefault(gkey, []).append((board, item, key))
+        for gkey, members in groups.items():
             if time.monotonic() >= deadline:
                 break
-            first_key = key + self._ALERTS_FIRST_SUFFIX
-            card_key = self._card_key(board, item)
-            card_at = self._sent.get(card_key)
-            page = dict(item, alerts_first_due=first_key not in self._sent,
-                        alerts_card_quiet=card_at is not None
-                        and now - card_at < _NEEDS_INPUT_ALERTS_CARD_WINDOW_S)
-            if send(board, page, last is not None):
-                self._sent[key] = now
-                delivered += 1
-                if page.get("alerts_withheld"):
-                    self._sent[first_key] = now
+            still_waiting = gkey[-1]
+            board = members[0][0]
+            entries = []
+            for _board, item, key in members:
+                card_key = self._card_key(board, item)
+                card_at = self._sent.get(card_key)
+                entries.append((item, key, key + self._ALERTS_FIRST_SUFFIX, card_key,
+                                card_at is not None
+                                and now - card_at < _NEEDS_INPUT_ALERTS_CARD_WINDOW_S))
+            page = dict(members[0][1],
+                        alerts_first_due=any(e[2] not in self._sent for e in entries),
+                        alerts_card_quiet=all(e[4] for e in entries))
+            if len(entries) > 1:
+                page["task_ids"] = [str(e[0]["task_id"]) for e in entries]
+                page["priority"] = max((_int_or_zero(e[0].get("priority")) for e in entries))
+            if send(board, page, still_waiting):
+                for _item, key, first_key, _card_key, _quiet in entries:
+                    self._sent[key] = now
+                    if page.get("alerts_withheld"):
+                        self._sent[first_key] = now
+                delivered += len(entries)
             if page.get("alerts_first_delivered"):
-                self._sent[first_key] = now
-                self._sent[card_key] = now
+                for _item, _key, first_key, card_key, _quiet in entries:
+                    self._sent[first_key] = now
+                    self._sent[card_key] = now
         if self._sent != before:
             self._save()
         return delivered
@@ -1444,13 +1481,26 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
         return False
     tid = str(item["task_id"])
     board_flag = "" if board in ("", "default", None) else f"--board {board} "
-    reason = " ".join(str(item.get("reason") or "").split())[:300]
+    reason = _needs_input_reason_text(item)
     lead = "⚠️ still waiting: " if still_waiting else "⚠️ "
-    message = (
-        f"{lead}`{tid}` needs a ruling: {reason} — `hermes kanban {board_flag}show {tid}`\n"
-        f"-# p{item.get('priority', 0)} · {str(item.get('title') or '')[:120]} · "
-        f"re-pages every 2 h while blocked · opt out: `hermes kanban {board_flag}edit {tid} --no-page`"
-    )
+    ids = [str(t) for t in (item.get("task_ids") or [])]
+    if len(ids) > 1:
+        # One line for a tick's same-reason, same-home cards (t_98cdaa01).
+        shown = ", ".join(f"`{t}`" for t in ids[:_NEEDS_INPUT_GROUP_LIST_CAP])
+        if len(ids) > _NEEDS_INPUT_GROUP_LIST_CAP:
+            shown += f" +{len(ids) - _NEEDS_INPUT_GROUP_LIST_CAP} more"
+        message = (
+            f"{lead}{len(ids)} cards need a ruling: {reason} — {shown} — "
+            f"`hermes kanban {board_flag}show <id>`\n"
+            f"-# p{item.get('priority', 0)} max · re-pages every 2 h while blocked · "
+            f"opt out per card: `hermes kanban {board_flag}edit <id> --no-page`"
+        )
+    else:
+        message = (
+            f"{lead}`{tid}` needs a ruling: {reason} — `hermes kanban {board_flag}show {tid}`\n"
+            f"-# p{item.get('priority', 0)} · {str(item.get('title') or '')[:120]} · "
+            f"re-pages every 2 h while blocked · opt out: `hermes kanban {board_flag}edit {tid} --no-page`"
+        )
     channel = item.get("channel")
     if channel is not None and not str(channel).isdigit():
         channel = None  # numeric channel ids only
