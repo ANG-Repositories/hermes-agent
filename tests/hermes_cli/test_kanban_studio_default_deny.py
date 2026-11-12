@@ -402,3 +402,110 @@ def test_browser_joined_portable_local_start_is_held(kanban_home, monkeypatch):
                                 spillover=_plan(free=2), reconcile_orphans=False)
     assert (tid, "studio") not in spawned, spawned
     assert res.placement_waits[tid].startswith("studio_default_deny:browser_join"), res.placement_waits
+
+
+# -- Prism on #264 (t_5d63270d) -------------------------------------------------------------------------------
+
+def test_held_review_reserves_no_ready_lane_capacity(kanban_home, monkeypatch):
+    """c-4f52c4dd8765315a: with one slot left, a review default-deny will hold must not keep an equal-priority
+    ready card from starting (``_review_ahead`` / review pool reserve / door publication before the hold)."""
+    _cfg(kanban_home, True, ["studio-state"])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        rid = _review_card(conn, body="review the diff")
+        tid = _card(conn)
+        res, spawned = _tick(conn, spillover=_plan(free=0), spawn_limit=1)
+    assert [t for t, _h in spawned] == [tid], (spawned, res.placement_waits)
+    assert res.placement_waits[rid].startswith("studio_default_deny:review_lane"), res.placement_waits
+
+
+def test_admit_to_the_studio_is_held_until_an_override_is_recorded(operator, monkeypatch):
+    """c-e7592fee5f5910ad: ``kanban admit --host studio`` on a portable card skipped the local-start check
+    (``force_host is None``). It is held, the refusal names the override, and the override is the audit record."""
+    from hermes_cli import kanban_admit as ka
+    _cfg(operator, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        spawned.append((task.id, placement.name if placement else "studio"))
+        return 4242
+
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="fix the lint")
+        res = kbd.admit_once(conn, tid, "studio", spawn_fn=spawn, spillover=_plan(free=2))
+        assert spawned == [], spawned
+        assert res.placement_waits[tid].startswith("studio_default_deny:operator_admit"), res.placement_waits
+        line = ka.refusal_from(res, tid)
+        assert f"hermes kanban studio-override {tid} --capability operator_admit" in line, line
+        ksa.override(conn, tid, "operator_admit", "operator ruling needs the studio", actor="apollo")
+        kbd.admit_once(conn, tid, "studio", spawn_fn=spawn, spillover=_plan(free=2))
+        kinds = [k for (k,) in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
+    assert spawned == [(tid, "studio")], spawned
+    assert kinds.index("studio_override") < kinds.index("spawned"), kinds
+
+
+def test_a_cleared_placement_wait_ends_the_hold_episode(kanban_home):
+    """c-51c01dfda9372e31: ``placement_wait {cleared: true}`` ends the episode in both scans: the next hold wakes
+    the home session again and its 60-minute clock restarts."""
+    class Pager:
+        sent: list = []
+
+        def page(self, key, text):
+            self.sent.append(key)
+            return "page"
+
+    pager = Pager()
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        waits = {tid: "studio_default_deny:studio-state (declared: x; no pool host has it)"}
+        assert ksa.notify_holds(conn, waits) == [tid]
+        # the first episode began two hours ago, then its wait cleared
+        conn.execute("UPDATE task_events SET created_at = created_at - 7200 WHERE task_id=? AND kind='mechanical_wake'",
+                     (tid,))
+        conn.commit()
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "placement_wait", {"cleared": True})
+        assert ksa.notify_holds(conn, waits, pager_factory=lambda: pager) == [tid]
+        ksa.notify_holds(conn, waits, pager_factory=lambda: pager)
+    assert pager.sent == [], pager.sent  # the new episode began at the second wake, not two hours ago
+
+
+def test_override_warning_uses_the_live_override_match(operator, capsys):
+    """c-8a854f5bdb779ec7: an override naming the capability HEAD releases ``workspace_kind:x`` (live_override),
+    so the command must not warn that it does not."""
+    import argparse
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "placement_wait",
+                             {"reason": "studio_default_deny:workspace_kind:origin_not_github (structural: x)"})
+        why = {"capability": "workspace_kind:origin_not_github", "source": "structural", "evidence": "x"}
+        ksa.cmd_studio_override(argparse.Namespace(task_id=tid, capability="workspace_kind",
+                                                   why="the port is not built yet", until=None, board=None))
+        released = ksa.decide(conn, _row(conn, tid), why, enabled=True, allow=frozenset()) is None
+    err = capsys.readouterr().err
+    assert released and "WARNING" not in err, err
+    ksa.cmd_studio_override(argparse.Namespace(task_id=tid, capability="browser-session",
+                                               why="the signed in browser", until=None, board=None))
+    assert "does not release it" in capsys.readouterr().err
+
+
+def test_local_review_placement_records_the_resolved_capability(kanban_home, monkeypatch):
+    """c-0d4f28b3daf38893: the review placement event names what the gate resolved (declared before review_lane),
+    so the replay need not assume review_lane."""
+    _cfg(kanban_home, True, ["studio-state", "review_lane"])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        declared = _review_card(conn)
+        plain = _review_card(conn, body="review the diff")
+        _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
+        got = {}
+        for tid in (declared, plain):
+            raw = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement' "
+                               "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+            p = json.loads(raw[0])
+            p = json.loads(p) if isinstance(p, str) else p
+            got[tid] = (p.get("entry"), (p.get("studio_capability") or {}).get("capability"))
+    assert {declared, plain} <= {t for t, _h in spawned}, spawned
+    assert got == {declared: ("review", "studio-state"), plain: ("review", "review_lane")}, got

@@ -93,8 +93,8 @@ from hermes_state_dbfile import (
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
-    _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
-    writer_autocheckpoint_enabled,
+    _WAL_INCOMPAT_MARKERS, _apply_macos_checkpoint_barrier, _enforce_macos_synchronous_full, _on_disk_journal_mode,
+    apply_database_pragmas, apply_wal_with_fallback, writer_autocheckpoint_enabled,
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from hermes_state_titles import SessionTitlesMixin
@@ -1806,10 +1806,15 @@ class SessionDB(
         """The dedicated checkpoint connection (opened once, closed in close()). Caller holds self._lock,
         so its open/close is ordered against the writer's own open/close and the WAL lock guard."""
         if self._ckpt_conn is None:
-            self._ckpt_conn = _connect_tracked_db(
+            conn = _connect_tracked_db(
                 self.db_path, tracking_path=self.db_path, check_same_thread=False, timeout=1.0,
                 isolation_level=None,
             )
+            # Per-connection pragmas: the writer's barrier does not reach the connection that actually
+            # checkpoints. Without F_FULLFSYNC a panic after the WAL reset can lose the copied pages (t_e8c62e86).
+            _apply_macos_checkpoint_barrier(conn)
+            _enforce_macos_synchronous_full(conn)
+            self._ckpt_conn = conn
         return self._ckpt_conn
 
     def _try_wal_checkpoint(self) -> None:
