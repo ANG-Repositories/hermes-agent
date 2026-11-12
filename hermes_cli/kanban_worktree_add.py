@@ -100,6 +100,9 @@ def run_git_group(argv: Sequence[str], timeout: float) -> subprocess.CompletedPr
 # A tree with an index, no index.lock and an old `initializing` lock is one whose add was killed in that instant
 # (the 150 finished-but-locked legacy trees on the Studio). Limit: the gate reasons about adds this dispatcher runs;
 # an add started by another tool with a post-checkout hook that runs longer than 2 x ADD_TIMEOUT_S is not covered.
+# Limit: git runs post-checkout after it writes the index and drops the lock, so a repo with a slow post-checkout
+# hook can have that hook cut off by the timeout kill, and the gate cannot see it (nothing in the tree records a
+# running hook; Studio 2026-11-12: 0 of 111 repositories have their own executable post-checkout hook).
 # A leftover index.lock holds its tree with no age-out (git itself refuses to work there): that hold needs an
 # operator.
 # Any read error, including "does not exist" on a file a rule needs, is not proof. A main checkout (.git is a

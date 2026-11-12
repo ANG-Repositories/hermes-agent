@@ -314,30 +314,34 @@ def test_a_running_add_is_held_on_rule_3_at_every_sample(repo, tmp_path):
     backlink exist it holds on rule 3 (no index / index.lock) until the add ends, then proves the finished tree."""
     git(repo, "config", "filter.slow.smudge", "sh -c 'sleep 1; cat'")
     target = repo / ".worktrees" / "t_run"
+    index = repo / ".git" / "worktrees" / "t_run" / "index"   # fresh repo: git names the admin dir after the tree
     proc = subprocess.Popen(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "wt/t_run", str(target), "HEAD"],
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    samples = []
+    pre_index = []
     try:
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             running = proc.poll() is None
             why = kwa.unproven(target)
+            # read AFTER the gate: the index only ever appears, so "absent now" means absent while the gate read
+            if running and not index.exists():
+                pre_index.append(why)
             if not running:
                 break
-            samples.append(why)
             time.sleep(0.1)
     finally:
         if proc.poll() is None:
             proc.kill()
         proc.wait()
     assert proc.returncode == 0, proc.stderr.read()
-    rule3 = [w for w in samples if w and w.startswith("rule 3")]
-    assert len(rule3) >= 10, samples                       # ~3 s of checkout at 0.1 s per sample
-    # every sample taken while git was running holds; a None can only be the instant after the unlock, before exit
-    held = [w is not None for w in samples]
-    assert all(held[: len(held) - 1]), samples
-    first3 = next(i for i, w in enumerate(samples) if w and w.startswith("rule 3"))
-    assert all(w.startswith(("rule 3", "rule 4")) for w in samples[first3:] if w), samples
+    # Prism #265 r10 P2 :336: git unlocks `initializing` (and may run post-checkout) before it exits, so samples
+    # between "index written" and "process gone" may read proven; they are not bounded. Every sample taken before
+    # the index exists holds, and holds on rule 3 once the gitfile and backlink exist.
+    assert all(w is not None for w in pre_index), pre_index
+    rule3 = [w for w in pre_index if w.startswith("rule 3")]
+    assert len(rule3) >= 10, pre_index                     # ~3 s of checkout at 0.1 s per sample
+    first3 = next(i for i, w in enumerate(pre_index) if w.startswith("rule 3"))
+    assert all(w.startswith("rule 3") for w in pre_index[first3:]), pre_index
     assert kwa.unproven(target) is None
 
 
