@@ -2350,6 +2350,15 @@ def _fallback_was_declared(job: dict, new_provider, new_model) -> bool:
     configured net caught it and the run SUCCEEDED — expected, calm telemetry.
     An undeclared switch is the genuine "shouldn't happen" case.
     """
+    # A run that ENDED on the job's own pinned provider/model (e.g. a mid-run
+    # step to a sibling model and back: P/X -> P/M) never left its declared
+    # primary, so it is not an undeclared switch (t_1fbc5271). Both halves must
+    # match: a job with no pinned provider cannot vouch for the provider.
+    own_provider = str(job.get("provider") or "").strip()
+    own_model = _coerce_job_model(job.get("model"))
+    if (own_provider and own_model and new_provider
+            and own_provider == str(new_provider).strip() and own_model == new_model):
+        return True
     chain = job.get("fallback")
     if not isinstance(chain, list):
         return False
