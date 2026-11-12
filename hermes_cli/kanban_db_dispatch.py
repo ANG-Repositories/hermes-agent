@@ -8713,6 +8713,10 @@ def _dispatch_once_locked(
                         # t_9965b8d5: the clones the carry left out are rebuilt from origin, same branch + commit.
                         _kb._kwh.carry_clones(placed_host, str(workspace), _split["clones"],
                                               _kb.kanban_home() / "fleet", reservation=_rid, staged=_staged)
+                    # t_d2f06cf6 (operator split 07:20 11-12): with worktree_stash_carry off the rebuilt checkouts
+                    # arrive with no stash; how many shared entries stayed on the Studio rides the event and a comment
+                    _left = {c["rel"]: c["stash_left"] for c in (_split or {}).get("clones", ())
+                             if c.get("stash_left")}
                     with _kbc.write_txn(conn):
                         # "workspace" = the stored path at carry time, "path" = the spelling persisted just
                         # below; carried_host() binds on either (Prism 34bd0265a601).
@@ -8720,8 +8724,14 @@ def _dispatch_once_locked(
                                           {"host": placed_host.name, "workspace": claimed.workspace_path,
                                            "path": str(workspace),
                                            **({"recloned": [{k: c[k] for k in ("rel", "slug", "branch", "sha")}
-                                                            for c in _split["clones"]]} if _split else {})},
+                                                            for c in _split["clones"]]} if _split else {}),
+                                           **({"stash_left": _left} if _left else {})},
                                           run_id=claimed.current_run_id)
+                    if _left:
+                        _kb.add_comment(conn, claimed.id, "dispatcher", (
+                            f"carried to {placed_host.name}: rebuilt without stash entries; "
+                            + ", ".join(f"{n} stash entries of {r}" for r, n in sorted(_left.items()))
+                            + " stayed on the Studio (kanban.placement.worktree_stash_carry is off)"))
             if protected is not None:
                 validate_mount(
                     protected.root, expected_mount=protected.mount_path,

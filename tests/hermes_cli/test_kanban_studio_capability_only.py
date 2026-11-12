@@ -1841,3 +1841,153 @@ def test_symlink_under_the_object_store_leaving_the_carry_is_refused(tmp_path):
     _g(ws / "dirty", "rev-parse", "HEAD^{tree}")
     why = kwh.carried_gitdir_loss(str(ws), ["dirty"], set())
     assert why and "symlink" in why and "pack" in why, why
+
+
+# -- 1h. operator split at 8693b634 (07:20 11-12): stash carry behind its own knob, default OFF ------------------------
+# With kanban.placement.worktree_stash_carry off the rebuild touches no stash on either host (no bundle, no fetch, no
+# stash store, no stash precondition); the count of shared entries left on the Studio rides the carried event and a
+# card comment. The stash code stays behind the knob.
+
+def _stash_knob(home, value):
+    (home / "config.yaml").write_text(f"kanban:\n  placement:\n    worktree_stash_carry: {str(value).lower()}\n")
+
+
+def test_stash_carry_knob_defaults_off_and_reads_the_root_config(kanban_home):
+    assert kwh.stash_carry_on({}) is False
+    assert kwh.stash_carry_on({"placement": {"worktree_stash_carry": True}}) is True
+    assert kwh.stash_carry_on({"placement": {"worktree_stash_carry": "off"}}) is False
+    _stash_knob(kanban_home, True)
+    assert kwh.stash_carry_on() is True
+    _stash_knob(kanban_home, False)
+    assert kwh.stash_carry_on() is False
+
+
+def test_stash_carry_off_rebuilds_with_no_stash_step_on_either_host(kanban_home, tmp_path, monkeypatch):
+    """Knob off (default): a clone with stash entries is rebuilt; nothing bundles, fetches or stores a stash, the
+    rebuilt clone lists no stash, and the record names how many entries stayed on the Studio. An unreadable stash
+    (refs/stash with no reflog) is no precondition either."""
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    for msg in ("one", "two"):
+        (repo / "a.txt").write_text(f"{msg}\n")
+        _g(repo, "stash", "push", "-q", "-m", msg)
+    runner, seen = _pool_runner(ws, pool, origin, monkeypatch)
+    argvs = []
+
+    def spy(argv, **kw):
+        argvs.append(list(argv))
+        return runner(argv, **kw)
+    rec, why = kwh.assess_clone(str(repo), spy)
+    assert why is None and "stash" not in rec, (why, rec)
+    clones = [{"rel": "repo", **rec}]
+    staged = kwh.carry_clones_check(_host(), str(ws), clones, spy)  # no reservation needed: no stash ssh
+    assert staged[0][3] == ((), None), staged
+    assert clones[0]["stash_left"] == 2, clones
+    kwh.carry_clones(_host(), str(ws), clones, kanban_home / "fleet", runner=spy, staged=staged)
+    flat = [" ".join(map(str, a)) for a in argvs] + seen
+    assert not any("bundle" in a or "stash store" in a for a in flat), flat
+    dest = pool / str(repo).lstrip("/")
+    assert _g(dest, "stash", "list") == "" and _g(dest, "rev-parse", "HEAD") == rec["sha"]
+    assert len(_g(repo, "stash", "list").splitlines()) == 2  # the Studio's list is untouched
+    (repo / ".git" / "logs" / "refs" / "stash").unlink()
+    kwh._clone_assess_cache.clear()
+    rec2, why2 = kwh.assess_clone(str(repo), runner)
+    assert why2 is None, why2
+
+
+def test_stash_carry_off_changed_stash_during_the_copy_does_not_refuse(kanban_home, tmp_path, monkeypatch):
+    """Knob off: the post-copy re-check compares no stash list (it was never staged)."""
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    from hermes_cli import kanban_worktree_port as kwt
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    rec, _why = kwh.assess_clone(str(repo), runner)
+    clones = [{"rel": "repo", **rec}]
+    staged = kwh.carry_clones_check(_host(), str(ws), clones, runner)
+    (repo / "a.txt").write_text("late\n")
+    _g(repo, "stash", "push", "-q", "-m", "late")
+    cloned = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
+    kwh.carry_clones(_host(), str(ws), clones, kanban_home / "fleet", runner=runner, staged=staged)
+    assert len(cloned) == 1
+
+
+def test_spawn_records_the_stash_entries_left_on_the_studio(kanban_home, small_carry, monkeypatch):
+    """The carried event and a card comment say how many shared stash entries stayed on the Studio."""
+    import subprocess
+    from pathlib import Path
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    monkeypatch.setattr(kwh, "carry_workspace", lambda host, ws, runner=None, exclude=(): None)
+    monkeypatch.setattr(kwh, "carry_clones", lambda *a, **k: None)
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        repo = Path(path) / "repo"
+        for n in range(3):
+            (repo / "big.bin").write_bytes(b"s%d" % n)
+            subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "stash", "-q"],
+                           check=True)
+        kwh._clone_assess_cache.clear()
+        plan = _plan(free=2)
+        plan.default_remote = True
+        _res, spawned = _tick(conn, spillover=plan, spawn_limit=2)
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                          (tid, kwh.CARRIED_EVENT)).fetchone()
+        bodies = [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))]
+    assert (tid, "ace-ai") in spawned, spawned
+    assert json.loads(ev[0])["stash_left"] == {"repo": 3}, ev
+    assert any("3 stash entries" in b and "repo" in b for b in bodies), bodies
+
+
+def test_nested_symlink_under_the_object_store_leaving_the_carry_is_refused(tmp_path):
+    """Operator 07:20 item 2: a symlink BELOW the first level of objects/ (a fan-out file or a pack file) that
+    resolves outside the workspace refuses the files carry; a symlink that stays inside does not."""
+    import shutil
+    from pathlib import Path
+    ws, outside = Path(tmp_path) / "ws", Path(tmp_path) / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    _clone_in(ws, "dirty", dirty=True)
+    _g(ws / "dirty", "gc", "-q")
+    pack_dir = ws / "dirty" / ".git" / "objects" / "pack"
+    pf = next(p for p in pack_dir.iterdir() if p.suffix == ".pack")
+    shutil.copy2(pf, ws / "inside.pack")
+    pf.unlink()
+    pf.symlink_to(ws / "inside.pack")
+    assert kwh.carried_gitdir_loss(str(ws), ["dirty"], set()) is None
+    shutil.move(str(ws / "inside.pack"), str(outside / pf.name))
+    pf.unlink()
+    pf.symlink_to(outside / pf.name)
+    _g(ws / "dirty", "rev-parse", "HEAD^{tree}")
+    why = kwh.carried_gitdir_loss(str(ws), ["dirty"], set())
+    assert why and "symlink" in why and pf.name in why, why
+
+
+@pytest.mark.parametrize("stash_knob", [False, True])
+def test_staged_carry_refuses_when_ignored_files_changed_during_the_copy(kanban_home, tmp_path, monkeypatch,
+                                                                         stash_knob):
+    """Operator 07:20 item 3: the post-copy re-check lists the ignored files again; a file added during the copy
+    refuses the spawn, as a moved HEAD does. Nothing is rebuilt."""
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    from hermes_cli import kanban_worktree_port as kwt
+    _stash_knob(kanban_home, stash_knob)
+    monkeypatch.setattr(kwh, "carry_split_fits", lambda *a, **k: None)  # no routing census in this fixture
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    (repo / ".git" / "info" / "exclude").write_text("data/\n")
+    (repo / "data").mkdir()
+    (repo / "data" / "a.csv").write_text("a\n")
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    rec, why = kwh.assess_clone(str(repo), runner)
+    assert why is None and rec["ignored"] == ("data/a.csv",), (why, rec)
+    clones = [{"rel": "repo", **rec}]
+    staged = kwh.carry_clones_check(_host(), str(ws), clones, runner, reservation="r-test")
+    (repo / "data" / "b.csv").write_text("written during the copy\n")
+    cloned = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
+    with pytest.raises(RuntimeError, match="ignored files changed during the copy"):
+        kwh.carry_clones(_host(), str(ws), clones, kanban_home / "fleet", runner=runner, reservation="r-test",
+                         staged=staged)
+    assert cloned == []
