@@ -3555,6 +3555,8 @@ def _set_worker_pid(
         spawn_payload["pool"] = pool
     with _kbc.write_txn(conn):
         launching_run_id = run_id if run_id is not None else _kb._current_run_id(conn, task_id)
+        # t_4b313c15: no `spawned` without its `placement`, on every branch below (one txn).
+        placement = placement if placement is not None else _unrecorded_placement(conn, launching_run_id)
         # Correlate even a late start with its launching run, never its successor.
         from hermes_cli.kanban_priority_door import EVENT
         authorization = conn.execute(
@@ -3590,22 +3592,55 @@ def _set_worker_pid(
                      "claim_lost": True},
                     run_id=int(run_id),
                 )
+                # A worker existed on this run (t_1073ffef run 34): record where, and drop the no-worker class
+                # the run's close stamped while the spawn was in flight.
+                _write_placement(conn, task_id, int(run_id), {**placement, "claim_lost": True})
+                conn.execute("UPDATE task_runs SET no_worker_class = NULL WHERE id = ?", (int(run_id),))
                 return False
         conn.execute(
             "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
             (int(pid), started_at, task_id),
         )
-        run_id = _kb._current_run_id(conn, task_id)
+        run_id = launching_run_id
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                 (int(pid), started_at, run_id),
             )
         _kb._append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
-        if placement is not None:
-            from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
-            _kb._append_event(conn, task_id, PLACEMENT_EVENT, placement, run_id=run_id)
+        _write_placement(conn, task_id, run_id, placement)
     return True
+
+
+def _write_placement(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], payload: dict) -> None:
+    """One ``placement`` event per run (inside the caller's txn). A worker that adopted its pid first may already
+    have written the minimal ``unrecorded`` record; the launcher's full record replaces that row in place. Any
+    other prior record stands, so a repeated ``_set_worker_pid`` never appends a second one (Prism 532aad7ea955)."""
+    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+    if run_id is not None:
+        prior = conn.execute(
+            "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (int(run_id), PLACEMENT_EVENT)).fetchone()
+        if prior is not None:
+            if prior[1] != "unrecorded" or payload.get("reason") == "unrecorded":
+                return
+            conn.execute("UPDATE task_events SET payload = ? WHERE id = ?",
+                         (json.dumps(payload, ensure_ascii=False), prior[0]))
+            _kb._journal_append(conn, task_id, PLACEMENT_EVENT, payload, run_id=run_id)
+            return
+    _kb._append_event(conn, task_id, PLACEMENT_EVENT, payload, run_id=run_id)
+
+
+def _unrecorded_placement(conn: sqlite3.Connection, run_id: Optional[int], *, entry: str = "unrecorded") -> dict:
+    """The minimal ``placement`` record for a worker whose launcher passed none (t_4b313c15): the run id and the
+    host ``record_placement`` stamped on the run before the launch (NULL when nothing did). ``reason`` /
+    ``entry`` name the gap, so a reader can count these instead of finding no record at all."""
+    host = None
+    if run_id is not None:
+        row = conn.execute("SELECT host FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
+        host = row[0] if row else None
+    return {"run_id": run_id, "host": host, "route_class": None, "reason": "unrecorded", "entry": entry}
 
 
 def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
@@ -3617,20 +3652,59 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
     ``run_id`` is no longer the card's live run: the card was reclaimed before this worker got here,
     and it must exit without working it."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
-        row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
-                           (task_id,)).fetchone()
-        if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
-            return False
-        # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
-        if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
-            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, task_id))
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, int(run_id)))
-            _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
-                              run_id=int(run_id))
+    lost = False
+    try:
+        with _kb.write_txn(conn):
+            row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
+                lost = True
+                _record_losing_worker(conn, task_id, int(run_id), int(pid), started_at)
+                return False
+            # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
+            if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
+                conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                             (int(pid), started_at, task_id))
+                conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                             (int(pid), started_at, int(run_id)))
+                _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
+                                  run_id=int(run_id))
+            # A worker is running this run; if its launcher died before the placement write, record it now.
+            from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+            if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
+                            (int(run_id), PLACEMENT_EVENT)).fetchone() is None:
+                _kb._append_event(conn, task_id, PLACEMENT_EVENT,
+                                  _unrecorded_placement(conn, int(run_id), entry="worker_registered"),
+                                  run_id=int(run_id))
+    except Exception:
+        if not lost:
+            raise
+        # The verdict is the ownership read, never the audit write (Prism 5c5caf4aae3d): a losing worker whose
+        # record or commit failed still exits instead of working a successor's card.
+        _kb._log.warning("kanban: worker %s lost run %s of %s; its registration record was not written",
+                         pid, run_id, task_id, exc_info=True)
+        return False
     return True
+
+
+def _record_losing_worker(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int, started_at: str) -> None:
+    """A worker started on a run that no longer holds its card (closed while the spawn was in flight, and the
+    launcher died before ``_set_worker_pid``; Prism f065138133fd). Inside the caller's txn: record that the
+    process existed and where, against its own run only, and drop the no-worker class the close stamped. The
+    card's pid is left alone: a successor may own it."""
+    if conn.execute("SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?", (run_id, task_id)).fetchone() is None:
+        return
+    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ('spawned', 'worker_registered') LIMIT 1",
+                    (run_id,)).fetchone() is None:
+        _kb._append_event(conn, task_id, "worker_registered",
+                          {"pid": pid, "started_at": started_at, "claim_lost": True}, run_id=run_id)
+    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
+                    (run_id, PLACEMENT_EVENT)).fetchone() is None:
+        _kb._append_event(conn, task_id, PLACEMENT_EVENT,
+                          {**_unrecorded_placement(conn, run_id, entry="worker_registered"), "claim_lost": True},
+                          run_id=run_id)
+    conn.execute("UPDATE task_runs SET no_worker_class = NULL WHERE id = ?", (run_id,))
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -4645,7 +4719,6 @@ def _launch_claimed(
     Exceptions propagate; ``state.launched`` says whether a process exists.
     """
     from hermes_cli.kanban_continuation import record_placement
-    from hermes_cli import kanban_placement_reasons as _pr
 
     from hermes_cli import kanban_priority_door as door
     if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
@@ -4673,8 +4746,7 @@ def _launch_claimed(
     if not pid:
         # No pid reported (no ``spawned`` event): still one record.
         with _kbc.write_txn(conn):
-            _kb._append_event(conn, claimed.id, _pr.PLACEMENT_EVENT, record,
-                              run_id=claimed.current_run_id)
+            _write_placement(conn, claimed.id, claimed.current_run_id, record)
     # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn returned and
     # the PID (when reported) is durably persisted, per the RFC timing
     # contract. Best-effort — can never break the dispatch loop.
@@ -5697,9 +5769,22 @@ def _studio_deny_unrouted(conn, row, ctx: dict, lane: str, default_assignee: Opt
             ctx["studio_on"] = _studio_capability_on(ctx["caps"], _studio_last_resort(_kb.kanban_home() / "fleet"))
     if not ctx["on"]:
         return None
-    stand_in = {"review": _ksa.REVIEW_CAP, "browser_join": _ksa.BROWSER_JOIN_CAP}.get(lane, _ksa.NO_PLAN_CAP)
+    stand_in = {"review": _ksa.REVIEW_CAP, "browser_join": _ksa.BROWSER_JOIN_CAP,
+                "admit": _ksa.ADMIT_CAP}.get(lane, _ksa.NO_PLAN_CAP)
     return _ksa.unrouted_hold(conn, row, ctx.get("caps"), studio_on=ctx.get("studio_on", False), kcfg=ctx["kcfg"],
                               stand_in=stand_in, default_assignee=default_assignee)
+
+
+def _review_studio_capability(row, origin_host, caps, ctx: dict) -> Optional[dict]:
+    """What default-deny resolves for a LOCAL review start (declared / attached skill / ``review_lane``), or None
+    for a pool start or a tick with no capability map."""
+    if origin_host is not None:
+        return None
+    caps = caps if caps is not None else ctx.get("caps")
+    if caps is None:
+        return None
+    from hermes_cli import kanban_studio_allowlist as _ksa
+    return _ksa.resolved_capability(row, caps, _ksa.REVIEW_CAP)
 
 
 def _carry_split_plan(workspace_path, carry_budget):
@@ -7523,6 +7608,7 @@ def _dispatch_once_locked(
     # review lane is never offered to the pool: its rows are always local.
     review_rows = []
     _review_pause_pins: dict = {}  # review id -> resume-origin host (Prism 01f1e61334ff)
+    _review_deny_waits: dict = {}  # t_062a5948: review-lane default-deny holds, persisted + notified after the loop
     # kanban admit enumerates them too, read-only, so a review row that
     # outranks the card binds it exactly as it binds the tick; it never spawns one.
     _review_dry = dry_run or _admit
@@ -7554,6 +7640,12 @@ def _dispatch_once_locked(
                 _rwhy = _rwhy if _rwhy is not None and _kph.local_destination_wait(_pause_cache) is not None else None
             else:
                 _rwhy = _kph.local_destination_wait(_pause_cache)
+                if _rwhy is None:
+                    # t_5d63270d (Prism c-4f52c4dd8765315a): a review with no pause pin and no enforced origin starts
+                    # locally, so a default-deny hold is decided here, before it reserves ready-lane capacity.
+                    _rwhy = _studio_deny_unrouted(conn, _rrow, _deny_ctx, "review", default_assignee)
+                    if _rwhy is not None:
+                        _review_deny_waits[_rrow["id"]] = _rwhy
             if _rwhy is not None:
                 result.placement_waits[_rrow["id"]] = _rwhy
                 continue
@@ -8569,10 +8661,13 @@ def _dispatch_once_locked(
             # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
             # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
             _local_wait = _kph.local_destination_wait(_pause_cache)
-            if _local_wait is None and force_host is None and route == "portable":
+            if _local_wait is None and route == "portable":
                 # t_062a5948 (Prism 827ad8491946 r2): a portable row starts locally only when its browser join was
-                # cut for the Studio (_portable_goes_remote keeps it here); _route_row never classified it.
-                _local_wait = _studio_deny_unrouted(conn, row, _deny_ctx, "browser_join", default_assignee)
+                # cut for the Studio (_portable_goes_remote keeps it here), or when `kanban admit --host studio`
+                # forces it (t_5d63270d, Prism c-e7592fee5f5910ad); _route_row never classified either.
+                _local_wait = _studio_deny_unrouted(conn, row, _deny_ctx,
+                                                    "browser_join" if force_host is None else "admit",
+                                                    default_assignee)
             if _local_wait is not None:
                 result.placement_waits[row["id"]] = _local_wait
                 continue
@@ -9022,7 +9117,6 @@ def _dispatch_once_locked(
             _kb._log.warning("kanban unknown-pin park failed: %s", exc)
     _tick_routes(result, ready_rows, row_route, row_rules, spillover is not None, dry_run)
 
-    _review_deny_waits: dict = {}  # t_062a5948: review-lane default-deny holds, persisted + notified after the loop
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
     # creating a PR.  The dispatcher spawns a review agent (loading
@@ -9294,7 +9388,11 @@ def _dispatch_once_locked(
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
-                placement={"route_class": "pin" if _review_origin_host else "local", "entry": "review"},
+                placement={"route_class": "pin" if _review_origin_host else "local", "entry": "review",
+                           # t_5d63270d (Prism c-0d4f28b3daf38893): the capability default-deny resolves for this
+                           # local review start, for the replay; None = a pool start, or no capability map.
+                           "studio_capability": _review_studio_capability(row, _review_origin_host, _caps,
+                                                                          _deny_ctx)},
             ):
                 _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
                 continue

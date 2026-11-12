@@ -59,8 +59,12 @@ LEDGER_FILE = "overrides.jsonl"
 NO_PLAN_CAP = "pool_unavailable"
 REVIEW_CAP = "review_lane"
 BROWSER_JOIN_CAP = "browser_join"  # a portable row kept on the Studio because its browser join was cut there
+# ``kanban admit --host studio`` on a portable card (Prism c-e7592fee5f5910ad): admit never writes a Studio start the
+# rule would not, so it is held under this stand-in until a ``studio-override --capability operator_admit`` exists.
+ADMIT_CAP = "operator_admit"
 _STAND_IN_EVIDENCE = {NO_PLAN_CAP: "no pool plan this tick", REVIEW_CAP: "the review lane runs only locally",
-                      BROWSER_JOIN_CAP: "its browser join was cut for the Studio"}
+                      BROWSER_JOIN_CAP: "its browser join was cut for the Studio",
+                      ADMIT_CAP: "kanban admit --host studio on a card no Studio-only capability holds"}
 
 
 def config(kcfg: Optional[Mapping]) -> tuple:
@@ -139,6 +143,16 @@ def live_override(conn, task_id: str, capability: Optional[str], *, now: Optiona
     return None
 
 
+def override_command(task_id: str, reason: str) -> Optional[str]:
+    """The ``studio-override`` command for a ``studio_default_deny:<cap> (...)`` hold, else None. For a multi-part
+    capability it names the first part."""
+    if not str(reason or "").startswith(WAIT_PREFIX + ":"):
+        return None
+    cap = reason[len(WAIT_PREFIX) + 1:].split(" (", 1)[0]
+    first = (parts(cap) or ("<cap>",))[0]
+    return f'hermes kanban studio-override {task_id} --capability {first} --why "<reason>"'
+
+
 def wait_reason(why: Mapping) -> str:
     cap = why.get("capability") or "unnamed"
     src, ev = why.get("source") or "?", why.get("evidence") or ""
@@ -168,6 +182,14 @@ def unrouted_hold(conn, row, caps, *, studio_on: bool, kcfg: Optional[Mapping], 
     enabled, allow = config(kcfg)
     if not enabled or not studio_on:
         return None
+    why = resolved_capability(row, caps, stand_in)
+    return decide(conn, row, why, enabled=enabled, allow=allow, assignee=row["assignee"] or default_assignee)
+
+
+def resolved_capability(row, caps, stand_in: str) -> dict:
+    """The capability :func:`unrouted_hold` judges a local start by: the card's declared or attached-skill
+    Studio-only capability, else ``stand_in``. The review lane records it in its placement event (Prism
+    c-0d4f28b3daf38893), so the replay reads what the gate would have resolved instead of assuming the stand-in."""
     from hermes_cli import kanban_host_capabilities as _khc
     from hermes_cli import kanban_studio_capability as _ksc
     try:
@@ -177,25 +199,40 @@ def unrouted_hold(conn, row, caps, *, studio_on: bool, kcfg: Optional[Mapping], 
     why = _ksc.studio_capability(_khc.declared_words(row["body"]), skills, getattr(caps, "cmap", None))
     if why is None:
         why = {"capability": stand_in, "source": "dispatch", "evidence": _STAND_IN_EVIDENCE.get(stand_in, stand_in)}
-    return decide(conn, row, why, enabled=enabled, allow=allow, assignee=row["assignee"] or default_assignee)
+    return why
 
 
 def _held_this_episode(conn, task_id: str) -> bool:
     """True when the current wait episode already woke the operator: a ``mechanical_wake`` from this source with no
     episode-ending event after it."""
-    from hermes_cli import kanban_placement_reasons as _pr
-    ends = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
-    for kind, raw in conn.execute(
-            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN (?, %s) ORDER BY id DESC"
-            % ",".join("?" * len(ends)), (task_id, WAKE_EVENT, *ends)):
+    for kind, _created, p in _episode_events(conn, task_id, (WAKE_EVENT,)):
         if kind != WAKE_EVENT:
             return False
-        try:
-            if (json.loads(raw or "{}") or {}).get("source") == HOLD_WAKE_SOURCE:
-                return True
-        except (TypeError, ValueError, AttributeError):
-            continue
+        if p.get("source") == HOLD_WAKE_SOURCE:
+            return True
     return False
+
+
+def _episode_events(conn, task_id: str, kinds):
+    """Newest first: ``kinds`` rows and the episode-ending rows, as ``(kind, created_at, payload dict)``. A
+    ``placement_wait`` with ``cleared: true`` is yielded as an episode end too (Prism c-51c01dfda9372e31): the hold
+    it named is over, so the next hold is a new episode (a new wake, a fresh 60-minute clock)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    ends = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
+    want = (*kinds, "placement_wait", *ends)
+    for kind, created, raw in conn.execute(
+            "SELECT kind, created_at, payload FROM task_events WHERE task_id = ? AND kind IN (%s) ORDER BY id DESC"
+            % ",".join("?" * len(want)), (task_id, *want)):
+        try:
+            p = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            p = {}
+        p = p if isinstance(p, dict) else {}
+        if kind == "placement_wait":
+            if not p.get("cleared"):
+                continue
+            kind = "placement_wait_cleared"
+        yield kind, created, p
 
 
 def wake_text(task_id: str, reason: str) -> str:
@@ -208,21 +245,14 @@ def wake_text(task_id: str, reason: str) -> str:
 def _episode_start(conn, task_id: str) -> Optional[int]:
     """When the current hold episode began: the oldest ``mechanical_wake`` from this source after the last
     episode-ending event, or None."""
-    from hermes_cli import kanban_placement_reasons as _pr
-    ends = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
     start = None
-    for kind, created, raw in conn.execute(
-            "SELECT kind, created_at, payload FROM task_events WHERE task_id = ? AND kind IN (?, ?, %s) "
-            "ORDER BY id DESC" % ",".join("?" * len(ends)), (task_id, WAKE_EVENT, PAGED_EVENT, *ends)):
+    for kind, created, p in _episode_events(conn, task_id, (WAKE_EVENT, PAGED_EVENT)):
         if kind not in (WAKE_EVENT, PAGED_EVENT):
             break
         if kind == PAGED_EVENT:
             return None  # this episode already paged
-        try:
-            if (json.loads(raw or "{}") or {}).get("source") == HOLD_WAKE_SOURCE:
-                start = int(created)
-        except (TypeError, ValueError, AttributeError):
-            continue
+        if p.get("source") == HOLD_WAKE_SOURCE:
+            start = int(created)
     return start
 
 
@@ -374,7 +404,8 @@ def cmd_studio_override(args) -> int:
     scope = "once (next run only)" if p["once"] else f"until {p['until']}"
     print(f"kanban studio-override: {args.task_id} may start on the Studio for {p['capability']} {scope}; "
           f"fix card: {p['fix_card'] or 'none'}; event={OVERRIDE_EVENT}; ledger={p.get('ledger') or 'NOT WRITTEN'}")
-    if p.get("held_capability") and p["capability"] not in parts(p["held_capability"]):
+    held = parts(p.get("held_capability"))
+    if held and p["capability"] not in set(held) | {head(x) for x in held}:  # live_override's match
         print(f"kanban studio-override: WARNING {args.task_id} is held for {p['held_capability']}, not "
               f"{p['capability']}: this override does not release it", file=sys.stderr)
     return 0

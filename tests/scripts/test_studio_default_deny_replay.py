@@ -98,7 +98,8 @@ def test_local_review_placement_counts_as_a_studio_start(tmp_path):
     con = sqlite3.connect(db)
     con.execute("INSERT INTO tasks VALUES ('t_rev', 'r', 'daedalus', 0)")
     con.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
-                ("t_rev", 7, "placement", json.dumps({"route_class": "local", "entry": "review"}), T0 + 60))
+                ("t_rev", 7, "placement", json.dumps({"route_class": "local", "entry": "review", "studio_capability": {
+                    "capability": "review_lane", "source": "dispatch", "evidence": "x"}}), T0 + 60))
     con.commit()
     con.close()
     only, _ = sddr.load_caps(caps)
@@ -161,5 +162,106 @@ def test_pre_capability_host_studio_pin_is_unknown_not_a_move(tmp_path):
     buf = io.StringIO()
     sddr.report(rows, moved, stuck, {"obsidian-vault"}, 2, out=buf)
     text = buf.getvalue()
-    assert "unknown (pre-capability Studio pin, rule host_studio) 1" in text
+    assert "unknown (no capability record: rule host_studio, or a review start before t_5d63270d) 1" in text
     assert "| host_studio (no capability record) | 1 | 1 |" in text
+
+
+# -- Prism on #264 (t_5d63270d) -------------------------------------------------------------------------------
+
+def _add(db, tid, run, payload, assignee="daedalus", at=T0 + 90):
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO tasks VALUES (?,?,?,0)", (tid, "t " + tid, assignee))
+    con.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+                (tid, run, "placement", json.dumps(payload), at))
+    con.commit()
+    con.close()
+
+
+def _verdict(db, caps_path, tid, allow=frozenset()):
+    only, pool = sddr.load_caps(caps_path)
+    rows, _m, _s = sddr.replay([str(db)], only, set(allow), T0, T0 + 2 * 86400, pool_hosts=pool)
+    return next(r for r in rows if r["task_id"] == tid)
+
+
+def test_single_capability_no_pool_host_has_is_not_movable(tmp_path):
+    """c-eecd8df36c880d40: a capability removed from the map since (on no row at all) is not a move."""
+    db, caps = _board(tmp_path)
+    _add(db, "t_gone", 10, {"host": "mac-studio-m3u", "rule": "requires:retired-cap", "studio_capability": {
+        "capability": "retired-cap", "source": "declared", "kind": "capability"}})
+    assert _verdict(db, caps, "t_gone")["verdict"] == "override"
+    _add(db, "t_dock", 11, {"host": "mac-studio-m3u", "rule": "requires:docker", "studio_capability": {
+        "capability": "docker", "source": "declared", "kind": "capability"}})
+    assert _verdict(db, caps, "t_dock")["verdict"] == "moves"  # ace-ai has docker
+
+
+def test_review_placement_uses_the_recorded_capability_and_older_records_are_unknown(tmp_path):
+    """c-0d4f28b3daf38893: the gate resolves a declared/skill capability before review_lane; the replay reads the
+    recorded one, and a review record without it is unknown, not a review_lane override."""
+    db, caps = _board(tmp_path)
+    _add(db, "t_rv_old", 12, {"route_class": "local", "entry": "review"})
+    _add(db, "t_rv_vault", 13, {"route_class": "local", "entry": "review", "studio_capability": {
+        "capability": "obsidian-vault", "source": "declared", "evidence": "requires: obsidian-vault"}})
+    old = _verdict(db, caps, "t_rv_old", {"review_lane"})
+    assert old["verdict"] == "unknown" and old["cap"] is None
+    rv = _verdict(db, caps, "t_rv_vault", {"obsidian-vault"})
+    assert (rv["cap"], rv["verdict"]) == ("obsidian-vault", "allowlisted")
+    assert _verdict(db, caps, "t_rv_vault", {"review_lane"})["verdict"] == "override"
+
+
+def test_operator_exemption_reads_the_runs_own_profile(tmp_path):
+    """c-f8d72eda4b367716: a card reassigned to apollo after a daedalus run stays non-exempt for that run, and a
+    card reassigned away from apollo keeps the exemption of the apollo run; no run id falls back to the assignee."""
+    db, caps = _board(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, profile TEXT)")
+    con.execute("INSERT INTO task_runs VALUES (2, 't_state', 'daedalus'), (5, 't_op', 'apollo')")
+    con.execute("UPDATE tasks SET assignee='apollo' WHERE id='t_state'")
+    con.execute("UPDATE tasks SET assignee='daedalus' WHERE id='t_op'")
+    con.commit()
+    con.close()
+    only, _ = sddr.load_caps(caps)
+    rows, _m, _s = sddr.replay([str(db)], only, {"obsidian-vault"}, T0, T0 + 2 * 86400)
+    v = {(r["task_id"], r["run_id"]): r["verdict"] for r in rows}
+    assert v[("t_state", 2)] == "override"   # the run was daedalus
+    assert v[("t_state", 3)] == "exempt"     # no task_runs row for run 3: falls back to the current assignee
+    assert v[("t_op", 5)] == "exempt"        # the run was apollo
+
+
+def test_local_files_single_part_still_moves_with_a_pool_map(tmp_path):
+    """747326d7da47 / c-c6f037912be89579: local_files is left movable on purpose (the files can be carried), so the
+    single-part pool-coverage check must not turn it into an override; a real capability word still gets it."""
+    db, caps = _board(tmp_path)
+    _add(db, "t_lf", 14, {"host": "mac-studio-m3u", "studio_capability": {
+        "capability": "local_files:/x", "source": "structural"}})
+    assert _verdict(db, caps, "t_lf")["verdict"] == "moves"
+    _add(db, "t_lf_dock", 15, {"host": "mac-studio-m3u", "studio_capability": {
+        "capability": "local_files:/x,docker", "source": "structural"}})
+    assert _verdict(db, caps, "t_lf_dock")["verdict"] == "moves"  # ace-ai has docker; the files are carried
+    _add(db, "t_lf_gone", 16, {"host": "mac-studio-m3u", "studio_capability": {
+        "capability": "local_files:/x,retired-cap", "source": "structural"}})
+    assert _verdict(db, caps, "t_lf_gone")["verdict"] == "override"
+
+
+def test_recorded_review_capability_a_pool_host_has_does_not_move():
+    """61725b377c98 / c-f73d1930b451cd50 (Prism's repro): a review start never leaves the main machine, so a recorded
+    review capability some pool host has is still held there: override, or allowlisted when the allowlist covers
+    the recorded capability (the live gate's decide())."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "kanban.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT)")
+        con.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
+                    "payload TEXT, created_at INTEGER)")
+        con.execute("INSERT INTO tasks VALUES ('t_rv', 'r', 'daedalus')")
+        con.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+                    ("t_rv", 1, "placement", json.dumps({"route_class": "local", "entry": "review",
+                                                         "studio_capability": {"capability": "obsidian-vault",
+                                                                               "source": "declared"}}), T0 + 60))
+        con.commit()
+        con.close()
+        rows, moved, _s = sddr.replay([str(db)], set(), set(), T0, T0 + 86400, pool_hosts=[{"obsidian-vault"}])
+        assert rows[0]["verdict"] == "override" and not moved
+        rows, _m, _s = sddr.replay([str(db)], set(), {"obsidian-vault"}, T0, T0 + 86400,
+                                   pool_hosts=[{"obsidian-vault"}])
+        assert rows[0]["verdict"] == "allowlisted"

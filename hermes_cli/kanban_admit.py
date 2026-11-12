@@ -473,6 +473,12 @@ def refusal_from(res, task_id: str) -> str:
             return f"refused on measured danger: {why[len(kbd.ADMIT_FLOOR) + 2:]}"
         if why.startswith(kbd.ADMIT_INELIGIBLE + ": "):
             return why[len(kbd.ADMIT_INELIGIBLE) + 2:]
+        from hermes_cli.kanban_studio_allowlist import override_command
+        cmd = override_command(task_id, why)
+        if cmd is not None:
+            # t_5d63270d (Prism c-e7592fee5f5910ad): admit never starts what default-deny holds; the override is the
+            # audited path (studio_override event + capability-gap ledger line), then admit again.
+            return f"held: {why}; to start it on the Studio run `{cmd}` first, then admit again"
         return f"held: {why}"
     for tid, why in res.workspace_refused:
         if tid == task_id:

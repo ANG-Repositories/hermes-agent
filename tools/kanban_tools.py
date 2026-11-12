@@ -1612,6 +1612,12 @@ def _handle_create(args: dict, **kw) -> str:
     allow_flagship = args.get("allow_flagship")
     _check(allow_flagship is None or isinstance(allow_flagship, str),
            "allow_flagship must be a reason string")
+    # The board's create code sees every caller's REAL body; the hook sees one agent's call (t_4743853f).
+    from hermes_cli import kanban_access_bound_pin as _pin
+    body = args.get("body")
+    body = body if isinstance(body, str) else None
+    for why in (_pin.refusal(body), _pin.studio_refusal(body)):
+        _check(not why, f"kanban_create: {why}")
     from hermes_cli import kanban_worker_policy as _worker_policy
     # allow_flagship authority (operator label, not a dispatched worker) is
     # judged by create_task itself, before any write.
