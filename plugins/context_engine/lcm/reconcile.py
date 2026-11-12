@@ -51,6 +51,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_USER_ROW_SYSTEM_NOTE_PREFIX = re.compile(r"^\[System note: [^\]]*\]")
+_USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]{2,5}\]")
 
 
 class ReconcileMixin:
@@ -1039,14 +1041,16 @@ class ReconcileMixin:
         The first host tool result whose full identity is stored fixes the
         alignment between host rows and stored rows. From host row 0 the rows
         are then compared position by position: assistant/tool/system rows must
-        be identical, user rows only need the same role (the host rewrites
-        them). The cursor stops after the last identical row before the first
-        mismatch, so it never passes a row that is not shown to be stored: a
-        gap in the store (rows the host holds that were never written, e.g. the
-        store-free compaction fallback marks its raw tail ingested) shifts the
-        alignment and ends the run there, and a reused call id with new
-        arguments fails on its assistant row. Two distinct tool-call ids must
-        be matched inside the run, so a short delta keeps dup-over-loss.
+        be identical, user rows must be equal under ``_user_row_rerender_key``
+        (the host re-renders them). The run ends at the first row that does not
+        match, so the cursor never passes a row that is not shown to be stored:
+        a gap in the store (rows the host holds that were never written, e.g.
+        the store-free compaction fallback marks its raw tail ingested) ends
+        the run at its first row, whether the gap shows on an assistant row, a
+        tool row or a user row (turns whose assistant reply repeats), and a
+        reused call id with new arguments fails on its assistant row. Two
+        distinct tool-call ids must be matched inside the run, so a short delta
+        keeps dup-over-loss.
         """
         stored_ids = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
         stored_tool_pos: dict[tuple[Any, ...], int] = {}
@@ -1071,15 +1075,35 @@ class ReconcileMixin:
             role = str(msg.get("role") or "")
             if role != str(stored_rows[pos].get("role") or ""):
                 break
-            if self._message_replay_identity(msg) == stored_ids[pos]:
-                if role == "tool" and msg.get("tool_call_id"):
-                    matched_ids.add(str(msg.get("tool_call_id")))
-                cursor = idx + 1
-            elif role != "user":
+            identity = self._message_replay_identity(msg)
+            if identity != stored_ids[pos] and not (
+                role == "user" and self._user_row_rerender_key(identity[1]) in (
+                    "", self._user_row_rerender_key(stored_ids[pos][1]),
+                )
+            ):
                 break
+            if role == "tool" and msg.get("tool_call_id"):
+                matched_ids.add(str(msg.get("tool_call_id")))
+            cursor = idx + 1
         if len(matched_ids) < 2:
             return 0
         return cursor
+
+    @staticmethod
+    def _user_row_rerender_key(content: Any) -> str:
+        """A user row's content with the host's re-render variance removed.
+
+        Measured on the live store (session 20261108_093540_fa4b70b9, store_ids
+        13007493, 12999747, 12993102, 12990342 and their later copies), the host
+        re-renders a stored user row in three ways only: trailing whitespace
+        dropped, a leading ``[System note: ...]`` block added or dropped, and a
+        leading ``[Wed 2026-11-11 23:57:30 PST]`` timestamp added or dropped.
+        Anything else is a different row. An empty key means the host emptied
+        the row: skipping it drops no content, so the caller accepts it.
+        """
+        text = str(content or "").strip()
+        text = _USER_ROW_SYSTEM_NOTE_PREFIX.sub("", text, count=1).strip()
+        return _USER_ROW_TIMESTAMP_PREFIX.sub("", text, count=1).strip()
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

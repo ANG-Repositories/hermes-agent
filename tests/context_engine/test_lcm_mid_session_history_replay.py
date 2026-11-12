@@ -230,3 +230,84 @@ class TestStoreGapIsNotSkipped:
         new_turn = calls(1)
         _rebuilt_agent_ingest(tmp_path, new_turn)
         assert _rows(tmp_path) == n0 + len(new_turn)
+
+
+def _plain_turn(i):
+    return [
+        {"role": "user", "content": f"[kanban] notice {i}: task finished"},
+        {"role": "assistant", "content": "Noted; nothing to do."},
+    ]
+
+
+def _plain_gap_store(tmp_path, gap):
+    # 4 tool turns (anchors), 12 notification turns whose assistant reply is
+    # identical, 2 tool turns: a gap turn lines up with its stored neighbour.
+    turns = [_turn(i) for i in range(4)] + [_plain_turn(i) for i in range(100, 112)] + [_turn(i) for i in range(4, 6)]
+    keys = list(range(4)) + list(range(100, 112)) + list(range(4, 6))
+    rows = [{"role": "system", "content": "You are Apollo."}]
+    for key, turn in zip(keys, turns):
+        if key not in gap:
+            rows.extend(turn)
+    eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+    eng.on_session_start(SESSION, platform="discord")
+    eng._store.append_batch(SESSION, [dict(r) for r in rows])
+    return [m for turn in turns for m in turn]
+
+
+class TestUserRowGapIsNotSkipped:
+    """Prism a6b4b0dcce80 / operator probe-275-gap2: a gap of turns with no
+    tool call and a repeated assistant reply differs only on its user row."""
+
+    def test_gap_of_one_notice_is_stored(self, tmp_path):
+        host = _plain_gap_store(tmp_path, {105})
+        _rebuilt_agent_ingest(tmp_path, host)
+        assert _count(tmp_path, "[kanban] notice 105: task finished") >= 1
+
+    def test_gap_of_three_notices_is_stored(self, tmp_path):
+        host = _plain_gap_store(tmp_path, {103, 104, 105})
+        _rebuilt_agent_ingest(tmp_path, host)
+        for i in (103, 104, 105):
+            assert _count(tmp_path, f"[kanban] notice {i}: task finished") >= 1
+
+    def test_no_gap_notice_history_appends_nothing(self, tmp_path):
+        host = _plain_gap_store(tmp_path, set())
+        n0 = _rows(tmp_path)
+        _rebuilt_agent_ingest(tmp_path, host)
+        assert _rows(tmp_path) == n0
+
+    def test_measured_user_row_rerenders_are_skipped(self, tmp_path):
+        # The three re-renders seen on the live store: trailing newline
+        # dropped (13007493), a [System note: ...] block dropped (12993102),
+        # a timestamp prefix added.
+        rows = [{"role": "system", "content": "You are Apollo."}]
+        for i in range(6):
+            rows.extend(_turn(i))
+        users = [i for i, r in enumerate(rows) if r["role"] == "user"]
+        rows[users[1]]["content"] += "\n"
+        rows[users[2]]["content"] = (
+            "[System note: The previous turn was interrupted by a gateway shutdown; the gateway is now back online.]"
+            "\n\n[Thu 2026-11-12 00:05:57 PST] " + rows[users[2]]["content"]
+        )
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        n0 = _rows(tmp_path)
+        host = [dict(r) for r in rows[1:]]
+        host[users[1] - 1]["content"] = host[users[1] - 1]["content"].rstrip()
+        host[users[2] - 1]["content"] = "[Thu 2026-11-12 00:05:57 PST] " + _turn(2)[0]["content"]
+        host[users[3] - 1]["content"] = "[Wed 2026-11-11 23:57:30 PST] " + host[users[3] - 1]["content"]
+        _rebuilt_agent_ingest(tmp_path, host)
+        assert _rows(tmp_path) == n0
+
+    def test_user_row_with_other_text_ends_the_run(self, tmp_path):
+        rows = [{"role": "system", "content": "You are Apollo."}]
+        for i in range(6):
+            rows.extend(_turn(i))
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        host = [dict(r) for r in rows[1:]]
+        host[8]["content"] = "[kanban] a different wake"
+        assert host[8]["role"] == "user"
+        _rebuilt_agent_ingest(tmp_path, host)
+        assert _count(tmp_path, "[kanban] a different wake") == 1
