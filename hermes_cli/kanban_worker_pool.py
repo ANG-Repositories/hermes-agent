@@ -2505,10 +2505,14 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     probed: Dict[str, dict] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
-        sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
+        active = h.enabled and h.state == "active"
+        free = count_free(h, running) if active else 0
+        # allocd on: probe a host past its count too, so _take_allocd (structural_free) can ask allocd for it.
+        # `free` stays the real count for every take that does not ask allocd (t_2158f095, Prism cba00e400ff4).
+        ask = free > 0 or (active and signal.allocd == "on")
+        sample = _probe_states(probe, h, ask, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
+               "band": None, "band_reason": "", "why": "", "probed": ask, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             if signal.placement_table is not None:

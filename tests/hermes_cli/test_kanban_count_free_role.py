@@ -146,8 +146,10 @@ def test_allocd_admits_a_count_free_host_past_the_old_count_until_it_refuses(sig
     monkeypatch.setattr(kh, "pool_key", lambda table, cands, h: h if h in cands else None)
     running = OLD_COUNT + 2  # past the old count already
     legacy = _allocd_plan(sig, AI, running)
-    assert kh.structural_free(legacy, "ace-ai") == 0
-    assert legacy.take("alpha") is None and legacy.refusal == "pool_full" and admitted == []
+    # t_2158f095 (one guard per start): an allocd take is not capped by a legacy count either; the plan's own
+    # slots stay the real count for every take that does not ask allocd (test_kanban_fwa_no_slot_cap.py).
+    assert legacy.slots["ace-ai"] == 0
+    assert kh.structural_free(legacy, "ace-ai") == kwp.UNCOUNTED_TICK_FREE
 
     p = _allocd_plan(sig, FREE_AI, running)
     assert kh.structural_free(p, "ace-ai") == kwp.UNCOUNTED_TICK_FREE

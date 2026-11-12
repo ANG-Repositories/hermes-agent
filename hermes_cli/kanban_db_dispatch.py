@@ -4241,13 +4241,45 @@ def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -
     return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
 
 
+def fleet_admission_active() -> bool:
+    """True when ``kanban.admission`` is ``utilization``: the fleet admission path
+    (``admission.admit_class("kanban")`` through the load gate / allocd) decides
+    how many workers start, so the two upstream small-VM memory guards below
+    (the derived ``max_in_progress`` default and ``_memory_pressure_level``)
+    stand down (t_2158f095, Apollo ruling t_2158f095-round4-integration 2; Ace
+    msg 1569308234441949345: "only fwa is the guard/gate"). Absent, unreadable
+    or any other value = False: upstream behaviour unchanged.
+
+    ONE reader (Apollo ruling t_2158f095-round5-integration item 11): the same
+    ``placement.admission_mode()`` (fleet-root config.yaml) that decides whether
+    the load gate / unified admission runs, so the guards never stand down
+    while the fleet path is off, or the reverse.
+
+    One guard per start, never zero (Apollo ruling on Prism 9c506516b019): the
+    load gate is what replaces these guards for a local start, and it has its
+    own off switch (``kanban.dispatch_load_gate.enabled``). Gate off = the
+    guards stay on. The gate's state comes from the gate's own builder
+    (``kanban_load_gate.gate_from_config``), not a second parse of the key.
+    """
+    try:
+        from hermes_cli.fleet_placement import placement as _placement
+        if _placement.admission_mode() != "utilization":
+            return False
+        from hermes_cli import kanban_load_gate as _klg
+        return bool(_klg.gate_from_config().enabled)
+    except Exception:
+        return False
+
+
 def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     """Effective global concurrency cap: explicit config wins, else the
-    memory-derived default. All config-parsing callers route through this so
-    both paths agree.
+    memory-derived default (none under fleet admission). All config-parsing
+    callers route through this so both paths agree.
     """
     if configured is not None:
         return configured
+    if fleet_admission_active():
+        return None
     return derive_default_max_in_progress()
 
 
@@ -4312,8 +4344,11 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     Reuses :func:`gateway.memory_status.classify_pressure` so "critical" matches
     the dashboard banner and lifecycle-ledger OOM heuristics. ``unknown``
     (non-Linux, read failure) imposes no restriction — never brick dispatch
-    where /proc is unavailable.
+    where /proc is unavailable. Also ``unknown`` under fleet admission
+    (:func:`fleet_admission_active`): FWA prices memory, this guard does not.
     """
+    if fleet_admission_active():
+        return "unknown"
     if sample is None:
         sample = _system_memory_sample()
     if not sample:
