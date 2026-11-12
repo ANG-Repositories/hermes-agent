@@ -746,6 +746,65 @@ def _is_linked_worktree(path: str) -> bool:
         return False
 
 
+def clone_unpushed_worktrees(repo: str, runner: Callable = subprocess.run) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """``(realpath, HEAD)`` of every OTHER worktree of the clone at ``repo`` whose HEAD no remote-tracking ref holds
+    (t_d2f06cf6): those commits live only in this clone's object store, which a re-clone from origin drops. None
+    when git cannot tell (fail closed)."""
+    def _run(*args):
+        try:
+            proc = runner(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8", timeout=10,
+                          stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout if getattr(proc, "returncode", 1) == 0 else None
+    listing = _run("worktree", "list", "--porcelain")
+    if listing is None:
+        return None
+    try:
+        me = os.path.realpath(repo)
+    except (OSError, ValueError):
+        return None
+    out = []
+    path = None
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line.startswith("HEAD ") and path is not None:
+            head = line[5:].strip()
+            if os.path.realpath(path) != me and head and set(head) != {"0"}:
+                if _run("rev-list", "-n", "1", head, "--not", "--remotes") != "":
+                    out.append((os.path.realpath(path), head))  # unpushed, or unreadable (fail closed)
+    return tuple(out)
+
+
+def split_worktree_loss(workspace: str, recs, worktrees, runner: Callable = subprocess.run) -> Optional[str]:
+    """None, or the reason a split carry would lose commits (t_d2f06cf6): a rebuilt CLONE (``recs`` minus the
+    ``worktrees`` rels) whose linked worktree inside ``workspace`` sits on a commit no remote holds, unless that
+    worktree is itself rebuilt and pushed at that commit. Its objects exist only in the clone's .git."""
+    try:
+        ws = os.path.realpath(workspace).rstrip("/") + "/"
+    except (OSError, ValueError):
+        return "workspace unreadable"
+    pushed = set()
+    for r in recs:
+        if r.get("push") is not None:
+            try:
+                pushed.add((os.path.realpath(os.path.join(workspace, r["rel"])), r["sha"]))
+            except (OSError, ValueError):
+                pass
+    for r in recs:
+        if r["rel"] in worktrees:
+            continue
+        lost = clone_unpushed_worktrees(os.path.join(workspace, r["rel"]), runner)
+        if lost is None:
+            return f"clone {r['rel']}: worktree list unreadable"
+        for path, head in lost:
+            if (path + "/").startswith(ws) and (path, head) not in pushed:
+                return (f"clone {r['rel']} has worktree {os.path.relpath(path, ws)} at {head[:12]}, "
+                        f"which no remote holds")
+    return None
+
+
 def carry_split_worktrees(path: Optional[str]) -> Tuple[str, ...]:
     """The linked-worktree rels (a subset of :func:`carry_split`'s) the last split census of ``path`` set aside."""
     try:
@@ -769,7 +828,9 @@ def worktree_usage(path: str, *, max_bytes: int, max_entries: int, fresh: bool =
     t = _time.monotonic()
     hit = _worktree_usage_cache.get(key)
     if not fresh and hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
-        return hit[1]
+        # a walk stopped at a cap is only a lower bound: reusable while it still exceeds the caps asked now
+        if hit[1] is None or hit[2] or hit[1][0] > max_bytes or hit[1][1] > max_entries:
+            return hit[1]
     stop = t + max_seconds
     total = entries = 0
     pending = [path]
@@ -795,7 +856,8 @@ def worktree_usage(path: str, *, max_bytes: int, max_entries: int, fresh: bool =
         usage = None
     if len(_worktree_usage_cache) > 4096:
         _worktree_usage_cache.clear()
-    _worktree_usage_cache[key] = (_time.monotonic(), usage)
+    complete = usage is not None and not pending and total <= max_bytes and entries <= max_entries
+    _worktree_usage_cache[key] = (_time.monotonic(), usage, complete)
     return usage
 
 
@@ -1088,6 +1150,9 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
             extra_entries += 1
         staged.append((c, dest, ignored))
     rebuilt = {c["rel"].strip("/") for c in clones}
+    lost = split_worktree_loss(workspace, clones, set(carry_split_worktrees(workspace)), runner)
+    if lost is not None:
+        raise RuntimeError(f"carry to {host.name}: {lost}")  # t_d2f06cf6: re-checked uncached, before any push
     if extra_entries or set(carry_split_worktrees(workspace)) - rebuilt:
         # Review F3 (22:1x): the spawn-time list gets the routing's caps again; a file that grew or appeared since
         # routing can push the carry over, and then the spawn fails with the same named reason the wait line uses.

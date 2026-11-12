@@ -520,6 +520,7 @@ def test_carry_clones_rebuilds_the_clone_at_the_same_commit(kanban_home, tmp_pat
     # Studio and pool host are one local path here: the Studio-side re-check (review F2) has no Studio clone to read
     monkeypatch.setattr(kwh, "clone_moved_since_routing", lambda *a, **k: None)
     monkeypatch.setattr(kwh, "clone_ignored_files", lambda *a, **k: ())
+    monkeypatch.setattr(kwh, "split_worktree_loss", lambda *a, **k: None)  # t_d2f06cf6: also a Studio-side read
     kwh.carry_clones(_host(), str(ws), [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": first,
                                          "push": None}], kanban_home / "fleet", runner=local)
     head = subprocess.run(["git", "-C", str(ws / "repo"), "rev-parse", "HEAD"], check=True, capture_output=True,
@@ -899,7 +900,10 @@ def test_spawn_recheck_counts_an_unrebuilt_worktree(kanban_home, wt_carry, monke
     assert kwh.carry_split(path) == ("mainwt", "repo")  # both set aside; only the clone is rebuildable
     assert kwh.carry_split_worktrees(path) == ("mainwt",)
     assert kwh.carry_split_fits(path, 0, 0, rebuilt={"repo"}) is None
-    assert "mainwt" in (kwh.carry_split_fits(path, 12000, 0, rebuilt={"repo"}) or ""), "worktree bytes not counted"
+    from hermes_cli.kanban_db_workspace import canon
+    room = 32768 - kwh._carry_split_usage[canon(path)][0] - 50  # the remainder plus this still fits the cap
+    assert kwh.carry_split_fits(path, room, 0, rebuilt={"repo", "mainwt"}) is None  # fits without the worktree
+    assert "worktree mainwt" in (kwh.carry_split_fits(path, room, 0, rebuilt={"repo"}) or ""), "worktree not counted"
     monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: None)
     monkeypatch.setattr(kwh, "clone_ignored_files", lambda *a, **k: ())
     kwh.carry_clones(_host(), path, [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha,
@@ -912,3 +916,15 @@ def test_clone_head_key_reads_a_linked_worktree(tmp_path):
     _worktree_of(tmp_path)
     key = kwh._clone_head_key(str(tmp_path / "mainwt"))
     assert key is not None and key[0] == "ref: refs/heads/feat/wt" and len(key[1]) == 40, key
+
+
+def test_carried_worktree_on_an_unpushed_commit_blocks_the_clone_rebuild(kanban_home, wt_carry):
+    """A dirty worktree (carried as files) whose HEAD no remote holds: its commits live only in the clone's .git,
+    which the re-clone drops. The card waits, named; nothing is rebuilt (never lose what is not recoverable)."""
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        _worktree_of(path, dirty=True, ahead=True, size=100)
+        route, plan = _route_carry(conn, tid)
+    assert plan is None and route[0] == "wait", route
+    assert "worktree mainwt at" in route[1] and "which no remote holds" in route[1], route

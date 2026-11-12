@@ -5618,6 +5618,9 @@ def _carry_split_plan(workspace_path, carry_budget):
         return None, over
     if not recs:
         return None, "over the carry limit even without its git clones (or the census is deferred)"
+    lost = _kb._kwh.split_worktree_loss(workspace_path, recs, worktrees)
+    if lost is not None:
+        return None, f"over the carry limit; {lost}"
     return {"exclude": tuple(c for c in clones if c in rebuilt), "clones": recs}, None
 
 
