@@ -7735,7 +7735,11 @@ def assign_task(
         conn, task_id, profile, flagship_override_reason, operator,
         releases_dispatch=clear_no_worker, sends_back=sends_back,
     )
-    if not sends_back:
+    # t_54f4fde6: the review-hold lane hands a parked card to the operator lane; that keeps it in review with a
+    # reviewer, so the open-PR refusal below (a review card left with no worker) does not apply.
+    hold_handoff = (not sends_back and is_human_reviewer(profile)
+                    and _review_hold_handoff_source(conn, task_id) is not None)
+    if not sends_back and not hold_handoff:
         held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
         if held:
             raise ReviewHoldRequired(
@@ -7795,6 +7799,14 @@ def assign_task(
             _append_event(
                 conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
             )
+        if hold_handoff and row["status"] == "review" and is_review_hold_assignee(row["assignee"]):
+            # The operator's review starts now: a fresh review entry (deadman clock, owner wake),
+            # same implementer, so a later send-back still restores the worker.
+            _append_event(conn, task_id, "review_requested", {
+                "summary": f"review hold: checks settled, handed to {profile}",
+                "implementer": _review_handoff_implementer(conn, task_id),
+                "reviewer": profile, "handed_from": row["assignee"],
+            })
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee", "status") if sends_back else ("assignee",))
     return True
@@ -12292,6 +12304,12 @@ def complete_task(
                 note = "\n".join([_neg.route_note(negative_trigger), note])
                 routed_meta["negative_handoff"] = negative_trigger
                 open_pr_reviewer = _neg.REVIEWER
+            else:
+                # t_54f4fde6 D1: the machine holder waits for CI/Prism; the land evaluator hands the card to
+                # the operator when they settle. Unset knob: None, today's reviewer resolution.
+                open_pr_reviewer = configured_review_hold_assignee()
+                if open_pr_reviewer:
+                    routed_meta["review_hold"] = open_pr_reviewer
             routed_summary = _neg.routed_summary(note, summary, result)
             routed_meta, staged = _stage_routed_scratch_artifacts(
                 conn, task_id, routed_meta, summary=summary, result=result,
@@ -14629,6 +14647,34 @@ def configured_review_assignee() -> Optional[str]:
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip()
+
+
+def configured_review_hold_assignee() -> Optional[str]:
+    """``kanban.review_hold_assignee`` (t_54f4fde6): the machine holder a handback with a still-open PR is
+    assigned to instead of the operator, while CI and Prism settle. hermes-home's land evaluator hands the
+    card to the operator (``assign``) when its checks have settled. Unset/blank/human = today's routing.
+    The holder is never spawned (not a profile) and is not a ``human:*`` lane, so the operator review deadman
+    does not watch it."""
+    try:
+        value, _source = _kanban_review_setting("review_hold_assignee", None)
+    except Exception:
+        return None
+    if not isinstance(value, str) or not value.strip() or is_human_reviewer(value):
+        return None
+    return value.strip().lower()
+
+
+def is_review_hold_assignee(assignee: Optional[str]) -> bool:
+    hold = configured_review_hold_assignee()
+    return bool(hold and isinstance(assignee, str) and assignee.strip().lower() == hold)
+
+
+def _review_hold_handoff_source(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The holder's name when ``task_id`` sits in ``review`` on the review-hold lane, else None."""
+    row = conn.execute("SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] != "review" or not is_review_hold_assignee(row["assignee"]):
+        return None
+    return row["assignee"]
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 MILESTONE_MARKER = "[milestone]"
 QA_REQUIRED_MARKER = "qa:required"
@@ -14821,6 +14867,8 @@ def resolve_reviewer(
     raw = str(reviewer).strip()
     if is_human_reviewer(raw):
         return raw.casefold(), None
+    if is_review_hold_assignee(raw):
+        return raw.lower(), None   # t_54f4fde6: the configured machine holder, a deliberate non-spawnable lane
 
     try:
         canonical = _canonical_assignee(raw)
@@ -14896,6 +14944,8 @@ def review_awaiting_human(
         "FROM tasks WHERE status = 'review' AND claim_lock IS NULL"
     ):
         assignee = row["assignee"]
+        if is_review_hold_assignee(assignee):
+            continue   # t_54f4fde6: the machine hold lane, not awaiting a human (the land evaluator times it out)
         since = int(row["since"] or now)
         age_minutes = max(0, (now - since) // 60)
         spawnable = bool(

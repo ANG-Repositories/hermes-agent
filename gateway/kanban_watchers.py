@@ -2447,6 +2447,12 @@ class GatewayKanbanWatchersMixin:
                                     _red_seen = _ow.runner_state(self).red_seen if _s5 else {}
                                     if _wake_mode:
                                         for _ev in events:
+                                            # t_54f4fde6: a handback parked on the review-hold lane is no
+                                            # decision yet; the hand-off to the operator wakes it later.
+                                            if _ev.kind == "review_requested" and _kb.is_review_hold_assignee(
+                                                    (_ev.payload or {}).get("reviewer")):
+                                                wake_noise[_ev.id] = "review-hold"
+                                                continue
                                             # t_fa08b93d: an operator-homed card has no home
                                             # chat; the operator's own transition is still an echo.
                                             if (_s5_home and _ns.is_own_echo(_ev, _home_sid, True)) or (
