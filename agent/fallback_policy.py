@@ -437,6 +437,10 @@ def skips_quota_gate(cls: str) -> bool:
 # restore gate asks the relay (/eligibility) again.
 RELAY_QUOTA_CACHE_S = 5 * MIN
 RELAY_QUOTA_CLASSES = frozenset({"quota_seat", "quota_model"})
+# The credential-pool failure reasons (FailoverReason values) that are seat
+# quota on a relay lane, besides a bare 429: the relay owns them, the pool row
+# stores nothing (credential_pool.relay_lane_quota_is_relays).
+RELAY_QUOTA_FAILURE_REASONS = frozenset({"rate_limit", "upstream_rate_limit", "pool_exhausted"})
 
 
 def _relay_pooled(provider: Optional[str]) -> bool:
@@ -447,9 +451,9 @@ def _relay_pooled(provider: Optional[str]) -> bool:
 
 def relay_quota_cooldown_s(cls: str, *, stated_reset_s: Optional[float] = None,
                            retry_after_s: Optional[float] = None,
-                           window: Optional[str] = None) -> float:
-    """The relay's reset for this seat/model, capped at the class ceiling, else
-    :data:`RELAY_QUOTA_CACHE_S`."""
+                           window: Optional[str] = None, jitter: float = 1.0) -> float:
+    """The relay's reset for this seat/model (times ``jitter``), else
+    :data:`RELAY_QUOTA_CACHE_S`; the class ceiling applies after jitter."""
     reset = next((float(v) for v in (stated_reset_s, retry_after_s)
                   if isinstance(v, (int, float)) and v > 0), None)
     if reset is None:
@@ -460,7 +464,7 @@ def relay_quota_cooldown_s(cls: str, *, stated_reset_s: Optional[float] = None,
         ceiling = COOLDOWN_TABLE["quota_seat"].ceiling_s
     else:
         ceiling = WINDOW_CEILING_DEFAULT_S
-    return min(reset, ceiling)
+    return min(reset * jitter, ceiling)
 
 
 def skips_legacy_arm(cls: str, provider: Optional[str]) -> bool:
@@ -496,7 +500,7 @@ def arm_sticky(store: StickyStore, key: StickyKey, *, cls: str, now: float,
     jit = default_jitter() if jitter is None else jitter
     if cls in RELAY_QUOTA_CLASSES and _relay_pooled(key.primary_provider):
         cooldown = relay_quota_cooldown_s(cls, stated_reset_s=stated_reset_s,
-                                          retry_after_s=retry_after_s, window=window) * jit
+                                          retry_after_s=retry_after_s, window=window, jitter=jit)
     else:
         cooldown = compute_cooldown_s(cls, n, stated_reset_s=stated_reset_s,
                                       retry_after_s=retry_after_s, window=window, jitter=jit)
@@ -665,6 +669,10 @@ class Eligibility:
     # their window, so a non-empty list = "warm copy exists, not eligible".
     warm_skip: Optional[str] = None
     warm_skipped: Tuple[str, ...] = ()
+    # t_d780729d: whether the answer carried ``model_eligible`` at all. A relay
+    # build that omits the key reads as model_eligible=False; only an answer
+    # that carries it may hold a session on its fallback (restore_allowed).
+    model_eligible_known: bool = False
 
 
 def _opt_int(v: Any) -> Optional[int]:
@@ -695,6 +703,7 @@ def parse_eligibility(obj: Any) -> Optional[Eligibility]:
         bound_seat=str(seat) if seat else None,
         bound_eligible=bool(obj.get("bound_eligible")),
         model_eligible=bool(obj.get("model_eligible")),
+        model_eligible_known="model_eligible" in obj,
         bound_expires_in_s=_opt_float(obj.get("bound_expires_in_s")),
         bound_idle_s=_opt_float(obj.get("bound_idle_s")),
         bound_expiry=obj.get("bound_expiry"),
@@ -975,9 +984,11 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
             # past it the relay's answer for this model decides. A relay that says
             # no seat can serve the model keeps the session on its fallback (the
             # cold/compaction branches below would only replay the refusal).
-            # Unreachable / stale -> None -> the branches below, unchanged.
+            # Unreachable / stale -> None -> the branches below, unchanged; so is an
+            # answer without a ``model_eligible`` key (an older relay build).
             elig = eligibility()
-            if elig is not None and not (elig.model_eligible or elig.bound_eligible):
+            if (elig is not None and elig.model_eligible_known
+                    and not (elig.model_eligible or elig.bound_eligible)):
                 return Decision(False, None, RELAY_MODEL_INELIGIBLE_REASON, exp, warm)
     last_fb = state.last_fallback_call_epoch
     if last_fb is None:

@@ -200,3 +200,209 @@ def test_relay_quota_class_skips_the_local_legacy_bench():
     assert fp.skips_legacy_arm("quota_model", "claude-bpx-12") is False
     assert fp.skips_legacy_arm("rate_upstream", "claude-alr") is False
     assert fp.skips_legacy_arm("conn", "openrouter") is True  # unchanged: skips_quota_gate
+
+
+# ── round 2 (Apollo send-back on #294) ─────────────────────────────────────
+
+# Every lane name that exists today (hermes-home lane table, 2026-11-12). A new
+# name must be added here, so CI says which side of the relay predicate it is on.
+POOLED_TODAY = ["claude-alr", "claude-alrf", "claude-alrs", "claude-apr", "claude-bpr",
+                "claude-btpr", "claude-btprf", "claude-dtlr", "claude-dtlrf",
+                "claude-clr", "claude-clrf"]
+PINS_TODAY = ["claude-apx-1", "claude-bpx-12", "claude-cpx-3", "claude-alx-4",
+              "claude-alxf-4", "claude-dpx-2", "claude-dtlx-5"]
+NOT_RELAY_TODAY = {
+    "claude-elr": "credit family: its own API budget, not subscription seats",
+    "claude-epr": "credit family: its own API budget, not subscription seats",
+    "claude-elx-2": "credit family pin: its own API budget, not subscription seats",
+    "claude-apr-2": "legacy per-key apr pool name (pre-grammar), kept in auth.json",
+    "claude-app": "legacy pool name",
+    "claude-bpp": "legacy pool name",
+    "claude-pool": "legacy pool name",
+    "claude-api-proxy": "legacy proxy name",
+    "claude-api-proxy-f1": "legacy proxy face",
+    "claude-bridge": "legacy bridge name",
+    "claude-bridge-tui": "legacy bridge face",
+    "claude-proxy": "legacy proxy name",
+    "claude-subscription-proxy": "legacy proxy name",
+}
+
+
+@pytest.mark.parametrize("name", POOLED_TODAY)
+def test_lane_table_pooled(name):
+    assert is_relay_pooled(name) and not is_relay_pinned(name)
+
+
+@pytest.mark.parametrize("name", PINS_TODAY)
+def test_lane_table_pins(name):
+    assert is_relay_pinned(name) and not is_relay_pooled(name)
+
+
+@pytest.mark.parametrize("name", sorted(NOT_RELAY_TODAY))
+def test_lane_table_not_relay(name):
+    assert NOT_RELAY_TODAY[name]
+    assert not is_relay_backed(name), NOT_RELAY_TODAY[name]
+
+
+# -- the predicate is a positive match on quota evidence --
+
+from agent.credential_pool import relay_lane_quota_is_relays as _q  # noqa: E402
+
+
+@pytest.mark.parametrize("code,reason", [
+    (429, None), (429, "rate_limit"),          # the 27 live shapes on the Studio
+    (None, "rate_limit"), (200, "upstream_rate_limit"), (503, "pool_exhausted"),
+])
+def test_predicate_matches_quota_evidence(code, reason):
+    for lane in ("claude-alr", "claude-apx-7"):
+        assert _q(lane, code, reason) is True
+
+
+@pytest.mark.parametrize("code,reason", [
+    (503, None), (529, None), (529, "overloaded"), (500, "server_error"), (None, None),
+    (401, None), (403, None), (429, "auth"), (None, "auth_permanent"), (402, "billing"),
+])
+def test_predicate_rejects_non_quota(code, reason):
+    assert _q("claude-alr", code, reason) is False
+
+
+def test_predicate_never_matches_non_relay():
+    assert _q("deepseek", 429, "rate_limit") is False
+
+
+@pytest.mark.parametrize("code,reason", [(503, None), (529, "overloaded")])
+def test_relay_lane_503_is_stored_as_on_main(tmp_path, monkeypatch, code, reason):
+    _auth(tmp_path, monkeypatch, {"claude-alr": [_row("r1", "sk-relay")]})
+    from agent.credential_pool import load_pool
+
+    load_pool("claude-alr").mark_exhausted_and_rotate(
+        status_code=code, credential_id="r1", api_key_hint="sk-relay", failure_reason=reason)
+    assert _disk_row(tmp_path, "claude-alr", "r1").get("last_status") == "exhausted"
+    assert load_pool("claude-alr").has_available() is False
+
+
+def test_relay_lane_forced_refresh_failure_is_stored_as_on_main(tmp_path, monkeypatch):
+    """_refresh_entry(force=True) on a non-OAuth entry marks with status None."""
+    _auth(tmp_path, monkeypatch, {"claude-apr": [_row("r1", "sk-relay")]})
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("claude-apr")
+    entry = pool.select()
+    assert pool._refresh_entry(entry, force=True) is None
+    assert _disk_row(tmp_path, "claude-apr", "r1").get("last_status") == "exhausted"
+
+
+@pytest.mark.parametrize("status", [
+    {"last_error_code": 429},                                         # 22 rows
+    {"last_error_code": 429, "failure_reason": "rate_limit", "last_error_reset_at": "NOW+3600"},  # 4
+    {"last_error_code": 429, "failure_reason": "rate_limit"},          # 1
+])
+def test_live_exhausted_shapes_are_ignored(tmp_path, monkeypatch, status):
+    now = time.time()
+    status = {k: (now + 3600 if v == "NOW+3600" else v) for k, v in status.items()}
+    _auth(tmp_path, monkeypatch, {"claude-apx-9": [_row(
+        "p9", "sk-pin", last_status="exhausted", last_status_at=now - 60, **status)]})
+    from agent.credential_pool import load_pool
+
+    assert load_pool("claude-apx-9").has_available() is True
+
+
+def test_stored_503_row_still_benches_relay_lane(tmp_path, monkeypatch):
+    _auth(tmp_path, monkeypatch, {"claude-alr": [_row(
+        "r1", "sk-relay", last_status="exhausted", last_error_code=503,
+        last_status_at=time.time() - 30)]})
+    from agent.credential_pool import load_pool
+
+    assert load_pool("claude-alr").has_available() is False
+
+
+# -- jitter never pushes the cache past its ceiling --
+
+def test_relay_quota_cooldown_ceiling_applies_after_jitter():
+    assert fp.relay_quota_cooldown_s("quota_model", stated_reset_s=30 * 86400.0,
+                                      jitter=1.1) == fp.WINDOW_CEILING_DEFAULT_S
+    assert fp.relay_quota_cooldown_s("quota_model", stated_reset_s=100.0, jitter=1.1) == pytest.approx(110.0)
+
+
+# -- restore gate: the relay's ineligible answer holds; nothing else changes --
+
+FB = ("claude-bpr", "claude-opus-5-5")
+
+
+def _restore_state(cls, *, provider="claude-alr", cold=False, compacted=False):
+    """Past ``until``; fallback warm (or cold); optional compaction since it."""
+    last_fb = T0 - (2 * 3600 if cold else 60)
+    return fp.StickyState(
+        primary_provider=provider, primary_model="claude-fable-5-2",
+        fallback_provider=FB[0], fallback_model=FB[1], cls=cls, until_epoch=T0 - 1,
+        active=True, entered_at=last_fb, last_fallback_call_epoch=last_fb,
+        last_compaction_epoch=(T0 - 30) if compacted else None,
+        last_primary_call_epoch=T0 - 600, last_primary_seat="sub-vps-6")
+
+
+def _answer(eligible, *, with_key=True):
+    obj = {"instance_id": "1:18811", "bound_seat": "sub-vps-6", "bound_eligible": eligible,
+           "bound_expires_in_s": 900, "snapshot_age_s": 1}
+    if with_key:
+        obj["model_eligible"] = eligible
+    return fp.parse_eligibility(obj)
+
+
+def _decide(state, elig, provider="claude-alr", calls=None):
+    def fn():
+        if calls is not None:
+            calls.append(1)
+        return elig
+    return fp.restore_allowed(state, T0, probe=True, primary_provider=provider, eligibility=fn)
+
+
+def _main_decision(state, elig, provider="claude-alr"):
+    """What main gives: the same gate with the relay-quota branch switched off."""
+    from unittest import mock
+    with mock.patch.object(fp, "RELAY_QUOTA_CLASSES", frozenset()):
+        return fp.restore_allowed(state, T0, probe=True, primary_provider=provider,
+                                  eligibility=lambda: elig)
+
+
+@pytest.mark.parametrize("cls", ["quota_model", "quota_seat"])
+@pytest.mark.parametrize("cold,compacted", [(False, False), (True, False), (False, True)])
+def test_restore_holds_when_relay_says_model_ineligible(cls, cold, compacted):
+    st = _restore_state(cls, cold=cold, compacted=compacted)
+    d = _decide(st, _answer(False))
+    assert d.allowed is False and d.reason == fp.RELAY_MODEL_INELIGIBLE_REASON
+    # without the hold, cold / compaction would have returned
+    if cold or compacted:
+        assert _main_decision(st, _answer(False)).allowed is True
+
+
+@pytest.mark.parametrize("cls", ["quota_model", "quota_seat"])
+@pytest.mark.parametrize("cold,compacted", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("which", ["eligible", "none", "no_key"])
+def test_restore_unchanged_when_relay_eligible_unreachable_or_keyless(cls, cold, compacted, which):
+    elig = {"eligible": _answer(True), "none": None,
+            "no_key": _answer(False, with_key=False)}[which]
+    st = _restore_state(cls, cold=cold, compacted=compacted)
+    got, want = _decide(st, elig), _main_decision(st, elig)
+    assert (got.allowed, got.branch) == (want.allowed, want.branch)
+    assert got.reason != fp.RELAY_MODEL_INELIGIBLE_REASON
+
+
+def test_keyless_answer_is_marked_unknown():
+    assert _answer(False, with_key=False).model_eligible_known is False
+    assert _answer(False).model_eligible_known is True
+
+
+@pytest.mark.parametrize("provider", ["claude-bpx-12", "openrouter", "anthropic"])
+def test_restore_branch_not_reached_for_pin_or_non_relay(provider):
+    st = _restore_state("quota_model", provider=provider, cold=True)
+    d = _decide(st, _answer(False), provider=provider)
+    assert d.reason != fp.RELAY_MODEL_INELIGIBLE_REASON
+    assert d == _main_decision(st, _answer(False), provider=provider)
+
+
+@pytest.mark.parametrize("cls", ["rate_upstream", "conn", "unclassified", "refusal"])
+def test_restore_branch_not_reached_for_non_quota_class(cls):
+    st = _restore_state(cls, cold=True)
+    d = _decide(st, _answer(False))
+    assert d.reason != fp.RELAY_MODEL_INELIGIBLE_REASON
+    assert d == _main_decision(st, _answer(False))

@@ -593,15 +593,22 @@ def relay_lane_quota_is_relays(provider: Any, status_code: Optional[int],
     lane name the moment the relay rotates, and a 429 with no reset left 25
     pinned-lane rows exhausted forever (Studio, 2026-11-12). Such a failure is
     never stored on the pool row: the relay's typed refusal / ``/eligibility``
-    decides. Auth failures stay local.
+    decides.
+
+    A positive match on quota evidence only: status 429, or a failure reason in
+    ``fallback_policy.RELAY_QUOTA_FAILURE_REASONS``. Auth (401/403/auth*) stays
+    local; every other failure (a 503/529, a ``None`` status from a refresh
+    path) keeps the pool's normal behaviour.
     """
+    from agent.fallback_policy import RELAY_QUOTA_FAILURE_REASONS
     from agent.relay_lanes import is_relay_backed
 
     if not is_relay_backed(provider):
         return False
-    if status_code in _LOCAL_AUTH_STATUS_CODES:
+    reason = str(failure_reason or "").strip().lower()
+    if status_code in _LOCAL_AUTH_STATUS_CODES or reason in _LOCAL_AUTH_FAILURE_REASONS:
         return False
-    return str(failure_reason or "").strip().lower() not in _LOCAL_AUTH_FAILURE_REASONS
+    return status_code == 429 or reason in RELAY_QUOTA_FAILURE_REASONS
 
 
 def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) -> Optional[float]:

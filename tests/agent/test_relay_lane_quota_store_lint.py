@@ -109,8 +109,27 @@ def _is_constant(name: str) -> bool:
     return name.lstrip("_").isupper() or name.lstrip("_")[:1].isupper()
 
 
+def _module_scope(tree: ast.Module) -> set:
+    """ids of every statement that runs at module scope, including under a
+    module-level ``if`` / ``try`` / ``with`` / ``for`` (not inside a def/class)."""
+    out: set = set()
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        out.add(id(node))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.stmt):
+                stack.append(child)
+            elif isinstance(child, ast.ExceptHandler) or (
+                    hasattr(ast, "match_case") and isinstance(child, ast.match_case)):
+                stack.extend(child.body)
+    return out
+
+
 def _stores(tree: ast.Module):
-    top = set(map(id, tree.body))
+    top = _module_scope(tree)
     for node in ast.walk(tree):
         targets = []
         if isinstance(node, ast.Assign):
@@ -219,6 +238,18 @@ def test_lint_catches_a_new_store(tmp_path, monkeypatch):
         "provider = 'claude-alr'\n"
         "class X:\n"
         "    def f(self):\n"
-        "        self._lane_exhausted_until = {provider: 1}\n")
+        "        self._lane_exhausted_until = {provider: 1}\n"
+        "        _local_quota = 1\n"
+        "if provider:\n"
+        "    _if_lane_quota = {}\n"
+        "try:\n"
+        "    _try_lane_exhausted = {}\n"
+        "except Exception:\n"
+        "    _except_lane_cooldown = {}\n"
+        "with open(__file__):\n"
+        "    _with_lane_bench = {}\n")
     monkeypatch.setattr(__import__(__name__, fromlist=["x"]), "ROOT", tmp_path)
-    assert ("agent/lane_quota.py", "_lane_exhausted_until") in _scan()
+    found = {n for (p, n) in _scan() if p == "agent/lane_quota.py"}
+    assert {"_lane_exhausted_until", "_if_lane_quota", "_try_lane_exhausted",
+            "_except_lane_cooldown", "_with_lane_bench"} <= found, found
+    assert "_local_quota" not in found  # a function local is not module state
