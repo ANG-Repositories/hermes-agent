@@ -702,8 +702,8 @@ NOT_A_CARD_REFUSAL = {
     "break: spawn_budget is not None and spawned >= spawn_budget": "budget spent by EARLIER ready rows; admit routes one row",
     "continue: route_first": "budget spent by EARLIER ready rows; admit routes one row",
     # t_103a4648 (Prism 996af7eca6ca): the wall's record-only tail also runs under a binding Studio ceiling;
-    # admit skips host admission, so `_ceiling_cut` is False there and the site is the route_first wall
-    "continue: route_first or _ceiling_cut": "the wall: no slot anywhere for an EARLIER row; admit routes one row",
+    # admit skips host admission, so `_ceiling_cut` is False there; the wall itself keys as `continue: route_first`
+    "continue: _ceiling_cut": "the wall under a binding Studio ceiling; admit skips host admission, never set there",
     "rows: sorted": "orders the rows; admit has one",
     "rows: bool": "the placement-record gate snapshot",
     "rows: _capabilities_unplanned": "dry-run preview only",

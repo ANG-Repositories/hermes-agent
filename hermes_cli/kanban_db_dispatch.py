@@ -8143,10 +8143,15 @@ def _dispatch_once_locked(
         pool_free = spillover is not None and spillover.budget > 0
         if not local_free and not pool_free:
             ready_scan_complete = False
-            if route_first or _ceiling_cut:
-                # No slot anywhere: this row and every one after it say why. Under a binding Studio ceiling the
-                # scan also goes on with route_first off: a later asap row may still use the ceiling's room, and
-                # every held local row is listed for the wait page (Prism 996af7eca6ca).
+            if route_first:
+                # No slot anywhere: this row and every one after it say why.
+                record_only = "wall"
+                result.placement_waits[row["id"]] = _wall_reason(route, route_arg, spillover)
+                continue
+            if _ceiling_cut:
+                # Under a binding Studio ceiling the scan also goes on with route_first off: a later asap row may
+                # still use the ceiling's room, and every held local row is listed for the wait page
+                # (Prism 996af7eca6ca).
                 record_only = "wall"
                 result.placement_waits[row["id"]] = _wall_reason(route, route_arg, spillover)
                 continue

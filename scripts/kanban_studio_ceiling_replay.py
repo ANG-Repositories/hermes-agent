@@ -76,12 +76,16 @@ def replay(runs, n, t0, t1):
     full_since = None
     ep = {"id": 0, "open": False, "paged": set()}
 
+    def in_window(a, b):
+        # Only the part of [a, b] inside the replay window counts (Prism 399f775412b6).
+        return max(0.0, min(b, t1) - max(a, t0))
+
     def mark(t):
         nonlocal at_ceiling, full_since
         if len(running) >= n and full_since is None:
             full_since = t
         elif len(running) < n and full_since is not None:
-            at_ceiling += t - full_since
+            at_ceiling += in_window(full_since, t)
             full_since = None
 
     while i < len(events) or queue or running:
@@ -114,7 +118,7 @@ def replay(runs, n, t0, t1):
             queue.append((now, dur))
         mark(now)
     if full_since is not None:
-        at_ceiling += max(0.0, min(now, t1) - full_since)
+        at_ceiling += in_window(full_since, now)
     delayed = [w for w in waits if w > 0]
     mean, peak = concurrency(intervals, t0, t1)
     return {

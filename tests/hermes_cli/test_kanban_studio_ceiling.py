@@ -147,7 +147,38 @@ def test_a_card_that_left_the_ceiling_restarts_its_clock():
     w.observe([], now=t0 + 1800, minutes=60, ceiling=8, running=7)       # it spawned
     w.observe(["t_a"], now=t0 + 1900, minutes=60, ceiling=8, running=8)   # held again (a retry)
     w.observe(["t_a"], now=t0 + 3700, minutes=60, ceiling=8, running=8)   # 30 min into this wait
-    assert pager.calls == []
+    assert [c[0] for c in pager.calls] == ["clear"]   # only the fresh-process clear (27939eccbc1d), no page
+
+
+def test_a_fresh_watcher_clears_an_episode_left_open_on_disk_once():
+    """Prism 27939eccbc1d: a gateway restart drops _paged, but episode_pager still holds the open episode. The first
+    empty tick of a fresh watcher sends one (idempotent) clear; later empty ticks send nothing."""
+    pager = _Pager()
+    w = ksc.CeilingWaitWatch(pager=pager)
+    t0 = 1_000_000.0
+    w.observe([], now=t0, minutes=60, ceiling=8, running=3)
+    w.observe([], now=t0 + 60, minutes=60, ceiling=8, running=3)
+    assert [c[0] for c in pager.calls] == ["clear"]
+
+
+def test_a_failed_startup_clear_retries_next_empty_tick():
+    calls = []
+    w = ksc.CeilingWaitWatch(pager=lambda verb, text: calls.append(verb) and False)
+    w.observe([], now=1.0, minutes=60, ceiling=8, running=3)
+    w.observe([], now=2.0, minutes=60, ceiling=8, running=3)
+    assert calls == ["clear", "clear"]
+
+
+def test_replay_counts_only_ceiling_time_inside_the_window():
+    """Prism 399f775412b6: one 2-hour run at ceiling 1 in a 1-hour window is 1.0 h at the ceiling, not 2.0."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "kanban_studio_ceiling_replay", Path(__file__).resolve().parents[2] / "scripts" / "kanban_studio_ceiling_replay.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.replay([(0.0, 7200.0, False, "task", None)], 1, 0.0, 3600.0)["hours_at_ceiling"] == 1.0
+    # a run that started before the window counts only from t0
+    assert mod.replay([(-3600.0, 5400.0, False, "task", None)], 1, 0.0, 3600.0)["hours_at_ceiling"] == 0.5
 
 
 def test_a_failed_send_retries_next_tick():

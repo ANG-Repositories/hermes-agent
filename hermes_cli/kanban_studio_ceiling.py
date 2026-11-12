@@ -72,6 +72,10 @@ class CeilingWaitWatch:
         self._pager = pager
         self._since: Dict[str, float] = {}
         self._paged = False
+        # A fresh process may inherit an episode a previous gateway opened on disk (episode_pager state): send one
+        # clear on the first empty tick even though this process never paged. episode_pager's clear of an unknown
+        # or already-cleared key is quiet, so this is idempotent (Prism 27939eccbc1d).
+        self._startup_clear_owed = True
 
     def observe(self, held: Iterable[str], *, now: float, minutes: Optional[float],
                 ceiling: Optional[int], running: Optional[int]) -> Optional[str]:
@@ -79,8 +83,10 @@ class CeilingWaitWatch:
         held = list(dict.fromkeys(held or ()))
         self._since = {t: self._since.get(t, now) for t in held}
         if not held:
-            if self._paged and self._pager("clear", "Studio kanban ceiling: no card is waiting at the ceiling now."):
+            if ((self._paged or self._startup_clear_owed)
+                    and self._pager("clear", "Studio kanban ceiling: no card is waiting at the ceiling now.")):
                 self._paged = False
+                self._startup_clear_owed = False
                 return "clear"
             return None
         if minutes is None or self._paged:
