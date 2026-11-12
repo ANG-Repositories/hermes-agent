@@ -3553,8 +3553,11 @@ def _set_worker_pid(
     if pool is not None:
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool
+    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
     with _kbc.write_txn(conn):
         launching_run_id = run_id if run_id is not None else _kb._current_run_id(conn, task_id)
+        # t_4b313c15: no `spawned` without its `placement`, on every branch below (one txn).
+        placement = placement if placement is not None else _unrecorded_placement(conn, launching_run_id)
         # Correlate even a late start with its launching run, never its successor.
         from hermes_cli.kanban_priority_door import EVENT
         authorization = conn.execute(
@@ -3590,6 +3593,10 @@ def _set_worker_pid(
                      "claim_lost": True},
                     run_id=int(run_id),
                 )
+                # A worker existed on this run (t_1073ffef run 34): record where, and drop the no-worker class
+                # the run's close stamped while the spawn was in flight.
+                _write_placement(conn, task_id, int(run_id), {**placement, "claim_lost": True})
+                conn.execute("UPDATE task_runs SET no_worker_class = NULL WHERE id = ?", (int(run_id),))
                 return False
         conn.execute(
             "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
@@ -3602,10 +3609,36 @@ def _set_worker_pid(
                 (int(pid), started_at, run_id),
             )
         _kb._append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
-        if placement is not None:
-            from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
-            _kb._append_event(conn, task_id, PLACEMENT_EVENT, placement, run_id=run_id)
+        _write_placement(conn, task_id, run_id, placement)
     return True
+
+
+def _write_placement(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], payload: dict) -> None:
+    """One ``placement`` event per run (inside the caller's txn). A worker that adopted its pid first may already
+    have written the minimal ``unrecorded`` record; the launcher's full record replaces that row in place."""
+    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+    if run_id is not None:
+        prior = conn.execute(
+            "SELECT id FROM task_events WHERE run_id = ? AND kind = ? "
+            "AND json_extract(payload, '$.reason') = 'unrecorded' ORDER BY id DESC LIMIT 1",
+            (int(run_id), PLACEMENT_EVENT)).fetchone()
+        if prior is not None:
+            conn.execute("UPDATE task_events SET payload = ? WHERE id = ?",
+                         (json.dumps(payload, ensure_ascii=False), prior[0]))
+            _kb._journal_append(conn, task_id, PLACEMENT_EVENT, payload, run_id=run_id)
+            return
+    _kb._append_event(conn, task_id, PLACEMENT_EVENT, payload, run_id=run_id)
+
+
+def _unrecorded_placement(conn: sqlite3.Connection, run_id: Optional[int], *, entry: str = "unrecorded") -> dict:
+    """The minimal ``placement`` record for a worker whose launcher passed none (t_4b313c15): the run id and the
+    host ``record_placement`` stamped on the run before the launch (NULL when nothing did). ``reason`` /
+    ``entry`` name the gap, so a reader can count these instead of finding no record at all."""
+    host = None
+    if run_id is not None:
+        row = conn.execute("SELECT host FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
+        host = row[0] if row else None
+    return {"run_id": run_id, "host": host, "route_class": None, "reason": "unrecorded", "entry": entry}
 
 
 def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
@@ -3630,6 +3663,12 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
                          (int(pid), started_at, int(run_id)))
             _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
                               run_id=int(run_id))
+        # A worker is running this run; if its launcher died before the placement write, record it now (t_4b313c15).
+        from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+        if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
+                        (int(run_id), PLACEMENT_EVENT)).fetchone() is None:
+            _kb._append_event(conn, task_id, PLACEMENT_EVENT,
+                              _unrecorded_placement(conn, int(run_id), entry="worker_registered"), run_id=int(run_id))
     return True
 
 
