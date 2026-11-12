@@ -575,6 +575,12 @@ def _satisfied(cap: str, ctx: CapabilityTick, pin_host: Optional[str]) -> bool:
     return all(cap in _host_caps(ctx, h) for h in hosts)
 
 
+def _hard_class(ctx: CapabilityTick, cap: str) -> bool:
+    """A capability prose may still pin under ``prose_pins_advisory`` (t_c82eded0): the map marks it
+    ``soft: false`` (docker, fleet-ssh, studio-state) or the Studio serves it identity-only."""
+    return ctx.cmap.soft.get(cap) is False or cap in ctx.cmap.identity_only
+
+
 def _first(reqs: List[Requirement]) -> Optional[Requirement]:
     return min(reqs, key=lambda r: (_SOURCE_RANK[r.matched_by], r.cap)) if reqs else None
 
@@ -611,7 +617,10 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         # t_c82eded0: a capability inferred from PROSE (body sniff, a skill named in the body) that no pool
         # host serves would hold the card on the Studio. It is advice: recorded, the card starts on a pool
         # host. One a pool host does serve still narrows the take to those hosts (``only`` below).
+        # A HARD class (the map's ``soft: false``: docker, fleet-ssh, studio-state) or an identity-only
+        # capability is never dropped here: those keep their hold or wait (Apollo review of #255, F1).
         prose = tuple(r for r in enforced if r.matched_by in PROSE_SOURCES
+                      and not _hard_class(ctx, r.cap)
                       and not any(r.cap in _host_caps(ctx, h) for h in ctx.pool_hosts))
         ignored += prose
         enforced = [r for r in enforced if r not in prose]
