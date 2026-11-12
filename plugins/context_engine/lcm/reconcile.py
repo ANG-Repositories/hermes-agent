@@ -55,6 +55,15 @@ _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from co
 # the note, gateway/run.py; " " after the timestamp, message_timestamps.py).
 _USER_ROW_SYSTEM_NOTE_PREFIX = re.compile(r"^\[System note: [^\]]*\](?:\n\n)?")
 _USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]{2,5}\] ?")
+# gateway/run_inbound.py discord_triggering_note + the "\n\n" it is joined with.
+_USER_ROW_DISCORD_NOTE_PREFIX = re.compile(
+    r"^\[Triggering message id: `[^`\n]*` — use as `message_id` for reply/react/pin via the discord tools\.\](?:\n\n)?"
+)
+_USER_ROW_WRAPPER_PREFIXES = (
+    _USER_ROW_SYSTEM_NOTE_PREFIX,
+    _USER_ROW_TIMESTAMP_PREFIX,
+    _USER_ROW_DISCORD_NOTE_PREFIX,
+)
 
 
 class ReconcileMixin:
@@ -1121,14 +1130,29 @@ class ReconcileMixin:
         re-renders a stored user row in three ways only: trailing whitespace
         dropped, a leading ``[System note: ...]`` block added or dropped, and a
         leading ``[Wed 2026-11-11 23:57:30 PST]`` timestamp added or dropped.
+        A gateway restart adds a fourth (t_17732be2, session
+        20261112_092254_4cd44442): the stored row carries the Discord
+        ``[Triggering message id: ...]`` note after the timestamp, and the
+        history the restarted gateway resumes from has it stripped. The
+        wrappers stack in either order: after a restart the host row reads
+        ``[ts] [System note: ...interrupted by a gateway shutdown...]\\n\\n[ts]
+        <text>`` against a stored ``[ts] <text>`` (session
+        20261108_093540_fa4b70b9 at the 10:39 boot), so leading wrappers are
+        removed in whatever order and number they appear.
         Each wrapper goes with the one separator the gateway writes after it;
         leading whitespace of the text itself is kept (indentation is content).
         Anything else is a different row. An empty key means the host emptied
         the row: skipping it drops no content, so the caller accepts it.
         """
         text = str(content or "").rstrip()
-        text = _USER_ROW_SYSTEM_NOTE_PREFIX.sub("", text, count=1)
-        return _USER_ROW_TIMESTAMP_PREFIX.sub("", text, count=1)
+        while True:
+            for wrapper in _USER_ROW_WRAPPER_PREFIXES:
+                rest = wrapper.sub("", text, count=1)
+                if rest != text:
+                    text = rest
+                    break
+            else:
+                return text
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

@@ -394,3 +394,93 @@ class TestRepeatedCallIdsDoNotAnchor:
         new_turn = poll()
         _rebuilt_agent_ingest(tmp_path, new_turn)
         assert _rows(tmp_path) == n0 + len(new_turn)
+
+
+_NOTE = "[Triggering message id: `{}` — use as `message_id` for reply/react/pin via the discord tools.]\n\n"
+
+
+def _restart_resume_shape():
+    """Stored rows and resumed host history of live session 20261112_092254_4cd44442
+    at the 10:39:22 gateway boot (role order copied from the real 108-row ingest).
+
+    The stored user rows were written from the live API-bound message, so they
+    carry the Discord triggering note after the timestamp. The history a
+    restarted gateway resumes from has the note stripped
+    (gateway/run_inbound.py strip_discord_triggering_note); the newest host row,
+    built for the live turn, still carries it.
+    """
+    roles = (
+        "uatuattattattatatattattatattatatatattattauattattatatatatatatatatatatatatat"
+        "tatattatatatatatatatatatauatatata"
+    )
+    stored = [{"role": "system", "content": "You are Apollo."}]
+    for i in range(10):
+        stored += _turn(900 + i)
+    host = []
+    for k, role in enumerate(roles):
+        if role == "u":
+            ts = f"[Thu 2026-11-12 09:{k % 60:02d}:44 PST] "
+            text = f"[Ace] request {k}: make a handoff"
+            stored.append({"role": "user", "content": ts + _NOTE.format(1570492307449446000 + k) + text})
+            host.append({"role": "user", "content": ts + text})
+        elif role == "t":
+            row = {"role": "tool", "tool_call_id": f"toolu_01{k:04d}RPcWTmy5", "content": f'{{"output": "result {k}"}}'}
+            stored.append(row)
+            host.append(dict(row))
+        else:
+            n_tools = len(roles[k + 1:]) - len(roles[k + 1:].lstrip("t"))
+            row = {"role": "assistant", "content": "" if n_tools else f"Answer {k}."}
+            if n_tools:
+                row["tool_calls"] = [{
+                    "id": f"toolu_01{k + 1 + j:04d}RPcWTmy5", "type": "function",
+                    "function": {"name": "terminal", "arguments": f'{{"command": "step {k + 1 + j}"}}'},
+                } for j in range(n_tools)]
+            stored.append(row)
+            host.append(dict(row))
+    new_user = {"role": "user", "content": "[Thu 2026-11-12 10:40:36 PST] " + _NOTE.format(1570508630308954122) + "[Ace] new"}
+    return stored, host + [new_user]
+
+
+class TestGatewayRestartResumeWithDiscordNote:
+    """t_17732be2: at the 10:39 boot the clean-tail session 20261112_092254_4cd44442
+    (78 tool rows, 78 distinct call ids) re-stored its whole 108-row slice: the
+    walk ended at host row 0, a user row that differs from the stored one only by
+    the Discord triggering note, before any call id was matched."""
+
+    def test_restart_resume_appends_only_the_new_user_row(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        fresh = _rebuilt_agent_ingest(tmp_path, history)
+        assert fresh._last_ingest_reconciliation["reason"] == "replayed history anchored on stored tool calls"
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_restart_system_note_ahead_of_the_timestamp_is_matched(self, tmp_path):
+        # Session 20261108_093540_fa4b70b9 at the 10:39 boot: the host row puts the
+        # gateway's restart note ahead of a second timestamp; the stored row has neither.
+        stored, history = _restart_resume_shape()
+        ts, text = "[Thu 2026-11-12 06:43:10 PST] ", "[kanban wake] Card t_b40ec765 waits in review"
+        note = ("[System note: The previous turn was interrupted by a gateway shutdown; the gateway "
+                "is now back online. Do NOT re-execute old tool calls.]\n\n")
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user" and _NOTE[:20] in r["content"])
+        stored[s_idx] = {"role": "user", "content": ts + text}
+        history[0] = {"role": "user", "content": ts + note + ts + text}
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_gap_user_row_with_other_text_behind_the_note_is_stored(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        # A host user row the store never got: same timestamp, other text.
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        history[idx] = {"role": "user", "content": history[idx]["content"] + " (edited)"}
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
