@@ -54,6 +54,10 @@ SITES: Dict[Key, Tuple[Optional[str], ...]] = {
     ("hermes_cli/kanban_db_dispatch.py", "_route_row", "_route_row_base"): ("held=held",),
     ("hermes_cli/kanban_db_dispatch.py", "_route_row_base", "origin_route"): ("held",),
     ("hermes_cli/kanban_continuation.py", "origin_route", "clear_lost_state"): (None,),
+    # kanban create's placement preview (t_0a5740f3): held_routes([row]) decides first, then passes held=
+    ("hermes_cli/kanban_create_placement.py", "preview_line", "_route_row"): ("held=held",),
+    # its no-plan branch mirrors the dispatcher's: origin_route only for a row not in held
+    ("hermes_cli/kanban_create_placement.py", "_unplanned_route", "origin_route"): ("held",),
 }
 
 
@@ -188,17 +192,29 @@ _FIX_CONT = '''
 def origin_route(conn, row):
     clear_lost_state(conn, row["id"], "h")
 '''
+_FIX_PREVIEW = '''
+def preview_line(conn, row, plan):
+    held = held_routes([row], {})
+    if row["id"] in held:
+        return held[row["id"]]
+    return _route_row(conn, row, plan, held=held)
+
+def _unplanned_route(conn, row, held):
+    if row["origin_host"] and row["id"] not in held:
+        return origin_route(conn, row)
+'''
 
 
 def _selftest() -> int:
     import tempfile
 
-    def run(dispatch: str) -> List[str]:
+    def run(dispatch: str, preview: str = _FIX_PREVIEW) -> List[str]:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / SCAN).mkdir()
             (root / SCAN / "kanban_db_dispatch.py").write_text(dispatch, encoding="utf-8")
             (root / SCAN / "kanban_continuation.py").write_text(_FIX_CONT, encoding="utf-8")
+            (root / SCAN / "kanban_create_placement.py").write_text(preview, encoding="utf-8")
             return check(root)
 
     cases = {
@@ -218,10 +234,13 @@ def _selftest() -> int:
         # t_9965b8d5: the wrapper must hand the held set through, or _route_row_base's early exit never fires
         "wrapper drops held=": (_FIX_OK.replace("_route_row_base(conn, row, plan, held=held)",
                                                  "_route_row_base(conn, row, plan)"), 1),
+        # t_0a5740f3: the create preview routes one card; it must hand the held set through too
+        "preview drops held=": ((_FIX_OK, _FIX_PREVIEW.replace("plan, held=held)", "plan)")), 1),
+        "preview no-plan origin unguarded": ((_FIX_OK, _FIX_PREVIEW.replace(' and row["id"] not in held', "")), 1),
     }
     bad = 0
     for name, (src, want) in cases.items():
-        got = run(src)
+        got = run(*src) if isinstance(src, tuple) else run(src)
         ok = (len(got) == 0) if want == 0 else (len(got) >= 1)
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {len(got)} finding(s)")
         for line in got:
