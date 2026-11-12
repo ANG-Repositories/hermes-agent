@@ -1066,6 +1066,20 @@ def _site_triggers():
         _clone_pending(m, ctx)
         return "ace-ai", "admit", "held: clone_pending:ace-ai"
 
+    def carry_pending(m, ctx):
+        # t_f3a411c2: a local_files card carried in the background (kanban_carry_background) waits carry_pending on
+        # its pool host until the copy has finished, its slot released. Kind `admit` like clone_pending.
+        real = kbd._route_row
+
+        def bg(conn, row, plan, *a, **k):
+            if k.get("carry_out") is not None:
+                k["carry_out"][row["id"]] = "background"
+            return real(conn, row, plan, *a, **k)
+        m.setattr(kbd, "_route_row", bg)
+        m.setattr(kbd, "_background_carry_gate", lambda conn, row, host, *a, **k: f"carry_pending:{host.name}")
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "admit", "held: carry_pending:ace-ai"
+
     def worktree_pinned(m, ctx):
         # t_fbe8a067: the last row_route pass applies a worktree card's operator pin, plan or no plan. A pin that
         # leaves out the Studio turns the no-plan local route into the named wait, never a Studio spawn.
@@ -1261,6 +1275,7 @@ def _site_triggers():
         "continue: _local_wait is not None": fwa_local_held,
         "continue: _gap is not None": layer0b,
         "continue: not _ready": clone_pending,
+        "continue: _bg_wait is not None": carry_pending,
         "route: _pinned_route": worktree_pinned,
         "continue: claimed is None": claim,
         "fail: except _kph.PauseHeld (try: _kb.claim_task)": claim_pause,

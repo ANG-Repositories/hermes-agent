@@ -10014,7 +10014,7 @@ def _background_carry_gate(conn, row, host, spillover, board, defer: bool, out: 
         return why
 
     if not defer:
-        job = _kcb.Job(tid, host, ws, stale)
+        job = _kcb.Job(tid, host, ws, stale, lock_dir)
         _event(_kcb.STARTED_EVENT, {"host": host.name, "path": ws, "background": False})
         try:
             if not _kcb.run_sync(job, lock_dir):
@@ -10050,9 +10050,12 @@ def _finalize_background_carry(task_id: str, host, workspace: str, carries: dict
     job = carries.pop(task_id, None)
     if job is None or job.workspace != str(Path(workspace)) or job.host.name != host.name:
         raise RuntimeError(f"{_kcb.PENDING}: no finished carry of {workspace} to {host.name} for this claim")
-    _kcb.take(task_id, host, job.workspace)
-    t0 = time.monotonic()
-    _kcb.finalize(host, job.workspace)
+    try:
+        _kcb.take(task_id, host, job.workspace)
+        t0 = time.monotonic()
+        _kcb.finalize(host, job.workspace)  # under the carry lock taken at the start (Prism b198d365c020)
+    finally:
+        _kcb.release(job)
     return {**job.stats, "finalize_s": round(time.monotonic() - t0, 2)}
 
 

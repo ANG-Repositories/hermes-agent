@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import resource
 import shlex
 import stat
 import subprocess
@@ -58,6 +57,7 @@ RSYNC_IO_TIMEOUT_S = 600           # rsync --timeout: an I/O stall, never a tota
 FINALIZE_TIMEOUT_S = 120
 RETRY_S = 120.0                    # a failed carry waits this long, named, before the next attempt
 PROGRESS_EVERY_S = 60.0
+FRESH_S = 120.0                    # a finished copy older than this is refreshed off the tick before the claim
 WORKERS = 2
 _run = subprocess.run              # the subprocess runner, read at call time (tests replace it)
 
@@ -114,6 +114,15 @@ def census(path: str) -> Tuple[int, int]:
     return total, entries
 
 
+def _children_cpu() -> float:
+    try:
+        import resource  # POSIX only (Windows has no resource module); the CPU figure is a record, never a gate
+    except ImportError:
+        return 0.0
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return ru.ru_utime + ru.ru_stime
+
+
 def _ssh(host: PoolHost, script: str, runner: Optional[Callable], timeout: float):
     return (runner or _run)(_ssh_argv(host, script), capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
@@ -140,8 +149,10 @@ def remove_staging(host: PoolHost, workspace: str, runner: Optional[Callable] = 
 class Job:
     """One background carry. ``phase``: queued, census, space, copy, copied. ``stats`` once copied."""
 
-    def __init__(self, task_id: str, host: PoolHost, workspace: str, stale: Optional[PoolHost] = None):
+    def __init__(self, task_id: str, host: PoolHost, workspace: str, stale: Optional[PoolHost] = None,
+                 lock_dir: Optional[Path] = None):
         self.task_id, self.host, self.workspace, self.stale = task_id, host, workspace, stale
+        self.lock_dir = lock_dir    # the (host, path) carry locks; the stale host's cleanup takes its lock there
         self.phase = "queued"
         self.bytes: Optional[int] = None
         self.entries: Optional[int] = None
@@ -151,6 +162,8 @@ class Job:
         self.stats: Dict[str, object] = {}
         self.future = None
         self.stale_cleaned: Optional[bool] = None
+        self.fd: Optional[int] = None  # the (host, path) carry lock, held from the start through the finalize
+        self.done_at: Optional[float] = None
 
     def elapsed(self) -> float:
         return time.monotonic() - self.t0
@@ -160,22 +173,28 @@ def run(job: Job, runner: Optional[Callable] = None) -> Dict[str, object]:
     """The whole carry up to (not including) the finalize; raises CarryRefused, CarryNoRoom or RuntimeError."""
     from hermes_cli import kanban_worker_hosts as _kwh
     runner = runner or _run
-    t0, cpu0 = time.monotonic(), time.thread_time()
-    ch0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    t0, cpu0, ch0 = time.monotonic(), time.thread_time(), _children_cpu()
     src = job.workspace.rstrip("/")
     if not _kwh.carry_path_safe(src):
         raise CarryRefused(f"{src!r} is not a shell-inert path")
     dest = src
     job.phase = "census"
     job.bytes, job.entries = census(src)
-    with os.scandir(src) as scan:
-        tops = sorted(e.name for e in scan if e.is_dir(follow_symlinks=False))
-    lost = _kwh.carried_gitdir_loss(src, tops, ())
+    # Prism b68c58398adb: from the workspace root itself, so a checkout rooted AT the workspace is checked too
+    lost = _kwh.carried_gitdir_loss(src, (".",), ())
     if lost is not None:
         raise CarryRefused(lost)
     if job.stale is not None and job.stale.name != job.host.name:
-        # a resumable staging dir an earlier attempt left on another host: that host is cleaned first
-        job.stale_cleaned = remove_staging(job.stale, src, runner)
+        # a resumable staging dir an earlier attempt left on another host: that host is cleaned first, under that
+        # host's carry lock (Prism 4d42b4210a5a); while another dispatcher holds it, the dir is left alone
+        sfd = _try_lock(lock_path(job.lock_dir, job.stale.name, src)) if job.lock_dir is not None else -1
+        if sfd is None:
+            job.stale_cleaned = False
+        else:
+            try:
+                job.stale_cleaned = remove_staging(job.stale, src, runner)
+            finally:
+                _unlock(sfd)
     job.phase = "space"
     _kwh.prepare_remote_workspace(job.host, dest, runner)
     free, staged = remote_space(job.host, dest, runner)
@@ -192,29 +211,31 @@ def run(job: Job, runner: Optional[Callable] = None) -> Dict[str, object]:
     if getattr(proc, "returncode", 1) != 0:
         raise RuntimeError(f"rsync rc={getattr(proc, 'returncode', '?')}: "
                            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
-    ch1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     job.phase = "copied"
     job.stats = {"bytes": job.bytes, "entries": job.entries, "seconds": round(time.monotonic() - t0, 2),
-                 "cpu_s": round((time.thread_time() - cpu0) + (ch1.ru_utime - ch0.ru_utime)
-                                + (ch1.ru_stime - ch0.ru_stime), 2),
+                 "cpu_s": round((time.thread_time() - cpu0) + (_children_cpu() - ch0), 2),
                  "staging": staging_path(dest)}
+    job.done_at = time.monotonic()
     return job.stats
 
 
 def finalize(host: PoolHost, workspace: str, runner: Optional[Callable] = None) -> None:
     """Move the finished staging dir onto the workspace path on ``host`` (one ssh call). An empty or absent
-    workspace is replaced whole; one that already holds files gets the staging copied over it (never deleted
-    from, as before). Raises when the staging dir is missing or the move fails (the staging dir stays)."""
+    workspace is replaced whole; one that already holds files gets the staging merged over it with rsync, as the
+    in-tick carry did (never deleted from; a destination symlink is replaced, never written through: Prism
+    0e52f77edd32). Raises when the staging dir is missing or the move fails (the staging dir stays)."""
     dest = workspace.rstrip("/")
     s, w = shlex.quote(staging_path(dest)), shlex.quote(dest)
     proc = _ssh(host, f"[ -d {s} ] || exit 4; if rmdir -- {w} 2>/dev/null || [ ! -e {w} ]; then mv -- {s} {w}; "
-                      f"else cp -a -- {s}/. {w}/ && rm -rf -- {s}; fi", runner, FINALIZE_TIMEOUT_S)
+                      f"else rsync -a -- {s}/ {w}/ && rm -rf -- {s}; fi", runner, FINALIZE_TIMEOUT_S)
     if getattr(proc, "returncode", 1) != 0:
         raise RuntimeError(f"carry to {host.name}: finalize rc={getattr(proc, 'returncode', '?')}: "
                            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
 
 
 # -- registry: one job per card, visible to every tick of this process; a flock per (host, path) for the others --
+# The flock is held from the start of the copy until the staging dir is consumed (finalize) or the carry failed
+# (Prism 18996b99e57f / b198d365c020): no other dispatcher can start an rsync into a staging dir being moved.
 
 _lock = threading.Lock()
 _jobs: Dict[str, Tuple[Job, Optional[int]]] = {}       # task id -> (job, lock fd)
@@ -276,15 +297,24 @@ def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start:
             # placed elsewhere since: that host's staging dir (finished or not) is removed by the next carry
             stale = stale or hit[0].host
             del _jobs[task_id]
+            release(hit[0])
             hit = None
         if hit is not None:
             job, fd = hit
             if not job.future.done():
                 return "running", job
             exc = job.future.exception()
+            if exc is None and job.done_at is not None and now - job.done_at > FRESH_S:
+                # Prism 38c86a910163: a copy that waited (no slot, no claim) is refreshed before it is claimed; the
+                # second rsync into the same staging dir sends only what changed on the Studio since, under the
+                # lock this job still holds
+                job.done_at = None
+                job.future = _pool.submit(run, job, runner)
+                return "running", job
             if exc is None:
                 return "done", job
             del _jobs[task_id]
+            release(job)
             _failed[task_id] = (now, wait_reason(exc, host.name))
             return "failed", (job, exc)
         seen = _failed.get(task_id)
@@ -299,39 +329,53 @@ def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start:
             return "busy", None
         if _pool is None:
             _pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="kanban-carry")
-        job = Job(task_id, host, workspace, stale)
+        job = Job(task_id, host, workspace, stale, lock_dir)
+        job.fd = fd
         try:
             job.future = _pool.submit(run, job, runner)
         except BaseException:
-            _unlock(fd)
+            release(job)
             raise
-        job.future.add_done_callback(lambda _f, _fd=fd: _unlock(_fd))
         _jobs[task_id] = (job, fd)
         return "started", job
 
 
+def release(job: Job) -> None:
+    """Drop the job's carry lock (idempotent)."""
+    fd, job.fd = job.fd, None
+    _unlock(fd)
+
+
 def take(task_id: str, host: PoolHost, workspace: str) -> Optional[Job]:
-    """At the claim: the finished job for this card (removed from the registry), or None. Re-raises its error."""
+    """At the claim: the finished job for this card (removed from the registry), or None. Re-raises its error.
+    The job's carry lock stays held: the caller finalizes, then :func:`release`."""
     with _lock:
         hit = _jobs.get(task_id)
         if hit is None or hit[0].host.name != host.name or hit[0].workspace != workspace \
                 or not hit[0].future.done():
             return None
         del _jobs[task_id]
-    hit[0].future.result()
+    try:
+        hit[0].future.result()
+    except BaseException:
+        release(hit[0])
+        raise
     return hit[0]
 
 
 def run_sync(job: Job, lock_dir: Path, runner: Optional[Callable] = None) -> bool:
     """A one-shot (CLI) tick: the same carry, run here under the same lock. False (nothing run) while another
-    dispatcher holds it; raises what :func:`run` raises."""
+    dispatcher holds it; raises what :func:`run` raises. On success the lock stays held on ``job`` until the
+    finalize (:func:`release`)."""
     fd = _try_lock(lock_path(lock_dir, job.host.name, job.workspace))
     if fd is None:
         return False
+    job.fd, job.lock_dir = fd, job.lock_dir or lock_dir
     try:
         run(job, runner)
-    finally:
-        _unlock(fd)
+    except BaseException:
+        release(job)
+        raise
     return True
 
 
@@ -404,5 +448,7 @@ def stale_host(conn, task_id: str, workspace: Optional[str], hosts: Mapping[str,
 def reset() -> None:
     """Tests: forget every job and backoff."""
     with _lock:
+        for job, _fd in _jobs.values():
+            release(job)
         _jobs.clear()
         _failed.clear()

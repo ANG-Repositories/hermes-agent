@@ -313,6 +313,110 @@ def test_a_checkout_whose_git_dir_does_not_travel_is_refused_and_keeps_the_cappe
     assert not Path(loop._map(kcb.staging_path(str(path)))).exists()
 
 
+def test_a_checkout_rooted_at_the_workspace_whose_git_dir_does_not_travel_is_refused(board, loop, tmp_path):
+    """Prism b68c58398adb: the git-state check runs from the workspace root, so a linked checkout AT the root counts."""
+    outside = tmp_path / "outside.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(outside)], check=True)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        (path / ".git").write_text(f"gitdir: {outside}\n")
+        job = kcb.Job(tid, _plan(free=2).hosts["ace-ai"], str(path))
+        with pytest.raises(kcb.CarryRefused):
+            kcb.run(job)
+    assert not any(c[0] == "rsync" for c in loop.calls)
+
+
+def test_the_carry_lock_is_held_from_the_start_until_the_finalize(board, loop, tmp_path):
+    """Prism 18996b99e57f / b198d365c020: a finished copy keeps its (host, path) lock until its staging dir is
+    consumed, so no other dispatcher can start an rsync into a staging dir being moved."""
+    lock_dir = tmp_path / "locks"
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        host = _plan(free=2).hosts["ace-ai"]
+        state, job = kcb.poll(tid, host, str(path), lock_dir)
+        assert state == "started"
+        _wait_done(tid)
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "done"
+        lp = kcb.lock_path(lock_dir, host.name, str(path))
+        assert kcb._try_lock(lp) is None          # another dispatcher: still locked after the copy finished
+        assert kcb.take(tid, host, str(path)) is job
+        assert kcb._try_lock(lp) is None          # still locked across the finalize
+        kcb.finalize(host, str(path), runner=loop)
+        kcb.release(job)
+        fd = kcb._try_lock(lp)
+    assert fd is not None
+    kcb._unlock(fd)
+
+
+def test_a_finished_copy_that_waited_is_refreshed_before_the_claim(board, loop, tmp_path, monkeypatch):
+    """Prism 38c86a910163: a Studio edit made after the copy finished reaches the pool host when the finished copy
+    is older than FRESH_S: it is re-synced off the tick, never claimed stale."""
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setattr(kcb, "FRESH_S", 0.0)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn, {"notes.md": b"v1\n"})
+        host = _plan(free=2).hosts["ace-ai"]
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "started"
+        _wait_done(tid)
+        (path / "notes.md").write_bytes(b"v2\n")
+        later = time.time() + 5
+        os.utime(path / "notes.md", (later, later))   # an edit after the copy: rsync's quick check sees the mtime
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "running"   # the refresh, off the tick
+        _wait_done(tid)
+        monkeypatch.setattr(kcb, "FRESH_S", 3600.0)
+        state, job = kcb.poll(tid, host, str(path), lock_dir)
+        assert state == "done"
+        kcb.take(tid, host, str(path))
+        kcb.finalize(host, str(path), runner=loop)
+        kcb.release(job)
+    assert (Path(loop._map(str(path))) / "notes.md").read_bytes() == b"v2\n"
+
+
+def test_stale_staging_is_left_alone_while_its_host_lock_is_held(board, loop, tmp_path):
+    """Prism 4d42b4210a5a: the stale host's staging dir is removed only under that host's carry lock."""
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    lock_dir = tmp_path / "locks"
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        plan = _plan(free=2, hosts=[_host("ace-ai"), _host("ace-media", priority=9)])
+        left = Path(loop._map(kcb.staging_path(str(path))))
+        left.mkdir(parents=True)
+        (left / "half").write_text("x")
+        held = kcb._try_lock(kcb.lock_path(lock_dir, "ace-media", str(path)))   # ace-media's carry is live
+        try:
+            job = kcb.Job(tid, plan.hosts["ace-ai"], str(path), plan.hosts["ace-media"], lock_dir)
+            removes = []
+            real = kcb.remove_staging
+            kcb.remove_staging, _r = (lambda h, ws, runner=None: removes.append(h.name) or real(h, ws, runner)), real
+            try:
+                kcb.run(job)
+            finally:
+                kcb.remove_staging = _r
+        finally:
+            kcb._unlock(held)
+    assert job.stale_cleaned is False and removes == []
+
+
+def test_finalize_into_a_nonempty_workspace_never_writes_through_a_symlink(board, loop, tmp_path):
+    """Prism 0e52f77edd32: a destination file symlink is replaced, as the in-tick rsync carry did."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+    host = _plan(free=2).hosts["ace-ai"]
+    dest = Path(loop._map(str(path)))
+    dest.mkdir(parents=True)
+    victim = tmp_path / "important.txt"
+    victim.write_text("keep me\n")
+    (dest / "notes.md").symlink_to(victim)
+    (dest / "other").write_text("left\n")
+    staging = Path(loop._map(kcb.staging_path(str(path))))
+    staging.mkdir(parents=True)
+    (staging / "notes.md").write_text("new\n")
+    kcb.finalize(host, str(path), runner=loop)
+    assert victim.read_text() == "keep me\n"
+    assert not (dest / "notes.md").is_symlink() and (dest / "notes.md").read_text() == "new\n"
+    assert (dest / "other").read_text() == "left\n" and not staging.exists()
+
+
 def test_kill_switch_restores_the_capped_in_tick_carry(board, loop, monkeypatch):
     (board / "config.yaml").write_text("kanban:\n  studio_pin_requires_reason: false\n  placement:\n"
                                        "    carry_caps: true\n")
