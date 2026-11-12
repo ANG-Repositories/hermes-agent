@@ -533,6 +533,8 @@ CARRY_BIND_RULE = "workspace_carry"
 _carry_scan_cache: Dict[tuple, tuple] = {}
 _carry_clone_cache: Dict[tuple, tuple] = {}  # skip_clones census key -> clone paths it skipped (t_9965b8d5)
 _carry_split_usage: Dict[object, tuple] = {}  # root -> (bytes, entries, caps) of the last skip_clones census (F4)
+_carry_worktree_cache: Dict[object, tuple] = {}  # root -> linked-worktree rels the last skip_clones census set aside
+_worktree_usage_cache: Dict[str, tuple] = {}  # worktree realpath -> (at, (bytes, entries) or None)
 _carry_waiting: Dict[tuple, tuple] = {}  # cache key -> (budget generation first deferred, last asked); FIFO
 _carry_gen = 0
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
@@ -679,6 +681,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     import stat
     pending = [root]
     clones: List[str] = []
+    worktrees: List[str] = []
     try:
         while pending and ok:
             current = pending.pop()
@@ -698,6 +701,13 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                                 and not os.path.islink(os.path.join(entry.path, ".git")):
                             # t_9965b8d5: a git clone is re-cloned on the pool host, never copied or counted
                             clones.append(os.path.relpath(entry.path, root))
+                            continue
+                        if skip_clones and _is_linked_worktree(entry.path):
+                            # t_d2f06cf6: a linked worktree (``.git`` is a gitdir FILE) is set aside like a clone.
+                            # The split plan decides it: rebuilt from origin when recoverable, else its files are
+                            # censused (worktree_usage) and carried, and they count toward the caps.
+                            worktrees.append(os.path.relpath(entry.path, root))
+                            clones.append(worktrees[-1])
                             continue
                         pending.append(entry.path)
                     if entries % 256 == 0 and clock() >= stop:
@@ -720,7 +730,73 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     if skip_clones:
         _carry_clone_cache[key] = tuple(sorted(clones)) if ok else ()
         _carry_split_usage[root] = (total, entries, max_bytes, max_entries)
+        _carry_worktree_cache[root] = tuple(sorted(worktrees)) if ok else ()
     return ok
+
+
+def _is_linked_worktree(path: str) -> bool:
+    """True when ``path/.git`` is a regular file naming a gitdir (a linked worktree), not a symlink."""
+    dotgit = os.path.join(path, ".git")
+    try:
+        if os.path.islink(dotgit) or not os.path.isfile(dotgit):
+            return False
+        with open(dotgit, encoding="utf-8-sig") as f:
+            return f.read(4096).startswith("gitdir: ")
+    except (OSError, UnicodeError):
+        return False
+
+
+def carry_split_worktrees(path: Optional[str]) -> Tuple[str, ...]:
+    """The linked-worktree rels (a subset of :func:`carry_split`'s) the last split census of ``path`` set aside."""
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        return _carry_worktree_cache.get(canon(path), ())
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return ()
+
+
+def worktree_usage(path: str, *, max_bytes: int, max_entries: int, fresh: bool = False,
+                   max_seconds: float = CARRY_SCAN_MAX_SECONDS) -> Optional[Tuple[int, int]]:
+    """``(bytes, entries)`` of the directory ``path`` (symlinks counted, never followed), or None when the walk
+    errors or outlives ``max_seconds``. Stops once a cap is passed (the tallies then already exceed it). Cached for
+    ``CARRY_SCAN_TTL_SECONDS`` unless ``fresh`` (the spawn-time re-check, review F3)."""
+    import stat
+    import time as _time
+    try:
+        key = os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+    t = _time.monotonic()
+    hit = _worktree_usage_cache.get(key)
+    if not fresh and hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
+        return hit[1]
+    stop = t + max_seconds
+    total = entries = 0
+    pending = [path]
+    usage: Optional[Tuple[int, int]] = None
+    try:
+        while pending and total <= max_bytes and entries <= max_entries:
+            current = pending.pop()
+            if current is not path and os.path.islink(current):
+                continue
+            with os.scandir(current) as scan:
+                for entry in scan:
+                    entries += 1
+                    info = entry.stat(follow_symlinks=False)
+                    total += info.st_size
+                    if total > max_bytes or entries > max_entries:
+                        break
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(entry.path)
+            if _time.monotonic() >= stop:
+                raise TimeoutError
+        usage = (total, entries)
+    except (OSError, TimeoutError):
+        usage = None
+    if len(_worktree_usage_cache) > 4096:
+        _worktree_usage_cache.clear()
+    _worktree_usage_cache[key] = (_time.monotonic(), usage)
+    return usage
 
 
 def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None,
@@ -828,10 +904,12 @@ def regenerable_cache(rel: str) -> bool:
     return any(p in REGENERABLE_CACHE_NAMES for p in parts) or any(p.endswith(".egg-info") for p in parts[:-1])
 
 
-def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int) -> Optional[str]:
+def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int, *,
+                     rebuilt: Optional[set] = None, fresh: bool = False) -> Optional[str]:
     """None when the split carry's remainder (the last :func:`carry_split` census of ``path``, against the caps that
-    census used) PLUS the clones' carried ignored files (``extra_*``) stays within the caps, else the reason naming
-    the cap (operator F4)."""
+    census used) PLUS the clones' carried ignored files (``extra_*``) PLUS every linked worktree NOT in ``rebuilt``
+    (t_d2f06cf6: its files ride the carry) stays within the caps, else the reason naming the cap (operator F4).
+    ``rebuilt`` None = every set-aside path is rebuilt (the pre-worktree callers)."""
     try:
         from hermes_cli.kanban_db_workspace import canon
         root = canon(path)
@@ -841,10 +919,19 @@ def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int) 
     if used is None:
         return "carry census unavailable"
     total, entries = used[0] + extra_bytes, used[1] + extra_entries
+    carried_wt = [] if rebuilt is None else [w for w in _carry_worktree_cache.get(root, ()) if w not in rebuilt]
+    for rel in carried_wt:
+        usage = worktree_usage(os.path.join(str(root), rel), max_bytes=max(0, used[2] - total),
+                               max_entries=max(0, used[3] - entries), fresh=fresh)
+        if usage is None:
+            return f"carry census of worktree {rel} unavailable"
+        total, entries = total + usage[0], entries + usage[1]
+    what = "the clones' ignored files" + (f" and worktree {', '.join(carried_wt)} (not rebuildable)"
+                                         if carried_wt else "")
     if total > used[2]:
-        return f"over the carry byte cap with the clones' ignored files: {total} > {used[2]} bytes"
+        return f"over the carry byte cap with {what}: {total} > {used[2]} bytes"
     if entries > used[3]:
-        return f"over the carry entry cap with the clones' ignored files: {entries} > {used[3]} entries"
+        return f"over the carry entry cap with {what}: {entries} > {used[3]} entries"
     return None
 
 
@@ -854,20 +941,31 @@ _clone_assess_cache: Dict[tuple, tuple] = {}  # (canonical path, HEAD key) -> (m
 def _clone_head_key(repo: str) -> Optional[tuple]:
     """A no-subprocess fingerprint of the clone's HEAD (review F3): the ``.git/HEAD`` text, the sha its branch ref
     holds (loose ref, else packed-refs) and the index mtime. None (do not cache) when any part cannot be read."""
-    git = os.path.join(repo, ".git")
+    git = common = os.path.join(repo, ".git")
     try:
+        if os.path.isfile(git):
+            # t_d2f06cf6: a linked worktree: HEAD and index in its gitdir, branch refs in the common dir
+            with open(git, encoding="utf-8-sig") as f:
+                line = f.read(4096).strip()
+            if not line.startswith("gitdir: "):
+                return None
+            git = os.path.join(repo, line[8:])
+            common = git
+            if os.path.isfile(os.path.join(git, "commondir")):
+                with open(os.path.join(git, "commondir"), encoding="utf-8-sig") as f:
+                    common = os.path.join(git, f.read().strip())
         with open(os.path.join(git, "HEAD"), encoding="utf-8-sig") as f:
             head = f.read().strip()
         sha = head
         if head.startswith("ref: "):
             ref = head[5:]
-            loose = os.path.join(git, *ref.split("/"))
+            loose = os.path.join(common, *ref.split("/"))
             if os.path.isfile(loose):
                 with open(loose, encoding="utf-8-sig") as f:
                     sha = f.read().strip()
             else:
                 sha = ""
-                with open(os.path.join(git, "packed-refs"), encoding="utf-8-sig") as f:
+                with open(os.path.join(common, "packed-refs"), encoding="utf-8-sig") as f:
                     for line in f:
                         parts = line.split()
                         if len(parts) == 2 and parts[1] == ref:
@@ -989,10 +1087,12 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
                 raise RuntimeError(f"carry to {host.name}: clone {c['rel']} ignored file {ign!r} unreadable")
             extra_entries += 1
         staged.append((c, dest, ignored))
-    if extra_entries:
+    rebuilt = {c["rel"].strip("/") for c in clones}
+    if extra_entries or set(carry_split_worktrees(workspace)) - rebuilt:
         # Review F3 (22:1x): the spawn-time list gets the routing's caps again; a file that grew or appeared since
         # routing can push the carry over, and then the spawn fails with the same named reason the wait line uses.
-        over = carry_split_fits(workspace, extra_bytes, extra_entries)
+        # t_d2f06cf6: a linked worktree carried as files (not rebuilt) is re-walked here, uncached.
+        over = carry_split_fits(workspace, extra_bytes, extra_entries, rebuilt=rebuilt, fresh=True)
         if over is not None:
             raise RuntimeError(f"carry to {host.name}: {over}")
     for c, dest, ignored in staged:
