@@ -1556,7 +1556,8 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
     """``(domain, pid)`` for ``label``, probing ``gui/<uid>`` then ``user/<uid>``. Never uses the current
     profile's cached ``_launchd_domain()`` — a fleet can mix domains. ``TimeoutExpired`` propagates."""
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    for domain in (f"gui/{uid}", f"user/{uid}"):
+    domains = ("system",) if (Path("/Library/LaunchDaemons") / f"{label}.plist").is_file() else (f"gui/{uid}", f"user/{uid}")
+    for domain in domains:
         loaded, pid = _launchd_print_service_pid(domain, label)
         if loaded:
             return (domain, pid)
@@ -3024,6 +3025,9 @@ def get_launchd_plist_path() -> Path:
     import pwd
     suffix = _profile_suffix()
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    daemon = Path("/Library/LaunchDaemons") / f"{name}.plist"
+    if daemon.is_file():
+        return daemon
     # Real account home: profile mode may point HOME at a profile dir.
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     return home / "Library" / "LaunchAgents" / f"{name}.plist"

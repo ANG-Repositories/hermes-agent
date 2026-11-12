@@ -70,6 +70,35 @@ def launchd_seam(monkeypatch, tmp_path):
     return calls
 
 
+@pytest.mark.parametrize("loaded", [True, False])
+def test_system_daemon_restart_never_refreshes_or_degrades(monkeypatch, tmp_path, loaded):
+    from hermes_cli import gateway_launchd as ld
+    label = "ai.hermes.gateway-mercury"
+    daemon = tmp_path / f"{label}.plist"
+    daemon.touch()
+    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: label)
+    monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "mercury")
+    original_is_file = ld.Path.is_file
+    monkeypatch.setattr(ld.Path, "is_file", lambda p: True if str(p) == f"/Library/LaunchDaemons/{label}.plist" else original_is_file(p))
+    monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+    monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: pytest.fail("must not rewrite a system plist"))
+    calls = []
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if not loaded:
+            raise gateway_cli.subprocess.CalledProcessError(113, cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(ld.subprocess, "run", run)
+    assert gateway_cli.get_launchd_plist_path() == ld.Path(f"/Library/LaunchDaemons/{label}.plist")
+    assert gateway_cli._launchd_domain() == "system"
+    if loaded:
+        gateway_cli.launchd_restart()
+    else:
+        with pytest.raises(gateway_cli.subprocess.CalledProcessError):
+            gateway_cli.launchd_restart()
+    assert calls == [["sudo", "-n", "launchctl", "kickstart", "-k", f"system/{label}"]]
+
+
 def test_stale_plist_is_refreshed_before_any_kickstart(monkeypatch, launchd_seam):
     """The update-restart path must repair the definition, not revive a stale one."""
     refreshed = []
