@@ -279,14 +279,12 @@ def _counting_gh(monkeypatch, box: dict) -> list:
     return calls
 
 
-def test_reopened_pr_holds_again_on_the_next_call(kanban_home, head_at, monkeypatch):
-    """A closed-unmerged state is not cached: a reopen is seen on the very next guard call."""
+def test_closed_unmerged_pr_still_holds(kanban_home, head_at, monkeypatch):
+    """A closed-unmerged PR can be reopened while its writer runs: keep the hold (prism P1 reopen race)."""
     _counting_gh(monkeypatch, head_at)
     head_at["pr"] = {"state": "closed", "merged": False}
     with kb.connect() as conn:
         parent, child = _bare_ref_child_under_running_parent(conn)
-        assert kb.check_respawn_guard(conn, child) != kpo.GUARD_REASON
-        head_at["pr"] = {"state": "open", "merged": False}
         detail: dict = {}
         assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
         assert detail["owner"] == parent
