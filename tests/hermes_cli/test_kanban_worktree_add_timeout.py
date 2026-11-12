@@ -19,7 +19,7 @@ from hermes_cli import kanban_worktree_residue as kwr
 
 def git(repo, *args, check=True):
     return subprocess.run(["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL, capture_output=True,
-                          text=True, check=check).stdout.strip()
+                          text=True, encoding="utf-8", errors="replace", check=check).stdout.strip()
 
 
 @pytest.fixture
@@ -29,9 +29,9 @@ def repo(tmp_path, monkeypatch):
     git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.name", "T")
     git(repo, "config", "user.email", "t@example.invalid")
-    (repo / ".gitattributes").write_text("*.slow filter=slow\n")
+    (repo / ".gitattributes").write_text("*.slow filter=slow\n", encoding="utf-8")
     for i in range(3):
-        (repo / f"f{i}.slow").write_text(f"{i}\n")
+        (repo / f"f{i}.slow").write_text(f"{i}\n", encoding="utf-8")
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "base")
     monkeypatch.setattr(kwr, "ADD_TIMEOUT_S", 2)
@@ -49,7 +49,7 @@ def registrations(repo) -> int:
 
 def alive(pid: int) -> bool:
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — the test drives POSIX process groups
     except ProcessLookupError:
         return False
     return True
@@ -66,7 +66,7 @@ def test_a_hung_add_is_killed_whole_and_leaves_nothing_then_a_second_spawn_succe
         kbw._ensure_git_worktree(repo, target, "wt/t_hang")
     assert time.monotonic() - t0 < 30
 
-    pids = [int(p) for p in pidfile.read_text().split()]
+    pids = [int(p) for p in pidfile.read_text(encoding="utf-8-sig").split()]
     assert pids, "the smudge filter never ran: the add did not hang inside its checkout"
     time.sleep(0.5)
     assert [p for p in pids if alive(p)] == []                      # no process of the group outlived it
@@ -86,7 +86,7 @@ def test_a_timed_out_add_never_deletes_a_branch_it_did_not_create(repo, tmp_path
     git(repo, "branch", "wt/t_mine")
     other = tmp_path / "scratch"
     git(repo, "worktree", "add", "-q", str(other), "wt/t_mine")
-    (other / "work.txt").write_text("commits of its own\n")
+    (other / "work.txt").write_text("commits of its own\n", encoding="utf-8")
     git(other, "add", "work.txt")
     git(other, "commit", "-qm", "own work")
     own = git(repo, "rev-parse", "wt/t_mine")
@@ -130,7 +130,7 @@ def test_a_half_built_tree_is_cleared_but_a_branch_with_its_own_commits_is_kept(
     git(repo, "branch", "wt/t_own")
     tmp = repo.parent / "own"
     git(repo, "worktree", "add", "-q", str(tmp), "wt/t_own")
-    (tmp / "x.txt").write_text("x\n")
+    (tmp / "x.txt").write_text("x\n", encoding="utf-8")
     git(tmp, "add", "x.txt")
     git(tmp, "commit", "-qm", "own")
     own = git(repo, "rev-parse", "wt/t_own")
@@ -177,7 +177,7 @@ def test_spawn_on_an_old_half_built_tree_clears_it_and_builds_a_real_checkout(re
 def _audit(*args):
     import sys
     script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
-    return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True)
+    return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, encoding="utf-8")
 
 
 def test_audit_drain_removes_only_dispatcher_trees_of_finished_cards(repo, tmp_path):

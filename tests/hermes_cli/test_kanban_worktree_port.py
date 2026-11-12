@@ -1898,4 +1898,4 @@ def test_a_half_built_tree_locked_for_another_reason_is_left_alone(studio_card):
     with kb.connect_closing() as conn:
         route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
     assert "own_tree_not_a_checkout" in (route[1] or ""), route
-    assert wt.is_dir() and (gitdir / "locked").read_text().strip() == "operator hold"
+    assert wt.is_dir() and (gitdir / "locked").read_text(encoding="utf-8").strip() == "operator hold"

@@ -40,11 +40,18 @@ class WorktreeAddTimeout(RuntimeError):
     """``git worktree add`` ran past its timeout; its whole process group was killed."""
 
 
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
-    """SIGTERM then SIGKILL the process group ``proc`` leads; reap ``proc``."""
-    for sig, wait in ((signal.SIGTERM, _KILL_GRACE_S), (signal.SIGKILL, 5.0)):
+    """SIGTERM then SIGKILL the process group ``proc`` leads; reap ``proc``. POSIX; elsewhere ``proc.kill()``."""
+    if not hasattr(os, "killpg"):
+        proc.kill()
+        proc.wait(timeout=5.0)
+        return
+    for sig, wait in ((signal.SIGTERM, _KILL_GRACE_S), (_SIGKILL, 5.0)):
         try:
-            os.killpg(proc.pid, sig)
+            os.killpg(proc.pid, sig)  # windows-footgun: ok — guarded by hasattr(os, "killpg") above
         except ProcessLookupError:
             break
         except OSError:
@@ -55,7 +62,7 @@ def _kill_group(proc: subprocess.Popen) -> None:
             continue
         # The leader is gone; a child may still be alive in the group: SIGKILL the rest (ESRCH = none left).
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, _SIGKILL)  # windows-footgun: ok — guarded by hasattr(os, "killpg") above
         except OSError:
             pass
         break
