@@ -697,7 +697,8 @@ def _decision_sites() -> set:
 NOT_A_CARD_REFUSAL = {
     "continue: dry_run": "the --dry-run preview; admit never dry-runs",
     "return: _cap == 0": "`dispatch --max 0`, an operator argument; admit has no --max (spec item 5)",
-    "continue: record_only is not None": "the tail behind an EARLIER row's wall; admit routes one row",
+    "continue: record_only is not None and (not (record_only == 'wall' and _asap_exempt))":
+        "the tail behind an EARLIER row's wall; admit routes one row (asap exemption: t_103a4648)",
     "break: spawn_budget is not None and spawned >= spawn_budget": "budget spent by EARLIER ready rows; admit routes one row",
     "continue: route_first": "budget spent by EARLIER ready rows; admit routes one row",
     "rows: sorted": "orders the rows; admit has one",
@@ -1229,7 +1230,9 @@ def _site_triggers():
         "return: _door_hold": door_hold,
         "continue: outcome == _LAUNCH_NOT_OWNED": launch_not_owned,
         "continue: outcome == _LAUNCH_CLAIM_LOST": launch_claim_lost,
-        "return: (spillover is None or spillover.budget <= 0) and (not route_first)": load_gate_paused,
+        # t_103a4648: `_exempt_left` (ceiling room for asap cards) is always 0 under admit (skip_host_admission)
+        "return: (spillover is None or spillover.budget <= 0) and (not route_first) and (not _exempt_left)":
+            load_gate_paused,
         "break: not local_free and (not pool_free)": load_gate_zero,
         "return: total_running >= max_in_progress": max_in_progress,
         "return: pressure == 'critical'": memory_critical,
