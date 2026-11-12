@@ -4719,7 +4719,6 @@ def _launch_claimed(
     Exceptions propagate; ``state.launched`` says whether a process exists.
     """
     from hermes_cli.kanban_continuation import record_placement
-    from hermes_cli import kanban_placement_reasons as _pr
 
     from hermes_cli import kanban_priority_door as door
     if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
@@ -4747,8 +4746,7 @@ def _launch_claimed(
     if not pid:
         # No pid reported (no ``spawned`` event): still one record.
         with _kbc.write_txn(conn):
-            _kb._append_event(conn, claimed.id, _pr.PLACEMENT_EVENT, record,
-                              run_id=claimed.current_run_id)
+            _write_placement(conn, claimed.id, claimed.current_run_id, record)
     # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn returned and
     # the PID (when reported) is durably persisted, per the RFC timing
     # contract. Best-effort — can never break the dispatch loop.

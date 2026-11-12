@@ -449,6 +449,7 @@ def test_replay_upserts_a_replaced_placement_by_run(journal_env, tmp_path, monke
     conn = _make_board_db(snapshot)
     base = int(time.time()) - 500
     conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", ("t_p", "t", "running", base))
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", ("t_q", "q", "running", base))
     conn.commit()
     conn.close()
 

@@ -267,9 +267,9 @@ def replay_into(
                 # and a run with no row gets one. A (task, kind, second) dedup would keep the placeholder or
                 # append a second row.
                 prior = conn.execute(
-                    "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? AND kind = ? "
-                    "ORDER BY id DESC LIMIT 1",
-                    (int(run_id), kind),
+                    "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? AND task_id = ? "
+                    "AND kind = ? ORDER BY id DESC LIMIT 1",
+                    (int(run_id), task_id, kind),
                 ).fetchone()
                 if prior is not None:
                     if prior[1] == "unrecorded" and payload.get("reason") != "unrecorded":
