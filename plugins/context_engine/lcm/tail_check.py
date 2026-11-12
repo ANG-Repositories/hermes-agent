@@ -22,8 +22,9 @@ Two probes:
   range (an index insert lands wherever its key sorts).
 * page-header scan (only when the SQLite build has ``sqlite_dbpage``): the
   last ``tail_pages`` pages of the file, read through the pager (WAL-aware).
-  Flags a page whose type byte says b-tree but whose header is impossible, and
-  an all-zero page that is not on the freelist (a lost write).
+  Flags a page whose type byte says b-tree but whose header is impossible.
+  (An all-zero page is NOT flagged: a valid overflow page of a zero-filled
+  BLOB is all zeros and is not on the freelist.)
 
 Neither probe proves the whole file is sound. A failure is a strong signal;
 a pass means "the tail the last checkpoints wrote reads back".
@@ -56,7 +57,6 @@ DEFAULT_TAIL_PAGES = 1024
 DEFAULT_DEADLINE_S = 10.0
 DEFAULT_VM_STEP_BUDGET = 50_000_000
 _PROGRESS_OPS = 10_000
-_MAX_FREELIST_PAGES = 200_000
 _MAX_BAD_PAGES_REPORTED = 50
 
 _BTREE_PAGE_TYPES = (0x02, 0x05, 0x0A, 0x0D)
@@ -76,7 +76,7 @@ def health_marker_path(hermes_home: str | Path) -> Path:
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
@@ -98,45 +98,94 @@ def read_store_health(hermes_home: str | Path, db_path: str | Path) -> Optional[
     return entry if isinstance(entry, dict) else None
 
 
+class _MarkerLock:
+    """Cross-process exclusive lock around the marker read-modify-replace (flock on a
+    sidecar file). Best-effort on platforms without fcntl."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path.with_name(path.name + ".lock")
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "_MarkerLock":
+        self._fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._fd is not None:
+            os.close(self._fd)  # releases the flock
+            self._fd = None
+
+
 def _write_store_health(hermes_home: str | Path, db_path: str | Path, entry: Dict[str, Any]) -> None:
     path = health_marker_path(hermes_home)
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        marker = _read_json(path) or {}
-        stores = marker.get("stores") if isinstance(marker.get("stores"), dict) else {}
-        stores[_db_key(db_path)] = entry
-        marker["stores"] = stores
-        marker["updated_at"] = entry.get("checked_at")
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".lcm-store-health.", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(marker, handle, indent=2, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        with _MarkerLock(path):
+            _replace_store_entry(path, db_path, entry)
     except OSError:
         logger.warning("LCM could not write store health marker %s", path, exc_info=True)
 
 
-def unclean_boot_key(hermes_home: str | Path) -> Optional[str]:
-    """Key of the current gateway life when it booted after an unclean exit, else None."""
-    sentinel = _read_json(Path(hermes_home).joinpath(*LIFECYCLE_SENTINEL_RELATIVE))
-    if not sentinel or not sentinel.get("prior_unclean_exit"):
+def _replace_store_entry(path: Path, db_path: str | Path, entry: Dict[str, Any]) -> None:
+    marker = _read_json(path) or {}
+    stores = marker.get("stores") if isinstance(marker.get("stores"), dict) else {}
+    stores[_db_key(db_path)] = entry
+    marker["stores"] = stores
+    marker["updated_at"] = entry.get("checked_at")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".lcm-store-health.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(marker, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _process_sentinel_path() -> Optional[Path]:
+    """The gateway PROCESS lifecycle sentinel (owned by the process home, not by the
+    profile a store belongs to: a multiplexed gateway claims it once)."""
+    try:
+        from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
+
+        return get_lifecycle_sentinel_path()
+    except Exception:
         return None
-    return f"{sentinel.get('pid')}:{sentinel.get('start_time') or sentinel.get('started_at')}"
+
+
+def unclean_boot_key(hermes_home: str | Path) -> Optional[str]:
+    """Key of the current gateway life when it booted after an unclean exit, else None.
+
+    Reads the process sentinel first, then the store's own profile home (a gateway
+    launched from that profile, or a standalone install)."""
+    candidates = [_process_sentinel_path(), Path(hermes_home).joinpath(*LIFECYCLE_SENTINEL_RELATIVE)]
+    seen = set()
+    for path in candidates:
+        if path is None or str(path) in seen:
+            continue
+        seen.add(str(path))
+        sentinel = _read_json(path)
+        if sentinel and sentinel.get("prior_unclean_exit"):
+            return f"{sentinel.get('pid')}:{sentinel.get('start_time') or sentinel.get('started_at')}"
+    return None
 
 
 def _quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _right_edge_walk(conn: sqlite3.Connection, rows: int, bad: List[str]) -> int:
+def _right_edge_walk(conn: sqlite3.Connection, rows: int, bad: List[str], tick=lambda: None) -> int:
     """Read the last ``rows`` entries of every b-tree; return how many b-trees were read."""
     objects = conn.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master "
@@ -145,6 +194,7 @@ def _right_edge_walk(conn: sqlite3.Connection, rows: int, bad: List[str]) -> int
     walked = 0
     for kind, name, tbl_name, sql in objects:
         name = str(name)
+        tick()
         try:
             if kind == "table":
                 if name.startswith("sqlite_") and name != "sqlite_sequence":
@@ -201,28 +251,6 @@ def _page(conn: sqlite3.Connection, pgno: int) -> Optional[bytes]:
     return bytes(row[0]) if row and row[0] is not None else None
 
 
-def _freelist(conn: sqlite3.Connection, page_size: int) -> Optional[set]:
-    count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-    if count > _MAX_FREELIST_PAGES:
-        return None
-    header = _page(conn, 1) or b""
-    trunk = struct.unpack(">I", header[32:36])[0] if len(header) >= 36 else 0
-    pages: set = set()
-    seen = 0
-    while trunk and seen <= count:
-        pages.add(trunk)
-        data = _page(conn, trunk)
-        if data is None:
-            return None
-        nxt, leaves = struct.unpack(">II", data[:8])
-        leaves = min(leaves, (page_size - 8) // 4)
-        for i in range(leaves):
-            pages.add(struct.unpack(">I", data[8 + 4 * i:12 + 4 * i])[0])
-        seen += 1 + leaves
-        trunk = nxt
-    return pages
-
-
 def _header_ok(data: bytes, offset: int, page_size: int, usable: int) -> bool:
     kind = data[offset]
     head = 12 if kind in (0x02, 0x05) else 8
@@ -246,16 +274,16 @@ def _header_ok(data: bytes, offset: int, page_size: int, usable: int) -> bool:
     return True
 
 
-def _page_scan(conn: sqlite3.Connection, tail_pages: int, bad: List[str]) -> int:
+def _page_scan(conn: sqlite3.Connection, tail_pages: int, bad: List[str], tick=lambda: None) -> int:
     page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
     page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
     header = _page(conn, 1) or b""
     reserved = header[20] if len(header) > 20 else 0
     usable = page_size - reserved
-    free = _freelist(conn, page_size)
     first = max(2, page_count - tail_pages + 1)
     scanned = 0
     for pgno in range(first, page_count + 1):
+        tick()
         data = _page(conn, pgno)
         scanned += 1
         if data is None:
@@ -265,8 +293,6 @@ def _page_scan(conn: sqlite3.Connection, tail_pages: int, bad: List[str]) -> int
         if kind in _BTREE_PAGE_TYPES:
             if not _header_ok(data, 0, page_size, usable):
                 bad.append(f"page:{pgno}: b-tree header invalid (type 0x{kind:02x})")
-        elif not any(data) and free is not None and pgno not in free:
-            bad.append(f"page:{pgno}: all-zero and not on the freelist")
     return scanned
 
 
@@ -282,21 +308,33 @@ def check_tail(
     """Run both probes on ``conn``; never raises. Returns the health entry."""
     started = time.monotonic()
     steps = 0
+    # The progress handler counts per statement; short statements may never reach the
+    # interval, so the budget/deadline is ALSO checked explicitly between statements.
+    interval = max(1, min(_PROGRESS_OPS, int(vm_step_budget)))
+
+    def _over() -> bool:
+        return steps > vm_step_budget or time.monotonic() - started > deadline_s
 
     def _progress() -> int:
         nonlocal steps
-        steps += _PROGRESS_OPS
-        return 1 if steps > vm_step_budget or time.monotonic() - started > deadline_s else 0
+        steps += interval
+        return 1 if _over() else 0
+
+    def _tick() -> None:
+        nonlocal steps
+        steps += 1
+        if _over():
+            raise _Budget()
 
     bad: List[str] = []
     result: Dict[str, Any] = {"btrees_walked": 0, "pages_checked": 0, "dbpage": False}
-    conn.set_progress_handler(_progress, _PROGRESS_OPS)
+    conn.set_progress_handler(_progress, interval)
     try:
         try:
-            result["btrees_walked"] = _right_edge_walk(conn, rows_per_btree, bad)
+            result["btrees_walked"] = _right_edge_walk(conn, rows_per_btree, bad, _tick)
             if use_dbpage and _has_dbpage(conn):
                 result["dbpage"] = True
-                result["pages_checked"] = _page_scan(conn, tail_pages, bad)
+                result["pages_checked"] = _page_scan(conn, tail_pages, bad, _tick)
             status = STATUS_UNHEALTHY if bad else STATUS_OK
         except _Budget:
             status = STATUS_UNHEALTHY if bad else STATUS_INCOMPLETE

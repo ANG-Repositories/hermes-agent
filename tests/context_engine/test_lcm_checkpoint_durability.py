@@ -26,6 +26,12 @@ from plugins.context_engine.lcm.lifecycle_state import LifecycleStateStore
 from plugins.context_engine.lcm.store import MessageStore
 
 
+@pytest.fixture(autouse=True)
+def _no_process_sentinel(monkeypatch):
+    """Keep the real gateway process sentinel out of these tests."""
+    monkeypatch.setattr(T, "_process_sentinel_path", lambda: None)
+
+
 def _pragmas(conn) -> dict:
     return {
         name: conn.execute(f"PRAGMA {name}").fetchone()[0]
@@ -165,3 +171,67 @@ def test_check_is_bounded(tmp_path):
     finally:
         conn.close()
     assert out["status"] == "incomplete" and out["reason"] == "budget_exhausted", out
+
+
+def test_zero_filled_overflow_page_is_not_corruption(tmp_path):
+    """Prism 3fdba662487f: a zeroblob's last overflow page is all zeros and valid."""
+    db = tmp_path / "z.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("PRAGMA page_size=4096")
+        conn.execute("CREATE TABLE t(x BLOB)")
+        conn.execute("INSERT INTO t VALUES(zeroblob(10000))")
+        conn.commit()
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        out = T.check_tail(conn)
+    finally:
+        conn.close()
+    assert out["status"] == "ok", out
+
+
+def test_marker_updates_from_concurrent_writers_are_not_lost(tmp_path, monkeypatch):
+    """Prism 08cd32efb0c8: read-modify-replace is serialized across writers."""
+    import threading
+
+    real_read = T._read_json
+    barrier = threading.Barrier(2, timeout=5)
+
+    def slow_read(path):
+        data = real_read(path)
+        if path.name == "lcm-store-health.json":
+            try:
+                barrier.wait(timeout=0.5)  # without the lock both readers meet here
+            except threading.BrokenBarrierError:
+                pass
+        return data
+
+    monkeypatch.setattr(T, "_read_json", slow_read)
+    threads = [
+        threading.Thread(target=T._write_store_health, args=(tmp_path, tmp_path / f"{n}.db", {"status": st}))
+        for n, st in (("a", "unhealthy"), ("b", "ok"))
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert T.read_store_health(tmp_path, tmp_path / "a.db")["status"] == "unhealthy"
+    assert T.read_store_health(tmp_path, tmp_path / "b.db")["status"] == "ok"
+
+
+def test_secondary_profile_store_uses_the_process_sentinel(tmp_path, monkeypatch):
+    """Prism b7f6231a4f6f: the unclean-exit trigger is the gateway PROCESS sentinel."""
+    process_home, profile_home = tmp_path / "proc", tmp_path / "profiles" / "b"
+    _mark_unclean(process_home)
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(T, "_process_sentinel_path",
+                        lambda: process_home / "state" / "gateway.lifecycle.json")
+    db = profile_home / "lcm.db"
+    _fill(db)
+    store = MessageStore(db_path=str(db), hermes_home=str(profile_home))
+    try:
+        assert store.tail_health is not None and store.tail_health["status"] == "ok"
+    finally:
+        store.close()
+    # verdict is scoped to the store's own profile home
+    assert T.read_store_health(profile_home, db)["status"] == "ok"
+    assert T.read_store_health(process_home, db) is None
