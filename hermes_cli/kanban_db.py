@@ -9365,8 +9365,8 @@ def _stamp_no_worker_class(conn: sqlite3.Connection, run_id: int, *, synthetic: 
     row = conn.execute("SELECT profile, worker_pid FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
     if row is None or row["worker_pid"]:
         return
-    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = 'spawned' LIMIT 1",
-                    (int(run_id),)).fetchone() is not None:
+    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ('spawned', 'worker_registered', "
+                    "'placement') LIMIT 1", (int(run_id),)).fetchone() is not None:
         return
     if _is_operator_profile(row["profile"]):
         cls = NO_WORKER_OPERATOR
