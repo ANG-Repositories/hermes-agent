@@ -1005,6 +1005,18 @@ _SPECS = [
     ], help="Operator-only: spawn ONE ready card on ONE host now, skipping the load gate "
             "and the host admission band (never the measured-danger floor or eligibility). "
             "Needs KANBAN_OPERATOR_TOKEN; kill switch kanban.admin_admit.enabled"),
+    _cmd("studio-override", [
+        _TASK_ID,
+        _arg("--capability", required=True,
+             help="The ONE Studio-only capability the hold names (from its studio_default_deny:<cap> wait reason)"),
+        _arg("--why", required=True, help="Why this card truly needs the Mac Studio (at least 3 words)"),
+        _group(
+            _arg("--once", action="store_true", help="One run only (default): the next spawn uses it up"),
+            _arg("--until", metavar="TIME", help="Hold until TIME (ISO-8601, epoch, or +N[smhd])"),
+        ),
+    ], help="Operator-only (t_062a5948): let ONE card held by Studio default-deny start on the Mac Studio for a "
+            "named capability. Writes a studio_override event and a capability-gap ledger line. "
+            "Needs KANBAN_OPERATOR_TOKEN"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),
