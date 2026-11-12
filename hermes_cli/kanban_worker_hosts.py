@@ -25,6 +25,7 @@ import subprocess
 from typing import Callable, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
+from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
 
 PLACEMENT_ENV = "KANBAN_WORKER_PLACEMENT"
 # The synthetic placement of a Studio-local worker (``kanban_local_worker_uid``). Defined here,
@@ -1099,30 +1100,94 @@ def _stash_label(entry) -> str:
     return f"stash entry {entry[0][:12]} ({entry[2][:80]})"
 
 
+# t_d2f06cf6 (operator 02:0x): the bundle build runs inside the dispatcher tick, so it gets a wall-clock ceiling far
+# below CARRY_TIMEOUT_SECONDS. Measured on the Studio: 0.5 s for 17 entries once origin's default branch is excluded,
+# 47 to 70 s when only HEAD was. A build that hits the ceiling is remembered for STASH_BUNDLE_RETRY_SECONDS: the card
+# then WAITS at routing with the reason named (stash_bundle_deferred) instead of re-blocking every tick.
+STASH_BUNDLE_TIMEOUT_SECONDS = 30
+STASH_BUNDLE_RETRY_SECONDS = 3600
+_stash_bundle_timeouts: Dict[tuple, Tuple[float, str]] = {}
+
+
+class StashBundleTimeout(WorkspaceUnavailable, RuntimeError):
+    """The stash bundle build hit STASH_BUNDLE_TIMEOUT_SECONDS. A WorkspaceUnavailable: the dispatcher releases the
+    claim and refunds the reservation without charging a worker failure, and routing makes the card wait."""
+
+
+def _stash_bundle_key(repo: str, entries, head: str) -> tuple:
+    return (os.path.normpath(str(repo)), tuple(e[0] for e in entries), str(head))
+
+
+def stash_bundle_deferred(repo: str, entries, head: str, now: Optional[float] = None) -> Optional[str]:
+    """The wait reason when a bundle of exactly these ``entries`` over ``head`` timed out less than
+    STASH_BUNDLE_RETRY_SECONDS ago, else None. A new stash entry or a moved HEAD is a new key: tried again."""
+    import time
+    if not entries:
+        return None
+    key = _stash_bundle_key(repo, entries, head)
+    hit = _stash_bundle_timeouts.get(key)
+    if hit is None:
+        return None
+    if (time.monotonic() if now is None else now) - hit[0] >= STASH_BUNDLE_RETRY_SECONDS:
+        _stash_bundle_timeouts.pop(key, None)
+        return None
+    return hit[1]
+
+
 def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.run) -> bytes:
-    """A git bundle holding the commits of every stash entry in ``entries`` not reachable from ``head`` (the commit
-    the rebuilt clone lands on), built in a throwaway bare repo that borrows ``repo``'s objects through an alternate:
-    nothing in ``repo`` or its common dir is written. Raises RuntimeError naming the entry on any failure."""
+    """A git bundle holding the commits of every stash entry in ``entries`` that the rebuilt clone does not already
+    hold: ``head`` (the commit the clone lands on) and origin's default branch as this checkout last saw it
+    (``refs/remotes/origin/HEAD``) are excluded, so the main commits between a worktree's base and a stash's base never
+    ride (operator 02:0x: 109 MB -> 1.8 MB). The pool clone may lack that default-branch sha (the Studio's tracking ref
+    can be ahead of what the clone fetched): :func:`stash_store_script` fetches any missing prerequisite from origin
+    and refuses (rc 10) when it cannot, so a partial list is never stored.
+
+    Built in a throwaway bare repo that borrows ``repo``'s objects through an alternate: nothing in ``repo`` or its
+    common dir is written. The whole build is bounded by STASH_BUNDLE_TIMEOUT_SECONDS; hitting it raises
+    :class:`StashBundleTimeout` and is remembered (:func:`stash_bundle_deferred`). Raises RuntimeError naming the entry
+    on any other failure."""
     import shutil
     import tempfile
+    import time
+    deadline = time.monotonic() + STASH_BUNDLE_TIMEOUT_SECONDS
+    what = ", ".join(map(_stash_label, entries))
+
+    def _timed_out():
+        reason = (f"stash bundle of {repo} exceeded {STASH_BUNDLE_TIMEOUT_SECONDS}s ({what}); "
+                  f"retried after {STASH_BUNDLE_RETRY_SECONDS}s or when the stash or HEAD changes")
+        _stash_bundle_timeouts[_stash_bundle_key(repo, entries, head)] = (time.monotonic(), reason)
+        if len(_stash_bundle_timeouts) > 4096:
+            _stash_bundle_timeouts.clear()
+        return StashBundleTimeout(reason)
+
+    def _git(*args, what, ok_rc=(0,)):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _timed_out()
+        try:
+            proc = runner(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=left, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise _timed_out()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"stash carry of {repo}: {what}: {exc}")
+        if getattr(proc, "returncode", 1) not in ok_rc:
+            raise RuntimeError(f"stash carry of {repo}: {what} rc={getattr(proc, 'returncode', '?')}: "
+                               f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        return proc
+
     try:
         dirs = _gitfile_dirs(repo)
         objects = os.path.realpath(os.path.join(dirs[1] if dirs else os.path.join(repo, ".git"), "objects"))
     except (OSError, UnicodeError, ValueError) as exc:
         raise RuntimeError(f"stash carry of {repo}: git dir unreadable: {exc}")
+    # origin's default branch, as this checkout last fetched it (shared refs in a linked worktree); rc 1 = none
+    base = (getattr(_git("-C", repo, "rev-parse", "-q", "--verify", "refs/remotes/origin/HEAD^{commit}",
+                         what="origin default branch", ok_rc=(0, 1)), "stdout", "") or "").strip()
+    excl = [f"^{head}"] + ([f"^{base}"] if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", base) else [])
     tmp = tempfile.mkdtemp(prefix="kanban-stash-")
     try:
         bare, out = os.path.join(tmp, "b.git"), os.path.join(tmp, "stash.bundle")
-
-        def _git(*args, what):
-            try:
-                proc = runner(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise RuntimeError(f"stash carry of {repo}: {what}: {exc}")
-            if getattr(proc, "returncode", 1) != 0:
-                raise RuntimeError(f"stash carry of {repo}: {what} rc={getattr(proc, 'returncode', '?')}: "
-                                   f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
         _git("init", "-q", "--bare", bare, what="bundle repo")
         alt = os.path.join(bare, "objects", "info", "alternates")
         with open(alt, "w", encoding="utf-8") as f:  # windows-footgun: ok — a write; a BOM breaks the path
@@ -1131,8 +1196,7 @@ def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.ru
         for i, e in enumerate(entries):
             _git("-C", bare, "update-ref", f"refs/carry/{i}", e[0], what=_stash_label(e))
             refs.append(f"refs/carry/{i}")
-        what = ", ".join(map(_stash_label, entries))
-        _git("-C", bare, "bundle", "create", out, *refs, f"^{head}", what=f"bundle of {what}")
+        _git("-C", bare, "bundle", "create", out, *refs, *excl, what=f"bundle of {what}")
         _git("-C", bare, "bundle", "verify", "-q", out, what=f"bundle verify of {what}")
         if os.path.getsize(out) > CARRY_MAX_BYTES:
             raise RuntimeError(f"stash carry of {repo}: bundle over the carry byte cap")
@@ -1146,7 +1210,8 @@ def stash_store_script(dest: str, entries) -> str:
     """Remote sh: unbundle the stash commits read on stdin into the rebuilt clone at ``dest`` and store each entry
     with its original subject, oldest first (so ``stash@{0}`` is the newest again), then PROVE the list is exactly
     ``entries`` (rc 8). Re-run safe: a clone already holding exactly that list is left alone; one holding any other
-    stash is refused (rc 9), never added to."""
+    stash is refused (rc 9), never added to. A bundle whose prerequisites the clone lacks even after one fetch of
+    origin is refused (rc 10), nothing stored."""
     d = shlex.quote(dest)
     want = " ".join(e[0] for e in entries)
     stores = "; ".join(f"git -C \"$d\" -c user.name=kanban-carry -c user.email=kanban-carry@localhost stash store "
@@ -1155,6 +1220,11 @@ def stash_store_script(dest: str, entries) -> str:
             "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
             "if [ \"$have\" = \"$want\" ]; then cat >/dev/null; exit 0; fi; [ -z \"$have\" ] || exit 9; "
             "t=$(mktemp); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; "
+            # t_d2f06cf6 (operator 02:0x): the bundle leaves out origin's default branch as the Studio saw it. A clone
+            # missing those commits fetches origin once, else refuses (rc 10) before any entry is stored.
+            "if ! git -C \"$d\" bundle verify -q \"$t\" >/dev/null 2>&1; then "
+            "git -C \"$d\" fetch -q origin >/dev/null 2>&1 || true; "
+            "git -C \"$d\" bundle verify -q \"$t\" >&2 || exit 10; fi; "
             "git -C \"$d\" bundle unbundle \"$t\" >/dev/null; "
             f"{stores}; "
             "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
@@ -1450,7 +1520,7 @@ def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable
 def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable = subprocess.run) -> list:
     """Every spawn-time re-check of a split carry (state moved since routing, git state a rebuild or file copy would
     lose, the caps), uncached, raising on the first refusal. The dispatcher calls it BEFORE ``carry_workspace``
-    copies anything (P2 c-38aac54b3e75a212 / Prism 06179c2d4439); :func:`carry_clones` runs it again after the copy.
+    copies anything (P2 c-38aac54b3e75a212 / Prism 06179c2d4439) and hands the result to :func:`carry_clones`.
     Returns ``[(clone, dest, ignored files, (stash entries, bundle bytes))]``. t_d2f06cf6: the stash entries are read
     afresh here (one written since routing rides too) and their bundle is built before anything is copied, so a
     failed bundle refuses the spawn naming the entry, with nothing on the pool host."""
@@ -1484,6 +1554,8 @@ def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable 
             if entries:
                 try:
                     stash = entries, stash_bundle(dest, entries, c["sha"], runner)
+                except StashBundleTimeout as exc:
+                    raise StashBundleTimeout(f"carry to {host.name}: clone {c['rel']}: {exc}")
                 except RuntimeError as exc:
                     raise RuntimeError(f"carry to {host.name}: clone {c['rel']}: {exc}")
         staged.append((c, dest, ignored, stash))
@@ -1505,13 +1577,16 @@ def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable 
 
 
 def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run,
-                 reservation: Optional[str] = None) -> None:
+                 reservation: Optional[str] = None, staged: Optional[list] = None) -> None:
     """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
     pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
     put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run).
-    ``reservation``: the card's reservation on ``host``, threaded to :func:`carry_stash`."""
+    ``reservation``: the card's reservation on ``host``, threaded to :func:`carry_stash`. ``staged``: the return of
+    the :func:`carry_clones_check` the dispatcher ran before the copy (t_d2f06cf6, operator 02:0x: the stash bundle
+    is built once per spawn); None = run the check here."""
     from hermes_cli import kanban_worktree_port as _kwt
-    staged = carry_clones_check(host, workspace, clones, runner)
+    if staged is None:
+        staged = carry_clones_check(host, workspace, clones, runner)
     for c, dest, ignored, (entries, bundle) in staged:
         if c.get("push") is not None:
             _kwt.push_card_branch(tuple(c["push"]), runner)

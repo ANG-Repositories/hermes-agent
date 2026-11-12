@@ -441,12 +441,20 @@ def test_over_limit_without_clones_waits_named(kanban_home, small_carry):
 
 def test_over_limit_spawn_carries_minus_clones_then_reclones_on_the_host(kanban_home, small_carry, monkeypatch):
     monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
-    calls, rids = [], []
+    calls, rids, checks, handed = [], [], [], []
     monkeypatch.setattr(kwh, "carry_workspace",
                         lambda host, ws, runner=None, exclude=(): calls.append(("carry", host.name, ws, exclude)))
+    real_check = kwh.carry_clones_check
+
+    def check(*a, **k):
+        out = real_check(*a, **k)
+        checks.append(out)
+        return out
+    monkeypatch.setattr(kwh, "carry_clones_check", check)
     monkeypatch.setattr(kwh, "carry_clones",
-                        lambda host, ws, clones, fleet_dir, runner=None, reservation=None: (calls.append(
-                            ("clone", host.name, ws, [c["rel"] for c in clones])), rids.append(reservation)))
+                        lambda host, ws, clones, fleet_dir, runner=None, reservation=None, staged=None: (calls.append(
+                            ("clone", host.name, ws, [c["rel"] for c in clones])), rids.append(reservation),
+                            handed.append(staged)))
     with kb.connect_closing() as conn:
         tid, path = _card_with_files(conn)
         sha = _clone_in(path)
@@ -467,6 +475,8 @@ def test_over_limit_spawn_carries_minus_clones_then_reclones_on_the_host(kanban_
     assert calls == [("carry", "ace-ai", path, ("repo",)), ("clone", "ace-ai", path, ["repo"])], calls
     # t_d2f06cf6: the rebuild (and its stash ssh) runs under the reservation take() booked for this spawn
     assert rids == ["rid-booked-by-take"], rids
+    # t_d2f06cf6 (operator 02:0x): the check (and its stash bundle) runs once; carry_clones gets its staged result
+    assert len(checks) == 1 and handed == [checks[0]] and checks[0] is not None, (checks, handed)
     assert json.loads(ev[0])["recloned"] == [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha}]
 
 
@@ -1543,3 +1553,128 @@ def test_t94bd2ec4_shape_repo_worktree_with_a_shared_stash_is_rebuilt(kanban_hom
     rec = next(c for c in plan["clones"] if c["rel"] == "repo")
     assert len(rec["stash"]) == 2, rec
     assert plan["exclude"] == ("repo",), plan
+
+
+# -- 1h. operator 02:0x: the stash bundle ships only what the rebuilt clone lacks, once per spawn, bounded ------------
+
+def _bundle_commits(bundle: bytes, tmp_path):
+    """Every commit sha in the pack of ``bundle`` (index-pack in an empty dir, then verify-pack)."""
+    import subprocess
+    from pathlib import Path
+    _head, _sep, pack = bundle.partition(b"\n\n")
+    d = Path(tmp_path) / "inspect"
+    d.mkdir()
+    (d / "x.pack").write_bytes(pack)
+    subprocess.run(["git", "index-pack", str(d / "x.pack")], check=True, capture_output=True)
+    out = subprocess.run(["git", "verify-pack", "-v", str(d / "x.idx")], check=True, capture_output=True,
+                         text=True).stdout
+    return {ln.split()[0] for ln in out.splitlines() if len(ln.split()) > 1 and ln.split()[1] == "commit"}
+
+
+def _wt_behind_main(tmp_path, n=5):
+    """A Studio clone ``repo`` with origin/HEAD set, a published linked worktree ``wt`` at the first commit, then
+    ``n`` main commits published to origin and a stash made on main's tip (shared list, newer than ``wt``): the
+    stash's base is ``n`` commits ahead of ``wt``'s HEAD on main."""
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    _g(repo, "remote", "set-head", "origin", DEFAULT_BR)
+    _g(repo, "worktree", "add", "-q", "-b", "feat/wt", str(ws / "wt"))
+    _pub(ws / "wt", "feat/wt")
+    mains = []
+    for i in range(n):
+        (repo / "a.txt").write_text(f"main {i}\n")
+        _g(repo, "commit", "-q", "-am", f"main {i}")
+        mains.append(_g(repo, "rev-parse", "HEAD"))
+    _pub(repo, DEFAULT_BR)
+    (repo / "a.txt").write_text("stashed on main tip\n")
+    _g(repo, "stash", "push", "-q", "-m", "on tip")
+    return origin, ws, pool, mains
+
+
+def test_stash_bundle_holds_no_main_commit_when_the_stash_base_is_ahead_of_head(tmp_path):
+    """Operator item 4: the stash's base is N commits ahead of the worktree HEAD on main. The bundle excludes
+    origin's default branch, so it holds the stash's own commits only, none of the N main commits."""
+    _origin, ws, _pool, mains = _wt_behind_main(tmp_path, n=5)
+    entries = kwh.stash_entries(str(ws / "wt"))
+    assert len(entries) == 1, entries
+    head = _g(ws / "wt", "rev-parse", "HEAD")
+    commits = _bundle_commits(kwh.stash_bundle(str(ws / "wt"), entries, head), tmp_path)
+    assert entries[0][0] in commits
+    assert not commits & set(mains), commits & set(mains)
+    assert len(commits) <= 2, commits  # the stash commit and its index commit
+
+
+def test_stash_bundle_on_a_worktree_behind_main_restores_on_the_pool_clone(kanban_home, tmp_path, monkeypatch):
+    """End to end: the main-excluding bundle is stored on the rebuilt clone (which has main from origin) and the
+    stash applies there."""
+    origin, ws, pool, _mains = _wt_behind_main(tmp_path, n=3)
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    rec = _carry_one(kanban_home, ws, "wt", runner)
+    assert len(rec["stash"]) == 1, rec
+    dest = pool / str(ws / "wt").lstrip("/")
+    assert _g(dest, "stash", "list", "--format=%gs") == f"On {DEFAULT_BR}: on tip"
+    _g(dest, "checkout", "-q", "--detach", f"origin/{DEFAULT_BR}")
+    _g(dest, "stash", "apply", "-q")
+    assert (dest / "a.txt").read_text() == "stashed on main tip\n"
+
+
+def test_bundle_prerequisite_the_pool_clone_cannot_get_refuses_naming_the_entry(kanban_home, tmp_path,
+                                                                                   monkeypatch):
+    """Constraint (b): the Studio's origin default-branch ref names a commit origin does not hold (the tracking ref
+    is ahead of what the pool clone can fetch). The bundle needs it as a prerequisite; the store refuses (rc 10)
+    naming the entry, and no partial list is stored."""
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    _g(repo, "remote", "set-head", "origin", DEFAULT_BR)
+    _g(repo, "worktree", "add", "-q", "-b", "feat/wt", str(ws / "wt"))
+    _pub(ws / "wt", "feat/wt")
+    (repo / "a.txt").write_text("never published\n")
+    _g(repo, "commit", "-q", "-am", "local only")
+    _g(repo, "update-ref", f"refs/remotes/origin/{DEFAULT_BR}", "HEAD")  # tracking ref ahead of origin
+    (repo / "a.txt").write_text("stash on the local-only commit\n")
+    _g(repo, "stash", "push", "-q", "-m", "needs the local commit")
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    with pytest.raises(RuntimeError, match=r"rc=10.*needs the local commit"):
+        _carry_one(kanban_home, ws, "wt", runner)
+    dest = pool / str(ws / "wt").lstrip("/")
+    assert _g(dest, "stash", "list") == ""
+
+
+def test_stash_bundle_timeout_waits_the_card_named(kanban_home, wt_carry, monkeypatch):
+    """Operator item 3: a bundle build over STASH_BUNDLE_TIMEOUT_SECONDS raises StashBundleTimeout (a
+    WorkspaceUnavailable: the dispatcher releases the claim and refunds, no failure charged), and the next routing
+    makes the card wait with the reason named until the stash or HEAD changes or the retry window passes."""
+    import subprocess
+    from pathlib import Path
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    kwh._stash_bundle_timeouts.clear()
+    try:
+        with kb.connect_closing() as conn:
+            tid, path = _card_with_files(conn)
+            _clone_in(path)
+            repo = Path(path) / "repo"
+            (repo / "big.bin").write_bytes(b"stashed")
+            _g(repo, "stash", "push", "-q", "-m", "slow one")
+            kwh._clone_assess_cache.clear()
+            route, plan = _route_carry(conn, tid)
+            assert route[0] != "wait", route
+            seen = []
+
+            def slow(argv, **kw):
+                if "bundle" in argv and "create" in argv:
+                    seen.append(kw.get("timeout"))
+                    raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+                return subprocess.run(argv, **kw)
+            with pytest.raises(WorkspaceUnavailable, match=r"slow one"):
+                kwh.carry_clones_check(_host(), path, plan["clones"], runner=slow)
+            assert seen and 0 < seen[0] <= kwh.STASH_BUNDLE_TIMEOUT_SECONDS < kwh.CARRY_TIMEOUT_SECONDS, seen
+            kwh._clone_assess_cache.clear()
+            route, plan = _route_carry(conn, tid)
+            assert route[0] == "wait" and "exceeded" in route[1] and "slow one" in route[1], route
+        key, (t0, _why) = next(iter(kwh._stash_bundle_timeouts.items()))
+        ents = [(s, 0, "") for s in key[1]]
+        assert kwh.stash_bundle_deferred(key[0], ents, key[2], now=t0 + 1) is not None
+        assert kwh.stash_bundle_deferred(key[0], ents, key[2], now=t0 + kwh.STASH_BUNDLE_RETRY_SECONDS) is None
+    finally:
+        kwh._stash_bundle_timeouts.clear()

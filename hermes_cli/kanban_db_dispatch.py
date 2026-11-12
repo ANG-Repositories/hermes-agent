@@ -5728,6 +5728,12 @@ def _carry_split_plan(workspace_path, carry_budget):
                 return None, f"over the carry limit; clone {rel} ignored file {ign!r} unreadable"
             extra_entries += 1
         recs.append({"rel": rel, **rec})
+    for r in recs:
+        # t_d2f06cf6 (operator 02:0x): a stash bundle that hit its build ceiling at a spawn waits, named, until it
+        # can be retried (the stash or HEAD changed, or STASH_BUNDLE_RETRY_SECONDS passed)
+        slow = _kb._kwh.stash_bundle_deferred(os.path.join(workspace_path, r["rel"]), r.get("stash") or (), r["sha"])
+        if slow is not None:
+            return None, slow
     rebuilt = {r["rel"] for r in recs}
     over = _kb._kwh.carry_split_fits(workspace_path, extra_bytes, extra_entries, rebuilt=rebuilt, why_not=why_not,
                                      budget=carry_budget)
@@ -8694,16 +8700,18 @@ def _dispatch_once_locked(
                     # failure (claim released, reservation refunded), never an empty-dir run.
                     _split = _carry_rows.get(claimed.id)
                     _split = _split if isinstance(_split, dict) else None
+                    _staged = None
                     if _split:
-                        # P2 c-38aac54b3e75a212: refuse before the rsync copies anything to the pool host
-                        _kb._kwh.carry_clones_check(placed_host, str(workspace), _split["clones"])
+                        # P2 c-38aac54b3e75a212: refuse before the rsync copies anything to the pool host. The stash
+                        # bundle it builds (bounded, StashBundleTimeout = a WorkspaceUnavailable) is reused below.
+                        _staged = _kb._kwh.carry_clones_check(placed_host, str(workspace), _split["clones"])
                         _kb._kwh.carry_workspace(placed_host, str(workspace), exclude=_split["exclude"])
                     else:
                         _kb._kwh.carry_workspace(placed_host, str(workspace))
                     if _split:
                         # t_9965b8d5: the clones the carry left out are rebuilt from origin, same branch + commit.
                         _kb._kwh.carry_clones(placed_host, str(workspace), _split["clones"],
-                                              _kb.kanban_home() / "fleet", reservation=_rid)
+                                              _kb.kanban_home() / "fleet", reservation=_rid, staged=_staged)
                     with _kbc.write_txn(conn):
                         # "workspace" = the stored path at carry time, "path" = the spelling persisted just
                         # below; carried_host() binds on either (Prism 34bd0265a601).
