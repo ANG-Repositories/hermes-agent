@@ -1138,18 +1138,27 @@ class ReconcileMixin:
         ``[ts] [System note: ...interrupted by a gateway shutdown...]\\n\\n[ts]
         <text>`` against a stored ``[ts] <text>`` (session
         20261108_093540_fa4b70b9 at the 10:39 boot), so leading wrappers are
-        removed in whatever order and number they appear.
+        removed in whatever order they appear, each at most once, except that
+        a system note opens room for one more timestamp (the gateway stamps the
+        note and the text after it). A second timestamp with no note between
+        is the user's own text and stays in the key.
         Each wrapper goes with the one separator the gateway writes after it;
         leading whitespace of the text itself is kept (indentation is content).
         Anything else is a different row. An empty key means the host emptied
         the row: skipping it drops no content, so the caller accepts it.
         """
         text = str(content or "").rstrip()
+        left = {wrapper: 1 for wrapper in _USER_ROW_WRAPPER_PREFIXES}
         while True:
             for wrapper in _USER_ROW_WRAPPER_PREFIXES:
+                if not left[wrapper]:
+                    continue
                 rest = wrapper.sub("", text, count=1)
                 if rest != text:
                     text = rest
+                    left[wrapper] -= 1
+                    if wrapper is _USER_ROW_SYSTEM_NOTE_PREFIX:
+                        left[_USER_ROW_TIMESTAMP_PREFIX] = 1
                     break
             else:
                 return text

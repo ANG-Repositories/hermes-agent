@@ -312,6 +312,22 @@ class TestUserRowGapIsNotSkipped:
         _rebuilt_agent_ingest(tmp_path, host)
         assert _count(tmp_path, "[kanban] a different wake") == 1
 
+    def test_user_row_differing_in_its_own_timestamp_ends_the_run(self, tmp_path):
+        # Prism 6017ce8a9844: a second timestamp with no note before it is the
+        # user's text; a row differing only there is a different row.
+        rows = [{"role": "system", "content": "You are Apollo."}]
+        for i in range(6):
+            rows.extend(_turn(i))
+        rows[9]["content"] = "[Thu 2026-11-12 09:00:00 PST] [Wed 2026-11-11 23:57:30 PST] report"
+        assert rows[9]["role"] == "user"
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        host = [dict(r) for r in rows[1:]]
+        host[8]["content"] = "[Thu 2026-11-12 09:00:00 PST] [Wed 2026-11-11 23:58:30 PST] report"
+        _rebuilt_agent_ingest(tmp_path, host)
+        assert _count(tmp_path, host[8]["content"]) == 1
+
 
 def _same_text_turn(i):
     # Same prompt every turn, only the timestamp prefix differs (goal-
