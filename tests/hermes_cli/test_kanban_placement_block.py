@@ -7,6 +7,7 @@ t_0e9fdf38 (spilled to ci-box twice).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -205,7 +206,8 @@ def test_concurrent_body_edit_is_not_overwritten(kanban_home, monkeypatch):
         monkeypatch.setattr(kpb, "_latest_blocks", real)
         assert _tick(conn).placement_rerouted == [(tid, "studio")]       # next tick, against the edit
         body = conn.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()[0]
-        assert body == "host: studio\nrequires: studio-state\noperator edit"      # t_388c4ab2: never a bare pin
+        assert _NOTE_RE.sub("", body.splitlines()[1]) == "requires: studio-state"   # t_388c4ab2: never a bare pin
+        assert body.splitlines()[0::2] == ["host: studio", "operator edit"]
 
 
 def test_studio_rerouted_card_blocking_again_with_generic_reason_is_recorded_unroutable(kanban_home):
@@ -367,7 +369,12 @@ def _comments(conn, tid):
 
 def _pin_lines(body):
     """The ``host:`` / ``requires:`` lines, in order (create_task adds an ``origin:`` header we ignore)."""
-    return [ln for ln in body.splitlines() if ln.startswith(("host:", "requires:"))]
+    return [_NOTE_RE.sub("", ln) for ln in body.splitlines() if ln.startswith(("host:", "requires:"))]
+
+
+# The re-route's own reason on its requires: line (t_d0852f2c); test_reroute_requires_line_passes_create_refusal
+# pins the note itself, these compare the words.
+_NOTE_RE = re.compile(r" \(re-routed after capability block[^\n]*\)$")
 
 
 def test_rerouted_studio_pin_survives_the_bare_pin_drop(kanban_home, studio_map):
@@ -395,7 +402,7 @@ def test_requires_word_comes_from_the_block_reason(kanban_home, studio_map, reas
         assert _tick(conn).placement_rerouted == [(tid, "studio")]
         body = _body(conn, tid)
         assert _pin_lines(body) == ["host: studio", f"requires: {word}"]
-        assert body.splitlines()[:2] == ["host: studio", f"requires: {word}"]
+        assert _pin_lines("\n".join(body.splitlines()[:2])) == ["host: studio", f"requires: {word}"]
         assert any(f"requires: {word}" in c for c in _comments(conn, tid) if "placement re-route" in c)
     assert _portable(body) == (False, kpr.HOST_STUDIO)
 
@@ -417,7 +424,7 @@ def test_reroute_never_writes_a_second_host_or_requires_line(kanban_home, studio
         assert _tick(conn).placement_rerouted == [(tid, "studio")]
         got = _body(conn, tid)
     assert len(_pin_lines(got)) == 2 and set(_pin_lines(got)) == want
-    assert [ln for ln in got.splitlines() if ln not in want] == \
+    assert [ln for ln in got.splitlines() if _NOTE_RE.sub("", ln) not in want] == \
         [ln for ln in before.splitlines() if not ln.startswith(("host:", "requires:"))]   # the rest is untouched
     assert kwp.studio_pin_justified(got, studio_map) and _portable(got) == (False, kpr.HOST_STUDIO)
 
@@ -429,7 +436,7 @@ def test_no_capability_map_still_writes_the_default_requires_line(kanban_home, m
         tid = _placed_block(conn, "drain", "fleet ssh is missing here; re-run on the Studio")
         _tick(conn)
         body = _body(conn, tid)
-    assert body.splitlines()[:2] == ["host: studio", "requires: studio-state"]
+    assert _pin_lines("\n".join(body.splitlines()[:2])) == ["host: studio", "requires: studio-state"]
     assert kwp.studio_pin_justified(body, REASONS)
 
 

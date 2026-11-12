@@ -239,7 +239,7 @@ def test_derived_requires_on_stamped_edit_keeps_the_host_line_first(kanban_home,
         assert stored.startswith("origin:")
         assert kb.edit_task(conn, tid, body=stored + "\nlaunchctl print gui/501")
         content = [ln for ln in kwp.without_header_lines(kb.get_task(conn, tid).body).splitlines() if ln.strip()]
-        assert content[:2] == ["host: mac-studio-m3u", "requires: studio-state"]
+        assert content[:2] == ["host: mac-studio-m3u", "requires: studio-state (auto: card names studio_launchd)"]
         route, rule, _ = _route(conn, tid, _caps())
         assert route[0] == "local", (route, rule)
 
