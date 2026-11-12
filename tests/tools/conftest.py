@@ -36,6 +36,35 @@ def _no_host_browser_use_cli():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_agent_browser(request):
+    """A unit test must never spawn the host's real agent-browser.
+
+    The real-profile session drops the daemon idle timeout on purpose, so a test that reaches
+    ``agent-browser --session hermes-real-profile get cdp-url`` leaves a daemon at ppid 1 that
+    never exits (t_6bf3a00e). Discovery raises FileNotFoundError, which every caller already
+    treats as "not installed"; tests that patch ``_find_agent_browser`` themselves still win,
+    and tests of discovery itself opt in with ``@pytest.mark.real_agent_browser``.
+    """
+    if request.node.get_closest_marker("real_agent_browser"):
+        yield
+        return
+    try:
+        from tools import browser_tool_install as bt_install
+    except Exception:
+        yield
+        return
+
+    def _refuse(*_a, **_kw):
+        raise FileNotFoundError(
+            "agent-browser discovery is disabled in tests/tools (it would spawn a real daemon); "
+            "patch _find_agent_browser or mark the test real_agent_browser"
+        )
+
+    with patch.object(bt_install, "_find_agent_browser", _refuse):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _no_host_bot_desktop_autostart():
     """Keep the host's TigerVNC/Xfce install out of tests.
 
