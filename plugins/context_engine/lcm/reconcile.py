@@ -51,6 +51,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+# Each wrapper with the one separator the gateway puts after it ("\n\n" after
+# the note, gateway/run.py; " " after the timestamp, message_timestamps.py).
+_USER_ROW_SYSTEM_NOTE_PREFIX = re.compile(r"^\[System note: [^\]]*\](?:\n\n)?")
+_USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]{2,5}\] ?")
 
 
 class ReconcileMixin:
@@ -998,6 +1002,19 @@ class ReconcileMixin:
             )
             return len(messages)
 
+        cursor = self._tool_call_anchored_replay_cursor(messages, stored_rows)
+        if cursor > 0:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed history anchored on stored tool calls",
+                cursor=cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            return cursor
+
         self._record_ingest_reconciliation(
             action="persisted batch",
             reason="persisted ambiguous delta",
@@ -1008,6 +1025,110 @@ class ReconcileMixin:
             effective_incoming=len(incoming_identities),
         )
         return 0
+
+    def _tool_call_anchored_replay_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_rows: List[Dict[str, Any]],
+    ) -> int:
+        """Cursor past the leading host rows proven to be stored, row by row.
+
+        A rebuilt agent's first ingest hands LCM the host's in-memory history:
+        a trailing slice of the session that starts mid-turn, has no system row
+        or compaction scaffold, and may carry host rewrites of earlier user rows
+        (a timestamp prefix, emptied content). No exact-suffix rule accepts it,
+        so each agent rebuild re-appended the whole slice under fresh
+        timestamps (t_73572f17: one session 552,644 rows / 10,848 contents).
+
+        The first host tool result whose full identity is stored fixes the
+        alignment between host rows and stored rows. From host row 0 the rows
+        are then compared position by position: assistant/tool/system rows must
+        be identical, user rows must be equal under ``_user_row_rerender_key``
+        (the host re-renders them). A user row matched only through that key
+        (or emptied) is provisional: the cursor passes it only when a later row
+        in the run matches by full identity, so a run that ends right after it
+        leaves it to be appended. The run ends at the first row that does not
+        match, so the cursor never passes a row that is not shown to be stored:
+        a gap in the store (rows the host holds that were never written, e.g.
+        the store-free compaction fallback marks its raw tail ingested) ends
+        the run at its first row, whether the gap shows on an assistant row, a
+        tool row or a user row (turns whose assistant reply repeats), and a
+        reused call id with new arguments fails on its assistant row. A call id
+        that occurs more than once among the stored rows neither anchors nor
+        counts: it cannot tell a new polling turn from an old one. Two distinct
+        once-stored tool-call ids must be matched inside the run, so a short
+        delta keeps dup-over-loss.
+
+        Accepted limit: a gap row is still skipped when its user row equals its
+        stored neighbour's apart from the re-render variance AND the rows after
+        it are identical to the neighbour's (same prompt, same reply, e.g. a
+        repeated "[<timestamp>] proceed" answered identically). Nothing in the
+        rows tells such a turn from a re-render of the stored one.
+        """
+        stored_ids = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
+        id_uses: dict[str, int] = {}
+        for row in stored_rows:
+            if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
+                call_id = str(row.get("tool_call_id"))
+                id_uses[call_id] = id_uses.get(call_id, 0) + 1
+        # A call id stored more than once (providers that number calls per
+        # turn) cannot say which occurrence a host row is: never anchor on it.
+        unique_ids = {call_id for call_id, uses in id_uses.items() if uses == 1}
+        stored_tool_pos: dict[tuple[Any, ...], int] = {}
+        for pos, (row, identity) in enumerate(zip(stored_rows, stored_ids)):
+            if str(row.get("role") or "") == "tool" and str(row.get("tool_call_id") or "") in unique_ids:
+                stored_tool_pos[identity] = pos
+        offset = None
+        for idx, msg in enumerate(messages):
+            if str(msg.get("role") or "") == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
+                pos = stored_tool_pos.get(self._message_replay_identity(msg))
+                if pos is not None:
+                    offset = pos - idx
+                    break
+        if offset is None or offset < 0:
+            return 0
+        cursor = 0
+        matched_ids: set[str] = set()
+        for idx, msg in enumerate(messages):
+            pos = idx + offset
+            if pos >= len(stored_rows):
+                break
+            role = str(msg.get("role") or "")
+            if role != str(stored_rows[pos].get("role") or ""):
+                break
+            identity = self._message_replay_identity(msg)
+            if identity != stored_ids[pos]:
+                if role == "user" and self._user_row_rerender_key(identity[1]) in (
+                    "", self._user_row_rerender_key(stored_ids[pos][1]),
+                ):
+                    # Provisional: the cursor passes it only when a later row
+                    # in the run matches by full identity.
+                    continue
+                break
+            if role == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
+                matched_ids.add(str(msg.get("tool_call_id")))
+            cursor = idx + 1
+        if len(matched_ids) < 2:
+            return 0
+        return cursor
+
+    @staticmethod
+    def _user_row_rerender_key(content: Any) -> str:
+        """A user row's content with the host's re-render variance removed.
+
+        Measured on the live store (session 20261108_093540_fa4b70b9, store_ids
+        13007493, 12999747, 12993102, 12990342 and their later copies), the host
+        re-renders a stored user row in three ways only: trailing whitespace
+        dropped, a leading ``[System note: ...]`` block added or dropped, and a
+        leading ``[Wed 2026-11-11 23:57:30 PST]`` timestamp added or dropped.
+        Each wrapper goes with the one separator the gateway writes after it;
+        leading whitespace of the text itself is kept (indentation is content).
+        Anything else is a different row. An empty key means the host emptied
+        the row: skipping it drops no content, so the caller accepts it.
+        """
+        text = str(content or "").rstrip()
+        text = _USER_ROW_SYSTEM_NOTE_PREFIX.sub("", text, count=1)
+        return _USER_ROW_TIMESTAMP_PREFIX.sub("", text, count=1)
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (
