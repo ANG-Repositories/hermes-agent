@@ -51,8 +51,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
-_USER_ROW_SYSTEM_NOTE_PREFIX = re.compile(r"^\[System note: [^\]]*\]")
-_USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]{2,5}\]")
+# Each wrapper with the one separator the gateway puts after it ("\n\n" after
+# the note, gateway/run.py; " " after the timestamp, message_timestamps.py).
+_USER_ROW_SYSTEM_NOTE_PREFIX = re.compile(r"^\[System note: [^\]]*\](?:\n\n)?")
+_USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]{2,5}\] ?")
 
 
 class ReconcileMixin:
@@ -1051,9 +1053,11 @@ class ReconcileMixin:
         the store-free compaction fallback marks its raw tail ingested) ends
         the run at its first row, whether the gap shows on an assistant row, a
         tool row or a user row (turns whose assistant reply repeats), and a
-        reused call id with new arguments fails on its assistant row. Two
-        distinct tool-call ids must be matched inside the run, so a short delta
-        keeps dup-over-loss.
+        reused call id with new arguments fails on its assistant row. A call id
+        that occurs more than once among the stored rows neither anchors nor
+        counts: it cannot tell a new polling turn from an old one. Two distinct
+        once-stored tool-call ids must be matched inside the run, so a short
+        delta keeps dup-over-loss.
 
         Accepted limit: a gap row is still skipped when its user row equals its
         stored neighbour's apart from the re-render variance AND the rows after
@@ -1062,13 +1066,21 @@ class ReconcileMixin:
         rows tells such a turn from a re-render of the stored one.
         """
         stored_ids = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
+        id_uses: dict[str, int] = {}
+        for row in stored_rows:
+            if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
+                call_id = str(row.get("tool_call_id"))
+                id_uses[call_id] = id_uses.get(call_id, 0) + 1
+        # A call id stored more than once (providers that number calls per
+        # turn) cannot say which occurrence a host row is: never anchor on it.
+        unique_ids = {call_id for call_id, uses in id_uses.items() if uses == 1}
         stored_tool_pos: dict[tuple[Any, ...], int] = {}
         for pos, (row, identity) in enumerate(zip(stored_rows, stored_ids)):
-            if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
+            if str(row.get("role") or "") == "tool" and str(row.get("tool_call_id") or "") in unique_ids:
                 stored_tool_pos[identity] = pos
         offset = None
         for idx, msg in enumerate(messages):
-            if str(msg.get("role") or "") == "tool" and msg.get("tool_call_id"):
+            if str(msg.get("role") or "") == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
                 pos = stored_tool_pos.get(self._message_replay_identity(msg))
                 if pos is not None:
                     offset = pos - idx
@@ -1093,7 +1105,7 @@ class ReconcileMixin:
                     # in the run matches by full identity.
                     continue
                 break
-            if role == "tool" and msg.get("tool_call_id"):
+            if role == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
                 matched_ids.add(str(msg.get("tool_call_id")))
             cursor = idx + 1
         if len(matched_ids) < 2:
@@ -1109,12 +1121,14 @@ class ReconcileMixin:
         re-renders a stored user row in three ways only: trailing whitespace
         dropped, a leading ``[System note: ...]`` block added or dropped, and a
         leading ``[Wed 2026-11-11 23:57:30 PST]`` timestamp added or dropped.
+        Each wrapper goes with the one separator the gateway writes after it;
+        leading whitespace of the text itself is kept (indentation is content).
         Anything else is a different row. An empty key means the host emptied
         the row: skipping it drops no content, so the caller accepts it.
         """
-        text = str(content or "").strip()
-        text = _USER_ROW_SYSTEM_NOTE_PREFIX.sub("", text, count=1).strip()
-        return _USER_ROW_TIMESTAMP_PREFIX.sub("", text, count=1).strip()
+        text = str(content or "").rstrip()
+        text = _USER_ROW_SYSTEM_NOTE_PREFIX.sub("", text, count=1)
+        return _USER_ROW_TIMESTAMP_PREFIX.sub("", text, count=1)
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

@@ -340,3 +340,57 @@ class TestRerenderMatchedUserRowIsProvisional:
         _rebuilt_agent_ingest(tmp_path, [m for turn in turns for m in turn])
         assert _count(tmp_path, "[Thu 2026-11-12 01:05:00 PST] proceed") >= 1
         assert _count(tmp_path, "Done step 105.") >= 1
+
+
+class TestRerenderKeyKeepsLeadingWhitespace:
+    """Advisory review at dab71bdd9b78 (finding 1): the host variance is
+    trailing whitespace only, so leading indentation makes a different row."""
+
+    def test_gap_turn_differing_only_by_indentation_is_stored(self, tmp_path):
+        def notice(i, indent=""):
+            return [
+                {"role": "user", "content": f"{indent}[kanban] notice {i}: task finished"},
+                {"role": "assistant", "content": "Noted; nothing to do."},
+            ]
+        # Turn 105 is turn 106's text indented; the reply is identical.
+        plain = [notice(106, "    ") if i == 105 else notice(i) for i in range(100, 112)]
+        turns = [_turn(i) for i in range(4)] + plain + [_turn(i) for i in range(4, 6)]
+        keys = list(range(4)) + list(range(100, 112)) + list(range(4, 6))
+        rows = [{"role": "system", "content": "You are Apollo."}]
+        for key, turn in zip(keys, turns):
+            if key != 105:
+                rows.extend(turn)
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        _rebuilt_agent_ingest(tmp_path, [m for turn in turns for m in turn])
+        assert _count(tmp_path, "    [kanban] notice 106: task finished") == 1
+
+
+class TestRepeatedCallIdsDoNotAnchor:
+    """Advisory review at dab71bdd9b78 (finding 2): a provider that reuses
+    call_0/call_1 every turn with identical arguments and results (polling).
+    A repeated id proves nothing about which occurrence a host row is."""
+
+    def test_new_identical_polling_turn_is_appended(self, tmp_path):
+        def poll():
+            out = []
+            for j in range(2):
+                out += [
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": f"call_{j}", "type": "function",
+                        "function": {"name": "terminal", "arguments": '{"command": "status"}'},
+                    }]},
+                    {"role": "tool", "tool_call_id": f"call_{j}", "content": "still running"},
+                ]
+            return out + [{"role": "assistant", "content": "Still running."}]
+        rows = [{"role": "system", "content": "You are Apollo."}]
+        for _ in range(5):
+            rows += poll()
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        n0 = _rows(tmp_path)
+        new_turn = poll()
+        _rebuilt_agent_ingest(tmp_path, new_turn)
+        assert _rows(tmp_path) == n0 + len(new_turn)
