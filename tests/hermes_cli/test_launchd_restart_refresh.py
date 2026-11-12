@@ -100,6 +100,26 @@ def test_system_daemon_restart_never_refreshes_or_degrades(monkeypatch, tmp_path
     assert calls == [["sudo", "-n", "launchctl", "kickstart", "-k", f"system/{label}"]]
 
 
+@pytest.mark.parametrize("self_restart", [True, False])
+def test_system_daemon_preserves_cooperative_restart(monkeypatch, launchd_seam, self_restart):
+    monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "system")
+    monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: pytest.fail("operator plist must not be rewritten"))
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 123)
+    monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: self_restart)
+    monkeypatch.setattr(gateway_cli, "probe_gateway_loop_liveness", lambda pid: "responsive")
+    drained = []
+    monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 1.0)
+    monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, budget, **kw: drained.append(pid) or True)
+    seen = []
+    monkeypatch.setattr(gateway_cli, "_wait_for_launchd_service_pid", lambda label, pid, **kw: seen.append(kw["domain"]) or True)
+
+    gateway_cli.launchd_restart()
+
+    assert launchd_seam == []
+    assert drained == ([] if self_restart else [123])
+    assert seen == ([] if self_restart else ["system"])
+
+
 def test_system_daemon_supervision_is_domain_explicit(monkeypatch):
     from hermes_cli import gateway_launchd as ld
     monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p).startswith("/Library/LaunchDaemons/"))
