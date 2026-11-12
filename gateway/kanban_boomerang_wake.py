@@ -970,10 +970,18 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                 raise RuntimeError(f"request_changes on a {status} card")
             _send_back("; ".join(str(f).strip() for f in verdict.get("findings") or [] if str(f).strip()))
         elif action == "redispatch" and status == "review":
+            # RC-4 (never the child's pick): the worker is the implementer the board's own review
+            # handoff names, which request_changes restores. The claim-time assignee of a review
+            # card is the REVIEWER (human:apollo); handing it back parked the card in todo with no
+            # worker (t_1c893466: t_b17af713, t_6dc9df18, t_38246203).
+            implementer = kb._review_handoff_implementer(conn, tid)  # noqa: SLF001
+            if not kb.is_worker_assignee(implementer):
+                raise RuntimeError(f"redispatch: review handoff names no worker implementer ({implementer})")
             _send_back(summary)
-            current = entry.get("assignee")   # RC-4: the CURRENT assignee only, never the child's pick
-            if current and getattr(kb.get_task(conn, tid), "assignee", None) != current:
-                kb.assign_task(conn, tid, current, worker_ok=True)
+            after = kb.get_task(conn, tid)
+            if not kb.is_worker_assignee(getattr(after, "assignee", None)) or kb._operator_todo(after):  # noqa: SLF001
+                raise RuntimeError(f"redispatch left the card {getattr(after, 'status', None)} on "
+                                   f"{getattr(after, 'assignee', None)}, no worker will spawn")
         elif status == "blocked" or entry.get("row") == "blocked_assess":
             kwargs = {"expect_block_event": int(entry["event_id"])} if entry.get("row") == "blocked_assess" else {}
             if entry.get("row") == "blocked_assess":
@@ -1192,6 +1200,15 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
                         "summary": summary, "surface": True, **finding}
             if getattr(task, "status", None) != "blocked":
                 return {"ok": False, "action": action, "reason": "state moved", "summary": summary}
+        if action in ("redispatch", "retry"):
+            task = kb.get_task(conn, live["task_id"])
+            if kb._operator_todo(task):  # noqa: SLF001
+                # t_1c893466: a todo card on a human lane has no worker to redispatch; requeue would
+                # refuse it ("requeue refused: ... is 'todo'"). Say so plainly, write nothing.
+                why = (f"card is todo on {task.assignee}: a human lane, no worker to {action}; "
+                       f"the operator acts on it or reassigns it to a worker")
+                return {"ok": False, "action": "surface", "surface": True, **finding,
+                        "reason": why, "summary": why, "detail": f"{why} (child said: {finding['detail']})"}
         if action == "land_inherited":
             degraded = _verify_land_inherited(live, verdict, kb, conn)
             if degraded:
