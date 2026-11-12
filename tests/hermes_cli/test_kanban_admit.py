@@ -202,6 +202,7 @@ def test_admit_refuses_a_second_writer_on_a_pr_another_card_runs(board, monkeypa
     on a PR holds it, so admit of card B naming the same PR refuses, owner named."""
     from hermes_cli import kanban_pr_owner as kpo
     monkeypatch.setattr(kpo, "pr_head_committed_at", lambda repo, n, **kw: None)
+    monkeypatch.setattr(kpo, "_gh_json", lambda path: None)  # PR state unreadable: hold (no network)
     _hot_local(monkeypatch)
     pr = "ANG-Ventures/hermes-agent#1624"
     with kb.connect_closing() as conn:

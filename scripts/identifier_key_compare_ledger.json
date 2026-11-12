@@ -467,6 +467,11 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
    "where": "hermes_cli/kanban_pr_owner.py:214 pr_head_committed_at"
   },
+  "hermes_cli/kanban_pr_owner.py::pr_state::fold::repo::key = (repo.lower(), int(number))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_owner.py:244 pr_state"
+  },
   "hermes_cli/kanban_provider_health.py::available_profile_fallback::fold::provider::if skip_providers and provider.strip().lower() in skip_providers:": {
    "verdict": "kept",
    "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
