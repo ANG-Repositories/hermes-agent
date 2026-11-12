@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "agtergrond-hersiening"
   notice:
     uncompressed_context_overflow: "⚠️ Die sessiekonteks (~{tokens} tokens) oorskry die model se konteksvenster (~{context_length} tokens) terwyl kompressie gedeaktiveer is (compression.enabled: false). Gebruik /compact om die geskiedenis te komprimeer of aktiveer kompressie in config.yaml."
+    compression_store_unavailable: "⚠️ Die konteks is bo die kompressiedrempel (~{tokens} tokens >= {threshold}), maar kompressie kan nie loop nie: die kompaksiestoor is beskadig (databasisfout). /compress gebruik dieselfde stoor en sal nie help nie. Gebruik /new om 'n nuwe sessie te begin."
 explainer:
   no_reply_prefix: "⚠️ Geen antwoord: "
   empty_response: "{model} het hierdie keer geen antwoord gelewer nie, selfs na herpogings. Stuur `continue` om weer te probeer, of verander modelle met /model."

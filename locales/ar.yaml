@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "المراجعة في الخلفية"
   notice:
     uncompressed_context_overflow: "⚠️ سياق الجلسة (~{tokens} رمزًا) يتجاوز نافذة سياق النموذج (~{context_length} رمزًا) مع تعطيل الضغط (compression.enabled: false). استخدم /compact لضغط السجل أو فعّل الضغط في config.yaml."
+    compression_store_unavailable: "⚠️ السياق تجاوز حد الضغط (~{tokens} رمزًا >= {threshold}) لكن لا يمكن تشغيل الضغط: مخزن الضغط تالف (خطأ في قاعدة البيانات). يستخدم /compress المخزن نفسه ولن يساعد. استخدم /new لبدء جلسة جديدة."
 explainer:
   no_reply_prefix: "⚠️ لا رد: "
   empty_response: "لم ينتج {model} ردًا هذه المرة، حتى بعد إعادة المحاولات. أرسل `continue` للمحاولة مجددًا، أو بدّل النموذج عبر /model."

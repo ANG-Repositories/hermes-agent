@@ -729,6 +729,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_fail_open_over_context_limit = False
         self._last_fail_open_fallback_attempted = False
         self._last_fail_open_fallback_status = ""
+        # True while the last compress() failed open on a damaged/unreadable
+        # store (sqlite3.DatabaseError other than locked/busy). The host reads
+        # it to classify the attempt as ``store_unavailable``, not no_progress.
+        self.last_compress_store_unavailable = False
         self._fail_open_total_count = 0
         self._fail_open_consecutive_count = 0
         self._fail_open_timestamps: list[float] = []
@@ -2563,6 +2567,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._degraded = False
         self._last_degraded_reason = ""
         self._fail_open_consecutive_count = 0
+        self.last_compress_store_unavailable = False
 
     def _fail_open_rate_snapshot(self) -> tuple[int, float]:
         now = time.time()
@@ -2585,6 +2590,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         context_limit: Optional[int],
     ) -> bool:
         return bool(context_limit and context_limit > 0 and raw_tokens >= context_limit)
+
+    @staticmethod
+    def _is_store_damage_error(exc: BaseException) -> bool:
+        """True for a store error that a retry cannot fix (e.g. ``database disk
+        image is malformed``). Locked/busy are transient and keep the old path."""
+        if not isinstance(exc, sqlite3.DatabaseError):
+            return False
+        text = str(exc).lower()
+        return "locked" not in text and "busy" not in text
 
     def _record_fail_open_degraded(
         self,
@@ -2715,8 +2729,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         request_overhead_tokens = max(0, raw_tokens - count_messages_tokens(messages))
         context_limit = self.context_length if self.context_length > 0 else None
+        over_context_limit = self._raw_messages_exceed_context_limit(raw_tokens, context_limit)
+        store_damaged = self._is_store_damage_error(exc)
+        self.last_compress_store_unavailable = store_damaged
+        # A damaged store fails every LCM pass identically, so waiting for the
+        # model limit means no compaction at all until the session hits the
+        # wall. Over the compaction threshold, run the store-free fallback now.
+        over_threshold = bool(self.threshold_tokens > 0 and raw_tokens >= self.threshold_tokens)
 
-        if not self._raw_messages_exceed_context_limit(raw_tokens, context_limit):
+        if not over_context_limit and not (store_damaged and over_threshold):
             self._record_fail_open_degraded(
                 exc,
                 raw_tokens=raw_tokens,
@@ -2750,6 +2771,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 fallback_status="failed",
                 fallback_exc=fallback_exc,
             )
+            if not over_context_limit:
+                # Still under the model limit: degrade as before, don't escalate.
+                return messages
             raise self._recoverable_fail_open_error(
                 exc,
                 fallback_exc,
@@ -3240,6 +3264,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_fail_open_over_context_limit = False
         self._last_fail_open_fallback_attempted = False
         self._last_fail_open_fallback_status = ""
+        self.last_compress_store_unavailable = False
         self._fail_open_total_count = 0
         self._fail_open_consecutive_count = 0
         self._fail_open_timestamps = []
