@@ -102,11 +102,39 @@ def common_dir(repo: Path) -> Optional[Path]:
     return Path(p.stdout.strip()).resolve()
 
 
-def _read(path: Path) -> Optional[str]:
+class _ReadFailed(Exception):
+    """A read :func:`half_built` needs failed for a reason other than \"does not exist\" (permission, I/O, ...)."""
+
+
+_ABSENT = (FileNotFoundError, NotADirectoryError)
+
+
+def _read3(path: Path, dir_is_absent: bool = False) -> Optional[str]:
+    """``path``'s text; None when it does not exist (or, with ``dir_is_absent``, is a directory: a ``.git`` dir is
+    a main checkout, not a gitfile). Any other failure raises :class:`_ReadFailed`: never the same as absent
+    (Prism #265 @fa5f8548 P1, the class: a read that fails is never \"not half-built\")."""
     try:
         return path.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
+    except _ABSENT:
         return None
+    except IsADirectoryError:
+        if dir_is_absent:
+            return None
+        raise _ReadFailed(f"{path} is a directory") from None
+    except OSError as exc:
+        raise _ReadFailed(f"{path} could not be read ({exc.strerror or exc})") from None
+
+
+def _exists3(path: Path) -> bool:
+    """``path`` exists; False only on \"does not exist\"; any other stat failure raises :class:`_ReadFailed`
+    (``Path.exists()`` reads a permission error as False)."""
+    try:
+        os.stat(path)
+        return True
+    except _ABSENT:
+        return False
+    except OSError as exc:
+        raise _ReadFailed(f"{path} could not be stat'd ({exc.strerror or exc})") from None
 
 
 class _Unreadable:
@@ -119,26 +147,34 @@ class _Unreadable:
 LOCK_UNREADABLE = _Unreadable()
 
 
-def admin_dirs_for(common: Path, target: Path) -> Optional[list]:
-    """Admin dirs under ``<common>/worktrees`` whose ``gitdir`` names ``<target>/.git`` (resolved); ``[]`` when
-    none does or there is no ``worktrees`` dir; None when the registry exists but cannot be listed (Prism #265 P1:
-    a search-only ``worktrees`` dir is \"could not enumerate\", never \"not registered\")."""
+def _admin_dirs(common: Path, target: Path) -> list:
+    """Admin dirs under ``<common>/worktrees`` whose ``gitdir`` names ``<target>/.git``. Raises :class:`_ReadFailed`
+    when the registry cannot be listed or ANY admin's ``gitdir`` backlink cannot be read (Prism #265 @fa5f8548 P1:
+    an unreadable backlink may be this tree's registration; skipping it read the tree as \"not registered\")."""
     want = os.path.realpath(os.path.join(str(target), ".git"))
     root = common / "worktrees"
-    out = []
     try:
         entries = sorted(root.iterdir())
-    except FileNotFoundError:
-        return out
-    except OSError:
-        return None
+    except _ABSENT:
+        return []
+    except OSError as exc:
+        raise _ReadFailed(f"worktree registry {root} could not be listed ({exc.strerror or exc})") from None
+    out = []
     for admin in entries:
-        pointed = _read(admin / "gitdir")
+        pointed = _read3(admin / "gitdir")
         if pointed is None:
-            continue
+            continue  # a stray file, or an admin dir with no backlink: names no tree
         if os.path.realpath(os.path.join(str(admin), pointed.strip())) == want:
             out.append(admin)
     return out
+
+
+def admin_dirs_for(common: Path, target: Path) -> Optional[list]:
+    """:func:`_admin_dirs`; None when it could not finish (registry unlistable, a backlink unreadable)."""
+    try:
+        return _admin_dirs(common, target)
+    except _ReadFailed:
+        return None
 
 
 def lock_reason(admin: Path) -> "Optional[str] | _Unreadable":
@@ -147,76 +183,80 @@ def lock_reason(admin: Path) -> "Optional[str] | _Unreadable":
     c-bf64c62a812cc1fc: an unreadable lock is never reported as "not locked"."""
     try:
         return (admin / "locked").read_text(encoding="utf-8-sig", errors="replace").strip()
-    except (FileNotFoundError, NotADirectoryError):
+    except _ABSENT:
         return None
     except OSError:
         return LOCK_UNREADABLE
 
 
-def _gitfile_admin(target: Path) -> Optional[Path]:
-    """The admin dir ``<target>/.git`` names, when that admin dir's ``gitdir`` names it back; else None."""
-    text = _read(target / ".git")
-    if not text or not text.strip().startswith("gitdir:"):
-        return None
-    admin = Path(os.path.realpath(os.path.join(str(target), text.strip()[len("gitdir:"):].strip())))
-    back = _read(admin / "gitdir")
-    if back is None or os.path.realpath(os.path.join(str(admin), back.strip())) != \
-            os.path.realpath(os.path.join(str(target), ".git")):
-        return None
-    return admin
-
-
-def _is_gitfile(target: Path) -> bool:
-    """``<target>/.git`` is a ``gitdir:`` file: the tree claims to be a linked checkout a caller might reuse."""
-    text = _read(target / ".git")
-    return bool(text) and text.strip().startswith("gitdir:")
-
-
 def half_built(repo_root: Path, target: Path, now: Optional[float] = None) -> Optional[dict]:
     """``{admin, age_s, branch, lock}`` when ``target`` must be held, None only when it is CONFIRMED not to be a
     tree an add left behind (a finished tree, another lock reason, not registered here). Three states, unknown
-    holds (Prism #265 @7acad872 P1s, same rule as the unreadable lock):
+    holds:
 
     * held: registered here, locked ``initializing`` with no index (``lock`` = ``"initializing"``), or locked with
       a lock file that cannot be read (``lock`` = ``"unreadable"``);
-    * could not assess (``lock`` = ``"unassessed"``, ``why`` names the failed step): the tree is a linked checkout
-      (``.git`` is a ``gitdir:`` file) not already confirmed finished, and the common-dir probe failed, the
-      worktree registry could not be listed, or the lock could not be dated. Held like the others, never reused;
+    * could not assess (``lock`` = ``"unassessed"``, ``why`` names the failed read): for a tree whose ``.git`` is a
+      ``gitdir:`` file, or cannot be read, EVERY read below that fails for a reason other than "does not exist":
+
+        1. ``<target>/.git`` (the gitfile)
+        2. ``<admin>/gitdir`` the gitfile names (its backlink)
+        3. ``<admin>/locked`` (fast read; unreadable → the slow path, which holds it as ``unreadable``)
+        4. ``<admin>/index`` stat (fast cheap exit: ``initializing`` + index = a finished tree, no probe)
+        5. the common-dir probe (``git rev-parse --git-common-dir``)
+        6. the ``<common>/worktrees`` listing
+        7. each listed admin's ``gitdir`` backlink
+        8. the matched admin's ``locked`` and ``index`` (slow path)
+        9. the ``locked`` mtime, and ``HEAD`` (branch name for the event)
+
+      plus more than one registration naming the tree. Held, never reused;
     * None: confirmed not half-built.
     """
-    admin = _gitfile_admin(target)
-    fast = lock_reason(admin) if admin is not None else None
-    if admin is not None and fast is not LOCK_UNREADABLE and fast != INIT_LOCK:
-        return None  # the common case on every tick: a finished tree, one file read, no git, no scan
-    linked = admin is not None or _is_gitfile(target)
+    linked = True  # until the gitfile is read: an unreadable .git holds
 
     def unassessed(why: str) -> Optional[dict]:
         if not linked:
             return None  # not a linked checkout: no caller reuses it as one; other guards own a plain dir
-        return {"admin": str(admin) if admin is not None else "", "age_s": None, "branch": "",
-                "lock": UNASSESSED, "why": why}
+        return {"admin": "", "age_s": None, "branch": "", "lock": UNASSESSED, "why": why}
 
-    common = common_dir(repo_root)
-    if common is None:
-        return unassessed("common-dir probe failed")
-    admins = admin_dirs_for(common, target)
-    if admins is None:
-        return unassessed("worktree registry could not be listed")
-    if len(admins) > 1:
-        return unassessed(f"{len(admins)} registrations name this tree")
-    if not admins:
-        return None  # listed, and not registered here
-    admin = admins[0]
-    reason = lock_reason(admin)
-    unreadable = reason is LOCK_UNREADABLE
-    if not unreadable and (reason != INIT_LOCK or (admin / "index").exists()):
-        return None
     try:
-        age: Optional[int] = int((now if now is not None else time.time()) - (admin / "locked").stat().st_mtime)
-    except OSError:
-        if not unreadable:
-            return unassessed("lock could not be dated")
-        age = None
-    head = (_read(admin / "HEAD") or "").strip()
+        text = _read3(target / ".git", dir_is_absent=True)
+        linked = bool(text) and text.strip().startswith("gitdir:")
+        admin: Optional[Path] = None
+        if linked:
+            cand = Path(os.path.realpath(os.path.join(str(target), text.strip()[len("gitdir:"):].strip())))
+            back = _read3(cand / "gitdir")
+            if back is not None and os.path.realpath(os.path.join(str(cand), back.strip())) == \
+                    os.path.realpath(os.path.join(str(target), ".git")):
+                admin = cand
+        if admin is not None:
+            fast = lock_reason(admin)
+            if fast is not LOCK_UNREADABLE and fast != INIT_LOCK:
+                return None  # the common case on every tick: a finished tree, two file reads, no git, no scan
+            if fast == INIT_LOCK and _exists3(admin / "index"):
+                return None  # finished but still locked `initializing` (the 150): one stat more, still no git
+
+        common = common_dir(repo_root)
+        if common is None:
+            return unassessed("common-dir probe failed")
+        admins = _admin_dirs(common, target)
+        if len(admins) > 1:
+            return unassessed(f"{len(admins)} registrations name this tree")
+        if not admins:
+            return None  # listed, every backlink read, and not registered here
+        admin = admins[0]
+        reason = lock_reason(admin)
+        unreadable = reason is LOCK_UNREADABLE
+        if not unreadable and (reason != INIT_LOCK or _exists3(admin / "index")):
+            return None
+        try:
+            age: Optional[int] = int((now if now is not None else time.time()) - os.stat(admin / "locked").st_mtime)
+        except OSError:
+            if not unreadable:
+                return unassessed("lock could not be dated")
+            age = None
+        head = (_read3(admin / "HEAD") or "").strip()
+    except _ReadFailed as exc:
+        return unassessed(str(exc))
     branch = head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else ""
     return {"admin": str(admin), "age_s": age, "branch": branch, "lock": "unreadable" if unreadable else INIT_LOCK}

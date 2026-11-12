@@ -185,14 +185,33 @@ def test_half_built_names_only_an_initializing_tree_without_an_index(repo):
 
 
 
+def _hash_tree(root: Path) -> list:
+    """``(relative path, sha256 of the bytes)`` for every file under ``root``; a dir is listed with ``-``."""
+    import hashlib
+    if not root.exists():
+        return []
+    out = []
+    for p in sorted(root.rglob("*")):
+        rel = str(p.relative_to(root))
+        out.append((rel, hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() and not p.is_symlink() else "-"))
+    return out
+
+
 def _snapshot_repo(repo) -> tuple:
-    """Everything a probe could change: registrations + their lock files, refs, the tree files."""
+    """Everything a probe could change: registrations, refs, and the CONTENT (sha256) of every file in the trees
+    and in the admin dirs (Prism #265 @fa5f8548 P2: names alone pass on a truncated file)."""
     wts = git(repo, "worktree", "list", "--porcelain")
     refs = git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
-    files = sorted(str(p.relative_to(repo)) for p in (repo / ".worktrees").rglob("*")) \
-        if (repo / ".worktrees").exists() else []
-    return wts, refs, files
+    return wts, refs, _hash_tree(repo / ".worktrees"), _hash_tree(repo / ".git" / "worktrees")
 
+
+def test_snapshot_sees_a_truncated_file(repo):
+    target = repo / ".worktrees" / "t_trunc"
+    _half_built(repo, target, "wt/t_trunc")
+    before = _snapshot_repo(repo)
+    with open(target / "f0.slow", "r+b") as fh:
+        fh.truncate(0)
+    assert _snapshot_repo(repo) != before
 
 
 # --- ruling:t_f609a5a0-no-automatic-deletion: nothing in the spawn, assess() or this module deletes ---------------
@@ -412,3 +431,110 @@ def test_decompose_siblings_of_a_half_built_root_fall_back_to_their_own_trees(re
         kbw._resolve_worktree_workspace(_task("t_root", root, "wt/t_root"))
     assert sorted(p.name for p in root.iterdir()) == root_files
     assert kwr.lock_reason(admin) == kwr.INIT_LOCK and not (admin / "index").exists()
+
+
+# --- review r8 (prism-direct #265 @fa5f8548): EVERY read half_built() needs fails closed ------------------------
+
+
+class _OsProxy:
+    """``os`` for the residue module, with ``stat`` raising EACCES on one path: a stat-only failure chmod cannot
+    isolate (the index and the lock mtime live in the same admin dir as the lock file it must still read)."""
+
+    def __init__(self, fail: Path):
+        self._fail = os.path.realpath(fail)
+
+    def stat(self, path, *a, **k):
+        if os.path.realpath(path) == self._fail:
+            raise PermissionError(13, "Permission denied", str(path))
+        return os.stat(path, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+def _no_index_or_finished(case, repo, target, admin):
+    """The index stat only matters on the fast cheap exit, i.e. for a tree that HAS an index; give it one back."""
+    if case == "index stat (fast path)":
+        git(target, "read-tree", "HEAD")
+    if case in ("index stat (slow path)", "lock mtime"):
+        # the gitfile names an admin dir that does not exist (a moved admin): the fast path cannot settle it, and the
+        # registry scan finds the real registration, whose backlink still names the tree
+        (target / ".git").write_text(f"gitdir: {admin.parent / 'gone'}\n", encoding="utf-8")
+
+
+_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+_CHMOD = pytest.mark.skipif(_ROOT, reason="root reads a mode-000 file")
+
+# (case, how to break the read) -- the reads, in half_built() order:
+_READS = [
+    pytest.param("gitfile", "chmod", lambda repo, target, admin, sib: target / ".git", marks=_CHMOD),
+    pytest.param("admin gitdir backlink", "chmod", lambda repo, target, admin, sib: admin / "gitdir", marks=_CHMOD),
+    pytest.param("lock file", "chmod", lambda repo, target, admin, sib: admin / "locked", marks=_CHMOD),
+    pytest.param("index stat (fast path)", "stat", lambda repo, target, admin, sib: admin / "index"),
+    pytest.param("common-dir probe", "probe", None),
+    pytest.param("registry listing", "chmod-dir", lambda repo, target, admin, sib: repo / ".git" / "worktrees",
+                 marks=_CHMOD),
+    pytest.param("another admin's gitdir backlink", "chmod", lambda repo, target, admin, sib: sib / "gitdir",
+                 marks=_CHMOD),
+    pytest.param("index stat (slow path)", "stat", lambda repo, target, admin, sib: admin / "index"),
+    pytest.param("lock mtime", "stat", lambda repo, target, admin, sib: admin / "locked"),
+    pytest.param("HEAD", "chmod", lambda repo, target, admin, sib: admin / "HEAD", marks=_CHMOD),
+]
+
+
+@pytest.mark.parametrize("case,how,which", _READS)
+def test_every_read_half_built_needs_fails_closed(repo, monkeypatch, case, how, which):
+    """Prism #265 @fa5f8548 P1 (third instance of one class): any read the assessment needs that fails for a reason
+    other than "does not exist" holds the tree in all three callers, and nothing is changed."""
+    from hermes_cli import kanban_worktree_port as kwt
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    sib_tree = repo / ".worktrees" / "t_sib"
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_sib", str(sib_tree), "HEAD")
+    sib = Path(git(sib_tree, "rev-parse", "--absolute-git-dir"))
+    target = repo / ".worktrees" / "t_rd"
+    admin = _half_built(repo, target, "wt/t_rd", age_s=10_000)
+    _no_index_or_finished(case, repo, target, admin)
+    before = _snapshot_repo(repo)
+    path = which(repo, target, admin, sib) if which else None
+    if how == "stat":
+        monkeypatch.setattr(kwr, "os", _OsProxy(path))
+    elif how == "probe":
+        monkeypatch.setattr(kwr, "common_dir", lambda _repo: None)
+    mode = None
+    if how in ("chmod", "chmod-dir"):
+        mode = path.stat().st_mode
+        os.chmod(path, 0o111 if how == "chmod-dir" else 0)
+    try:
+        hb = kwr.half_built(repo, target)
+        assert hb is not None, f"{case}: an unreadable read reported the tree as not half-built"
+        assert hb["lock"] in (kwr.UNASSESSED, "unreadable", kwr.INIT_LOCK), hb
+        with pytest.raises(WorkspaceUnavailable, match=kwr.HALF_BUILT_HELD):
+            kbw._hold_half_built(repo, target)
+        with pytest.raises(WorkspaceUnavailable, match=kwr.HALF_BUILT_HELD):
+            kbw._resolve_worktree_workspace(_task("t_rd", target, "wt/t_rd"))
+        assert kwt._half_built_held(repo, target, "wt/t_rd") == kwt.WHY_HALF_BUILT
+    finally:
+        if mode is not None:
+            os.chmod(path, mode)
+        monkeypatch.undo()
+    assert _snapshot_repo(repo) == before
+    # readable again: the real state (half-built, or finished for the fast-path index case)
+    real_state = kwr.half_built(repo, target)
+    if case == "index stat (fast path)":
+        assert real_state is None
+    else:
+        assert real_state is not None and real_state["lock"] == kwr.INIT_LOCK
+
+
+def test_finished_but_initializing_takes_the_cheap_exit_without_git(repo, monkeypatch):
+    """Prism #265 @fa5f8548 P2: a finished tree still locked `initializing` (index present) is settled by the fast
+    path: no common-dir probe (no git spawn), no registry scan."""
+    target = repo / ".worktrees" / "t_done"
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_done", str(target), "HEAD")
+    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
+
+    def boom(*a, **k):
+        raise AssertionError("slow path taken")
+    monkeypatch.setattr(kwr, "common_dir", boom)
+    monkeypatch.setattr(kwr, "_admin_dirs", boom)
+    assert kwr.half_built(repo, target) is None
