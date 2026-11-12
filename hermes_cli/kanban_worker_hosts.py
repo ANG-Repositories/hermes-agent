@@ -519,6 +519,8 @@ def local_workspace_binding(path: Optional[str], *, runner: Callable = subproces
 # its gate admits; when it does not, the dir is carried to the chosen pool host (same path) and the card runs there.
 # The bounds keep the in-tick scan and copy short; they are a cost bound, not a capacity count: a bigger dir keeps
 # the old rule (Studio or wait).
+# t_f3a411c2: these two caps and the in-tick copy now apply only under ROOT kanban.placement.carry_caps: true (the
+# kill switch); by default the carry has no size cap and runs off the tick (kanban_carry_background).
 CARRY_MAX_BYTES = 1024 ** 3
 CARRY_MAX_ENTRIES = 20000
 CARRY_TIMEOUT_SECONDS = 300

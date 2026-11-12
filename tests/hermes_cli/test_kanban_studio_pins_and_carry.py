@@ -50,6 +50,14 @@ def _row(conn, tid):
 
 
 @pytest.fixture(autouse=True)
+def _carry_caps_on(monkeypatch):
+    """t_f3a411c2: this suite pins the capped in-tick carry (kanban.placement.carry_caps: true, the kill switch).
+    The default background carry with no cap is test_kanban_carry_background.py."""
+    from hermes_cli import kanban_carry_background as _kcb
+    monkeypatch.setattr(_kcb, "caps_on", lambda kcfg=None: True)
+
+
+@pytest.fixture(autouse=True)
 def _studio_last_resort_on(kanban_home, monkeypatch):
     """The live setting (hermes-home fleet/placement-policy.json since #10047): kanban on, mac-studio last."""
     # kwp._studio_words() adds the live gethostname() short form: run on ACE-AI, ``host: ace-ai`` named
