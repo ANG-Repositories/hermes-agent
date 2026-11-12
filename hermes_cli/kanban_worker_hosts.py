@@ -1049,7 +1049,7 @@ def _read_head_reflog(gitdir: str) -> List[Tuple[str, int, str]]:
         return []
     out = []
     prev_created = False
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             head, _tab, msg = line.rstrip("\n").partition("\t")
             parts = head.split()
