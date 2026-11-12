@@ -5796,10 +5796,15 @@ def _carry_split_plan(workspace_path, carry_budget):
         return None, "over the carry limit even without its git clones (or the census is deferred)"
     recs = []
     extra_bytes = extra_entries = 0
+    why_not = {}
     for rel in clones:
         rec, why = _kb._kwh.assess_clone_cached(os.path.join(workspace_path, rel))
         if rec is None:
-            return None, f"over the carry limit; clone {rel} cannot be rebuilt from origin: {why}"
+            # t_d2f06cf6 + operator F3: a clone or linked worktree no remote can rebuild (dirty, detached, no
+            # origin, ...) is carried as files and counts toward the caps (carry_split_fits below), never dropped.
+            # A clone copied as files loses nothing: its .git rides with it. F5: the reason rides the wait line.
+            why_not[rel] = why
+            continue
         # operator F4: the clone's non-cache ignored files ride the carry, so they count toward its caps
         for ign in rec.get("ignored") or ():
             try:
@@ -5808,10 +5813,26 @@ def _carry_split_plan(workspace_path, carry_budget):
                 return None, f"over the carry limit; clone {rel} ignored file {ign!r} unreadable"
             extra_entries += 1
         recs.append({"rel": rel, **rec})
-    over = _kb._kwh.carry_split_fits(workspace_path, extra_bytes, extra_entries)
+    for r in recs:
+        # t_d2f06cf6 (operator 02:0x): a stash bundle that hit its build ceiling at a spawn waits, named, until it
+        # can be retried (the stash or HEAD changed, or STASH_BUNDLE_RETRY_SECONDS passed)
+        slow = _kb._kwh.stash_bundle_deferred(os.path.join(workspace_path, r["rel"]), r.get("stash") or (), r["sha"])
+        if slow is not None:
+            return None, slow
+    rebuilt = {r["rel"] for r in recs}
+    over = _kb._kwh.carry_split_fits(workspace_path, extra_bytes, extra_entries, rebuilt=rebuilt, why_not=why_not,
+                                     budget=carry_budget)
     if over is not None:
         return None, over
-    return {"exclude": tuple(clones), "clones": recs}, None
+    if not recs:
+        return None, "over the carry limit even without its git clones (or the census is deferred)"
+    lost = _kb._kwh.split_worktree_loss(workspace_path, recs)
+    if lost is not None:
+        return None, f"over the carry limit; {lost}"
+    dangling = _kb._kwh.carried_gitdir_loss(workspace_path, [c for c in clones if c not in rebuilt], rebuilt)
+    if dangling is not None:  # Prism 805c10f0cb3d / 78347eb52e27
+        return None, f"over the carry limit; {dangling}"
+    return {"exclude": tuple(c for c in clones if c in rebuilt), "clones": recs}, None
 
 
 def _board_default_safe(board):
@@ -8774,14 +8795,23 @@ def _dispatch_once_locked(
                     # failure (claim released, reservation refunded), never an empty-dir run.
                     _split = _carry_rows.get(claimed.id)
                     _split = _split if isinstance(_split, dict) else None
+                    _staged = None
                     if _split:
+                        # P2 c-38aac54b3e75a212: refuse before the rsync copies anything to the pool host. The stash
+                        # bundle it builds (bounded, StashBundleTimeout = a WorkspaceUnavailable) is reused below.
+                        _staged = _kb._kwh.carry_clones_check(placed_host, str(workspace), _split["clones"],
+                                                              reservation=_rid)
                         _kb._kwh.carry_workspace(placed_host, str(workspace), exclude=_split["exclude"])
                     else:
                         _kb._kwh.carry_workspace(placed_host, str(workspace))
                     if _split:
                         # t_9965b8d5: the clones the carry left out are rebuilt from origin, same branch + commit.
                         _kb._kwh.carry_clones(placed_host, str(workspace), _split["clones"],
-                                              _kb.kanban_home() / "fleet")
+                                              _kb.kanban_home() / "fleet", reservation=_rid, staged=_staged)
+                    # t_d2f06cf6 (operator split 07:20 11-12): with worktree_stash_carry off the rebuilt checkouts
+                    # arrive with no stash; how many shared entries stayed on the Studio rides the event and a comment
+                    _left = {c["rel"]: c["stash_left"] for c in (_split or {}).get("clones", ())
+                             if c.get("stash_left")}
                     with _kbc.write_txn(conn):
                         # "workspace" = the stored path at carry time, "path" = the spelling persisted just
                         # below; carried_host() binds on either (Prism 34bd0265a601).
@@ -8789,8 +8819,14 @@ def _dispatch_once_locked(
                                           {"host": placed_host.name, "workspace": claimed.workspace_path,
                                            "path": str(workspace),
                                            **({"recloned": [{k: c[k] for k in ("rel", "slug", "branch", "sha")}
-                                                            for c in _split["clones"]]} if _split else {})},
+                                                            for c in _split["clones"]]} if _split else {}),
+                                           **({"stash_left": _left} if _left else {})},
                                           run_id=claimed.current_run_id)
+                    if _left:
+                        _kb.add_comment(conn, claimed.id, "dispatcher", (
+                            f"carried to {placed_host.name}: rebuilt without stash entries; "
+                            + ", ".join(f"{n} stash entries of {r}" for r, n in sorted(_left.items()))
+                            + " stayed on the Studio (kanban.placement.worktree_stash_carry is off)"))
             if protected is not None:
                 validate_mount(
                     protected.root, expected_mount=protected.mount_path,

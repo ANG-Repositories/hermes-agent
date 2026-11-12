@@ -25,6 +25,7 @@ import subprocess
 from typing import Callable, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
+from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
 
 PLACEMENT_ENV = "KANBAN_WORKER_PLACEMENT"
 # The synthetic placement of a Studio-local worker (``kanban_local_worker_uid``). Defined here,
@@ -528,6 +529,9 @@ CARRY_SCAN_TTL_SECONDS = 300
 # CARRY_TICK_SCAN_SECONDS on walks, the rest of its rows are refused uncached and walked on a later tick.
 CARRY_SCAN_MAX_SECONDS = 2.0
 CARRY_TICK_SCAN_SECONDS = 5.0
+# The spawn-time re-walk of a set-aside path carried as files (outside the tick, before an rsync of up to
+# CARRY_TIMEOUT_SECONDS): long enough for any tree under the caps, so a big one does not fail the spawn.
+CARRY_SPAWN_WALK_SECONDS = 30.0
 CARRY_WAIT_FORGET_SECONDS = 900
 CARRIED_EVENT = "workspace_carried"
 # portable() bind rule of a carried card: once carried, every later run binds to the host holding the copy
@@ -536,6 +540,10 @@ CARRY_BIND_RULE = "workspace_carry"
 _carry_scan_cache: Dict[tuple, tuple] = {}
 _carry_clone_cache: Dict[tuple, tuple] = {}  # skip_clones census key -> clone paths it skipped (t_9965b8d5)
 _carry_split_usage: Dict[object, tuple] = {}  # root -> (bytes, entries, caps) of the last skip_clones census (F4)
+_carry_worktree_cache: Dict[object, tuple] = {}  # root -> linked-worktree rels the last skip_clones census set aside
+_worktree_usage_cache: Dict[str, tuple] = {}  # worktree realpath -> (at, (bytes, entries) or None)
+_carry_setaside_cache: Dict[object, tuple] = {}  # root -> every clone/worktree rel the last skip_clones census set aside
+_worktree_partial: Dict[str, tuple] = {}  # worktree realpath -> (at, pending dirs, bytes, entries) of a timed-out walk
 _carry_waiting: Dict[tuple, tuple] = {}  # cache key -> (budget generation first deferred, last asked); FIFO
 _carry_gen = 0
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
@@ -662,7 +670,8 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     except (OSError, RuntimeError, ValueError):
         return False
     clock = budget.clock if budget is not None else _time.monotonic
-    key = (root, max_bytes, max_entries) + (("skip_clones",) if skip_clones else ())
+    wt_on = skip_clones and worktree_carry_on()
+    key = (root, max_bytes, max_entries) + (("skip_clones",) if skip_clones else ()) + (("worktrees",) if wt_on else ())
     t = clock() if now is None else now
     hit = _carry_scan_cache.get(key)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
@@ -682,6 +691,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     import stat
     pending = [root]
     clones: List[str] = []
+    worktrees: List[str] = []
     try:
         while pending and ok:
             current = pending.pop()
@@ -701,6 +711,13 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                                 and not os.path.islink(os.path.join(entry.path, ".git")):
                             # t_9965b8d5: a git clone is re-cloned on the pool host, never copied or counted
                             clones.append(os.path.relpath(entry.path, root))
+                            continue
+                        if wt_on and _is_linked_worktree(entry.path):
+                            # t_d2f06cf6: a linked worktree (``.git`` is a gitdir FILE) is set aside like a clone.
+                            # The split plan decides it: rebuilt from origin when recoverable, else its files are
+                            # censused (worktree_usage) and carried, and they count toward the caps.
+                            worktrees.append(os.path.relpath(entry.path, root))
+                            clones.append(worktrees[-1])
                             continue
                         pending.append(entry.path)
                     if entries % 256 == 0 and clock() >= stop:
@@ -723,7 +740,337 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     if skip_clones:
         _carry_clone_cache[key] = tuple(sorted(clones)) if ok else ()
         _carry_split_usage[root] = (total, entries, max_bytes, max_entries)
+        _carry_worktree_cache[root] = tuple(sorted(worktrees)) if ok else ()
+        _carry_setaside_cache[root] = tuple(sorted(clones)) if ok else ()
     return ok
+
+
+WORKTREE_CARRY_KNOB = "worktree_split_carry"
+
+
+def worktree_carry_on(kcfg: Optional[Mapping] = None) -> bool:
+    """``kanban.placement.worktree_split_carry`` in the ROOT config (t_d2f06cf6, default on): a linked worktree in an
+    over-cap scratch workspace is set aside and rebuilt from origin like a clone (its stash entries ride only with
+    ``worktree_stash_carry`` on, :func:`stash_carry_on`). False/"off"/0 = the rule before t_d2f06cf6: a linked worktree counts as
+    files toward the caps and any stash keeps a clone from being rebuilt. Unreadable config reads as the default."""
+    if kcfg is None:
+        try:
+            from hermes_cli import kanban_db as _kdb
+            kcfg = _kdb._board_home_kanban_cfg()
+        except Exception:
+            kcfg = {}
+    placement = kcfg.get("placement") if isinstance(kcfg, Mapping) else None
+    val = placement.get(WORKTREE_CARRY_KNOB, True) if isinstance(placement, Mapping) else True
+    if isinstance(val, str):
+        return val.strip().lower() not in ("off", "false", "no", "0", "")
+    return bool(val)
+
+
+STASH_CARRY_KNOB = "worktree_stash_carry"
+
+
+def stash_carry_on(kcfg: Optional[Mapping] = None) -> bool:
+    """``kanban.placement.worktree_stash_carry`` in the ROOT config (t_d2f06cf6, operator split 07:20 11-12, default
+    OFF): with it on, a rebuilt checkout's stash entries move host to host as a bundle (:func:`carry_stash`). Off, the
+    rebuild touches no stash on either host (no bundle, no fetch, no ``stash store``, no stash precondition); the
+    entries stay in the Studio's git dir and the spawn records how many. Only read while ``worktree_split_carry`` is
+    on. Unreadable config reads as the default."""
+    if kcfg is None:
+        try:
+            from hermes_cli import kanban_db as _kdb
+            kcfg = _kdb._board_home_kanban_cfg()
+        except Exception:
+            kcfg = {}
+    placement = kcfg.get("placement") if isinstance(kcfg, Mapping) else None
+    val = placement.get(STASH_CARRY_KNOB, False) if isinstance(placement, Mapping) else False
+    if isinstance(val, str):
+        return val.strip().lower() not in ("off", "false", "no", "0", "")
+    return bool(val)
+
+
+def _stash_carried() -> bool:
+    """The stash rides the rebuild only when both the split carry and the stash carry are on."""
+    return worktree_carry_on() and stash_carry_on()
+
+
+def stash_count(repo: str, runner: Callable = subprocess.run) -> Optional[int]:
+    """How many entries ``git stash list`` shows for ``repo`` (the shared list for a linked worktree), for the record
+    only; None when git cannot say. Never a precondition (stash carry off)."""
+    try:
+        proc = runner(["git", "-C", repo, "stash", "list", "--format=%H"], capture_output=True, text=True,
+                      encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    return sum(1 for line in (proc.stdout or "").splitlines() if line.strip())
+
+
+def _is_linked_worktree(path: str) -> bool:
+    """True when ``path/.git`` is a regular file naming a gitdir (a linked worktree), not a symlink."""
+    dotgit = os.path.join(path, ".git")
+    try:
+        if os.path.islink(dotgit) or not os.path.isfile(dotgit):
+            return False
+        with open(dotgit, encoding="utf-8-sig") as f:
+            return f.read(4096).startswith("gitdir: ")
+    except (OSError, UnicodeError):
+        return False
+
+
+def _gitfile_dirs(path: str) -> Optional[Tuple[str, str, bool]]:
+    """``(gitdir, common dir, shared)`` for a checkout whose ``.git`` is a gitdir FILE, else None. ``shared`` is True
+    only when the gitdir holds a ``commondir`` file (a linked worktree sharing one repo with other checkouts); a
+    ``--separate-git-dir`` repo or a submodule checkout also has a gitfile but owns its whole git dir (operator item
+    2 at d77ebe045e). Raises OSError/UnicodeError/ValueError on an unreadable pointer."""
+    if not _is_linked_worktree(path):
+        return None
+    with open(os.path.join(path, ".git"), encoding="utf-8-sig") as f:
+        gitdir = os.path.realpath(os.path.join(path, f.read(4096).strip()[8:]))
+    cfile = os.path.join(gitdir, "commondir")
+    if not os.path.isfile(cfile):
+        return gitdir, gitdir, False
+    with open(cfile, encoding="utf-8-sig") as f:
+        return gitdir, os.path.realpath(os.path.join(gitdir, f.read().strip())), True
+
+
+def clone_linked_worktrees(repo: str, runner: Callable = subprocess.run) -> Optional[Tuple[str, ...]]:
+    """Realpaths of every OTHER worktree of the clone at ``repo`` (``git worktree list``), or None when git cannot
+    list them (fail closed)."""
+    try:
+        proc = runner(["git", "-C", repo, "worktree", "list", "--porcelain"], capture_output=True, text=True,
+                      encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        me = os.path.realpath(repo)
+        return tuple(os.path.realpath(line[9:]) for line in (proc.stdout or "").splitlines()
+                     if line.startswith("worktree ") and os.path.realpath(line[9:]) != me)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def split_worktree_loss(workspace: str, recs, runner: Callable = subprocess.run) -> Optional[str]:
+    """None, or the reason a split carry would lose git state (t_d2f06cf6): a clone in ``recs`` is rebuilt from
+    origin, so its worktree metadata, the worktrees' indexes and any commit only its .git holds stay behind on the
+    Studio. Every linked worktree of it inside ``workspace`` must be rebuilt too (in ``recs``); one that is not would
+    land on the pool host as files whose ``.git`` names a gitdir that does not exist there."""
+    try:
+        ws = os.path.realpath(workspace).rstrip("/") + "/"
+        rebuilt = {os.path.realpath(os.path.join(workspace, r["rel"])) for r in recs}
+    except (OSError, ValueError):
+        return "workspace unreadable"
+    for r in recs:
+        try:
+            dirs = _gitfile_dirs(os.path.join(workspace, r["rel"]))
+        except (OSError, UnicodeError, ValueError):
+            return f"clone {r['rel']}: git dir unreadable"
+        if dirs is not None and dirs[2]:
+            # Prism 78347eb52e27 / c-acee245679ee7db1: a rebuilt LINKED worktree leaves the common dir (the primary's
+            # .git) where it is; the primary and its other worktrees keep their git state. Only rebuilding the
+            # checkout that holds the common dir strands its worktrees.
+            continue
+        others = clone_linked_worktrees(os.path.join(workspace, r["rel"]), runner)
+        if others is None:
+            return f"clone {r['rel']}: worktree list unreadable"
+        for path in others:
+            if (path + "/").startswith(ws) and path not in rebuilt:
+                return (f"clone {r['rel']} holds the git state of worktree {os.path.relpath(path, ws)}, which "
+                        f"cannot be rebuilt from origin")
+    return None
+
+
+def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
+    """None, or the reason a set-aside path carried AS FILES would arrive with a dangling git dir (Prism 805c10f0cb3d,
+    78347eb52e27). The carry copies the workspace to the SAME path on the pool host minus the ``rebuilt`` rels, so a
+    linked worktree in ``carried`` keeps a working ``.git`` only when its gitdir and common dir sit inside the
+    workspace and outside every rebuilt rel. A gitdir that no longer exists on the Studio (a dead stub) loses nothing
+    by the copy. Anything unreadable fails closed."""
+    try:
+        ws = os.path.realpath(workspace).rstrip("/") + "/"
+        gone = tuple(os.path.realpath(os.path.join(workspace, r)).rstrip("/") + "/" for r in rebuilt)
+    except (OSError, ValueError):
+        return "workspace unreadable"
+
+    def _travels(p: str) -> bool:
+        p = p.rstrip("/") + "/"
+        return p.startswith(ws) and not any(p.startswith(g) for g in gone)
+
+    def _alternates_loss(name: str, common: str) -> Optional[str]:
+        # Prism ca4b50199bda / c-86a12a77bcdd7173: objects borrowed through objects/info/alternates (followed
+        # transitively, as git does) must travel too, or the copy arrives without them.
+        seen, todo = set(), [os.path.join(common, "objects")]
+        while todo:
+            objs = os.path.realpath(todo.pop())
+            if objs in seen:
+                continue
+            seen.add(objs)
+            if not _travels(objs):
+                # Prism 519874fe750e: the repo's own objects dir symlinked out of the carry
+                return (f"{name} is carried as files but its object store {objs} does not travel with it "
+                        f"(outside the workspace or in a rebuilt clone)")
+            # advisory 03:2x + operator 07:20 item 2: a symlink ANYWHERE under the object store (pack, info, a
+            # fan-out dir, a pack or loose object file) that leaves the carry arrives dangling; the realpath of the
+            # store root alone does not see it. Symlinked dirs are checked, never entered.
+            walk = [objs] if os.path.isdir(objs) else []
+            while walk:
+                with os.scandir(walk.pop()) as scan:
+                    for e in scan:
+                        if e.is_symlink():
+                            if not _travels(os.path.realpath(e.path)):
+                                return (f"{name} is carried as files but {e.path} is a symlink to "
+                                        f"{os.path.realpath(e.path)}, which does not travel with it")
+                        elif e.is_dir(follow_symlinks=False):
+                            walk.append(e.path)
+            alt = os.path.join(objs, "info", "alternates")
+            if not os.path.lexists(alt):
+                continue
+            with open(alt, encoding="utf-8-sig", newline="") as f:
+                # advisory 03:2x: git splits on LF only and never trims a line; a trailing space is part of the path
+                for line in f.read().split("\n"):
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith('"'):
+                        # Prism bd234dd77562: git C-quotes an alternate path; never read a quoted one as relative
+                        return f"{name} is carried as files but has a quoted alternate {line} (not resolved here)"
+                    target = os.path.realpath(os.path.join(objs, line))
+                    if not _travels(target):
+                        return (f"{name} is carried as files but borrows objects through an alternate {target} "
+                                f"that does not travel with it (outside the workspace or in a rebuilt clone)")
+                    todo.append(target)
+        return None
+
+    def _repo_loss(repo: str, name: str) -> Optional[str]:
+        try:
+            dirs = _gitfile_dirs(repo)
+            if dirs is None:
+                common = os.path.join(repo, ".git")
+                if os.path.islink(common) and not _travels(os.path.realpath(common)):
+                    return (f"{name} is carried as files but its .git symlink resolves to "
+                            f"{os.path.realpath(common)}, which does not travel with it")
+                if not os.path.isdir(common):
+                    return None
+            else:
+                gitdir, common, _shared = dirs
+                if not os.path.isdir(gitdir):
+                    return None  # dead stub: git already cannot use it on the Studio; the files are all there is
+                for p in (gitdir, common):
+                    if not _travels(p):
+                        return (f"worktree {name} is carried as files but its git dir {p} does not travel with it "
+                                f"(outside the workspace or in a rebuilt clone)")
+            return _alternates_loss(name, common)
+        except (OSError, UnicodeError, ValueError):
+            return f"{name}: git dir unreadable"
+
+    for rel in carried:
+        # Prism 23e5001bba80 / c-480d52ee4b039482: every repo at or under a carried rel (a worktree nested in a clone
+        # carried as files, say), not only the top-level one. Symlinks are never followed; .git dirs not entered.
+        top = os.path.join(workspace, rel)
+        stack = [(top, rel)]
+        while stack:
+            d, name = stack.pop()
+            if os.path.lexists(os.path.join(d, ".git")):
+                lost = _repo_loss(d, name)
+                if lost is not None:
+                    return lost
+            try:
+                with os.scandir(d) as scan:
+                    subs = [e for e in scan if e.name != ".git" and e.is_dir(follow_symlinks=False)]
+            except OSError:
+                return f"{name}: unreadable"
+            stack.extend((e.path, f"{name}/{e.name}") for e in subs)
+    return None
+
+
+def carry_split_setaside(path: Optional[str]) -> Tuple[str, ...]:
+    """Every clone and linked-worktree rel the last split census of ``path`` set aside (operator F3: one that is
+    not rebuilt is carried as files and counted, so the spawn re-check needs the whole list)."""
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        return _carry_setaside_cache.get(canon(path), ())
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return ()
+
+
+def carry_split_worktrees(path: Optional[str]) -> Tuple[str, ...]:
+    """The linked-worktree rels (a subset of :func:`carry_split`'s) the last split census of ``path`` set aside."""
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        return _carry_worktree_cache.get(canon(path), ())
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return ()
+
+
+def worktree_usage(path: str, *, max_bytes: int, max_entries: int, fresh: bool = False,
+                   max_seconds: float = CARRY_SCAN_MAX_SECONDS,
+                   budget: Optional[CarryScanBudget] = None) -> Optional[Tuple[int, int]]:
+    """``(bytes, entries)`` of the directory ``path`` (symlinks counted, never followed), or None when the walk
+    errors or has not finished. Stops once a cap is passed (the tallies then already exceed it). Cached for
+    ``CARRY_SCAN_TTL_SECONDS`` unless ``fresh`` (the spawn-time re-check, review F3).
+
+    Operator F4 (t_d2f06cf6): a walk that outlives ``max_seconds`` (or the tick ``budget``) is not a cached refusal.
+    It is checkpointed at a directory boundary and resumed by the next call, so a big carried worktree finishes on a
+    later tick instead of reading ``census unavailable`` on every tick. A ``fresh`` walk never resumes a checkpoint."""
+    import stat
+    import time as _time
+    try:
+        key = os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+    t = _time.monotonic()
+    hit = _worktree_usage_cache.get(key)
+    if not fresh and hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
+        # a walk stopped at a cap is only a lower bound: reusable while it still exceeds the caps asked now
+        if hit[1] is None or hit[2] or hit[1][0] > max_bytes or hit[1][1] > max_entries:
+            return hit[1]
+    if budget is not None:
+        if budget.left() <= 0:
+            budget.deferred += 1
+            return None
+        max_seconds = min(max_seconds, budget.left())
+    stop = t + max_seconds
+    part = None if fresh else _worktree_partial.pop(key, None)
+    if part is not None and t - part[0] < CARRY_SCAN_TTL_SECONDS:
+        pending, total, entries = list(part[1]), part[2], part[3]
+    else:
+        pending, total, entries = [path], 0, 0
+    usage: Optional[Tuple[int, int]] = None
+    timed_out = False
+    try:
+        while pending and total <= max_bytes and entries <= max_entries:
+            current = pending.pop()
+            if current != path and os.path.islink(current):
+                continue
+            with os.scandir(current) as scan:
+                for entry in scan:
+                    entries += 1
+                    info = entry.stat(follow_symlinks=False)
+                    total += info.st_size
+                    if total > max_bytes or entries > max_entries:
+                        break
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(entry.path)
+            # checkpoint only here, after a whole directory: a resumed walk never counts a directory twice
+            if pending and total <= max_bytes and entries <= max_entries and _time.monotonic() >= stop:
+                timed_out = True
+                break
+        if not timed_out:
+            usage = (total, entries)
+    except OSError:
+        usage = None
+    if budget is not None:
+        budget.spent_s += max(0.0, _time.monotonic() - t)
+    if timed_out:
+        if len(_worktree_partial) > 4096:
+            _worktree_partial.clear()
+        _worktree_partial[key] = (t, tuple(pending), total, entries)
+        if budget is not None:
+            budget.deferred += 1
+        return None
+    if len(_worktree_usage_cache) > 4096:
+        _worktree_usage_cache.clear()
+    complete = usage is not None and not pending and total <= max_bytes and entries <= max_entries
+    _worktree_usage_cache[key] = (_time.monotonic(), usage, complete)
+    return usage
 
 
 def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None,
@@ -739,10 +1086,226 @@ def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None
         root = canon(path)
     except (OSError, RuntimeError, ValueError):
         return None
-    clones = _carry_clone_cache.get((root, max_bytes, max_entries, "skip_clones"), ())
+    clones = _carry_clone_cache.get((root, max_bytes, max_entries, "skip_clones")
+                                    + (("worktrees",) if worktree_carry_on() else ()), ())
     if not clones or not all(carry_path_safe(f"{str(root).rstrip('/')}/{c}") for c in clones):
         return None
     return clones
+
+
+def stash_entries(repo: str, runner: Callable = subprocess.run) -> Optional[Tuple[Tuple[str, int, str], ...]]:
+    """The stash entries a rebuild of the checkout at ``repo`` must carry, newest first, as ``(commit, unix ts,
+    reflog subject)``; None when unreadable (operator design at 2119cc07, t_d2f06cf6: never guess who owns a stash).
+
+    Every entry of the list the checkout sees: a clone's own, or for a linked worktree the whole list shared through
+    the common dir (operator 03:2x: no timestamp filter; a clock or GIT_COMMITTER_DATE can date a new stash before
+    the worktree, and all 35 entries of the home repo bundle in 2.8 MB / 5.5 s). Carrying another checkout's entry
+    too costs a few objects; the originals stay in the common dir untouched.
+
+    ``refs/stash`` with no reflog lists as empty (rc 0) while the ref still holds a stash: when the ref resolves and
+    the list does not include its commit, the stash is unreadable (None), never an empty carry."""
+    try:
+        st = runner(["git", "-C", repo, "stash", "list", "--date=unix", "--format=%H%x09%gd%x09%gs"],
+                    capture_output=True, text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+        ref = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True,
+                     text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(st, "returncode", 1) != 0 or getattr(ref, "returncode", 2) not in (0, 1):
+        return None
+    out = []
+    for line in (st.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            sha, sel, subject = line.split("\t", 2)
+            ts = int(sel[sel.index("{") + 1:sel.index("}")])
+        except (ValueError, IndexError):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):
+            return None
+        out.append((sha, ts, subject))
+    live = (getattr(ref, "stdout", "") or "").strip() if getattr(ref, "returncode", 1) == 0 else ""
+    if live and live not in {e[0] for e in out}:
+        return None  # advisory 03:2x: refs/stash holds a commit the list does not show (reflog expired or removed)
+    return tuple(out)
+
+
+def _stash_label(entry) -> str:
+    return f"stash entry {entry[0][:12]} ({entry[2][:80]})"
+
+
+# t_d2f06cf6 (operator 02:0x): the bundle build runs inside the dispatcher tick, so it gets a wall-clock ceiling far
+# below CARRY_TIMEOUT_SECONDS. Measured on the Studio: 0.5 s for 17 entries once origin's default branch is excluded,
+# 47 to 70 s when only HEAD was. A build that hits the ceiling is remembered for STASH_BUNDLE_RETRY_SECONDS: the card
+# then WAITS at routing with the reason named (stash_bundle_deferred) instead of re-blocking every tick.
+STASH_BUNDLE_TIMEOUT_SECONDS = 30
+STASH_BUNDLE_RETRY_SECONDS = 3600
+_stash_bundle_timeouts: Dict[tuple, Tuple[float, str]] = {}
+
+
+class StashBundleTimeout(WorkspaceUnavailable, RuntimeError):
+    """The stash bundle build hit STASH_BUNDLE_TIMEOUT_SECONDS. A WorkspaceUnavailable: the dispatcher releases the
+    claim and refunds the reservation without charging a worker failure, and routing makes the card wait."""
+
+
+def _stash_bundle_key(repo: str, entries, head: str) -> tuple:
+    return (os.path.normpath(str(repo)), tuple(e[0] for e in entries), str(head))
+
+
+def stash_bundle_deferred(repo: str, entries, head: str, now: Optional[float] = None) -> Optional[str]:
+    """The wait reason when a bundle of exactly these ``entries`` over ``head`` timed out less than
+    STASH_BUNDLE_RETRY_SECONDS ago, else None. A new stash entry or a moved HEAD is a new key: tried again."""
+    import time
+    if not entries:
+        return None
+    key = _stash_bundle_key(repo, entries, head)
+    hit = _stash_bundle_timeouts.get(key)
+    if hit is None:
+        return None
+    if (time.monotonic() if now is None else now) - hit[0] >= STASH_BUNDLE_RETRY_SECONDS:
+        _stash_bundle_timeouts.pop(key, None)
+        return None
+    return hit[1]
+
+
+def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.run) -> bytes:
+    """A git bundle holding the commits of every stash entry in ``entries`` that the rebuilt clone does not already
+    hold: ``head`` (the commit the clone lands on) and origin's default branch as this checkout last saw it
+    (``refs/remotes/origin/HEAD``) are excluded, so the main commits between a worktree's base and a stash's base never
+    ride (operator 02:0x: 109 MB -> 1.8 MB). The pool clone may lack that default-branch sha (the Studio's tracking ref
+    can be ahead of what the clone fetched): :func:`stash_store_script` fetches any missing prerequisite from origin
+    and refuses (rc 10) when it cannot, so a partial list is never stored.
+
+    Built in a throwaway bare repo that borrows ``repo``'s objects through an alternate: nothing in ``repo`` or its
+    common dir is written. The whole build is bounded by STASH_BUNDLE_TIMEOUT_SECONDS; hitting it raises
+    :class:`StashBundleTimeout` and is remembered (:func:`stash_bundle_deferred`). Raises RuntimeError naming the entry
+    on any other failure."""
+    import shutil
+    import tempfile
+    import time
+    deadline = time.monotonic() + STASH_BUNDLE_TIMEOUT_SECONDS
+    what = ", ".join(map(_stash_label, entries))
+
+    def _timed_out():
+        reason = (f"stash bundle of {repo} exceeded {STASH_BUNDLE_TIMEOUT_SECONDS}s ({what}); "
+                  f"retried after {STASH_BUNDLE_RETRY_SECONDS}s or when the stash or HEAD changes")
+        _stash_bundle_timeouts[_stash_bundle_key(repo, entries, head)] = (time.monotonic(), reason)
+        if len(_stash_bundle_timeouts) > 4096:
+            _stash_bundle_timeouts.clear()
+        return StashBundleTimeout(reason)
+
+    def _git(*args, what, ok_rc=(0,)):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _timed_out()
+        try:
+            proc = runner(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=left, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise _timed_out()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"stash carry of {repo}: {what}: {exc}")
+        if getattr(proc, "returncode", 1) not in ok_rc:
+            raise RuntimeError(f"stash carry of {repo}: {what} rc={getattr(proc, 'returncode', '?')}: "
+                               f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        return proc
+
+    try:
+        dirs = _gitfile_dirs(repo)
+        objects = os.path.realpath(os.path.join(dirs[1] if dirs else os.path.join(repo, ".git"), "objects"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RuntimeError(f"stash carry of {repo}: git dir unreadable: {exc}")
+    # origin's default branch, as this checkout last fetched it (shared refs in a linked worktree); rc 1 = none
+    base = (getattr(_git("-C", repo, "rev-parse", "-q", "--verify", "refs/remotes/origin/HEAD^{commit}",
+                         what="origin default branch", ok_rc=(0, 1)), "stdout", "") or "").strip()
+    excl = [f"^{head}"] + ([f"^{base}"] if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", base) else [])
+    tmp = tempfile.mkdtemp(prefix="kanban-stash-")
+    try:
+        bare, out = os.path.join(tmp, "b.git"), os.path.join(tmp, "stash.bundle")
+        _git("init", "-q", "--bare", bare, what="bundle repo")
+        alt = os.path.join(bare, "objects", "info", "alternates")
+        with open(alt, "w", encoding="utf-8") as f:  # windows-footgun: ok — a write; a BOM breaks the path
+            f.write(objects + "\n")
+        refs = []
+        for i, e in enumerate(entries):
+            _git("-C", bare, "update-ref", f"refs/carry/{i}", e[0], what=_stash_label(e))
+            refs.append(f"refs/carry/{i}")
+        # advisory 03:2x P2: every entry already reachable from the exclusions = nothing to send (``git bundle
+        # create`` refuses an empty bundle). b"" tells the store script the commits are already in the clone.
+        count = (getattr(_git("-C", bare, "rev-list", "--count", *refs, *excl, what=f"commits of {what}"),
+                         "stdout", "") or "").strip()
+        if count == "0":
+            return b""
+        _git("-C", bare, "bundle", "create", out, *refs, *excl, what=f"bundle of {what}")
+        _git("-C", bare, "bundle", "verify", "-q", out, what=f"bundle verify of {what}")
+        if os.path.getsize(out) > CARRY_MAX_BYTES:
+            raise RuntimeError(f"stash carry of {repo}: bundle over the carry byte cap")
+        with open(out, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def stash_store_script(dest: str, entries) -> str:
+    """Remote sh: unbundle the stash commits read on stdin into the rebuilt clone at ``dest`` and store each entry
+    with its original subject, oldest first (so ``stash@{0}`` is the newest again), then PROVE the list is exactly
+    ``entries`` (rc 8). Re-run safe: a clone already holding exactly that list is left alone; one holding any other
+    stash is refused (rc 9), never added to. A bundle whose prerequisites the clone lacks even after one fetch of
+    origin is refused (rc 10), nothing stored. An EMPTY payload (every entry already reachable from what the clone
+    holds, :func:`stash_bundle`) unbundles nothing: the clone must hold each entry commit, after at most one fetch of
+    origin, else rc 10."""
+    d = shlex.quote(dest)
+    want = " ".join(e[0] for e in entries)
+    stores = "; ".join(f"git -C \"$d\" -c user.name=kanban-carry -c user.email=kanban-carry@localhost stash store "
+                       f"-q -m {shlex.quote(e[2])} {e[0]}" for e in reversed(tuple(entries)))
+    return (f"set -e; d={d}; want={shlex.quote(want)}; "
+            "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
+            "if [ \"$have\" = \"$want\" ]; then cat >/dev/null; exit 0; fi; [ -z \"$have\" ] || exit 9; "
+            "t=$(mktemp); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; "
+            "if [ -s \"$t\" ]; then "
+            # t_d2f06cf6 (operator 02:0x): the bundle leaves out origin's default branch as the Studio saw it. A clone
+            # missing those commits fetches origin once, else refuses (rc 10) before any entry is stored.
+            "if ! git -C \"$d\" bundle verify -q \"$t\" >/dev/null 2>&1; then "
+            "git -C \"$d\" fetch -q origin >/dev/null 2>&1 || true; "
+            "git -C \"$d\" bundle verify -q \"$t\" >&2 || exit 10; fi; "
+            "git -C \"$d\" bundle unbundle \"$t\" >/dev/null; "
+            "else "
+            # advisory 03:2x P2: nothing to send; the entry commits must already be in the clone
+            "h() { for s in $want; do git -C \"$d\" cat-file -e \"$s^{commit}\" 2>/dev/null || return 1; done; }; "
+            "if ! h; then git -C \"$d\" fetch -q origin >/dev/null 2>&1 || true; "
+            "h || { echo \"stash commits missing from the clone\" >&2; exit 10; }; fi; "
+            "fi; "
+            f"{stores}; "
+            "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
+            "[ \"$have\" = \"$want\" ] || exit 8")
+
+
+def carry_stash(host: PoolHost, repo: str, dest: str, entries, head: str, runner: Callable = subprocess.run,
+                bundle: Optional[bytes] = None, reservation: Optional[str] = None) -> None:
+    """Move the stash ``entries`` of the Studio checkout ``repo`` to the rebuilt clone at ``dest`` on ``host``:
+    a bundle over the pool ssh (never GitHub), stored there with the original subjects, in order. Raises naming the
+    entries on any failure.
+
+    ``reservation``: the id take() booked for this card on ``host`` (the dispatcher's ``_rid``). The store ssh runs
+    under it (ALLOC_RESERVATION in its env) and takes no reservation of its own; without one it refuses."""
+    if not entries:
+        return
+    if not reservation:
+        raise RuntimeError(f"stash carry to {host.name}: no placement reservation for this card; "
+                           f"{', '.join(map(_stash_label, entries))} not carried")
+    payload = bundle if bundle is not None else stash_bundle(repo, entries, head, runner)
+    env = dict(os.environ, ALLOC_RESERVATION=str(reservation))
+    try:
+        proc = runner(_ssh_argv(host, stash_store_script(dest, entries)), input=payload, capture_output=True,
+                      timeout=CARRY_TIMEOUT_SECONDS, env=env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"stash carry to {host.name}: {', '.join(map(_stash_label, entries))}: {exc}")
+    if getattr(proc, "returncode", 1) != 0:
+        err = getattr(proc, "stderr", b"") or b""
+        err = err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err)
+        raise RuntimeError(f"stash carry to {host.name} rc={getattr(proc, 'returncode', '?')}: "
+                           f"{', '.join(map(_stash_label, entries))}: {err.strip()[:200]}")
 
 
 def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional[dict], Optional[str]]:
@@ -769,9 +1332,18 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         return None, "detached_head"
     if not _kwt._clean_on_branch(_P(repo), branch, runner):
         return None, "dirty_tree"
-    if _out("rev-parse", "-q", "--verify", "refs/stash") is not None:
-        # Prism 425d85646d96: a stash lives only in this .git; the re-clone would drop it.
-        return None, "stash_present"
+    # Prism 425d85646d96: a stash lives only in the Studio's git dir and a re-clone drops it. t_d2f06cf6 (operator
+    # design at 2119cc07): it no longer keeps the checkout from being rebuilt; its entries ride to the rebuilt clone
+    # as a bundle (carry_stash) when kanban.placement.worktree_stash_carry is on; off (default, operator split
+    # 07:20 11-12) no stash is read here at all, so none can refuse. With the split switch off, any stash keeps the
+    # old refusal.
+    entries = ()
+    if not worktree_carry_on() or stash_carry_on():
+        entries = stash_entries(repo, runner)
+        if entries is None:
+            return None, "stash_unreadable"
+        if entries and not worktree_carry_on():
+            return None, "stash_present"
     # Prism 38aae6c981c1/62448b5b6868/72087e167990/30ed122cf9a9: a re-clone cannot restore ignored files (datasets,
     # .env, built state). Operator F4: they are carried into the rebuilt clone (carry_clones), except regenerable
     # caches, which are dropped; listed one per FILE so the carry copies exactly these paths.
@@ -795,7 +1367,10 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         if remote and _out("merge-base", "--is-ancestor", remote, local) is None:
             return None, "diverged_from_origin"
         push = (repo, branch, remote, local)
-    return {"slug": slug, "branch": branch, "sha": local, "push": push, "ignored": ignored}, None
+    rec = {"slug": slug, "branch": branch, "sha": local, "push": push, "ignored": ignored}
+    if entries:
+        rec["stash"] = entries
+    return rec, None
 
 
 # Operator F4 (2026-11-10 20:5x): ignored paths a re-clone may DROP because a run regenerates them. Anything else
@@ -831,10 +1406,14 @@ def regenerable_cache(rel: str) -> bool:
     return any(p in REGENERABLE_CACHE_NAMES for p in parts) or any(p.endswith(".egg-info") for p in parts[:-1])
 
 
-def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int) -> Optional[str]:
+def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int, *,
+                     rebuilt: Optional[set] = None, fresh: bool = False, why_not: Optional[dict] = None,
+                     budget: Optional[CarryScanBudget] = None) -> Optional[str]:
     """None when the split carry's remainder (the last :func:`carry_split` census of ``path``, against the caps that
-    census used) PLUS the clones' carried ignored files (``extra_*``) stays within the caps, else the reason naming
-    the cap (operator F4)."""
+    census used) PLUS the clones' carried ignored files (``extra_*``) PLUS every set-aside clone or linked worktree
+    NOT in ``rebuilt`` (t_d2f06cf6 + operator F3: its files ride the carry) stays within the caps, else the reason
+    naming the cap (operator F4) and, per path carried as files, why it is not rebuilt (``why_not``, operator F5).
+    ``rebuilt`` None = every set-aside path is rebuilt (the pre-worktree callers)."""
     try:
         from hermes_cli.kanban_db_workspace import canon
         root = canon(path)
@@ -844,10 +1423,29 @@ def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int) 
     if used is None:
         return "carry census unavailable"
     total, entries = used[0] + extra_bytes, used[1] + extra_entries
+    carried_wt = [] if rebuilt is None else [w for w in _carry_setaside_cache.get(root, ()) if w not in rebuilt]
+    why_not = why_not or {}
+
+    worktrees = set(_carry_worktree_cache.get(root, ()))
+
+    def _named(rel):
+        kind = "worktree" if rel in worktrees else "clone"
+        return f"{kind} {rel} ({why_not[rel]})" if why_not.get(rel) else f"{kind} {rel}"
+    for rel in carried_wt:
+        usage = worktree_usage(os.path.join(str(root), rel), max_bytes=max(0, used[2] - total),
+                               max_entries=max(0, used[3] - entries), fresh=fresh, budget=budget,
+                               max_seconds=CARRY_SPAWN_WALK_SECONDS if fresh else CARRY_SCAN_MAX_SECONDS)
+        if usage is None:
+            if not fresh and os.path.realpath(os.path.join(str(root), rel)) in _worktree_partial:
+                return f"carry census of {_named(rel)} not finished; it resumes next tick"
+            return f"carry census of {_named(rel)} unavailable"
+        total, entries = total + usage[0], entries + usage[1]
+    what = "the clones' ignored files" + (f" and {', '.join(_named(w) for w in carried_wt)} carried as files "
+                                         f"(not rebuildable)" if carried_wt else "")
     if total > used[2]:
-        return f"over the carry byte cap with the clones' ignored files: {total} > {used[2]} bytes"
+        return f"over the carry byte cap with {what}: {total} > {used[2]} bytes"
     if entries > used[3]:
-        return f"over the carry entry cap with the clones' ignored files: {entries} > {used[3]} entries"
+        return f"over the carry entry cap with {what}: {entries} > {used[3]} entries"
     return None
 
 
@@ -857,20 +1455,31 @@ _clone_assess_cache: Dict[tuple, tuple] = {}  # (canonical path, HEAD key) -> (m
 def _clone_head_key(repo: str) -> Optional[tuple]:
     """A no-subprocess fingerprint of the clone's HEAD (review F3): the ``.git/HEAD`` text, the sha its branch ref
     holds (loose ref, else packed-refs) and the index mtime. None (do not cache) when any part cannot be read."""
-    git = os.path.join(repo, ".git")
+    git = common = os.path.join(repo, ".git")
     try:
+        if os.path.isfile(git):
+            # t_d2f06cf6: a linked worktree: HEAD and index in its gitdir, branch refs in the common dir
+            with open(git, encoding="utf-8-sig") as f:
+                line = f.read(4096).strip()
+            if not line.startswith("gitdir: "):
+                return None
+            git = os.path.join(repo, line[8:])
+            common = git
+            if os.path.isfile(os.path.join(git, "commondir")):
+                with open(os.path.join(git, "commondir"), encoding="utf-8-sig") as f:
+                    common = os.path.join(git, f.read().strip())
         with open(os.path.join(git, "HEAD"), encoding="utf-8-sig") as f:
             head = f.read().strip()
         sha = head
         if head.startswith("ref: "):
             ref = head[5:]
-            loose = os.path.join(git, *ref.split("/"))
+            loose = os.path.join(common, *ref.split("/"))
             if os.path.isfile(loose):
                 with open(loose, encoding="utf-8-sig") as f:
                     sha = f.read().strip()
             else:
                 sha = ""
-                with open(os.path.join(git, "packed-refs"), encoding="utf-8-sig") as f:
+                with open(os.path.join(common, "packed-refs"), encoding="utf-8-sig") as f:
                     for line in f:
                         parts = line.split()
                         if len(parts) == 2 and parts[1] == ref:
@@ -954,21 +1563,26 @@ def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable
         return "HEAD unreadable"
     if getattr(cur, "returncode", 1) != 0 or (cur.stdout or "").strip() != sha:
         return f"HEAD moved off {str(sha)[:12]}"
-    try:
-        st = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True, text=True,
-                    encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
+    if worktree_carry_on() and not stash_carry_on():
+        return None  # operator split 07:20: the stash stays on the Studio and is no precondition
+    entries = stash_entries(repo, runner)
+    if entries is None:
         return "stash unreadable"
-    if getattr(st, "returncode", 1) == 0:
+    if entries and not worktree_carry_on():
         return "has a stash"  # Prism 425d85646d96: written since routing; the re-clone would drop it
     return None
 
 
-def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run) -> None:
-    """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
-    pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
-    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
-    from hermes_cli import kanban_worktree_port as _kwt
+def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable = subprocess.run,
+                       reservation: Optional[str] = None) -> list:
+    """Every spawn-time re-check of a split carry (state moved since routing, git state a rebuild or file copy would
+    lose, the caps), uncached, raising on the first refusal. The dispatcher calls it BEFORE ``carry_workspace``
+    copies anything (P2 c-38aac54b3e75a212 / Prism 06179c2d4439) and hands the result to :func:`carry_clones`.
+    Returns ``[(clone, dest, ignored files, (stash entries, bundle bytes))]``. t_d2f06cf6: the stash entries are read
+    afresh here (one written since routing rides too) and their bundle is built before anything is copied, so a
+    failed bundle refuses the spawn naming the entry, with nothing on the pool host. ``reservation``: the card's
+    reservation on ``host``; a stash to carry with none refuses here, before the copy (advisory 03:2x), since the
+    store ssh must run under it (:func:`carry_stash`)."""
     # Every check runs for every clone before anything is pushed, rebuilt or copied (nothing half-carried).
     staged = []
     extra_bytes = extra_entries = 0
@@ -991,14 +1605,76 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
             except OSError:
                 raise RuntimeError(f"carry to {host.name}: clone {c['rel']} ignored file {ign!r} unreadable")
             extra_entries += 1
-        staged.append((c, dest, ignored))
-    if extra_entries:
+        stash = (), None
+        if not _stash_carried():
+            # operator split 07:20 11-12: no stash step; the count left on the Studio is for the record only
+            c["stash_left"] = stash_count(dest, runner)
+        else:
+            entries = stash_entries(dest, runner)
+            if entries is None:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']} stash unreadable")
+            if entries and not reservation:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']}: no placement reservation for this card; "
+                                   f"{', '.join(map(_stash_label, entries))} not carried")
+            if entries:
+                try:
+                    stash = entries, stash_bundle(dest, entries, c["sha"], runner)
+                except StashBundleTimeout as exc:
+                    raise StashBundleTimeout(f"carry to {host.name}: clone {c['rel']}: {exc}")
+                except RuntimeError as exc:
+                    raise RuntimeError(f"carry to {host.name}: clone {c['rel']}: {exc}")
+        staged.append((c, dest, ignored, stash))
+    rebuilt = {c["rel"].strip("/") for c in clones}
+    lost = split_worktree_loss(workspace, clones, runner)
+    if lost is not None:
+        raise RuntimeError(f"carry to {host.name}: {lost}")  # t_d2f06cf6: re-checked uncached, before any push
+    dangling = carried_gitdir_loss(workspace, sorted(set(carry_split_setaside(workspace)) - rebuilt), rebuilt)
+    if dangling is not None:
+        raise RuntimeError(f"carry to {host.name}: {dangling}")  # Prism 805c10f0cb3d: re-read before any push
+    if extra_entries or set(carry_split_setaside(workspace)) - rebuilt:
         # Review F3 (22:1x): the spawn-time list gets the routing's caps again; a file that grew or appeared since
         # routing can push the carry over, and then the spawn fails with the same named reason the wait line uses.
-        over = carry_split_fits(workspace, extra_bytes, extra_entries)
+        # t_d2f06cf6: a clone or linked worktree carried as files (not rebuilt) is re-walked here, uncached.
+        over = carry_split_fits(workspace, extra_bytes, extra_entries, rebuilt=rebuilt, fresh=True)
         if over is not None:
             raise RuntimeError(f"carry to {host.name}: {over}")
-    for c, dest, ignored in staged:
+    return staged
+
+
+def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run,
+                 reservation: Optional[str] = None, staged: Optional[list] = None) -> None:
+    """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
+    pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
+    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run).
+    ``reservation``: the card's reservation on ``host``, threaded to :func:`carry_stash`. ``staged``: the return of
+    the :func:`carry_clones_check` the dispatcher ran before the copy (t_d2f06cf6, operator 02:0x: the stash bundle
+    is built once per spawn); None = run the check here. A ``staged`` result was taken before ``carry_workspace``
+    copied, so each checkout is re-read cheaply first (advisory 03:2x): HEAD and branch unchanged, still clean, and
+    the same stash list. Any difference refuses the spawn naming it; the bundle is never rebuilt in this tick."""
+    from hermes_cli import kanban_worktree_port as _kwt
+    if staged is None:
+        staged = carry_clones_check(host, workspace, clones, runner, reservation=reservation)
+    else:
+        for c, dest, ignored, (entries, _bundle) in staged:
+            moved = clone_moved_since_routing(dest, c["branch"], c["sha"], runner)
+            if moved:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']} {moved} during the copy")
+            # operator 07:20 item 3: the ignored files are listed AGAIN after the copy; a difference refuses, the
+            # same way a moved HEAD does (a file written during the copy would otherwise be left behind)
+            now_ignored = clone_ignored_files(dest, runner)
+            if now_ignored is None:
+                raise RuntimeError(f"carry to {host.name}: cannot list the ignored files of {c['rel']} after the copy")
+            if tuple(now_ignored) != tuple(ignored):
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']} ignored files changed during the copy "
+                                   f"({len(ignored)} staged, {len(now_ignored)} now)")
+            if _stash_carried():
+                now = stash_entries(dest, runner)
+                if now is None:
+                    raise RuntimeError(f"carry to {host.name}: clone {c['rel']} stash unreadable after the copy")
+                if tuple(now) != tuple(entries):
+                    raise RuntimeError(f"carry to {host.name}: clone {c['rel']} stash changed during the copy "
+                                       f"({len(entries)} staged, {len(now)} now)")
+    for c, dest, ignored, (entries, bundle) in staged:
         if c.get("push") is not None:
             _kwt.push_card_branch(tuple(c["push"]), runner)
         route = _kwt.derived_route(c["slug"], fleet_dir, (host.name,))
@@ -1016,6 +1692,9 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
                 raise RuntimeError(f"carry to {host.name}: ignored files of {c['rel']} rc="
                                    f"{getattr(proc, 'returncode', '?')}: "
                                    f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        if entries:
+            # t_d2f06cf6: the Studio checkout's stash entries, stored on the rebuilt clone in their original order
+            carry_stash(host, dest, dest, entries, c["sha"], runner, bundle=bundle, reservation=reservation)
 
 
 def remote_workspace_has_content(placement_raw: Optional[str],
