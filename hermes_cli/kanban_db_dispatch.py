@@ -10190,16 +10190,16 @@ def _default_spawn(
     # "background"/"idle", niceness is inherited across fork/exec, so it covers
     # every process the worker later spawns (terminal-tool children included).
     cpu_priority_mode, cpu_nice = _kb.worker_cpu_priority_config()
-    priority_preexec = _kb._build_worker_priority_preexec(cpu_nice)
     # Process-table ceiling for the whole worker tree (t_368e9873): a
     # self-respawning scratch script held 9,6xx of the uid's 10,666 slots on
     # 2026-10-01 and every fork on the host failed. RLIMIT_NPROC counts the
     # uid, so the worker tree stops at a reserve the gateways still own.
     from hermes_cli import kanban_proc_bounds as _kpb
     nproc_limit = _kpb.resolve_worker_nproc_limit()
-    priority_preexec = _kpb.chain_preexec(
-        priority_preexec, _kpb.worker_nproc_preexec_limit(nproc_limit),
-    )
+    # Both are applied by an exec-form launcher in the child, never a
+    # preexec_fn: a preexec_fn sends the spawn down fork_exec, which on macOS
+    # forks the whole gateway (t_b9a61253). The launcher keeps the pid.
+    limits_prefix = _kpb.worker_limits_launcher_argv(nproc_limit, cpu_nice)
     # macOS: nice alone leaves the worker in the gateway's own QoS class and
     # I/O tier, so worker pytest/git storms still starve the resident gateway
     # (t_14c130aa). Clamp QoS via exec-form taskpolicy; it keeps the pid.
@@ -10212,7 +10212,7 @@ def _default_spawn(
     cmd = _restart_safe_worker_argv(task, cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
-    spawn_cmd = [*darwin_prefix, *cmd]
+    spawn_cmd = [*darwin_prefix, *limits_prefix, *cmd]
     _kb._log.info(
         "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s nproc=%s",
         task.id,
@@ -10224,6 +10224,12 @@ def _default_spawn(
     )
     spawned_at = time.time()
     spawned_boot = _kb._boot_evidence()
+    # No PATH pre-check for the launched argv: with ``limits_prefix`` Popen
+    # finds the launcher, and a worker argv that cannot be exec'd makes the
+    # launcher exit 127, which the reaper already classifies as
+    # ``infra_unavailable`` (requeue, no failure counted; KANBAN_INFRA_EXIT_CODES),
+    # the same remedy as the taskpolicy prefix. A bare Popen still raises
+    # FileNotFoundError -> the RuntimeError below.
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             spawn_cmd,
@@ -10233,7 +10239,6 @@ def _default_spawn(
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
-            preexec_fn=priority_preexec,
             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
         )
     except FileNotFoundError:
