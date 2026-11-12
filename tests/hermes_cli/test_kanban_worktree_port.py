@@ -1829,3 +1829,73 @@ def test_a_clean_worktree_of_repo_a_inside_repo_b_never_ports_b_in_either_persis
                       carry_out=[]) == (None, None)
     assert why == ["own_tree_repo_mismatch"], why
     assert kwt.repo_pin(tid, path, None, kanban_home / "fleet") == ("ace-ai",)
+
+
+# ---- t_f609a5a0: a killed `worktree add` (locked initializing, no index) is named and cleared ----
+
+def _make_half_built(wt: Path, age_s: int) -> Path:
+    import os
+    import time
+    from hermes_cli import kanban_worktree_residue as kwr
+    gitdir = Path(subprocess.run(["git", "-C", str(wt), "rev-parse", "--absolute-git-dir"],
+                                 check=True, capture_output=True, text=True).stdout.strip())
+    (gitdir / "index").unlink()
+    _git("worktree", "lock", "--reason", kwr.INIT_LOCK, str(wt), cwd=wt)
+    if age_s:
+        old = time.time() - age_s
+        os.utime(gitdir / "locked", (old, old))
+    return gitdir
+
+
+def test_a_young_half_built_own_tree_waits_named_not_studio_capability_only(studio_card):
+    """t_33172156: the add was killed 60 s in; placement read own_tree_not_a_checkout and parked it as
+    studio_capability_only for 2 h 20 min. Now the wait names the real reason, which the starvation reporter knows."""
+    from hermes_cli import kanban_placement_starvation as kps
+    tid, wt, bare, calls = studio_card
+    _make_half_built(wt, age_s=0)
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out, studio_on=True)
+    assert route == ("wait", "half_built_worktree (not_portable:workspace_kind:own_tree_half_built_add)"), route
+    assert "studio_capability_only" not in route[1]
+    assert kps.fix_for(route[1].split(" (", 1)[0]) is not None and "worktree remove -f -f" in kps.fix_for(
+        "half_built_worktree")
+    assert wt.is_dir()  # young: an add may still be running, never cleared
+
+
+def test_an_old_half_built_own_tree_is_cleared_and_the_card_ports(studio_card, anchor):
+    tid, wt, bare, calls = studio_card
+    # The incident: wt/<id> was cut from origin/main and has no commits of its own.
+    _git("update-ref", "refs/remotes/origin/main", "main", cwd=anchor)
+    gitdir = _make_half_built(wt, age_s=3600)
+    with kb.connect_closing() as conn:
+        out: dict = {}
+        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out, studio_on=True)
+    assert route == ("portable", None), route
+    assert not wt.exists() and not gitdir.exists()
+    assert subprocess.run(["git", "-C", str(anchor), "branch", "--list", f"wt/{tid}"],
+                          capture_output=True, text=True).stdout.strip() == ""  # empty branch (main tip) dropped
+
+
+def test_an_old_half_built_tree_whose_branch_no_remote_has_keeps_the_branch(studio_card, anchor):
+    tid, wt, bare, calls = studio_card
+    tip = subprocess.run(["git", "-C", str(anchor), "rev-parse", f"wt/{tid}"], capture_output=True,
+                         text=True).stdout.strip()
+    _make_half_built(wt, age_s=3600)
+    with kb.connect_closing() as conn:
+        kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
+    assert not wt.exists()
+    assert subprocess.run(["git", "-C", str(anchor), "rev-parse", f"wt/{tid}"], capture_output=True,
+                          text=True).stdout.strip() == tip  # commits no remote has: the branch stays
+
+
+def test_a_half_built_tree_locked_for_another_reason_is_left_alone(studio_card):
+    tid, wt, bare, calls = studio_card
+    gitdir = Path(subprocess.run(["git", "-C", str(wt), "rev-parse", "--absolute-git-dir"],
+                                 check=True, capture_output=True, text=True).stdout.strip())
+    (gitdir / "index").unlink()
+    _git("worktree", "lock", "--reason", "operator hold", str(wt), cwd=wt)
+    with kb.connect_closing() as conn:
+        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
+    assert "own_tree_not_a_checkout" in (route[1] or ""), route
+    assert wt.is_dir() and (gitdir / "locked").read_text().strip() == "operator hold"
