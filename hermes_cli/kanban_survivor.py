@@ -4036,6 +4036,10 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
                         "survivor_unavailable: workspace changed after its proof "
                         f"({str(repo.relative_to(workspace)) or '.'})")
         if worktree_root is not None:
+            # A finished tree a killed add left locked `initializing` (t_f609a5a0) refuses every remove short of
+            # -f -f; release that stale lock only, so git's own no-force dirty check still decides.
+            from hermes_cli.kanban_worktree_residue import release_stale_add_lock
+            release_stale_add_lock(Path(worktree_root), workspace)
             # Preserve upstream's handle-release retry, still without --force.
             result = _git(worktree_root, "worktree", "remove", str(workspace), check=False)
             if result.returncode:

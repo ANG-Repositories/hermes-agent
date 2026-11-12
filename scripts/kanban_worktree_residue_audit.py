@@ -10,8 +10,10 @@ Modes (all read-only except ``--drain --execute``):
   audit   (default) one row per ``locked initializing`` registration: path, path shape, branch, the card that
           path names and its status, lock age, whether the branch has commits no remote-tracking ref has, and
           the drain verdict. ``--json`` for machine output.
-  --check the sweep: exit 1 and one ``finding:`` line per ``locked initializing`` registration older than
-          ``--min-age-h`` (default 1 h); silent, exit 0, when clean.
+  --check the sweep: exit 1 and one ``finding:`` line per HALF-BUILT registration (locked ``initializing`` AND no
+          index) older than ``--min-age-h`` (default 1 h); silent, exit 0, when clean. A finished tree that still
+          carries the lock (``state`` finished-still-locked) is not a finding: spawn reuse and card-close cleanup
+          release that stale lock (``release_stale_add_lock``).
   --drain prints what the drain WOULD remove (dry run). ``--execute`` removes them.
 
 The drain removes a tree only when every one of these holds (anything else is listed, never touched):
@@ -108,6 +110,8 @@ def attribute(repo: Path, conn, min_age_s: int, now: float) -> list:
         own = kwr.branch_has_own_commits(repo, branch) if branch else False
         card = card_row(conn, name) if dispatcher else None
         why = []
+        state = ("unknown" if admin is None else
+                 "finished-still-locked" if (admin / "index").exists() else "half-built")
         if admin is None:
             why.append(f"{len(admins)} admin dirs name the path")
         elif (admin / "index").exists():
@@ -127,7 +131,7 @@ def attribute(repo: Path, conn, min_age_s: int, now: float) -> list:
             why.append(f"written after the add died: {late}")
         if age is None or age < min_age_s:
             why.append(f"lock age {age}s < {min_age_s}s")
-        rows.append({"path": str(path), "shape": shape, "branch": branch, "head": wt.get("head", ""),
+        rows.append({"path": str(path), "state": state, "shape": shape, "branch": branch, "head": wt.get("head", ""),
                      "card": name if dispatcher else None,
                      "card_status": (card or {}).get("status") if card and card.get("exists") else
                      ("missing" if card else None),
@@ -160,10 +164,12 @@ def main(argv=None) -> int:
     if a.check:
         hits = []
         for r in attribute(repo, None, min_age, now):
-            if r["lock_age_h"] is not None and r["lock_age_h"] * 3600 >= min_age:
+            # Keyed on "no index", never on the lock alone: a finished tree a killed add left locked is a
+            # healthy checkout (Studio 2026-11-11: 150 of 189 locked trees), not a finding.
+            if r["state"] == "half-built" and r["lock_age_h"] is not None and r["lock_age_h"] * 3600 >= min_age:
                 hits.append(r)
         for r in hits:
-            print(f"finding: locked-initializing worktree {r['path']} (branch {r['branch'] or '-'}, "
+            print(f"finding: half-built worktree (locked initializing, no index) {r['path']} (branch {r['branch'] or '-'}, "
                   f"lock {r['lock_age_h']} h old) in {repo}")
         if hits:
             print(f"finding: {len(hits)} half-built worktrees older than {a.min_age_h:g} h in {repo}; "
@@ -193,7 +199,7 @@ def main(argv=None) -> int:
     if a.json:
         print(json.dumps(rows, indent=1))
         return 0
-    cols = ("path", "shape", "branch", "card", "card_status", "card_spawned", "lock_age_h", "branch_own_commits",
+    cols = ("path", "state", "shape", "branch", "card", "card_status", "card_spawned", "lock_age_h", "branch_own_commits",
             "drain", "keep_reason")
     print("\t".join(cols))
     for r in rows:

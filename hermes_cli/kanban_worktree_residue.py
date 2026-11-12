@@ -30,10 +30,14 @@ from typing import Optional, Sequence
 
 INIT_LOCK = "initializing"
 HALF_BUILT_HELD = "half_built_worktree_held"
-ADD_TIMEOUT_S = 60
+# Studio home tree 2026-11-11 (30,578 files, 1,150 registrations, load1 36): two timed adds took 32.0 s and 106.1 s,
+# and 83 of 6,540 spawns in 7 days failed at the old 60 s. 300 s is ~3x the slowest measured add; a run past it is
+# killed whole and cleaned up, so the longer wait costs a slower failure, not a leftover.
+ADD_TIMEOUT_S = 300
+_SLACK_S = 120
 # A half-built tree younger than this may belong to an add that is still running (another dispatcher process):
 # placement only names it. Two add timeouts plus slack.
-HALF_BUILT_MIN_AGE_S = 600
+HALF_BUILT_MIN_AGE_S = 2 * ADD_TIMEOUT_S + _SLACK_S
 _KILL_GRACE_S = 2.0
 
 
@@ -281,7 +285,29 @@ def half_built(repo_root: Path, target: Path, now: Optional[float] = None) -> Op
     return {"admin": str(admin), "age_s": int(age), "branch": branch}
 
 
-def written_after_add(target: Path, admin: Path, slack_s: float = 120.0) -> Optional[str]:
+def release_stale_add_lock(repo_root: Path, target: Path, now: Optional[float] = None) -> bool:
+    """``git worktree unlock`` a FINISHED tree whose ``initializing`` lock outlived its add; True when released.
+
+    Before this module the spawn's ``subprocess.run`` timeout killed only git's parent: the checkout child ran on,
+    wrote the index, and the parent that would have dropped the lock was dead. The tree is a complete checkout
+    (reused and worked in by the next spawn) that stays locked ``initializing`` forever, and card-close cleanup's
+    no-force ``worktree remove`` (``-f`` too) refuses a locked tree, so the tree outlives its card. Released only
+    when it has an index (the checkout finished) and the lock is older than an add can run: nothing is removed,
+    and the caller's ``remove`` keeps git's own dirty check. Never raises."""
+    try:
+        admin = _gitfile_admin(target)
+        if admin is None or lock_reason(admin) != INIT_LOCK or not (admin / "index").exists():
+            return False
+        if (now if now is not None else time.time()) - (admin / "locked").stat().st_mtime \
+                <= ADD_TIMEOUT_S + _SLACK_S:
+            return False
+        u = _git(repo_root, "worktree", "unlock", str(target))
+        return u is not None and u.returncode == 0
+    except Exception:
+        return False
+
+
+def written_after_add(target: Path, admin: Path, slack_s: float = _SLACK_S) -> Optional[str]:
     """A file under ``target`` modified after the add that made it could have been running, else None.
 
     The add writes its checkout between taking the ``initializing`` lock and its kill (at most its timeout), so a

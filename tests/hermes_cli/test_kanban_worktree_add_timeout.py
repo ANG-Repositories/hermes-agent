@@ -17,6 +17,9 @@ from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_worktree_residue as kwr
 
 
+_TXT = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
 def git(repo, *args, check=True):
     return subprocess.run(["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, encoding="utf-8", errors="replace", check=check).stdout.strip()
@@ -203,8 +206,14 @@ def test_audit_drain_removes_only_dispatcher_trees_of_finished_cards(repo, tmp_p
     _half_built(repo, wt / "t_0000beef", "wt/t_0000beef", age_s=10_000)    # no card with that id
     _half_built(repo, wt / "t_0000feed", "wt/t_0000feed", reason="operator", age_s=10_000)
 
+    finished = wt / "t_0000f1f1"                                          # a finished tree still carrying the lock
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_0000f1f1", str(finished), "HEAD")
+    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(finished))
+    _age_tree(finished, Path(git(finished, "rev-parse", "--absolute-git-dir")), 10_000)
+
     chk = _audit("--repo", str(repo), "--check")
-    assert chk.returncode == 1 and chk.stdout.count("finding: locked-initializing") == 4
+    assert chk.returncode == 1 and chk.stdout.count("finding: half-built worktree") == 4, chk.stdout
+    assert "t_0000f1f1" not in chk.stdout                                # keyed on "no index", not on the lock
     dry = _audit("--repo", str(repo), "--db", str(db), "--drain")
     assert dry.returncode == 0 and "would remove" in dry.stdout and dry.stdout.count("would remove") == 1
     assert (wt / "t_0000d0e0").is_dir()                                  # a dry run touches nothing
@@ -212,7 +221,7 @@ def test_audit_drain_removes_only_dispatcher_trees_of_finished_cards(repo, tmp_p
     assert run.returncode == 0, run.stderr
     assert not (wt / "t_0000d0e0").exists() and not done.exists()
     assert git(repo, "branch", "--list", "wt/t_0000d0e0") != ""          # no remote has its tip: branch kept
-    for kept in ("t_000ready", "fold-x", "t_0000beef", "t_0000feed"):
+    for kept in ("t_000ready", "fold-x", "t_0000beef", "t_0000feed", "t_0000f1f1"):
         assert (wt / kept).is_dir(), kept
 
 
@@ -255,7 +264,7 @@ def test_already_exists_never_removes_a_foreign_finished_tree_with_uncommitted_w
     with pytest.raises(RuntimeError, match="already exists"):
         kbw._ensure_git_worktree(repo, target, "wt/t_cardA")
 
-    assert (target / "uncommitted.txt").read_text(encoding="utf-8") == "someone's work\n"
+    assert (target / "uncommitted.txt").read_text(encoding="utf-8-sig") == "someone's work\n"
     assert registrations(repo) == before + 1
     assert git(target, "branch", "--show-current") == "wt/other"
 
@@ -271,7 +280,7 @@ def test_already_exists_never_removes_a_foreign_plain_directory(repo, monkeypatc
     with pytest.raises(RuntimeError, match="already exists"):
         kbw._ensure_git_worktree(repo, target, "wt/t_cardB")
 
-    assert (target / "file.txt").read_text(encoding="utf-8") == "not a worktree\n"
+    assert (target / "file.txt").read_text(encoding="utf-8-sig") == "not a worktree\n"
 
 
 def test_remove_failed_add_keeps_a_registration_that_predates_the_add(repo):
@@ -349,3 +358,80 @@ def test_clear_half_built_deletes_a_branch_the_trunk_already_contains(repo, tmp_
     assert git(repo, "branch", "--list", "wt/t_triv") == ""
     kbw._ensure_git_worktree(repo, target, "wt/t_triv")              # re-created from the trunk
     assert git(target, "branch", "--show-current") == "wt/t_triv"
+
+
+# --- review r2 (operator Studio audit 2026-11-11: 150 of 189 `initializing` locks sit on FINISHED trees) ---------
+
+
+def test_a_parent_only_kill_finishes_the_checkout_but_leaves_the_lock(repo, tmp_path):
+    """The root cause of the 150: the old spawn's subprocess.run timeout killed only git's parent; the checkout
+    child finished (index written) and nobody dropped the lock. The group kill closes that path."""
+    import signal as _sig
+    git(repo, "config", "filter.slow.smudge", "sh -c 'sleep 1; cat'")
+    target = repo / ".worktrees" / "t_parent"
+    p = subprocess.Popen(["git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "wt/t_parent", str(target),
+                          "HEAD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)
+    p.send_signal(_sig.SIGKILL)
+    p.wait()
+    admin = repo / ".git" / "worktrees" / "t_parent"
+    deadline = time.monotonic() + 30
+    while not (admin / "index").exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    time.sleep(0.5)
+    assert (admin / "index").exists() and kwr.lock_reason(admin) == kwr.INIT_LOCK
+    assert git(target, "status", "--porcelain") == ""                # a complete, clean checkout, still locked
+    assert kwr.half_built(repo, target) is None                      # not residue: never cleared as one
+
+
+def _finished_locked(repo, name, age_s):
+    target = repo / ".worktrees" / name
+    git(repo, "worktree", "add", "-q", "-b", f"wt/{name}", str(target), "HEAD")
+    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
+    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
+    if age_s:
+        old = time.time() - age_s
+        os.utime(admin / "locked", (old, old))
+    return target, admin
+
+
+def test_card_close_remove_refuses_a_finished_tree_locked_initializing_without_the_release(repo):
+    """Measured: a no-force and a single -f `worktree remove` both refuse; -f -f is the only override."""
+    target, _ = _finished_locked(repo, "t_close0", 10_000)
+    for args in (("remove",), ("remove", "-f")):
+        r = subprocess.run(["git", "-C", str(repo), "worktree", *args, str(target)], **_TXT)
+        assert r.returncode != 0 and "locked" in r.stderr
+    assert target.is_dir()
+
+
+def test_release_stale_add_lock_unlocks_only_a_finished_tree_older_than_an_add(repo):
+    target, admin = _finished_locked(repo, "t_rel", 10_000)
+    assert kwr.release_stale_add_lock(repo, target) is True
+    assert kwr.lock_reason(admin) is None
+    r = subprocess.run(["git", "-C", str(repo), "worktree", "remove", str(target)], **_TXT)
+    assert r.returncode == 0                                         # card close's no-force remove now succeeds
+
+    young, yadmin = _finished_locked(repo, "t_young2", 0)            # an add may still be finishing
+    assert kwr.release_stale_add_lock(repo, young) is False and kwr.lock_reason(yadmin) == kwr.INIT_LOCK
+    hb = repo / ".worktrees" / "t_hb2"
+    hadmin = _half_built(repo, hb, "wt/t_hb2", age_s=10_000)         # no index: residue, not a finished tree
+    assert kwr.release_stale_add_lock(repo, hb) is False and kwr.lock_reason(hadmin) == kwr.INIT_LOCK
+    other, oadmin = _finished_locked(repo, "t_op", 0)
+    git(repo, "worktree", "unlock", str(other))
+    git(repo, "worktree", "lock", "--reason", "operator: keep", str(other))
+    os.utime(oadmin / "locked", (time.time() - 10_000,) * 2)
+    assert kwr.release_stale_add_lock(repo, other) is False and kwr.lock_reason(oadmin) == "operator: keep"
+
+
+def test_release_keeps_the_dirty_check_a_dirty_finished_tree_is_not_removed(repo):
+    target, _ = _finished_locked(repo, "t_dirty", 10_000)
+    (target / "f0.slow").write_text("edited\n", encoding="utf-8")
+    assert kwr.release_stale_add_lock(repo, target) is True
+    r = subprocess.run(["git", "-C", str(repo), "worktree", "remove", str(target)], **_TXT)
+    assert r.returncode != 0 and (target / "f0.slow").read_text(encoding="utf-8-sig") == "edited\n"
+
+
+def test_spawn_reusing_a_finished_locked_tree_releases_the_stale_lock(repo):
+    target, admin = _finished_locked(repo, "t_reuse", 10_000)
+    kbw._ensure_git_worktree(repo, target, "wt/t_reuse")
+    assert kwr.lock_reason(admin) is None and git(target, "branch", "--show-current") == "wt/t_reuse"
