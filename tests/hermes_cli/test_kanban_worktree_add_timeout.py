@@ -172,3 +172,44 @@ def test_spawn_on_an_old_half_built_tree_clears_it_and_builds_a_real_checkout(re
     kbw._ensure_git_worktree(repo, target, "wt/t_old")
     assert git(target, "status", "--porcelain") == ""                # the index exists again: a real checkout
     assert kwr.half_built(repo, target) is None
+
+
+def _audit(*args):
+    import sys
+    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
+    return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True)
+
+
+def test_audit_drain_removes_only_dispatcher_trees_of_finished_cards(repo, tmp_path):
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, branch_name TEXT)")
+    c.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT)")
+    c.executemany("INSERT INTO tasks VALUES (?, ?, NULL)", [("t_0000d0e0", "done"), ("t_000ready", "ready")])
+    c.executemany("INSERT INTO task_events VALUES (?, 'spawned')", [("t_0000d0e0",), ("t_000ready",)])
+    c.commit()
+    c.close()
+    wt = repo / ".worktrees"
+    done = _half_built(repo, wt / "t_0000d0e0", "wt/t_0000d0e0", age_s=10_000)
+    _half_built(repo, wt / "t_000ready", "wt/t_000ready", age_s=10_000)   # not hex: not a dispatcher id
+    _half_built(repo, wt / "fold-x", "fold-x", age_s=10_000)               # another tool's tree
+    _half_built(repo, wt / "t_0000beef", "wt/t_0000beef", age_s=10_000)    # no card with that id
+    _half_built(repo, wt / "t_0000feed", "wt/t_0000feed", reason="operator", age_s=10_000)
+
+    chk = _audit("--repo", str(repo), "--check")
+    assert chk.returncode == 1 and chk.stdout.count("finding: locked-initializing") == 4
+    dry = _audit("--repo", str(repo), "--db", str(db), "--drain")
+    assert dry.returncode == 0 and "would remove" in dry.stdout and dry.stdout.count("would remove") == 1
+    assert (wt / "t_0000d0e0").is_dir()                                  # a dry run touches nothing
+    run = _audit("--repo", str(repo), "--db", str(db), "--drain", "--execute")
+    assert run.returncode == 0, run.stderr
+    assert not (wt / "t_0000d0e0").exists() and not done.exists()
+    assert git(repo, "branch", "--list", "wt/t_0000d0e0") != ""          # no remote has its tip: branch kept
+    for kept in ("t_000ready", "fold-x", "t_0000beef", "t_0000feed"):
+        assert (wt / kept).is_dir(), kept
+
+
+def test_audit_check_is_silent_when_clean(repo):
+    r = _audit("--repo", str(repo), "--check")
+    assert r.returncode == 0 and r.stdout == ""
