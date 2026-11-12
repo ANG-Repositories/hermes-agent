@@ -303,7 +303,8 @@ def test_over_limit_clone_ahead_on_the_default_branch_waits_and_never_pushes(kan
         assert kwh.assess_clone(str(repo)) == (None, "unpushed_commits_on_default_branch")
         route, plan = _route_carry(conn, tid)
     assert plan is None and route[0] == "wait", route
-    assert "clone repo cannot be rebuilt from origin: unpushed_commits_on_default_branch" in route[1], route
+    # operator F3/F5 (t_d2f06cf6): carried as files (its .git rides along), counted, and the reason names why
+    assert "clone repo (unpushed_commits_on_default_branch) carried as files" in route[1], route
     assert pushed == []
 
 
@@ -349,7 +350,7 @@ def test_over_limit_with_a_dirty_clone_waits_named(kanban_home, small_carry):
         route, plan = _route_carry(conn, tid)
     assert plan is None
     assert route[0] == "wait" and route[1].startswith("studio_capability_only:local_files"), route
-    assert "clone repo cannot be rebuilt from origin: dirty_tree" in route[1], route
+    assert "clone repo (dirty_tree) carried as files" in route[1], route
 
 
 def test_over_limit_clone_with_only_pycache_reclones_and_is_not_refused(kanban_home, small_carry):
@@ -962,3 +963,161 @@ def test_carried_worktree_on_an_unpushed_commit_blocks_the_clone_rebuild(kanban_
         route, plan = _route_carry(conn, tid)
     assert plan is None and route[0] == "wait", route
     assert "holds the git state of worktree mainwt" in route[1], route
+
+
+# -- 1d. operator review of #253 at e62372100f (F1-F5): the three real Studio workspaces moved none ------------------
+
+def _stash_in(repo, msg_branch_checkout=None):
+    """Push one stash entry into ``repo``'s (common) stash list, made from the checkout ``msg_branch_checkout``."""
+    import subprocess
+    from pathlib import Path
+    co = Path(msg_branch_checkout or repo)
+    (co / "big.bin").write_bytes(b"s" * 10)
+    subprocess.run(["git", "-C", str(co), "-c", "user.email=t@t", "-c", "user.name=t", "stash", "push", "-q"],
+                   check=True, capture_output=True)
+
+
+def test_linked_worktree_ignores_a_foreign_stash_in_the_shared_repo(kanban_home, wt_carry):
+    """F1/F2: the live home repo's shared stash list (34 entries, none the worktree's) blocked every worktree.
+    A stash made on another branch belongs to another checkout and stays in the common dir: the worktree moves."""
+    from pathlib import Path
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        outside = Path(path).parent / (Path(path).name + "-outside")
+        outside.mkdir()
+        _clone_in(outside)
+        _stash_in(outside / "repo")  # made on main, in the main checkout
+        sha = _worktree_of(outside, "wt-elsewhere")
+        import shutil
+        import subprocess
+        shutil.move(str(outside / "wt-elsewhere"), str(Path(path) / "repo"))
+        subprocess.run(["git", "-C", str(outside / "repo"), "worktree", "repair", str(Path(path) / "repo")],
+                       check=True, capture_output=True)
+        assert kwh.has_own_stash(str(Path(path) / "repo"), "feat/wt") is False
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait", route
+    assert plan["exclude"] == ("repo",) and plan["clones"][0]["sha"] == sha, plan
+
+
+def test_linked_worktree_own_branch_stash_still_blocks_the_rebuild(kanban_home, wt_carry):
+    """F2: a stash made ON the worktree's branch is its own work: the worktree is not rebuilt (carried as files)."""
+    from pathlib import Path
+    with kb.connect_closing() as conn:
+        _tid, path = _card_with_files(conn)
+        _clone_in(path)
+        _worktree_of(path)
+        _stash_in(Path(path) / "repo", Path(path) / "mainwt")  # "WIP on feat/wt: ..."
+        assert kwh.has_own_stash(str(Path(path) / "mainwt"), "feat/wt") is True
+        kwh._clone_assess_cache.clear()
+        assert kwh.assess_clone(str(Path(path) / "mainwt")) == (None, "stash_present")
+
+
+def test_clone_keeps_the_full_stash_check():
+    """F2: a plain clone owns every stash in its .git, whatever branch it was made on."""
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as d:
+        _clone_in(d)
+        repo = Path(d) / "repo"
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other"], check=True)
+        _stash_in(repo)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "main"], check=True)
+        assert kwh.has_own_stash(str(repo), "main") is True
+
+
+def _fixture_clone(ws, name):
+    """A pytest fixture clone: a .git, no origin (t_8d98e335 holds 30 of them, 117 entries each)."""
+    import subprocess
+    from pathlib import Path
+    repo = Path(ws) / name
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, capture_output=True)
+    (repo / "f.txt").write_text("x\n")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "f"],
+                   check=True)
+
+
+def test_unrebuildable_small_clone_is_carried_as_files_and_counted(kanban_home, small_carry, monkeypatch):
+    """F3: one clone with no origin no longer refuses the whole plan; it is carried as files (its .git with it, so
+    nothing is lost) and it counts toward the caps. At the caps it fits here; the rebuildable clone is rebuilt."""
+    kwh._worktree_usage_cache.clear()
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        sha = _clone_in(path)
+        _fixture_clone(path, "fx/repo0")
+        # cap between "everything" and "everything but the rebuildable clone's 20 kB big.bin" (fs-independent)
+        total = kwh.worktree_usage(path, max_bytes=1 << 30, max_entries=1 << 20, fresh=True)[0]
+        cap = total - 10000
+        monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_bytes", cap)
+        monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_bytes", cap)
+        kwh._worktree_usage_cache.clear()
+        assert not kwh.carry_size_ok(path)  # plain carry refuses it
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait", route
+    assert plan["exclude"] == ("repo",), plan  # the fixture clone is NOT excluded: its files ride the rsync
+    assert [c["rel"] for c in plan["clones"]] == ["repo"] and plan["clones"][0]["sha"] == sha, plan
+
+
+def test_unrebuildable_clones_past_the_caps_wait_named(kanban_home, small_carry, monkeypatch):
+    """F3 + F5: counted, so enough of them break the entry cap; the wait line names each and why."""
+    monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_entries", 60)
+    monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_entries", 60)
+    monkeypatch.setitem(kwh.carry_size_ok.__kwdefaults__, "max_bytes", 1 << 20)
+    monkeypatch.setitem(kwh.carry_split.__kwdefaults__, "max_bytes", 1 << 20)
+    kwh._worktree_usage_cache.clear()
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        for i in range(3):
+            _fixture_clone(path, f"fx/repo{i}")
+        route, plan = _route_carry(conn, tid)
+    assert plan is None and route[0] == "wait", route
+    assert "over the carry entry cap" in route[1] and "clone fx/repo0 (origin_not_github)" in route[1], route
+
+
+def test_slow_worktree_walk_resumes_on_the_next_tick(tmp_path, monkeypatch):
+    """F4: a walk past its time bound is checkpointed, not cached as None; later calls resume and finish it.
+    A fresh (spawn-time) walk never trusts a checkpoint."""
+    kwh._worktree_usage_cache.clear()
+    kwh._worktree_partial.clear()
+    root = tmp_path / "wt"
+    for i in range(6):
+        (root / f"d{i}").mkdir(parents=True)
+        (root / f"d{i}" / "f").write_bytes(b"x" * 100)
+    clock = iter(range(0, 10_000))
+    monkeypatch.setattr(__import__("time"), "monotonic", lambda: float(next(clock)) * 0.001)
+    # each monotonic() call advances 1 ms; a 2.5 ms bound times out after ~1 directory
+    first = kwh.worktree_usage(str(root), max_bytes=1 << 20, max_entries=10_000, max_seconds=0.0025)
+    assert first is None and kwh._worktree_partial, "a slow walk must checkpoint, not give up"
+    seen = None
+    for _ in range(20):
+        seen = kwh.worktree_usage(str(root), max_bytes=1 << 20, max_entries=10_000, max_seconds=0.0025)
+        if seen is not None:
+            break
+    assert seen is not None and seen[1] == 12, seen  # 6 dirs + 6 files
+    assert not kwh._worktree_partial
+    # the finished tally equals one unbounded walk: no directory counted twice or skipped
+    kwh._worktree_usage_cache.clear()
+    assert kwh.worktree_usage(str(root), max_bytes=1 << 20, max_entries=10_000, max_seconds=60, fresh=True) == seen
+
+
+def test_unfinished_worktree_census_waits_with_a_resume_reason(kanban_home, wt_carry, monkeypatch):
+    """F4/F5: the wait line says the census of the named worktree resumes, not a bare `census unavailable`."""
+    from pathlib import Path
+    real = kwh.worktree_usage
+
+    def slow(path, **kw):
+        kwh._worktree_partial[__import__("os").path.realpath(path)] = (0.0, (path,), 0, 0)
+        return None
+    monkeypatch.setattr(kwh, "worktree_usage", slow)
+    monkeypatch.setattr(__import__("time"), "monotonic", lambda: 1.0)
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        _worktree_of(path, detached=True, size=100)
+        route, plan = _route_carry(conn, tid)
+    monkeypatch.setattr(kwh, "worktree_usage", real)
+    assert plan is None and route[0] == "wait", route
+    assert "worktree mainwt (detached_head)" in route[1] and "resumes next tick" in route[1], route

@@ -5595,15 +5595,15 @@ def _carry_split_plan(workspace_path, carry_budget):
         return None, "over the carry limit even without its git clones (or the census is deferred)"
     recs = []
     extra_bytes = extra_entries = 0
-    worktrees = set(_kb._kwh.carry_split_worktrees(workspace_path))
+    why_not = {}
     for rel in clones:
         rec, why = _kb._kwh.assess_clone_cached(os.path.join(workspace_path, rel))
-        if rec is None and rel in worktrees:
-            # t_d2f06cf6: a linked worktree no remote can rebuild (dirty, detached, broken gitdir, ...) is carried
-            # as files and counts toward the caps (carry_split_fits below), never dropped.
-            continue
         if rec is None:
-            return None, f"over the carry limit; clone {rel} cannot be rebuilt from origin: {why}"
+            # t_d2f06cf6 + operator F3: a clone or linked worktree no remote can rebuild (dirty, detached, no
+            # origin, ...) is carried as files and counts toward the caps (carry_split_fits below), never dropped.
+            # A clone copied as files loses nothing: its .git rides with it. F5: the reason rides the wait line.
+            why_not[rel] = why
+            continue
         # operator F4: the clone's non-cache ignored files ride the carry, so they count toward its caps
         for ign in rec.get("ignored") or ():
             try:
@@ -5613,7 +5613,8 @@ def _carry_split_plan(workspace_path, carry_budget):
             extra_entries += 1
         recs.append({"rel": rel, **rec})
     rebuilt = {r["rel"] for r in recs}
-    over = _kb._kwh.carry_split_fits(workspace_path, extra_bytes, extra_entries, rebuilt=rebuilt)
+    over = _kb._kwh.carry_split_fits(workspace_path, extra_bytes, extra_entries, rebuilt=rebuilt, why_not=why_not,
+                                     budget=carry_budget)
     if over is not None:
         return None, over
     if not recs:

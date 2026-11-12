@@ -525,6 +525,9 @@ CARRY_SCAN_TTL_SECONDS = 300
 # CARRY_TICK_SCAN_SECONDS on walks, the rest of its rows are refused uncached and walked on a later tick.
 CARRY_SCAN_MAX_SECONDS = 2.0
 CARRY_TICK_SCAN_SECONDS = 5.0
+# The spawn-time re-walk of a set-aside path carried as files (outside the tick, before an rsync of up to
+# CARRY_TIMEOUT_SECONDS): long enough for any tree under the caps, so a big one does not fail the spawn.
+CARRY_SPAWN_WALK_SECONDS = 30.0
 CARRY_WAIT_FORGET_SECONDS = 900
 CARRIED_EVENT = "workspace_carried"
 # portable() bind rule of a carried card: once carried, every later run binds to the host holding the copy
@@ -535,6 +538,8 @@ _carry_clone_cache: Dict[tuple, tuple] = {}  # skip_clones census key -> clone p
 _carry_split_usage: Dict[object, tuple] = {}  # root -> (bytes, entries, caps) of the last skip_clones census (F4)
 _carry_worktree_cache: Dict[object, tuple] = {}  # root -> linked-worktree rels the last skip_clones census set aside
 _worktree_usage_cache: Dict[str, tuple] = {}  # worktree realpath -> (at, (bytes, entries) or None)
+_carry_setaside_cache: Dict[object, tuple] = {}  # root -> every clone/worktree rel the last skip_clones census set aside
+_worktree_partial: Dict[str, tuple] = {}  # worktree realpath -> (at, pending dirs, bytes, entries) of a timed-out walk
 _carry_waiting: Dict[tuple, tuple] = {}  # cache key -> (budget generation first deferred, last asked); FIFO
 _carry_gen = 0
 # The rsync DESTINATION ``host:path`` is parsed by the remote shell on rsync < 3 (macOS 2.6.9) and by openrsync,
@@ -731,6 +736,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
         _carry_clone_cache[key] = tuple(sorted(clones)) if ok else ()
         _carry_split_usage[root] = (total, entries, max_bytes, max_entries)
         _carry_worktree_cache[root] = tuple(sorted(worktrees)) if ok else ()
+        _carry_setaside_cache[root] = tuple(sorted(clones)) if ok else ()
     return ok
 
 
@@ -782,6 +788,16 @@ def split_worktree_loss(workspace: str, recs, runner: Callable = subprocess.run)
     return None
 
 
+def carry_split_setaside(path: Optional[str]) -> Tuple[str, ...]:
+    """Every clone and linked-worktree rel the last split census of ``path`` set aside (operator F3: one that is
+    not rebuilt is carried as files and counted, so the spawn re-check needs the whole list)."""
+    try:
+        from hermes_cli.kanban_db_workspace import canon
+        return _carry_setaside_cache.get(canon(path), ())
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return ()
+
+
 def carry_split_worktrees(path: Optional[str]) -> Tuple[str, ...]:
     """The linked-worktree rels (a subset of :func:`carry_split`'s) the last split census of ``path`` set aside."""
     try:
@@ -792,10 +808,15 @@ def carry_split_worktrees(path: Optional[str]) -> Tuple[str, ...]:
 
 
 def worktree_usage(path: str, *, max_bytes: int, max_entries: int, fresh: bool = False,
-                   max_seconds: float = CARRY_SCAN_MAX_SECONDS) -> Optional[Tuple[int, int]]:
+                   max_seconds: float = CARRY_SCAN_MAX_SECONDS,
+                   budget: Optional[CarryScanBudget] = None) -> Optional[Tuple[int, int]]:
     """``(bytes, entries)`` of the directory ``path`` (symlinks counted, never followed), or None when the walk
-    errors or outlives ``max_seconds``. Stops once a cap is passed (the tallies then already exceed it). Cached for
-    ``CARRY_SCAN_TTL_SECONDS`` unless ``fresh`` (the spawn-time re-check, review F3)."""
+    errors or has not finished. Stops once a cap is passed (the tallies then already exceed it). Cached for
+    ``CARRY_SCAN_TTL_SECONDS`` unless ``fresh`` (the spawn-time re-check, review F3).
+
+    Operator F4 (t_d2f06cf6): a walk that outlives ``max_seconds`` (or the tick ``budget``) is not a cached refusal.
+    It is checkpointed at a directory boundary and resumed by the next call, so a big carried worktree finishes on a
+    later tick instead of reading ``census unavailable`` on every tick. A ``fresh`` walk never resumes a checkpoint."""
     import stat
     import time as _time
     try:
@@ -808,14 +829,23 @@ def worktree_usage(path: str, *, max_bytes: int, max_entries: int, fresh: bool =
         # a walk stopped at a cap is only a lower bound: reusable while it still exceeds the caps asked now
         if hit[1] is None or hit[2] or hit[1][0] > max_bytes or hit[1][1] > max_entries:
             return hit[1]
+    if budget is not None:
+        if budget.left() <= 0:
+            budget.deferred += 1
+            return None
+        max_seconds = min(max_seconds, budget.left())
     stop = t + max_seconds
-    total = entries = 0
-    pending = [path]
+    part = None if fresh else _worktree_partial.pop(key, None)
+    if part is not None and t - part[0] < CARRY_SCAN_TTL_SECONDS:
+        pending, total, entries = list(part[1]), part[2], part[3]
+    else:
+        pending, total, entries = [path], 0, 0
     usage: Optional[Tuple[int, int]] = None
+    timed_out = False
     try:
         while pending and total <= max_bytes and entries <= max_entries:
             current = pending.pop()
-            if current is not path and os.path.islink(current):
+            if current != path and os.path.islink(current):
                 continue
             with os.scandir(current) as scan:
                 for entry in scan:
@@ -826,11 +856,23 @@ def worktree_usage(path: str, *, max_bytes: int, max_entries: int, fresh: bool =
                         break
                     if stat.S_ISDIR(info.st_mode):
                         pending.append(entry.path)
-            if _time.monotonic() >= stop:
-                raise TimeoutError
-        usage = (total, entries)
-    except (OSError, TimeoutError):
+            # checkpoint only here, after a whole directory: a resumed walk never counts a directory twice
+            if pending and total <= max_bytes and entries <= max_entries and _time.monotonic() >= stop:
+                timed_out = True
+                break
+        if not timed_out:
+            usage = (total, entries)
+    except OSError:
         usage = None
+    if budget is not None:
+        budget.spent_s += max(0.0, _time.monotonic() - t)
+    if timed_out:
+        if len(_worktree_partial) > 4096:
+            _worktree_partial.clear()
+        _worktree_partial[key] = (t, tuple(pending), total, entries)
+        if budget is not None:
+            budget.deferred += 1
+        return None
     if len(_worktree_usage_cache) > 4096:
         _worktree_usage_cache.clear()
     complete = usage is not None and not pending and total <= max_bytes and entries <= max_entries
@@ -857,6 +899,28 @@ def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None
     return clones
 
 
+def has_own_stash(repo: str, branch: str, runner: Callable = subprocess.run) -> Optional[bool]:
+    """True when the checkout at ``repo`` holds a stash a rebuild would leave behind, None when unreadable.
+
+    A clone owns every stash in its .git. A linked worktree shares the stash list of the common git dir with every
+    other checkout of that repo (operator F1/F2, t_d2f06cf6: the live home repo lists 34, none of the worktree's), so
+    only an entry made on its own branch (reflog subject ``WIP on <branch>:`` / ``On <branch>:``) counts; the rest
+    belong to other checkouts and stay in the common dir, which the carry never moves."""
+    try:
+        if not _is_linked_worktree(repo):
+            st = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True,
+                        text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+            return getattr(st, "returncode", 1) == 0
+        st = runner(["git", "-C", repo, "stash", "list", "--format=%gs"], capture_output=True, text=True,
+                    encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(st, "returncode", 1) != 0:
+        return None
+    own = (f"WIP on {branch}:", f"On {branch}:")
+    return any(line.startswith(own) for line in (st.stdout or "").splitlines())
+
+
 def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional[dict], Optional[str]]:
     """``(record, None)`` when the clone at ``repo`` can be rebuilt from origin on a pool host, else
     ``(None, reason)``. The rules are the worktree port's (t_1d2c5939): a GitHub origin, on a branch, nothing
@@ -881,7 +945,10 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         return None, "detached_head"
     if not _kwt._clean_on_branch(_P(repo), branch, runner):
         return None, "dirty_tree"
-    if _out("rev-parse", "-q", "--verify", "refs/stash") is not None:
+    stash = has_own_stash(repo, branch, runner)
+    if stash is None:
+        return None, "stash_unreadable"
+    if stash:
         # Prism 425d85646d96: a stash lives only in this .git; the re-clone would drop it.
         return None, "stash_present"
     # Prism 38aae6c981c1/62448b5b6868/72087e167990/30ed122cf9a9: a re-clone cannot restore ignored files (datasets,
@@ -944,10 +1011,12 @@ def regenerable_cache(rel: str) -> bool:
 
 
 def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int, *,
-                     rebuilt: Optional[set] = None, fresh: bool = False) -> Optional[str]:
+                     rebuilt: Optional[set] = None, fresh: bool = False, why_not: Optional[dict] = None,
+                     budget: Optional[CarryScanBudget] = None) -> Optional[str]:
     """None when the split carry's remainder (the last :func:`carry_split` census of ``path``, against the caps that
-    census used) PLUS the clones' carried ignored files (``extra_*``) PLUS every linked worktree NOT in ``rebuilt``
-    (t_d2f06cf6: its files ride the carry) stays within the caps, else the reason naming the cap (operator F4).
+    census used) PLUS the clones' carried ignored files (``extra_*``) PLUS every set-aside clone or linked worktree
+    NOT in ``rebuilt`` (t_d2f06cf6 + operator F3: its files ride the carry) stays within the caps, else the reason
+    naming the cap (operator F4) and, per path carried as files, why it is not rebuilt (``why_not``, operator F5).
     ``rebuilt`` None = every set-aside path is rebuilt (the pre-worktree callers)."""
     try:
         from hermes_cli.kanban_db_workspace import canon
@@ -958,15 +1027,25 @@ def carry_split_fits(path: Optional[str], extra_bytes: int, extra_entries: int, 
     if used is None:
         return "carry census unavailable"
     total, entries = used[0] + extra_bytes, used[1] + extra_entries
-    carried_wt = [] if rebuilt is None else [w for w in _carry_worktree_cache.get(root, ()) if w not in rebuilt]
+    carried_wt = [] if rebuilt is None else [w for w in _carry_setaside_cache.get(root, ()) if w not in rebuilt]
+    why_not = why_not or {}
+
+    worktrees = set(_carry_worktree_cache.get(root, ()))
+
+    def _named(rel):
+        kind = "worktree" if rel in worktrees else "clone"
+        return f"{kind} {rel} ({why_not[rel]})" if why_not.get(rel) else f"{kind} {rel}"
     for rel in carried_wt:
         usage = worktree_usage(os.path.join(str(root), rel), max_bytes=max(0, used[2] - total),
-                               max_entries=max(0, used[3] - entries), fresh=fresh)
+                               max_entries=max(0, used[3] - entries), fresh=fresh, budget=budget,
+                               max_seconds=CARRY_SPAWN_WALK_SECONDS if fresh else CARRY_SCAN_MAX_SECONDS)
         if usage is None:
-            return f"carry census of worktree {rel} unavailable"
+            if not fresh and os.path.realpath(os.path.join(str(root), rel)) in _worktree_partial:
+                return f"carry census of {_named(rel)} not finished; it resumes next tick"
+            return f"carry census of {_named(rel)} unavailable"
         total, entries = total + usage[0], entries + usage[1]
-    what = "the clones' ignored files" + (f" and worktree {', '.join(carried_wt)} (not rebuildable)"
-                                         if carried_wt else "")
+    what = "the clones' ignored files" + (f" and {', '.join(_named(w) for w in carried_wt)} carried as files "
+                                         f"(not rebuildable)" if carried_wt else "")
     if total > used[2]:
         return f"over the carry byte cap with {what}: {total} > {used[2]} bytes"
     if entries > used[3]:
@@ -1088,12 +1167,10 @@ def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable
         return "HEAD unreadable"
     if getattr(cur, "returncode", 1) != 0 or (cur.stdout or "").strip() != sha:
         return f"HEAD moved off {str(sha)[:12]}"
-    try:
-        st = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True, text=True,
-                    encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
+    stash = has_own_stash(repo, branch, runner)
+    if stash is None:
         return "stash unreadable"
-    if getattr(st, "returncode", 1) == 0:
+    if stash:
         return "has a stash"  # Prism 425d85646d96: written since routing; the re-clone would drop it
     return None
 
@@ -1130,10 +1207,10 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
     lost = split_worktree_loss(workspace, clones, runner)
     if lost is not None:
         raise RuntimeError(f"carry to {host.name}: {lost}")  # t_d2f06cf6: re-checked uncached, before any push
-    if extra_entries or set(carry_split_worktrees(workspace)) - rebuilt:
+    if extra_entries or set(carry_split_setaside(workspace)) - rebuilt:
         # Review F3 (22:1x): the spawn-time list gets the routing's caps again; a file that grew or appeared since
         # routing can push the carry over, and then the spawn fails with the same named reason the wait line uses.
-        # t_d2f06cf6: a linked worktree carried as files (not rebuilt) is re-walked here, uncached.
+        # t_d2f06cf6: a clone or linked worktree carried as files (not rebuilt) is re-walked here, uncached.
         over = carry_split_fits(workspace, extra_bytes, extra_entries, rebuilt=rebuilt, fresh=True)
         if over is not None:
             raise RuntimeError(f"carry to {host.name}: {over}")
