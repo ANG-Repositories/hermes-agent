@@ -274,6 +274,33 @@ def test_identity_only_waits_with_no_pool_plan(home):
         assert res.placement_waits[tid] == "requires_unsatisfied:docker"
 
 
+# -- t_c82eded0: prose_pins_advisory on never drops a HARD class ----------------------
+
+def _prose_on(monkeypatch):
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {
+        "capabilities": "enforce", "body_requires_mode": "enforce", khc.PROSE_KNOB: True}})
+
+
+def test_prose_knob_on_body_sniffed_docker_still_waits(home, monkeypatch):
+    """Apollo review of #255 F1/F3: docker is `soft: false`; prose may not drop it to an advisory."""
+    _prose_on(monkeypatch)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, DOCKER)
+        res, spawned = _tick(conn)
+        assert spawned == [] and not res.placed
+        assert res.placement_waits[tid] == "requires_unsatisfied:docker"
+
+
+def test_prose_knob_on_ssh_sudo_stays_access_bound(home, monkeypatch):
+    _prose_on(monkeypatch)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, "Step 1: ssh ci sudo setpci -s 80:01.1 CAP_EXP+30.w=0003:000f")
+        (route, _aff, out) = _route(conn, tid)
+        assert route[0] == "local"
+        assert "access_bound:ssh-root:ci" in out["reasons"][tid]
+        assert "requires:fleet-ssh" in out["reasons"][tid]
+
+
 def test_worker_env_honours_the_map_hardness(home):
     """b8ddb038892b: KANBAN_PLACEMENT_CAPS uses the same per-class modes as placement."""
     env = json.loads(khc.spawn_env(home / "fleet", {"placement": {"capabilities": "enforce"}}))

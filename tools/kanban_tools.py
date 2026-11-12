@@ -1616,9 +1616,12 @@ def _handle_create(args: dict, **kw) -> str:
             # half; an opt-out (or worker) create keeps today's no-row behaviour.
             home_fallback=bool(boomerang) and not _is_dispatcher_owned_worker())
         from hermes_cli.kanban_boomerang_default import wake_route
+        from hermes_cli.kanban_create_placement import preview_line
+        placement = preview_line(conn, new_tid)  # t_0a5740f3: where it will run, which line decided it
         # ``wake_route``: whether any chat will actually be woken (never assumed).
         return _ok(task_id=new_tid, **landed, **gate, subscribed=subscribed,
                    wake_route=wake_route(conn, new_tid),
+                   **({"placement": placement} if placement else {}),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))

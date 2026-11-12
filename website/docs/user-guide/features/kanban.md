@@ -1171,7 +1171,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 | `lifecycle_channel` | `""` | `platform:chat_id` that receives the notifier's done / ready-for-review / blocked lines instead of the subscriber's chat (e.g. a log channel). The subscriber's agent is still woken. A `needs_input` block on a priority >= 100 card, failure lines, review change requests and triage routing stay in the subscriber's chat. Empty = unchanged. |
-| `lifecycle_digest_seconds` | `0` | With `lifecycle_channel` set: hold its lines and post them as ONE digest message (bounded to one Discord message; overflow folds into a "+N more" tally) once the oldest held line is this many seconds old (`14400` = one post per 4 h). The subscriber's wake is not delayed. `0` = one post per line. |
+| `lifecycle_digest_seconds` | `1800` | With `lifecycle_channel` set: hold its lines and post them as ONE digest message (bounded to one Discord message; overflow folds into a "+N more" tally) once the oldest held line is this many seconds old (`14400` = one post per 4 h). A card that re-enters the same state several times in one window is one line, tagged `×N`. The subscriber's wake is not delayed. `0` = one post per line. |
 | `lifecycle_route` | `"channel"` | With `lifecycle_channel` set: `channel` (default) sends every done / ready-for-review / blocked line to `lifecycle_channel`; review hand-offs still wake the owner and changes-requested stays in the subscriber's chat. `home` (opt-in) posts done / ready-for-review / blocked / changes-requested lines in the card's HOME chat (the origin chat of its home session); `lifecycle_channel` gets a line only when the card has no home (`[no-home]`) or the home cannot be reached (`[home-unreachable:<reason>]`). Re-home a card with `hermes kanban rehome <id> --session <sid>`. |
 | `lifecycle_home_digest_seconds` | `120` | Fold home-chat lines into one post per home chat once the oldest is this old. `0` = one post per line. |
 | `wake_owner_session` | `true` | A card event that needs its owner enqueues a handoff TURN into the card's home session when that session is live in an operator gateway: a `needs_input` block, a block whose reason names a time or precondition, a stalled/crashed/gave-up/timed-out worker, the last blocker of open children going done, or a review handback whose PR is red or dirty. One wake per card per 10 min; all cards due for one session go in one turn. The lifecycle line still posts. A card body line `wake: off` opts that card out. |
@@ -1323,6 +1323,16 @@ entry path adds `requires: studio-state` and create reports the derivation.
 rejection), or `off` (no entry warning, notice, or derivation). Legacy booleans
 remain supported: `true` means `refuse`, `false` means `off`. Refusal is not armed
 by default. An absent or invalid capability map retains the existing safe-local behavior.
+
+Card prose alone never pins a card to the Studio
+(`kanban.placement.prose_pins_advisory`, root config, read per tick, default
+`true`). A `CARD_NEEDS` match, a body-sniffed capability or a skill named in the
+body is recorded as the `placement` event's `advisory` list plus one card comment
+starting `placement advisory:`, and the card starts on a pool host. If the work
+really needs the Studio, the worker blocks with `kind=capability` and the
+dispatcher re-routes it once to `host: studio` with a `requires:` word. A
+`requires:` line, an attached skill, a `host:` pin or a structural fact still
+holds a card. `false` restores the old prose holds.
 
 Legacy bare pins can still reach dispatch. The dispatcher logs their removal at
 WARNING (rate-limited per card) and persists one card comment beginning

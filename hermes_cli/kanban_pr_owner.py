@@ -70,6 +70,7 @@ _META_KEYS = ("pr_url", "pr_urls", "pr")
 _GH_TIMEOUT_SECONDS = 10
 _HEAD_CACHE_TTL = 300
 _HEAD_CACHE: dict = {}
+_STATE_CACHE: dict = {}
 
 HeadCommitFn = Callable[[str, int], Optional[int]]
 
@@ -159,6 +160,8 @@ def running_owners(conn: sqlite3.Connection, targets: set, *, exclude: str = "")
             continue  # an operator `claim --review` never pushes
         heartbeat = max((int(h) for h in (row[6], row[7]) if h), default=None)
         for target in sorted(targets & card_pr_targets(conn, row[0])):
+            if pr_state(*target) == "merged":
+                continue  # merged PR cannot reopen: nothing left to compete for (t_032a0e6f)
             out.append({"task_id": row[0], "assignee": row[1], "since": row[3] or row[2],
                         "run_id": row[5], "last_heartbeat_at": heartbeat,
                         "pr": fmt_pr(target), "repo": target[0], "number": target[1]})
@@ -227,6 +230,29 @@ def pr_head_committed_at(repo: str, number: int, *, refresh: bool = False) -> Op
             when = None
     _HEAD_CACHE[key] = (time.time(), when)
     return when
+
+
+def pr_state(repo: str, number: int) -> Optional[str]:
+    """``"open"`` / ``"merged"`` / ``"closed"`` (unmerged) via REST. None = unknown.
+
+    Incident 2026-11-11 (t_032a0e6f): t_dcf6920a was held ``pr_owner_busy`` for
+    15 min on hermes-home#10552, merged hours earlier. Only a merged PR releases
+    the hold (it cannot be reopened); closed-unmerged and unreadable keep it.
+    open/merged/None are memoized 5 min. Closed-unmerged is never cached.
+    """
+    key = (repo.lower(), int(number))
+    hit = _STATE_CACHE.get(key)
+    if hit and time.time() - hit[0] < _HEAD_CACHE_TTL:
+        return hit[1]
+    pr = _gh_json(f"repos/{repo}/pulls/{number}") or {}
+    state = pr.get("state")
+    if state == "closed" and pr.get("merged") is True:
+        state = "merged"
+    elif state == "closed":
+        return "closed"
+    state = state if state in ("open", "merged") else None
+    _STATE_CACHE[key] = (time.time(), state)
+    return state
 
 
 def owner_is_stale(owner: dict, *, now: Optional[int] = None,

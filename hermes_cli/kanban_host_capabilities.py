@@ -63,6 +63,11 @@ DEFAULT_ENFORCE = ("browser-session", "screen")
 # the pre-t_640a4ea0 hold. An explicit ``requires:`` line is always enforced.
 ADVISORY = "advisory"
 BODY_MODES = (ADVISORY, ENFORCE)
+# kanban.placement.prose_pins_advisory (t_c82eded0, root config, read per tick, default on): a capability
+# inferred from card PROSE (a body sniff, a skill named in the body) that no pool host serves no longer
+# holds an unpinned card on the Studio; it is recorded as an advisory and the card starts on a pool host.
+# Only a declared ``requires:`` line, an attached skill or a structural fact holds it. false = the old hold.
+PROSE_KNOB = "prose_pins_advisory"
 BODY_IGNORED = "requires_body_ignored"
 BODY_IGNORED_EVENT = "placement_body_ignored"
 # ONE comment + ONE #logs line per card held at host=none past one tick.
@@ -74,6 +79,7 @@ HARD, SOFT = "hard", "soft"
 # matched_by values, in the order a pin is attributed (declared beats skill).
 DECLARED, SKILL, NAMED_SKILL, BODY = "declared", "skill", "named_skill", "body"
 _SOURCE_RANK = {DECLARED: 0, SKILL: 1, NAMED_SKILL: 2, BODY: 3}
+PROSE_SOURCES = frozenset({NAMED_SKILL, BODY})   # inferred from card text, never declared (t_c82eded0)
 
 RULE_PREFIX = "requires:"
 UNKNOWN_PREFIX = "unknown:"
@@ -180,6 +186,7 @@ class CapabilityTick:
     enforce: Tuple[str, ...]
     pool_hosts: Tuple[str, ...]
     body_mode: str = ADVISORY
+    prose_advisory: bool = False
 
     def mode_of(self, cap: str) -> str:
         if self.mode == OFF:
@@ -237,6 +244,16 @@ def read_body_mode(kanban_cfg: Any) -> str:
     raw = pl.get("body_requires_mode", ADVISORY) if isinstance(pl, Mapping) else ADVISORY
     mode = str(raw).strip().lower()
     return mode if mode in BODY_MODES else ADVISORY
+
+
+def read_prose_advisory(kanban_cfg: Any) -> bool:
+    """``kanban.placement.prose_pins_advisory`` from the ROOT config (default on). False / "off" / "false" /
+    "no" / 0 is the kill switch; anything else (a typo included) reads as on, the documented default."""
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
+    raw = pl.get(PROSE_KNOB, True) if isinstance(pl, Mapping) else True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("off", "false", "no", "0")
+    return raw is not False and raw != 0
 
 
 def env_value(mode: str, enforce: Iterable[str]) -> str:
@@ -425,7 +442,8 @@ def tick(fleet_dir: Path, kanban_cfg: Any, pool_hosts: Iterable[str]) -> Optiona
         _note_demoted(cmap, _time.monotonic())
     return CapabilityTick(cmap=cmap, mode=eff, enforce=enforce,
                           pool_hosts=tuple(h.lower() for h in pool_hosts or ()),
-                          body_mode=read_body_mode(kanban_cfg))
+                          body_mode=read_body_mode(kanban_cfg),
+                          prose_advisory=read_prose_advisory(kanban_cfg))
 
 
 # -- derivation (s2.2) ------------------------------------------------------
@@ -557,6 +575,12 @@ def _satisfied(cap: str, ctx: CapabilityTick, pin_host: Optional[str]) -> bool:
     return all(cap in _host_caps(ctx, h) for h in hosts)
 
 
+def _hard_class(ctx: CapabilityTick, cap: str) -> bool:
+    """A capability prose may still pin under ``prose_pins_advisory`` (t_c82eded0): the map marks it
+    ``soft: false`` (docker, fleet-ssh, studio-state) or the Studio serves it identity-only."""
+    return ctx.cmap.soft.get(cap) is False or cap in ctx.cmap.identity_only
+
+
 def _first(reqs: List[Requirement]) -> Optional[Requirement]:
     return min(reqs, key=lambda r: (_SOURCE_RANK[r.matched_by], r.cap)) if reqs else None
 
@@ -589,6 +613,17 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         ignored = tuple(r for r in enforced if r.matched_by == BODY and r.cap in ctx.cmap.identity_only
                         and not any(r.cap in _host_caps(ctx, h) for h in ctx.pool_hosts))
         enforced = [r for r in enforced if r not in ignored]
+    if ctx.prose_advisory and pin_host is None:
+        # t_c82eded0: a capability inferred from PROSE (body sniff, a skill named in the body) that no pool
+        # host serves would hold the card on the Studio. It is advice: recorded, the card starts on a pool
+        # host. One a pool host does serve still narrows the take to those hosts (``only`` below).
+        # A HARD class (the map's ``soft: false``: docker, fleet-ssh, studio-state) or an identity-only
+        # capability is never dropped here: those keep their hold or wait (Apollo review of #255, F1).
+        prose = tuple(r for r in enforced if r.matched_by in PROSE_SOURCES
+                      and not _hard_class(ctx, r.cap)
+                      and not any(r.cap in _host_caps(ctx, h) for h in ctx.pool_hosts))
+        ignored += prose
+        enforced = [r for r in enforced if r not in prose]
     warned = [r for r in live if ctx.mode_of(r.cap) == WARN]
     hard = _first([r for r in enforced if r.strength == HARD])
     soft = _first([r for r in enforced if r.strength == SOFT])
@@ -829,6 +864,54 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
         except Exception:
             log.warning("kanban dispatch: could not park %s needs_input (pin lacks %s)",
                         tid, req.cap, exc_info=True)
+
+
+# -- prose-only Studio signals: advisory, with the hand-back named (t_c82eded0) --
+
+PROSE_ADVISORY_PREFIX = "placement advisory:"
+
+
+def prose_advisory_comment(advisories: Iterable[Mapping[str, Any]]) -> str:
+    """The ONE card comment for prose-only Studio signals: what matched, and what a worker on a pool host does
+    when the work really needs the Studio."""
+    seen = []
+    for a in advisories:
+        what = a.get("need") or a.get("capability") or "?"
+        src = "skill named in the body" if a.get("source") == NAMED_SKILL else "body"
+        item = f'{what} ({src}: "{str(a.get("evidence") or "")[:80]}")'
+        if item not in seen:
+            seen.append(item)
+    return (f"{PROSE_ADVISORY_PREFIX} the card text suggests the Mac Studio ({'; '.join(seen)}), but prose no "
+            f"longer pins a card, so it may start on a pool host. If the work truly needs something only the "
+            f"Studio has, stop at once with kanban_block(kind=\"capability\", reason=\"needs <what> only the Studio "
+            f"has; re-run on the Studio\"): the dispatcher re-routes it there once with host: studio and a "
+            f"requires: line. Authors: a line `requires: <capability>` pins on purpose.")
+
+
+def record_prose_advisories(conn, advisories: Mapping[str, Any]) -> List[str]:
+    """Post :func:`prose_advisory_comment` once per card (any earlier advisory comment is the latch).
+    Best-effort: never breaks a tick. Returns the card ids commented this call."""
+    import logging
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as _kbc
+    posted: List[str] = []
+    for tid, adv in (advisories or {}).items():
+        if not adv:
+            continue
+        try:
+            exists = ("SELECT 1 FROM task_comments WHERE task_id = ? AND substr(body, 1, ?) = ? LIMIT 1",
+                      (tid, len(PROSE_ADVISORY_PREFIX), PROSE_ADVISORY_PREFIX))
+            if conn.execute(*exists).fetchone():
+                continue
+            with _kbc.write_txn(conn):
+                if conn.execute(*exists).fetchone():
+                    continue
+                _kb.add_comment(conn, tid, "dispatcher", prose_advisory_comment(adv))
+            posted.append(tid)
+        except Exception:
+            logging.getLogger(__name__).warning("kanban dispatch: could not post the prose advisory on %s", tid,
+                                                exc_info=True)
+    return posted
 
 
 # -- body-sniffed pins: advisory, and a held enforce pin is never silent (t_640a4ea0) --
