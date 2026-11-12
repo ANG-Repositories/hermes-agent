@@ -3572,6 +3572,7 @@ display:
     aux_failure_label: "revisão em segundo plano"
   notice:
     uncompressed_context_overflow: "⚠️ O contexto da sessão (~{tokens} tokens) excede a janela de contexto do modelo (~{context_length} tokens) com a compressão desativada (compression.enabled: false). Use /compact para comprimir o histórico ou ative a compressão em config.yaml."
+    compression_store_unavailable: "⚠️ O contexto excede o limite de compressão (~{tokens} tokens >= {threshold}) mas a compressão não pode ser executada: o armazenamento de compactação está danificado (erro de banco de dados). /compress usa o mesmo armazenamento e não vai ajudar. Use /new para iniciar uma nova sessão."
 explainer:
   no_reply_prefix: "⚠️ Sem resposta: "
   empty_response: "{model} não produziu uma resposta desta vez, mesmo após novas tentativas. Envie `continue` para tentar novamente ou troque de modelo com /model."

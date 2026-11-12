@@ -918,9 +918,15 @@ def _sudo_before_break(remote: str) -> bool:
 def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
                      pin_hosts: Iterable[str] = (),
                      ssh_hosts: Optional[Collection[str]] = None,
-                     canon: Optional[Mapping[str, str]] = None) -> Optional[str]:
+                     canon: Optional[Mapping[str, str]] = None,
+                     served: Collection[str] = ()) -> Optional[str]:
     """The Studio-only ACCESS the card needs, or None: ``ssh-root:<host>`` or
     ``control-plane-read`` (first hit; ssh-root wins on a tie).
+
+    ``served`` (t_79c2259b): ssh aliases whose root access a capability of the
+    map serves on pool hosts (``capabilities.<cap>.ssh_root``, enforced this
+    tick). Such an ``ssh-root:<alias>`` is not Studio-only; the capability
+    layer judges it as a HARD requirement, so the scan moves on to the next hit.
 
     ``ssh-root:<host>``: a body line ``ssh [opts] [user@]<alias> ... sudo ...``
     for a probed alias, with :func:`host_bound_targets`' discipline: only the
@@ -938,6 +944,7 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
     pins = {PIN_ANY, PIN_STUDIO, *(h.lower() for h in (pin_hosts or ()))}
     known = None if ssh_hosts is None else {h.lower() for h in ssh_hosts}
     canon = {k.lower(): v for k, v in (canon or {}).items()}
+    served_set = {s.lower() for s in (served or ()) if s}
     cp_read = False
     for line in (body or "").splitlines():
         m = HOST_PIN_RE.match(line)
@@ -958,6 +965,8 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
                 continue
             at = re.search(rf"(?<![\w.-]){re.escape(target)}(?![\w-])", rest)
             if at and _sudo_before_break(rest[at.end():]):
+                if w in served_set:
+                    continue
                 return _reasons.ssh_root(canon.get(w, w))
         if not cp_read and any(_live_control_plane_path(m.group(1))
                                for m in _CONTROL_PLANE_PATH_RE.finditer(line)):
@@ -1256,7 +1265,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              body_signals: bool = True,
              worktree_hosts: Optional[Tuple[str, ...]] = None,
              studio_reasons: Optional[frozenset] = None,
-             prose_advisory: bool = False) -> Tuple[bool, Optional[str], Optional[str]]:
+             prose_advisory: bool = False,
+             access_served: Collection[str] = ()) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1330,7 +1340,9 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     # no pin and no reach matrix can move it. Decided before host_reach (Momus
     # pass 2 R-F: a stale matrix must not decide the name) and before every pin
     # branch (a pool pin is a contradiction the dispatcher parks needs_input).
-    access = access_bound_for(body, pool)
+    # ``access_served`` (t_79c2259b): ssh-root aliases a pool capability serves; ``requires`` above
+    # already carries that capability as a HARD requirement when no candidate host has it.
+    access = access_bound_for(body, pool, served=access_served)
     if access is not None:
         return False, _reasons.access_bound(access), None
     pin, ignored, _dropped = effective_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None),
@@ -1383,7 +1395,7 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     return True, None, "policy"
 
 
-def access_bound_for(body: Optional[str], pool) -> Optional[str]:
+def access_bound_for(body: Optional[str], pool, *, served: Collection[str] = ()) -> Optional[str]:
     """:func:`access_bound_cap` against this pool's alias vocabulary: the
     reach-matrix aliases plus every known pool host (the same set
     :func:`reach_allowed_hosts` binds on), canonicalised by ``pin_aliases``."""
@@ -1391,7 +1403,7 @@ def access_bound_for(body: Optional[str], pool) -> Optional[str]:
     aliases = (*(getattr(pool, "reach_aliases", ()) or ()), *(h.lower() for h in pool_hosts))
     return access_bound_cap(body, aliases, pin_hosts=pool_hosts,
                             ssh_hosts=getattr(pool, "ssh_hosts", None),
-                            canon=getattr(pool, "pin_aliases", None))
+                            canon=getattr(pool, "pin_aliases", None), served=served)
 
 
 def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
