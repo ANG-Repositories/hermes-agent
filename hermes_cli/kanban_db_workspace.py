@@ -871,6 +871,17 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _hold_half_built(repo_root: Path, target: Path) -> None:
+    """Raise ``WorkspaceUnavailable`` when ``target`` is a tree a killed add left half-built (t_f609a5a0): never
+    reused, never removed here (ruling:t_f609a5a0-no-automatic-deletion). Held, named; an operator inspects it
+    before removing it. Every path that hands a worker an existing linked checkout calls this first."""
+    hb = _kwr.half_built(repo_root, target) if target.exists() else None
+    if hb is not None:
+        from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+        raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is a killed `git worktree add` (locked "
+                                   f"initializing, no index, lock {hb['age_s']}s old); left as git left it")
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``.
 
@@ -883,13 +894,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     branch if needed) so the reused checkout matches the requested branch.
     """
     target = target.expanduser()
-    hb = _kwr.half_built(repo_root, target) if target.exists() else None
-    if hb is not None:
-        # A prior add was killed mid-checkout (t_f609a5a0): never reused, never removed here
-        # (ruling:t_f609a5a0-no-automatic-deletion). Held, named; an operator inspects it before removing it.
-        from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
-        raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is a killed `git worktree add` (locked "
-                                   f"initializing, no index, lock {hb['age_s']}s old); left as git left it")
+    _hold_half_built(repo_root, target)
     repo_common = _git_common_dir(repo_root)
     if (
         target.exists() and repo_common is not None
@@ -1003,6 +1008,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
+        # Prism #265 P1 c-53aef5301a38d84d: this early return hands the immediate-spawn and review lanes an
+        # existing checkout; a half-built one is held here exactly as in _ensure_git_worktree.
+        _hold_half_built(requested, requested)
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
             return requested_resolved, actual_branch

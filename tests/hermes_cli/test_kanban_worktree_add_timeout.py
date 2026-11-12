@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -43,8 +44,20 @@ def repo(tmp_path, monkeypatch):
 
 
 def slow_checkout(repo, pidfile: Path, on=True):
-    git(repo, "config", "filter.slow.smudge",
-        f"sh -c 'echo $$ >> {pidfile}; sleep 60; cat'" if on else "cat")
+    """The smudge filter records its pid and hangs. ``pidfile`` is shell-quoted (Prism #265 P2 c-d5881e1a2f1d7ae5):
+    a tmp path with a space or quote still lands in the file."""
+    script = f"echo $$ >> {shlex.quote(str(pidfile))}; sleep 60; cat"
+    git(repo, "config", "filter.slow.smudge", f"sh -c {shlex.quote(script)}" if on else "cat")
+
+
+def _wait_for(pred, timeout=30.0):
+    """Poll ``pred`` (a readiness marker, never a fixed sleep: Prism #265 P2 c-ca6771b4c8c38a46)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def registrations(repo) -> int:
@@ -60,7 +73,7 @@ def alive(pid: int) -> bool:
 
 
 def test_a_hung_add_is_killed_whole_and_the_spawn_removes_nothing(repo, tmp_path):
-    pidfile = tmp_path / "smudge.pids"
+    pidfile = tmp_path / "smudge pids 'q'"                            # a space and quotes: the path is quoted
     slow_checkout(repo, pidfile)
     target = repo / ".worktrees" / "t_hang"
     before = registrations(repo)
@@ -73,21 +86,58 @@ def test_a_hung_add_is_killed_whole_and_the_spawn_removes_nothing(repo, tmp_path
 
     pids = [int(p) for p in pidfile.read_text(encoding="utf-8-sig").split()]
     assert pids, "the smudge filter never ran: the add did not hang inside its checkout"
-    time.sleep(0.5)
-    assert [p for p in pids if alive(p)] == []                      # no process of the group outlived it
-    # The spawn removes nothing. git's own SIGTERM handler (the group's first signal) may drop its half-built tree
-    # and registration; if the SIGKILL came first, the tree stays half-built, named. The branch always stays.
-    if target.exists():
-        assert kwr.half_built(repo, target) is not None and registrations(repo) == before + 1
-    else:
-        assert registrations(repo) == before
+    assert _wait_for(lambda: not [p for p in pids if alive(p)], 5.0)  # no process of the group outlived it
+    # SIGKILL only: git's SIGTERM cleanup never ran, so the half-built tree, its registration and the branch stay,
+    # named and held for the operator.
+    assert target.is_dir() and kwr.half_built(repo, target) is not None
+    assert registrations(repo) == before + 1
     assert git(repo, "branch", "--list", "wt/t_hang") != ""
 
-    if not target.exists():
-        slow_checkout(repo, pidfile, on=False)
-        kbw._ensure_git_worktree(repo, target, "wt/t_hang")          # the retry checks out the kept branch
-        assert git(target, "branch", "--show-current") == "wt/t_hang"
-        assert git(target, "status", "--porcelain") == ""
+
+def test_a_file_written_into_the_target_before_the_timeout_survives_the_kill(repo, tmp_path):
+    """Prism #265 P1 c-f6873eb7b7d1e8fb: SIGTERM first let `git worktree add` run its own cleanup, which deleted the
+    incomplete tree and a file someone wrote into it. The group gets SIGKILL directly; the file survives."""
+    pidfile = tmp_path / "smudge.pids"
+    slow_checkout(repo, pidfile)
+    target = repo / ".worktrees" / "t_written"
+    seen = {}
+
+    def write_when_hung():
+        # readiness marker: the smudge filter has started, i.e. the add is inside its checkout with the tree locked
+        if _wait_for(lambda: pidfile.exists() and pidfile.read_text(encoding="utf-8-sig").strip(), 20.0):
+            (target / "someones-note.txt").write_text("mine\n", encoding="utf-8")
+            seen["written"] = True
+
+    import threading
+    th = threading.Thread(target=write_when_hung)
+    th.start()
+    with pytest.raises(RuntimeError, match="timed out"):
+        kbw._ensure_git_worktree(repo, target, "wt/t_written")
+    th.join()
+    assert seen.get("written"), "the add never reached its checkout"
+    assert (target / "someones-note.txt").read_text(encoding="utf-8-sig") == "mine\n"
+
+
+def test_an_exceptional_exit_while_waiting_kills_the_group_and_reraises(tmp_path, monkeypatch):
+    """Prism #265 P2 c-038d5f46d9069eb3: KeyboardInterrupt (any BaseException) mid-wait kills the group too."""
+    pidfile = tmp_path / "child pid"
+    calls = {"n": 0}
+    real = subprocess.Popen.communicate
+
+    def interrupted(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            assert _wait_for(lambda: pidfile.exists() and pidfile.read_text(encoding="utf-8-sig").strip(), 10.0)
+            raise KeyboardInterrupt
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
+    inner = f"echo $$ > {shlex.quote(str(pidfile))}; exec sleep 60"
+    script = f"sh -c {shlex.quote(inner)} & wait"                     # a grandchild in the group, not the leader
+    with pytest.raises(KeyboardInterrupt):
+        kwr.run_git_group(["sh", "-c", script], timeout=30)
+    child = int(pidfile.read_text(encoding="utf-8-sig").split()[0])
+    assert _wait_for(lambda: not alive(child), 5.0)
 
 
 def test_a_second_spawn_on_a_half_built_tree_is_held_named_and_touches_nothing(repo, tmp_path):
@@ -230,10 +280,11 @@ def test_no_code_path_in_the_spawn_assess_or_the_residue_module_removes_anything
     spawn and assess() reach are only the read-only ones (plus the unlock of a finished tree)."""
     from hermes_cli import kanban_worktree_port as kwt
     srcs = {
-        "kanban_worktree_residue.py": Path(kwr.__file__).read_text(encoding="utf-8"),
+        "kanban_worktree_residue.py": Path(kwr.__file__).read_text(encoding="utf-8-sig"),
         "kanban_worktree_residue_audit.py": (Path(__file__).resolve().parents[2] / "scripts" /
-                                             "kanban_worktree_residue_audit.py").read_text(encoding="utf-8"),
+                                             "kanban_worktree_residue_audit.py").read_text(encoding="utf-8-sig"),
         "_ensure_git_worktree": _source_of(kbw._ensure_git_worktree),
+        "_hold_half_built": _source_of(kbw._hold_half_built),
         "_half_built_held": _source_of(kwt._half_built_held),
     }
     for name, src in srcs.items():
@@ -244,7 +295,7 @@ def test_no_code_path_in_the_spawn_assess_or_the_residue_module_removes_anything
         assert not hasattr(kwr, gone), gone
     allowed = {"half_built", "release_stale_add_lock", "run_git_group", "WorktreeAddTimeout", "HALF_BUILT_HELD",
                "ADD_TIMEOUT_S"}
-    for fn in (kbw._ensure_git_worktree, kwt._half_built_held, kwt.assess):
+    for fn in (kbw._ensure_git_worktree, kbw._hold_half_built, kwt._half_built_held, kwt.assess):
         src = _source_of(fn)
         used = set(re.findall(r"_kwr\.(\w+)", src))
         assert used <= allowed, (fn.__name__, used - allowed)
@@ -270,11 +321,14 @@ def test_a_parent_only_kill_finishes_the_checkout_but_leaves_the_lock(repo, tmp_
     """The root cause of the 150: the old spawn's subprocess.run timeout killed only git's parent; the checkout
     child finished (index written) and nobody dropped the lock. The group kill closes that path."""
     import signal as _sig
-    git(repo, "config", "filter.slow.smudge", "sh -c 'sleep 1; cat'")
+    started = tmp_path / "smudge started"
+    script = f"echo $$ >> {shlex.quote(str(started))}; sleep 1; cat"
+    git(repo, "config", "filter.slow.smudge", f"sh -c {shlex.quote(script)}")
     target = repo / ".worktrees" / "t_parent"
     p = subprocess.Popen(["git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "wt/t_parent", str(target),
                           "HEAD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.8)
+    # readiness marker, not a fixed sleep: the checkout child is running its first smudge
+    assert _wait_for(lambda: started.exists() and started.read_text(encoding="utf-8-sig").strip(), 30.0)
     p.send_signal(_sig.SIGKILL)
     p.wait()
     admin = repo / ".git" / "worktrees" / "t_parent"
@@ -340,3 +394,75 @@ def test_spawn_reusing_a_finished_locked_tree_releases_the_stale_lock(repo):
     assert kwr.lock_reason(admin) is None and git(target, "branch", "--show-current") == "wt/t_reuse"
 
 
+
+
+# --- review r5 (Prism #265 @9cdae381) ---------------------------------------------------------------------------
+
+
+def test_resolve_holds_a_half_built_requested_checkout_instead_of_returning_it(repo):
+    """Prism #265 P1 c-53aef5301a38d84d: the existing-linked-checkout early return in _resolve_worktree_workspace
+    (immediate-spawn and review lanes) holds a half-built tree like _ensure_git_worktree does, and touches nothing."""
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    target = repo / ".worktrees" / "t_early"
+    admin = _half_built(repo, target, "wt/t_early", age_s=10_000)
+    before = _snapshot_repo(repo)
+
+    class _Task:
+        id = "t_early"
+        workspace_kind = "worktree"
+        workspace_path = str(target)
+        branch_name = "wt/t_early"
+
+    with pytest.raises(WorkspaceUnavailable, match=kwr.HALF_BUILT_HELD):
+        kbw._resolve_worktree_workspace(_Task())
+    assert _snapshot_repo(repo) == before and kwr.lock_reason(admin) == kwr.INIT_LOCK
+
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_fine", str(repo / ".worktrees" / "t_fine"), "HEAD")
+    _Task.id, _Task.workspace_path, _Task.branch_name = "t_fine", str(repo / ".worktrees" / "t_fine"), "wt/t_fine"
+    got, branch = kbw._resolve_worktree_workspace(_Task())               # a finished checkout is still reused
+    assert branch == "wt/t_fine" and Path(got) == (repo / ".worktrees" / "t_fine").resolve()
+
+
+def test_a_failed_rev_parse_is_unknown_not_no_own_commits(repo, monkeypatch):
+    """Prism #265 P1 c-5f2cb908f57d60a2 / c-3bed16991a4b3217: git failing or timing out is None end to end."""
+    git(repo, "branch", "wt/t_rev")
+    assert kwr.rev(repo, "refs/heads/wt/t_rev") == git(repo, "rev-parse", "HEAD")
+    assert kwr.rev(repo, "refs/heads/nope") == ""                       # absent ref: known
+    assert kwr.branch_has_own_commits(repo, "nope") is False
+    assert kwr.sha_has_own_commits(repo, None) is None
+
+    monkeypatch.setattr(kwr, "_git", lambda *a, **k: None)              # timed out / could not run
+    assert kwr.rev(repo, "refs/heads/wt/t_rev") is None
+    assert kwr.branch_has_own_commits(repo, "wt/t_rev") is None
+
+    def broken(*a, **k):
+        return subprocess.CompletedProcess(a, 128, "", "fatal: not a git repository")
+    monkeypatch.setattr(kwr, "_git", broken)                            # git ran and failed
+    assert kwr.rev(repo, "refs/heads/wt/t_rev") is None
+    assert kwr.branch_has_own_commits(repo, "wt/t_rev") is None
+
+
+def test_audit_row_keeps_unknown_own_commits_as_none(repo, monkeypatch):
+    import importlib.util
+    _half_built(repo, repo / ".worktrees" / "t_0000aaaa", "wt/t_0000aaaa", age_s=10_000)
+    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
+    spec = importlib.util.spec_from_file_location("kwr_audit_unknown", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod.kwr, "rev", lambda *a, **k: None)
+    rows = mod.attribute(repo, None, time.time())
+    assert len(rows) == 1 and rows[0]["branch_own_commits"] is None
+
+
+@pytest.mark.parametrize("name", ["t_é x", 't_q"z', "t_bs\\z", "t_n\nl"])
+def test_audit_check_finds_a_half_built_tree_whose_path_git_would_quote(repo, name):
+    """Prism #265 P1 c-3b354bf2730246e2: parsed from `worktree list --porcelain -z`, so non-ASCII, quote, backslash
+    and newline paths are found (state half-built, not unknown) and --check exits 1."""
+    target = repo / ".worktrees" / name
+    _half_built(repo, target, "wt/odd", age_s=10_000)
+    chk = _audit("--repo", str(repo), "--check")
+    assert chk.returncode == 1 and chk.stdout.count("finding: half-built worktree") == 1, chk.stdout
+    js = _audit("--repo", str(repo), "--json")
+    import json as _json
+    rows = _json.loads(js.stdout)
+    assert [r["state"] for r in rows] == ["half-built"] and Path(rows[0]["path"]).name == name

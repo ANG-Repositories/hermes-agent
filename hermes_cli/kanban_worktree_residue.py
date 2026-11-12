@@ -8,8 +8,8 @@ parked it silently for 2 h 20 min.
 
 This module:
 
-* runs the add in its own process group and kills the whole group on timeout (:func:`run_git_group`), so no git
-  child outlives the spawn;
+* runs the add in its own process group and SIGKILLs the whole group on timeout or any exceptional exit
+  (:func:`run_git_group`), so no git child outlives the spawn and git's own SIGTERM cleanup never runs;
 * names a card's own half-built tree (:func:`half_built`, read-only) so placement can say what holds the card;
 * releases a stale ``initializing`` lock on a FINISHED tree (:func:`release_stale_add_lock`; it removes nothing).
 
@@ -33,7 +33,6 @@ HALF_BUILT_HELD = "half_built_worktree_held"
 # killed whole; what it left is named, so the longer wait costs a slower failure, not a silent park.
 ADD_TIMEOUT_S = 300
 _SLACK_S = 120
-_KILL_GRACE_S = 2.0
 
 
 class WorktreeAddTimeout(RuntimeError):
@@ -44,28 +43,22 @@ _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
-    """SIGTERM then SIGKILL the process group ``proc`` leads; reap ``proc``. POSIX; elsewhere ``proc.kill()``."""
+    """SIGKILL the process group ``proc`` leads, then reap ``proc``. POSIX; elsewhere ``proc.kill()``.
+
+    SIGKILL, never SIGTERM first (Prism #265 P1 c-f6873eb7b7d1e8fb): on SIGTERM ``git worktree add`` runs its own
+    cleanup and deletes the incomplete tree, files someone wrote into it included. A killed add's tree is left as
+    git left it (ruling:t_f609a5a0-no-automatic-deletion)."""
     if not hasattr(os, "killpg"):
         proc.kill()
-        proc.wait(timeout=5.0)
-        return
-    for sig, wait in ((signal.SIGTERM, _KILL_GRACE_S), (_SIGKILL, 5.0)):
         try:
-            os.killpg(proc.pid, sig)  # windows-footgun: ok — guarded by hasattr(os, "killpg") above
-        except ProcessLookupError:
-            break
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=wait)
+            proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            continue
-        # The leader is gone; a child may still be alive in the group: SIGKILL the rest (ESRCH = none left).
-        try:
-            os.killpg(proc.pid, _SIGKILL)  # windows-footgun: ok — guarded by hasattr(os, "killpg") above
-        except OSError:
             pass
-        break
+        return
+    try:
+        os.killpg(proc.pid, _SIGKILL)  # windows-footgun: ok — guarded by hasattr(os, "killpg") above
+    except OSError:
+        pass  # ESRCH: the group is already gone
     try:
         proc.wait(timeout=5.0)
     except subprocess.TimeoutExpired:
@@ -87,6 +80,11 @@ def run_git_group(argv: Sequence[str], timeout: float) -> subprocess.CompletedPr
             pass
         raise WorktreeAddTimeout(f"`{' '.join(argv[3:6])} ...` timed out after {timeout:g} seconds "
                                  f"(process group {proc.pid} killed)") from None
+    except BaseException:
+        # KeyboardInterrupt / SystemExit / anything else mid-wait (Prism #265 P2 c-038d5f46d9069eb3): no git child
+        # outlives the caller either.
+        _kill_group(proc)
+        raise
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 
 
@@ -105,9 +103,17 @@ def common_dir(repo: Path) -> Optional[Path]:
     return Path(p.stdout.strip()).resolve()
 
 
-def rev(repo: Path, ref: str) -> str:
+def rev(repo: Path, ref: str) -> Optional[str]:
+    """The commit ``ref`` names; ``""`` = no such ref (``rev-parse -q --verify`` exit 1, nothing on stderr);
+    None = unknown (git failed, timed out or could not run). Prism #265 P1 c-5f2cb908f57d60a2."""
     p = _git(repo, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}")
-    return p.stdout.strip() if p is not None and p.returncode == 0 else ""
+    if p is None:
+        return None
+    if p.returncode == 0 and p.stdout.strip():
+        return p.stdout.strip()
+    if p.returncode == 1 and not (p.stderr or "").strip():
+        return ""
+    return None
 
 
 def _read(path: Path) -> Optional[str]:
@@ -200,8 +206,11 @@ def release_stale_add_lock(repo_root: Path, target: Path, now: Optional[float] =
         return False
 
 
-def sha_has_own_commits(repo_root: Path, tip: str) -> Optional[bool]:
-    """True when ``tip`` is a commit no remote-tracking ref has; None = unknown."""
+def sha_has_own_commits(repo_root: Path, tip: Optional[str]) -> Optional[bool]:
+    """True when ``tip`` is a commit no remote-tracking ref has; False for no tip (``""``); None = unknown (a
+    ``None`` tip, or git failed). Prism #265 P1 c-3bed16991a4b3217: unknown is never reported as False."""
+    if tip is None:
+        return None
     if not tip:
         return False
     p = _git(repo_root, "for-each-ref", "--contains", tip, "--count=1", "--format=%(refname)", "refs/remotes/",

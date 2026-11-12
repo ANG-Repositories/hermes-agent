@@ -11,7 +11,7 @@ read-only; ruling:t_f609a5a0-no-automatic-deletion):
 
   table   (default) one row per ``locked initializing`` registration: path, state, path shape, branch, HEAD, the
           card that path names and its status, whether it ever spawned, lock age, whether the branch has commits
-          no remote-tracking ref has. ``--json`` for machine output.
+          no remote-tracking ref has (empty = unknown: git failed). ``--json`` for machine output.
   --check the sweep: exit 1 and one ``finding:`` line per HALF-BUILT registration (locked ``initializing`` AND no
           index) older than ``--min-age-h`` (default 1 h); silent, exit 0, when clean. No content hashing, no board.
 
@@ -47,15 +47,18 @@ def git(repo: Path, *args: str) -> str:
 
 
 def initializing(repo: Path) -> list:
-    """``[{path, branch, head}]`` of every registration ``worktree list`` reports ``locked initializing``."""
+    """``[{path, branch, head}]`` of every registration ``worktree list`` reports ``locked initializing``.
+
+    ``--porcelain -z`` (Prism #265 P1 c-3b354bf2730246e2): NUL-terminated fields, so a path with a newline, quote,
+    backslash or non-ASCII byte arrives verbatim, never quoted or split, and its admin dir is found."""
     out, cur = [], {}
-    for line in git(repo, "worktree", "list", "--porcelain").splitlines() + [""]:
-        if not line:
+    for field in git(repo, "worktree", "list", "--porcelain", "-z").split("\0"):
+        if not field:  # an empty field ends a record
             if cur.get("locked") == kwr.INIT_LOCK:
                 out.append(cur)
             cur = {}
             continue
-        key, _, val = line.partition(" ")
+        key, _, val = field.partition(" ")
         if key == "worktree":
             cur["path"] = val
         elif key == "branch":
@@ -64,6 +67,8 @@ def initializing(repo: Path) -> list:
             cur["head"] = val
         elif key == "locked":
             cur["locked"] = val
+    if cur.get("locked") == kwr.INIT_LOCK:
+        out.append(cur)
     return out
 
 
