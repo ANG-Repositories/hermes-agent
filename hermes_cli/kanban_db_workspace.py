@@ -883,14 +883,13 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     branch if needed) so the reused checkout matches the requested branch.
     """
     target = target.expanduser()
-    if target.exists() and _kwr.half_built(repo_root, target) is not None:
-        # A prior add was killed mid-checkout (t_f609a5a0): never reuse it. Cleared under the ownership rule
-        # (old enough, on this branch, branch kept when it has commits of its own); else the add below refuses.
-        res = _kwr.clear_half_built(repo_root, target, branch=branch_name)
-        if not res.get("cleared"):
-            from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
-            raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is a killed `git worktree add` "
-                                       f"(locked initializing, no index), not cleared: {res.get('why')}")
+    hb = _kwr.half_built(repo_root, target) if target.exists() else None
+    if hb is not None:
+        # A prior add was killed mid-checkout (t_f609a5a0): never reused, never removed here
+        # (ruling:t_f609a5a0-no-automatic-deletion). Held, named; an operator inspects it before removing it.
+        from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+        raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is a killed `git worktree add` (locked "
+                                   f"initializing, no index, lock {hb['age_s']}s old); left as git left it")
     repo_common = _git_common_dir(repo_root)
     if (
         target.exists() and repo_common is not None
@@ -912,8 +911,6 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
             )
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    created_branch = False
-    base_sha = ""
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
@@ -930,8 +927,6 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
                 target, repo_root,
             )
         args = ["worktree", "add", "--no-track", "-b", branch_name, str(target), base or "HEAD"]
-        created_branch = True
-        base_sha = _kwr.rev(repo_root, base or "HEAD")
     # Anything non-empty at the target that is not a live worktree of this
     # repo (the branch above already reused those) makes `worktree add` refuse
     # "already exists" on every retry (t_5c6c67c5 burned 3 spawns to gave_up).
@@ -940,23 +935,22 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
     if target_occupied(repo_root, target):
         raise dead_stub_hold(repo_root, target)
-    # t_f609a5a0: own process group, killed whole on timeout. A failed or timed-out add removes only what it provably
-    # created: the snapshot taken here is compared after the add, so a tree another process made in the gap between
-    # the check above and the add is never deleted; on "already exists" nothing is removed.
-    pre = _kwr.snapshot(repo_root, target)
+    # t_f609a5a0: own process group, killed whole on timeout, so no git child outlives the spawn. Nothing is removed
+    # after a failed or timed-out add (ruling:t_f609a5a0-no-automatic-deletion): what git left is logged with its
+    # path, the spawn fails, and the next placement names the tree.
     try:
         result = _kwr.run_git_group(["git", "-C", str(repo_root), *args], timeout=_kwr.ADD_TIMEOUT_S)
     except _kwr.WorktreeAddTimeout as exc:
-        undo = _kwr.remove_failed_add(repo_root, target, pre=pre, branch=branch_name, created_branch=created_branch,
-                                      base_sha=base_sha, timed_out=True)
-        raise RuntimeError(f"git worktree add for {target} on branch {branch_name}: {exc}; cleanup: {undo}") \
-            from None
+        _kb._log.warning(
+            "PHASE=kanban_worktree_add_timeout %s (branch %s): %s; left as git left it, path exists: %s",
+            target, branch_name, exc, os.path.lexists(str(target)),
+        )
+        raise RuntimeError(f"git worktree add for {target} on branch {branch_name}: {exc}; "
+                           f"nothing removed, operator: inspect {target} before removing") from None
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
-        undo = _kwr.remove_failed_add(repo_root, target, pre=pre, branch=branch_name, created_branch=created_branch,
-                                      base_sha=base_sha, timed_out=False, already_exists="already exists" in stderr)
         raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}; cleanup: {undo}"
+            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
 
 

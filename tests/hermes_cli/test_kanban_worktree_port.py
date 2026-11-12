@@ -1831,7 +1831,7 @@ def test_a_clean_worktree_of_repo_a_inside_repo_b_never_ports_b_in_either_persis
     assert kwt.repo_pin(tid, path, None, kanban_home / "fleet") == ("ace-ai",)
 
 
-# ---- t_f609a5a0: a killed `worktree add` (locked initializing, no index) is named and cleared ----
+# ---- t_f609a5a0: a killed `worktree add` (locked initializing, no index) is named, never removed ----
 
 def _make_half_built(wt: Path, age_s: int) -> Path:
     import os
@@ -1848,46 +1848,30 @@ def _make_half_built(wt: Path, age_s: int) -> Path:
     return gitdir
 
 
-def test_a_young_half_built_own_tree_waits_named_not_studio_capability_only(studio_card):
+@pytest.mark.parametrize("age_s", [0, 3600])
+def test_a_half_built_own_tree_waits_named_not_studio_capability_only_and_is_untouched(studio_card, anchor, age_s):
     """t_33172156: the add was killed 60 s in; placement read own_tree_not_a_checkout and parked it as
-    studio_capability_only for 2 h 20 min. Now the wait names the real reason, which the starvation reporter knows."""
+    studio_capability_only for 2 h 20 min. Now the wait names the real reason at any age, the reporter's text
+    prescribes no command, and nothing is removed (ruling:t_f609a5a0-no-automatic-deletion)."""
     from hermes_cli import kanban_placement_starvation as kps
     tid, wt, bare, calls = studio_card
-    _make_half_built(wt, age_s=0)
+    _git("update-ref", "refs/remotes/origin/main", "main", cwd=anchor)
+    tip = subprocess.run(["git", "-C", str(anchor), "rev-parse", f"wt/{tid}"], capture_output=True,
+                         text=True).stdout.strip()
+    gitdir = _make_half_built(wt, age_s=age_s)
+    files = sorted(str(p) for p in wt.rglob("*"))
     with kb.connect_closing() as conn:
         out: dict = {}
         route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out, studio_on=True)
     assert route == ("wait", "half_built_worktree (not_portable:workspace_kind:own_tree_half_built_add)"), route
     assert "studio_capability_only" not in route[1]
-    assert kps.fix_for(route[1].split(" (", 1)[0]) is not None and "worktree remove -f -f" in kps.fix_for(
-        "half_built_worktree")
-    assert wt.is_dir()  # young: an add may still be running, never cleared
-
-
-def test_an_old_half_built_own_tree_is_cleared_and_the_card_ports(studio_card, anchor):
-    tid, wt, bare, calls = studio_card
-    # The incident: wt/<id> was cut from origin/main and has no commits of its own.
-    _git("update-ref", "refs/remotes/origin/main", "main", cwd=anchor)
-    gitdir = _make_half_built(wt, age_s=3600)
-    with kb.connect_closing() as conn:
-        out: dict = {}
-        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), worktree_out=out, studio_on=True)
-    assert route == ("portable", None), route
-    assert not wt.exists() and not gitdir.exists()
-    assert subprocess.run(["git", "-C", str(anchor), "branch", "--list", f"wt/{tid}"],
-                          capture_output=True, text=True).stdout.strip() == ""  # empty branch (main tip) dropped
-
-
-def test_an_old_half_built_tree_whose_branch_no_remote_has_keeps_the_branch(studio_card, anchor):
-    tid, wt, bare, calls = studio_card
-    tip = subprocess.run(["git", "-C", str(anchor), "rev-parse", f"wt/{tid}"], capture_output=True,
-                         text=True).stdout.strip()
-    _make_half_built(wt, age_s=3600)
-    with kb.connect_closing() as conn:
-        kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
-    assert not wt.exists()
+    fix = kps.fix_for(route[1].split(" (", 1)[0])
+    assert fix is not None and "inspect before removing" in fix
+    for cmd in ("worktree remove", "-f -f", "reset", "unlock", "branch -D", "git -C", "Fix:"):
+        assert cmd not in fix, cmd
+    assert sorted(str(p) for p in wt.rglob("*")) == files and gitdir.is_dir() and (gitdir / "locked").is_file()
     assert subprocess.run(["git", "-C", str(anchor), "rev-parse", f"wt/{tid}"], capture_output=True,
-                          text=True).stdout.strip() == tip  # commits no remote has: the branch stays
+                          text=True).stdout.strip() == tip
 
 
 def test_a_half_built_tree_locked_for_another_reason_is_left_alone(studio_card):
@@ -1900,24 +1884,3 @@ def test_a_half_built_tree_locked_for_another_reason_is_left_alone(studio_card):
         route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
     assert "own_tree_not_a_checkout" in (route[1] or ""), route
     assert wt.is_dir() and (gitdir / "locked").read_text(encoding="utf-8").strip() == "operator hold"
-
-
-def test_a_half_built_own_tree_that_holds_work_gets_a_fix_that_never_force_removes(studio_card):
-    """Prism #265 P1 1: a tree the cleanup keeps because it holds work waits under its OWN code, and the posted fix
-    for that code never suggests `worktree remove -f -f` (which would delete the work)."""
-    from hermes_cli import kanban_placement_starvation as kps
-    tid, wt, bare, calls = studio_card
-    gitdir = _make_half_built(wt, age_s=3600)
-    (wt / "notes.md").write_text("written into the dead tree", encoding="utf-8")   # untracked: work, whatever its mtime
-    import os
-    import time
-    old = time.time() - 3600
-    os.utime(wt / "notes.md", (old, old))
-    with kb.connect_closing() as conn:
-        route = kbd._route_row(conn, _row(conn, tid), _plan(free=2), studio_on=True)
-    assert route == ("wait", "half_built_worktree_holds_work "
-                             "(not_portable:workspace_kind:own_tree_half_built_holds_work)"), route
-    fix = kps.fix_for(route[1].split(" (", 1)[0])
-    assert fix is not None and "-f -f" not in fix and "remove -f" not in fix, fix
-    assert "-f -f" in kps.fix_for("half_built_worktree")              # the no-work code keeps its fix
-    assert wt.is_dir() and (wt / "notes.md").is_file() and gitdir.is_dir()

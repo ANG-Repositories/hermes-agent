@@ -1,4 +1,4 @@
-"""A timed-out ``git worktree add`` leaves nothing behind (t_f609a5a0).
+"""A timed-out ``git worktree add`` is killed whole and named; nothing is ever deleted (t_f609a5a0).
 
 The hang is a REAL git: a smudge filter that sleeps runs inside the add's ``git reset --hard`` child, i.e. inside
 the window where git holds the new tree locked ``initializing`` and has not written its index yet, the exact state
@@ -7,6 +7,7 @@ t_33172156's spawn left on the Studio. The filter records its pid so the test ca
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -58,50 +59,47 @@ def alive(pid: int) -> bool:
     return True
 
 
-def test_a_hung_add_is_killed_whole_and_leaves_nothing_then_a_second_spawn_succeeds(repo, tmp_path):
+def test_a_hung_add_is_killed_whole_and_the_spawn_removes_nothing(repo, tmp_path):
     pidfile = tmp_path / "smudge.pids"
     slow_checkout(repo, pidfile)
     target = repo / ".worktrees" / "t_hang"
     before = registrations(repo)
 
     t0 = time.monotonic()
-    with pytest.raises(RuntimeError, match="timed out after 2 seconds"):
+    with pytest.raises(RuntimeError, match="timed out after 2 seconds") as ei:
         kbw._ensure_git_worktree(repo, target, "wt/t_hang")
     assert time.monotonic() - t0 < 30
+    assert "nothing removed" in str(ei.value) and "inspect" in str(ei.value)
 
     pids = [int(p) for p in pidfile.read_text(encoding="utf-8-sig").split()]
     assert pids, "the smudge filter never ran: the add did not hang inside its checkout"
     time.sleep(0.5)
     assert [p for p in pids if alive(p)] == []                      # no process of the group outlived it
-    assert not target.exists()                                       # the path is gone
-    assert registrations(repo) == before                             # the registration is gone
-    assert not list((repo / ".git" / "worktrees").glob("*")) if (repo / ".git" / "worktrees").exists() else True
-    assert git(repo, "branch", "--list", "wt/t_hang") == ""          # the branch it created is gone
+    # The spawn removes nothing. git's own SIGTERM handler (the group's first signal) may drop its half-built tree
+    # and registration; if the SIGKILL came first, the tree stays half-built, named. The branch always stays.
+    if target.exists():
+        assert kwr.half_built(repo, target) is not None and registrations(repo) == before + 1
+    else:
+        assert registrations(repo) == before
+    assert git(repo, "branch", "--list", "wt/t_hang") != ""
 
-    slow_checkout(repo, pidfile, on=False)
-    kbw._ensure_git_worktree(repo, target, "wt/t_hang")              # the retry starts clean
-    assert git(target, "branch", "--show-current") == "wt/t_hang"
-    assert git(target, "status", "--porcelain") == ""
-    assert registrations(repo) == before + 1
+    if not target.exists():
+        slow_checkout(repo, pidfile, on=False)
+        kbw._ensure_git_worktree(repo, target, "wt/t_hang")          # the retry checks out the kept branch
+        assert git(target, "branch", "--show-current") == "wt/t_hang"
+        assert git(target, "status", "--porcelain") == ""
 
 
-def test_a_timed_out_add_never_deletes_a_branch_it_did_not_create(repo, tmp_path):
-    git(repo, "branch", "wt/t_mine")
-    other = tmp_path / "scratch"
-    git(repo, "worktree", "add", "-q", str(other), "wt/t_mine")
-    (other / "work.txt").write_text("commits of its own\n", encoding="utf-8")
-    git(other, "add", "work.txt")
-    git(other, "commit", "-qm", "own work")
-    own = git(repo, "rev-parse", "wt/t_mine")
-    git(repo, "worktree", "remove", str(other))
-    slow_checkout(repo, tmp_path / "pids")
-    target = repo / ".worktrees" / "t_mine"
-
-    with pytest.raises(RuntimeError, match="timed out"):
-        kbw._ensure_git_worktree(repo, target, "wt/t_mine")
-
-    assert not target.exists()
-    assert git(repo, "rev-parse", "wt/t_mine") == own                # pre-existing branch, untouched
+def test_a_second_spawn_on_a_half_built_tree_is_held_named_and_touches_nothing(repo, tmp_path):
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    target = repo / ".worktrees" / "t_y2"
+    admin = _half_built(repo, target, "wt/t_y2", age_s=10_000)
+    files = sorted(p.name for p in target.iterdir())
+    with pytest.raises(WorkspaceUnavailable, match=kwr.HALF_BUILT_HELD):
+        kbw._ensure_git_worktree(repo, target, "wt/t_y2")
+    assert sorted(p.name for p in target.iterdir()) == files
+    assert admin.is_dir() and kwr.lock_reason(admin) == kwr.INIT_LOCK and not (admin / "index").exists()
+    assert git(repo, "branch", "--list", "wt/t_y2") != ""
 
 
 def _half_built(repo, target, branch, reason=kwr.INIT_LOCK, age_s=0):
@@ -122,66 +120,14 @@ def _age_tree(target: Path, admin: Path, age_s: int) -> None:
         os.utime(p, (old, old))
 
 
-def test_a_lock_reason_other_than_initializing_is_never_touched(repo):
+def test_half_built_names_only_an_initializing_tree_without_an_index(repo):
     target = repo / ".worktrees" / "t_keep"
-    admin = _half_built(repo, target, "wt/t_keep", reason="operator: keep this", age_s=10_000)
-
-    assert kwr.half_built(repo, target) is None
-    assert kwr.clear_half_built(repo, target, branch="wt/t_keep")["cleared"] is False
-    rep = kwr.remove_failed_add(repo, target, pre={"absent": True, "admins": []}, branch="wt/t_keep",
-                                created_branch=True, base_sha=git(repo, "rev-parse", "HEAD"), timed_out=True)
-    assert rep["kept"] and not rep["removed"] and not rep["branch_deleted"]
-    assert kwr.drain_half_built(repo, target, branch="wt/t_keep",
-                                branch_sha=git(repo, "rev-parse", "wt/t_keep"))["kept"]
-    assert target.is_dir() and admin.is_dir()
-    assert git(repo, "branch", "--list", "wt/t_keep") != ""
-
-
-def test_a_half_built_tree_is_cleared_but_a_branch_with_its_own_commits_is_kept(repo):
-    git(repo, "branch", "wt/t_own")
-    tmp = repo.parent / "own"
-    git(repo, "worktree", "add", "-q", str(tmp), "wt/t_own")
-    (tmp / "x.txt").write_text("x\n", encoding="utf-8")
-    git(tmp, "add", "x.txt")
-    git(tmp, "commit", "-qm", "own")
-    own = git(repo, "rev-parse", "wt/t_own")
-    git(repo, "worktree", "remove", str(tmp))
-    target = repo / ".worktrees" / "t_own"
-    git(repo, "worktree", "add", "-q", str(target), "wt/t_own")
-    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
-    (admin / "index").unlink()
-    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
-    _age_tree(target, admin, 10_000)
-
-    res = kwr.clear_half_built(repo, target, branch="wt/t_own")
-
-    assert res["cleared"] is True and res["branch_kept"] is True
-    assert not target.exists() and not admin.exists()
-    assert git(repo, "rev-parse", "wt/t_own") == own
-
-
-def test_a_young_half_built_tree_is_named_not_cleared(repo):
-    target = repo / ".worktrees" / "t_young"
-    _half_built(repo, target, "wt/t_young")
-    res = kwr.clear_half_built(repo, target, branch="wt/t_young")
-    assert res["cleared"] is False and "initializing lock is" in res["why"]
-    assert target.is_dir()
-
-
-def test_spawn_on_a_young_half_built_tree_is_held_uncharged_named(repo):
-    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
-    target = repo / ".worktrees" / "t_y2"
-    _half_built(repo, target, "wt/t_y2")
-    with pytest.raises(WorkspaceUnavailable, match=kwr.HALF_BUILT_HELD):
-        kbw._ensure_git_worktree(repo, target, "wt/t_y2")
-
-
-def test_spawn_on_an_old_half_built_tree_clears_it_and_builds_a_real_checkout(repo):
-    target = repo / ".worktrees" / "t_old"
-    _half_built(repo, target, "wt/t_old", age_s=10_000)
-    kbw._ensure_git_worktree(repo, target, "wt/t_old")
-    assert git(target, "status", "--porcelain") == ""                # the index exists again: a real checkout
-    assert kwr.half_built(repo, target) is None
+    _half_built(repo, target, "wt/t_keep", reason="operator: keep this", age_s=10_000)
+    assert kwr.half_built(repo, target) is None                       # another lock reason: not this module's
+    hb = repo / ".worktrees" / "t_hb"
+    _half_built(repo, hb, "wt/t_hb", age_s=10_000)
+    got = kwr.half_built(repo, hb)
+    assert got is not None and got["branch"] == "wt/t_hb" and got["age_s"] >= 9_000
 
 
 def _audit(*args):
@@ -190,40 +136,48 @@ def _audit(*args):
     return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, encoding="utf-8")
 
 
-def test_audit_drain_removes_only_dispatcher_trees_of_finished_cards(repo, tmp_path):
+def _snapshot_repo(repo) -> tuple:
+    """Everything the audit could change: registrations + their lock files, refs, the tree files."""
+    wts = git(repo, "worktree", "list", "--porcelain")
+    refs = git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    files = sorted(str(p.relative_to(repo)) for p in (repo / ".worktrees").rglob("*")) \
+        if (repo / ".worktrees").exists() else []
+    return wts, refs, files
+
+
+def test_audit_is_read_only_and_check_keys_on_no_index(repo, tmp_path):
     import sqlite3
     db = tmp_path / "kanban.db"
     c = sqlite3.connect(db)
     c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, branch_name TEXT)")
     c.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT)")
-    c.executemany("INSERT INTO tasks VALUES (?, ?, NULL)", [("t_0000d0e0", "done"), ("t_000ready", "ready")])
-    c.executemany("INSERT INTO task_events VALUES (?, 'spawned')", [("t_0000d0e0",), ("t_000ready",)])
+    c.execute("INSERT INTO tasks VALUES ('t_0000d0e0', 'done', NULL)")
+    c.execute("INSERT INTO task_events VALUES ('t_0000d0e0', 'spawned')")
     c.commit()
     c.close()
     wt = repo / ".worktrees"
-    done = _half_built(repo, wt / "t_0000d0e0", "wt/t_0000d0e0", age_s=10_000)
-    _half_built(repo, wt / "t_000ready", "wt/t_000ready", age_s=10_000)   # not hex: not a dispatcher id
+    _half_built(repo, wt / "t_0000d0e0", "wt/t_0000d0e0", age_s=10_000)
     _half_built(repo, wt / "fold-x", "fold-x", age_s=10_000)               # another tool's tree
-    _half_built(repo, wt / "t_0000beef", "wt/t_0000beef", age_s=10_000)    # no card with that id
     _half_built(repo, wt / "t_0000feed", "wt/t_0000feed", reason="operator", age_s=10_000)
-
     finished = wt / "t_0000f1f1"                                          # a finished tree still carrying the lock
     git(repo, "worktree", "add", "-q", "-b", "wt/t_0000f1f1", str(finished), "HEAD")
     git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(finished))
     _age_tree(finished, Path(git(finished, "rev-parse", "--absolute-git-dir")), 10_000)
+    before = _snapshot_repo(repo)
 
     chk = _audit("--repo", str(repo), "--check")
-    assert chk.returncode == 1 and chk.stdout.count("finding: half-built worktree") == 4, chk.stdout
+    assert chk.returncode == 1 and chk.stdout.count("finding: half-built worktree") == 2, chk.stdout
     assert "t_0000f1f1" not in chk.stdout                                # keyed on "no index", not on the lock
-    dry = _audit("--repo", str(repo), "--db", str(db), "--drain")
-    assert dry.returncode == 0 and "would remove" in dry.stdout and dry.stdout.count("would remove") == 1
-    assert (wt / "t_0000d0e0").is_dir()                                  # a dry run touches nothing
-    run = _audit("--repo", str(repo), "--db", str(db), "--drain", "--execute")
-    assert run.returncode == 0, run.stderr
-    assert not (wt / "t_0000d0e0").exists() and not done.exists()
-    assert git(repo, "branch", "--list", "wt/t_0000d0e0") != ""          # no remote has its tip: branch kept
-    for kept in ("t_000ready", "fold-x", "t_0000beef", "t_0000feed", "t_0000f1f1"):
-        assert (wt / kept).is_dir(), kept
+    assert "worktree remove" not in chk.stdout and "reset" not in chk.stdout
+    tab = _audit("--repo", str(repo), "--db", str(db))
+    assert tab.returncode == 0, tab.stderr
+    assert "t_0000d0e0\thalf-built" in tab.stdout and "finished-still-locked" in tab.stdout
+    assert "\tdone\tTrue\t" in tab.stdout
+    js = _audit("--repo", str(repo), "--db", str(db), "--json")
+    assert js.returncode == 0 and '"state": "half-built"' in js.stdout
+    for gone in ("--drain", "--execute"):
+        assert _audit("--repo", str(repo), gone).returncode == 2         # argparse: no such option any more
+    assert _snapshot_repo(repo) == before                                # nothing changed
 
 
 def test_audit_check_is_silent_when_clean(repo):
@@ -231,134 +185,82 @@ def test_audit_check_is_silent_when_clean(repo):
     assert r.returncode == 0 and r.stdout == ""
 
 
-def test_a_half_built_tree_someone_wrote_into_after_the_add_died_is_kept(repo):
-    target = repo / ".worktrees" / "t_late"
-    _half_built(repo, target, "wt/t_late", age_s=10_000)
-    (target / "notes.txt").write_text("written into the dead tree by hand\n", encoding="utf-8")
-    res = kwr.clear_half_built(repo, target, branch="wt/t_late")
-    assert res["cleared"] is False and "written after the add died" in res["why"]
-    assert (target / "notes.txt").is_file()
+def test_audit_check_does_no_content_hashing(repo, monkeypatch):
+    """Prism #265 P2 c-7d3a831f652c416d: the sweep reads admin-dir files only, never per-row git."""
+    import importlib.util
+    target = repo / ".worktrees" / "t_cheap"
+    _half_built(repo, target, "wt/t_cheap", age_s=10_000)
+    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
+    spec = importlib.util.spec_from_file_location("kwr_audit_cheap", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def boom(*a, **k):
+        raise AssertionError("per-row git call in --check")
+    monkeypatch.setattr(mod.kwr, "branch_has_own_commits", boom)
+    monkeypatch.setattr(mod.kwr, "rev", boom)
+    assert mod.main(["--repo", str(repo), "--check"]) == 1
 
 
-# --- review r1 (Apollo, hermes-agent#265 @329537e1): a failed add never deletes what it did not create ----------
+# --- ruling:t_f609a5a0-no-automatic-deletion: nothing in the spawn, assess() or this module deletes ---------------
 
 
-def _race(monkeypatch, make_foreign):
-    """The check-then-act gap: ``make_foreign`` runs after the spawn's occupied check passed, before its add."""
-    from hermes_cli import kanban_worktree_stub as kws
-
-    def occupied_then_raced(repo_root, target):
-        make_foreign(target)
-        return False
-    monkeypatch.setattr(kws, "target_occupied", occupied_then_raced)
+_DESTRUCTIVE = ("rmtree", "rmdir", "os.remove", ".unlink(", '"-d"', '"-D"', '"prune"', '"remove"')
 
 
-def test_already_exists_never_removes_a_foreign_finished_tree_with_uncommitted_work(repo, monkeypatch):
-    target = repo / ".worktrees" / "t_cardA"
-
-    def foreign(t):
-        git(repo, "worktree", "add", "-q", "-b", "wt/other", str(t), "HEAD")
-        (t / "uncommitted.txt").write_text("someone's work\n", encoding="utf-8")
-    _race(monkeypatch, foreign)
-    before = registrations(repo)
-
-    with pytest.raises(RuntimeError, match="already exists"):
-        kbw._ensure_git_worktree(repo, target, "wt/t_cardA")
-
-    assert (target / "uncommitted.txt").read_text(encoding="utf-8-sig") == "someone's work\n"
-    assert registrations(repo) == before + 1
-    assert git(target, "branch", "--show-current") == "wt/other"
+def _source_of(func) -> str:
+    import inspect
+    import textwrap
+    return textwrap.dedent(inspect.getsource(func))
 
 
-def test_already_exists_never_removes_a_foreign_plain_directory(repo, monkeypatch):
-    target = repo / ".worktrees" / "t_cardB"
-
-    def foreign(t):
-        t.mkdir(parents=True)
-        (t / "file.txt").write_text("not a worktree\n", encoding="utf-8")
-    _race(monkeypatch, foreign)
-
-    with pytest.raises(RuntimeError, match="already exists"):
-        kbw._ensure_git_worktree(repo, target, "wt/t_cardB")
-
-    assert (target / "file.txt").read_text(encoding="utf-8-sig") == "not a worktree\n"
+def _calls_in(src: str) -> set:
+    import ast
+    names = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Call):
+            f = node.func
+            names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+    return names
 
 
-def test_remove_failed_add_keeps_a_registration_that_predates_the_add(repo):
-    """Function level, both shapes, without the stderr hint: the snapshot alone keeps them."""
-    target = repo / ".worktrees" / "t_pre"
-    git(repo, "worktree", "add", "-q", "-b", "wt/pre", str(target), "HEAD")
-    (target / "u.txt").write_text("u\n", encoding="utf-8")
-    pre = kwr.snapshot(repo, target)
-    rep = kwr.remove_failed_add(repo, target, pre=pre, branch="wt/t_pre", created_branch=False,
-                                base_sha=git(repo, "rev-parse", "HEAD"), timed_out=True)
-    assert not rep["removed"] and (target / "u.txt").is_file() and kwr.admin_dirs_for(kwr.common_dir(repo), target)
-
-    plain = repo / ".worktrees" / "t_plain"
-    plain.mkdir()
-    (plain / "f").write_text("f\n", encoding="utf-8")
-    pre = kwr.snapshot(repo, plain)
-    rep = kwr.remove_failed_add(repo, plain, pre=pre, branch="wt/t_plain", created_branch=False, base_sha="",
-                                timed_out=True)
-    assert not rep["removed"] and (plain / "f").is_file()
-
-
-def test_a_finished_tree_that_appeared_during_a_timed_out_add_is_kept(repo):
-    """New since the snapshot, but it has an index (a concurrent add that finished): not this add's residue."""
-    target = repo / ".worktrees" / "t_conc"
-    pre = kwr.snapshot(repo, target)
-    git(repo, "worktree", "add", "-q", "-b", "wt/t_conc", str(target), "HEAD")
-    (target / "w.txt").write_text("w\n", encoding="utf-8")
-    rep = kwr.remove_failed_add(repo, target, pre=pre, branch="wt/t_conc", created_branch=True,
-                                base_sha=git(repo, "rev-parse", "HEAD"), timed_out=True)
-    assert not rep["removed"] and (target / "w.txt").is_file()
-    assert not rep["branch_deleted"]                                 # checked out in that tree
+def test_no_code_path_in_the_spawn_assess_or_the_residue_module_removes_anything():
+    """Static: the add path, assess() + its half-built probe, the residue module and the audit script carry no
+    worktree remove / prune, rmtree / rmdir / unlink, update-ref -d or branch -D, and the residue functions the
+    spawn and assess() reach are only the read-only ones (plus the unlock of a finished tree)."""
+    from hermes_cli import kanban_worktree_port as kwt
+    srcs = {
+        "kanban_worktree_residue.py": Path(kwr.__file__).read_text(encoding="utf-8"),
+        "kanban_worktree_residue_audit.py": (Path(__file__).resolve().parents[2] / "scripts" /
+                                             "kanban_worktree_residue_audit.py").read_text(encoding="utf-8"),
+        "_ensure_git_worktree": _source_of(kbw._ensure_git_worktree),
+        "_half_built_held": _source_of(kwt._half_built_held),
+    }
+    for name, src in srcs.items():
+        for bad in _DESTRUCTIVE:
+            assert bad not in src, f"{name} contains {bad!r}"
+    for gone in ("remove_failed_add", "clear_half_built", "drain_half_built", "_drop_tree", "_delete_branch_at",
+                 "holds_work", "differs_from_head", "detached_unreachable"):
+        assert not hasattr(kwr, gone), gone
+    allowed = {"half_built", "release_stale_add_lock", "run_git_group", "WorktreeAddTimeout", "HALF_BUILT_HELD",
+               "ADD_TIMEOUT_S"}
+    for fn in (kbw._ensure_git_worktree, kwt._half_built_held, kwt.assess):
+        src = _source_of(fn)
+        used = set(re.findall(r"_kwr\.(\w+)", src))
+        assert used <= allowed, (fn.__name__, used - allowed)
+    assert "_half_built_held" in _calls_in(_source_of(kwt.assess))
 
 
-def _with_remote(repo, tmp_path):
-    """A bare clone as ``origin``: the trunk ref is ``origin/main``."""
-    remote = tmp_path / "remote.git"
-    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True, capture_output=True)
-    git(repo, "remote", "add", "origin", str(remote))
-    git(repo, "fetch", "-q", "origin")
-    return remote
-
-
-def test_clear_half_built_keeps_a_pushed_card_branch_and_the_next_spawn_resumes_it(repo, tmp_path):
-    _with_remote(repo, tmp_path)
-    git(repo, "branch", "wt/t_push")
-    tmp = tmp_path / "work"
-    git(repo, "worktree", "add", "-q", str(tmp), "wt/t_push")
-    (tmp / "done.txt").write_text("pushed work\n", encoding="utf-8")
-    git(tmp, "add", "done.txt")
-    git(tmp, "commit", "-qm", "worker commit")
-    git(tmp, "push", "-q", "origin", "wt/t_push")
-    tip = git(repo, "rev-parse", "wt/t_push")
-    git(repo, "worktree", "remove", str(tmp))
-    target = repo / ".worktrees" / "t_push"
-    git(repo, "worktree", "add", "-q", str(target), "wt/t_push")    # the re-add, then killed
-    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
-    (admin / "index").unlink()
-    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
-    _age_tree(target, admin, 10_000)
-
-    res = kwr.clear_half_built(repo, target, branch="wt/t_push")
-
-    assert res["cleared"] is True and res["branch_kept"] is True
-    assert git(repo, "rev-parse", "wt/t_push") == tip                # the recorded branch_name still resolves
-    kbw._ensure_git_worktree(repo, target, "wt/t_push")
-    assert git(target, "rev-parse", "HEAD") == tip and (target / "done.txt").is_file()
-
-
-def test_clear_half_built_deletes_a_branch_the_trunk_already_contains(repo, tmp_path):
-    _with_remote(repo, tmp_path)
-    target = repo / ".worktrees" / "t_triv"
-    _half_built(repo, target, "wt/t_triv", age_s=10_000)
-    res = kwr.clear_half_built(repo, target, branch="wt/t_triv")
-    assert res["cleared"] is True and res["branch_kept"] is False
-    assert git(repo, "branch", "--list", "wt/t_triv") == ""
-    kbw._ensure_git_worktree(repo, target, "wt/t_triv")              # re-created from the trunk
-    assert git(target, "branch", "--show-current") == "wt/t_triv"
+def test_assess_leaves_a_half_built_tree_byte_for_byte(repo):
+    """Prism #265 P2 c-30fd064da15bbe38: the placement probe has no destructive side effect in any mode."""
+    from hermes_cli import kanban_worktree_port as kwt
+    target = repo / ".worktrees" / "t_ass"
+    admin = _half_built(repo, target, "wt/t_ass", age_s=10_000)
+    (target / "late.txt").write_text("someone's\n", encoding="utf-8")
+    before = _snapshot_repo(repo)
+    for _ in range(2):
+        assert kwt._half_built_held(repo, target, "wt/t_ass") == kwt.WHY_HALF_BUILT
+    assert _snapshot_repo(repo) == before and kwr.lock_reason(admin) == kwr.INIT_LOCK
 
 
 # --- review r2 (operator Studio audit 2026-11-11: 150 of 189 `initializing` locks sit on FINISHED trees) ---------
@@ -438,145 +340,3 @@ def test_spawn_reusing_a_finished_locked_tree_releases_the_stale_lock(repo):
     assert kwr.lock_reason(admin) is None and git(target, "branch", "--show-current") == "wt/t_reuse"
 
 
-# --- review r3 (Prism #265 @3ea42c70, 5 P1s): nothing the cleanup cannot prove is residue is ever deleted --------
-
-
-def test_p1_2_an_untracked_file_with_an_early_mtime_keeps_the_tree(repo):
-    """An mtime inside the add's window does not prove git wrote the file: an untracked one is work."""
-    target = repo / ".worktrees" / "t_untr"
-    admin = _half_built(repo, target, "wt/t_untr", age_s=10_000)
-    (target / "mine.txt").write_text("a person's note, written right after the kill\n", encoding="utf-8")
-    _age_tree(target, admin, 10_000)                                # backdated: the mtime test alone passes it
-    assert kwr.written_after_add(target, admin) is None
-    res = kwr.clear_half_built(repo, target, branch="wt/t_untr")
-    assert res["cleared"] is False and res["holds_work"] is True and "untracked" in res["why"], res
-    assert kwr.drain_half_built(repo, target, branch="wt/t_untr", branch_sha="")["kept"]
-    assert (target / "mine.txt").is_file()
-
-
-def test_p1_2_a_tracked_file_whose_content_differs_from_head_keeps_the_tree(repo):
-    target = repo / ".worktrees" / "t_diff"
-    admin = _half_built(repo, target, "wt/t_diff", age_s=10_000)
-    (target / "f1.slow").write_text("edited, not HEAD's\n", encoding="utf-8")
-    _age_tree(target, admin, 10_000)
-    res = kwr.clear_half_built(repo, target, branch="wt/t_diff")
-    assert res["cleared"] is False and res["holds_work"] is True and "differs from HEAD" in res["why"], res
-    assert kwr.drain_half_built(repo, target, branch="wt/t_diff", branch_sha="")["kept"]
-    assert (target / "f1.slow").read_text(encoding="utf-8-sig") == "edited, not HEAD's\n"
-
-
-def test_p1_2_a_partial_checkout_of_head_content_is_still_residue(repo):
-    """Positive control: a SUBSET of HEAD's files, byte-equal, is what a killed add leaves: cleared."""
-    target = repo / ".worktrees" / "t_part"
-    admin = _half_built(repo, target, "wt/t_part", age_s=10_000)
-    (target / "f2.slow").unlink()
-    assert kwr.differs_from_head(repo, target, admin) is None
-    assert kwr.clear_half_built(repo, target, branch="wt/t_part")["cleared"] is True
-    assert not target.exists()
-
-
-def test_p1_3_drain_deletes_the_branch_only_at_the_sha_the_audit_approved(repo):
-    target = repo / ".worktrees" / "t_stale"
-    admin = _half_built(repo, target, "wt/t_stale", age_s=10_000)
-    approved = git(repo, "rev-parse", "wt/t_stale")
-    # Between attribution and drain the branch gains an unpushed commit (written from another tree).
-    other = repo.parent / "other"
-    git(repo, "worktree", "add", "-q", "--detach", str(other), approved)
-    (other / "late.txt").write_text("late\n", encoding="utf-8")
-    git(other, "add", "late.txt")
-    git(other, "commit", "-qm", "late unpushed commit")
-    moved = git(other, "rev-parse", "HEAD")
-    git(repo, "update-ref", "refs/heads/wt/t_stale", moved)
-    git(repo, "worktree", "remove", str(other))
-    # The half-built tree's HEAD now names the moved tip: write that content so it is still pure residue.
-    (target / "late.txt").write_text("late\n", encoding="utf-8")
-    _age_tree(target, admin, 10_000)
-
-    rep = kwr.drain_half_built(repo, target, branch="wt/t_stale", branch_sha=approved)
-
-    assert rep["removed"] is True and rep["branch_deleted"] is False, rep
-    assert git(repo, "rev-parse", "wt/t_stale") == moved             # the new commit survives
-
-
-def test_p1_3_audit_drain_passes_the_tip_it_read(repo, tmp_path, monkeypatch):
-    """The audit hands drain_half_built the tip it attributed, never a re-read."""
-    import importlib.util
-    import sqlite3
-    db = tmp_path / "kanban.db"
-    c = sqlite3.connect(db)
-    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, branch_name TEXT)")
-    c.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT)")
-    c.execute("INSERT INTO tasks VALUES ('t_0000abcd', 'done', NULL)")
-    c.commit()
-    c.close()
-    _with_remote(repo, tmp_path)
-    target = repo / ".worktrees" / "t_0000abcd"
-    _half_built(repo, target, "wt/t_0000abcd", age_s=10_000)
-    tip = git(repo, "rev-parse", "wt/t_0000abcd")
-    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
-    spec = importlib.util.spec_from_file_location("kwr_audit_t", script)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    seen = {}
-    real = mod.kwr.drain_half_built
-
-    def spy(repo_root, tgt, *, branch, branch_sha=""):
-        seen["sha"] = branch_sha
-        return real(repo_root, tgt, branch=branch, branch_sha=branch_sha)
-    monkeypatch.setattr(mod.kwr, "drain_half_built", spy)
-    assert mod.main(["--repo", str(repo), "--db", str(db), "--drain", "--execute"]) == 0
-    assert seen["sha"] == tip and not target.exists()
-    assert git(repo, "branch", "--list", "wt/t_0000abcd") == ""     # the trunk has it: deleted at that tip
-
-
-def _detached_half_built(repo, target, age_s=10_000):
-    """A half-built DETACHED tree whose HEAD is a commit no ref contains."""
-    git(repo, "worktree", "add", "-q", "--detach", str(target), "HEAD")
-    (target / "d.txt").write_text("detached work\n", encoding="utf-8")
-    git(target, "add", "d.txt")
-    git(target, "commit", "-qm", "detached commit")
-    sha = git(target, "rev-parse", "HEAD")
-    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
-    (admin / "index").unlink()
-    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
-    _age_tree(target, admin, age_s)
-    return admin, sha
-
-
-def test_p1_4_clear_half_built_refuses_a_detached_head_no_ref_contains(repo):
-    target = repo / ".worktrees" / "t_det"
-    admin, sha = _detached_half_built(repo, target)
-    assert kwr.differs_from_head(repo, target, admin) is None       # pure HEAD content: only the commit is at stake
-    res = kwr.clear_half_built(repo, target, branch="wt/t_det")
-    assert res["cleared"] is False and res["holds_work"] is True and sha in res["why"], res
-    assert admin.is_dir() and (admin / "HEAD").read_text(encoding="utf-8-sig").strip() == sha
-    assert git(repo, "cat-file", "-t", sha) == "commit"
-
-
-def test_p1_4_a_detached_head_some_branch_contains_is_still_cleared(repo):
-    target = repo / ".worktrees" / "t_det2"
-    admin, sha = _detached_half_built(repo, target)
-    git(repo, "branch", "keep/t_det2", sha)                          # pinned: removing the admin dir loses nothing
-    assert kwr.clear_half_built(repo, target, branch="wt/t_det2")["cleared"] is True
-    assert git(repo, "rev-parse", "keep/t_det2") == sha
-
-
-def test_p1_5_audit_drain_keeps_a_detached_tree_whose_commit_no_ref_contains(repo, tmp_path):
-    import sqlite3
-    db = tmp_path / "kanban.db"
-    c = sqlite3.connect(db)
-    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, branch_name TEXT)")
-    c.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT)")
-    c.execute("INSERT INTO tasks VALUES ('t_0000de7a', 'done', NULL)")
-    c.commit()
-    c.close()
-    target = repo / ".worktrees" / "t_0000de7a"
-    admin, sha = _detached_half_built(repo, target)
-    dry = _audit("--repo", str(repo), "--db", str(db), "--drain")
-    assert "would remove" not in dry.stdout, dry.stdout
-    run = _audit("--repo", str(repo), "--db", str(db), "--drain", "--execute")
-    assert run.returncode == 0 and target.is_dir() and admin.is_dir()
-    assert kwr.drain_half_built(repo, target, branch="", branch_sha="")["kept"]
-    assert git(repo, "cat-file", "-t", sha) == "commit" and admin.is_dir()
-    tab = _audit("--repo", str(repo), "--db", str(db))
-    assert "detached HEAD" in tab.stdout and sha in tab.stdout

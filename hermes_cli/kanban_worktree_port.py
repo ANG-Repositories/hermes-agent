@@ -90,7 +90,6 @@ WHY_DIVERGED = "diverged_from_origin"
 WHY_UNPUSHED = "unpushed_commits"          # hand-list mode only
 WHY_NOT_CHECKOUT = "own_tree_not_a_checkout"
 WHY_HALF_BUILT = "own_tree_half_built_add"   # t_f609a5a0: a killed `worktree add` left it locked `initializing`
-WHY_HALF_BUILT_WORK = "own_tree_half_built_holds_work"   # ... and it holds work: never cleared, never force-removed
 WHY_PROBE_FAILED = "own_tree_probe_failed"
 WHY_REPO_MISMATCH = "own_tree_repo_mismatch"
 WHY_DERIVED_OFF = "derived_mode_off"
@@ -119,11 +118,8 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
     WHY_NOT_CHECKOUT: "the card's .worktrees/<id> holds files but is not a git checkout, or has no index: git "
                       "cannot see or carry them",
     WHY_HALF_BUILT: "the card's .worktrees/<id> is a `git worktree add` that was killed mid-checkout (locked "
-                    "`initializing`, no index): cleared on the next tick once it is older than an add can run and "
-                    "its branch has no commits of its own; held, named, until then (t_f609a5a0)",
-    WHY_HALF_BUILT_WORK: "the card's .worktrees/<id> is a killed `git worktree add` that holds work (a file written "
-                         "after the add died, an untracked file, content that is not HEAD's, or a detached HEAD no "
-                         "ref contains): never cleared and never force-removed; an operator saves it (t_f609a5a0)",
+                    "`initializing`, no index): never removed automatically; held, named, until an operator "
+                    "inspects and clears it (t_f609a5a0)",
     WHY_PROBE_FAILED: "git could not read whether the card's own Studio tree has an index (error or timeout): "
                       "unknown state is never read as an empty tree",
     WHY_REPO_MISMATCH: "the card's .worktrees/<id> belongs to another repo than the directory it sits in (its git "
@@ -727,29 +723,25 @@ def _ref_table(top: Path) -> Optional[Dict[str, str]]:
 
 
 def _half_built_held(repo: Path, tree: Path, branch: str) -> Optional[str]:
-    """The local-only reason when ``tree`` (the card's own ``.worktrees/<id>``) is a half-built add that still holds
-    the card, else None.
+    """:data:`WHY_HALF_BUILT` when ``tree`` (the card's own ``.worktrees/<id>``) is a half-built add, else None.
 
     A killed ``git worktree add`` (t_f609a5a0) leaves the tree locked ``initializing`` with no index; it used to
-    read as :data:`WHY_NOT_CHECKOUT` and park the card silently. Old enough, it is cleared here under the
-    ownership rule of :func:`kanban_worktree_residue.clear_half_built` (this card's path and branch only; the
-    branch is kept when it holds commits no remote has) and the card ports as if the tree had never been made.
-    Held: :data:`WHY_HALF_BUILT_WORK` when the tree holds work (its fix never removes it), else
-    :data:`WHY_HALF_BUILT`. One log line per clear or hold. Never raises."""
+    read as :data:`WHY_NOT_CHECKOUT` and park the card silently as ``studio_capability_only``. Read-only: nothing
+    is removed, unlocked or written (ruling:t_f609a5a0-no-automatic-deletion). One log line per hold. Never raises;
+    an unreadable state is held under the same name."""
     from hermes_cli import kanban_worktree_residue as _kwr
     try:
-        if not tree.exists() or _kwr.half_built(repo, tree) is None:
+        if not tree.exists():
             return None
-        res = _kwr.clear_half_built(repo, tree, branch=branch)
-    except Exception as exc:  # the dispatcher tick: unknown state holds the card, named as work (never removed)
+        hb = _kwr.half_built(repo, tree)
+    except Exception as exc:  # the dispatcher tick: unknown state holds the card, named, never touched
         _log.warning("kanban worktree port: half-built tree %s not assessed: %s", tree, exc)
-        return WHY_HALF_BUILT_WORK
-    if res.get("cleared"):
-        _log.warning("PHASE=kanban_half_built_worktree_cleared %s (lock age %ss, branch %s %s)", tree,
-                     res.get("age_s"), branch, "kept" if res.get("branch_kept") else "deleted")
+        return WHY_HALF_BUILT
+    if hb is None:
         return None
-    _log.warning("PHASE=kanban_half_built_worktree_held %s: %s", tree, res.get("why"))
-    return WHY_HALF_BUILT_WORK if res.get("holds_work") else WHY_HALF_BUILT
+    _log.warning("PHASE=kanban_half_built_worktree_held %s (lock age %ss, tree branch %s, card branch %s)", tree,
+                 hb.get("age_s"), hb.get("branch") or "-", branch)
+    return WHY_HALF_BUILT
 
 
 def _dir_empty(path: Path) -> bool:

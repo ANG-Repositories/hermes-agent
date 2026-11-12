@@ -187,12 +187,6 @@ def test_workspace_deletion_has_one_choke_point():
         # the mirror flock, never a workspace. Resuming them in place instead
         # promoted a killed fetch's tmp_pack residue into the precious mirror.
         ("kanban_clone.py", "_discard_dead_builds"),
-        # Reviewed exception (t_f609a5a0): removes ONE registration that is a killed `git worktree add`'s
-        # residue (locked `initializing`, no index, the only admin dir naming the path). Callers: a timed-out
-        # add's own new registration (snapshot before the add, never on "already exists"), a card's own
-        # half-built tree older than an add with no file written after it died, and the operator drain. Such a
-        # tree has no index, so the survivor capture would read every file as a staged delete; it holds no work.
-        ("kanban_worktree_residue.py", "_drop_tree"),
     }
 
 
