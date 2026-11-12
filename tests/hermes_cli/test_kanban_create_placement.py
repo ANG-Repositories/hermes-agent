@@ -117,6 +117,45 @@ def test_studio_last_resort_without_the_capability_rule_still_offers_the_studio(
     assert line.startswith("will run on a pool host or the Mac Studio"), line
 
 
+def test_a_capability_only_pool_hosts_serve_names_them_never_the_studio(kanban_home, pool, monkeypatch):
+    """Prism 14d195cbf4f1: a portable card whose capability only named pool hosts serve (the dispatcher's
+    ``caps_out["only"]``) never takes a local slot, so the line names those hosts and never offers the Studio,
+    also with t_9965b8d5's switch off. Repro: ``requires: docker``, docker identity-only on ace-ai."""
+    import dataclasses
+    from tests.hermes_cli.test_kanban_studio_capability_only import _caps as caps_fn
+    tick = caps_fn()
+    tick = dataclasses.replace(tick, cmap=dataclasses.replace(tick.cmap, identity_only=frozenset({"docker"})))
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: tick)
+    monkeypatch.setattr(kbd, "_studio_capability_on", lambda caps, last: False)
+    with kb.connect_closing() as conn:
+        _tid, line = _line(conn, "requires: docker (builds the image)\nwork")
+    assert line.startswith("will run on ace-ai,"), line
+    assert "Mac Studio" not in line, line
+    assert "`requires: docker (builds the image)`" in line, line
+
+
+def test_a_lost_origin_route_keeps_the_pin_wait_not_the_studio(kanban_home, monkeypatch):
+    """Prism "Lost wait": with no pool plan, an enforced continuation origin that resolves to None must keep the
+    wait already established (here a registered remote pin's ``pool_unavailable``), never fall back to local."""
+    from hermes_cli import kanban_continuation as kcont
+    from hermes_cli import kanban_worker_pool as kwp
+    monkeypatch.setattr(kcp, "_pool_config", lambda: kwp.PoolConfig(refused="sidecar"))
+    monkeypatch.setattr(kwp, "known_host_ids", lambda fleet, **k: ("ace-ai",))
+    monkeypatch.setattr(kwp, "pin_aliases", lambda fleet, **k: {})
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"continuation": "enforce"}})
+    monkeypatch.setattr(kcont, "origin_route", lambda *a, **k: None)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alpha", body="host: ace-ai\nfix the lint")
+        tid2 = kb.create_task(conn, title="t", assignee="alpha", body="fix the lint")
+        conn.execute("UPDATE tasks SET origin_host='ace-ai' WHERE id IN (?, ?)", (tid, tid2))
+        line = kcp.preview_line(conn, tid)
+        plain = kcp.preview_line(conn, tid2)
+    assert line.startswith("will wait (pool_unavailable)"), line
+    assert "Mac Studio" not in line, line
+    # No wait was established: local, as before.
+    assert plain.startswith("will run on the Mac Studio while there is no pool plan"), plain
+
+
 def test_preview_never_raises_and_writes_no_event(kanban_home, pool, monkeypatch):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="alpha", body="fix")

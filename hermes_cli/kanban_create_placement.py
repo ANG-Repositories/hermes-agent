@@ -102,7 +102,9 @@ def _unplanned_route(conn, row, cfg, held: dict, pause_cache: dict) -> "tuple[st
     if row["origin_host"] and tid not in held and kcont.mode(kbd._root_kanban_cfg()) == "enforce":
         oroute = kcont.origin_route(conn, row, cfg, config=kbd._root_kanban_cfg(), states={}, dry_run=True,
                                     caps=kbd._capability_tick(cfg))
-        route, rule = (oroute or ("local", None)), ("continuation origin" if oroute else why)
+        if oroute:
+            route, rule = oroute, "continuation origin"
+        # No origin route: keep the pin / carry / identity wait already set (Prism "Lost wait"); local only if none.
     route = route or ("local", None)
     pins = kbd._wt_pin_hosts(row, None)
     if pins:
@@ -112,7 +114,13 @@ def _unplanned_route(conn, row, cfg, held: dict, pause_cache: dict) -> "tuple[st
     return route[0], route[1], rule
 
 
-def _format(route: str, arg, rule: Optional[str], body: str, studio: Optional[dict], studio_on: bool) -> str:
+def _format(route: str, arg, rule: Optional[str], body: str, studio: Optional[dict], studio_on: bool,
+            only: "Optional[tuple]" = None, wt_pin: Optional[str] = None) -> str:
+    if route == "portable" and only:
+        # Only these pool hosts serve the card (capability or worktree pin): no local slot, no Studio last resort,
+        # whatever t_9965b8d5's switch says (Prism 14d195cbf4f1).
+        why = "rule worktree operator pin" if wt_pin else _quote(_requires_line(body, None), "rule capability")
+        return f"will run on {', '.join(only)}, decided by: {why}"
     if route == "portable":
         where = "a pool host" if studio_on else f"a pool host or {STUDIO} (whichever has room)"
         return f"will run on {where}, decided by: no line pins it"
@@ -158,13 +166,16 @@ def preview_line(conn, task_id: str) -> Optional[str]:
         default_assignee = (kbd._root_kanban_cfg().get("default_assignee") or "").strip() or None
         rules: dict = {}
         studio: dict = {}
+        caps_out: dict = {}
         route, arg = kbd._route_row(
-            conn, row, plan, default_assignee, {}, None, None, {}, unknown_out={}, caps=caps, caps_out={},
+            conn, row, plan, default_assignee, {}, None, None, {}, unknown_out={}, caps=caps, caps_out=caps_out,
             rules_out=rules, access_out={}, binds=kbd._workspace_binds(conn, [row], dry_run=True), held=held,
             worktree_out={}, carry_out={}, pause_cache=pause_cache, studio_on=studio_on, studio_out=studio)
         # A portable card skips the Studio only under t_9965b8d5's rule (``_portable_goes_remote``), not under
         # last_resort alone (Prism ce9e08fd61ec).
-        return _format(route, arg, rules.get(task_id), body, studio.get(task_id), studio_on)
+        return _format(route, arg, rules.get(task_id), body, studio.get(task_id), studio_on,
+                       tuple((caps_out.get("only") or {}).get(task_id) or ()),
+                       (caps_out.get("wt_pin") or {}).get(task_id))
     except Exception:  # noqa: BLE001 - a preview must never fail a create
         _log.debug("kanban create: placement preview for %s failed", task_id, exc_info=True)
         return None
