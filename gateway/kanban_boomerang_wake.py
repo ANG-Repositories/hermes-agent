@@ -95,6 +95,10 @@ class BoomerangWakeState:
         return raw if isinstance(raw, dict) else {}
 
     def _write(self, data: dict) -> None:
+        if not isinstance(data.get("restart_spent"), dict):
+            # Migrate a pre-t_a256e37c file once: persist the seed so later reads never reseed
+            # from historical ``#restartN`` claims (Prism f05ecc4393cf).
+            data["restart_spent"] = self._restart_spent_of(data)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".boomerang-wake-", dir=str(self.path.parent))
         try:
@@ -133,6 +137,9 @@ class BoomerangWakeState:
         """Record one more automatic retry for ``task_id``; returns the new count."""
         with _LOCK:
             data = self._read()
+            # Seed (migrate) the restart part BEFORE the crash bump: the seed is capped by the
+            # counter, so a stale ``#restartN`` claim cannot claim this crash retry.
+            data["restart_spent"] = self._restart_spent_of(data)
             retries = self._retries_of(data)
             retries[str(task_id)] = retries.get(str(task_id), 0) + 1
             data["retries"] = retries

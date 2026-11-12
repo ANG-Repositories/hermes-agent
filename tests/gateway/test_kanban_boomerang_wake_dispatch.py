@@ -2085,3 +2085,19 @@ def test_bare_retries_file_still_loads_and_refunds_restart_claims(tmp_path):
     assert state.retries("t_r") == 0 and state.retries("t_c") == 1
     doc = json.loads(path.read_text())
     assert doc["restart_spent"] == {} and doc["retries"] == {"t_c": 1}
+
+
+def test_legacy_seed_is_migrated_once_and_a_crash_retry_is_not_refunded(tmp_path):
+    """Prism f05ecc4393cf: a ``#restart1`` claim from before a ``completed`` reset must not make a
+    later crash retry refundable. The first write persists ``restart_spent``; reads never reseed."""
+    path = tmp_path / "kanban_boomerang_wake.json"
+    path.write_text(json.dumps({
+        "retries": {},
+        "claims": {"b|t|1#restart1": {"task_id": "t", "state": "terminal", "outcome": "complete"},
+                   "b|t|2": {"task_id": "t", "state": "running"}}}))
+    state = ah.BoomerangWakeState(path)
+    assert state.bump_retry("t") == 1
+    assert json.loads(path.read_text())["restart_spent"] == {}, "bump_retry left no persisted map"
+    assert state.restart_spent("t") == 0
+    state.update_claim("b|t|2", state=ah.STATE_TERMINAL, outcome="retry")
+    assert state.retries("t") == 1, "a stale restart claim refunded the crash retry"
