@@ -1210,7 +1210,8 @@ def _s4_hold_home_turn(ctx: Ctx, rep: StepReport, arm: str, card: str, pid_path:
               child_sid or f"no running claim with child_session in {path}")
     if not child_sid:
         return False
-    agent_log = _LogFile(gateway_log_path(True).with_name("agent.log"), True)
+    # Whole file (live=False): the call may predate this read, and the child's session id is unique.
+    agent_log = _LogFile(gateway_log_path(True).with_name("agent.log"), False)
     re_call = re.compile(ctx.plan["expect"].get("child_model_call_log_regex",
                                                 r"\[{child}\] agent\.conversation_loop: API call #\d+")
                          .format(child=re.escape(child_sid)))
@@ -1234,10 +1235,11 @@ def _s4_hold_home_turn(ctx: Ctx, rep: StepReport, arm: str, card: str, pid_path:
     rep.commands.append(shown + f"   # hold turn, {sent.group(0) if sent else 'not sent'}")
     rep.raw.append(f"--- s4_hold_turn\n{out.strip()[-2000:]}")
     state_path = pid_path.with_name("gateway_state.json")
-    busy = ctx.poll(lambda: _active_agents(state_path) or None, 120.0) if sent else None
+    hold_window = 120.0
+    busy = ctx.poll(lambda: _active_agents(state_path) or None, hold_window) if sent else None
     rep.check(f"{arm}: home-session turn held open before the restart", PASS if busy else FAIL,
               f"{sent.group(0)}; {state_path.name} active_agents={busy}" if sent and busy
-              else (f"{sent.group(0)}; active_agents stayed 0 for 120s" if sent else "hold turn not sent"))
+              else (f"{sent.group(0)}; active_agents stayed 0 for {hold_window:.0f}s" if sent else "hold turn not sent"))
     return bool(busy)
 
 
