@@ -36,7 +36,7 @@ import stat
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, Mapping, Optional, Tuple
 
@@ -366,16 +366,29 @@ def take(task_id: str, host: PoolHost, workspace: str) -> Optional[Job]:
 def run_sync(job: Job, lock_dir: Path, runner: Optional[Callable] = None) -> bool:
     """A one-shot (CLI) tick: the same carry, run here under the same lock. False (nothing run) while another
     dispatcher holds it; raises what :func:`run` raises. On success the lock stays held on ``job`` until the
-    finalize (:func:`release`)."""
+    finalize (:func:`release`). The finished job is kept in the registry, like a background one, so a claim that
+    never comes (claim_task None, PauseHeld, a route failure) does not strand its lock: the card's next carry in
+    this process releases it first (Prism eba22256a789)."""
+    with _lock:
+        prev = _jobs.get(job.task_id)
+        if prev is not None and not (prev[0].future is not None and prev[0].future.done()):
+            return False  # a background copy of this card is still running in this process
+        _jobs.pop(job.task_id, None)
+    if prev is not None:
+        release(prev[0])
     fd = _try_lock(lock_path(lock_dir, job.host.name, job.workspace))
     if fd is None:
         return False
     job.fd, job.lock_dir = fd, job.lock_dir or lock_dir
     try:
-        run(job, runner)
+        stats = run(job, runner)
     except BaseException:
         release(job)
         raise
+    job.future = Future()
+    job.future.set_result(stats)
+    with _lock:
+        _jobs[job.task_id] = (job, fd)
     return True
 
 

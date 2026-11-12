@@ -348,6 +348,27 @@ def test_the_carry_lock_is_held_from_the_start_until_the_finalize(board, loop, t
     kcb._unlock(fd)
 
 
+def test_a_sync_carry_whose_claim_is_skipped_does_not_strand_its_lock(board, loop, tmp_path):
+    """Prism eba22256a789: a one-shot carry that finished but whose claim never ran (claim_task None, PauseHeld, a
+    route failure) is kept in the registry, not only in the tick's dict: the next carry of that card in the same
+    process reuses its lock, and a finalize still releases it."""
+    lock_dir = tmp_path / "locks"
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        host = _plan(free=2).hosts["ace-ai"]
+        lp = kcb.lock_path(lock_dir, host.name, str(path))
+        assert kcb.run_sync(kcb.Job(tid, host, str(path), None, lock_dir), lock_dir, runner=loop)
+        # the tick that ran it exits without the claim: its tick-local job is dropped
+        job2 = kcb.Job(tid, host, str(path), None, lock_dir)
+        assert kcb.run_sync(job2, lock_dir, runner=loop)  # not stranded: the same process carries it again
+        assert kcb.take(tid, host, str(path)) is job2
+        kcb.finalize(host, str(path), runner=loop)
+        kcb.release(job2)
+        fd = kcb._try_lock(lp)
+    assert fd is not None
+    kcb._unlock(fd)
+
+
 def test_a_finished_copy_that_waited_is_refreshed_before_the_claim(board, loop, tmp_path, monkeypatch):
     """Prism 38c86a910163: a Studio edit made after the copy finished reaches the pool host when the finished copy
     is older than FRESH_S: it is re-synced off the tick, never claimed stale."""
