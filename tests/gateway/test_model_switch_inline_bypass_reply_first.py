@@ -7,20 +7,19 @@ of #169 could not register and the confirmation waited for the whole save (reply
 9.244 s). The inline path now runs the save after the inline reply is sent.
 
 Real ``BasePlatformAdapter`` busy-session path, real ``/model`` handler, real ``SessionStore``; the
-state.db write is an event-gated stand-in that releases itself SAVE_S after it starts.
+state.db write is an event-gated stand-in the test releases only after the reply was sent.
 """
 
 import asyncio
 import logging
 import re
-import time
 
 import pytest
 
 from tests.gateway.test_model_switch_reply_first import FOLLOWUP, _drained, _ev, _Harness, _switched
 from tests.gateway.test_turn_lease_flush_window import _wait_for
 
-SAVE_S = 1.5  # the slow state.db write
+SAVE_S = 1.5  # bound on each event wait (never a latency assertion)
 
 
 def _phase_fields(caplog):
@@ -47,33 +46,25 @@ async def _busy(h):
 
 @pytest.mark.asyncio
 async def test_busy_session_model_reply_is_sent_before_the_save_settles(tmp_path, monkeypatch, caplog):
+    """Ordering, not a stopwatch: the save is held open until the confirmation has been SENT, so a
+    reply that waited for the save never arrives and the bounded wait fails. A wall-clock bound on
+    the reply (SAVE_S / 2) flaked on loaded runners (1.16 s, main run 43259635914)."""
     h = _Harness(tmp_path, monkeypatch)
     busy = await _busy(h)
-    stamps = {}
-
-    async def _release_after_save_time():
-        await h.db.entered.wait()
-        stamps["save_started"] = time.monotonic()
-        await asyncio.sleep(SAVE_S)
-        stamps["save_released"] = time.monotonic()
-        h.db.release.set()
-
-    releaser = asyncio.create_task(_release_after_save_time())
-    started = time.monotonic()
     try:
         with caplog.at_level(logging.INFO, logger="gateway.run"):
             # Busy session: the base adapter dispatches the command inline.
             cmd = asyncio.create_task(h.adapter.handle_message(_ev("/model gpt-5.5")))
-            await _wait_for(lambda: h.sent_with(_switched("gpt-5.5")), "the busy-session /model confirmation",
-                            timeout=SAVE_S * 4)
-            reply_latency = time.monotonic() - started
+            await _wait_for(lambda: h.sent_with(_switched("gpt-5.5")), "the busy-session /model confirmation "
+                            "while the state.db write is still held", timeout=SAVE_S * 4)
             saved_at_reply = list(h.db.models)
+            assert not h.db.release.is_set()
+            assert saved_at_reply == [], "the confirmation waited for the state.db write"
+            assert not cmd.done(), "the inline save settled before the reply"
+            # The save runs after the reply: release it now and let it land.
+            await asyncio.wait_for(h.db.entered.wait(), SAVE_S * 4)
+            h.db.release.set()
             await asyncio.wait_for(cmd, SAVE_S * 4)
-            settled_latency = time.monotonic() - started
-        print(f"busy-session /model: reply {reply_latency:.3f}s, save settled {settled_latency:.3f}s "
-              f"(save held {SAVE_S}s)")
-        assert saved_at_reply == [], "the confirmation waited for the state.db write"
-        assert reply_latency < SAVE_S / 2, f"reply took {reply_latency:.2f}s behind a {SAVE_S}s save"
         # The save still ran, after the reply, and is durable.
         assert h.db.models == ["gpt-5.5"]
         assert h.runner.session_store.get_model_override(h.key())["model"] == "gpt-5.5"
@@ -82,12 +73,11 @@ async def test_busy_session_model_reply_is_sent_before_the_save_settles(tmp_path
         assert len(fields) == 1, lines
         f = fields[0]
         assert f["path"] == "inline_bypass" and f["save"] == "ok", lines[0]
-        assert float(f["reply_s"]) < SAVE_S / 2 <= float(f["total_s"]), lines[0]
+        assert float(f["reply_s"]) <= float(f["total_s"]), lines[0]
         print(lines[0])
     finally:
         h.db.release.set()
         busy.set()
-        await releaser
         await _drained(h)
 
 
