@@ -247,3 +247,22 @@ def test_saturated_cli_dispatch_still_places_portable_cards_remote(board, monkey
     assert "utilization SATURATED" in out
     assert _running() == 3, out  # the pool's 3 free slots, none local
     assert "LOCAL" in out and "remote placement continues" in out
+
+
+def test_one_shot_dispatch_lets_asap_cards_through_the_kanban_ceiling(board, monkeypatch, capsys):
+    """Prism 0dff9ae63019 (t_103a4648): the one-shot verb applies the host's kanban ceiling, so it must also forward
+    the room the ceiling cut; an operator asap card spawns through it and plain cards still wait."""
+    monkeypatch.setattr(klg, "utilization_context", lambda: {
+        "host": "mac-studio", "ceiling": 0, "ceiling_reason": "backstop",
+        "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), "limits": ad.Limits(mem_reserve_gb=0.0),
+        "mem_available_gb": 400.0, "mem_total_gb": 512.0})
+    with kb.connect_closing() as conn:
+        urgent = kb.create_task(conn, title="urgent", assignee="alpha")
+        conn.execute("UPDATE tasks SET asap = 1 WHERE id = ?", (urgent,))
+        conn.commit()
+    _load(monkeypatch, 1.0)
+    _run()
+    capsys.readouterr()
+    with kb.connect_closing() as conn:
+        running = [r[0] for r in conn.execute("SELECT id FROM tasks WHERE status = 'running'")]
+    assert running == [urgent]

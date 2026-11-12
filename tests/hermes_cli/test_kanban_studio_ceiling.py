@@ -259,3 +259,29 @@ def test_no_exemption_when_the_ceiling_is_not_what_binds(board):
         conn.commit()
         order, res = _tick(conn, spawn_paused="utilization: saturated:cpu", spawn_limit=0)
     assert order == [] and res.ceiling_exempt_spawned == 0
+
+
+def test_ceiling_bound_lists_held_cards_after_another_board_used_the_asap_room(board):
+    """Prism aa55a32125bc: board A spent the tick's asap room, board B gets ceiling_exempt=0. B's plain card is
+    still waiting at the ceiling, so it must stay in ceiling_held (else the wait clock resets / the page clears)."""
+    with kb.connect_closing() as conn:
+        t = kb.create_task(conn, title="plain", assignee="daedalus")
+        order, res = _tick(conn, spawn_paused=CEILING_WHY, spawn_limit=0, ceiling_exempt=0, ceiling_bound=True)
+    assert order == [] and res.ceiling_held == [t]
+
+
+def test_asap_spawns_through_the_ceiling_with_route_first_off(board, monkeypatch):
+    """Prism 996af7eca6ca: with kanban.placement.route_first off, a higher-priority plain card at the wall must not
+    stop the scan before the asap card that the ceiling room lets through."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_priority_door as door
+    monkeypatch.setattr(kbd, "_route_first_enabled", lambda: False)
+    monkeypatch.setattr(door, "enabled", lambda: False)
+    with kb.connect_closing() as conn:
+        plain = kb.create_task(conn, title="plain", assignee="daedalus", priority=99)
+        urgent = kb.create_task(conn, title="urgent", assignee="daedalus")
+        conn.execute("UPDATE tasks SET asap = 1 WHERE id = ?", (urgent,))
+        conn.commit()
+        order, res = _tick(conn, spawn_paused=CEILING_WHY, spawn_limit=0, ceiling_exempt=4)
+    assert order == [urgent]
+    assert res.ceiling_held == [plain] and res.ceiling_exempt_spawned == 1

@@ -108,6 +108,9 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
         "override": None,
         "info": None,
         "lines": [],
+        # t_103a4648: the room the host's kanban ceiling cut (operator asap cards may use it) and whether it bound
+        "ceiling_exempt": 0,
+        "ceiling_bound": False,
     }
     stream = sys.stderr if getattr(args, "json", False) else sys.stdout
 
@@ -182,6 +185,8 @@ def _cli_utilization_gate(conn, args, gate, out, emit, load1):
     info = gate.snapshot()
     info.pop("boards", None)
     out["info"] = info
+    out["ceiling_exempt"] = int(getattr(gate, "ceiling_exempt", 0) or 0)
+    out["ceiling_bound"] = bool(getattr(gate, "ceiling_bound", False))
     l1 = "?" if load1 is None else f"{load1:.1f}"
     busy = "?" if cpu_busy is None else f"{cpu_busy:.2f}"
     if getattr(args, "ignore_load_gate", False):
@@ -343,6 +348,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             # --max is additive across local AND remote spawns (total budget).
             max_new=additive,
             entry="cli",
+            # Prism 0dff9ae63019: the one-shot verb applies the same ceiling, so asap cards get the same room.
+            ceiling_exempt=gate.get("ceiling_exempt", 0),
+            ceiling_bound=gate.get("ceiling_bound", False),
         )
         if not args.dry_run:
             for _b in _pool_builders:  # placement 1b: publish kanban's reservations

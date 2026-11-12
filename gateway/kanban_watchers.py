@@ -4179,7 +4179,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None, spillover=None, ceiling_exempt: int = 0) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None, requeue_note: "Optional[str]" = None, spillover=None, ceiling_exempt: int = 0, ceiling_bound: bool = False) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -4240,6 +4240,7 @@ class GatewayKanbanWatchersMixin:
                     budget_cache=budget_cache,
                     spillover=spillover,
                     ceiling_exempt=ceiling_exempt,
+                    ceiling_bound=ceiling_bound,
                     # The long-lived gateway tick runs pool-host clones in the background (t_915b8d2d).
                     defer_pool_clone=True,
                     # ...and the orphan sweep (t_97a78e19).
@@ -4403,6 +4404,7 @@ class GatewayKanbanWatchersMixin:
                     requeue_note=_requeue_note,
                     spillover=_tick.remote_plan,
                     ceiling_exempt=_ceiling_left,
+                    ceiling_bound=bool(getattr(_tick, "ceiling_bound", False)),
                 )
                 out.append((slug, res))
                 if res is not None:

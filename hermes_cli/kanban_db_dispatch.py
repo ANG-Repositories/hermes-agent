@@ -4383,6 +4383,7 @@ def _dispatch_once_steps(
     defer_pool_clone: bool = False,
     defer_maintenance: bool = False,
     ceiling_exempt: Optional[int] = None,
+    ceiling_bound: Optional[bool] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -4437,6 +4438,7 @@ def _dispatch_once_steps(
             entry=entry,
             defer_maintenance=defer_maintenance,
             ceiling_exempt=ceiling_exempt,
+            ceiling_bound=ceiling_bound,
         )
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -4475,6 +4477,7 @@ def _dispatch_once_steps(
                 defer_pool_clone=defer_pool_clone,
                 defer_maintenance=defer_maintenance,
                 ceiling_exempt=ceiling_exempt,
+                ceiling_bound=ceiling_bound,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -6777,6 +6780,7 @@ def _dispatch_once_locked(
     defer_pool_clone: bool = False,
     defer_maintenance: bool = False,
     ceiling_exempt: Optional[int] = None,
+    ceiling_bound: Optional[bool] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7094,13 +7098,17 @@ def _dispatch_once_locked(
     # consumers.kanban.ceiling cut from what utilization admitted this tick (LoadGate.ceiling_exempt). Only
     # operator-set ``asap`` cards on the local route may use that room; every other card waits. kanban admit
     # (skip_host_admission) skips the ceiling with the rest of host admission.
+    # ``ceiling_bound`` is the TICK's fact (LoadGate.ceiling_bound), passed separately because ``ceiling_exempt`` is
+    # one pool across boards: a board that gets 0 after another spent it is still held by the ceiling (Prism
+    # aa55a32125bc). None (older callers) falls back to the room this board was handed.
     _exempt_left = 0 if skip_host_admission else max(0, int(ceiling_exempt or 0))
-    _ceiling_cut = _exempt_left > 0   # the ceiling bound this tick: a local card left waiting is held by it
+    _ceiling_cut = (not skip_host_admission) and (
+        bool(ceiling_bound) if ceiling_bound is not None else _exempt_left > 0)
     _exempt_rows: set = set()
     if spawn_paused:
         result.spawn_paused = str(spawn_paused)
         local_budget = 0
-        if (spillover is None or spillover.budget <= 0) and not route_first and not _exempt_left:
+        if (spillover is None or spillover.budget <= 0) and not route_first and not _ceiling_cut:
             return result
 
     running_count = 0
@@ -8135,8 +8143,10 @@ def _dispatch_once_locked(
         pool_free = spillover is not None and spillover.budget > 0
         if not local_free and not pool_free:
             ready_scan_complete = False
-            if route_first:
-                # No slot anywhere: this row and every one after it say why.
+            if route_first or _ceiling_cut:
+                # No slot anywhere: this row and every one after it say why. Under a binding Studio ceiling the
+                # scan also goes on with route_first off: a later asap row may still use the ceiling's room, and
+                # every held local row is listed for the wait page (Prism 996af7eca6ca).
                 record_only = "wall"
                 result.placement_waits[row["id"]] = _wall_reason(route, route_arg, spillover)
                 continue
@@ -10274,7 +10284,8 @@ def run_daemon(
                 gate_kwargs = {"spawn_paused": tick.spawn_paused,
                                "spawn_limit": tick.local_allowance,
                                "spillover": tick.remote_plan,
-                               "ceiling_exempt": tick.ceiling_exempt}
+                               "ceiling_exempt": tick.ceiling_exempt,
+                               "ceiling_bound": tick.ceiling_bound}
                 if load_gate.host_recovered():
                     with contextlib.closing(_kbc.connect()) as _rconn:
                         _kb.requeue_host_transient_blocks(
