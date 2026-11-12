@@ -1536,13 +1536,19 @@ def _launchd_print_service_pid(domain: str, label: str) -> tuple[bool, int | Non
     ``TimeoutExpired`` propagates — fleet-restart callers own per-label failure accounting (a wedged
     launchctl call must be reported, not read as "unloaded").
     """
+    output = _launchd_print_service_output(domain, label)
+    if output is None:
+        return (False, None)
+    return (True, _parse_launchd_pid_from_print_output(output))
+
+
+def _launchd_print_service_output(domain: str, label: str) -> str | None:
+    """Loaded job output, or None if unavailable; launchctl timeouts propagate."""
     try:
         result = subprocess.run(["launchctl", "print", f"{domain}/{label}"], timeout=5, **_CAPTURE_TEXT)
     except FileNotFoundError:
-        return (False, None)
-    if result.returncode != 0:
-        return (False, None)
-    return (True, _parse_launchd_pid_from_print_output(result.stdout))
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def _launchd_service_registered(label: str, *, timeout: int = 5) -> bool:

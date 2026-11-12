@@ -18,6 +18,7 @@ kickstart.
 
 from __future__ import annotations
 
+import plistlib
 from types import SimpleNamespace
 
 import pytest
@@ -64,7 +65,7 @@ def launchd_seam(monkeypatch, tmp_path):
         if check and cmd[0] == "launchctl" and cmd[1] == "kickstart" and "-k" in cmd:
             # The wedged-launchctl shape: kickstart never returns.
             raise gateway_cli.subprocess.TimeoutExpired(cmd, 90)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="properties = keepalive | runatload\n", stderr="")
 
     monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
     return calls
@@ -103,7 +104,10 @@ def test_system_daemon_restart_never_refreshes_or_degrades(monkeypatch, tmp_path
 
 
 @pytest.mark.parametrize("self_restart", [True, False])
-def test_system_daemon_preserves_cooperative_restart(monkeypatch, launchd_seam, self_restart):
+def test_system_daemon_preserves_cooperative_restart(monkeypatch, launchd_seam, self_restart, tmp_path):
+    daemon = tmp_path / "daemon.plist"
+    daemon.write_bytes(plistlib.dumps({"RunAtLoad": True, "KeepAlive": True}))
+    monkeypatch.setattr(gateway_cli, "get_launchd_service_plist", lambda: daemon)
     monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "system")
     monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: pytest.fail("operator plist must not be rewritten"))
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 123)
@@ -117,9 +121,71 @@ def test_system_daemon_preserves_cooperative_restart(monkeypatch, launchd_seam, 
 
     gateway_cli.launchd_restart()
 
-    assert launchd_seam == []
+    assert launchd_seam == [["launchctl", "print", "system/ai.hermes.gateway"]]
     assert drained == ([] if self_restart else [123])
     assert seen == ([] if self_restart else ["system"])
+
+
+@pytest.mark.parametrize("keepalive", [None, False, {"SuccessfulExit": False}])
+def test_system_daemon_without_guaranteed_respawn_kickstarts(monkeypatch, tmp_path, keepalive):
+    from hermes_cli import gateway_launchd as ld
+
+    label = "ai.hermes.gateway-mercury"
+    daemon = tmp_path / f"{label}.plist"
+    definition = {"Label": label, "RunAtLoad": True}
+    if keepalive is not None:
+        definition["KeepAlive"] = keepalive
+    original = plistlib.dumps(definition)
+    daemon.write_bytes(original)
+    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: label)
+    monkeypatch.setattr(gateway_cli, "get_launchd_service_plist", lambda: daemon)
+    monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "system")
+    monkeypatch.setattr(ld.os, "geteuid", lambda: 501)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 123)
+    monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: pytest.fail("must not rewrite operator plist"))
+    monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: pytest.fail("must not request an unsupervised self-exit"))
+    monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", lambda *a, **kw: pytest.fail("must not exit before kickstart"))
+    monkeypatch.setattr(gateway_cli, "_wait_for_api_server_port_free", lambda: None)
+    calls = []
+    monkeypatch.setattr(ld.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+
+    gateway_cli.launchd_restart()
+
+    assert calls == [["sudo", "-n", "launchctl", "kickstart", "-k", f"system/{label}"]]
+    assert daemon.read_bytes() == original
+
+
+@pytest.mark.parametrize("print_failure", ["missing", "nonzero", "timeout", "oserror"])
+def test_system_daemon_loaded_policy_must_guarantee_respawn(monkeypatch, tmp_path, print_failure):
+    daemon = tmp_path / "daemon.plist"
+    original = plistlib.dumps({"RunAtLoad": True, "KeepAlive": True})
+    daemon.write_bytes(original)
+    monkeypatch.setattr(gateway_cli, "get_launchd_service_plist", lambda: daemon)
+    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "system")
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 123)
+    monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: pytest.fail("loaded policy must guarantee respawn"))
+    monkeypatch.setattr(gateway_cli, "_wait_for_api_server_port_free", lambda: None)
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["launchctl", "print"]:
+            assert kwargs["timeout"] == 5
+            if print_failure == "timeout":
+                raise gateway_cli.subprocess.TimeoutExpired(cmd, 5)
+            if print_failure == "oserror":
+                raise OSError("unreadable job")
+            return SimpleNamespace(returncode=1 if print_failure == "nonzero" else 0,
+                                   stdout="properties = runatload | system service\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gateway_cli.subprocess, "run", run)
+    gateway_cli.launchd_restart()
+    assert calls == [["launchctl", "print", "system/ai.hermes.gateway"],
+                     ["sudo", "-n", "launchctl", "kickstart", "-k", "system/ai.hermes.gateway"]]
+    assert daemon.read_bytes() == original
 
 
 def test_system_daemon_supervision_is_domain_explicit(monkeypatch):
