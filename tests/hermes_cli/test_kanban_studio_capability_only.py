@@ -1260,6 +1260,24 @@ def test_worktree_stash_on_a_branch_it_left_counts_even_if_another_checkout_took
     assert kwh.has_own_stash(str(wt), "feat/new") is True
 
 
+def test_own_reflog_proof_wins_over_a_coincident_reset_in_another_checkout(tmp_path):
+    """The worktree stashes on feat/old, switches away, and the primary checks out feat/old and resets at the same
+    commit in the same second. Both reflogs then hold a matching reset: the worktree's own proof decides (counts)."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    _worktree_of(tmp_path, branch="feat/old")
+    wt, repo = Path(tmp_path) / "mainwt", Path(tmp_path) / "repo"
+    _stash_in(repo, wt)
+    _g(wt, "checkout", "-q", "-b", "feat/new")
+    _g(repo, "checkout", "-q", "feat/old")
+    _g(repo, "reset", "-q", "--hard", "HEAD")
+    gitdir = repo / ".git" / "worktrees" / "mainwt"
+    log = (gitdir / "logs" / "HEAD").read_text().splitlines()
+    # drop the worktree's checkout line naming feat/old, so only the reset proof is left
+    (gitdir / "logs" / "HEAD").write_text("".join(f"{l}\n" for l in log if "feat/old" not in l.split("\t", 1)[-1]))
+    assert kwh.has_own_stash(str(wt), "feat/new") is True
+
+
 def test_separate_git_dir_repo_keeps_the_full_stash_check(tmp_path):
     """Operator item 2 (Prism 9e5b3d6ff57b): a ``--separate-git-dir`` repo has a ``.git`` FILE but shares its git
     dir with no other checkout (no commondir). Every stash in it is its own, whatever branch it was made on."""
