@@ -84,6 +84,39 @@ def test_a_fleet_pause_hold_says_the_card_waits_not_a_host(kanban_home, pool, mo
     assert "will run on" not in line, line
 
 
+def test_a_refused_pool_keeps_a_registered_pin_waiting_not_the_studio(kanban_home, monkeypatch):
+    """Prism 99e5feafc2ff: no pool plan is not "runs on the Studio". The dispatcher's no-plan branch keeps a
+    registered remote pin waiting ``pool_unavailable``; the preview must say the same."""
+    from hermes_cli import kanban_worker_pool as kwp
+    monkeypatch.setattr(kcp, "_pool_config", lambda: kwp.PoolConfig(refused="sidecar"))
+    monkeypatch.setattr(kwp, "known_host_ids", lambda fleet, **k: ("ace-ai",))
+    monkeypatch.setattr(kwp, "pin_aliases", lambda fleet, **k: {})
+    with kb.connect_closing() as conn:
+        _tid, line = _line(conn, "host: ace-ai\nfix the lint")
+        _tid2, plain = _line(conn, "fix the lint")
+    assert line.startswith("will wait (pool_unavailable)"), line
+    assert "Mac Studio" not in line, line
+    assert plain.startswith("will run on the Mac Studio while there is no pool plan"), plain
+    assert "sidecar" in plain, plain
+
+
+def test_an_unassigned_card_routes_as_the_default_assignee(kanban_home, pool, monkeypatch):
+    """Prism d0d266085414: the dispatcher routes an unassigned card as ``kanban.default_assignee``."""
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"default_assignee": "alpha"})
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee=None, body="fix the lint")
+        line = kcp.preview_line(conn, tid)
+    assert line.startswith("will run on a pool host"), line
+
+
+def test_studio_last_resort_without_the_capability_rule_still_offers_the_studio(kanban_home, pool, monkeypatch):
+    """Prism ce9e08fd61ec: a portable card skips the Studio only under t_9965b8d5's rule, not last_resort alone."""
+    monkeypatch.setattr(kbd, "_studio_capability_on", lambda caps, last: False)
+    with kb.connect_closing() as conn:
+        _tid, line = _line(conn, "fix the lint")
+    assert line.startswith("will run on a pool host or the Mac Studio"), line
+
+
 def test_preview_never_raises_and_writes_no_event(kanban_home, pool, monkeypatch):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="alpha", body="fix")

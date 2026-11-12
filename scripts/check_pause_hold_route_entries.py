@@ -56,6 +56,8 @@ SITES: Dict[Key, Tuple[Optional[str], ...]] = {
     ("hermes_cli/kanban_continuation.py", "origin_route", "clear_lost_state"): (None,),
     # kanban create's placement preview (t_0a5740f3): held_routes([row]) decides first, then passes held=
     ("hermes_cli/kanban_create_placement.py", "preview_line", "_route_row"): ("held=held",),
+    # its no-plan branch mirrors the dispatcher's: origin_route only for a row not in held
+    ("hermes_cli/kanban_create_placement.py", "_unplanned_route", "origin_route"): ("held",),
 }
 
 
@@ -196,6 +198,10 @@ def preview_line(conn, row, plan):
     if row["id"] in held:
         return held[row["id"]]
     return _route_row(conn, row, plan, held=held)
+
+def _unplanned_route(conn, row, held):
+    if row["origin_host"] and row["id"] not in held:
+        return origin_route(conn, row)
 '''
 
 
@@ -230,6 +236,7 @@ def _selftest() -> int:
                                                  "_route_row_base(conn, row, plan)"), 1),
         # t_0a5740f3: the create preview routes one card; it must hand the held set through too
         "preview drops held=": ((_FIX_OK, _FIX_PREVIEW.replace("plan, held=held)", "plan)")), 1),
+        "preview no-plan origin unguarded": ((_FIX_OK, _FIX_PREVIEW.replace(' and row["id"] not in held', "")), 1),
     }
     bad = 0
     for name, (src, want) in cases.items():
