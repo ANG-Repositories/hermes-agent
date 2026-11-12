@@ -998,6 +998,19 @@ class ReconcileMixin:
             )
             return len(messages)
 
+        cursor = self._tool_call_anchored_replay_cursor(messages, stored_rows)
+        if cursor > 0:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed history anchored on stored tool calls",
+                cursor=cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            return cursor
+
         self._record_ingest_reconciliation(
             action="persisted batch",
             reason="persisted ambiguous delta",
@@ -1008,6 +1021,62 @@ class ReconcileMixin:
             effective_incoming=len(incoming_identities),
         )
         return 0
+
+    def _tool_call_anchored_replay_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_rows: List[Dict[str, Any]],
+    ) -> int:
+        """Cursor past host history whose tool results are already stored.
+
+        A rebuilt agent's first ingest hands LCM the host's in-memory history:
+        a trailing slice of the session that starts mid-turn, has no system row
+        or compaction scaffold, and may carry host rewrites of earlier user rows
+        (a timestamp prefix, emptied content). No exact-suffix rule accepts it,
+        so each agent rebuild re-appended the whole slice under fresh
+        timestamps (t_73572f17: one session 552,644 rows / 10,848 contents).
+
+        A tool result's call id is unique per provider call. If the store
+        already holds the result for the call at ``messages[j]``, the host had
+        ``messages[:j + 1]`` when that row was stored, so those rows were
+        already offered for ingest. Anchor on the LAST such row, then extend
+        while the following rows equal the stored rows after it. Rows past
+        that point are new and get appended. Two distinct stored call ids are
+        required, so a short delta keeps the dup-over-loss default, and an
+        anchor must match the stored row's full identity, not just its call
+        id, so a provider that reuses ids cannot hide a new result.
+        """
+        stored_call_pos: dict[str, list[int]] = {}
+        for pos, row in enumerate(stored_rows):
+            call_id = str(row.get("tool_call_id") or "")
+            if str(row.get("role") or "") == "tool" and call_id:
+                stored_call_pos.setdefault(call_id, []).append(pos)
+        anchor = -1
+        anchor_pos = -1
+        anchored_ids: set[str] = set()
+        for idx, msg in enumerate(messages):
+            call_id = str(msg.get("tool_call_id") or "")
+            if str(msg.get("role") or "") != "tool" or call_id not in stored_call_pos:
+                continue
+            identity = self._message_replay_identity(msg)
+            for pos in reversed(stored_call_pos[call_id]):
+                if self._message_replay_identity(stored_rows[pos], stored_row=True) == identity:
+                    anchored_ids.add(call_id)
+                    anchor, anchor_pos = idx, pos
+                    break
+        if anchor < 0 or len(anchored_ids) < 2:
+            return 0
+        cursor = anchor + 1
+        stored_pos = anchor_pos + 1
+        while (
+            cursor < len(messages)
+            and stored_pos < len(stored_rows)
+            and self._message_replay_identity(messages[cursor])
+            == self._message_replay_identity(stored_rows[stored_pos], stored_row=True)
+        ):
+            cursor += 1
+            stored_pos += 1
+        return cursor
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (
