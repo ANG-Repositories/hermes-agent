@@ -65,11 +65,15 @@ def registrations(repo) -> int:
 
 
 def alive(pid: int) -> bool:
+    """False once ``pid`` is gone OR a zombie (Prism #265 P2 c-658240d2a3610b9e): a killed process whose parent
+    has not reaped it yet still answers kill(0) but runs nothing."""
     try:
         os.kill(pid, 0)  # windows-footgun: ok — the test drives POSIX process groups
     except ProcessLookupError:
         return False
-    return True
+    st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, encoding="utf-8",
+                        errors="replace").stdout.strip()
+    return bool(st) and not st.startswith("Z")
 
 
 def test_a_hung_add_is_killed_whole_and_the_spawn_removes_nothing(repo, tmp_path):
@@ -180,14 +184,9 @@ def test_half_built_names_only_an_initializing_tree_without_an_index(repo):
     assert got is not None and got["branch"] == "wt/t_hb" and got["age_s"] >= 9_000
 
 
-def _audit(*args):
-    import sys
-    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
-    return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, encoding="utf-8")
-
 
 def _snapshot_repo(repo) -> tuple:
-    """Everything the audit could change: registrations + their lock files, refs, the tree files."""
+    """Everything a probe could change: registrations + their lock files, refs, the tree files."""
     wts = git(repo, "worktree", "list", "--porcelain")
     refs = git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
     files = sorted(str(p.relative_to(repo)) for p in (repo / ".worktrees").rglob("*")) \
@@ -195,67 +194,11 @@ def _snapshot_repo(repo) -> tuple:
     return wts, refs, files
 
 
-def test_audit_is_read_only_and_check_keys_on_no_index(repo, tmp_path):
-    import sqlite3
-    db = tmp_path / "kanban.db"
-    c = sqlite3.connect(db)
-    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, branch_name TEXT)")
-    c.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT)")
-    c.execute("INSERT INTO tasks VALUES ('t_0000d0e0', 'done', NULL)")
-    c.execute("INSERT INTO task_events VALUES ('t_0000d0e0', 'spawned')")
-    c.commit()
-    c.close()
-    wt = repo / ".worktrees"
-    _half_built(repo, wt / "t_0000d0e0", "wt/t_0000d0e0", age_s=10_000)
-    _half_built(repo, wt / "fold-x", "fold-x", age_s=10_000)               # another tool's tree
-    _half_built(repo, wt / "t_0000feed", "wt/t_0000feed", reason="operator", age_s=10_000)
-    finished = wt / "t_0000f1f1"                                          # a finished tree still carrying the lock
-    git(repo, "worktree", "add", "-q", "-b", "wt/t_0000f1f1", str(finished), "HEAD")
-    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(finished))
-    _age_tree(finished, Path(git(finished, "rev-parse", "--absolute-git-dir")), 10_000)
-    before = _snapshot_repo(repo)
-
-    chk = _audit("--repo", str(repo), "--check")
-    assert chk.returncode == 1 and chk.stdout.count("finding: half-built worktree") == 2, chk.stdout
-    assert "t_0000f1f1" not in chk.stdout                                # keyed on "no index", not on the lock
-    assert "worktree remove" not in chk.stdout and "reset" not in chk.stdout
-    tab = _audit("--repo", str(repo), "--db", str(db))
-    assert tab.returncode == 0, tab.stderr
-    assert "t_0000d0e0\thalf-built" in tab.stdout and "finished-still-locked" in tab.stdout
-    assert "\tdone\tTrue\t" in tab.stdout
-    js = _audit("--repo", str(repo), "--db", str(db), "--json")
-    assert js.returncode == 0 and '"state": "half-built"' in js.stdout
-    for gone in ("--drain", "--execute"):
-        assert _audit("--repo", str(repo), gone).returncode == 2         # argparse: no such option any more
-    assert _snapshot_repo(repo) == before                                # nothing changed
-
-
-def test_audit_check_is_silent_when_clean(repo):
-    r = _audit("--repo", str(repo), "--check")
-    assert r.returncode == 0 and r.stdout == ""
-
-
-def test_audit_check_does_no_content_hashing(repo, monkeypatch):
-    """Prism #265 P2 c-7d3a831f652c416d: the sweep reads admin-dir files only, never per-row git."""
-    import importlib.util
-    target = repo / ".worktrees" / "t_cheap"
-    _half_built(repo, target, "wt/t_cheap", age_s=10_000)
-    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
-    spec = importlib.util.spec_from_file_location("kwr_audit_cheap", script)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    def boom(*a, **k):
-        raise AssertionError("per-row git call in --check")
-    monkeypatch.setattr(mod.kwr, "branch_has_own_commits", boom)
-    monkeypatch.setattr(mod.kwr, "rev", boom)
-    assert mod.main(["--repo", str(repo), "--check"]) == 1
-
 
 # --- ruling:t_f609a5a0-no-automatic-deletion: nothing in the spawn, assess() or this module deletes ---------------
 
 
-_DESTRUCTIVE = ("rmtree", "rmdir", "os.remove", ".unlink(", '"-d"', '"-D"', '"prune"', '"remove"')
+_DESTRUCTIVE = ("rmtree", "rmdir", "os.remove", ".unlink(", '"-d"', '"-D"', '"prune"', '"remove"', '"unlock"')
 
 
 def _source_of(func) -> str:
@@ -275,14 +218,12 @@ def _calls_in(src: str) -> set:
 
 
 def test_no_code_path_in_the_spawn_assess_or_the_residue_module_removes_anything():
-    """Static: the add path, assess() + its half-built probe, the residue module and the audit script carry no
-    worktree remove / prune, rmtree / rmdir / unlink, update-ref -d or branch -D, and the residue functions the
-    spawn and assess() reach are only the read-only ones (plus the unlock of a finished tree)."""
+    """Static: the add path, assess() + its half-built probe and the residue module carry no worktree remove /
+    prune / unlock, rmtree / rmdir / unlink, update-ref -d or branch -D, and the residue functions the spawn and
+    assess() reach are only the read-only ones (ruling:t_f609a5a0-spawn-fix-only)."""
     from hermes_cli import kanban_worktree_port as kwt
     srcs = {
         "kanban_worktree_residue.py": Path(kwr.__file__).read_text(encoding="utf-8-sig"),
-        "kanban_worktree_residue_audit.py": (Path(__file__).resolve().parents[2] / "scripts" /
-                                             "kanban_worktree_residue_audit.py").read_text(encoding="utf-8-sig"),
         "_ensure_git_worktree": _source_of(kbw._ensure_git_worktree),
         "_hold_half_built": _source_of(kbw._hold_half_built),
         "_half_built_held": _source_of(kwt._half_built_held),
@@ -291,9 +232,9 @@ def test_no_code_path_in_the_spawn_assess_or_the_residue_module_removes_anything
         for bad in _DESTRUCTIVE:
             assert bad not in src, f"{name} contains {bad!r}"
     for gone in ("remove_failed_add", "clear_half_built", "drain_half_built", "_drop_tree", "_delete_branch_at",
-                 "holds_work", "differs_from_head", "detached_unreachable"):
+                 "holds_work", "differs_from_head", "detached_unreachable", "release_stale_add_lock"):
         assert not hasattr(kwr, gone), gone
-    allowed = {"half_built", "release_stale_add_lock", "run_git_group", "WorktreeAddTimeout", "HALF_BUILT_HELD",
+    allowed = {"half_built", "run_git_group", "WorktreeAddTimeout", "HALF_BUILT_HELD",
                "ADD_TIMEOUT_S"}
     for fn in (kbw._ensure_git_worktree, kbw._hold_half_built, kwt._half_built_held, kwt.assess):
         src = _source_of(fn)
@@ -312,88 +253,6 @@ def test_assess_leaves_a_half_built_tree_byte_for_byte(repo):
     for _ in range(2):
         assert kwt._half_built_held(repo, target, "wt/t_ass") == kwt.WHY_HALF_BUILT
     assert _snapshot_repo(repo) == before and kwr.lock_reason(admin) == kwr.INIT_LOCK
-
-
-# --- review r2 (operator Studio audit 2026-11-11: 150 of 189 `initializing` locks sit on FINISHED trees) ---------
-
-
-def test_a_parent_only_kill_finishes_the_checkout_but_leaves_the_lock(repo, tmp_path):
-    """The root cause of the 150: the old spawn's subprocess.run timeout killed only git's parent; the checkout
-    child finished (index written) and nobody dropped the lock. The group kill closes that path."""
-    import signal as _sig
-    started = tmp_path / "smudge started"
-    script = f"echo $$ >> {shlex.quote(str(started))}; sleep 1; cat"
-    git(repo, "config", "filter.slow.smudge", f"sh -c {shlex.quote(script)}")
-    target = repo / ".worktrees" / "t_parent"
-    p = subprocess.Popen(["git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "wt/t_parent", str(target),
-                          "HEAD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # readiness marker, not a fixed sleep: the checkout child is running its first smudge
-    assert _wait_for(lambda: started.exists() and started.read_text(encoding="utf-8-sig").strip(), 30.0)
-    p.send_signal(_sig.SIGKILL)
-    p.wait()
-    admin = repo / ".git" / "worktrees" / "t_parent"
-    deadline = time.monotonic() + 30
-    while not (admin / "index").exists() and time.monotonic() < deadline:
-        time.sleep(0.2)
-    time.sleep(0.5)
-    assert (admin / "index").exists() and kwr.lock_reason(admin) == kwr.INIT_LOCK
-    assert git(target, "status", "--porcelain") == ""                # a complete, clean checkout, still locked
-    assert kwr.half_built(repo, target) is None                      # not residue: never cleared as one
-
-
-def _finished_locked(repo, name, age_s):
-    target = repo / ".worktrees" / name
-    git(repo, "worktree", "add", "-q", "-b", f"wt/{name}", str(target), "HEAD")
-    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
-    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
-    if age_s:
-        old = time.time() - age_s
-        os.utime(admin / "locked", (old, old))
-    return target, admin
-
-
-def test_card_close_remove_refuses_a_finished_tree_locked_initializing_without_the_release(repo):
-    """Measured: a no-force and a single -f `worktree remove` both refuse; -f -f is the only override."""
-    target, _ = _finished_locked(repo, "t_close0", 10_000)
-    for args in (("remove",), ("remove", "-f")):
-        r = subprocess.run(["git", "-C", str(repo), "worktree", *args, str(target)], **_TXT)
-        assert r.returncode != 0 and "locked" in r.stderr
-    assert target.is_dir()
-
-
-def test_release_stale_add_lock_unlocks_only_a_finished_tree_older_than_an_add(repo):
-    target, admin = _finished_locked(repo, "t_rel", 10_000)
-    assert kwr.release_stale_add_lock(repo, target) is True
-    assert kwr.lock_reason(admin) is None
-    r = subprocess.run(["git", "-C", str(repo), "worktree", "remove", str(target)], **_TXT)
-    assert r.returncode == 0                                         # card close's no-force remove now succeeds
-
-    young, yadmin = _finished_locked(repo, "t_young2", 0)            # an add may still be finishing
-    assert kwr.release_stale_add_lock(repo, young) is False and kwr.lock_reason(yadmin) == kwr.INIT_LOCK
-    hb = repo / ".worktrees" / "t_hb2"
-    hadmin = _half_built(repo, hb, "wt/t_hb2", age_s=10_000)         # no index: residue, not a finished tree
-    assert kwr.release_stale_add_lock(repo, hb) is False and kwr.lock_reason(hadmin) == kwr.INIT_LOCK
-    other, oadmin = _finished_locked(repo, "t_op", 0)
-    git(repo, "worktree", "unlock", str(other))
-    git(repo, "worktree", "lock", "--reason", "operator: keep", str(other))
-    os.utime(oadmin / "locked", (time.time() - 10_000,) * 2)
-    assert kwr.release_stale_add_lock(repo, other) is False and kwr.lock_reason(oadmin) == "operator: keep"
-
-
-def test_release_keeps_the_dirty_check_a_dirty_finished_tree_is_not_removed(repo):
-    target, _ = _finished_locked(repo, "t_dirty", 10_000)
-    (target / "f0.slow").write_text("edited\n", encoding="utf-8")
-    assert kwr.release_stale_add_lock(repo, target) is True
-    r = subprocess.run(["git", "-C", str(repo), "worktree", "remove", str(target)], **_TXT)
-    assert r.returncode != 0 and (target / "f0.slow").read_text(encoding="utf-8-sig") == "edited\n"
-
-
-def test_spawn_reusing_a_finished_locked_tree_releases_the_stale_lock(repo):
-    target, admin = _finished_locked(repo, "t_reuse", 10_000)
-    kbw._ensure_git_worktree(repo, target, "wt/t_reuse")
-    assert kwr.lock_reason(admin) is None and git(target, "branch", "--show-current") == "wt/t_reuse"
-
-
 
 
 # --- review r5 (Prism #265 @9cdae381) ---------------------------------------------------------------------------
@@ -423,46 +282,51 @@ def test_resolve_holds_a_half_built_requested_checkout_instead_of_returning_it(r
     assert branch == "wt/t_fine" and Path(got) == (repo / ".worktrees" / "t_fine").resolve()
 
 
-def test_a_failed_rev_parse_is_unknown_not_no_own_commits(repo, monkeypatch):
-    """Prism #265 P1 c-5f2cb908f57d60a2 / c-3bed16991a4b3217: git failing or timing out is None end to end."""
-    git(repo, "branch", "wt/t_rev")
-    assert kwr.rev(repo, "refs/heads/wt/t_rev") == git(repo, "rev-parse", "HEAD")
-    assert kwr.rev(repo, "refs/heads/nope") == ""                       # absent ref: known
-    assert kwr.branch_has_own_commits(repo, "nope") is False
-    assert kwr.sha_has_own_commits(repo, None) is None
-
-    monkeypatch.setattr(kwr, "_git", lambda *a, **k: None)              # timed out / could not run
-    assert kwr.rev(repo, "refs/heads/wt/t_rev") is None
-    assert kwr.branch_has_own_commits(repo, "wt/t_rev") is None
-
-    def broken(*a, **k):
-        return subprocess.CompletedProcess(a, 128, "", "fatal: not a git repository")
-    monkeypatch.setattr(kwr, "_git", broken)                            # git ran and failed
-    assert kwr.rev(repo, "refs/heads/wt/t_rev") is None
-    assert kwr.branch_has_own_commits(repo, "wt/t_rev") is None
+# --- review r6 (Prism #265 @6496c8e4) ---------------------------------------------------------------------------
 
 
-def test_audit_row_keeps_unknown_own_commits_as_none(repo, monkeypatch):
-    import importlib.util
-    _half_built(repo, repo / ".worktrees" / "t_0000aaaa", "wt/t_0000aaaa", age_s=10_000)
-    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_worktree_residue_audit.py"
-    spec = importlib.util.spec_from_file_location("kwr_audit_unknown", script)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(mod.kwr, "rev", lambda *a, **k: None)
-    rows = mod.attribute(repo, None, time.time())
-    assert len(rows) == 1 and rows[0]["branch_own_commits"] is None
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_an_unreadable_lock_is_held_never_read_as_a_finished_checkout(repo):
+    """Prism #265 P1 c-bf64c62a812cc1fc: lock_reason() kept "no lock" and "lock unreadable" apart; an unreadable
+    lock fails closed in both callers (_hold_half_built, _half_built_held), even when the tree has an index."""
+    from hermes_cli import kanban_worktree_port as kwt
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    target = repo / ".worktrees" / "t_unread"
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_unread", str(target), "HEAD")   # a finished tree: has an index
+    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
+    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
+    assert kwr.lock_reason(admin / "nope") is None                                # no lock file: not locked
+    os.chmod(admin / "locked", 0)
+    try:
+        assert kwr.lock_reason(admin) is kwr.LOCK_UNREADABLE
+        hb = kwr.half_built(repo, target)
+        assert hb is not None and hb["lock"] == "unreadable"
+        def snap():  # `git worktree list` itself refuses an unreadable lock: refs + tree files + admin dir
+            return (git(repo, "for-each-ref", "--format=%(refname) %(objectname)"),
+                    sorted(str(p.relative_to(repo)) for p in (repo / ".worktrees").rglob("*")),
+                    sorted(p.name for p in admin.iterdir()))
+        before = snap()
+        with pytest.raises(WorkspaceUnavailable, match=kwr.HALF_BUILT_HELD):
+            kbw._ensure_git_worktree(repo, target, "wt/t_unread")
+
+        class _Task:
+            id = "t_unread"
+            workspace_kind = "worktree"
+            workspace_path = str(target)
+            branch_name = "wt/t_unread"
+
+        with pytest.raises(WorkspaceUnavailable, match="cannot be read"):
+            kbw._resolve_worktree_workspace(_Task())
+        assert kwt._half_built_held(repo, target, "wt/t_unread") == kwt.WHY_HALF_BUILT
+        assert snap() == before
+    finally:
+        os.chmod(admin / "locked", 0o644)
+    assert kwr.lock_reason(admin) == kwr.INIT_LOCK and kwr.half_built(repo, target) is None   # readable again
 
 
-@pytest.mark.parametrize("name", ["t_é x", 't_q"z', "t_bs\\z", "t_n\nl"])
-def test_audit_check_finds_a_half_built_tree_whose_path_git_would_quote(repo, name):
-    """Prism #265 P1 c-3b354bf2730246e2: parsed from `worktree list --porcelain -z`, so non-ASCII, quote, backslash
-    and newline paths are found (state half-built, not unknown) and --check exits 1."""
-    target = repo / ".worktrees" / name
-    _half_built(repo, target, "wt/odd", age_s=10_000)
-    chk = _audit("--repo", str(repo), "--check")
-    assert chk.returncode == 1 and chk.stdout.count("finding: half-built worktree") == 1, chk.stdout
-    js = _audit("--repo", str(repo), "--json")
-    import json as _json
-    rows = _json.loads(js.stdout)
-    assert [r["state"] for r in rows] == ["half-built"] and Path(rows[0]["path"]).name == name
+def test_alive_treats_a_zombie_as_terminated(tmp_path):
+    """Prism #265 P2 c-658240d2a3610b9e: an unreaped child is dead for the group-kill assertions."""
+    p = subprocess.Popen(["sh", "-c", "exit 0"])
+    assert _wait_for(lambda: not alive(p.pid), 10.0)                  # zombie until wait(): already not alive
+    p.wait()
+    assert not alive(p.pid)

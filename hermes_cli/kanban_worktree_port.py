@@ -118,7 +118,8 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
     WHY_NOT_CHECKOUT: "the card's .worktrees/<id> holds files but is not a git checkout, or has no index: git "
                       "cannot see or carry them",
     WHY_HALF_BUILT: "the card's .worktrees/<id> is a `git worktree add` that was killed mid-checkout (locked "
-                    "`initializing`, no index): never removed automatically; held, named, until an operator "
+                    "`initializing`, no index; or locked with an unreadable lock file): never removed automatically; "
+                    "held, named, until an operator "
                     "inspects and clears it (t_f609a5a0)",
     WHY_PROBE_FAILED: "git could not read whether the card's own Studio tree has an index (error or timeout): "
                       "unknown state is never read as an empty tree",
@@ -739,8 +740,8 @@ def _half_built_held(repo: Path, tree: Path, branch: str) -> Optional[str]:
         return WHY_HALF_BUILT
     if hb is None:
         return None
-    _log.warning("PHASE=kanban_half_built_worktree_held %s (lock age %ss, tree branch %s, card branch %s)", tree,
-                 hb.get("age_s"), hb.get("branch") or "-", branch)
+    _log.warning("PHASE=kanban_half_built_worktree_held %s (lock %s, lock age %ss, tree branch %s, card branch %s)",
+                 tree, hb.get("lock"), hb.get("age_s"), hb.get("branch") or "-", branch)
     return WHY_HALF_BUILT
 
 

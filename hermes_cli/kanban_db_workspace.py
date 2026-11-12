@@ -878,6 +878,9 @@ def _hold_half_built(repo_root: Path, target: Path) -> None:
     hb = _kwr.half_built(repo_root, target) if target.exists() else None
     if hb is not None:
         from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+        if hb.get("lock") == "unreadable":
+            raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is locked and its lock file cannot be read; "
+                                       f"unknown state is held, never reused; left as it is")
         raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is a killed `git worktree add` (locked "
                                    f"initializing, no index, lock {hb['age_s']}s old); left as git left it")
 
@@ -900,7 +903,6 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         target.exists() and repo_common is not None
         and _path_key(_git_common_dir(target)) == _path_key(repo_common)
     ):
-        _kwr.release_stale_add_lock(repo_root, target)   # t_f609a5a0: a finished tree left locked by a killed add
         if _git_current_branch(target) == branch_name:
             return
         # Reused worktree is on the wrong branch — realign it.
