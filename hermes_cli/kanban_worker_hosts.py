@@ -755,6 +755,22 @@ def _is_linked_worktree(path: str) -> bool:
         return False
 
 
+def _gitfile_dirs(path: str) -> Optional[Tuple[str, str, bool]]:
+    """``(gitdir, common dir, shared)`` for a checkout whose ``.git`` is a gitdir FILE, else None. ``shared`` is True
+    only when the gitdir holds a ``commondir`` file (a linked worktree sharing one repo with other checkouts); a
+    ``--separate-git-dir`` repo or a submodule checkout also has a gitfile but owns its whole git dir (operator item
+    2 at d77ebe045e). Raises OSError/UnicodeError/ValueError on an unreadable pointer."""
+    if not _is_linked_worktree(path):
+        return None
+    with open(os.path.join(path, ".git"), encoding="utf-8-sig") as f:
+        gitdir = os.path.realpath(os.path.join(path, f.read(4096).strip()[8:]))
+    cfile = os.path.join(gitdir, "commondir")
+    if not os.path.isfile(cfile):
+        return gitdir, gitdir, False
+    with open(cfile, encoding="utf-8-sig") as f:
+        return gitdir, os.path.realpath(os.path.join(gitdir, f.read().strip())), True
+
+
 def clone_linked_worktrees(repo: str, runner: Callable = subprocess.run) -> Optional[Tuple[str, ...]]:
     """Realpaths of every OTHER worktree of the clone at ``repo`` (``git worktree list``), or None when git cannot
     list them (fail closed)."""
@@ -781,6 +797,15 @@ def split_worktree_loss(workspace: str, recs, runner: Callable = subprocess.run)
     except (OSError, ValueError):
         return "workspace unreadable"
     for r in recs:
+        try:
+            dirs = _gitfile_dirs(os.path.join(workspace, r["rel"]))
+        except (OSError, UnicodeError, ValueError):
+            return f"clone {r['rel']}: git dir unreadable"
+        if dirs is not None and dirs[2]:
+            # Prism 78347eb52e27 / c-acee245679ee7db1: a rebuilt LINKED worktree leaves the common dir (the primary's
+            # .git) where it is; the primary and its other worktrees keep their git state. Only rebuilding the
+            # checkout that holds the common dir strands its worktrees.
+            continue
         others = clone_linked_worktrees(os.path.join(workspace, r["rel"]), runner)
         if others is None:
             return f"clone {r['rel']}: worktree list unreadable"
@@ -806,25 +831,67 @@ def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
     def _travels(p: str) -> bool:
         p = p.rstrip("/") + "/"
         return p.startswith(ws) and not any(p.startswith(g) for g in gone)
-    for rel in carried:
-        wt = os.path.join(workspace, rel)
-        if not _is_linked_worktree(wt):
-            continue
+
+    def _alternates_loss(name: str, common: str) -> Optional[str]:
+        # Prism ca4b50199bda / c-86a12a77bcdd7173: objects borrowed through objects/info/alternates (followed
+        # transitively, as git does) must travel too, or the copy arrives without them.
+        seen, todo = set(), [os.path.join(common, "objects")]
+        while todo:
+            objs = os.path.realpath(todo.pop())
+            if objs in seen:
+                continue
+            seen.add(objs)
+            alt = os.path.join(objs, "info", "alternates")
+            if not os.path.lexists(alt):
+                continue
+            with open(alt, encoding="utf-8-sig") as f:
+                for line in f.read().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    target = os.path.realpath(os.path.join(objs, line))
+                    if not _travels(target):
+                        return (f"{name} is carried as files but borrows objects through an alternate {target} "
+                                f"that does not travel with it (outside the workspace or in a rebuilt clone)")
+                    todo.append(target)
+        return None
+
+    def _repo_loss(repo: str, name: str) -> Optional[str]:
         try:
-            with open(os.path.join(wt, ".git"), encoding="utf-8-sig") as f:
-                gitdir = os.path.realpath(os.path.join(wt, f.read(4096).strip()[8:]))
-            if not os.path.isdir(gitdir):
-                continue  # dead stub: git already cannot use it on the Studio; the files are all there is
-            common = gitdir
-            if os.path.isfile(os.path.join(gitdir, "commondir")):
-                with open(os.path.join(gitdir, "commondir"), encoding="utf-8-sig") as f:
-                    common = os.path.realpath(os.path.join(gitdir, f.read().strip()))
+            dirs = _gitfile_dirs(repo)
+            if dirs is None:
+                common = os.path.join(repo, ".git")
+                if os.path.islink(common) or not os.path.isdir(common):
+                    return None
+            else:
+                gitdir, common, _shared = dirs
+                if not os.path.isdir(gitdir):
+                    return None  # dead stub: git already cannot use it on the Studio; the files are all there is
+                for p in (gitdir, common):
+                    if not _travels(p):
+                        return (f"worktree {name} is carried as files but its git dir {p} does not travel with it "
+                                f"(outside the workspace or in a rebuilt clone)")
+            return _alternates_loss(name, common)
         except (OSError, UnicodeError, ValueError):
-            return f"worktree {rel}: git dir unreadable"
-        for p in (gitdir, common):
-            if not _travels(p):
-                return (f"worktree {rel} is carried as files but its git dir {p} does not travel with it "
-                        f"(outside the workspace or in a rebuilt clone)")
+            return f"{name}: git dir unreadable"
+
+    for rel in carried:
+        # Prism 23e5001bba80 / c-480d52ee4b039482: every repo at or under a carried rel (a worktree nested in a clone
+        # carried as files, say), not only the top-level one. Symlinks are never followed; .git dirs not entered.
+        top = os.path.join(workspace, rel)
+        stack = [(top, rel)]
+        while stack:
+            d, name = stack.pop()
+            if os.path.lexists(os.path.join(d, ".git")):
+                lost = _repo_loss(d, name)
+                if lost is not None:
+                    return lost
+            try:
+                with os.scandir(d) as scan:
+                    subs = [e for e in scan if e.name != ".git" and e.is_dir(follow_symlinks=False)]
+            except OSError:
+                return f"{name}: unreadable"
+            stack.extend((e.path, f"{name}/{e.name}") for e in subs)
     return None
 
 
@@ -942,23 +1009,111 @@ def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None
 def has_own_stash(repo: str, branch: str, runner: Callable = subprocess.run) -> Optional[bool]:
     """True when the checkout at ``repo`` holds a stash a rebuild would leave behind, None when unreadable.
 
-    A clone owns every stash in its .git. A linked worktree shares the stash list of the common git dir with every
-    other checkout of that repo (operator F1/F2, t_d2f06cf6: the live home repo lists 34, none of the worktree's), so
-    only an entry made on its own branch (reflog subject ``WIP on <branch>:`` / ``On <branch>:``) counts; the rest
-    belong to other checkouts and stay in the common dir, which the carry never moves."""
+    A clone, or any gitfile repo with no ``commondir`` (``--separate-git-dir``, a submodule), owns every stash in its
+    git dir. A linked worktree shares the stash list of the common git dir with every other checkout of that repo
+    (operator F1/F2, t_d2f06cf6: the live home repo lists 34, none of the worktree's); an entry stays out of the count
+    only when :func:`_stash_is_foreign` proves it another checkout's. The common dir never moves with the carry."""
     try:
-        if not _is_linked_worktree(repo):
+        dirs = _gitfile_dirs(repo)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    try:
+        if dirs is None or not dirs[2]:
+            # a clone, or a gitfile repo that owns its whole git dir (--separate-git-dir, a submodule checkout;
+            # operator item 2 / Prism 9e5b3d6ff57b): every stash in it is its own
             st = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True,
                         text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
             return getattr(st, "returncode", 1) == 0
-        st = runner(["git", "-C", repo, "stash", "list", "--format=%gs"], capture_output=True, text=True,
-                    encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+        st = runner(["git", "-C", repo, "stash", "list", "--date=unix", "--format=%gd%x09%P%x09%gs"],
+                    capture_output=True, text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     if getattr(st, "returncode", 1) != 0:
         return None
-    own = (f"WIP on {branch}:", f"On {branch}:")
-    return any(line.startswith(own) for line in (st.stdout or "").splitlines())
+    entries = [line for line in (st.stdout or "").splitlines() if line.strip()]
+    if not entries:
+        return False
+    try:
+        owners = _stash_owner_evidence(dirs[0], dirs[1])
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return any(not _stash_is_foreign(line, branch, owners) for line in entries)
+
+
+def _read_head_reflog(gitdir: str) -> List[Tuple[str, int, str]]:
+    """``(new sha, unix ts, message)`` per line of ``<gitdir>/logs/HEAD``; [] when there is none. The
+    ``reset: moving to HEAD`` that ``git worktree add`` logs right after its creation line (old sha all zeros) is
+    relabelled ``worktree add``, so it never reads as a stash's reset."""
+    path = os.path.join(gitdir, "logs", "HEAD")
+    if not os.path.isfile(path):
+        return []
+    out = []
+    prev_created = False
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            head, _tab, msg = line.rstrip("\n").partition("\t")
+            parts = head.split()
+            if len(parts) >= 5 and parts[-2].isdigit():
+                if prev_created and msg == "reset: moving to HEAD":
+                    msg = "worktree add"
+                out.append((parts[1], int(parts[-2]), msg))
+                prev_created = set(parts[0]) == {"0"}
+    return out
+
+
+def _stash_owner_evidence(gitdir: str, common: str) -> dict:
+    """What the shared repo records about who stashed what: this checkout's HEAD reflog, every OTHER checkout's
+    HEAD reflog (the primary's and each ``worktrees/*``), and the branch each other checkout has checked out."""
+    me = os.path.realpath(gitdir)
+    others = [common] + [os.path.join(common, "worktrees", n) for n in
+                         (sorted(os.listdir(os.path.join(common, "worktrees")))
+                          if os.path.isdir(os.path.join(common, "worktrees")) else ())]
+    other_logs, other_branches = [], set()
+    for g in others:
+        if os.path.realpath(g) == me:
+            continue
+        other_logs.extend(_read_head_reflog(g))
+        try:
+            with open(os.path.join(g, "HEAD"), encoding="utf-8-sig") as f:
+                head = f.read().strip()
+        except FileNotFoundError:
+            continue
+        if head.startswith("ref: refs/heads/"):
+            other_branches.add(head[len("ref: refs/heads/"):])
+    return {"mine": _read_head_reflog(gitdir), "others": other_logs, "branches": other_branches}
+
+
+def _stash_is_foreign(line: str, branch: str, owners: dict) -> bool:
+    """True only when a shared-list stash entry is PROVABLY another checkout's (operator item 1 at d77ebe045e: fail
+    closed). ``git stash push`` stores the entry, then resets HEAD (``reset: moving to HEAD`` at the stash's first
+    parent, same second or just after) in the reflog of the checkout that made it, so:
+
+    - that reset in THIS checkout's HEAD reflog: ours, whatever the subject's branch is now (renamed, switched);
+    - that reset only in another checkout's HEAD reflog: theirs;
+    - neither (reflog expired, ``stash store``): theirs only when the subject names a branch another checkout has
+      checked out right now, that is not ours, and that this checkout's reflog never shows it on. Else ours."""
+    try:
+        sel, parents, subject = line.split("\t", 2)
+        ts = int(sel[sel.index("{") + 1:sel.index("}")])
+        base = parents.split()[0]
+    except (ValueError, IndexError):
+        return False
+
+    def _made_in(log) -> bool:
+        return any(sha == base and ts <= t <= ts + 2 and msg == "reset: moving to HEAD" for sha, t, msg in log)
+    if _made_in(owners["mine"]):
+        return False
+    if _made_in(owners["others"]):
+        return True
+    m = re.match(r"(?:WIP on|On) (.+?): ", subject)
+    b = m.group(1) if m else None
+    if not b or b == branch or b not in owners["branches"]:
+        return False
+    for _sha, _t, msg in owners["mine"]:
+        words = {w[len("refs/heads/"):] if w.startswith("refs/heads/") else w for w in msg.split()}
+        if b in words:
+            return False
+    return True
 
 
 def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional[dict], Optional[str]]:
@@ -1215,11 +1370,11 @@ def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable
     return None
 
 
-def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run) -> None:
-    """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
-    pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
-    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
-    from hermes_cli import kanban_worktree_port as _kwt
+def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable = subprocess.run) -> list:
+    """Every spawn-time re-check of a split carry (state moved since routing, git state a rebuild or file copy would
+    lose, the caps), uncached, raising on the first refusal. The dispatcher calls it BEFORE ``carry_workspace``
+    copies anything (P2 c-38aac54b3e75a212 / Prism 06179c2d4439); :func:`carry_clones` runs it again after the copy.
+    Returns ``[(clone, dest, ignored files)]``."""
     # Every check runs for every clone before anything is pushed, rebuilt or copied (nothing half-carried).
     staged = []
     extra_bytes = extra_entries = 0
@@ -1257,6 +1412,15 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
         over = carry_split_fits(workspace, extra_bytes, extra_entries, rebuilt=rebuilt, fresh=True)
         if over is not None:
             raise RuntimeError(f"carry to {host.name}: {over}")
+    return staged
+
+
+def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Callable = subprocess.run) -> None:
+    """Rebuild each skipped clone on ``host`` (t_9965b8d5): push its unpushed commits first (force-with-lease
+    pinned to the origin sha the routing saw), clone origin at ``<workspace>/<rel>`` on the same branch, then
+    put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
+    from hermes_cli import kanban_worktree_port as _kwt
+    staged = carry_clones_check(host, workspace, clones, runner)
     for c, dest, ignored in staged:
         if c.get("push") is not None:
             _kwt.push_card_branch(tuple(c["push"]), runner)

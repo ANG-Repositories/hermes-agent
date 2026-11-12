@@ -8642,6 +8642,8 @@ def _dispatch_once_locked(
                     _split = _carry_rows.get(claimed.id)
                     _split = _split if isinstance(_split, dict) else None
                     if _split:
+                        # P2 c-38aac54b3e75a212: refuse before the rsync copies anything to the pool host
+                        _kb._kwh.carry_clones_check(placed_host, str(workspace), _split["clones"])
                         _kb._kwh.carry_workspace(placed_host, str(workspace), exclude=_split["exclude"])
                     else:
                         _kb._kwh.carry_workspace(placed_host, str(workspace))

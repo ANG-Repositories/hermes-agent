@@ -1200,3 +1200,184 @@ def test_carry_clones_refuses_a_dangling_gitdir(kanban_home, wt_carry, monkeypat
     with pytest.raises(RuntimeError, match="worktree mainwt is carried as files but its git dir"):
         kwh.carry_clones(_host(), path, clone, kanban_home / "fleet")
     assert rebuilt == []
+
+
+# -- 1f. operator send-back at d77ebe045e (Prism round at that head): stash ownership, gitfile repos, alternates,
+# nested worktrees, check-before-copy, a rebuilt worktree beside its carried primary ---------------------------------
+
+def _g(cwd, *a):
+    import subprocess
+    return subprocess.run(["git", "-C", str(cwd), "-c", "user.email=t@t", "-c", "user.name=t", *a], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.mark.parametrize("move", ["rename", "switch"])
+def test_worktree_stash_made_before_a_branch_rename_or_switch_still_counts(tmp_path, move):
+    """Operator item 1 (Prism e8f8d17a75a9 / e9a1e6ba0dfd / 25455a3cf47f): a stash made in the worktree on feat/old
+    keeps the subject ``WIP on feat/old:`` after the branch is renamed or switched. No other checkout has feat/old
+    checked out, so the entry cannot be shown to be another checkout's: it counts (fail closed)."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    _worktree_of(tmp_path, branch="feat/old")
+    wt = Path(tmp_path) / "mainwt"
+    _stash_in(Path(tmp_path) / "repo", wt)
+    assert kwh.has_own_stash(str(wt), "feat/old") is True
+    if move == "rename":
+        _g(wt, "branch", "-m", "feat/old", "feat/new")
+    else:
+        _g(wt, "checkout", "-q", "-b", "feat/new")
+    assert kwh.has_own_stash(str(wt), "feat/new") is True
+
+
+def test_worktree_stash_owner_is_proven_by_the_other_checkouts_head_reflog(tmp_path):
+    """An entry is another checkout's only when THAT checkout's HEAD reflog records the stash's reset (same commit,
+    same second). Made in the primary on a branch since deleted: provably the primary's, so it does not count. Once
+    the primary's HEAD reflog no longer shows it, the owner cannot be shown and the entry counts (fail closed)."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    repo = Path(tmp_path) / "repo"
+    _g(repo, "checkout", "-q", "-b", "gone")
+    _stash_in(repo)
+    _g(repo, "checkout", "-q", "main")
+    _g(repo, "branch", "-D", "gone")
+    _worktree_of(tmp_path)
+    wt = str(Path(tmp_path) / "mainwt")
+    assert kwh.has_own_stash(wt, "feat/wt") is False
+    (repo / ".git" / "logs" / "HEAD").write_text("")
+    assert kwh.has_own_stash(wt, "feat/wt") is True
+
+
+def test_worktree_stash_on_a_branch_it_left_counts_even_if_another_checkout_took_it(tmp_path):
+    """The worktree's own HEAD reflog shows it was on feat/old: an entry on feat/old may be its own even though
+    another checkout has feat/old checked out now, so it counts."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    _worktree_of(tmp_path, branch="feat/old")
+    wt, repo = Path(tmp_path) / "mainwt", Path(tmp_path) / "repo"
+    _stash_in(repo, wt)
+    _g(wt, "checkout", "-q", "-b", "feat/new")
+    _g(repo, "checkout", "-q", "feat/old")
+    assert kwh.has_own_stash(str(wt), "feat/new") is True
+
+
+def test_separate_git_dir_repo_keeps_the_full_stash_check(tmp_path):
+    """Operator item 2 (Prism 9e5b3d6ff57b): a ``--separate-git-dir`` repo has a ``.git`` FILE but shares its git
+    dir with no other checkout (no commondir). Every stash in it is its own, whatever branch it was made on."""
+    from pathlib import Path
+    repo = Path(tmp_path) / "s"
+    _g(tmp_path, "init", "-q", "-b", "main", "--separate-git-dir", str(Path(tmp_path) / "sep.git"), str(repo))
+    (repo / "a").write_text("a\n")
+    _g(repo, "add", "a")
+    _g(repo, "commit", "-q", "-m", "a")
+    _g(repo, "checkout", "-q", "-b", "other")
+    (repo / "a").write_text("b\n")
+    _g(repo, "stash", "push", "-q")
+    _g(repo, "checkout", "-q", "main")
+    assert (repo / ".git").is_file()
+    assert kwh.has_own_stash(str(repo), "main") is True
+
+
+def test_submodule_checkout_keeps_the_full_stash_check(tmp_path):
+    """Operator item 2: a submodule checkout's ``.git`` is a file naming ``.git/modules/<name>`` (no commondir)."""
+    from pathlib import Path
+    up = Path(tmp_path) / "up"
+    up.mkdir()
+    _g(up, "init", "-q", "-b", "main")
+    (up / "f").write_text("f\n")
+    _g(up, "add", "f")
+    _g(up, "commit", "-q", "-m", "f")
+    sup = Path(tmp_path) / "sup"
+    sup.mkdir()
+    _g(sup, "init", "-q", "-b", "main")
+    _g(sup, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(up), "sub")
+    sub = sup / "sub"
+    assert (sub / ".git").is_file()
+    _g(sub, "checkout", "-q", "-b", "other")
+    (sub / "f").write_text("g\n")
+    _g(sub, "stash", "push", "-q")
+    _g(sub, "checkout", "-q", "main")
+    assert kwh.has_own_stash(str(sub), "main") is True
+
+
+def test_clone_carried_as_files_with_an_outside_alternate_is_refused(tmp_path):
+    """Operator item 3 (Prism ca4b50199bda): a clone carried as files that borrows objects through
+    ``objects/info/alternates`` from outside the workspace arrives without those objects. Refused, named."""
+    from pathlib import Path
+    ws, store = Path(tmp_path) / "ws", Path(tmp_path) / "store"
+    ws.mkdir()
+    store.mkdir()
+    _clone_in(store, "src")
+    _g(ws, "clone", "-q", "--shared", str(store / "src"), "repo")
+    alt = ws / "repo" / ".git" / "objects" / "info" / "alternates"
+    assert alt.is_file()
+    why = kwh.carried_gitdir_loss(str(ws), ["repo"], set())
+    assert why and "repo" in why and "alternate" in why, why
+
+
+def test_alternate_inside_what_travels_is_not_refused(tmp_path):
+    """An alternate that resolves into another path carried as files travels with it: nothing is refused."""
+    from pathlib import Path
+    ws = Path(tmp_path)
+    _clone_in(ws, "src")
+    _g(ws, "clone", "-q", "--shared", str(ws / "src"), "repo")
+    assert kwh.carried_gitdir_loss(str(ws), ["repo", "src"], set()) is None
+    # ... but not when the alternate's owner is rebuilt (its .git does not travel)
+    assert "alternate" in (kwh.carried_gitdir_loss(str(ws), ["repo"], {"src"}) or "")
+
+
+def test_worktree_nested_in_a_clone_carried_as_files_is_checked(tmp_path):
+    """Operator item 4 (Prism 23e5001bba80): a linked worktree nested inside a clone carried as files is checked by
+    the same rule as a top-level one: a gitdir outside what travels is refused, one inside the clone is not."""
+    import shutil
+    from pathlib import Path
+    ws, out = Path(tmp_path) / "ws", Path(tmp_path) / "out"
+    ws.mkdir()
+    out.mkdir()
+    _clone_in(ws)
+    _worktree_of(ws, "inner")
+    shutil.move(str(ws / "inner"), str(ws / "repo" / "inner"))
+    _g(ws / "repo", "worktree", "repair", str(ws / "repo" / "inner"))
+    assert kwh.carried_gitdir_loss(str(ws), ["repo"], set()) is None  # its gitdir is in repo/.git: travels
+    _clone_in(out)
+    _worktree_of(out, "far")
+    shutil.move(str(out / "far"), str(ws / "repo" / "far"))
+    _g(out / "repo", "worktree", "repair", str(ws / "repo" / "far"))
+    why = kwh.carried_gitdir_loss(str(ws), ["repo"], set())
+    assert why and "worktree repo/far is carried as files but its git dir" in why, why
+
+
+def test_clean_rebuilt_worktree_does_not_block_its_carried_primary(tmp_path):
+    """P2 c-acee245679ee7db1: a clean, pushed linked worktree is rebuilt while its dirty primary clone is carried as
+    files. The primary's .git (the common dir) travels, so the rebuild loses nothing: no wait."""
+    from pathlib import Path
+    _clone_in(tmp_path, dirty=True)
+    _worktree_of(tmp_path)
+    rec, why = kwh.assess_clone(str(Path(tmp_path) / "mainwt"))
+    assert why is None, why
+    assert kwh.split_worktree_loss(str(tmp_path), [{"rel": "mainwt", **rec}]) is None
+    # the primary rebuilt while the worktree is carried still waits (its git state lives in the primary's .git)
+    assert "holds the git state of worktree mainwt" in (
+        kwh.split_worktree_loss(str(tmp_path), [{"rel": "repo"}]) or "")
+
+
+def test_spawn_checks_every_clone_before_the_workspace_is_copied(kanban_home, small_carry, monkeypatch):
+    """P2 c-38aac54b3e75a212 (Prism 06179c2d4439): the spawn-time git-state and cap re-checks run BEFORE the rsync,
+    so a refusal leaves nothing copied to the pool host."""
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    calls = []
+    monkeypatch.setattr(kwh, "carry_workspace",
+                        lambda host, ws, runner=None, exclude=(): calls.append("carry"))
+
+    def refuse(host, ws, clones, runner=None):
+        calls.append("check")
+        raise RuntimeError("carry to ace-ai: clone repo has a stash")
+    monkeypatch.setattr(kwh, "carry_clones_check", refuse)
+    monkeypatch.setattr(kwh, "carry_clones", lambda *a, **k: calls.append("clone"))
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        plan = _plan(free=2)
+        plan.default_remote = True
+        _res, spawned = _tick(conn, spillover=plan, spawn_limit=2)
+    assert calls == ["check"], calls
+    assert (tid, "ace-ai") not in spawned, spawned
