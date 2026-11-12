@@ -560,7 +560,8 @@ def _refuse_operator_daemon_write() -> None:
 def refresh_launchd_plist_if_needed() -> bool:
     """Rewrite the installed plist when the generated one differs, then bootout/bootstrap so launchd
     re-reads it immediately."""
-    _refuse_operator_daemon_write()
+    if _gw()._launchd_domain() == "system":
+        _refuse_operator_daemon_write()
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
         return False
@@ -729,7 +730,8 @@ def launchd_uninstall():
 
 
 def launchd_start():
-    _refuse_operator_daemon_write()
+    if _gw()._launchd_domain() == "system":
+        _refuse_operator_daemon_write()
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
 

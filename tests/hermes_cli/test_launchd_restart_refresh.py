@@ -164,6 +164,7 @@ def test_operator_daemon_refuses_definition_writers(monkeypatch, tmp_path, verb)
     monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p) == daemon)
     monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
     monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "missing.plist")
+    monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "system")
     monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: pytest.fail("must refuse before generating"))
     monkeypatch.setattr(ld.subprocess, "run", lambda *a, **kw: pytest.fail("must not bootstrap operator daemon"))
     with pytest.raises(SystemExit) as exc:
@@ -171,6 +172,54 @@ def test_operator_daemon_refuses_definition_writers(monkeypatch, tmp_path, verb)
     assert daemon in str(exc.value)
     assert "operator-owned" in str(exc.value)
     assert not (tmp_path / "missing.plist").exists()
+
+
+@pytest.mark.parametrize("live_domain", ["gui/501", "user/501"])
+@pytest.mark.parametrize("verb", ["launchd_restart", "launchd_start", "refresh_launchd_plist_if_needed"])
+def test_stale_daemon_plist_allows_live_user_service(monkeypatch, launchd_seam, live_domain, verb):
+    """A leftover daemon definition must not block the discovered LaunchAgent."""
+    from hermes_cli import gateway_launchd as ld
+
+    daemon = "/Library/LaunchDaemons/ai.hermes.gateway.plist"
+    original_is_file = ld.Path.is_file
+    monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p) == daemon or original_is_file(p))
+    monkeypatch.setattr(ld.os, "getuid", lambda: 501)
+    # Exercise discovery rather than pinning its result to the desired domain.
+    monkeypatch.setattr(gateway_cli, "_launchd_domain", ld._launchd_domain)
+    monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+    monkeypatch.setattr(
+        gateway_cli, "_launchd_print_service_pid",
+        lambda domain, label: (domain == live_domain, 123 if domain == live_domain else None),
+    )
+    monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+    monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: pytest.fail("current agent needs no rewrite"))
+    monkeypatch.setattr(gateway_cli, "_launchd_ok", lambda message: None)
+
+    def run(cmd, **kwargs):
+        launchd_seam.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ld.subprocess, "run", run)
+    assert gateway_cli._launchd_domain() == live_domain
+    getattr(gateway_cli, verb)()
+    if verb == "refresh_launchd_plist_if_needed":
+        assert launchd_seam == []
+    else:
+        assert any("kickstart" in cmd and f"{live_domain}/ai.hermes.gateway" in cmd for cmd in launchd_seam)
+    assert not any("system/ai.hermes.gateway" in cmd for cmd in launchd_seam)
+
+
+def test_install_still_refuses_stale_daemon_plist(monkeypatch, tmp_path):
+    from hermes_cli import gateway_launchd as ld
+
+    daemon = "/Library/LaunchDaemons/ai.hermes.gateway.plist"
+    monkeypatch.setattr(ld.Path, "is_file", lambda p: str(p) == daemon)
+    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: pytest.fail("install must refuse first"))
+    monkeypatch.setattr(ld.subprocess, "run", lambda *a, **kw: pytest.fail("install must not load a job"))
+    with pytest.raises(SystemExit, match="operator-owned"):
+        gateway_cli.launchd_install()
 
 
 def test_stale_plist_is_refreshed_before_any_kickstart(monkeypatch, launchd_seam):
