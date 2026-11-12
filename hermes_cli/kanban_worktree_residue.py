@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 INIT_LOCK = "initializing"
+UNASSESSED = "unassessed"  # half_built() could not finish its read: held, never reused
 HALF_BUILT_HELD = "half_built_worktree_held"
 # Studio home tree 2026-11-11 (30,578 files, 1,150 registrations, load1 36): two timed adds took 32.0 s and 106.1 s,
 # and 83 of 6,540 spawns in 7 days failed at the old 60 s. 300 s is ~3x the slowest measured add; a run past it is
@@ -118,15 +119,19 @@ class _Unreadable:
 LOCK_UNREADABLE = _Unreadable()
 
 
-def admin_dirs_for(common: Path, target: Path) -> list:
-    """Admin dirs under ``<common>/worktrees`` whose ``gitdir`` names ``<target>/.git`` (resolved)."""
+def admin_dirs_for(common: Path, target: Path) -> Optional[list]:
+    """Admin dirs under ``<common>/worktrees`` whose ``gitdir`` names ``<target>/.git`` (resolved); ``[]`` when
+    none does or there is no ``worktrees`` dir; None when the registry exists but cannot be listed (Prism #265 P1:
+    a search-only ``worktrees`` dir is \"could not enumerate\", never \"not registered\")."""
     want = os.path.realpath(os.path.join(str(target), ".git"))
     root = common / "worktrees"
     out = []
     try:
         entries = sorted(root.iterdir())
-    except OSError:
+    except FileNotFoundError:
         return out
+    except OSError:
+        return None
     for admin in entries:
         pointed = _read(admin / "gitdir")
         if pointed is None:
@@ -161,21 +166,46 @@ def _gitfile_admin(target: Path) -> Optional[Path]:
     return admin
 
 
+def _is_gitfile(target: Path) -> bool:
+    """``<target>/.git`` is a ``gitdir:`` file: the tree claims to be a linked checkout a caller might reuse."""
+    text = _read(target / ".git")
+    return bool(text) and text.strip().startswith("gitdir:")
+
+
 def half_built(repo_root: Path, target: Path, now: Optional[float] = None) -> Optional[dict]:
-    """``{admin, age_s, branch, lock}`` when ``target`` is a registered worktree of ``repo_root`` that an add left
-    behind: locked ``initializing`` and no index, or locked with a lock file that cannot be read (``lock`` =
-    ``"unreadable"``: unknown state fails closed and is held, never read as a finished checkout). None otherwise
-    (a finished tree, another lock reason, not registered here)."""
+    """``{admin, age_s, branch, lock}`` when ``target`` must be held, None only when it is CONFIRMED not to be a
+    tree an add left behind (a finished tree, another lock reason, not registered here). Three states, unknown
+    holds (Prism #265 @7acad872 P1s, same rule as the unreadable lock):
+
+    * held: registered here, locked ``initializing`` with no index (``lock`` = ``"initializing"``), or locked with
+      a lock file that cannot be read (``lock`` = ``"unreadable"``);
+    * could not assess (``lock`` = ``"unassessed"``, ``why`` names the failed step): the tree is a linked checkout
+      (``.git`` is a ``gitdir:`` file) not already confirmed finished, and the common-dir probe failed, the
+      worktree registry could not be listed, or the lock could not be dated. Held like the others, never reused;
+    * None: confirmed not half-built.
+    """
     admin = _gitfile_admin(target)
     fast = lock_reason(admin) if admin is not None else None
     if admin is not None and fast is not LOCK_UNREADABLE and fast != INIT_LOCK:
         return None  # the common case on every tick: a finished tree, one file read, no git, no scan
+    linked = admin is not None or _is_gitfile(target)
+
+    def unassessed(why: str) -> Optional[dict]:
+        if not linked:
+            return None  # not a linked checkout: no caller reuses it as one; other guards own a plain dir
+        return {"admin": str(admin) if admin is not None else "", "age_s": None, "branch": "",
+                "lock": UNASSESSED, "why": why}
+
     common = common_dir(repo_root)
     if common is None:
-        return None
+        return unassessed("common-dir probe failed")
     admins = admin_dirs_for(common, target)
-    if len(admins) != 1:
-        return None
+    if admins is None:
+        return unassessed("worktree registry could not be listed")
+    if len(admins) > 1:
+        return unassessed(f"{len(admins)} registrations name this tree")
+    if not admins:
+        return None  # listed, and not registered here
     admin = admins[0]
     reason = lock_reason(admin)
     unreadable = reason is LOCK_UNREADABLE
@@ -185,7 +215,7 @@ def half_built(repo_root: Path, target: Path, now: Optional[float] = None) -> Op
         age: Optional[int] = int((now if now is not None else time.time()) - (admin / "locked").stat().st_mtime)
     except OSError:
         if not unreadable:
-            return None
+            return unassessed("lock could not be dated")
         age = None
     head = (_read(admin / "HEAD") or "").strip()
     branch = head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else ""

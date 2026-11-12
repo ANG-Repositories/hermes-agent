@@ -881,6 +881,9 @@ def _hold_half_built(repo_root: Path, target: Path) -> None:
         if hb.get("lock") == "unreadable":
             raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is locked and its lock file cannot be read; "
                                        f"unknown state is held, never reused; left as it is")
+        if hb.get("lock") == "unassessed":
+            raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} could not be assessed ({hb.get('why')}); "
+                                       f"unknown state is held, never reused; left as it is")
         raise WorkspaceUnavailable(f"{_kwr.HALF_BUILT_HELD}: {target} is a killed `git worktree add` (locked "
                                    f"initializing, no index, lock {hb['age_s']}s old); left as git left it")
 
@@ -1010,11 +1013,12 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
-        # Prism #265 P1 c-53aef5301a38d84d: this early return hands the immediate-spawn and review lanes an
-        # existing checkout; a half-built one is held here exactly as in _ensure_git_worktree.
-        _hold_half_built(requested, requested)
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            # Prism #265 P1 c-53aef5301a38d84d: this early return hands the immediate-spawn and review lanes an
+            # existing checkout; a half-built one is held here exactly as in _ensure_git_worktree. Only when this
+            # card would USE the tree (Prism #265 P2 @7acad872): a sibling on another branch falls back below.
+            _hold_half_built(requested, requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
@@ -1029,6 +1033,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
+        _hold_half_built(requested, requested)
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)

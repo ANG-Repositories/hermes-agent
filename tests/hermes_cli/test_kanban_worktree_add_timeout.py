@@ -330,3 +330,85 @@ def test_alive_treats_a_zombie_as_terminated(tmp_path):
     assert _wait_for(lambda: not alive(p.pid), 10.0)                  # zombie until wait(): already not alive
     p.wait()
     assert not alive(p.pid)
+
+
+# --- review r7 (prism-direct #265 @7acad872): could-not-assess holds; the hold runs only for a tree this card uses -
+
+
+def _task(tid, path, branch):
+    return type("_Task", (), {"id": tid, "workspace_kind": "worktree", "workspace_path": str(path),
+                              "branch_name": branch})()
+
+
+def test_a_failed_common_dir_probe_holds_a_half_built_tree_in_both_callers(repo, monkeypatch):
+    """P1 residue.py:173: a common-dir probe that fails or times out is "could not assess", never "not half-built";
+    _hold_half_built (spawn and the resolve early return) and _half_built_held (placement) both hold."""
+    from hermes_cli import kanban_worktree_port as kwt
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    target = repo / ".worktrees" / "t_probe"
+    admin = _half_built(repo, target, "wt/t_probe", age_s=10_000)
+    fine = repo / ".worktrees" / "t_probe_fine"
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_probe_fine", str(fine), "HEAD")
+    before = _snapshot_repo(repo)
+    monkeypatch.setattr(kwr, "common_dir", lambda _repo: None)          # the probe failed / timed out
+    hb = kwr.half_built(repo, target)
+    assert hb is not None and hb["lock"] == kwr.UNASSESSED and "common-dir" in hb["why"]
+    with pytest.raises(WorkspaceUnavailable, match="could not be assessed"):
+        kbw._ensure_git_worktree(repo, target, "wt/t_probe")
+    with pytest.raises(WorkspaceUnavailable, match="could not be assessed"):
+        kbw._resolve_worktree_workspace(_task("t_probe", target, "wt/t_probe"))
+    assert kwt._half_built_held(repo, target, "wt/t_probe") == kwt.WHY_HALF_BUILT
+    assert kwr.half_built(repo, fine) is None                            # a finished tree never needs the probe
+    got, _ = kbw._resolve_worktree_workspace(_task("t_probe_fine", fine, "wt/t_probe_fine"))
+    assert Path(got) == fine.resolve()
+    monkeypatch.undo()
+    assert _snapshot_repo(repo) == before and kwr.lock_reason(admin) == kwr.INIT_LOCK
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root lists a search-only dir")
+def test_an_unlistable_worktree_registry_holds_a_half_built_tree(repo):
+    """P1 residue.py:126: a search-only <common>/worktrees resolves the known checkout but cannot be listed; that is
+    "could not enumerate", never an empty registry, so the half-built tree is held."""
+    from hermes_cli import kanban_worktree_port as kwt
+    target = repo / ".worktrees" / "t_list"
+    _half_built(repo, target, "wt/t_list", age_s=10_000)
+    fine = repo / ".worktrees" / "t_list_fine"
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_list_fine", str(fine), "HEAD")
+    reg = repo / ".git" / "worktrees"
+    os.chmod(reg, 0o111)
+    try:
+        assert kwr.admin_dirs_for(repo / ".git", target) is None
+        hb = kwr.half_built(repo, target)
+        assert hb is not None and hb["lock"] == kwr.UNASSESSED and "registry" in hb["why"]
+        assert kwt._half_built_held(repo, target, "wt/t_list") == kwt.WHY_HALF_BUILT
+        assert kwr.half_built(repo, fine) is None                        # finished: confirmed by its own lock read
+    finally:
+        os.chmod(reg, 0o755)
+    assert kwr.half_built(repo, target)["lock"] == kwr.INIT_LOCK       # listable again: the real state
+
+
+def test_a_plain_directory_is_not_held_when_the_probe_fails(repo, monkeypatch):
+    """Unknown holds only a tree that claims to be a linked checkout; a plain dir stays with its own guards."""
+    plain = repo / ".worktrees" / "t_plain"
+    plain.mkdir(parents=True)
+    (plain / "x").write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(kwr, "common_dir", lambda _repo: None)
+    assert kwr.half_built(repo, plain) is None
+
+
+def test_decompose_siblings_of_a_half_built_root_fall_back_to_their_own_trees(repo):
+    """P2 kanban_db_workspace.py:1012: children inherit the root card's workspace_path. When that is the root's
+    half-built tree, a child on its own branch falls back to .worktrees/<child> as before; only the root (whose
+    branch the tree carries) is held. The root tree is left as it is."""
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    root = repo / ".worktrees" / "t_root"
+    admin = _half_built(repo, root, "wt/t_root", age_s=10_000)
+    root_files = sorted(p.name for p in root.iterdir())
+    for child in ("t_c1", "t_c2"):
+        got, branch = kbw._resolve_worktree_workspace(_task(child, root, f"wt/{child}"))
+        assert Path(got) == (repo / ".worktrees" / child).resolve() and branch == f"wt/{child}"
+        assert (Path(got) / "f0.slow").is_file()
+    with pytest.raises(WorkspaceUnavailable, match=kwr.HALF_BUILT_HELD):
+        kbw._resolve_worktree_workspace(_task("t_root", root, "wt/t_root"))
+    assert sorted(p.name for p in root.iterdir()) == root_files
+    assert kwr.lock_reason(admin) == kwr.INIT_LOCK and not (admin / "index").exists()
