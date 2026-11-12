@@ -182,9 +182,7 @@ def main(argv=None) -> int:
                       + (f"; would delete branch {b}" if b and r["branch_own_commits"] is False else
                          f"; keep branch {b} (own commits: {r['branch_own_commits']})" if b else ""))
                 continue
-            tip = kwr.rev(repo, f"refs/heads/{b}") if b else ""
-            rep = kwr.remove_failed_add(repo, p, branch=b, created_branch=r["branch_own_commits"] is False and
-                                        bool(tip), base_sha=tip)
+            rep = kwr.drain_half_built(repo, p, branch=b, delete_branch=r["branch_own_commits"] is False)
             print(f"removed={rep['removed']} admin_dropped={len(rep['admin_dropped'])} "
                   f"branch_deleted={rep['branch_deleted']} {p}" + (f" kept={rep['kept']}" if rep["kept"] else ""))
         after = git(repo, "worktree", "list", "--porcelain").count("\nworktree ") + 1

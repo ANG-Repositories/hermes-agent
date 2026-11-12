@@ -125,9 +125,10 @@ def test_a_lock_reason_other_than_initializing_is_never_touched(repo):
 
     assert kwr.half_built(repo, target) is None
     assert kwr.clear_half_built(repo, target, branch="wt/t_keep")["cleared"] is False
-    rep = kwr.remove_failed_add(repo, target, branch="wt/t_keep", created_branch=True,
-                                base_sha=git(repo, "rev-parse", "HEAD"))
+    rep = kwr.remove_failed_add(repo, target, pre={"absent": True, "admins": []}, branch="wt/t_keep",
+                                created_branch=True, base_sha=git(repo, "rev-parse", "HEAD"), timed_out=True)
     assert rep["kept"] and not rep["removed"] and not rep["branch_deleted"]
+    assert kwr.drain_half_built(repo, target, branch="wt/t_keep", delete_branch=True)["kept"]
     assert target.is_dir() and admin.is_dir()
     assert git(repo, "branch", "--list", "wt/t_keep") != ""
 
@@ -227,3 +228,124 @@ def test_a_half_built_tree_someone_wrote_into_after_the_add_died_is_kept(repo):
     res = kwr.clear_half_built(repo, target, branch="wt/t_late")
     assert res["cleared"] is False and "written after the add died" in res["why"]
     assert (target / "notes.txt").is_file()
+
+
+# --- review r1 (Apollo, hermes-agent#265 @329537e1): a failed add never deletes what it did not create ----------
+
+
+def _race(monkeypatch, make_foreign):
+    """The check-then-act gap: ``make_foreign`` runs after the spawn's occupied check passed, before its add."""
+    from hermes_cli import kanban_worktree_stub as kws
+
+    def occupied_then_raced(repo_root, target):
+        make_foreign(target)
+        return False
+    monkeypatch.setattr(kws, "target_occupied", occupied_then_raced)
+
+
+def test_already_exists_never_removes_a_foreign_finished_tree_with_uncommitted_work(repo, monkeypatch):
+    target = repo / ".worktrees" / "t_cardA"
+
+    def foreign(t):
+        git(repo, "worktree", "add", "-q", "-b", "wt/other", str(t), "HEAD")
+        (t / "uncommitted.txt").write_text("someone's work\n", encoding="utf-8")
+    _race(monkeypatch, foreign)
+    before = registrations(repo)
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        kbw._ensure_git_worktree(repo, target, "wt/t_cardA")
+
+    assert (target / "uncommitted.txt").read_text(encoding="utf-8") == "someone's work\n"
+    assert registrations(repo) == before + 1
+    assert git(target, "branch", "--show-current") == "wt/other"
+
+
+def test_already_exists_never_removes_a_foreign_plain_directory(repo, monkeypatch):
+    target = repo / ".worktrees" / "t_cardB"
+
+    def foreign(t):
+        t.mkdir(parents=True)
+        (t / "file.txt").write_text("not a worktree\n", encoding="utf-8")
+    _race(monkeypatch, foreign)
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        kbw._ensure_git_worktree(repo, target, "wt/t_cardB")
+
+    assert (target / "file.txt").read_text(encoding="utf-8") == "not a worktree\n"
+
+
+def test_remove_failed_add_keeps_a_registration_that_predates_the_add(repo):
+    """Function level, both shapes, without the stderr hint: the snapshot alone keeps them."""
+    target = repo / ".worktrees" / "t_pre"
+    git(repo, "worktree", "add", "-q", "-b", "wt/pre", str(target), "HEAD")
+    (target / "u.txt").write_text("u\n", encoding="utf-8")
+    pre = kwr.snapshot(repo, target)
+    rep = kwr.remove_failed_add(repo, target, pre=pre, branch="wt/t_pre", created_branch=False,
+                                base_sha=git(repo, "rev-parse", "HEAD"), timed_out=True)
+    assert not rep["removed"] and (target / "u.txt").is_file() and kwr.admin_dirs_for(kwr.common_dir(repo), target)
+
+    plain = repo / ".worktrees" / "t_plain"
+    plain.mkdir()
+    (plain / "f").write_text("f\n", encoding="utf-8")
+    pre = kwr.snapshot(repo, plain)
+    rep = kwr.remove_failed_add(repo, plain, pre=pre, branch="wt/t_plain", created_branch=False, base_sha="",
+                                timed_out=True)
+    assert not rep["removed"] and (plain / "f").is_file()
+
+
+def test_a_finished_tree_that_appeared_during_a_timed_out_add_is_kept(repo):
+    """New since the snapshot, but it has an index (a concurrent add that finished): not this add's residue."""
+    target = repo / ".worktrees" / "t_conc"
+    pre = kwr.snapshot(repo, target)
+    git(repo, "worktree", "add", "-q", "-b", "wt/t_conc", str(target), "HEAD")
+    (target / "w.txt").write_text("w\n", encoding="utf-8")
+    rep = kwr.remove_failed_add(repo, target, pre=pre, branch="wt/t_conc", created_branch=True,
+                                base_sha=git(repo, "rev-parse", "HEAD"), timed_out=True)
+    assert not rep["removed"] and (target / "w.txt").is_file()
+    assert not rep["branch_deleted"]                                 # checked out in that tree
+
+
+def _with_remote(repo, tmp_path):
+    """A bare clone as ``origin``: the trunk ref is ``origin/main``."""
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True, capture_output=True)
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "fetch", "-q", "origin")
+    return remote
+
+
+def test_clear_half_built_keeps_a_pushed_card_branch_and_the_next_spawn_resumes_it(repo, tmp_path):
+    _with_remote(repo, tmp_path)
+    git(repo, "branch", "wt/t_push")
+    tmp = tmp_path / "work"
+    git(repo, "worktree", "add", "-q", str(tmp), "wt/t_push")
+    (tmp / "done.txt").write_text("pushed work\n", encoding="utf-8")
+    git(tmp, "add", "done.txt")
+    git(tmp, "commit", "-qm", "worker commit")
+    git(tmp, "push", "-q", "origin", "wt/t_push")
+    tip = git(repo, "rev-parse", "wt/t_push")
+    git(repo, "worktree", "remove", str(tmp))
+    target = repo / ".worktrees" / "t_push"
+    git(repo, "worktree", "add", "-q", str(target), "wt/t_push")    # the re-add, then killed
+    admin = Path(git(target, "rev-parse", "--absolute-git-dir"))
+    (admin / "index").unlink()
+    git(repo, "worktree", "lock", "--reason", kwr.INIT_LOCK, str(target))
+    _age_tree(target, admin, 10_000)
+
+    res = kwr.clear_half_built(repo, target, branch="wt/t_push")
+
+    assert res["cleared"] is True and res["branch_kept"] is True
+    assert git(repo, "rev-parse", "wt/t_push") == tip                # the recorded branch_name still resolves
+    kbw._ensure_git_worktree(repo, target, "wt/t_push")
+    assert git(target, "rev-parse", "HEAD") == tip and (target / "done.txt").is_file()
+
+
+def test_clear_half_built_deletes_a_branch_the_trunk_already_contains(repo, tmp_path):
+    _with_remote(repo, tmp_path)
+    target = repo / ".worktrees" / "t_triv"
+    _half_built(repo, target, "wt/t_triv", age_s=10_000)
+    res = kwr.clear_half_built(repo, target, branch="wt/t_triv")
+    assert res["cleared"] is True and res["branch_kept"] is False
+    assert git(repo, "branch", "--list", "wt/t_triv") == ""
+    kbw._ensure_git_worktree(repo, target, "wt/t_triv")              # re-created from the trunk
+    assert git(target, "branch", "--show-current") == "wt/t_triv"

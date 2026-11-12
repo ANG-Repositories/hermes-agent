@@ -939,21 +939,21 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
     if target_occupied(repo_root, target):
         raise dead_stub_hold(repo_root, target)
-    # t_f609a5a0: own process group, killed whole on timeout; a failed or timed-out add removes the tree it
-    # started (target was absent or empty just above, so it is this add's) and the branch it created.
+    # t_f609a5a0: own process group, killed whole on timeout. A failed or timed-out add removes only what it provably
+    # created: the snapshot taken here is compared after the add, so a tree another process made in the gap between
+    # the check above and the add is never deleted; on "already exists" nothing is removed.
+    pre = _kwr.snapshot(repo_root, target)
     try:
         result = _kwr.run_git_group(["git", "-C", str(repo_root), *args], timeout=_kwr.ADD_TIMEOUT_S)
     except _kwr.WorktreeAddTimeout as exc:
-        undo = _kwr.remove_failed_add(repo_root, target, branch=branch_name, created_branch=created_branch,
-                                      base_sha=base_sha)
+        undo = _kwr.remove_failed_add(repo_root, target, pre=pre, branch=branch_name, created_branch=created_branch,
+                                      base_sha=base_sha, timed_out=True)
         raise RuntimeError(f"git worktree add for {target} on branch {branch_name}: {exc}; cleanup: {undo}") \
             from None
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
-        # "already exists": the branch (or path) was someone else's before this add, never ours to delete.
-        undo = _kwr.remove_failed_add(repo_root, target, branch=branch_name,
-                                      created_branch=created_branch and "already exists" not in stderr,
-                                      base_sha=base_sha)
+        undo = _kwr.remove_failed_add(repo_root, target, pre=pre, branch=branch_name, created_branch=created_branch,
+                                      base_sha=base_sha, timed_out=False, already_exists="already exists" in stderr)
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}; cleanup: {undo}"
         )

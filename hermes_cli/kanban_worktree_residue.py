@@ -9,9 +9,10 @@ locked by git's own reason ``initializing``, with the new branch. Placement then
 This module is the one place that:
 
 * runs the add in its own process group and kills the whole group on timeout (:func:`run_git_group`);
-* removes the tree THIS spawn tried to create, and only that one (:func:`remove_failed_add`): ``worktree remove -f -f``
-  of its own path, else the ONE admin dir whose ``gitdir`` names that path (never a bare ``worktree prune``), and the
-  branch only when this spawn created it and it still points at the base it was created from (no commits of its own);
+* removes what THIS spawn's add provably created, and only that (:func:`remove_failed_add`, against a
+  :func:`snapshot` taken before the add): the one registration that appeared since, still locked ``initializing``
+  with no index, via ``worktree remove -f -f`` else that ONE admin dir (never a bare ``worktree prune``); nothing on
+  an "already exists" failure; the branch only when this spawn created it and it still points at its base;
 * names a leftover half-built tree of a card (:func:`half_built`) so placement can say what holds the card and clear
   it under the same ownership rule (:func:`clear_half_built`).
 
@@ -141,37 +142,93 @@ def lock_reason(admin: Path) -> Optional[str]:
     return None if text is None else text.strip()
 
 
-def remove_failed_add(repo_root: Path, target: Path, *, branch: str, created_branch: bool,
-                      base_sha: str) -> dict:
-    """Undo a failed or timed-out ``worktree add`` of ``target``. The caller proved ``target`` was absent or empty
-    before the add, so whatever is there now is this add's. ``{"removed", "admin_dropped", "branch_deleted",
-    "kept"}``; never raises."""
+def snapshot(repo_root: Path, target: Path) -> dict:
+    """What sits at ``target`` BEFORE an add: ``{"absent", "admins"}``. :func:`remove_failed_add` removes only what
+    appeared after it, so a tree another process made in the check-then-add gap is never this add's to delete."""
+    common = common_dir(repo_root)
+    return {"absent": not os.path.lexists(str(target)),
+            "admins": sorted(str(a) for a in admin_dirs_for(common, target)) if common is not None else None}
+
+
+def _init_residue(admin: Path) -> bool:
+    """``admin`` is a registration a killed add left: locked ``initializing`` and no index (checkout unfinished)."""
+    return lock_reason(admin) == INIT_LOCK and not (admin / "index").exists()
+
+
+def _drop_tree(repo_root: Path, common: Path, target: Path, admin: Path, *, rmtree_path: bool, report: dict) -> None:
+    """Remove the tree registered by ``admin`` (the ONLY admin dir naming ``target``; the caller proved it is
+    add residue). ``worktree remove -f -f``, else drop that one admin dir (never a repo-wide prune); the path itself
+    is ``rmtree``'d only when ``rmtree_path`` (the caller saw it absent before the add, or it is a proven half-built
+    tree)."""
+    rm = _git(repo_root, "worktree", "remove", "-f", "-f", str(target), timeout=120)
+    report["removed"] = rm is not None and rm.returncode == 0
+    if not report["removed"]:
+        # A tree killed before its .git file was written fails `remove` with "validation failed".
+        if admin.is_dir() and admin_dirs_for(common, target) == [admin]:
+            shutil.rmtree(admin, ignore_errors=True)
+            report["admin_dropped"].append(str(admin))
+        if rmtree_path and target.exists() and not admin_dirs_for(common, target):
+            shutil.rmtree(target, ignore_errors=True)
+        report["removed"] = not target.exists() or (not rmtree_path and not admin.exists())
+
+
+def _delete_branch_at(repo_root: Path, common: Optional[Path], branch: str, sha: str) -> bool:
+    """Delete ``refs/heads/<branch>`` only while it still points at ``sha`` and no worktree has it checked out.
+    ``update-ref -d <ref> <old>`` is atomic: a branch that moved meanwhile is kept."""
+    if not (branch and sha) or rev(repo_root, f"refs/heads/{branch}") != sha or _checked_out(common, branch):
+        return False
+    d = _git(repo_root, "update-ref", "-d", f"refs/heads/{branch}", sha)
+    return d is not None and d.returncode == 0
+
+
+def remove_failed_add(repo_root: Path, target: Path, *, pre: dict, branch: str, created_branch: bool,
+                      base_sha: str, timed_out: bool, already_exists: bool = False) -> dict:
+    """Undo a failed or timed-out ``worktree add`` of ``target``, removing only what THIS add provably created.
+
+    ``pre`` is :func:`snapshot` taken just before the add. Removed: the one registration naming ``target`` that did
+    not exist in ``pre``, and only while it is add residue (locked ``initializing``, no index). The path is
+    ``rmtree``'d only when ``pre`` saw it absent. Only a TIMED-OUT add leaves a tree: on any other failure git
+    removes its own junk tree and registration before it exits, so a registration still there is someone else's and
+    only the branch is considered. Kept: everything on an "already exists" failure, a tree with an index, any other lock, a registration that predates the add, two new registrations (a concurrent add: whose is
+    which is unknown). The branch goes only when this add created it and it still sits at ``base_sha``.
+    ``{"removed", "admin_dropped", "branch_deleted", "kept"}``; never raises."""
     report = {"removed": False, "admin_dropped": [], "branch_deleted": False, "kept": []}
+    if already_exists:
+        report["kept"].append("add refused 'already exists': the path or branch was not this add's")
+        return report
     try:
         common = common_dir(repo_root)
-        admins = admin_dirs_for(common, target) if common is not None else []
-        foreign = [a for a in admins if lock_reason(a) not in (None, INIT_LOCK)]
-        if foreign:
-            report["kept"] = [f"{a}: locked {lock_reason(a)!r}" for a in foreign]
+        if common is None or pre.get("admins") is None:
+            report["kept"].append("repo or pre-add snapshot unreadable")
             return report
-        if admins:
-            rm = _git(repo_root, "worktree", "remove", "-f", "-f", str(target), timeout=120)
-            report["removed"] = rm is not None and rm.returncode == 0
-            if not report["removed"]:
-                # A tree killed before its .git file was written fails `remove` with "validation failed":
-                # drop the ONE admin dir that names this path, never a repo-wide prune.
-                for admin in admin_dirs_for(common, target):
-                    shutil.rmtree(admin, ignore_errors=True)
-                    report["admin_dropped"].append(str(admin))
-        if target.exists() and common is not None and not admin_dirs_for(common, target):
-            shutil.rmtree(target, ignore_errors=True)
-            report["removed"] = report["removed"] or not target.exists()
-        if created_branch and base_sha and branch:
-            # Only when it still points at the base this spawn created it from: then it has no commits of its own.
-            # update-ref -d with the old value is atomic, and refuses a branch checked out in a live worktree.
-            if rev(repo_root, f"refs/heads/{branch}") == base_sha and not _checked_out(common, branch):
-                d = _git(repo_root, "update-ref", "-d", f"refs/heads/{branch}", base_sha)
-                report["branch_deleted"] = d is not None and d.returncode == 0
+        before = set(pre["admins"])
+        admins = admin_dirs_for(common, target)
+        old = [a for a in admins if str(a) in before]
+        new = [a for a in admins if str(a) not in before]
+        if old:
+            report["kept"].append(f"registration predates this add: {[str(a) for a in old]}")
+        elif len(new) > 1:
+            report["kept"].append(f"{len(new)} new registrations name the path (a concurrent add): none removed")
+        elif new and not timed_out:
+            report["kept"].append(f"{new[0]}: git cleans its own tree on a non-timeout failure: not this add's")
+        elif new and not _init_residue(new[0]):
+            report["kept"].append(f"{new[0]}: not add residue (lock {lock_reason(new[0])!r}, "
+                                  f"index {(new[0] / 'index').exists()})")
+        elif new:
+            _drop_tree(repo_root, common, target, new[0], rmtree_path=bool(pre.get("absent")), report=report)
+        elif os.path.lexists(str(target)):
+            # A kill between git's mkdir of the tree and its `gitdir` write leaves an EMPTY unregistered dir: only
+            # that, and only at a path this call saw absent, is removed (rmdir refuses anything non-empty).
+            if timed_out and pre.get("absent") and target.is_dir() and not target.is_symlink():
+                try:
+                    os.rmdir(target)
+                    report["removed"] = True
+                except OSError:
+                    report["kept"].append(f"{target}: unregistered and not empty: not this add's")
+            else:
+                report["kept"].append(f"{target}: exists with no registration: not this add's")
+        if created_branch and not old and len(new) <= 1:
+            report["branch_deleted"] = _delete_branch_at(repo_root, common, branch, base_sha)
     except Exception as exc:  # cleanup is best effort: the add's own error is what the caller raises
         report["kept"].append(f"cleanup error: {exc}")
     return report
@@ -257,13 +314,53 @@ def branch_has_own_commits(repo_root: Path, branch: str) -> Optional[bool]:
     return p.stdout.strip() == ""
 
 
+def drain_half_built(repo_root: Path, target: Path, *, branch: str, delete_branch: bool) -> dict:
+    """Operator drain (``scripts/kanban_worktree_residue_audit.py --drain --execute``) of ONE tree the audit already
+    attributed: removed only while exactly one registration names it and that one is still add residue (locked
+    ``initializing``, no index); the branch only when ``delete_branch`` and it still sits at the tip read here."""
+    rep = {"removed": False, "admin_dropped": [], "branch_deleted": False, "kept": []}
+    try:
+        common = common_dir(repo_root)
+        admins = admin_dirs_for(common, target) if common is not None else []
+        if len(admins) != 1 or not _init_residue(admins[0]):
+            rep["kept"].append(f"{len(admins)} registrations / not add residue any more")
+            return rep
+        tip = rev(repo_root, f"refs/heads/{branch}") if branch else ""
+        _drop_tree(repo_root, common, target, admins[0], rmtree_path=True, report=rep)
+        if delete_branch and rep["removed"]:
+            rep["branch_deleted"] = _delete_branch_at(repo_root, common, branch, tip)
+    except Exception as exc:
+        rep["kept"].append(f"cleanup error: {exc}")
+    return rep
+
+
+def _trunk_contains(repo_root: Path, sha: str) -> bool:
+    """``sha`` is reachable from the checkout's remote trunk ref (no fetch): a branch at ``sha`` holds nothing a
+    fresh ``-b <branch> <trunk>`` would lose."""
+    try:
+        from hermes_cli.kanban_branch_base import fresh_trunk_ref
+        trunk = fresh_trunk_ref(repo_root, fetch=False)
+    except Exception:
+        return False
+    if not trunk or not sha:
+        return False
+    p = _git(repo_root, "merge-base", "--is-ancestor", sha, trunk)
+    return p is not None and p.returncode == 0
+
+
 def clear_half_built(repo_root: Path, target: Path, *, branch: str, min_age_s: int = HALF_BUILT_MIN_AGE_S,
                      now: Optional[float] = None) -> dict:
     """Clear a card's own leftover half-built tree (placement, t_f609a5a0). ``{"cleared", "why", ...}``.
 
     Ownership: the caller passes the card's canonical ``<repo>/.worktrees/<id>`` and its branch. Refused when the
     tree is not half-built (:func:`half_built`), younger than ``min_age_s`` (an add may still be running), on another
-    branch, or the branch has commits no remote has (then the tree is removed and the branch kept)."""
+    branch, or written into after the add died.
+
+    The LOCAL branch is deleted only when the remote trunk already contains its tip (it has no commits of its own,
+    so the next spawn's ``-b <branch> <trunk>`` loses nothing). Otherwise it is kept, including a branch whose work
+    a worker pushed (a remote has the tip, the trunk does not): the next spawn's ``worktree add <path> <branch>``
+    then checks out that same branch at that same tip, so the card's recorded ``branch_name`` still resolves to its
+    work. ``branch_kept`` says which."""
     hb = half_built(repo_root, target, now=now)
     if hb is None:
         return {"cleared": False, "why": "not a half-built tree"}
@@ -271,13 +368,21 @@ def clear_half_built(repo_root: Path, target: Path, *, branch: str, min_age_s: i
         return {"cleared": False, "why": f"initializing lock is {hb['age_s']}s old (< {min_age_s}s)", **hb}
     if hb["branch"] and hb["branch"] != branch:
         return {"cleared": False, "why": f"tree is on {hb['branch']}, not {branch}", **hb}
-    late = written_after_add(target, Path(hb["admin"]))
+    admin = Path(hb["admin"])
+    late = written_after_add(target, admin)
     if late is not None:
         return {"cleared": False, "why": f"a file was written after the add died ({late})", **hb}
-    own = branch_has_own_commits(repo_root, branch)
-    tip = rev(repo_root, f"refs/heads/{branch}")
-    rep = remove_failed_add(repo_root, target, branch=branch, created_branch=own is False and bool(tip),
-                            base_sha=tip)
-    cleared = not target.exists() and not admin_dirs_for(common_dir(repo_root) or Path("/nonexistent"), target)
+    common = common_dir(repo_root)
+    rep = {"removed": False, "admin_dropped": [], "branch_deleted": False, "kept": []}
+    try:
+        if common is None or admin_dirs_for(common, target) != [admin] or not _init_residue(admin):
+            return {"cleared": False, "why": "tree changed while being assessed", **hb}
+        _drop_tree(repo_root, common, target, admin, rmtree_path=True, report=rep)
+        tip = rev(repo_root, f"refs/heads/{branch}") if branch else ""
+        if tip and _trunk_contains(repo_root, tip):
+            rep["branch_deleted"] = _delete_branch_at(repo_root, common, branch, tip)
+    except Exception as exc:
+        rep["kept"].append(f"cleanup error: {exc}")
+    cleared = not target.exists() and not admin_dirs_for(common or Path("/nonexistent"), target)
     return {"cleared": cleared, "why": "cleared" if cleared else f"cleanup incomplete: {rep}",
             "branch_kept": not rep["branch_deleted"], **hb, **rep}
