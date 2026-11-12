@@ -669,7 +669,8 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
     except (OSError, RuntimeError, ValueError):
         return False
     clock = budget.clock if budget is not None else _time.monotonic
-    key = (root, max_bytes, max_entries) + (("skip_clones",) if skip_clones else ())
+    wt_on = skip_clones and worktree_carry_on()
+    key = (root, max_bytes, max_entries) + (("skip_clones",) if skip_clones else ()) + (("worktrees",) if wt_on else ())
     t = clock() if now is None else now
     hit = _carry_scan_cache.get(key)
     if hit is not None and t - hit[0] < CARRY_SCAN_TTL_SECONDS:
@@ -710,7 +711,7 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
                             # t_9965b8d5: a git clone is re-cloned on the pool host, never copied or counted
                             clones.append(os.path.relpath(entry.path, root))
                             continue
-                        if skip_clones and _is_linked_worktree(entry.path):
+                        if wt_on and _is_linked_worktree(entry.path):
                             # t_d2f06cf6: a linked worktree (``.git`` is a gitdir FILE) is set aside like a clone.
                             # The split plan decides it: rebuilt from origin when recoverable, else its files are
                             # censused (worktree_usage) and carried, and they count toward the caps.
@@ -741,6 +742,27 @@ def carry_size_ok(path: Optional[str], *, max_bytes: int = CARRY_MAX_BYTES,
         _carry_worktree_cache[root] = tuple(sorted(worktrees)) if ok else ()
         _carry_setaside_cache[root] = tuple(sorted(clones)) if ok else ()
     return ok
+
+
+WORKTREE_CARRY_KNOB = "worktree_split_carry"
+
+
+def worktree_carry_on(kcfg: Optional[Mapping] = None) -> bool:
+    """``kanban.placement.worktree_split_carry`` in the ROOT config (t_d2f06cf6, default on): a linked worktree in an
+    over-cap scratch workspace is set aside and rebuilt from origin like a clone, and every rebuilt checkout's stash
+    entries move host to host as a bundle. False/"off"/0 = the rule before t_d2f06cf6: a linked worktree counts as
+    files toward the caps and any stash keeps a clone from being rebuilt. Unreadable config reads as the default."""
+    if kcfg is None:
+        try:
+            from hermes_cli import kanban_db as _kdb
+            kcfg = _kdb._board_home_kanban_cfg()
+        except Exception:
+            kcfg = {}
+    placement = kcfg.get("placement") if isinstance(kcfg, Mapping) else None
+    val = placement.get(WORKTREE_CARRY_KNOB, True) if isinstance(placement, Mapping) else True
+    if isinstance(val, str):
+        return val.strip().lower() not in ("off", "false", "no", "0", "")
+    return bool(val)
 
 
 def _is_linked_worktree(path: str) -> bool:
@@ -1010,86 +1032,53 @@ def carry_split(path: Optional[str], *, budget: Optional[CarryScanBudget] = None
         root = canon(path)
     except (OSError, RuntimeError, ValueError):
         return None
-    clones = _carry_clone_cache.get((root, max_bytes, max_entries, "skip_clones"), ())
+    clones = _carry_clone_cache.get((root, max_bytes, max_entries, "skip_clones")
+                                    + (("worktrees",) if worktree_carry_on() else ()), ())
     if not clones or not all(carry_path_safe(f"{str(root).rstrip('/')}/{c}") for c in clones):
         return None
     return clones
 
 
-def has_own_stash(repo: str, branch: str, runner: Callable = subprocess.run) -> Optional[bool]:
-    """True when the checkout at ``repo`` holds a stash a rebuild would leave behind, None when unreadable.
+def stash_entries(repo: str, runner: Callable = subprocess.run) -> Optional[Tuple[Tuple[str, int, str], ...]]:
+    """The stash entries a rebuild of the checkout at ``repo`` must carry, newest first, as ``(commit, unix ts,
+    reflog subject)``; None when unreadable (operator design at 2119cc07, t_d2f06cf6: never guess who owns a stash).
 
-    A clone, or any gitfile repo with no ``commondir`` (``--separate-git-dir``, a submodule), owns every stash in its
-    git dir. A linked worktree shares the stash list of the common git dir with every other checkout of that repo
-    (operator F1/F2, t_d2f06cf6: the live home repo lists 34, none of the worktree's); an entry stays out of the count
-    only when :func:`_stash_is_foreign` proves it another checkout's. The common dir never moves with the carry."""
+    A clone, or a gitfile repo with no ``commondir`` (``--separate-git-dir``, a submodule), owns its whole stash list:
+    every entry. A linked worktree shares the common dir's list with every other checkout: every entry NOT older than
+    its creation line (the first line of its HEAD reflog, old sha all zeros), or every entry when its reflog no longer
+    starts there. That is the one proof needing no guess: a checkout cannot have made a stash before it existed.
+    Carrying another checkout's entry too costs a few objects; the originals stay in the common dir untouched."""
     try:
         dirs = _gitfile_dirs(repo)
     except (OSError, UnicodeError, ValueError):
         return None
     try:
-        if dirs is None or not dirs[2]:
-            # a clone, or a gitfile repo that owns its whole git dir (--separate-git-dir, a submodule checkout;
-            # operator item 2 / Prism 9e5b3d6ff57b): every stash in it is its own
-            st = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True,
-                        text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
-            return getattr(st, "returncode", 1) == 0
-        st = runner(["git", "-C", repo, "stash", "list", "--date=unix", "--format=%gd%x09%P%x09%gs"],
+        st = runner(["git", "-C", repo, "stash", "list", "--date=unix", "--format=%H%x09%gd%x09%gs"],
                     capture_output=True, text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     if getattr(st, "returncode", 1) != 0:
         return None
-    entries = [line for line in (st.stdout or "").splitlines() if line.strip()]
-    if not entries:
-        return False
-    try:
-        owners = _stash_owner_evidence(dirs[0], dirs[1])
-    except (OSError, UnicodeError, ValueError):
-        return None
-    return any(not _stash_is_foreign(line, branch, owners) for line in entries)
-
-
-def _read_head_reflog(gitdir: str) -> List[Tuple[str, int, str]]:
-    """``(new sha, unix ts, message)`` per line of ``<gitdir>/logs/HEAD``; [] when there is none. The
-    ``reset: moving to HEAD`` that ``git worktree add`` logs right after its creation line (old sha all zeros) is
-    relabelled ``worktree add``, so it never reads as a stash's reset."""
-    path = os.path.join(gitdir, "logs", "HEAD")
-    if not os.path.isfile(path):
-        return []
     out = []
-    prev_created = False
-    with open(path, encoding="utf-8-sig", errors="replace") as f:
-        for line in f:
-            head, _tab, msg = line.rstrip("\n").partition("\t")
-            parts = head.split()
-            if len(parts) >= 5 and parts[-2].isdigit():
-                if prev_created and msg == "reset: moving to HEAD":
-                    msg = "worktree add"
-                out.append((parts[1], int(parts[-2]), msg))
-                prev_created = set(parts[0]) == {"0"}
-    return out
-
-
-def _stash_owner_evidence(gitdir: str, common: str) -> dict:
-    """What the shared repo records about who stashed what: this checkout's HEAD reflog, when it was created (if
-    the reflog still reaches back that far), and the branch each OTHER checkout has checked out."""
-    me = os.path.realpath(gitdir)
-    others = [common] + [os.path.join(common, "worktrees", n) for n in
-                         (sorted(os.listdir(os.path.join(common, "worktrees")))
-                          if os.path.isdir(os.path.join(common, "worktrees")) else ())]
-    other_branches = set()
-    for g in others:
-        if os.path.realpath(g) == me:
+    for line in (st.stdout or "").splitlines():
+        if not line.strip():
             continue
         try:
-            with open(os.path.join(g, "HEAD"), encoding="utf-8-sig") as f:
-                head = f.read().strip()
-        except FileNotFoundError:
-            continue
-        if head.startswith("ref: refs/heads/"):
-            other_branches.add(head[len("ref: refs/heads/"):])
-    return {"mine": _read_head_reflog(gitdir), "born": _reflog_birth(gitdir), "branches": other_branches}
+            sha, sel, subject = line.split("\t", 2)
+            ts = int(sel[sel.index("{") + 1:sel.index("}")])
+        except (ValueError, IndexError):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):
+            return None
+        out.append((sha, ts, subject))
+    if dirs is not None and dirs[2]:
+        try:
+            born = _reflog_birth(dirs[0])
+        except (OSError, UnicodeError):
+            return None
+        if born is not None:
+            out = [e for e in out if e[1] >= born]
+    return tuple(out)
 
 
 def _reflog_birth(gitdir: str) -> Optional[int]:
@@ -1106,45 +1095,89 @@ def _reflog_birth(gitdir: str) -> Optional[int]:
     return None
 
 
-def _stash_is_foreign(line: str, branch: str, owners: dict) -> bool:
-    """True only when a shared-list stash entry is PROVABLY another checkout's (operator item 1 at d77ebe045e: fail
-    closed). ``git stash push`` stores the entry, then resets HEAD (``reset: moving to HEAD`` at the stash's first
-    parent, same second or just after) in the reflog of the checkout that made it, so:
+def _stash_label(entry) -> str:
+    return f"stash entry {entry[0][:12]} ({entry[2][:80]})"
 
-    - that reset in THIS checkout's HEAD reflog: ours, whatever the subject's branch is now (renamed, switched);
-    - this checkout's HEAD reflog is complete since its creation line and the entry is older than that line: theirs
-      (this checkout did not exist yet);
-    - else theirs only when this reflog is complete since creation, the subject names a branch another checkout has
-      checked out right now that is not ours, and this reflog never shows us on it (every branch departure is
-      logged with its name). Else ours.
 
-    A matching reset in ANOTHER checkout's reflog proves nothing (Prism fa2f9ee74043: a plain ``reset --hard HEAD``
-    writes the same line), and neither does branch evidence once our reflog was expired (Prism 465c103e47b9)."""
+def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.run) -> bytes:
+    """A git bundle holding the commits of every stash entry in ``entries`` not reachable from ``head`` (the commit
+    the rebuilt clone lands on), built in a throwaway bare repo that borrows ``repo``'s objects through an alternate:
+    nothing in ``repo`` or its common dir is written. Raises RuntimeError naming the entry on any failure."""
+    import shutil
+    import tempfile
     try:
-        sel, parents, subject = line.split("\t", 2)
-        ts = int(sel[sel.index("{") + 1:sel.index("}")])
-        base = parents.split()[0]
-    except (ValueError, IndexError):
-        return False
+        dirs = _gitfile_dirs(repo)
+        objects = os.path.realpath(os.path.join(dirs[1] if dirs else os.path.join(repo, ".git"), "objects"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RuntimeError(f"stash carry of {repo}: git dir unreadable: {exc}")
+    tmp = tempfile.mkdtemp(prefix="kanban-stash-")
+    try:
+        bare, out = os.path.join(tmp, "b.git"), os.path.join(tmp, "stash.bundle")
 
-    def _made_in(log) -> bool:
-        return any(sha == base and ts <= t <= ts + 2 and msg == "reset: moving to HEAD" for sha, t, msg in log)
-    if _made_in(owners["mine"]):
-        return False
-    born = owners.get("born")
-    if born is None:
-        return False
-    if ts < born:
-        return True
-    m = re.match(r"(?:WIP on|On) (.+?): ", subject)
-    b = m.group(1) if m else None
-    if not b or b == branch or b not in owners["branches"]:
-        return False
-    for _sha, _t, msg in owners["mine"]:
-        words = {w[len("refs/heads/"):] if w.startswith("refs/heads/") else w for w in msg.split()}
-        if b in words:
-            return False
-    return True
+        def _git(*args, what):
+            try:
+                proc = runner(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=CARRY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(f"stash carry of {repo}: {what}: {exc}")
+            if getattr(proc, "returncode", 1) != 0:
+                raise RuntimeError(f"stash carry of {repo}: {what} rc={getattr(proc, 'returncode', '?')}: "
+                                   f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        _git("init", "-q", "--bare", bare, what="bundle repo")
+        with open(os.path.join(bare, "objects", "info", "alternates"), "w", encoding="utf-8") as f:
+            f.write(objects + "\n")
+        refs = []
+        for i, e in enumerate(entries):
+            _git("-C", bare, "update-ref", f"refs/carry/{i}", e[0], what=_stash_label(e))
+            refs.append(f"refs/carry/{i}")
+        what = ", ".join(map(_stash_label, entries))
+        _git("-C", bare, "bundle", "create", out, *refs, f"^{head}", what=f"bundle of {what}")
+        _git("-C", bare, "bundle", "verify", "-q", out, what=f"bundle verify of {what}")
+        if os.path.getsize(out) > CARRY_MAX_BYTES:
+            raise RuntimeError(f"stash carry of {repo}: bundle over the carry byte cap")
+        with open(out, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def stash_store_script(dest: str, entries) -> str:
+    """Remote sh: unbundle the stash commits read on stdin into the rebuilt clone at ``dest`` and store each entry
+    with its original subject, oldest first (so ``stash@{0}`` is the newest again), then PROVE the list is exactly
+    ``entries`` (rc 8). Re-run safe: a clone already holding exactly that list is left alone; one holding any other
+    stash is refused (rc 9), never added to."""
+    d = shlex.quote(dest)
+    want = " ".join(e[0] for e in entries)
+    stores = "; ".join(f"git -C \"$d\" -c user.name=kanban-carry -c user.email=kanban-carry@localhost stash store "
+                       f"-q -m {shlex.quote(e[2])} {e[0]}" for e in reversed(tuple(entries)))
+    return (f"set -e; d={d}; want={shlex.quote(want)}; "
+            "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
+            "if [ \"$have\" = \"$want\" ]; then cat >/dev/null; exit 0; fi; [ -z \"$have\" ] || exit 9; "
+            "t=$(mktemp); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; "
+            "git -C \"$d\" bundle unbundle \"$t\" >/dev/null; "
+            f"{stores}; "
+            "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
+            "[ \"$have\" = \"$want\" ] || exit 8")
+
+
+def carry_stash(host: PoolHost, repo: str, dest: str, entries, head: str, runner: Callable = subprocess.run,
+                bundle: Optional[bytes] = None) -> None:
+    """Move the stash ``entries`` of the Studio checkout ``repo`` to the rebuilt clone at ``dest`` on ``host``:
+    a bundle over the pool ssh (never GitHub), stored there with the original subjects, in order. Raises naming the
+    entries on any failure."""
+    if not entries:
+        return
+    payload = bundle if bundle is not None else stash_bundle(repo, entries, head, runner)
+    try:
+        proc = runner(_ssh_argv(host, stash_store_script(dest, entries)), input=payload, capture_output=True,
+                      timeout=CARRY_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"stash carry to {host.name}: {', '.join(map(_stash_label, entries))}: {exc}")
+    if getattr(proc, "returncode", 1) != 0:
+        err = getattr(proc, "stderr", b"") or b""
+        err = err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err)
+        raise RuntimeError(f"stash carry to {host.name} rc={getattr(proc, 'returncode', '?')}: "
+                           f"{', '.join(map(_stash_label, entries))}: {err.strip()[:200]}")
 
 
 def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional[dict], Optional[str]]:
@@ -1171,11 +1204,13 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         return None, "detached_head"
     if not _kwt._clean_on_branch(_P(repo), branch, runner):
         return None, "dirty_tree"
-    stash = has_own_stash(repo, branch, runner)
-    if stash is None:
+    # Prism 425d85646d96: a stash lives only in the Studio's git dir and a re-clone drops it. t_d2f06cf6 (operator
+    # design at 2119cc07): it no longer keeps the checkout from being rebuilt; its entries ride to the rebuilt clone
+    # as a bundle (carry_stash). With the switch off, any stash keeps the old refusal.
+    entries = stash_entries(repo, runner)
+    if entries is None:
         return None, "stash_unreadable"
-    if stash:
-        # Prism 425d85646d96: a stash lives only in this .git; the re-clone would drop it.
+    if entries and not worktree_carry_on():
         return None, "stash_present"
     # Prism 38aae6c981c1/62448b5b6868/72087e167990/30ed122cf9a9: a re-clone cannot restore ignored files (datasets,
     # .env, built state). Operator F4: they are carried into the rebuilt clone (carry_clones), except regenerable
@@ -1200,7 +1235,10 @@ def assess_clone(repo: str, runner: Callable = subprocess.run) -> Tuple[Optional
         if remote and _out("merge-base", "--is-ancestor", remote, local) is None:
             return None, "diverged_from_origin"
         push = (repo, branch, remote, local)
-    return {"slug": slug, "branch": branch, "sha": local, "push": push, "ignored": ignored}, None
+    rec = {"slug": slug, "branch": branch, "sha": local, "push": push, "ignored": ignored}
+    if entries:
+        rec["stash"] = entries
+    return rec, None
 
 
 # Operator F4 (2026-11-10 20:5x): ignored paths a re-clone may DROP because a run regenerates them. Anything else
@@ -1393,10 +1431,10 @@ def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable
         return "HEAD unreadable"
     if getattr(cur, "returncode", 1) != 0 or (cur.stdout or "").strip() != sha:
         return f"HEAD moved off {str(sha)[:12]}"
-    stash = has_own_stash(repo, branch, runner)
-    if stash is None:
+    entries = stash_entries(repo, runner)
+    if entries is None:
         return "stash unreadable"
-    if stash:
+    if entries and not worktree_carry_on():
         return "has a stash"  # Prism 425d85646d96: written since routing; the re-clone would drop it
     return None
 
@@ -1405,7 +1443,9 @@ def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable 
     """Every spawn-time re-check of a split carry (state moved since routing, git state a rebuild or file copy would
     lose, the caps), uncached, raising on the first refusal. The dispatcher calls it BEFORE ``carry_workspace``
     copies anything (P2 c-38aac54b3e75a212 / Prism 06179c2d4439); :func:`carry_clones` runs it again after the copy.
-    Returns ``[(clone, dest, ignored files)]``."""
+    Returns ``[(clone, dest, ignored files, (stash entries, bundle bytes))]``. t_d2f06cf6: the stash entries are read
+    afresh here (one written since routing rides too) and their bundle is built before anything is copied, so a
+    failed bundle refuses the spawn naming the entry, with nothing on the pool host."""
     # Every check runs for every clone before anything is pushed, rebuilt or copied (nothing half-carried).
     staged = []
     extra_bytes = extra_entries = 0
@@ -1428,7 +1468,17 @@ def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable 
             except OSError:
                 raise RuntimeError(f"carry to {host.name}: clone {c['rel']} ignored file {ign!r} unreadable")
             extra_entries += 1
-        staged.append((c, dest, ignored))
+        stash = (), None
+        if worktree_carry_on():
+            entries = stash_entries(dest, runner)
+            if entries is None:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']} stash unreadable")
+            if entries:
+                try:
+                    stash = entries, stash_bundle(dest, entries, c["sha"], runner)
+                except RuntimeError as exc:
+                    raise RuntimeError(f"carry to {host.name}: clone {c['rel']}: {exc}")
+        staged.append((c, dest, ignored, stash))
     rebuilt = {c["rel"].strip("/") for c in clones}
     lost = split_worktree_loss(workspace, clones, runner)
     if lost is not None:
@@ -1452,7 +1502,7 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
     put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run)."""
     from hermes_cli import kanban_worktree_port as _kwt
     staged = carry_clones_check(host, workspace, clones, runner)
-    for c, dest, ignored in staged:
+    for c, dest, ignored, (entries, bundle) in staged:
         if c.get("push") is not None:
             _kwt.push_card_branch(tuple(c["push"]), runner)
         route = _kwt.derived_route(c["slug"], fleet_dir, (host.name,))
@@ -1470,6 +1520,9 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
                 raise RuntimeError(f"carry to {host.name}: ignored files of {c['rel']} rc="
                                    f"{getattr(proc, 'returncode', '?')}: "
                                    f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        if entries:
+            # t_d2f06cf6: the Studio checkout's stash entries, stored on the rebuilt clone in their original order
+            carry_stash(host, dest, dest, entries, c["sha"], runner, bundle=bundle)
 
 
 def remote_workspace_has_content(placement_raw: Optional[str],

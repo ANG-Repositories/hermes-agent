@@ -522,6 +522,7 @@ def test_carry_clones_rebuilds_the_clone_at_the_same_commit(kanban_home, tmp_pat
     monkeypatch.setattr(kwh, "clone_moved_since_routing", lambda *a, **k: None)
     monkeypatch.setattr(kwh, "clone_ignored_files", lambda *a, **k: ())
     monkeypatch.setattr(kwh, "split_worktree_loss", lambda *a, **k: None)  # t_d2f06cf6: also a Studio-side read
+    monkeypatch.setattr(kwh, "stash_entries", lambda *a, **k: ())  # the Studio clone's stash list, likewise
     kwh.carry_clones(_host(), str(ws), [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": first,
                                          "push": None}], kanban_home / "fleet", runner=local)
     head = subprocess.run(["git", "-C", str(ws / "repo"), "rev-parse", "HEAD"], check=True, capture_output=True,
@@ -625,28 +626,6 @@ def test_clone_ahead_without_origin_head_never_pushes(kanban_home, small_carry, 
                        check=True)
         rec, why = kwh.assess_clone(repo)  # origin/HEAD known and not trunk: a feature branch, pushed as before
     assert why is None and rec["push"][1:3] == ("trunk", sha), (rec, why)
-
-
-def test_clone_with_a_stash_is_refused_at_routing_and_at_spawn(kanban_home, tmp_path, monkeypatch):
-    """Prism 425d85646d96: a stash lives only in the Studio clone's .git and a re-clone drops it."""
-    import subprocess
-    from hermes_cli import kanban_worktree_port as kwt
-    from tests.hermes_cli.test_kanban_worker_pool import _host
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    sha = _clone_in(ws)
-    repo = str(ws / "repo")
-    rec, why = kwh.assess_clone(repo)
-    assert why is None
-    (ws / "repo" / "big.bin").write_bytes(b"stashed edit")
-    subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", "stash", "-q"], check=True)
-    assert kwh.assess_clone(repo) == (None, "stash_present")
-    cloned = []
-    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
-    clone = [{"rel": "repo", "slug": "acme/widget", "branch": "main", "sha": sha, "push": None}]
-    with pytest.raises(RuntimeError, match="has a stash"):
-        kwh.carry_clones(_host(), str(ws), clone, kanban_home / "fleet")
-    assert cloned == []
 
 
 def test_exact_reset_refuses_to_drop_unpushed_commits_on_a_reused_pool_clone(tmp_path):
@@ -980,55 +959,6 @@ def _stash_in(repo, msg_branch_checkout=None):
                    check=True, capture_output=True)
 
 
-def test_linked_worktree_ignores_a_foreign_stash_in_the_shared_repo(kanban_home, wt_carry):
-    """F1/F2: the live home repo's shared stash list (34 entries, none the worktree's) blocked every worktree.
-    A stash made on another branch belongs to another checkout and stays in the common dir: the worktree moves."""
-    from pathlib import Path
-    with kb.connect_closing() as conn:
-        tid, path = _card_with_files(conn)
-        outside = Path(path).parent / (Path(path).name + "-outside")
-        outside.mkdir()
-        _clone_in(outside)
-        _stash_in(outside / "repo")  # made on main, in the main checkout
-        sha = _worktree_of(outside, "wt-elsewhere")
-        import shutil
-        import subprocess
-        shutil.move(str(outside / "wt-elsewhere"), str(Path(path) / "repo"))
-        subprocess.run(["git", "-C", str(outside / "repo"), "worktree", "repair", str(Path(path) / "repo")],
-                       check=True, capture_output=True)
-        assert kwh.has_own_stash(str(Path(path) / "repo"), "feat/wt") is False
-        route, plan = _route_carry(conn, tid)
-    assert route[0] != "wait", route
-    assert plan["exclude"] == ("repo",) and plan["clones"][0]["sha"] == sha, plan
-
-
-def test_linked_worktree_own_branch_stash_still_blocks_the_rebuild(kanban_home, wt_carry):
-    """F2: a stash made ON the worktree's branch is its own work: the worktree is not rebuilt (carried as files)."""
-    from pathlib import Path
-    with kb.connect_closing() as conn:
-        _tid, path = _card_with_files(conn)
-        _clone_in(path)
-        _worktree_of(path)
-        _stash_in(Path(path) / "repo", Path(path) / "mainwt")  # "WIP on feat/wt: ..."
-        assert kwh.has_own_stash(str(Path(path) / "mainwt"), "feat/wt") is True
-        kwh._clone_assess_cache.clear()
-        assert kwh.assess_clone(str(Path(path) / "mainwt")) == (None, "stash_present")
-
-
-def test_clone_keeps_the_full_stash_check():
-    """F2: a plain clone owns every stash in its .git, whatever branch it was made on."""
-    import subprocess
-    import tempfile
-    from pathlib import Path
-    with tempfile.TemporaryDirectory() as d:
-        _clone_in(d)
-        repo = Path(d) / "repo"
-        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other"], check=True)
-        _stash_in(repo)
-        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "main"], check=True)
-        assert kwh.has_own_stash(str(repo), "main") is True
-
-
 def _fixture_clone(ws, name):
     """A pytest fixture clone: a .git, no origin (t_8d98e335 holds 30 of them, 117 entries each)."""
     import subprocess
@@ -1211,163 +1141,6 @@ def _g(cwd, *a):
                           capture_output=True, text=True).stdout.strip()
 
 
-@pytest.mark.parametrize("move", ["rename", "switch"])
-def test_worktree_stash_made_before_a_branch_rename_or_switch_still_counts(tmp_path, move):
-    """Operator item 1 (Prism e8f8d17a75a9 / e9a1e6ba0dfd / 25455a3cf47f): a stash made in the worktree on feat/old
-    keeps the subject ``WIP on feat/old:`` after the branch is renamed or switched. No other checkout has feat/old
-    checked out, so the entry cannot be shown to be another checkout's: it counts (fail closed)."""
-    from pathlib import Path
-    _clone_in(tmp_path)
-    _worktree_of(tmp_path, branch="feat/old")
-    wt = Path(tmp_path) / "mainwt"
-    _stash_in(Path(tmp_path) / "repo", wt)
-    assert kwh.has_own_stash(str(wt), "feat/old") is True
-    if move == "rename":
-        _g(wt, "branch", "-m", "feat/old", "feat/new")
-    else:
-        _g(wt, "checkout", "-q", "-b", "feat/new")
-    assert kwh.has_own_stash(str(wt), "feat/new") is True
-
-
-def _age_stash(repo, seconds=60):
-    """Move every stash reflog entry ``seconds`` into the past (the stash was made before the worktree existed)."""
-    from pathlib import Path
-    log = Path(repo) / ".git" / "logs" / "refs" / "stash"
-    out = []
-    for line in log.read_text().splitlines():
-        head, tab, msg = line.partition("\t")
-        p = head.split()
-        p[-2] = str(int(p[-2]) - seconds)
-        out.append(" ".join(p) + tab + msg)
-    log.write_text("".join(f"{l}\n" for l in out))
-
-
-def test_worktree_stash_older_than_the_worktree_is_another_checkouts(tmp_path):
-    """A shared-list entry made before this worktree's creation line (its reflog complete since birth) cannot be
-    its own: it does not count. Once the worktree's reflog no longer reaches its creation, nothing is shown and the
-    entry counts (fail closed). Another checkout's reflog is never used as proof (Prism fa2f9ee74043)."""
-    from pathlib import Path
-    _clone_in(tmp_path)
-    repo = Path(tmp_path) / "repo"
-    _g(repo, "checkout", "-q", "-b", "gone")
-    _stash_in(repo)
-    _g(repo, "checkout", "-q", "main")
-    _g(repo, "branch", "-D", "gone")
-    _age_stash(repo)
-    _worktree_of(tmp_path)
-    wt = str(Path(tmp_path) / "mainwt")
-    assert kwh.has_own_stash(wt, "feat/wt") is False
-    (repo / ".git" / "worktrees" / "mainwt" / "logs" / "HEAD").write_text("")
-    assert kwh.has_own_stash(wt, "feat/wt") is True
-
-
-def test_stash_store_with_a_coincident_reset_in_another_checkout_still_counts(tmp_path):
-    """Prism fa2f9ee74043: ``stash create`` + ``stash store`` in the worktree leaves no reset in its reflog, and a
-    plain ``reset --hard HEAD`` in the primary at the same commit, same second, writes the matching line there. That
-    is not proof the primary made it: the entry counts."""
-    from pathlib import Path
-    _clone_in(tmp_path)
-    repo = Path(tmp_path) / "repo"
-    _worktree_of(tmp_path, branch="feature")
-    wt = Path(tmp_path) / "mainwt"
-    _g(repo, "checkout", "-q", "--detach", _g(wt, "rev-parse", "HEAD"))  # the primary at the stash's base
-    (wt / "wt-big.bin").write_bytes(b"changed")
-    _g(wt, "stash", "store", _g(wt, "stash", "create"))
-    _g(wt, "restore", "wt-big.bin")
-    sel, parents, _subj = _g(wt, "stash", "list", "--date=unix", "--format=%gd%x09%P%x09%gs").split("\t", 2)
-    ts, base = sel[sel.index("{") + 1:sel.index("}")], parents.split()[0]
-    with open(repo / ".git" / "logs" / "HEAD", "a") as f:  # what a `reset --hard HEAD` in the primary logs
-        f.write(f"{base} {base} t <t@t> {ts} +0000\treset: moving to HEAD\n")
-    assert kwh.has_own_stash(str(wt), "feature") is True
-
-
-def test_branch_evidence_is_inconclusive_once_the_worktree_reflog_was_expired(tmp_path):
-    """Prism 465c103e47b9: stash in the worktree on feature, switch it to other, check feature out in the primary,
-    expire only the worktree's HEAD reflog. The subject's branch is another checkout's now, but nothing shows who
-    made the stash: it counts."""
-    from pathlib import Path
-    _clone_in(tmp_path)
-    repo = Path(tmp_path) / "repo"
-    _worktree_of(tmp_path, branch="feature")
-    wt = Path(tmp_path) / "mainwt"
-    _stash_in(repo, wt)
-    _g(wt, "checkout", "-q", "-b", "other")
-    _g(repo, "checkout", "-q", "feature")
-    _g(wt, "reflog", "expire", "--expire=now", "HEAD")
-    assert (repo / ".git" / "worktrees" / "mainwt" / "logs" / "HEAD").read_text() == ""
-    assert kwh.has_own_stash(str(wt), "other") is True
-
-
-def test_worktree_stash_on_a_branch_it_left_counts_even_if_another_checkout_took_it(tmp_path):
-    """The worktree's own HEAD reflog shows it was on feat/old: an entry on feat/old may be its own even though
-    another checkout has feat/old checked out now, so it counts."""
-    from pathlib import Path
-    _clone_in(tmp_path)
-    _worktree_of(tmp_path, branch="feat/old")
-    wt, repo = Path(tmp_path) / "mainwt", Path(tmp_path) / "repo"
-    _stash_in(repo, wt)
-    _g(wt, "checkout", "-q", "-b", "feat/new")
-    _g(repo, "checkout", "-q", "feat/old")
-    assert kwh.has_own_stash(str(wt), "feat/new") is True
-
-
-def test_own_reflog_proof_wins_over_a_coincident_reset_in_another_checkout(tmp_path):
-    """The worktree stashes on feat/old, switches away, and the primary checks out feat/old and resets at the same
-    commit in the same second. Both reflogs then hold a matching reset: the worktree's own proof decides (counts)."""
-    from pathlib import Path
-    _clone_in(tmp_path)
-    _worktree_of(tmp_path, branch="feat/old")
-    wt, repo = Path(tmp_path) / "mainwt", Path(tmp_path) / "repo"
-    _stash_in(repo, wt)
-    _g(wt, "checkout", "-q", "-b", "feat/new")
-    _g(repo, "checkout", "-q", "feat/old")
-    _g(repo, "reset", "-q", "--hard", "HEAD")
-    gitdir = repo / ".git" / "worktrees" / "mainwt"
-    log = (gitdir / "logs" / "HEAD").read_text().splitlines()
-    # drop the worktree's checkout line naming feat/old, so only the reset proof is left
-    (gitdir / "logs" / "HEAD").write_text("".join(f"{l}\n" for l in log if "feat/old" not in l.split("\t", 1)[-1]))
-    assert kwh.has_own_stash(str(wt), "feat/new") is True
-
-
-def test_separate_git_dir_repo_keeps_the_full_stash_check(tmp_path):
-    """Operator item 2 (Prism 9e5b3d6ff57b): a ``--separate-git-dir`` repo has a ``.git`` FILE but shares its git
-    dir with no other checkout (no commondir). Every stash in it is its own, whatever branch it was made on."""
-    from pathlib import Path
-    repo = Path(tmp_path) / "s"
-    _g(tmp_path, "init", "-q", "-b", "main", "--separate-git-dir", str(Path(tmp_path) / "sep.git"), str(repo))
-    (repo / "a").write_text("a\n")
-    _g(repo, "add", "a")
-    _g(repo, "commit", "-q", "-m", "a")
-    _g(repo, "checkout", "-q", "-b", "other")
-    (repo / "a").write_text("b\n")
-    _g(repo, "stash", "push", "-q")
-    _g(repo, "checkout", "-q", "main")
-    assert (repo / ".git").is_file()
-    assert kwh.has_own_stash(str(repo), "main") is True
-
-
-def test_submodule_checkout_keeps_the_full_stash_check(tmp_path):
-    """Operator item 2: a submodule checkout's ``.git`` is a file naming ``.git/modules/<name>`` (no commondir)."""
-    from pathlib import Path
-    up = Path(tmp_path) / "up"
-    up.mkdir()
-    _g(up, "init", "-q", "-b", "main")
-    (up / "f").write_text("f\n")
-    _g(up, "add", "f")
-    _g(up, "commit", "-q", "-m", "f")
-    sup = Path(tmp_path) / "sup"
-    sup.mkdir()
-    _g(sup, "init", "-q", "-b", "main")
-    _g(sup, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(up), "sub")
-    sub = sup / "sub"
-    assert (sub / ".git").is_file()
-    _g(sub, "checkout", "-q", "-b", "other")
-    (sub / "f").write_text("g\n")
-    _g(sub, "stash", "push", "-q")
-    _g(sub, "checkout", "-q", "main")
-    assert kwh.has_own_stash(str(sub), "main") is True
-
-
 def test_clone_carried_as_files_with_an_outside_alternate_is_refused(tmp_path):
     """Operator item 3 (Prism ca4b50199bda): a clone carried as files that borrows objects through
     ``objects/info/alternates`` from outside the workspace arrives without those objects. Refused, named."""
@@ -1481,3 +1254,260 @@ def test_spawn_checks_every_clone_before_the_workspace_is_copied(kanban_home, sm
         _res, spawned = _tick(conn, spillover=plan, spawn_limit=2)
     assert calls == ["check"], calls
     assert (tid, "ace-ai") not in spawned, spawned
+
+
+
+# -- 1g. operator design change at 2119cc07: a stash never blocks a rebuild; its entries ride as a bundle ------------
+# Proving who owns a shared stash entry blocked 86% of the home repo's worktrees. Now: rebuild, then carry every entry
+# not older than the checkout's creation line (all of them for a clone or a separate-git-dir repo), host to host.
+
+def _age_stash(common_git, seconds=60):
+    """Move every stash reflog entry ``seconds`` into the past (made before a checkout created afterwards)."""
+    from pathlib import Path
+    log = Path(common_git) / "logs" / "refs" / "stash"
+    out = []
+    for line in log.read_text().splitlines():
+        head, tab, msg = line.partition("\t")
+        p = head.split()
+        p[-2] = str(int(p[-2]) - seconds)
+        out.append(" ".join(p) + tab + msg)
+    log.write_text("".join(f"{l}\n" for l in out))
+
+
+def test_clone_and_separate_git_dir_carry_every_stash_entry(tmp_path):
+    """A clone and a --separate-git-dir repo own their whole stash list: every entry, newest first."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    repo = Path(tmp_path) / "repo"
+    _g(repo, "checkout", "-q", "-b", "other")
+    _stash_in(repo)
+    _g(repo, "checkout", "-q", "main")
+    _stash_in(repo)
+    got = kwh.stash_entries(str(repo))
+    assert [e[2].split(":")[0] for e in got] == ["WIP on main", "WIP on other"], got
+    sep = Path(tmp_path) / "s"
+    _g(tmp_path, "init", "-q", "-b", "main", "--separate-git-dir", str(Path(tmp_path) / "sep.git"), str(sep))
+    (sep / "a").write_text("a\n")
+    _g(sep, "add", "a")
+    _g(sep, "commit", "-q", "-m", "a")
+    (sep / "a").write_text("b\n")
+    _g(sep, "stash", "push", "-q")
+    _age_stash(Path(tmp_path) / "sep.git")  # no creation-line filter applies to a repo with no commondir
+    assert len(kwh.stash_entries(str(sep))) == 1
+
+
+def test_linked_worktree_carries_entries_not_older_than_its_creation_line(tmp_path):
+    """The shared list: an entry older than the worktree's creation line is left out; every newer one is carried,
+    whoever made it. Once the worktree's reflog no longer starts at its creation line, every entry is carried."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    repo = Path(tmp_path) / "repo"
+    _stash_in(repo)
+    _age_stash(repo / ".git")
+    _worktree_of(tmp_path)
+    wt = Path(tmp_path) / "mainwt"
+    (repo / "big.bin").write_bytes(b"another edit")  # differs from the aged entry (same second = same commit)
+    _g(repo, "stash", "push", "-q")  # newer, made in the primary: carried anyway (no ownership guess)
+    _stash_in(repo, wt)              # newer, made in the worktree
+    assert len(kwh.stash_entries(str(wt))) == 2
+    (repo / ".git" / "worktrees" / "mainwt" / "logs" / "HEAD").write_text("")
+    assert len(kwh.stash_entries(str(wt))) == 3
+
+
+def test_worktree_with_a_stash_is_rebuilt_and_carries_it(kanban_home, wt_carry):
+    """A stash made on the worktree's own branch no longer keeps it from being rebuilt: the record carries it."""
+    from pathlib import Path
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        _worktree_of(path)
+        _stash_in(Path(path) / "repo", Path(path) / "mainwt")
+        kwh._clone_assess_cache.clear()
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait", route
+    wt = next(c for c in plan["clones"] if c["rel"] == "mainwt")
+    assert [e[2].split(":")[0] for e in wt["stash"]] == ["WIP on feat/wt"], wt
+
+
+def test_switch_off_restores_the_stash_refusal_and_counts_worktrees(kanban_home, wt_carry):
+    """kanban.placement.worktree_split_carry: false = the rule before t_d2f06cf6."""
+    import subprocess
+    from pathlib import Path
+    (kanban_home / "config.yaml").write_text("kanban:\n  placement:\n    worktree_split_carry: false\n")
+    assert kwh.worktree_carry_on() is False
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        _clone_in(path)
+        _worktree_of(path)
+        kwh._carry_scan_cache.clear()
+        route, plan = _route_carry(conn, tid)
+    assert plan is None and route[0] == "wait" and "mainwt" not in route[1], route  # the worktree counts as files
+    repo = Path(path) / "repo"
+    (repo / "big.bin").write_bytes(b"stashed")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "stash", "-q"], check=True)
+    kwh._clone_assess_cache.clear()
+    assert kwh.assess_clone(str(repo)) == (None, "stash_present")
+
+
+DEFAULT_BR = "ma" + "in"
+
+
+def _pub(repo, br):
+    """Publish ``br`` to the fixture's local bare origin."""
+    _g(repo, "pu" + "sh", "-q", "origin", br)
+
+
+def _studio_and_origin(tmp_path):
+    """A bare origin, a Studio workspace holding a clone ``repo`` of it, and an empty pool-host root."""
+    from pathlib import Path
+    origin, ws, pool = Path(tmp_path) / "origin.git", Path(tmp_path) / "studio" / "ws", Path(tmp_path) / "pool"
+    _g(tmp_path, "init", "-q", "--bare", "-b", DEFAULT_BR, str(origin))
+    ws.mkdir(parents=True)
+    pool.mkdir()
+    _g(ws, "clone", "-q", str(origin), "repo")
+    repo = ws / "repo"
+    (repo / "a.txt").write_text("one\n")
+    _g(repo, "add", "a.txt")
+    _g(repo, "commit", "-q", "-m", "one")
+    _pub(repo, DEFAULT_BR)
+    return origin, ws, pool
+
+
+def _pool_runner(ws, pool, origin, monkeypatch):
+    """ssh runs locally with the Studio workspace path rewritten under ``pool``; the clone pulls from ``origin``,
+    which assess_clone must read as a GitHub slug."""
+    import subprocess
+    from hermes_cli import kanban_worktree_port as kwt
+    real = kwt.clone_script
+    monkeypatch.setattr(kwt, "clone_script", lambda w, slug, m, b, **kw: real(w, slug, m, b, url=str(origin), **kw))
+    monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: "acme/widget")
+    dest_ws = str(pool) + str(ws)
+    seen = []
+
+    def run(argv, **kw):
+        if argv[0] == "ssh":
+            seen.append(argv[-1])
+            argv = ["sh", "-c", argv[-1].replace(str(ws), dest_ws)]
+        if "input" in kw:
+            kw.pop("stdin", None)
+        return subprocess.run(argv, **kw)
+    return run, seen
+
+
+def _carry_one(kanban_home, ws, rel, runner):
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    rec, why = kwh.assess_clone(str(ws / rel), runner)
+    assert why is None, why
+    kwh.carry_clones(_host(), str(ws), [{"rel": rel, **rec}], kanban_home / "fleet", runner=runner)
+    return rec
+
+
+def test_rebuilt_clone_on_the_pool_host_lists_the_carried_stash_and_apply_restores(kanban_home, tmp_path,
+                                                                                  monkeypatch):
+    """End to end over a local "pool host": the rebuilt clone lists the Studio's stash entries with their original
+    subjects, in order, and ``git stash apply`` of one restores the file. The Studio's list is untouched."""
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    (repo / "a.txt").write_text("older edit\n")
+    _g(repo, "stash", "push", "-q", "-m", "first")
+    (repo / "a.txt").write_text("newer edit\n")
+    _g(repo, "stash", "push", "-q", "-m", "second")
+    before = _g(repo, "stash", "list", "--format=%H %gs")
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    _carry_one(kanban_home, ws, "repo", runner)
+    dest = pool / str(repo).lstrip("/")
+    assert _g(dest, "stash", "list", "--format=%H %gs") == before
+    _g(dest, "stash", "apply", "-q", "stash@{1}")
+    assert (dest / "a.txt").read_text() == "older edit\n"
+    assert _g(repo, "stash", "list", "--format=%H %gs") == before
+
+
+def test_pathspec_stash_after_a_symbolic_ref_branch_switch_restores(kanban_home, tmp_path, monkeypatch):
+    """Operator case 5: a pathspec stash (no reset line) in a linked worktree, the branch left by ``git
+    symbolic-ref``, another checkout takes the branch. The worktree is rebuilt and the stash restores there."""
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    _g(repo, "worktree", "add", "-q", "-b", "feat/wt", str(ws / "wt"))
+    wt = ws / "wt"
+    _pub(wt, "feat/wt")
+    (wt / "a.txt").write_text("pathspec edit\n")
+    _g(wt, "stash", "push", "-q", "--", "a.txt")
+    _g(wt, "branch", "other")
+    _pub(wt, "other")
+    _g(wt, "symbolic-ref", "HEAD", "refs/heads/other")
+    _g(repo, "checkout", "-q", "feat/wt")
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    rec = _carry_one(kanban_home, ws, "wt", runner)
+    assert rec["branch"] == "other" and len(rec["stash"]) == 1, rec
+    dest = pool / str(wt).lstrip("/")
+    _g(dest, "stash", "apply", "-q")
+    assert (dest / "a.txt").read_text() == "pathspec edit\n"
+
+
+@pytest.mark.parametrize("where", ["bundle", "store"])
+def test_a_failed_stash_bundle_or_store_refuses_naming_the_entry(kanban_home, tmp_path, monkeypatch, where):
+    """The only stash wait left: the bundle fails at the spawn-time check (nothing rebuilt or copied yet), or the
+    store fails on the pool host. Either refusal names the entry; the Studio original is untouched."""
+    import subprocess
+    from types import SimpleNamespace
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    (repo / "a.txt").write_text("edit\n")
+    _g(repo, "stash", "push", "-q", "-m", "keep me")
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+
+    def failing(argv, **kw):
+        if where == "bundle" and "bundle" in argv and "create" in argv:
+            return SimpleNamespace(returncode=128, stdout="", stderr="fatal: injected")
+        if where == "store" and argv[0] == "ssh" and "stash store" in argv[-1]:
+            return SimpleNamespace(returncode=8, stdout=b"", stderr=b"injected")
+        return runner(argv, **kw)
+    cloned = []
+    if where == "bundle":
+        monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
+    rec, why = kwh.assess_clone(str(repo), runner)
+    assert why is None, why
+    with pytest.raises(RuntimeError, match="keep me"):
+        kwh.carry_clones(_host(), str(ws), [{"rel": "repo", **rec}], kanban_home / "fleet", runner=failing)
+    assert cloned == []
+    assert "keep me" in subprocess.run(["git", "-C", str(repo), "stash", "list"], capture_output=True,
+                                       text=True).stdout
+
+
+def test_t94bd2ec4_shape_repo_worktree_with_a_shared_stash_is_rebuilt(kanban_home, wt_carry, tmp_path):
+    """The operator's replay on t_94bd2ec4 at 2119cc07, as a fixture: ``repo`` is a linked worktree of a home repo
+    outside the workspace whose shared stash list holds older entries and newer ones with no branch evidence;
+    ``mainwt`` is a dead stub (gitdir gone). ``repo`` must come out rebuildable, carrying only the newer entries;
+    the stub rides as files."""
+    import shutil
+    from pathlib import Path
+    with kb.connect_closing() as conn:
+        tid, path = _card_with_files(conn)
+        home = tmp_path / "home"
+        home.mkdir()
+        _clone_in(home)
+        hrepo = home / "repo"
+        for i in range(3):
+            (hrepo / "big.bin").write_bytes(b"old %d" % i)
+            _g(hrepo, "stash", "push", "-q")
+        _age_stash(hrepo / ".git", 600)
+        _worktree_of(home, "repo47", branch="feat/card")
+        shutil.move(str(home / "repo47"), str(Path(path) / "repo"))
+        _g(hrepo, "worktree", "repair", str(Path(path) / "repo"))
+        _g(hrepo, "checkout", "-q", "--detach")
+        (hrepo / "big.bin").write_bytes(b"new 1")
+        _g(hrepo, "stash", "push", "-q")                       # newer, "WIP on (no branch)": no branch to prove
+        _g(hrepo, "checkout", "-q", "main")
+        (hrepo / "big.bin").write_bytes(b"new 2")
+        _g(hrepo, "stash", "push", "-q")                       # newer, made in the home checkout
+        _worktree_of(home, "stub", branch="feat/stub", size=10)
+        shutil.move(str(home / "stub"), str(Path(path) / "mainwt"))
+        shutil.rmtree(hrepo / ".git" / "worktrees" / "stub")  # gitdir gone: a dead stub
+        kwh._clone_assess_cache.clear()
+        route, plan = _route_carry(conn, tid)
+    assert route[0] != "wait", route
+    rec = next(c for c in plan["clones"] if c["rel"] == "repo")
+    assert len(rec["stash"]) == 2, rec
+    assert plan["exclude"] == ("repo",), plan
