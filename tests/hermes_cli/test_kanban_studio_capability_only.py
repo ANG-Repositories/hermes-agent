@@ -1229,10 +1229,23 @@ def test_worktree_stash_made_before_a_branch_rename_or_switch_still_counts(tmp_p
     assert kwh.has_own_stash(str(wt), "feat/new") is True
 
 
-def test_worktree_stash_owner_is_proven_by_the_other_checkouts_head_reflog(tmp_path):
-    """An entry is another checkout's only when THAT checkout's HEAD reflog records the stash's reset (same commit,
-    same second). Made in the primary on a branch since deleted: provably the primary's, so it does not count. Once
-    the primary's HEAD reflog no longer shows it, the owner cannot be shown and the entry counts (fail closed)."""
+def _age_stash(repo, seconds=60):
+    """Move every stash reflog entry ``seconds`` into the past (the stash was made before the worktree existed)."""
+    from pathlib import Path
+    log = Path(repo) / ".git" / "logs" / "refs" / "stash"
+    out = []
+    for line in log.read_text().splitlines():
+        head, tab, msg = line.partition("\t")
+        p = head.split()
+        p[-2] = str(int(p[-2]) - seconds)
+        out.append(" ".join(p) + tab + msg)
+    log.write_text("".join(f"{l}\n" for l in out))
+
+
+def test_worktree_stash_older_than_the_worktree_is_another_checkouts(tmp_path):
+    """A shared-list entry made before this worktree's creation line (its reflog complete since birth) cannot be
+    its own: it does not count. Once the worktree's reflog no longer reaches its creation, nothing is shown and the
+    entry counts (fail closed). Another checkout's reflog is never used as proof (Prism fa2f9ee74043)."""
     from pathlib import Path
     _clone_in(tmp_path)
     repo = Path(tmp_path) / "repo"
@@ -1240,11 +1253,49 @@ def test_worktree_stash_owner_is_proven_by_the_other_checkouts_head_reflog(tmp_p
     _stash_in(repo)
     _g(repo, "checkout", "-q", "main")
     _g(repo, "branch", "-D", "gone")
+    _age_stash(repo)
     _worktree_of(tmp_path)
     wt = str(Path(tmp_path) / "mainwt")
     assert kwh.has_own_stash(wt, "feat/wt") is False
-    (repo / ".git" / "logs" / "HEAD").write_text("")
+    (repo / ".git" / "worktrees" / "mainwt" / "logs" / "HEAD").write_text("")
     assert kwh.has_own_stash(wt, "feat/wt") is True
+
+
+def test_stash_store_with_a_coincident_reset_in_another_checkout_still_counts(tmp_path):
+    """Prism fa2f9ee74043: ``stash create`` + ``stash store`` in the worktree leaves no reset in its reflog, and a
+    plain ``reset --hard HEAD`` in the primary at the same commit, same second, writes the matching line there. That
+    is not proof the primary made it: the entry counts."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    repo = Path(tmp_path) / "repo"
+    _worktree_of(tmp_path, branch="feature")
+    wt = Path(tmp_path) / "mainwt"
+    _g(repo, "checkout", "-q", "--detach", _g(wt, "rev-parse", "HEAD"))  # the primary at the stash's base
+    (wt / "wt-big.bin").write_bytes(b"changed")
+    _g(wt, "stash", "store", _g(wt, "stash", "create"))
+    _g(wt, "restore", "wt-big.bin")
+    sel, parents, _subj = _g(wt, "stash", "list", "--date=unix", "--format=%gd%x09%P%x09%gs").split("\t", 2)
+    ts, base = sel[sel.index("{") + 1:sel.index("}")], parents.split()[0]
+    with open(repo / ".git" / "logs" / "HEAD", "a") as f:  # what a `reset --hard HEAD` in the primary logs
+        f.write(f"{base} {base} t <t@t> {ts} +0000\treset: moving to HEAD\n")
+    assert kwh.has_own_stash(str(wt), "feature") is True
+
+
+def test_branch_evidence_is_inconclusive_once_the_worktree_reflog_was_expired(tmp_path):
+    """Prism 465c103e47b9: stash in the worktree on feature, switch it to other, check feature out in the primary,
+    expire only the worktree's HEAD reflog. The subject's branch is another checkout's now, but nothing shows who
+    made the stash: it counts."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    repo = Path(tmp_path) / "repo"
+    _worktree_of(tmp_path, branch="feature")
+    wt = Path(tmp_path) / "mainwt"
+    _stash_in(repo, wt)
+    _g(wt, "checkout", "-q", "-b", "other")
+    _g(repo, "checkout", "-q", "feature")
+    _g(wt, "reflog", "expire", "--expire=now", "HEAD")
+    assert (repo / ".git" / "worktrees" / "mainwt" / "logs" / "HEAD").read_text() == ""
+    assert kwh.has_own_stash(str(wt), "other") is True
 
 
 def test_worktree_stash_on_a_branch_it_left_counts_even_if_another_checkout_took_it(tmp_path):
@@ -1330,6 +1381,37 @@ def test_clone_carried_as_files_with_an_outside_alternate_is_refused(tmp_path):
     assert alt.is_file()
     why = kwh.carried_gitdir_loss(str(ws), ["repo"], set())
     assert why and "repo" in why and "alternate" in why, why
+
+
+def test_clone_whose_objects_dir_is_symlinked_out_of_the_carry_is_refused(tmp_path):
+    """Prism 519874fe750e: ``.git/objects`` symlinked to a store outside the workspace, no alternates file. The
+    symlink-preserving copy arrives without the objects: refused, named."""
+    import shutil
+    from pathlib import Path
+    ws, pool = Path(tmp_path) / "ws", Path(tmp_path) / "pool"
+    ws.mkdir()
+    _clone_in(ws, "dirty", dirty=True)
+    objs = ws / "dirty" / ".git" / "objects"
+    shutil.move(str(objs), str(pool))
+    objs.symlink_to(pool)
+    _g(ws / "dirty", "rev-parse", "HEAD^{tree}")  # the repo still works on the Studio
+    why = kwh.carried_gitdir_loss(str(ws), ["dirty"], set())
+    assert why and "object store" in why and "dirty" in why, why
+
+
+def test_clone_with_a_quoted_alternate_is_refused(tmp_path):
+    """Prism bd234dd77562: git C-quotes an alternates path. A quoted absolute path must not be read as a relative
+    one inside the workspace: refused (fail closed)."""
+    from pathlib import Path
+    ws, store = Path(tmp_path) / "ws", Path(tmp_path) / "store"
+    ws.mkdir()
+    store.mkdir()
+    _clone_in(store, "src")
+    _g(ws, "clone", "-q", "--shared", str(store / "src"), "dirty")
+    alt = ws / "dirty" / ".git" / "objects" / "info" / "alternates"
+    alt.write_text(f'"{store / "src" / ".git" / "objects"}"\n')
+    why = kwh.carried_gitdir_loss(str(ws), ["dirty"], set())
+    assert why and "quoted alternate" in why, why
 
 
 def test_alternate_inside_what_travels_is_not_refused(tmp_path):

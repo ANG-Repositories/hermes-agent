@@ -841,6 +841,10 @@ def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
             if objs in seen:
                 continue
             seen.add(objs)
+            if not _travels(objs):
+                # Prism 519874fe750e: the repo's own objects dir symlinked out of the carry
+                return (f"{name} is carried as files but its object store {objs} does not travel with it "
+                        f"(outside the workspace or in a rebuilt clone)")
             alt = os.path.join(objs, "info", "alternates")
             if not os.path.lexists(alt):
                 continue
@@ -849,6 +853,9 @@ def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
+                    if line.startswith('"'):
+                        # Prism bd234dd77562: git C-quotes an alternate path; never read a quoted one as relative
+                        return f"{name} is carried as files but has a quoted alternate {line} (not resolved here)"
                     target = os.path.realpath(os.path.join(objs, line))
                     if not _travels(target):
                         return (f"{name} is carried as files but borrows objects through an alternate {target} "
@@ -861,7 +868,10 @@ def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
             dirs = _gitfile_dirs(repo)
             if dirs is None:
                 common = os.path.join(repo, ".git")
-                if os.path.islink(common) or not os.path.isdir(common):
+                if os.path.islink(common) and not _travels(os.path.realpath(common)):
+                    return (f"{name} is carried as files but its .git symlink resolves to "
+                            f"{os.path.realpath(common)}, which does not travel with it")
+                if not os.path.isdir(common):
                     return None
             else:
                 gitdir, common, _shared = dirs
@@ -1062,17 +1072,16 @@ def _read_head_reflog(gitdir: str) -> List[Tuple[str, int, str]]:
 
 
 def _stash_owner_evidence(gitdir: str, common: str) -> dict:
-    """What the shared repo records about who stashed what: this checkout's HEAD reflog, every OTHER checkout's
-    HEAD reflog (the primary's and each ``worktrees/*``), and the branch each other checkout has checked out."""
+    """What the shared repo records about who stashed what: this checkout's HEAD reflog, when it was created (if
+    the reflog still reaches back that far), and the branch each OTHER checkout has checked out."""
     me = os.path.realpath(gitdir)
     others = [common] + [os.path.join(common, "worktrees", n) for n in
                          (sorted(os.listdir(os.path.join(common, "worktrees")))
                           if os.path.isdir(os.path.join(common, "worktrees")) else ())]
-    other_logs, other_branches = [], set()
+    other_branches = set()
     for g in others:
         if os.path.realpath(g) == me:
             continue
-        other_logs.extend(_read_head_reflog(g))
         try:
             with open(os.path.join(g, "HEAD"), encoding="utf-8-sig") as f:
                 head = f.read().strip()
@@ -1080,7 +1089,21 @@ def _stash_owner_evidence(gitdir: str, common: str) -> dict:
             continue
         if head.startswith("ref: refs/heads/"):
             other_branches.add(head[len("ref: refs/heads/"):])
-    return {"mine": _read_head_reflog(gitdir), "others": other_logs, "branches": other_branches}
+    return {"mine": _read_head_reflog(gitdir), "born": _reflog_birth(gitdir), "branches": other_branches}
+
+
+def _reflog_birth(gitdir: str) -> Optional[int]:
+    """The unix ts of the checkout's creation line (old sha all zeros) when its HEAD reflog still starts with it, so
+    the reflog is complete since birth; None when it was expired or trimmed (the history is then unknown)."""
+    try:
+        with open(os.path.join(gitdir, "logs", "HEAD"), encoding="utf-8-sig", errors="replace") as f:
+            first = f.readline()
+    except FileNotFoundError:
+        return None
+    parts = first.partition("\t")[0].split()
+    if len(parts) >= 5 and set(parts[0]) == {"0"} and parts[-2].isdigit():
+        return int(parts[-2])
+    return None
 
 
 def _stash_is_foreign(line: str, branch: str, owners: dict) -> bool:
@@ -1089,9 +1112,14 @@ def _stash_is_foreign(line: str, branch: str, owners: dict) -> bool:
     parent, same second or just after) in the reflog of the checkout that made it, so:
 
     - that reset in THIS checkout's HEAD reflog: ours, whatever the subject's branch is now (renamed, switched);
-    - that reset only in another checkout's HEAD reflog: theirs;
-    - neither (reflog expired, ``stash store``): theirs only when the subject names a branch another checkout has
-      checked out right now, that is not ours, and that this checkout's reflog never shows it on. Else ours."""
+    - this checkout's HEAD reflog is complete since its creation line and the entry is older than that line: theirs
+      (this checkout did not exist yet);
+    - else theirs only when this reflog is complete since creation, the subject names a branch another checkout has
+      checked out right now that is not ours, and this reflog never shows us on it (every branch departure is
+      logged with its name). Else ours.
+
+    A matching reset in ANOTHER checkout's reflog proves nothing (Prism fa2f9ee74043: a plain ``reset --hard HEAD``
+    writes the same line), and neither does branch evidence once our reflog was expired (Prism 465c103e47b9)."""
     try:
         sel, parents, subject = line.split("\t", 2)
         ts = int(sel[sel.index("{") + 1:sel.index("}")])
@@ -1103,7 +1131,10 @@ def _stash_is_foreign(line: str, branch: str, owners: dict) -> bool:
         return any(sha == base and ts <= t <= ts + 2 and msg == "reset: moving to HEAD" for sha, t, msg in log)
     if _made_in(owners["mine"]):
         return False
-    if _made_in(owners["others"]):
+    born = owners.get("born")
+    if born is None:
+        return False
+    if ts < born:
         return True
     m = re.match(r"(?:WIP on|On) (.+?): ", subject)
     b = m.group(1) if m else None
