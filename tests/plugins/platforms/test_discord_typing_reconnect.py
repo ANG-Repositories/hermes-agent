@@ -6,9 +6,11 @@ import traceback
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import discord
-from discord.ext import commands
 import pytest
+
+# Real SDK lifecycle states; skip where the optional discord.py dep is absent.
+discord = pytest.importorskip("discord", reason="discord.py optional dep not installed")
+commands = pytest.importorskip("discord.ext.commands")
 
 from gateway.config import PlatformConfig
 from plugins.platforms.discord import adapter as discord_platform

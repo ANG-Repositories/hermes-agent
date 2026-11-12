@@ -8,7 +8,9 @@
     ],
     "paths": [
       "gateway/platforms/base.py",
-      "plugins/platforms/discord/adapter.py"
+      "gateway/platforms/base_*.py",
+      "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py"
     ],
     "why": "Discord liveness reconnect replaces the adapter object while a turn still refreshes typing through the retired object. Resolve the owning transport slot each tick, issue a token on the replacement, and retire only that token on stop/cancel/supersede. The probe exercises the real reconnect installer without needing progress painting. Card t_5880041a.",
     "lifecycle": "upstream-intended",

@@ -1181,7 +1181,6 @@ def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.ru
     common dir is written. The whole build is bounded by STASH_BUNDLE_TIMEOUT_SECONDS; hitting it raises
     :class:`StashBundleTimeout` and is remembered (:func:`stash_bundle_deferred`). Raises RuntimeError naming the entry
     on any other failure."""
-    import shutil
     import tempfile
     import time
     deadline = time.monotonic() + STASH_BUNDLE_TIMEOUT_SECONDS
@@ -1220,8 +1219,8 @@ def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.ru
     base = (getattr(_git("-C", repo, "rev-parse", "-q", "--verify", "refs/remotes/origin/HEAD^{commit}",
                          what="origin default branch", ok_rc=(0, 1)), "stdout", "") or "").strip()
     excl = [f"^{head}"] + ([f"^{base}"] if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", base) else [])
-    tmp = tempfile.mkdtemp(prefix="kanban-stash-")
-    try:
+    # TemporaryDirectory, not mkdtemp + rmtree: workspace deletion has one choke point (test_kanban_survivor).
+    with tempfile.TemporaryDirectory(prefix="kanban-stash-", ignore_cleanup_errors=True) as tmp:
         bare, out = os.path.join(tmp, "b.git"), os.path.join(tmp, "stash.bundle")
         _git("init", "-q", "--bare", bare, what="bundle repo")
         alt = os.path.join(bare, "objects", "info", "alternates")
@@ -1243,8 +1242,6 @@ def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.ru
             raise RuntimeError(f"stash carry of {repo}: bundle over the carry byte cap")
         with open(out, "rb") as f:
             return f.read()
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def stash_store_script(dest: str, entries) -> str:
