@@ -388,9 +388,10 @@ KANBAN_ATTACHMENT_READ_SCHEMA = _schema(
     (
         "Read one attachment's bytes by id (from kanban_attachments). Works from any "
         "host, including a pool host where the attachment's stored_path does not exist. "
-        "Returns filename, size, sha256 and the content: `text` when it is UTF-8, else "
-        "`content_base64`. A worker may read its own card's and its parents' attachments; "
-        "files over 64 KiB are refused with their size."
+        "Returns filename, size_bytes and sha256 of the whole file, and the content: "
+        "`text` when it is UTF-8 and fits the result budget, else `content_base64`. A "
+        "worker may read its own card's and its parents' attachments. One read returns at "
+        "most 64 KiB; read a larger file in ranges with offset/length until `eof` is true."
     ),
     {
         "attachment_id": _prop("integer", "Attachment id from kanban_attachments (required)."),
@@ -398,6 +399,8 @@ KANBAN_ATTACHMENT_READ_SCHEMA = _schema(
         "encoding": {"type": "string", "enum": ["auto", "base64"],
                      "description": "auto (default): UTF-8 text when it decodes, else base64. "
                                     "base64: always content_base64."},
+        "offset": _prop("integer", "Byte offset to start reading at (default 0)."),
+        "length": _prop("integer", "Bytes to read from offset (1..65536, default 65536)."),
     },
     ["attachment_id"],
 )

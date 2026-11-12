@@ -125,6 +125,47 @@ def test_over_cap_attachment_is_refused_with_its_size(pool_worker):
     assert str(kt.KANBAN_ATTACHMENT_READ_MAX_BYTES) in got["error"]
 
 
+@pytest.mark.parametrize("unit", [b"\x00", b'"\\'], ids=["nul", "quote-backslash"])
+def test_escape_heavy_text_at_the_cap_fits_the_result_budget(pool_worker, unit):
+    """Valid UTF-8 that JSON must escape grows up to 6x; the reply falls back to base64
+    instead of overflowing the tool-result budget (Prism c-9baa2b4733c00414)."""
+    from tools import kanban_tools as kt
+    from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
+    payload = unit * (kt.KANBAN_ATTACHMENT_READ_MAX_BYTES // len(unit))
+    assert len(json.dumps(payload.decode("utf-8"))) > DEFAULT_RESULT_SIZE_CHARS
+    att = _store(pool_worker["tid"], "escapes.txt", payload)
+    raw = kt._handle_attachment_read({"attachment_id": att})
+    assert len(raw) <= DEFAULT_RESULT_SIZE_CHARS
+    got = json.loads(raw)
+    assert got.get("ok") is True, got
+    assert got["encoding"] == "base64" and "budget" in got["note"]
+    digest = hashlib.sha256(payload).hexdigest()
+    assert got["sha256"] == digest
+    assert hashlib.sha256(base64.b64decode(got["content_base64"])).hexdigest() == digest
+
+
+def test_large_file_reads_back_in_ranges(pool_worker):
+    """A 200 KiB file is refused whole but reassembles from four ranged reads."""
+    from tools import kanban_tools as kt
+    payload = bytes((i * 7 + i // 251) % 256 for i in range(200 * 1024))
+    digest = hashlib.sha256(payload).hexdigest()
+    att = _store(pool_worker["tid"], "big.bin", payload)
+    assert _read({"attachment_id": att}).get("ok") is not True
+    cap = kt.KANBAN_ATTACHMENT_READ_MAX_BYTES
+    parts, offset = [], 0
+    for _ in range(4):
+        got = _read({"attachment_id": att, "offset": offset, "length": cap})
+        assert got.get("ok") is True, got
+        assert got["size_bytes"] == len(payload) and got["sha256"] == digest
+        chunk = base64.b64decode(got["content_base64"])
+        assert len(chunk) <= cap and got["offset"] == offset
+        parts.append(chunk)
+        offset += len(chunk)
+    assert got["eof"] is True
+    assert hashlib.sha256(b"".join(parts)).hexdigest() == digest
+    assert _read({"attachment_id": att, "length": cap + 1}).get("ok") is not True
+
+
 def test_no_path_argument_is_accepted(pool_worker):
     got = _read({"attachment_id": 1, "path": "/etc/passwd"})
     assert got.get("ok") is not True

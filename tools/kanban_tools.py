@@ -1475,6 +1475,15 @@ def _handle_attachment_read(args: dict, **kw) -> str:
         raise _Reject("attachment_id is required (an integer from kanban_attachments)")
     encoding = str(args.get("encoding") or "auto").strip().lower()
     _check(encoding in ("auto", "base64"), "encoding must be 'auto' or 'base64'")
+    cap = KANBAN_ATTACHMENT_READ_MAX_BYTES
+    ranged = args.get("offset") is not None or args.get("length") is not None
+    try:
+        offset = int(args.get("offset") or 0)
+        length = int(args["length"]) if args.get("length") is not None else cap
+    except (TypeError, ValueError):
+        raise _Reject("offset and length must be integers (bytes)")
+    _check(offset >= 0, "offset must be >= 0")
+    _check(1 <= length <= cap, f"length must be between 1 and {cap} bytes")
     tid = _require_task_id(args)
     owned = _owned_worker_task_id()
     with _board(args.get("board"), verb="attachment_read", card_ids=(tid,)) as (kb, conn):
@@ -1496,31 +1505,46 @@ def _handle_attachment_read(args: dict, **kw) -> str:
         _check(path.is_relative_to(base) and path.is_file(),
                f"attachment {att_id} of {tid}: stored file is not inside the card's attachments "
                "directory; refusing to read it")
-    size = path.stat().st_size
-    cap = KANBAN_ATTACHMENT_READ_MAX_BYTES
-    _check(size <= cap,
-           f"attachment {att_id} ({att.filename}) is {size} bytes, over the "
-           f"{cap}-byte kanban_attachment_read cap; nothing returned")
+    # One pass: hash the whole file, keep only the requested range.
+    whole = hashlib.sha256()
+    data = b""
+    size = 0
     with open(path, "rb") as fh:
-        data = fh.read(cap + 1)
-    _check(len(data) <= cap,
-           f"attachment {att_id} ({att.filename}) is {len(data)}+ bytes, over the "
-           f"{cap}-byte kanban_attachment_read cap; nothing returned")
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            lo, hi = max(offset - size, 0), min(offset + length - size, len(block))
+            if lo < hi:
+                data += block[lo:hi]
+            whole.update(block)
+            size += len(block)
+    _check(ranged or size <= cap,
+           f"attachment {att_id} ({att.filename}) is {size} bytes, over the "
+           f"{cap}-byte kanban_attachment_read cap; nothing returned. Read it in ranges "
+           f"with offset/length (each at most {cap} bytes)")
+    _check(offset <= size, f"offset {offset} is past the end of attachment {att_id} ({size} bytes)")
     out: dict[str, Any] = {
         "task_id": tid, "attachment_id": att_id, "filename": att.filename,
-        "content_type": att.content_type, "size": len(data),
-        "sha256": hashlib.sha256(data).hexdigest()}
-    text = None
+        "content_type": att.content_type, "size_bytes": size,
+        "sha256": whole.hexdigest(), "offset": offset, "size": len(data),
+        "eof": offset + len(data) >= size}
+    if ranged:
+        out["range_sha256"] = hashlib.sha256(data).hexdigest()
+    b64 = {"encoding": "base64", "content_base64": base64.b64encode(data).decode("ascii")}
     if encoding == "auto":
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             text = None
-    if text is not None:
-        out.update(encoding="utf-8", text=text)
-    else:
-        out.update(encoding="base64", content_base64=base64.b64encode(data).decode("ascii"))
-    return _ok(**out)
+        if text is not None:
+            reply = _ok(**out, encoding="utf-8", text=text)
+            # JSON escaping can inflate text up to 6x (NUL -> \u0000); an over-budget
+            # result is spilled to a board-host file a pool worker cannot open.
+            from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
+            if len(reply) <= DEFAULT_RESULT_SIZE_CHARS:
+                return reply
+            b64["note"] = (f"UTF-8 text serialized to {len(reply)} chars (JSON escaping), over "
+                           f"the {DEFAULT_RESULT_SIZE_CHARS}-char tool-result budget; "
+                           "returned as base64")
+    return _ok(**out, **b64)
 
 
 def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
