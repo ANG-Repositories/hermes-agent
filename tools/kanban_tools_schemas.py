@@ -383,6 +383,25 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
     [],
 )
 
+KANBAN_ATTACHMENT_READ_SCHEMA = _schema(
+    "kanban_attachment_read",
+    (
+        "Read one attachment's bytes by id (from kanban_attachments). Works from any "
+        "host, including a pool host where the attachment's stored_path does not exist. "
+        "Returns filename, size, sha256 and the content: `text` when it is UTF-8, else "
+        "`content_base64`. A worker may read its own card's and its parents' attachments; "
+        "files over 64 KiB are refused with their size."
+    ),
+    {
+        "attachment_id": _prop("integer", "Attachment id from kanban_attachments (required)."),
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "encoding": {"type": "string", "enum": ["auto", "base64"],
+                     "description": "auto (default): UTF-8 text when it decodes, else base64. "
+                                    "base64: always content_base64."},
+    },
+    ["attachment_id"],
+)
+
 KANBAN_CREATE_SCHEMA = _schema(
     "kanban_create",
     (
