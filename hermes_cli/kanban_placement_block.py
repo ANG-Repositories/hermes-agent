@@ -164,6 +164,16 @@ def studio_requires_word(reason: str, studio_reasons: Optional[frozenset]) -> st
     return rest[0] if rest else _pr.ACCESS_CONTROL_PLANE_READ
 
 
+def reroute_note(reason: str) -> str:
+    """The reason a re-route writes on its ``requires:`` line: the block reason's first line, cut short, so the
+    line passes hermes-home create_refusal() (t_d0852f2c). Never a newline: the note must stay on the line."""
+    first = next((ln.strip() for ln in (reason or "").splitlines() if ln.strip()), "")
+    first = re.sub(r"\s+", " ", first)
+    if len(first) > 100:
+        first = first[:100].rsplit(" ", 1)[0] + " ..."
+    return f"re-routed after capability block: {first}" if first else "re-routed after capability block"
+
+
 def pin_body(body: Optional[str], host: str, *, reason: str, studio_reasons: Optional[frozenset],
              pool) -> str:
     """THE body a re-route writes: ``host: <host>`` unless the body already resolves to that pin, and for the
@@ -180,11 +190,13 @@ def pin_body(body: Optional[str], host: str, *, reason: str, studio_reasons: Opt
     if host == _kwp.PIN_STUDIO:
         vocab = studio_reasons if studio_reasons is not None else frozenset({DEFAULT_STUDIO_REQUIRES})
         if not _kwp.studio_pin_justified(text, vocab):
+            from hermes_cli import kanban_studio_pin as _ksp
             word = studio_requires_word(reason, studio_reasons)
+            note = reroute_note(reason)
             if _REQUIRES_HEAD_RE.search(text):
-                text = _REQUIRES_HEAD_RE.sub(lambda m: f"{m.group(1)}{word}, ", text, count=1)
+                text = _ksp.add_requires_word(text, word, note)
             else:
-                head.append(f"requires: {word}")
+                head.append(_ksp.requires_line(word, note))
     return "\n".join(head + [text]) if head else text
 
 

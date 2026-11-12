@@ -11,6 +11,29 @@ _FIRST_LINE = re.compile(r"^[ \t]*host:[ \t]*(?:studio|mac-studio[\w-]*)[ \t]*$"
 _STUDIO_NEEDS = frozenset({"studio_relay", "studio_launchd", "vault", "skills_tree", "studio_tree"})
 NOTICE_PREFIX = "[placement] bare host: studio dropped: add requires: "
 _log = logging.getLogger(__name__)
+_REQUIRES_LINE = re.compile(r"^([ \t]*requires:[ \t]*)(.*?)([ \t]*\r?)$", re.IGNORECASE | re.MULTILINE)
+# hermes-home studio-requires-reason (create_refusal): a Studio-only word needs >= 3 words after the note cut.
+_NOTE_CUT = re.compile(r"\s(?:—|–|--|#)|[(#]")
+_NOTE_WORD = re.compile(r"[A-Za-z][A-Za-z0-9'./~_-]*")
+_NOTE_MIN_WORDS = 3
+
+
+def requires_line(word, note):
+    """``requires: <word> (<note>)``: a line the writer's own reason keeps past create_refusal (t_d0852f2c)."""
+    return f"requires: {word} ({note})"
+
+
+def add_requires_word(body, word, note):
+    """Put ``word`` first on the body's first ``requires:`` line; give the line ``note`` when it has no reason."""
+    def one(m):
+        value = word + (", " + m.group(2) if m.group(2) else "")
+        cut = _NOTE_CUT.split(value, maxsplit=1)
+        if len(cut) < 2:
+            value += f" ({note})"
+        elif len(_NOTE_WORD.findall(cut[1])) < _NOTE_MIN_WORDS:
+            value += f"; {note}"
+        return m.group(1) + value + m.group(3)
+    return _REQUIRES_LINE.sub(one, body, count=1)
 
 
 def prepare_body(body, notices=None):
@@ -28,17 +51,18 @@ def prepare_body(body, notices=None):
     reasons = ksc.create_reasons(caps.load_map(kb.kanban_home() / "fleet"))  # dispatch's vocabulary (t_9965b8d5)
     if reasons is None or pool.studio_pin_justified(body, reasons):
         return body
-    if pool.card_needs(body) & _STUDIO_NEEDS and "studio-state" in reasons:
+    needs = pool.card_needs(body) & _STUDIO_NEEDS
+    if needs and "studio-state" in reasons:
+        note = "auto: card names " + ", ".join(sorted(needs))
         # One line, including when the caller already declared unrelated requirements.
-        head = re.compile(r"^([ \t]*requires:[ \t]*)", re.IGNORECASE | re.MULTILINE)
-        if head.search(body):
-            return head.sub(lambda m: m.group(1) + "studio-state, ", body, count=1)
+        if _REQUIRES_LINE.search(body):
+            return add_requires_word(body, "studio-state", note)
         # After the host directive itself: a provenance header may precede it on a stored body.
         lines = body.splitlines(keepends=True)
         at = next(i for i, ln in enumerate(lines) if _FIRST_LINE.fullmatch(ln.rstrip("\r\n")))
         host = lines[at] if lines[at].endswith("\n") else lines[at] + "\n"
-        return "".join(lines[:at]) + host + "requires: studio-state" + ("\n" if at + 1 < len(lines) else "") \
-            + "".join(lines[at + 1:])
+        return "".join(lines[:at]) + host + requires_line("studio-state", note) \
+            + ("\n" if at + 1 < len(lines) else "") + "".join(lines[at + 1:])
     if mode is not True and mode != "refuse":
         if notices is not None:
             notices.append(reasons)
