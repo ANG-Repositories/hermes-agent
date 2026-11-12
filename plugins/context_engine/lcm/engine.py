@@ -5008,6 +5008,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
+            "store_tail_health": getattr(getattr(self, "_store", None), "tail_health", None),
             "last_ingest_error": self._last_ingest_error,
             "last_ingest_error_time": self._last_ingest_error_time,
             "model": self.model,

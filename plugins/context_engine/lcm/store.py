@@ -31,6 +31,7 @@ from .db_bootstrap import (
     run_versioned_migrations,
 )
 from .config import LCMConfig
+from .tail_check import maybe_check_store_tail
 from .ingest_protection import (
     protect_message_for_ingest,
     protect_messages_for_ingest,
@@ -366,6 +367,8 @@ class MessageStore:
             db_path=self.db_path,
         )
         self._conn: Optional[sqlite3.Connection] = None
+        # Open-time tail check verdict (tail_check.py); None when no check was due.
+        self.tail_health: Optional[Dict[str, Any]] = None
         # ``self._conn`` is shared across threads (the connection is opened with
         # ``check_same_thread=False``). SQLite's own C-level mutex serializes
         # statements at the engine layer, but the Python ``sqlite3`` module
@@ -389,6 +392,9 @@ class MessageStore:
         self._conn = guard_connection(sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
+        # After an unclean gateway exit, read back the tail the last checkpoints
+        # wrote before any schema write touches it (t_6314cc2f). Bounded, never raises.
+        self.tail_health = maybe_check_store_tail(self._conn, self.db_path, self._hermes_home)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
