@@ -295,7 +295,7 @@ def test_no_hold_started_no_release_call(rig, monkeypatch):
 def test_release_failure_never_fails_the_exit(rig, monkeypatch, caplog):
     from cron import script_runner
 
-    rig.r._land_hold_started = 1.0
+    rig.r._land_hold_spawned = True
 
     def boom(*_a, **_k):
         raise script_runner.subprocess.TimeoutExpired("land_wait.py", 10)

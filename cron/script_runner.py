@@ -266,7 +266,8 @@ class ScriptRunner:
         # Land hold (t_3c08d829): None = not started; a Popen = helper running; True = settled.
         self._land_hold: Any = None
         self._land_hold_deadline = 0.0
-        self._land_hold_started = 0.0
+        self._land_hold_spawned = False  # a helper was started, so a record may exist
+        self._land_hold_started = float("-inf")  # monotonic start of the helper, a timestamp only
         self._land_hold_lock = threading.Lock()
         self._reasons: Dict[str, Optional[str]] = {}
         self._last_ok: Dict[str, str] = {}
@@ -514,6 +515,7 @@ class ScriptRunner:
                                    "start failed (%s: %s)", type(exc).__name__, exc)
                     self._land_hold = True
                     return True
+                self._land_hold_spawned = True
                 self._land_hold_started = time.monotonic()
                 self._land_hold_deadline = self._land_hold_started + _land_wait_budget_s()
                 return False
@@ -564,7 +566,7 @@ class ScriptRunner:
         2026-11-11), so a reused pid would hold every land until the record is 1800 s old.
         Residual: a runner SIGKILLed (launchd exit timeout) before this step leaves the record for
         up to 1800 s."""
-        if not self._land_hold_started:
+        if not self._land_hold_spawned:
             return  # the helper never started: no record was published
         helper = _land_wait_helper()
         try:
