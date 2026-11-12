@@ -5591,6 +5591,14 @@ def _pinned_route(row, route, pins, port, caps_out, *, planned: bool = True):
     return route
 
 
+def _served_ssh_root(caps) -> frozenset:
+    """ssh-root aliases an enforced pool capability serves this tick (t_79c2259b); empty without a map."""
+    if caps is None:
+        return frozenset()
+    from hermes_cli import kanban_host_capabilities as _khc
+    return _khc.served_ssh_root(caps)
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -5875,6 +5883,7 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         requires=verdict.for_portable() if verdict is not None else None,
         body_signals=legacy_body,
         worktree_hosts=wt_hosts, studio_reasons=studio_reasons, prose_advisory=prose_on,
+        access_served=_served_ssh_root(caps),
     )
     # Only content the remote cannot reproduce binds (t_e7c03f48): a clean, pushed checkout plus logs/patches does
     # not. ``lf_detail`` names the first binding path for the reason; a placed run starts fresh on the pool host

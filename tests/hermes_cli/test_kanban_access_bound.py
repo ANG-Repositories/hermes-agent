@@ -297,3 +297,102 @@ def test_foreign_access_contradiction_is_not_parked(home, monkeypatch):
     assert row[0] == "ready"
     assert n_comments == 0
     assert tid not in res.access_contradictions
+
+
+# -- t_79c2259b: ssh-root access a pool capability serves -------------------------
+
+NAS = "Run: ssh nas-truenas 'id -un; sudo -n id -u; sudo -n /sbin/zfs list -H -o name boot-pool'\n"
+NAS_MAP = {
+    "schema": 1,
+    "capabilities": {"nas-admin": {"what": "root on the NAS", "soft": False, "ssh_root": ["NAS-TrueNAS"]},
+                     "docker": {}},
+    "hosts": {"studio": {"capabilities": ["nas-admin", "docker"]},
+              "ci-box": {"capabilities": ["nas-admin"]}, "ace-media": {"capabilities": ["nas-admin"]},
+              "ace-ai": {"capabilities": []}},
+}
+
+
+def _nas_cfg():
+    aliases = (*ALIASES, "nas-truenas")
+    reach = {h: {a: 0 for a in aliases} for h in ("ci-box", "ace-ai", "ace-media")}
+    return kwp.PoolConfig(hosts=("ci-box", "ace-ai", "ace-media"), profiles=("alpha",),
+                          reach=reach, reach_aliases=aliases, reach_status="ok",
+                          ssh_hosts=frozenset({"ci", "ci-box", "ace-ai", "ace-media", "nas-truenas"}),
+                          pin_aliases=PIN_ALIASES)
+
+
+def _nas_ctx(doc=None, mode="enforce", pool=("ci-box", "ace-ai", "ace-media")):
+    import json as _json
+    from hermes_cli import kanban_host_capabilities as khc
+    cmap = khc.map_from_bytes(_json.dumps(doc or NAS_MAP).encode(), b"{}")
+    return khc.CapabilityTick(cmap, mode, (), tuple(pool))
+
+
+def test_served_ssh_root_alias_is_skipped_and_the_next_access_still_binds():
+    al = ("nas-truenas", "ci-box")
+    assert kwp.access_bound_cap(NAS, al) == "ssh-root:nas-truenas"
+    assert kwp.access_bound_cap(NAS, al, served={"nas-truenas"}) is None
+    # Only the served alias is released: a second, unserved ssh-root on the card still binds.
+    assert kwp.access_bound_cap(NAS + "ssh ci-box sudo dmesg\n", al, served={"nas-truenas"}) == \
+        "ssh-root:ci-box"
+    assert kwp.access_bound_cap(NAS + KANBAN_DB, al, served={"nas-truenas"}) == "control-plane-read"
+
+
+def test_portable_releases_only_a_served_access():
+    """RED ON BASE: portable() had no access_served; every NAS card was access_bound (t_f6720e3e)."""
+    base = dict(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                assignee="alpha", body=NAS, pool=_nas_cfg())
+    assert kwp.portable(**base) == (False, "access_bound:ssh-root:nas-truenas", None)
+    assert kwp.portable(**base, access_served=frozenset({"nas-truenas"})) == (True, None, "policy")
+
+
+def test_map_parses_ssh_root_and_rejects_a_bad_shape():
+    from hermes_cli import kanban_host_capabilities as khc
+    ctx = _nas_ctx()
+    assert ctx.cmap.valid and ctx.cmap.ssh_root == {"nas-truenas": "nas-admin"}
+    bad = {**NAS_MAP, "capabilities": {**NAS_MAP["capabilities"], "nas-admin": {"ssh_root": "nas-truenas"}}}
+    cm = _nas_ctx(bad).cmap
+    assert not cm.valid and "ssh_root" in cm.error and cm.ssh_root == {}
+    assert khc.ssh_root_hits("ssh nas-truenas uptime\n", ctx.cmap) == []   # no sudo: not root access
+
+
+def test_ssh_root_on_a_served_alias_derives_a_hard_requirement():
+    from hermes_cli import kanban_host_capabilities as khc
+    reqs, _none = khc.derive(NAS, (), _nas_ctx().cmap)
+    (req,) = [r for r in reqs if r.cap == "nas-admin"]
+    assert (req.strength, req.matched_by, req.term) == (khc.HARD, khc.BODY, "ssh-root:nas-truenas")
+    v = khc.evaluate(NAS, (), _nas_ctx())
+    assert v.only == ("ci-box", "ace-media") and v.hard_rule is None
+
+
+@pytest.mark.parametrize("mode,pool,want", [
+    ("enforce", ("ci-box", "ace-ai", "ace-media"), {"nas-truenas"}),   # a real hold: placed on advertisers
+    ("warn", ("ci-box", "ace-media"), {"nas-truenas"}),                # warn, but every pool host has it
+    ("warn", ("ci-box", "ace-ai", "ace-media"), set()),                # warn and ace-ai lacks it: Studio, as today
+    ("off", ("ci-box", "ace-media"), set()),
+])
+def test_served_ssh_root_needs_a_hold_or_a_whole_pool(mode, pool, want):
+    from hermes_cli import kanban_host_capabilities as khc
+    assert khc.served_ssh_root(_nas_ctx(mode=mode, pool=pool)) == want
+    assert khc.served_ssh_root(None) == frozenset()
+
+
+def test_nas_admin_card_starts_on_a_pool_host_that_advertises_it(home, monkeypatch):
+    """Acceptance (t_79c2259b F2): t_f6720e3e's body was placed local by access_bound:ssh-root:nas-truenas.
+    MUTATION (drop access_served in _route_row): the card spawns on the Studio -> RED."""
+    ctx = _nas_ctx()
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: ctx)
+    p = kwp.plan([_host("ci-box", 0), _host("ace-ai", 1), _host("ace-media", 2)], {},
+                 probe=lambda h: (1.0, 16), config=_nas_cfg())
+    p.band, p.spill_reason = "spilling", "load"
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        spawned.append((task.id, placement.name if placement else "studio"))
+        return 4242
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="nas probe", assignee="alpha", body=NAS)
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4, spillover=p,
+                                reconcile_orphans=False)
+    assert spawned and spawned[0][0] == tid and spawned[0][1] in ("ci-box", "ace-media"), (spawned, res.routes)
