@@ -27,6 +27,7 @@ import argparse
 import collections
 import datetime as _dt
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -66,7 +67,7 @@ def is_studio(host) -> bool:
 
 
 def load_caps(path: Path):
-    doc = json.loads(path.read_text())
+    doc = json.loads(path.read_text(encoding="utf-8-sig"))
     hosts = {h: set(v if isinstance(v, list) else (v or {}).get("capabilities") or [])
              for h, v in (doc.get("hosts") or {}).items()}
     studio = hosts.pop("studio", set())
@@ -96,7 +97,8 @@ def capability_of(p: dict):
 
 
 def head(cap: str) -> str:
-    return cap.split(":", 1)[0]
+    """Name before any detail: ``workspace_kind:x`` and ``linked(derived-from->t_x)`` both reduce to the rule."""
+    return re.split(r"[:(]", cap, maxsplit=1)[0].strip()
 
 
 def covered(cap, allow) -> bool:

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -53,6 +54,10 @@ PAGER_PRODUCER = "studio-default-deny"
 PAGE_AFTER_S = 60 * 60
 LEDGER_DIR = ("state", "studio-capability-gap")
 LEDGER_FILE = "overrides.jsonl"
+# Local starts that never reach ``_route_row`` (Prism 827ad8491946 on #251) name these when no declared Studio-only
+# capability does: an unplanned tick (pool disabled/refused/empty) and the review lane (always local).
+NO_PLAN_CAP = "pool_unavailable"
+REVIEW_CAP = "review_lane"
 
 
 def config(kcfg: Optional[Mapping]) -> tuple:
@@ -77,8 +82,14 @@ def parts(capability: Optional[str]) -> tuple:
     return tuple(p.strip().lower() for p in str(capability or "").split(",") if p.strip())
 
 
+def head(part: str) -> str:
+    """The capability name before any detail: ``workspace_kind:x`` -> ``workspace_kind``, ``linked(k->t)`` ->
+    ``linked`` (Prism e3e on #251: structural rules carry parenthesized details)."""
+    return re.split(r"[:(]", part, maxsplit=1)[0].strip()
+
+
 def _covered(part: str, words) -> bool:
-    return part in words or part.split(":", 1)[0] in words
+    return part in words or head(part) in words
 
 
 def allowed(capability: Optional[str], allow) -> bool:
@@ -87,18 +98,20 @@ def allowed(capability: Optional[str], allow) -> bool:
     return bool(ps) and all(_covered(p, allow) for p in ps)
 
 
-def operator_only(row) -> bool:
+def operator_only(row, assignee: Optional[str] = None) -> bool:
+    """``assignee`` = the effective assignee (the row's, else the dispatcher's default). Byte-exact compare."""
     from hermes_cli import kanban_db as _kb
     keys = row.keys() if hasattr(row, "keys") else ()
     if "no_worker" in keys and row["no_worker"]:
         return True
-    return str(row["assignee"] or "").strip().lower() in _kb.OPERATOR_PROFILES
+    return (assignee or row["assignee"] or "") in _kb.OPERATOR_PROFILES
 
 
 def live_override(conn, task_id: str, capability: Optional[str], *, now: Optional[float] = None) -> Optional[dict]:
     """The newest ``studio_override`` on the card that still holds and names a part of ``capability``, else None.
     ``once``: no ``spawned`` event after it. ``until``: ``now`` before it."""
     want = set(parts(capability))
+    want |= {head(p) for p in want}
     if not want:
         return None
     now = time.time() if now is None else now
@@ -129,10 +142,12 @@ def wait_reason(why: Mapping) -> str:
     return f"{WAIT_PREFIX}:{cap} ({src}: {ev}; no pool host has it; not on the Studio allowlist)"
 
 
-def decide(conn, row, why: Optional[Mapping], *, enabled: bool, allow, now: Optional[float] = None):
+def decide(conn, row, why: Optional[Mapping], *, enabled: bool, allow, now: Optional[float] = None,
+           assignee: Optional[str] = None):
     """``None`` = the Studio route stands (rule off, exempt, allowlisted, or overridden); else the wait reason.
-    ``why`` is what ``kanban_studio_capability.justify`` named (never None here: an unnamed route already waits)."""
-    if not enabled or why is None or operator_only(row):
+    ``why`` is what ``kanban_studio_capability.justify`` named, or a stand-in for a local start that never ran it
+    (:data:`NO_PLAN_CAP`, :data:`REVIEW_CAP`)."""
+    if not enabled or why is None or operator_only(row, assignee):
         return None
     cap = why.get("capability")
     if allowed(cap, allow):
@@ -140,6 +155,27 @@ def decide(conn, row, why: Optional[Mapping], *, enabled: bool, allow, now: Opti
     if live_override(conn, row["id"], cap, now=now) is not None:
         return None
     return wait_reason(why)
+
+
+def unrouted_hold(conn, row, caps, *, studio_on: bool, kcfg: Optional[Mapping], stand_in: str,
+                  default_assignee: Optional[str] = None) -> Optional[str]:
+    """The wait reason for a LOCAL start that ``_route_row`` never classified (no pool plan, or a review row), else
+    None. Same switch, allowlist, exemption and override as :func:`decide`. The capability is the card's declared
+    Studio-only one when it names one, else ``stand_in``. Inert unless t_9965b8d5's rule is on (``studio_on``)."""
+    enabled, allow = config(kcfg)
+    if not enabled or not studio_on:
+        return None
+    from hermes_cli import kanban_host_capabilities as _khc
+    from hermes_cli import kanban_studio_capability as _ksc
+    try:
+        skills = tuple(s for s in (json.loads(row["skills"] or "[]") or []) if isinstance(s, str))
+    except (TypeError, ValueError):
+        skills = ()
+    why = _ksc.studio_capability(_khc.declared_words(row["body"]), skills, getattr(caps, "cmap", None))
+    if why is None:
+        why = {"capability": stand_in, "source": "dispatch",
+               "evidence": "no pool plan this tick" if stand_in == NO_PLAN_CAP else "the review lane runs only locally"}
+    return decide(conn, row, why, enabled=enabled, allow=allow, assignee=row["assignee"] or default_assignee)
 
 
 def _held_this_episode(conn, task_id: str) -> bool:

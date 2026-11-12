@@ -70,3 +70,11 @@ def test_report_counts_overrides_per_day_and_lists_stuck_cards(tmp_path):
     assert "Mean 1.0 overrides/day" in text and "Under the ~10/day line" in text
     assert "| t_state | 2 | studio-state | declared |" in text
     assert "| obsidian-vault | 1 | 1 | declared | keep |" in text
+
+
+def test_structural_rule_with_parenthesized_detail_needs_an_override():
+    """Prism e3e on #251: ``linked(derived-from->t_x)`` is the structural ``linked`` rule, not a portable run."""
+    cap, src = sddr.capability_of({"rule": "linked(derived-from->t_1234abcd)"})
+    assert src == "structural"
+    assert sddr.studio_only_cap(cap, frozenset())
+    assert sddr.covered(cap, {"linked"}) and not sddr.covered(cap, {"profile"})

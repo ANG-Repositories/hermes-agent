@@ -279,3 +279,85 @@ def test_hold_is_structural_for_the_starvation_report():
     from hermes_cli.kanban_placement_starvation import fix_for
     fix = fix_for("studio_default_deny:studio-state")
     assert fix and "studio-override" in fix
+
+
+# -- Prism r1 on #251: local starts that never reach _route_row, effective assignee, structural details ----------
+
+def test_unplanned_tick_holds_a_studio_only_card(kanban_home, monkeypatch):
+    """827ad8491946: no pool plan (disabled/refused/empty) used to default every card to a local start."""
+    _cfg(kanban_home, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=2)
+    assert spawned == [], spawned
+    assert res.placement_waits[tid].startswith("studio_default_deny:studio-state"), res.placement_waits
+
+
+def test_unplanned_tick_holds_an_undeclared_card_as_pool_unavailable(kanban_home, monkeypatch):
+    _cfg(kanban_home, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="fix the lint")
+        res, spawned = _tick(conn, spillover=None, spawn_limit=2)
+    assert spawned == [], spawned
+    assert res.placement_waits[tid].startswith("studio_default_deny:pool_unavailable"), res.placement_waits
+
+
+def test_unplanned_tick_allowlisted_and_off_still_run_local(kanban_home, monkeypatch):
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        _cfg(kanban_home, True, ["studio-state"])
+        _res, spawned = _tick(conn, spillover=None, spawn_limit=2)
+        assert [t for t, _h in spawned] == [tid]
+    with kb.connect_closing() as conn:
+        tid2 = _card(conn)
+        _cfg(kanban_home, False, [])
+        _res, spawned = _tick(conn, spillover=None, spawn_limit=2)
+        assert [t for t, _h in spawned] == [tid2]
+
+
+def _review_card(conn, body="requires: studio-state"):
+    tid = _card(conn, body=body)
+    conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+    conn.commit()
+    return tid
+
+
+def test_review_lane_local_start_is_held(kanban_home, monkeypatch):
+    """827ad8491946: the review-spawn loop never consulted the rule."""
+    _cfg(kanban_home, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        tid = _review_card(conn)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=2)
+    assert tid not in [t for t, _h in spawned], spawned
+    assert res.placement_waits[tid].startswith("studio_default_deny:studio-state"), res.placement_waits
+
+
+def test_review_lane_allowlisted_runs(kanban_home, monkeypatch):
+    _cfg(kanban_home, True, ["review_lane"])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        tid = _review_card(conn, body="review the diff")
+        _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=2)
+    assert tid in [t for t, _h in spawned], spawned
+
+
+def test_operator_exemption_uses_the_effective_assignee(kanban_home):
+    """An unassigned card the dispatcher hands to an operator default is exempt; a case variant is not."""
+    _cfg(kanban_home, True, [])
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee=None)
+        row = _row(conn, tid)
+        assert kbd._route_row(conn, row, _plan(free=2), "aegis", caps=_caps(), rules_out={}, carry_out={},
+                              studio_out={})[0] == "local"
+        why = {"capability": "studio-state", "source": "declared", "evidence": "x"}
+        assert ksa.decide(conn, row, why, enabled=True, allow=frozenset(), assignee="Aegis") is not None
+
+
+def test_structural_capability_with_parenthesized_detail_is_matched():
+    """e3e (Prism) on #251: ``linked(derived-from->t_x)`` is the ``linked`` rule."""
+    assert ksa.allowed("linked(derived-from->t_1234abcd)", {"linked"})
+    assert ksa.head("linked(derived-from->t_1)") == "linked"

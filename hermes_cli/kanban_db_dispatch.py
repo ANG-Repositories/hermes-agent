@@ -5583,7 +5583,7 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         # (ROOT config, read here every tick; default off).
         from hermes_cli import kanban_studio_allowlist as _ksa
         _deny_on, _allow = _ksa.config(_root_kanban_cfg())
-        held = _ksa.decide(conn, row, why, enabled=_deny_on, allow=_allow)
+        held = _ksa.decide(conn, row, why, enabled=_deny_on, allow=_allow, assignee=row["assignee"] or default_assignee)
         if held is not None:
             return "wait", held
         if studio_out is not None:
@@ -5591,6 +5591,29 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         return route
     return "wait", _ksc.wait_reason(rule, route[1], task_id=tid, workspace_path=row["workspace_path"],
                                     board_default=_board_default_safe(board) if kind == "worktree" else None)
+
+
+def _studio_deny_unrouted(conn, row, ctx: dict, lane: str, default_assignee: Optional[str] = None) -> Optional[str]:
+    """Studio default-deny for a LOCAL start ``_route_row`` never saw (no pool plan; the review lane). ``ctx`` caches
+    this tick's switch, capability map and t_9965b8d5 state, read once and only when the switch is on."""
+    from hermes_cli import kanban_studio_allowlist as _ksa
+    if "on" not in ctx:
+        kcfg = _root_kanban_cfg()
+        ctx["kcfg"] = kcfg
+        ctx["on"] = _ksa.config(kcfg)[0]
+        if ctx["on"]:
+            from hermes_cli import kanban_worker_pool as _kwp
+            try:
+                pool = _kwp.read_pool(_kb.kanban_home() / "fleet", kanban_cfg=kcfg)
+            except Exception:
+                pool = None
+            ctx["caps"] = _capability_tick(pool)
+            ctx["studio_on"] = _studio_capability_on(ctx["caps"], _studio_last_resort(_kb.kanban_home() / "fleet"))
+    if not ctx["on"]:
+        return None
+    return _ksa.unrouted_hold(conn, row, ctx.get("caps"), studio_on=ctx.get("studio_on", False), kcfg=ctx["kcfg"],
+                              stand_in=_ksa.REVIEW_CAP if lane == "review" else _ksa.NO_PLAN_CAP,
+                              default_assignee=default_assignee)
 
 
 def _carry_split_plan(workspace_path, carry_budget):
@@ -7344,6 +7367,16 @@ def _dispatch_once_locked(
                     caps=_capability_tick(_unplanned_pool),
                 )
                 row_route[r["id"]] = _origin_route or ('local', None)
+    # t_062a5948 (Prism 827ad8491946): with no pool plan every other card defaults to a local start that
+    # _route_row never classified. Studio default-deny holds those too; inert unless its switch is on.
+    _deny_ctx: dict = {}
+    if spillover is None:
+        for r in ready_rows:
+            if r["id"] in _pause_held or row_route.get(r["id"], ("local", None))[0] != "local":
+                continue
+            _held = _studio_deny_unrouted(conn, r, _deny_ctx, "ready", default_assignee)
+            if _held is not None:
+                row_route[r["id"]] = ("wait", _held)
     # Fleet pause hold, layer 1 (t_133d6efd, spec §5.8): after BOTH routing branches, before any spawn. The
     # pre-route holds win over anything a no-plan branch wrote; the post-route pass applies resume pins and
     # catches a row whose manifest appeared mid-tick.
@@ -8952,6 +8985,12 @@ def _dispatch_once_locked(
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
+        if _review_origin_host is None:
+            # t_062a5948 (Prism 827ad8491946): a review run starts locally; Studio default-deny holds it too.
+            _deny_wait = _studio_deny_unrouted(conn, row, _deny_ctx, "review", default_assignee)
+            if _deny_wait is not None:
+                result.placement_waits[row['id']] = _deny_wait
+                continue
         _dest_wait = (_kph.destination_wait(_review_origin_host.name, _pause_cache) if _review_origin_host is not None
                       else _kph.local_destination_wait(_pause_cache))
         if _dest_wait is not None:                         # FWA destination fence, review lane (fe6a1ad69c44)
