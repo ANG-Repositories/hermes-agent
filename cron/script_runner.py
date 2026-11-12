@@ -50,6 +50,8 @@ _LAND_WAIT_HELPER = ("skills-shared", "hermes-harness", "safe-gateway-restart", 
                      "land_wait.py")
 # Past the helper's own bound (SGR_LAND_WAIT_SECS) the runner stops waiting for it and kills it.
 _LAND_WAIT_SLACK_S = 30.0
+# The exit-path release of the restart-pending record is one file unlink; never hold the exit long.
+_LAND_RELEASE_TIMEOUT_S = 10.0
 
 
 def _now_iso() -> str:
@@ -489,8 +491,8 @@ class ScriptRunner:
         (non-blocking: the ticker and main's 0.5 s poll come back here) and returns True once it
         has exited. A missing helper, a start failure, a non-zero exit or a helper past
         ``SGR_LAND_WAIT_SECS`` + slack never blocks the drain: one log line, then True. The
-        restart-pending record it leaves is owned by this pid, so it lapses when the runner exits.
-        ``SGR_LAND_WAIT=0`` makes the helper return at once."""
+        restart-pending record it leaves is owned by this pid; ``main`` removes it on exit
+        (``release_land_hold``). ``SGR_LAND_WAIT=0`` makes the helper return at once."""
         with self._land_hold_lock:
             hold = self._land_hold
             if hold is True:
@@ -542,12 +544,44 @@ class ScriptRunner:
             return True
 
     def end_land_hold(self) -> None:
-        """Kill a still-running land-hold helper on exit (the drain ended without a kill). Its
-        restart-pending record names this pid, so the tick ignores it once the runner is gone."""
+        """Kill a still-running land-hold helper on exit (the drain ended without a kill), and reap
+        it so it cannot publish its record after ``release_land_hold`` removed it."""
         hold = self._land_hold
         if hold not in (None, True) and hold.poll() is None:
             with contextlib.suppress(Exception):
                 os.killpg(hold.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
+            with contextlib.suppress(Exception):
+                hold.wait(5)
+
+    def release_land_hold(self) -> None:
+        """Remove this runner's restart-pending record: ``land_wait.py default --release --owner
+        <pid>``. ``main`` calls it as the LAST exit step, after in-flight scripts were terminated
+        (until then the record is what stops a new land). Best effort: a missing helper, a failure
+        or a timeout logs one line and never blocks or fails the exit.
+
+        The record cannot be left to lapse with the runner: the tick reads a record whose owner pid
+        is alive as live, and on the Studio the pid space wraps in minutes (427 pids/s measured
+        2026-11-11), so a reused pid would hold every land until the record is 1800 s old.
+        Residual: a runner SIGKILLed (launchd exit timeout) before this step leaves the record for
+        up to 1800 s."""
+        if not self._land_hold_started:
+            return  # the helper never started: no record was published
+        helper = _land_wait_helper()
+        try:
+            p = subprocess.run(
+                [sys.executable, str(helper), "default", "--release", "--owner", str(os.getpid())],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=_LAND_RELEASE_TIMEOUT_S,
+                check=False)
+        except Exception as exc:  # noqa: BLE001 - the release must never block or fail the exit
+            logger.warning("script runner: land hold release failed (%s: %s)",
+                           type(exc).__name__, exc)
+            return
+        out = ((p.stdout or b"") + (p.stderr or b"")).decode("utf-8", "replace").strip()
+        if p.returncode != 0:
+            logger.warning("script runner: land hold release exited %d%s", p.returncode,
+                           f" ({out})" if out else "")
+        elif out:
+            logger.warning("script runner: land hold release: %s", " | ".join(out.splitlines()))
 
     def _check_host(self) -> None:
         try:
@@ -1176,16 +1210,21 @@ def main(argv: Optional[list] = None) -> int:
     thread = threading.Thread(target=InProcessCronScheduler().start, args=(stop,), kwargs=kwargs,
                               name="cron-script-runner", daemon=True)
     thread.start()
-    while not stop.wait(0.5):
-        if not thread.is_alive():
-            logger.error("cron script runner ticker thread exited; exiting 1")
-            return 1
-        runner.poll_skew_bound()
-    runner.end_land_hold()
-    if runner.sigterm:
-        return runner.shutdown()
-    thread.join(timeout=_SHUTDOWN_WAIT_S)
-    return runner.exit_code
+    try:
+        while not stop.wait(0.5):
+            if not thread.is_alive():
+                logger.error("cron script runner ticker thread exited; exiting 1")
+                runner.end_land_hold()
+                return 1
+            runner.poll_skew_bound()
+        runner.end_land_hold()
+        if runner.sigterm:
+            return runner.shutdown()
+        thread.join(timeout=_SHUTDOWN_WAIT_S)
+        return runner.exit_code
+    finally:
+        # Last step, after shutdown() terminated the scripts (t_3c08d829 round 2).
+        runner.release_land_hold()
 
 
 if __name__ == "__main__":
