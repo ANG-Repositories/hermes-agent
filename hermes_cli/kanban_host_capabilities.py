@@ -78,7 +78,10 @@ NONE_WORD = "none"   # reserved: ``requires: none`` overrides every SOFT require
 HARD, SOFT = "hard", "soft"
 # matched_by values, in the order a pin is attributed (declared beats skill).
 DECLARED, SKILL, NAMED_SKILL, BODY = "declared", "skill", "named_skill", "body"
-_SOURCE_RANK = {DECLARED: 0, SKILL: 1, NAMED_SKILL: 2, BODY: 3}
+# ``ssh <alias> ... sudo`` on an alias a capability serves (t_79c2259b): a structural access fact, not
+# prose, so no body/prose advisory path may drop it while access_bound releases the alias (Prism 86b7cb2c2b27).
+ACCESS = "access"
+_SOURCE_RANK = {DECLARED: 0, ACCESS: 1, SKILL: 2, NAMED_SKILL: 3, BODY: 4}
 PROSE_SOURCES = frozenset({NAMED_SKILL, BODY})   # inferred from card text, never declared (t_c82eded0)
 
 RULE_PREFIX = "requires:"
@@ -566,7 +569,7 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
     for alias, cap in ssh_root_hits(body, cmap):
         # ``ssh <alias> ... sudo`` on an alias a capability serves (t_79c2259b): HARD, like a
         # declared word, because the work cannot run without that access.
-        reqs.append(Requirement(cap_of(cap), HARD, BODY, f"ssh-root:{alias}"))
+        reqs.append(Requirement(cap_of(cap), HARD, ACCESS, f"ssh-root:{alias}"))
     seen = set()
     for cap, rx in cmap.sniff:
         if cap in seen:
@@ -720,6 +723,8 @@ def _source_text(req: Requirement) -> str:
         return f"skill {req.term} named in the body"
     if req.matched_by == DECLARED:
         return f"requires: {req.term}"
+    if req.matched_by == ACCESS:
+        return f"body {req.term} (ssh ... sudo)"
     return f'body "{req.term}"'
 
 
@@ -741,6 +746,8 @@ def pin_comment(req: Requirement, known: Iterable[str], *, host: str = STUDIO_HO
         undo = "To let it spill, add a line `host: any` or `requires: none`."
     elif req.matched_by == DECLARED:
         undo = "To let it spill, remove the `requires:` line."
+    elif req.matched_by == ACCESS:
+        undo = f"To let it spill, advertise {req.cap} on a pool host or remove the ssh ... sudo line."
     else:
         undo = f"To let it spill, remove the skill {req.term} from the card."
     return (f"{head}. This card needs a capability no pool host has, so it runs on the "
@@ -988,6 +995,8 @@ def held_comment(affinity: Mapping[str, Any], line: Optional[str]) -> str:
         undo = "or replace that line with `requires: none`"
     elif req.matched_by == SKILL:
         undo = f"or remove the skill {req.term} from the card"
+    elif req.matched_by == ACCESS:
+        undo = "or remove the ssh ... sudo line"
     else:
         undo = "or add a line `requires: none`"
     return (f"{HELD_PREFIX} {cap} from {_source_text(req)}{where}. No host that may run this card "

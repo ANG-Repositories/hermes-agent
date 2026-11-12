@@ -360,9 +360,41 @@ def test_ssh_root_on_a_served_alias_derives_a_hard_requirement():
     from hermes_cli import kanban_host_capabilities as khc
     reqs, _none = khc.derive(NAS, (), _nas_ctx().cmap)
     (req,) = [r for r in reqs if r.cap == "nas-admin"]
-    assert (req.strength, req.matched_by, req.term) == (khc.HARD, khc.BODY, "ssh-root:nas-truenas")
+    assert (req.strength, req.matched_by, req.term) == (khc.HARD, khc.ACCESS, "ssh-root:nas-truenas")
     v = khc.evaluate(NAS, (), _nas_ctx())
     assert v.only == ("ci-box", "ace-media") and v.hard_rule is None
+
+
+@pytest.mark.parametrize("variant", ["prose_advisory", "identity_only", "tighten"])
+def test_served_ssh_root_requirement_is_never_dropped_as_prose(variant, monkeypatch):
+    """Prism 86b7cb2c2b27: served_ssh_root() releases access_bound, so the HARD requirement must survive every
+    body/prose drop path (prose_pins_advisory, body_requires_mode advisory, studio tighten) when no pool host
+    advertises the capability. RED ON 4ee4a8cf: matched_by was BODY and each path dropped it -> card portable."""
+    import dataclasses
+    from hermes_cli import kanban_host_capabilities as khc
+    from hermes_cli import kanban_studio_capability as ksc
+    row = {"what": "root on the NAS", "ssh_root": ["nas-truenas"]}   # no ``soft: false``: not a hard class
+    doc = {**NAS_MAP, "capabilities": {**NAS_MAP["capabilities"], "nas-admin": row},
+           "hosts": {"studio": {"capabilities": ["nas-admin", "docker"]}, "ci-box": {"capabilities": []},
+                     "ace-media": {"capabilities": []}, "ace-ai": {"capabilities": []}}}
+    if variant == "identity_only":
+        doc["hosts"]["studio"]["studio_tier"] = {"nas-admin": khc.IDENTITY_ONLY}
+    cmap = khc.map_from_bytes(__import__("json").dumps(doc).encode(), b"{}")
+    assert cmap.valid, cmap.error
+    ctx = khc.CapabilityTick(cmap, "enforce", ("nas-admin",), ("ci-box", "ace-ai", "ace-media"),
+                             body_mode=khc.ADVISORY, prose_advisory=(variant == "prose_advisory"))
+    monkeypatch.setattr(ksc, "BODY_TIGHTENED", frozenset({"nas-admin"}))
+    assert khc.served_ssh_root(ctx) == {"nas-truenas"}   # access_bound lets go of the alias...
+    v = khc.evaluate(NAS, (), ctx)
+    if variant == "tighten":
+        v = ksc.tighten(v)
+    # ...so the capability layer must still hold the card: no pool host may run it.
+    assert not v.body_ignored, v.body_ignored
+    assert v.hard_rule == "requires:nas-admin" or v.wait == "requires_unsatisfied:nas-admin", dataclasses.asdict(v)
+    ok, rule, _ = kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                               assignee="alpha", body=NAS, pool=_nas_cfg(), requires=v.for_portable(),
+                               access_served=khc.served_ssh_root(ctx))
+    assert not ok and rule == "requires:nas-admin", (ok, rule)
 
 
 @pytest.mark.parametrize("mode,pool,want", [
