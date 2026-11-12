@@ -26,7 +26,9 @@ PLACEMENT_KEYS = {"run_id", "route", "rule", "host", "considered", "gate", "plan
                   # Control-Plane Protection v0.3 §3.1 (t_667f1f6a): the I-1 / AC-2 fields.
                   "route_class", "placement_default", "reason", "take_refusal", "pool_free_at_spawn",
                   # t_9965b8d5: the capability that justified a Studio placement (None on a pool one).
-                  "studio_capability"}
+                  "studio_capability",
+                  # t_c82eded0: prose-only Studio signals recorded, not enforced (None when none matched).
+                  "advisory"}
 
 
 def _events(conn, tid, kind):

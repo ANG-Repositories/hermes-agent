@@ -482,7 +482,10 @@ def test_local_files_too_big_to_carry_keeps_the_old_pin(kanban_home, carried, mo
 
 
 def test_local_files_with_another_studio_rule_stays_local(kanban_home, carried):
-    """Only the files are continuity: a card some other rule keeps home is not carried."""
+    """Only the files are continuity: a card some other rule keeps home is not carried. The other rule here is
+    the legacy body list, which binds only with t_c82eded0's kill switch off (prose_pins_advisory: false)."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  studio_pin_requires_reason: false\n  placement:\n    prose_pins_advisory: false\n")
     with kb.connect_closing() as conn:
         tid, _ = _card_with_files(conn, body="add to cart in the signed-in browser")
         route, rule, carry = _route(conn, tid, None)

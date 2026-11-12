@@ -224,6 +224,10 @@ def kanban_home(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     (home / "profiles" / "alpha").mkdir(parents=True, exist_ok=True)
+    # The Studio hold these dispatcher cases pin is the one t_c82eded0's kill switch keeps
+    # (kanban.placement.prose_pins_advisory: false); the default is covered in
+    # test_kanban_prose_pins_advisory.py.
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"prose_pins_advisory": False}})
     with kb.connect_closing():
         kb.create_board(slug="default", name="Test")
     return home
