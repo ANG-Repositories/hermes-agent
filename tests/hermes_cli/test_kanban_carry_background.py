@@ -369,6 +369,27 @@ def test_a_sync_carry_whose_claim_is_skipped_does_not_strand_its_lock(board, loo
     kcb._unlock(fd)
 
 
+def test_a_kept_sync_carry_is_refreshed_in_a_process_that_never_started_a_background_one(
+        board, loop, tmp_path, monkeypatch):
+    """Prism 64edba28c538: a one-shot carry kept in the registry and then polled once older than FRESH_S is
+    refreshed on the carry pool, which this process may never have created (no background carry ran yet)."""
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setattr(kcb, "_pool", None)
+    monkeypatch.setattr(kcb, "FRESH_S", 0.0)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        host = _plan(free=2).hosts["ace-ai"]
+        job = kcb.Job(tid, host, str(path), None, lock_dir)
+        assert kcb.run_sync(job, lock_dir, runner=loop)
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "running"
+        _wait_done(tid)
+        monkeypatch.setattr(kcb, "FRESH_S", 3600.0)
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "done"
+        assert kcb.take(tid, host, str(path)) is job
+        kcb.finalize(host, str(path), runner=loop)
+        kcb.release(job)
+
+
 def test_a_finished_copy_that_waited_is_refreshed_before_the_claim(board, loop, tmp_path, monkeypatch):
     """Prism 38c86a910163: a Studio edit made after the copy finished reaches the pool host when the finished copy
     is older than FRESH_S: it is re-synced off the tick, never claimed stale."""

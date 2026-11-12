@@ -276,6 +276,15 @@ def failure_state(job: Job, exc: BaseException) -> str:
     return "resumable"
 
 
+def _executor() -> ThreadPoolExecutor:
+    """The carry thread pool, created on first use (caller holds ``_lock``). A job kept by :func:`run_sync` can be
+    refreshed by a later poll in a process that never started a background carry (Prism 64edba28c538)."""
+    global _pool
+    if _pool is None:
+        _pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="kanban-carry")
+    return _pool
+
+
 def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start: bool = True,
          stale: Optional[PoolHost] = None, runner: Optional[Callable] = None) -> Tuple[str, object]:
     """One tick's look at the card's carry: ``(state, detail)``.
@@ -287,7 +296,6 @@ def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start:
     * ``backoff``: an earlier failure is younger than RETRY_S (detail: its wait reason);
     * ``busy``: another dispatcher holds this carry's lock, or this card's job runs to another host;
     * ``none``: nothing recorded and ``start`` is False."""
-    global _pool
     now = time.monotonic()
     with _lock:
         hit = _jobs.get(task_id)
@@ -309,7 +317,7 @@ def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start:
                 # second rsync into the same staging dir sends only what changed on the Studio since, under the
                 # lock this job still holds
                 job.done_at = None
-                job.future = _pool.submit(run, job, runner)
+                job.future = _executor().submit(run, job, runner)
                 return "running", job
             if exc is None:
                 return "done", job
@@ -327,12 +335,10 @@ def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start:
         fd = _try_lock(lock_path(lock_dir, host.name, workspace))
         if fd is None:
             return "busy", None
-        if _pool is None:
-            _pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="kanban-carry")
         job = Job(task_id, host, workspace, stale, lock_dir)
         job.fd = fd
         try:
-            job.future = _pool.submit(run, job, runner)
+            job.future = _executor().submit(run, job, runner)
         except BaseException:
             release(job)
             raise
