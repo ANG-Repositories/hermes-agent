@@ -5697,9 +5697,22 @@ def _studio_deny_unrouted(conn, row, ctx: dict, lane: str, default_assignee: Opt
             ctx["studio_on"] = _studio_capability_on(ctx["caps"], _studio_last_resort(_kb.kanban_home() / "fleet"))
     if not ctx["on"]:
         return None
-    stand_in = {"review": _ksa.REVIEW_CAP, "browser_join": _ksa.BROWSER_JOIN_CAP}.get(lane, _ksa.NO_PLAN_CAP)
+    stand_in = {"review": _ksa.REVIEW_CAP, "browser_join": _ksa.BROWSER_JOIN_CAP,
+                "admit": _ksa.ADMIT_CAP}.get(lane, _ksa.NO_PLAN_CAP)
     return _ksa.unrouted_hold(conn, row, ctx.get("caps"), studio_on=ctx.get("studio_on", False), kcfg=ctx["kcfg"],
                               stand_in=stand_in, default_assignee=default_assignee)
+
+
+def _review_studio_capability(row, origin_host, caps, ctx: dict) -> Optional[dict]:
+    """What default-deny resolves for a LOCAL review start (declared / attached skill / ``review_lane``), or None
+    for a pool start or a tick with no capability map."""
+    if origin_host is not None:
+        return None
+    caps = caps if caps is not None else ctx.get("caps")
+    if caps is None:
+        return None
+    from hermes_cli import kanban_studio_allowlist as _ksa
+    return _ksa.resolved_capability(row, caps, _ksa.REVIEW_CAP)
 
 
 def _carry_split_plan(workspace_path, carry_budget):
@@ -7502,6 +7515,7 @@ def _dispatch_once_locked(
     # review lane is never offered to the pool: its rows are always local.
     review_rows = []
     _review_pause_pins: dict = {}  # review id -> resume-origin host (Prism 01f1e61334ff)
+    _review_deny_waits: dict = {}  # t_062a5948: review-lane default-deny holds, persisted + notified after the loop
     # kanban admit enumerates them too, read-only, so a review row that
     # outranks the card binds it exactly as it binds the tick; it never spawns one.
     _review_dry = dry_run or _admit
@@ -7533,6 +7547,12 @@ def _dispatch_once_locked(
                 _rwhy = _rwhy if _rwhy is not None and _kph.local_destination_wait(_pause_cache) is not None else None
             else:
                 _rwhy = _kph.local_destination_wait(_pause_cache)
+                if _rwhy is None:
+                    # t_5d63270d (Prism c-4f52c4dd8765315a): a review with no pause pin and no enforced origin starts
+                    # locally, so a default-deny hold is decided here, before it reserves ready-lane capacity.
+                    _rwhy = _studio_deny_unrouted(conn, _rrow, _deny_ctx, "review", default_assignee)
+                    if _rwhy is not None:
+                        _review_deny_waits[_rrow["id"]] = _rwhy
             if _rwhy is not None:
                 result.placement_waits[_rrow["id"]] = _rwhy
                 continue
@@ -8548,10 +8568,13 @@ def _dispatch_once_locked(
             # FWA destination fence, local start (Prism fe6a1ad69c44): a local route or the last-resort fallback
             # starts on the dispatcher's own host, so a live fwa kanban hold on it waits the card too.
             _local_wait = _kph.local_destination_wait(_pause_cache)
-            if _local_wait is None and force_host is None and route == "portable":
+            if _local_wait is None and route == "portable":
                 # t_062a5948 (Prism 827ad8491946 r2): a portable row starts locally only when its browser join was
-                # cut for the Studio (_portable_goes_remote keeps it here); _route_row never classified it.
-                _local_wait = _studio_deny_unrouted(conn, row, _deny_ctx, "browser_join", default_assignee)
+                # cut for the Studio (_portable_goes_remote keeps it here), or when `kanban admit --host studio`
+                # forces it (t_5d63270d, Prism c-e7592fee5f5910ad); _route_row never classified either.
+                _local_wait = _studio_deny_unrouted(conn, row, _deny_ctx,
+                                                    "browser_join" if force_host is None else "admit",
+                                                    default_assignee)
             if _local_wait is not None:
                 result.placement_waits[row["id"]] = _local_wait
                 continue
@@ -8986,7 +9009,6 @@ def _dispatch_once_locked(
             _kb._log.warning("kanban unknown-pin park failed: %s", exc)
     _tick_routes(result, ready_rows, row_route, row_rules, spillover is not None, dry_run)
 
-    _review_deny_waits: dict = {}  # t_062a5948: review-lane default-deny holds, persisted + notified after the loop
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
     # creating a PR.  The dispatcher spawns a review agent (loading
@@ -9258,7 +9280,11 @@ def _dispatch_once_locked(
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
                 pool=admitted_routes.get(claimed.id),
-                placement={"route_class": "pin" if _review_origin_host else "local", "entry": "review"},
+                placement={"route_class": "pin" if _review_origin_host else "local", "entry": "review",
+                           # t_5d63270d (Prism c-0d4f28b3daf38893): the capability default-deny resolves for this
+                           # local review start, for the replay; None = a pool start, or no capability map.
+                           "studio_capability": _review_studio_capability(row, _review_origin_host, _caps,
+                                                                          _deny_ctx)},
             ):
                 _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
                 continue
