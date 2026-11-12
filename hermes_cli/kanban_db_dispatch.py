@@ -3553,7 +3553,6 @@ def _set_worker_pid(
     if pool is not None:
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool
-    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
     with _kbc.write_txn(conn):
         launching_run_id = run_id if run_id is not None else _kb._current_run_id(conn, task_id)
         # t_4b313c15: no `spawned` without its `placement`, on every branch below (one txn).
@@ -3602,7 +3601,7 @@ def _set_worker_pid(
             "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
             (int(pid), started_at, task_id),
         )
-        run_id = _kb._current_run_id(conn, task_id)
+        run_id = launching_run_id
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
@@ -3615,14 +3614,17 @@ def _set_worker_pid(
 
 def _write_placement(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], payload: dict) -> None:
     """One ``placement`` event per run (inside the caller's txn). A worker that adopted its pid first may already
-    have written the minimal ``unrecorded`` record; the launcher's full record replaces that row in place."""
+    have written the minimal ``unrecorded`` record; the launcher's full record replaces that row in place. Any
+    other prior record stands, so a repeated ``_set_worker_pid`` never appends a second one (Prism 532aad7ea955)."""
     from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
     if run_id is not None:
         prior = conn.execute(
-            "SELECT id FROM task_events WHERE run_id = ? AND kind = ? "
-            "AND json_extract(payload, '$.reason') = 'unrecorded' ORDER BY id DESC LIMIT 1",
+            "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
             (int(run_id), PLACEMENT_EVENT)).fetchone()
         if prior is not None:
+            if prior[1] != "unrecorded" or payload.get("reason") == "unrecorded":
+                return
             conn.execute("UPDATE task_events SET payload = ? WHERE id = ?",
                          (json.dumps(payload, ensure_ascii=False), prior[0]))
             _kb._journal_append(conn, task_id, PLACEMENT_EVENT, payload, run_id=run_id)
@@ -3650,26 +3652,38 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
     ``run_id`` is no longer the card's live run: the card was reclaimed before this worker got here,
     and it must exit without working it."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
-        row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
-                           (task_id,)).fetchone()
-        if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
-            _record_losing_worker(conn, task_id, int(run_id), int(pid), started_at)
-            return False
-        # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
-        if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
-            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, task_id))
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, int(run_id)))
-            _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
-                              run_id=int(run_id))
-        # A worker is running this run; if its launcher died before the placement write, record it now (t_4b313c15).
-        from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
-        if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
-                        (int(run_id), PLACEMENT_EVENT)).fetchone() is None:
-            _kb._append_event(conn, task_id, PLACEMENT_EVENT,
-                              _unrecorded_placement(conn, int(run_id), entry="worker_registered"), run_id=int(run_id))
+    lost = False
+    try:
+        with _kb.write_txn(conn):
+            row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
+                lost = True
+                _record_losing_worker(conn, task_id, int(run_id), int(pid), started_at)
+                return False
+            # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
+            if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
+                conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                             (int(pid), started_at, task_id))
+                conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                             (int(pid), started_at, int(run_id)))
+                _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
+                                  run_id=int(run_id))
+            # A worker is running this run; if its launcher died before the placement write, record it now.
+            from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+            if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
+                            (int(run_id), PLACEMENT_EVENT)).fetchone() is None:
+                _kb._append_event(conn, task_id, PLACEMENT_EVENT,
+                                  _unrecorded_placement(conn, int(run_id), entry="worker_registered"),
+                                  run_id=int(run_id))
+    except Exception:
+        if not lost:
+            raise
+        # The verdict is the ownership read, never the audit write (Prism 5c5caf4aae3d): a losing worker whose
+        # record or commit failed still exits instead of working a successor's card.
+        _kb._log.warning("kanban: worker %s lost run %s of %s; its registration record was not written",
+                         pid, run_id, task_id, exc_info=True)
+        return False
     return True
 
 

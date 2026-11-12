@@ -13,7 +13,9 @@ with no worker), so "no placement event" is never the only evidence.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -161,3 +163,91 @@ def test_claimed_human_lane_close_is_classed_operator(conn):
         conn.execute("UPDATE task_runs SET profile='human:apollo' WHERE id=?", (claimed.current_run_id,))
         kb._end_run(conn, tid, outcome="changes_requested", status="changes_requested")
     assert _cls(conn, claimed.current_run_id) == "operator"
+
+
+def test_a_repeated_set_worker_pid_never_writes_a_second_placement(conn):
+    """Prism 532aad7ea955: a second _set_worker_pid on the same run appended a second record."""
+    tid = kb.create_task(conn, title="pid stamped twice", assignee="worker")
+    run_id = kb.claim_task(conn, tid).current_run_id
+    assert kbd._set_worker_pid(conn, tid, 1111, run_id=run_id, placement={"host": "ace-ai", "reason": "policy"})
+    assert kbd._set_worker_pid(conn, tid, 1111, run_id=run_id) is True
+    assert _kinds(conn, run_id).count("placement") == 1
+    assert _payload(conn, run_id, "placement")["host"] == "ace-ai"
+
+
+def test_adopt_then_set_without_run_id_replaces_the_placeholder(conn, monkeypatch):
+    """Prism 532aad7ea955 / operator c-ec799aedac187b1f: _set_worker_pid without run_id writes against the
+    resolved launching run, so the worker's placeholder is replaced, never joined by a second record."""
+    tid = kb.create_task(conn, title="worker adopted first", assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    run_id = claimed.current_run_id
+    monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
+    assert kbd.adopt_worker_pid(conn, tid, run_id, 2222) is True
+    assert kbd._set_worker_pid(conn, tid, 2222, placement={"host": "ace-ai", "reason": "policy"}) is True
+    assert _kinds(conn, run_id).count("placement") == 1
+    assert _payload(conn, run_id, "placement")["host"] == "ace-ai"
+
+
+@pytest.mark.parametrize("where", ["record", "commit"])
+def test_a_lost_claim_returns_false_even_when_its_record_cannot_be_written(conn, monkeypatch, where):
+    """Prism 5c5caf4aae3d / operator c-b6a31ddd13a9c5e9: the losing verdict must not depend on the audit write.
+    An exception from the record, or from the transaction's commit, used to reach
+    register_current_worker_from_env, whose handler returns True, and the losing worker started."""
+    tid = kb.create_task(conn, title="lost claim, disk full", assignee="worker")
+    run_id = kb.claim_task(conn, tid).current_run_id
+    assert kb.schedule_task(conn, tid, reason="operator hold", wake_at=2_000_000_000) is True
+    if where == "record":
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("database or disk is full")
+        monkeypatch.setattr(kbd, "_record_losing_worker", boom)
+    else:
+        real = kb.write_txn
+
+        @contextlib.contextmanager
+        def failing_commit(c, **kw):
+            with real(c, **kw):
+                yield c
+            raise sqlite3.OperationalError("database is locked")
+        monkeypatch.setattr(kb, "write_txn", failing_commit)
+    assert kbd.adopt_worker_pid(conn, tid, run_id, 9393) is False
+
+
+def test_an_owning_worker_still_sees_a_board_error(conn, monkeypatch):
+    """Only the LOST verdict is shielded: an owning worker's write error still propagates (caller decides)."""
+    tid = kb.create_task(conn, title="owner, board error", assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
+    monkeypatch.setattr(kbd, "_unrecorded_placement", lambda *a, **k: (_ for _ in ()).throw(
+        sqlite3.OperationalError("database or disk is full")))
+    with pytest.raises(sqlite3.OperationalError):
+        kbd.adopt_worker_pid(conn, tid, claimed.current_run_id, 9494)
+
+
+def _pid_only_legacy_run(conn, title):
+    """A run whose only worker evidence is task_runs.worker_pid (no spawned / worker_registered event)."""
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    run_id = kb.claim_task(conn, tid).current_run_id
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET worker_pid = 4040 WHERE id = ?", (run_id,))
+    return tid, run_id
+
+
+def test_reaper_reads_worker_pid_before_clearing_it(conn, monkeypatch):
+    """Prism 31803cfc0dc0 / operator c-cd19e655c8f5b36d: end_orphaned_terminal_runs nulls worker_pid in its close
+    UPDATE, then stamped the class, so a pid-only legacy run read as `refused`."""
+    tid, run_id = _pid_only_legacy_run(conn, "orphaned terminal run")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    assert run_id in kb.end_orphaned_terminal_runs(conn)
+    assert _cls(conn, run_id) is None
+
+
+def test_reclaim_dangling_run_reads_worker_pid_before_clearing_it(conn):
+    """Same ordering in _reclaim_dangling_run."""
+    tid, run_id = _pid_only_legacy_run(conn, "dangling run")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        kb._reclaim_dangling_run(conn, tid, statuses=("ready",), now=int(kb.time.time()), note="test")
+    assert conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0] is not None
+    assert _cls(conn, run_id) is None
