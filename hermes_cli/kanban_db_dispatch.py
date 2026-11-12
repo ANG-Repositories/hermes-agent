@@ -5579,6 +5579,13 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             from hermes_cli import kanban_host_capabilities as _khc
             why = _ksc.studio_capability(_khc.declared_words(row["body"]), skills, getattr(caps, "cmap", None))
     if why is not None:
+        # t_062a5948: default-deny. A named capability also needs the allowlist or a live operator override
+        # (ROOT config, read here every tick; default off).
+        from hermes_cli import kanban_studio_allowlist as _ksa
+        _deny_on, _allow = _ksa.config(_root_kanban_cfg())
+        held = _ksa.decide(conn, row, why, enabled=_deny_on, allow=_allow)
+        if held is not None:
+            return "wait", held
         if studio_out is not None:
             studio_out[tid] = why
         return route
@@ -8832,6 +8839,12 @@ def _dispatch_once_locked(
             notify_starved_holds(conn, result.placement_waits, int(time.time()))
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban placement-starved notify failed: %s", exc)
+        try:
+            # t_062a5948: a Studio default-deny hold wakes the card's home session once, pages once at 60 min.
+            from hermes_cli.kanban_studio_allowlist import notify_holds
+            notify_holds(conn, result.placement_waits)
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban studio default-deny notify failed: %s", exc)
     if result.unknown_pins:
         try:
             from hermes_cli.kanban_unknown_pin import park_unknown_pins

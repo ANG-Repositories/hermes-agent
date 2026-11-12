@@ -2447,7 +2447,12 @@ DEFAULT_CONFIG = {
                       # else the card waits (studio_capability_only:<rule>); a pool refusal waits, never a
                       # Studio last resort. Active only while placement-policy makes the Studio last resort
                       # and the capability map reads. false = the behaviour before t_9965b8d5 (kill switch).
-                      "studio_capability_only": True},
+                      "studio_capability_only": True,
+                      # studio_default_deny (t_062a5948; ROOT config, read per tick): on top of the rule above, a
+                      # Studio-only capability also needs to be in `allow` or carry a live operator override
+                      # (`hermes kanban studio-override`), else the card waits studio_default_deny:<cap>.
+                      # Operator-assignee and no_worker cards are exempt. Default off; the operator arms it.
+                      "studio_default_deny": {"enabled": False, "allow": []}},
         # Admission predicate of the shared placement scorer and unified_filter (t_da6f84f7): legacy = the
         # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
         # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).

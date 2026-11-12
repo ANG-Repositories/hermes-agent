@@ -205,12 +205,20 @@ def test_cli_prints_one_line_and_refuses_with_rc1(operator, capsys):
 
 
 def test_verb_is_registered_and_denied_to_subagents():
+    import argparse
     from hermes_cli import kanban as kcli
     from hermes_cli import kanban_parser as kp
     assert "studio-override" in kcli._DELEGATED_CHILD_DENIED_ACTIONS
-    names = [spec[0] for spec in kp.COMMANDS] if hasattr(kp, "COMMANDS") else None
-    if names is not None:
-        assert "studio-override" in names
+    top = argparse.ArgumentParser()
+    kp.build_parser(top.add_subparsers(dest="cmd"))
+    ns = top.parse_args(["kanban", "studio-override", "t_00000001", "--capability", "studio-state",
+                         "--why", "reads the live board", "--until", "+2h"])
+    assert ns.kanban_action == "studio-override" and ns.capability == "studio-state" and ns.until == "+2h"
+    with pytest.raises(SystemExit):
+        top.parse_args(["kanban", "studio-override", "t_00000001", "--why", "x y z"])  # no --capability
+    with pytest.raises(SystemExit):
+        top.parse_args(["kanban", "studio-override", "t_00000001", "--capability", "c", "--why", "x y z",
+                        "--once", "--until", "+1h"])
 
 
 # -- 6. one wake per hold episode -------------------------------------------------------------------------------
