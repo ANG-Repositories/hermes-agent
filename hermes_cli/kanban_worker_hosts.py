@@ -868,12 +868,20 @@ def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
                 # Prism 519874fe750e: the repo's own objects dir symlinked out of the carry
                 return (f"{name} is carried as files but its object store {objs} does not travel with it "
                         f"(outside the workspace or in a rebuilt clone)")
+            # advisory 03:2x: a symlink directly under the object store (pack, info, a fan-out dir) that leaves the
+            # carry arrives dangling; the realpath of the store root alone does not see it
+            if os.path.isdir(objs):
+                with os.scandir(objs) as scan:
+                    for e in scan:
+                        if e.is_symlink() and not _travels(os.path.realpath(e.path)):
+                            return (f"{name} is carried as files but {e.path} is a symlink to "
+                                    f"{os.path.realpath(e.path)}, which does not travel with it")
             alt = os.path.join(objs, "info", "alternates")
             if not os.path.lexists(alt):
                 continue
-            with open(alt, encoding="utf-8-sig") as f:
-                for line in f.read().splitlines():
-                    line = line.strip()
+            with open(alt, encoding="utf-8-sig", newline="") as f:
+                # advisory 03:2x: git splits on LF only and never trims a line; a trailing space is part of the path
+                for line in f.read().split("\n"):
                     if not line or line.startswith("#"):
                         continue
                     if line.startswith('"'):
@@ -1044,21 +1052,21 @@ def stash_entries(repo: str, runner: Callable = subprocess.run) -> Optional[Tupl
     """The stash entries a rebuild of the checkout at ``repo`` must carry, newest first, as ``(commit, unix ts,
     reflog subject)``; None when unreadable (operator design at 2119cc07, t_d2f06cf6: never guess who owns a stash).
 
-    A clone, or a gitfile repo with no ``commondir`` (``--separate-git-dir``, a submodule), owns its whole stash list:
-    every entry. A linked worktree shares the common dir's list with every other checkout: every entry NOT older than
-    its creation line (the first line of its HEAD reflog, old sha all zeros), or every entry when its reflog no longer
-    starts there. That is the one proof needing no guess: a checkout cannot have made a stash before it existed.
-    Carrying another checkout's entry too costs a few objects; the originals stay in the common dir untouched."""
-    try:
-        dirs = _gitfile_dirs(repo)
-    except (OSError, UnicodeError, ValueError):
-        return None
+    Every entry of the list the checkout sees: a clone's own, or for a linked worktree the whole list shared through
+    the common dir (operator 03:2x: no timestamp filter; a clock or GIT_COMMITTER_DATE can date a new stash before
+    the worktree, and all 35 entries of the home repo bundle in 2.8 MB / 5.5 s). Carrying another checkout's entry
+    too costs a few objects; the originals stay in the common dir untouched.
+
+    ``refs/stash`` with no reflog lists as empty (rc 0) while the ref still holds a stash: when the ref resolves and
+    the list does not include its commit, the stash is unreadable (None), never an empty carry."""
     try:
         st = runner(["git", "-C", repo, "stash", "list", "--date=unix", "--format=%H%x09%gd%x09%gs"],
                     capture_output=True, text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
+        ref = runner(["git", "-C", repo, "rev-parse", "-q", "--verify", "refs/stash"], capture_output=True,
+                     text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
-    if getattr(st, "returncode", 1) != 0:
+    if getattr(st, "returncode", 1) != 0 or getattr(ref, "returncode", 2) not in (0, 1):
         return None
     out = []
     for line in (st.stdout or "").splitlines():
@@ -1072,28 +1080,10 @@ def stash_entries(repo: str, runner: Callable = subprocess.run) -> Optional[Tupl
         if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):
             return None
         out.append((sha, ts, subject))
-    if dirs is not None and dirs[2]:
-        try:
-            born = _reflog_birth(dirs[0])
-        except (OSError, UnicodeError):
-            return None
-        if born is not None:
-            out = [e for e in out if e[1] >= born]
+    live = (getattr(ref, "stdout", "") or "").strip() if getattr(ref, "returncode", 1) == 0 else ""
+    if live and live not in {e[0] for e in out}:
+        return None  # advisory 03:2x: refs/stash holds a commit the list does not show (reflog expired or removed)
     return tuple(out)
-
-
-def _reflog_birth(gitdir: str) -> Optional[int]:
-    """The unix ts of the checkout's creation line (old sha all zeros) when its HEAD reflog still starts with it, so
-    the reflog is complete since birth; None when it was expired or trimmed (the history is then unknown)."""
-    try:
-        with open(os.path.join(gitdir, "logs", "HEAD"), encoding="utf-8-sig", errors="replace") as f:
-            first = f.readline()
-    except FileNotFoundError:
-        return None
-    parts = first.partition("\t")[0].split()
-    if len(parts) >= 5 and set(parts[0]) == {"0"} and parts[-2].isdigit():
-        return int(parts[-2])
-    return None
 
 
 def _stash_label(entry) -> str:
@@ -1196,6 +1186,12 @@ def stash_bundle(repo: str, entries, head: str, runner: Callable = subprocess.ru
         for i, e in enumerate(entries):
             _git("-C", bare, "update-ref", f"refs/carry/{i}", e[0], what=_stash_label(e))
             refs.append(f"refs/carry/{i}")
+        # advisory 03:2x P2: every entry already reachable from the exclusions = nothing to send (``git bundle
+        # create`` refuses an empty bundle). b"" tells the store script the commits are already in the clone.
+        count = (getattr(_git("-C", bare, "rev-list", "--count", *refs, *excl, what=f"commits of {what}"),
+                         "stdout", "") or "").strip()
+        if count == "0":
+            return b""
         _git("-C", bare, "bundle", "create", out, *refs, *excl, what=f"bundle of {what}")
         _git("-C", bare, "bundle", "verify", "-q", out, what=f"bundle verify of {what}")
         if os.path.getsize(out) > CARRY_MAX_BYTES:
@@ -1211,7 +1207,9 @@ def stash_store_script(dest: str, entries) -> str:
     with its original subject, oldest first (so ``stash@{0}`` is the newest again), then PROVE the list is exactly
     ``entries`` (rc 8). Re-run safe: a clone already holding exactly that list is left alone; one holding any other
     stash is refused (rc 9), never added to. A bundle whose prerequisites the clone lacks even after one fetch of
-    origin is refused (rc 10), nothing stored."""
+    origin is refused (rc 10), nothing stored. An EMPTY payload (every entry already reachable from what the clone
+    holds, :func:`stash_bundle`) unbundles nothing: the clone must hold each entry commit, after at most one fetch of
+    origin, else rc 10."""
     d = shlex.quote(dest)
     want = " ".join(e[0] for e in entries)
     stores = "; ".join(f"git -C \"$d\" -c user.name=kanban-carry -c user.email=kanban-carry@localhost stash store "
@@ -1220,12 +1218,19 @@ def stash_store_script(dest: str, entries) -> str:
             "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
             "if [ \"$have\" = \"$want\" ]; then cat >/dev/null; exit 0; fi; [ -z \"$have\" ] || exit 9; "
             "t=$(mktemp); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; "
+            "if [ -s \"$t\" ]; then "
             # t_d2f06cf6 (operator 02:0x): the bundle leaves out origin's default branch as the Studio saw it. A clone
             # missing those commits fetches origin once, else refuses (rc 10) before any entry is stored.
             "if ! git -C \"$d\" bundle verify -q \"$t\" >/dev/null 2>&1; then "
             "git -C \"$d\" fetch -q origin >/dev/null 2>&1 || true; "
             "git -C \"$d\" bundle verify -q \"$t\" >&2 || exit 10; fi; "
             "git -C \"$d\" bundle unbundle \"$t\" >/dev/null; "
+            "else "
+            # advisory 03:2x P2: nothing to send; the entry commits must already be in the clone
+            "h() { for s in $want; do git -C \"$d\" cat-file -e \"$s^{commit}\" 2>/dev/null || return 1; done; }; "
+            "if ! h; then git -C \"$d\" fetch -q origin >/dev/null 2>&1 || true; "
+            "h || { echo \"stash commits missing from the clone\" >&2; exit 10; }; fi; "
+            "fi; "
             f"{stores}; "
             "have=$(git -C \"$d\" stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
             "[ \"$have\" = \"$want\" ] || exit 8")
@@ -1517,13 +1522,16 @@ def clone_moved_since_routing(repo: str, branch: str, sha: str, runner: Callable
     return None
 
 
-def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable = subprocess.run) -> list:
+def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable = subprocess.run,
+                       reservation: Optional[str] = None) -> list:
     """Every spawn-time re-check of a split carry (state moved since routing, git state a rebuild or file copy would
     lose, the caps), uncached, raising on the first refusal. The dispatcher calls it BEFORE ``carry_workspace``
     copies anything (P2 c-38aac54b3e75a212 / Prism 06179c2d4439) and hands the result to :func:`carry_clones`.
     Returns ``[(clone, dest, ignored files, (stash entries, bundle bytes))]``. t_d2f06cf6: the stash entries are read
     afresh here (one written since routing rides too) and their bundle is built before anything is copied, so a
-    failed bundle refuses the spawn naming the entry, with nothing on the pool host."""
+    failed bundle refuses the spawn naming the entry, with nothing on the pool host. ``reservation``: the card's
+    reservation on ``host``; a stash to carry with none refuses here, before the copy (advisory 03:2x), since the
+    store ssh must run under it (:func:`carry_stash`)."""
     # Every check runs for every clone before anything is pushed, rebuilt or copied (nothing half-carried).
     staged = []
     extra_bytes = extra_entries = 0
@@ -1551,6 +1559,9 @@ def carry_clones_check(host: PoolHost, workspace: str, clones, runner: Callable 
             entries = stash_entries(dest, runner)
             if entries is None:
                 raise RuntimeError(f"carry to {host.name}: clone {c['rel']} stash unreadable")
+            if entries and not reservation:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']}: no placement reservation for this card; "
+                                   f"{', '.join(map(_stash_label, entries))} not carried")
             if entries:
                 try:
                     stash = entries, stash_bundle(dest, entries, c["sha"], runner)
@@ -1583,10 +1594,24 @@ def carry_clones(host: PoolHost, workspace: str, clones, fleet_dir, runner: Call
     put HEAD on the exact commit. Raises on any failure (a spawn failure: claim released, nothing half-run).
     ``reservation``: the card's reservation on ``host``, threaded to :func:`carry_stash`. ``staged``: the return of
     the :func:`carry_clones_check` the dispatcher ran before the copy (t_d2f06cf6, operator 02:0x: the stash bundle
-    is built once per spawn); None = run the check here."""
+    is built once per spawn); None = run the check here. A ``staged`` result was taken before ``carry_workspace``
+    copied, so each checkout is re-read cheaply first (advisory 03:2x): HEAD and branch unchanged, still clean, and
+    the same stash list. Any difference refuses the spawn naming it; the bundle is never rebuilt in this tick."""
     from hermes_cli import kanban_worktree_port as _kwt
     if staged is None:
-        staged = carry_clones_check(host, workspace, clones, runner)
+        staged = carry_clones_check(host, workspace, clones, runner, reservation=reservation)
+    else:
+        for c, dest, _ignored, (entries, _bundle) in staged:
+            moved = clone_moved_since_routing(dest, c["branch"], c["sha"], runner)
+            if moved:
+                raise RuntimeError(f"carry to {host.name}: clone {c['rel']} {moved} during the copy")
+            if worktree_carry_on():
+                now = stash_entries(dest, runner)
+                if now is None:
+                    raise RuntimeError(f"carry to {host.name}: clone {c['rel']} stash unreadable after the copy")
+                if tuple(now) != tuple(entries):
+                    raise RuntimeError(f"carry to {host.name}: clone {c['rel']} stash changed during the copy "
+                                       f"({len(entries)} staged, {len(now)} now)")
     for c, dest, ignored, (entries, bundle) in staged:
         if c.get("push") is not None:
             _kwt.push_card_branch(tuple(c["push"]), runner)

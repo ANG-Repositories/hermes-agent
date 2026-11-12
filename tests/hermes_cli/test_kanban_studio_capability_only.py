@@ -1261,7 +1261,7 @@ def test_spawn_checks_every_clone_before_the_workspace_is_copied(kanban_home, sm
     monkeypatch.setattr(kwh, "carry_workspace",
                         lambda host, ws, runner=None, exclude=(): calls.append("carry"))
 
-    def refuse(host, ws, clones, runner=None):
+    def refuse(host, ws, clones, runner=None, reservation=None):
         calls.append("check")
         raise RuntimeError("carry to ace-ai: clone repo has a stash")
     monkeypatch.setattr(kwh, "carry_clones_check", refuse)
@@ -1316,9 +1316,10 @@ def test_clone_and_separate_git_dir_carry_every_stash_entry(tmp_path):
     assert len(kwh.stash_entries(str(sep))) == 1
 
 
-def test_linked_worktree_carries_entries_not_older_than_its_creation_line(tmp_path):
-    """The shared list: an entry older than the worktree's creation line is left out; every newer one is carried,
-    whoever made it. Once the worktree's reflog no longer starts at its creation line, every entry is carried."""
+def test_linked_worktree_carries_every_shared_stash_entry(tmp_path):
+    """Operator 03:2x (timestamp filter withdrawn): a linked worktree carries EVERY entry of the shared list, an
+    entry dated before the worktree's creation line included (a clock or GIT_COMMITTER_DATE can date its own new
+    stash that way)."""
     from pathlib import Path
     _clone_in(tmp_path)
     repo = Path(tmp_path) / "repo"
@@ -1327,11 +1328,40 @@ def test_linked_worktree_carries_entries_not_older_than_its_creation_line(tmp_pa
     _worktree_of(tmp_path)
     wt = Path(tmp_path) / "mainwt"
     (repo / "big.bin").write_bytes(b"another edit")  # differs from the aged entry (same second = same commit)
-    _g(repo, "stash", "push", "-q")  # newer, made in the primary: carried anyway (no ownership guess)
+    _g(repo, "stash", "push", "-q")  # newer, made in the primary
     _stash_in(repo, wt)              # newer, made in the worktree
-    assert len(kwh.stash_entries(str(wt))) == 2
-    (repo / ".git" / "worktrees" / "mainwt" / "logs" / "HEAD").write_text("")
     assert len(kwh.stash_entries(str(wt))) == 3
+
+
+def test_stash_dated_before_the_worktree_by_committer_date_is_carried(tmp_path):
+    """Advisory 03:2x: a worktree's own stash made with GIT_COMMITTER_DATE in the past has a reflog ts older than
+    the worktree's creation line. It is still carried."""
+    import os
+    import subprocess
+    from pathlib import Path
+    _clone_in(tmp_path)
+    _worktree_of(tmp_path)
+    wt = Path(tmp_path) / "mainwt"
+    (wt / "big.bin").write_bytes(b"own edit, back-dated")
+    env = dict(os.environ, GIT_COMMITTER_DATE="2001-01-01T00:00:00Z", GIT_AUTHOR_DATE="2001-01-01T00:00:00Z")
+    subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "stash", "push", "-q", "-m",
+                    "back-dated"], check=True, env=env)
+    got = kwh.stash_entries(str(wt))
+    assert [e[2] for e in got] == ["On feat/wt: back-dated"], got
+
+
+def test_refs_stash_without_its_reflog_is_unreadable_not_empty(tmp_path):
+    """Advisory 03:2x: refs/stash with its reflog removed lists as empty (rc 0) while the ref still holds a stash.
+    That is stash_unreadable (the rebuild is refused), never an empty carry."""
+    from pathlib import Path
+    _clone_in(tmp_path)
+    repo = Path(tmp_path) / "repo"
+    _stash_in(repo)
+    (repo / ".git" / "logs" / "refs" / "stash").unlink()
+    assert _g(repo, "stash", "list") == ""
+    assert kwh.stash_entries(str(repo)) is None
+    kwh._clone_assess_cache.clear()
+    assert kwh.assess_clone(str(repo)) == (None, "stash_unreadable")
 
 
 def test_worktree_with_a_stash_is_rebuilt_and_carries_it(kanban_home, wt_carry):
@@ -1521,8 +1551,8 @@ def test_a_failed_stash_bundle_or_store_refuses_naming_the_entry(kanban_home, tm
 def test_t94bd2ec4_shape_repo_worktree_with_a_shared_stash_is_rebuilt(kanban_home, wt_carry, tmp_path):
     """The operator's replay on t_94bd2ec4 at 2119cc07, as a fixture: ``repo`` is a linked worktree of a home repo
     outside the workspace whose shared stash list holds older entries and newer ones with no branch evidence;
-    ``mainwt`` is a dead stub (gitdir gone). ``repo`` must come out rebuildable, carrying only the newer entries;
-    the stub rides as files."""
+    ``mainwt`` is a dead stub (gitdir gone). ``repo`` must come out rebuildable, carrying every shared entry
+    (operator 03:2x: no timestamp filter); the stub rides as files."""
     import shutil
     from pathlib import Path
     with kb.connect_closing() as conn:
@@ -1551,7 +1581,7 @@ def test_t94bd2ec4_shape_repo_worktree_with_a_shared_stash_is_rebuilt(kanban_hom
         route, plan = _route_carry(conn, tid)
     assert route[0] != "wait", route
     rec = next(c for c in plan["clones"] if c["rel"] == "repo")
-    assert len(rec["stash"]) == 2, rec
+    assert len(rec["stash"]) == 5, rec
     assert plan["exclude"] == ("repo",), plan
 
 
@@ -1667,7 +1697,7 @@ def test_stash_bundle_timeout_waits_the_card_named(kanban_home, wt_carry, monkey
                     raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
                 return subprocess.run(argv, **kw)
             with pytest.raises(WorkspaceUnavailable, match=r"slow one"):
-                kwh.carry_clones_check(_host(), path, plan["clones"], runner=slow)
+                kwh.carry_clones_check(_host(), path, plan["clones"], runner=slow, reservation="r-test")
             assert seen and 0 < seen[0] <= kwh.STASH_BUNDLE_TIMEOUT_SECONDS < kwh.CARRY_TIMEOUT_SECONDS, seen
             kwh._clone_assess_cache.clear()
             route, plan = _route_carry(conn, tid)
@@ -1678,3 +1708,136 @@ def test_stash_bundle_timeout_waits_the_card_named(kanban_home, wt_carry, monkey
         assert kwh.stash_bundle_deferred(key[0], ents, key[2], now=t0 + kwh.STASH_BUNDLE_RETRY_SECONDS) is None
     finally:
         kwh._stash_bundle_timeouts.clear()
+
+
+# -- 1i. advisory read at b6261123 (operator 03:2x): stale staging, no reservation, empty bundle, alternates -------
+
+def _staged_studio(tmp_path, monkeypatch):
+    """A Studio clone with one stash, staged by carry_clones_check (bundle built), and clone_on_host recorded."""
+    from hermes_cli import kanban_worktree_port as kwt
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    (repo / "a.txt").write_text("edit\n")
+    _g(repo, "stash", "push", "-q", "-m", "staged one")
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    rec, why = kwh.assess_clone(str(repo), runner)
+    assert why is None, why
+    clones = [{"rel": "repo", **rec}]
+    staged = kwh.carry_clones_check(_host(), str(ws), clones, runner, reservation="r-test")
+    cloned = []
+    monkeypatch.setattr(kwt, "clone_on_host", lambda *a, **k: cloned.append(a))
+    return ws, repo, clones, staged, runner, cloned
+
+
+@pytest.mark.parametrize("change", ["stash", "head"])
+def test_staged_carry_refuses_when_the_checkout_changed_during_the_copy(kanban_home, tmp_path, monkeypatch, change):
+    """Advisory 03:2x: the staged result was taken before carry_workspace copied. A stash written, or a commit made,
+    during the copy refuses the spawn naming it; nothing is rebuilt and the bundle is not rebuilt."""
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    ws, repo, clones, staged, runner, cloned = _staged_studio(tmp_path, monkeypatch)
+    if change == "stash":
+        (repo / "a.txt").write_text("written during the copy\n")
+        _g(repo, "stash", "push", "-q", "-m", "late one")
+        match = "stash changed during the copy"
+    else:
+        (repo / "b.txt").write_text("b\n")
+        _g(repo, "add", "b.txt")
+        _g(repo, "commit", "-q", "-m", "late commit")
+        match = "HEAD moved"
+    bundles = []
+
+    def spy(argv, **kw):
+        if "bundle" in argv:
+            bundles.append(argv)
+        return runner(argv, **kw)
+    with pytest.raises(RuntimeError, match=match):
+        kwh.carry_clones(_host(), str(ws), clones, kanban_home / "fleet", runner=spy, reservation="r-test",
+                         staged=staged)
+    assert cloned == [] and bundles == [], (cloned, bundles)
+
+
+def test_staged_carry_with_nothing_changed_proceeds(kanban_home, tmp_path, monkeypatch):
+    """The cheap re-check passes when nothing moved: the rebuild runs on the staged result."""
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    ws, repo, clones, staged, runner, cloned = _staged_studio(tmp_path, monkeypatch)
+    monkeypatch.setattr(kwh, "carry_stash", lambda *a, **k: None)
+    kwh.carry_clones(_host(), str(ws), clones, kanban_home / "fleet", runner=runner, reservation="r-test",
+                     staged=staged)
+    assert len(cloned) == 1, cloned
+
+
+def test_no_reservation_refuses_at_the_check_before_any_copy(kanban_home, tmp_path, monkeypatch):
+    """Advisory 03:2x: a stash to carry with no reservation refuses in carry_clones_check, before the bundle is
+    built and before carry_workspace copies anything. A clone with no stash needs none."""
+    from tests.hermes_cli.test_kanban_worker_pool import _host
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    rec, _why = kwh.assess_clone(str(repo), runner)
+    assert kwh.carry_clones_check(_host(), str(ws), [{"rel": "repo", **rec}], runner) is not None
+    (repo / "a.txt").write_text("edit\n")
+    _g(repo, "stash", "push", "-q", "-m", "needs a reservation")
+    rec, _why = kwh.assess_clone(str(repo), runner)
+    argvs = []
+
+    def spy(argv, **kw):
+        argvs.append(argv)
+        return runner(argv, **kw)
+    with pytest.raises(RuntimeError, match="no placement reservation.*needs a reservation"):
+        kwh.carry_clones_check(_host(), str(ws), [{"rel": "repo", **rec}], spy)
+    assert not any("bundle" in a for a in argvs), argvs
+
+
+def test_stash_already_reachable_from_head_carries_with_an_empty_payload(kanban_home, tmp_path, monkeypatch):
+    """Advisory 03:2x P2: a clean checkout on a branch created at stash@{0}: every stash commit is reachable from
+    HEAD, so ``git bundle create`` would refuse an empty bundle. stash_bundle returns b"", and the store script only
+    stores the entries (the commits are in the clone) and proves the list."""
+    origin, ws, pool = _studio_and_origin(tmp_path)
+    repo = ws / "repo"
+    (repo / "a.txt").write_text("stashed\n")
+    _g(repo, "stash", "push", "-q", "-m", "reachable")
+    _g(repo, "branch", "feat/s", "stash@{0}")
+    _pub(repo, "feat/s")
+    _g(repo, "checkout", "-q", "feat/s")
+    entries = kwh.stash_entries(str(repo))
+    assert kwh.stash_bundle(str(repo), entries, _g(repo, "rev-parse", "HEAD")) == b""
+    before = _g(repo, "stash", "list", "--format=%H %gs")
+    runner, _seen = _pool_runner(ws, pool, origin, monkeypatch)
+    _carry_one(kanban_home, ws, "repo", runner)
+    dest = pool / str(repo).lstrip("/")
+    assert _g(dest, "stash", "list", "--format=%H %gs") == before
+
+
+def test_alternate_with_a_trailing_space_is_read_as_git_reads_it(tmp_path):
+    """Advisory 03:2x: git never trims an alternates line. ``<ws>/borrowed `` (trailing space) is a symlink to a
+    store outside the workspace while ``<ws>/borrowed`` is an empty dir inside it: refused."""
+    from pathlib import Path
+    ws, store = Path(tmp_path) / "ws", Path(tmp_path) / "store"
+    ws.mkdir()
+    store.mkdir()
+    _clone_in(store, "src")
+    _g(ws, "clone", "-q", "--shared", str(store / "src"), "repo")
+    (ws / "borrowed ").symlink_to(store / "src" / ".git" / "objects")
+    (ws / "borrowed").mkdir()
+    (ws / "repo" / ".git" / "objects" / "info" / "alternates").write_text(f"{ws / 'borrowed '}\n")
+    _g(ws / "repo", "rev-parse", "HEAD^{tree}")  # git resolves the spaced path
+    why = kwh.carried_gitdir_loss(str(ws), ["repo", "borrowed", "borrowed "], set())
+    assert why and "alternate" in why, why
+
+
+def test_symlink_under_the_object_store_leaving_the_carry_is_refused(tmp_path):
+    """Advisory 03:2x: a normal ``.git/objects`` whose ``pack`` dir is a symlink out of the workspace arrives with a
+    dangling pack dir. Refused, named."""
+    import shutil
+    from pathlib import Path
+    ws, outside = Path(tmp_path) / "ws", Path(tmp_path) / "outside-pack"
+    ws.mkdir()
+    _clone_in(ws, "dirty", dirty=True)
+    _g(ws / "dirty", "gc", "-q")
+    pack = ws / "dirty" / ".git" / "objects" / "pack"
+    shutil.move(str(pack), str(outside))
+    pack.symlink_to(outside)
+    _g(ws / "dirty", "rev-parse", "HEAD^{tree}")
+    why = kwh.carried_gitdir_loss(str(ws), ["dirty"], set())
+    assert why and "symlink" in why and "pack" in why, why
