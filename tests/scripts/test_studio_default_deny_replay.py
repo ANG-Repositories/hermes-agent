@@ -225,3 +225,43 @@ def test_operator_exemption_reads_the_runs_own_profile(tmp_path):
     assert v[("t_state", 2)] == "override"   # the run was daedalus
     assert v[("t_state", 3)] == "exempt"     # no task_runs row for run 3: falls back to the current assignee
     assert v[("t_op", 5)] == "exempt"        # the run was apollo
+
+
+def test_local_files_single_part_still_moves_with_a_pool_map(tmp_path):
+    """747326d7da47 / c-c6f037912be89579: local_files is left movable on purpose (the files can be carried), so the
+    single-part pool-coverage check must not turn it into an override; a real capability word still gets it."""
+    db, caps = _board(tmp_path)
+    _add(db, "t_lf", 14, {"host": "mac-studio-m3u", "studio_capability": {
+        "capability": "local_files:/x", "source": "structural"}})
+    assert _verdict(db, caps, "t_lf")["verdict"] == "moves"
+    _add(db, "t_lf_dock", 15, {"host": "mac-studio-m3u", "studio_capability": {
+        "capability": "local_files:/x,docker", "source": "structural"}})
+    assert _verdict(db, caps, "t_lf_dock")["verdict"] == "moves"  # ace-ai has docker; the files are carried
+    _add(db, "t_lf_gone", 16, {"host": "mac-studio-m3u", "studio_capability": {
+        "capability": "local_files:/x,retired-cap", "source": "structural"}})
+    assert _verdict(db, caps, "t_lf_gone")["verdict"] == "override"
+
+
+def test_recorded_review_capability_a_pool_host_has_does_not_move():
+    """61725b377c98 / c-f73d1930b451cd50 (Prism's repro): a review start never leaves the main machine, so a recorded
+    review capability some pool host has is still held there: override, or allowlisted when the allowlist covers
+    the recorded capability (the live gate's decide())."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "kanban.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT)")
+        con.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
+                    "payload TEXT, created_at INTEGER)")
+        con.execute("INSERT INTO tasks VALUES ('t_rv', 'r', 'daedalus')")
+        con.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+                    ("t_rv", 1, "placement", json.dumps({"route_class": "local", "entry": "review",
+                                                         "studio_capability": {"capability": "obsidian-vault",
+                                                                               "source": "declared"}}), T0 + 60))
+        con.commit()
+        con.close()
+        rows, moved, _s = sddr.replay([str(db)], set(), set(), T0, T0 + 86400, pool_hosts=[{"obsidian-vault"}])
+        assert rows[0]["verdict"] == "override" and not moved
+        rows, _m, _s = sddr.replay([str(db)], set(), {"obsidian-vault"}, T0, T0 + 86400,
+                                   pool_hosts=[{"obsidian-vault"}])
+        assert rows[0]["verdict"] == "allowlisted"

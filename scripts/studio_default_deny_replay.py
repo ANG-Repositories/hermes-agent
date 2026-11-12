@@ -39,6 +39,7 @@ from pathlib import Path
 OPERATOR_PROFILES = frozenset({"default", "apollo", "aegis"})
 STRUCTURAL = ("profile", "native_command", "host_reach", "linked", "workspace_of", "workspace_shared",
               "workspace_kind", "local_files", "workspace_bind")
+MOVABLE_STRUCTURAL = ("local_files",)  # structural, but the files can be carried: not Studio-only by itself
 # Proposed keep (truly Studio-only) / deny, with the reason. The replay prints counts next to each; the operator
 # decides. A capability absent here is shown as "deny (unreviewed)".
 PROPOSED = {
@@ -127,14 +128,17 @@ def studio_only_cap(cap, studio_only, pool_hosts=None) -> bool:
     if cap is None:
         return False
     ps = [x.strip() for x in cap.split(",") if x.strip()]
-    if any(head(x) in STRUCTURAL and head(x) not in ("local_files",) for x in ps):
+    if any(head(x) in STRUCTURAL and head(x) not in MOVABLE_STRUCTURAL for x in ps):
         return True
     if cap in ("studio-needs", "review_lane"):
         return True  # body words meant a Studio resource (t_c82eded0 removes it); the review lane never leaves
     if any(x in studio_only for x in ps):
         return True
     # it still needs ONE pool host that has every part, a single part included: a capability no pool host has
-    # (one since removed from the map, so it is in neither row) does not move (Prism c-eecd8df36c880d40)
+    # (one since removed from the map, so it is in neither row) does not move (Prism c-eecd8df36c880d40). Parts
+    # left movable on purpose (local_files: the files are carried) are not host capabilities, so no pool host
+    # lists them; they are dropped before the check, never counted against the move (Prism 747326d7da47).
+    ps = [x for x in ps if head(x) not in MOVABLE_STRUCTURAL]
     return pool_hosts is not None and bool(ps) and not any(set(ps) <= set(h) for h in pool_hosts)
 
 
@@ -174,6 +178,11 @@ def replay(dbs, studio_only, allow, since, now, pool_hosts=None):
                 verdict = "exempt"
             elif cap is None and src in ("host_studio", "review_unrecorded"):
                 verdict = "unknown"  # no record of what held it (Prism 9fec6c08b569, c-0d4f28b3daf38893)
+            elif p.get("entry") == "review":
+                # a review start never leaves the main machine, so the recorded capability is held there whatever
+                # the pool has; the live gate (kanban_studio_allowlist.decide) allows it only when the allowlist
+                # covers that recorded capability (Prism 61725b377c98)
+                verdict = "allowlisted" if covered(cap, allow) else "override"
             elif studio_only_cap(cap, studio_only, pool_hosts):
                 verdict = "allowlisted" if covered(cap, allow) else "override"
             else:
