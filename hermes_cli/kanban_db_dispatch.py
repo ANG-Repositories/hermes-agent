@@ -4254,10 +4254,19 @@ def fleet_admission_active() -> bool:
     ``placement.admission_mode()`` (fleet-root config.yaml) that decides whether
     the load gate / unified admission runs, so the guards never stand down
     while the fleet path is off, or the reverse.
+
+    One guard per start, never zero (Apollo ruling on Prism 9c506516b019): the
+    load gate is what replaces these guards for a local start, and it has its
+    own off switch (``kanban.dispatch_load_gate.enabled``). Gate off = the
+    guards stay on. The gate's state comes from the gate's own builder
+    (``kanban_load_gate.gate_from_config``), not a second parse of the key.
     """
     try:
         from hermes_cli.fleet_placement import placement as _placement
-        return _placement.admission_mode() == "utilization"
+        if _placement.admission_mode() != "utilization":
+            return False
+        from hermes_cli import kanban_load_gate as _klg
+        return bool(_klg.gate_from_config().enabled)
     except Exception:
         return False
 
