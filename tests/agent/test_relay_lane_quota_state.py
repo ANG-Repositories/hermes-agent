@@ -215,16 +215,18 @@ NOT_RELAY_TODAY = {
     "claude-elr": "credit family: its own API budget, not subscription seats",
     "claude-epr": "credit family: its own API budget, not subscription seats",
     "claude-elx-2": "credit family pin: its own API budget, not subscription seats",
-    "claude-apr-2": "legacy per-key apr pool name (pre-grammar), kept in auth.json",
-    "claude-app": "legacy pool name",
-    "claude-bpp": "legacy pool name",
-    "claude-pool": "legacy pool name",
-    "claude-api-proxy": "legacy proxy name",
-    "claude-api-proxy-f1": "legacy proxy face",
-    "claude-bridge": "legacy bridge name",
-    "claude-bridge-tui": "legacy bridge face",
-    "claude-proxy": "legacy proxy name",
-    "claude-subscription-proxy": "legacy proxy name",
+    # Legacy names still in auth.json. Those with an alias in hermes-home
+    # lane-names.json reach a relay door when used unresolved, and then keep their
+    # own pool verdict (named in the #294 handback); the rest have no alias.
+    "claude-apr-2": "legacy per-key apr pool row, no alias in lane-names.json",
+    "claude-app": "legacy pool name, no alias in lane-names.json",
+    "claude-pool": "legacy pool name, no alias in lane-names.json",
+    "claude-api-proxy-f1": "legacy proxy face, no alias in lane-names.json",
+    "claude-bpp": "legacy alias -> claude-bpr (lane-names.json aliases)",
+    "claude-api-proxy": "legacy alias -> claude-apx-0 (lane-names.json aliases)",
+    "claude-proxy": "legacy alias -> claude-apx-0 (lane-names.json aliases)",
+    "claude-subscription-proxy": "legacy alias -> claude-apx-0 (lane-names.json aliases)",
+    "claude-bridge": "legacy alias -> claude-bpx-0 (lane-names.json aliases)",
 }
 
 
