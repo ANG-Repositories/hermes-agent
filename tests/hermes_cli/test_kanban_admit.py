@@ -121,9 +121,28 @@ def _hot_local(monkeypatch, *, load1=66.0, mem=100.0, threads=64, cpu_busy=0.99)
     monkeypatch.setattr(ka.os, "cpu_count", lambda: threads)
 
 
-def _remote(band="red", hot=True, mem=100.0, load1=10.0, threads=32):
+def _sample(host, *, mem=100.0, threads=32, cpu_busy=0.1, **kw):
+    """One fresh FWA admission sample (the pushed pressure vector) for ``host``."""
+    import time as _time
+
+    return {"host": host, "os": "linux", "at": _time.time(), "ncpu": threads, "cpu_busy": cpu_busy,
+            "mem_available_gb": mem, "psi_cpu_some10": 0.0, "psi_mem_some10": 0.0, "psi_io_some10": 0.0, **kw}
+
+
+def _pressure(now, **kw):
+    """A fresh pushed pressure file body carrying every axis FWA requires."""
+    return json.dumps({"at": now, "mem_available_gb": 100.0, "cpu_busy": 0.1, "ncpu": 32, "psi_cpu_some10": 0.0,
+                       "psi_mem_some10": 0.0, "psi_io_some10": 0.0, **kw})
+
+
+def _remote(band="red", hot=True, mem=100.0, load1=10.0, threads=32, cpu_busy=0.1):
+    """The remote FWA inputs: a fresh sample, the kanban prior, an 8 GB host reserve, no leases."""
+    from hermes_cli.fleet_placement import admission as ad
+
     def fn(host, signal):
-        return ka.Measure(host.name, load1, threads, mem, 8.0, extra={"band": band, "hot": hot, "ncpu": threads})
+        return ka.Measure(host.name, _sample(host.name, mem=mem, threads=threads, cpu_busy=cpu_busy),
+                          ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"), ad.Limits(mem_reserve_gb=8.0),
+                          hid=host.name, extra={"band": band, "hot": hot, "ncpu": threads, "load1": load1})
     return fn
 
 
@@ -138,7 +157,8 @@ def test_admit_spawns_on_a_host_whose_band_is_hot_and_writes_the_event(board, mo
     assert ev["actor"] == "apollo" and ev["host"] == "studio" and ev["reason"] == "Ace 21:3x: do both"
     assert ev["band"] == "spilling" and ev["gate_allowance"] == 0    # what it overrode
     assert ev["admission"] == "utilization"
-    assert ev["load1"] == 66.0 and ev["load_limit"] == 96.0 and ev["mem_reserve_gb"] == 0.0
+    assert ev["load1"] == 66.0 and "load_limit" not in ev and ev["mem_reserve_gb"] == 0.0
+    assert ev["fwa_binding"] == "cpu"      # the CPU line is what admit overrides; FWA priced it
 
 
 def test_admit_spawns_on_a_hot_pool_host_and_places_it_there(board, monkeypatch):
@@ -165,18 +185,16 @@ def test_admit_refuses_an_ineligible_host(board, monkeypatch):
     assert _status(pinned) == _status(studio_only) == "ready" and not _events(pinned)
 
 
-def test_admit_refuses_under_the_measured_floor_and_prints_number_and_threshold(board, monkeypatch):
+def test_admit_refuses_on_the_canonical_fwa_verdict_naming_axis_and_number(board, monkeypatch):
+    """FWA is the floor: 3 GB available - 8 GB reserve - 3 GB card refuses on mem_gb with the number; an
+    unmeasured axis refuses. load1 49 on 32 threads (the removed private bar) admits."""
     tid = _card()
-    with pytest.raises(ka.AdmitRefused, match=r"memory available 3\.0 GB < mem_reserve_gb 8 GB"):
+    with pytest.raises(ka.AdmitRefused, match=r"ace-ai: FWA refused: saturated:mem_gb -8\.00 \(binding mem_gb\)"):
         ka.admit(tid, "ace-ai", "ruling", spawn_fn=_spawn, measure_remote_fn=_remote(mem=3.0))
-    with pytest.raises(ka.AdmitRefused, match=r"load1 49\.0 > threads 32 x 1\.5 = 48"):
-        ka.admit(tid, "ace-ai", "ruling", spawn_fn=_spawn, measure_remote_fn=_remote(load1=49.0))
-    with pytest.raises(ka.AdmitRefused, match="memory available is unmeasured"):
+    with pytest.raises(ka.AdmitRefused, match="FWA refused: unmeasured:mem_available_gb"):
         ka.admit(tid, "ace-ai", "ruling", spawn_fn=_spawn, measure_remote_fn=_remote(mem=None))
-    _hot_local(monkeypatch, load1=100.0, threads=64)
-    with pytest.raises(ka.AdmitRefused, match=r"load1 100\.0 > threads 64 x 1\.5 = 96"):
-        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
     assert _status(tid) == "ready" and not _events(tid)
+    assert ka.admit(tid, "ace-ai", "ruling", spawn_fn=_spawn, measure_remote_fn=_remote(load1=49.0))["host"] == "ace-ai"
 
 
 def test_admit_refuses_a_running_card_naming_its_host(board, monkeypatch):
@@ -202,6 +220,7 @@ def test_admit_refuses_a_second_writer_on_a_pr_another_card_runs(board, monkeypa
     on a PR holds it, so admit of card B naming the same PR refuses, owner named."""
     from hermes_cli import kanban_pr_owner as kpo
     monkeypatch.setattr(kpo, "pr_head_committed_at", lambda repo, n, **kw: None)
+    monkeypatch.setattr(kpo, "_gh_json", lambda path: None)  # PR state unreadable: hold (no network)
     _hot_local(monkeypatch)
     pr = "ANG-Ventures/hermes-agent#1624"
     with kb.connect_closing() as conn:
@@ -215,13 +234,17 @@ def test_admit_refuses_a_second_writer_on_a_pr_another_card_runs(board, monkeypa
 
 
 def test_floor_refuses_non_finite_measurements():
+    from hermes_cli.fleet_placement import admission as ad
+
     nan, inf = float("nan"), float("inf")
-    assert "unmeasured" in ka.floor_refusal(ka.Measure("h", nan, 8, nan, 4.0))
-    assert "unmeasured" in ka.floor_refusal(ka.Measure("h", 1.0, 8, inf, 4.0))
-    assert "load1/threads unmeasured" in ka.floor_refusal(ka.Measure("h", nan, 8, 50.0, 4.0))
-    assert "load1/threads unmeasured" in ka.floor_refusal(ka.Measure("h", 1.0, -4, 50.0, 4.0))
-    assert "not a finite threshold" in ka.floor_refusal(ka.Measure("h", 1.0, 8, 50.0, nan))
-    assert ka.floor_refusal(ka.Measure("h", 1.0, 8, 50.0, 4.0)) is None
+    need, lim = ad.Estimate(cpus=1.0, ram_gb=3.0), ad.Limits(mem_reserve_gb=4.0)
+    assert "unmeasured:mem_available_gb" in ka.floor_refusal(ka.Measure("h", _sample("h", mem=nan), need, lim))
+    assert "unmeasured:mem_available_gb" in ka.floor_refusal(ka.Measure("h", _sample("h", mem=inf), need, lim))
+    assert "unmeasured:cpu_busy" in ka.floor_refusal(ka.Measure("h", _sample("h", cpu_busy=nan), need, lim))
+    assert "unmeasured:ncpu" in ka.floor_refusal(ka.Measure("h", _sample("h", threads=-4), need, lim))
+    assert "fail closed" in ka.floor_refusal(ka.Measure("h", _sample("h"), None, None, threshold_error="x unreadable"))
+    assert "FWA inputs unmeasured" in ka.floor_refusal(ka.Measure("h", _sample("h"), None, lim))
+    assert ka.floor_refusal(ka.Measure("h", _sample("h", mem=50.0), need, lim)) is None
 
 
 def test_admit_refuses_when_the_workspace_admission_refuses(board, monkeypatch):
@@ -294,13 +317,12 @@ def test_a_stale_remote_pressure_sample_is_unmeasured_memory(tmp_path, monkeypat
 
     monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))   # no table: never the host's (t_2105a835)
 
-    sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0,
-                            pressure_text=json.dumps({"at": 1000.0, "mem_available_gb": 100.0}))
+    sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0, pressure_text=_pressure(1000.0))
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
                              placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
-    assert m.mem_available_gb is None and "unmeasured" in ka.floor_refusal(m)
+    assert m.sample.get("mem_available_gb") is None and "unmeasured" in ka.floor_refusal(m)
 
 
 @pytest.fixture
@@ -331,7 +353,7 @@ def test_an_unreadable_local_placement_table_refuses_instead_of_a_zero_reserve(b
     table = pl.fleet_root() / pl.TABLE_REL
     table.parent.mkdir(parents=True, exist_ok=True)
     table.write_text("{not json")
-    with pytest.raises(ka.AdmitRefused, match="not a finite threshold"):
+    with pytest.raises(ka.AdmitRefused, match="placement table .* unreadable.*fail closed"):
         ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)
 
 
@@ -345,16 +367,15 @@ def test_an_invalid_remote_placement_table_refuses_instead_of_a_zero_reserve(boa
     table = pl.fleet_root() / pl.TABLE_REL
     table.parent.mkdir(parents=True, exist_ok=True)
     table.write_text("{not json")
-    sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0,
-                            pressure_text=json.dumps({"at": 2000.0, "mem_available_gb": 100.0}))
+    sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0, pressure_text=_pressure(2000.0))
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
                              placement_table=None)
     m = ka.measure_remote(POOL_HOST, signal)
-    assert m.mem_available_gb == 100.0
+    assert m.sample["mem_available_gb"] == 100.0
     refusal = ka.floor_refusal(m)
-    assert refusal is not None and "not a finite threshold" in refusal and str(table) in refusal
-    # An ABSENT table is still "no reserve configured": 0 GB, admits.
+    assert refusal is not None and "unreadable" in refusal and str(table) in refusal
+    # An ABSENT table is still "no reserve configured": default limits, admits.
     table.unlink()
     assert ka.floor_refusal(ka.measure_remote(POOL_HOST, signal)) is None
 
@@ -559,8 +580,7 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
 
     def probe(host, **kw):
         asked.append(kw)
-        return kwp.HostSample(load1=1.0, ncpu=32, remote_now=now,
-                              pressure_text=json.dumps({"at": now, "mem_available_gb": 100.0}),
+        return kwp.HostSample(load1=1.0, ncpu=32, remote_now=now, pressure_text=_pressure(now),
                               boards=frozenset({"other"}))
 
     monkeypatch.setattr(kwp, "probe_host", probe)
@@ -572,8 +592,7 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
     assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
     # The same probe listing this board admits.
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: kwp.HostSample(
-        load1=1.0, ncpu=32, remote_now=now,
-        pressure_text=json.dumps({"at": now, "mem_available_gb": 100.0}),
+        load1=1.0, ncpu=32, remote_now=now, pressure_text=_pressure(now),
         boards=frozenset({"default"})))
     assert ka.admit(tid, "ace-ai", "ruling", kanban_cfg={"workspaces_root": "/srv/ws"},
                     spawn_fn=_spawn)["host"] == "ace-ai"
@@ -608,9 +627,9 @@ def test_placement_table_under_an_unsearchable_dir_is_nan_not_zero(board, monkey
     so a table beneath a 0o000 directory read as "no reserve". Only a missing
     file is absent; anything else is an unknown threshold that refuses, naming
     the table."""
-    import math as _math
     import os as _os
 
+    from hermes_cli.fleet_placement import admission as ad
     from hermes_cli.fleet_placement import placement as pl
 
     table = pl.fleet_root() / pl.TABLE_REL
@@ -621,16 +640,36 @@ def test_placement_table_under_an_unsearchable_dir_is_nan_not_zero(board, monkey
     try:
         if _os.geteuid() == 0:
             pytest.skip("root ignores directory permissions")
-        threads, reserve, err = ka._host_row(None, "local", 8)
-        assert _math.isnan(reserve) and err is not None and str(table) in err
-        m = ka.Measure("studio", 1.0, 8, 100.0, reserve, threshold_error=err)
+        need = ad.Estimate(cpus=1.0, ram_gb=3.0)
+        hid, limits, got, leases, err = ka._fwa_inputs(None, "local", need, now=1.0)
+        assert limits is None and got is None and err is not None and str(table) in err
+        m = ka.Measure("studio", _sample("local"), got, limits, threshold_error=err)
         refusal = ka.floor_refusal(m)
         assert refusal is not None and str(table) in refusal
     finally:
         parent.chmod(0o755)
-    # A truly absent table stays "no reserve": 0 GB.
+    # A truly absent table stays "no row": default limits (0 GB reserve), the caller's estimate.
     table.unlink()
-    assert ka._host_row(None, "local", 8) == (8, 0.0, None)
+    assert ka._fwa_inputs(None, "local", need, now=1.0) == ("local", ad.Limits(), need, (), None)
+
+
+def test_fwa_inputs_without_a_table_row_still_counts_the_ledger(board):
+    """Prism 891b269f644d / 5e9e08ea372d: no table (or no row) is default limits, never an empty ledger. A live
+    lease still binds, and an unreadable ledger fails closed."""
+    from hermes_cli.fleet_placement import admission as ad
+    from hermes_cli.fleet_placement import placement as pl
+
+    lpath = pl.fleet_root() / pl.RESERVATIONS_REL
+    lpath.parent.mkdir(parents=True, exist_ok=True)
+    pl.reserve("local", "prism", pl.Footprint(ram_gb=8.0, threads=1), ttl_s=600.0, job_id="j1", path=lpath, now=1.0)
+    need = ad.Estimate(cpus=1.0, ram_gb=3.0)
+    assert not (pl.fleet_root() / pl.TABLE_REL).exists()
+    hid, limits, got, leases, err = ka._fwa_inputs(None, "local", need, now=2.0)
+    assert err is None and limits == ad.Limits() and got == need
+    assert [(lease.host, lease.need.ram_gb) for lease in leases] == [("local", 8.0)]
+    lpath.write_text("not json")
+    hid, limits, got, leases, err = ka._fwa_inputs(None, "local", need, now=2.0)
+    assert limits is None and err is not None and str(lpath) in err
 
 
 # -- r7 (Apollo invariant): admit == the dispatcher's own route and refusal, host admission off --
@@ -882,6 +921,13 @@ def _site_triggers():
         ctx["plan"] = None
         return "studio", "twin", "requires_unsatisfied:docker"
 
+    def no_plan_studio_deny(m, ctx):
+        # t_062a5948: with no pool plan, Studio default-deny holds a local start _route_row never classified.
+        m.setattr(kbd, "_studio_deny_unrouted", lambda conn, row, c, lane, da=None:
+                  "studio_default_deny:pool_unavailable (dispatch: no pool plan this tick)")
+        ctx["plan"] = None
+        return "studio", "twin", "studio_default_deny:pool_unavailable"
+
     def no_plan_origin(m, ctx):
         upd("UPDATE tasks SET origin_host='ace-ai' WHERE id=?", ctx)
         m.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"continuation": "enforce"}})
@@ -951,8 +997,8 @@ def _site_triggers():
         return "studio", "twin", "workspace unavailable: workspaces_root_unmounted"
 
     def floor(m, ctx):
-        _hot_local(m, load1=200.0)
-        return "studio", "admit", "refused on measured danger: studio: load1 200.0"
+        _hot_local(m, load1=10.0, mem=1.0)              # FWA's own memory axis refuses: 1 GB - 3 GB card
+        return "studio", "admit", "refused on measured danger: studio: FWA refused: saturated:mem_gb"
 
     def floor_error(m, ctx):
         m.setattr(ka, "measure_local", lambda: (_ for _ in ()).throw(RuntimeError("probe died")))
@@ -1192,6 +1238,7 @@ def _site_triggers():
         "rows: _identity_only_unplanned": no_plan_identity,
         "route: row_route.setdefault": no_plan_identity,
         "route: _origin_route or ('local', None)": no_plan_origin,
+        "route: ('wait', _held)": no_plan_studio_deny,
         "continue: wait is not None": route_row,
         "continue: _default_assignee and _default_assignee_resolved": unassigned,
         "continue: except Exception (try: _kbc.write_txn)": default_assignee_write,
@@ -1422,3 +1469,65 @@ def test_admit_records_the_worker_pid_never_its_own(board, monkeypatch):
     assert res["pid"] == t.worker_pid == run_pid == 4242
     assert t.worker_pid != os.getpid()
     assert "note" not in res
+
+
+# -- t_2158f095 (Ace msg 1569308234441949345 / 1569529863298359387): the floor IS the canonical FWA predicate --
+
+FWA_TABLE = {
+    "schema": 1, "default_first": "mac-studio", "saturate_to": 1.0,
+    "footprints": {"kanban": {"ram_gb": 3, "threads": 1}},
+    "hosts": {"mac-studio": {"cores": 24, "threads": 32, "mem_total_gb": 512, "mem_reserve_gb": 128,
+                             "cores_reserve": 4, "consumers": {}, "aliases": ["studio", "local"]}},
+}
+
+
+def _fwa_table():
+    from hermes_cli.fleet_placement import placement as pl
+
+    table = pl.fleet_root() / pl.TABLE_REL
+    table.parent.mkdir(parents=True, exist_ok=True)
+    table.write_text(json.dumps(FWA_TABLE))
+
+
+def test_no_private_load1_bar_a_hot_cpu_line_is_what_admit_overrides(board, monkeypatch):
+    """The old floor refused load1 > threads x 1.5 on its own. FWA prices CPU from cpu_busy and the override
+    contract turns ONLY that line into a penalty: load1 200 on 64 threads with memory room admits."""
+    _fwa_table()
+    _hot_local(monkeypatch, load1=200.0, threads=64, mem=300.0, cpu_busy=0.99)
+    res = ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)
+    assert res["pid"] == 4242
+    assert "load_limit" not in res["payload"] and res["payload"]["fwa_binding"] == "cpu"
+
+
+def test_no_private_memory_floor_the_reserve_is_subtracted_once_by_fwa(board, monkeypatch):
+    """mem_reserve_gb is FWA's input (subtracted once inside admission.admit), never admit's own floor: 130 GB
+    available on a 128 GB reserve with a 3 GB card refuses by FWA's own memory axis, naming it."""
+    _fwa_table()
+    _hot_local(monkeypatch, load1=1.0, mem=130.0, cpu_busy=0.05)
+    tid = _card()
+    with pytest.raises(ka.AdmitRefused, match=r"FWA refused: saturated:mem_gb -1\.00 \(binding mem_gb\)"):
+        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    assert _status(tid) == "ready" and not _events(tid)
+    _hot_local(monkeypatch, load1=1.0, mem=132.0, cpu_busy=0.05)        # 132 - 128 - 3 > 0: FWA admits
+    assert ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)["pid"] == 4242
+
+
+def test_canonical_fwa_refusal_counts_every_consumers_live_leases(board, monkeypatch):
+    """A Prism lease the sample cannot show yet holds memory: FWA refuses, so admit refuses (no bypass)."""
+    import time as _time
+
+    from hermes_cli.fleet_placement import placement as pl
+
+    _fwa_table()
+    _hot_local(monkeypatch, load1=1.0, mem=140.0, cpu_busy=0.05)
+    pl.reserve("mac-studio", "prism", pl.Footprint(ram_gb=10.0, threads=1.0), ttl_s=600, job_id="pr-1",
+               path=pl.fleet_root() / pl.RESERVATIONS_REL, now=_time.time() + 5)
+    with pytest.raises(ka.AdmitRefused, match="FWA refused: saturated:mem_gb"):
+        ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)
+
+
+def test_canonical_unmeasured_axis_refuses_fail_closed(board, monkeypatch):
+    _fwa_table()
+    _hot_local(monkeypatch, load1=1.0, mem=None, cpu_busy=0.05)
+    with pytest.raises(ka.AdmitRefused, match="FWA refused: unmeasured:mem_available_gb"):
+        ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)

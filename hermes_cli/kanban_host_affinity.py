@@ -265,6 +265,12 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
         cfg = _kwp.PoolConfig()
     known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
     aliases = cfg.pin_aliases or _kwp.pin_aliases(_kb.kanban_home() / "fleet")
+    try:  # t_c82eded0: the same per-tick knob the planned path reads
+        from hermes_cli import kanban_db_dispatch as _kbd
+        from hermes_cli import kanban_host_capabilities as _khc
+        prose = _khc.read_prose_advisory(_kbd._root_kanban_cfg())
+    except Exception:
+        prose = True
     for r in rows:
         # Same pin rule as the planned path: only a REAL pin (any/studio/a known
         # host) is the operator's call; a prose ``host: example.com`` line is not.
@@ -277,7 +283,7 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
             skills = ()
         assignee = r["assignee"] or default_assignee
         manifest = manifest_affinity_safe(skills, assignee) if skills and assignee else {}
-        hit = _kwp.studio_affinity(r["body"], skills, cfg, manifest=manifest)
+        hit = _kwp.studio_affinity(r["body"], skills, cfg, manifest=manifest, prose_advisory=prose)
         if hit is not None:
             result.placement_affinity[r["id"]] = {
                 "host": _kwp.STUDIO_HOST, "rule": hit[0], "matched_by": hit[1]}

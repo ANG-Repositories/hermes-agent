@@ -22892,20 +22892,20 @@ def _ctx_header(lines: list[str], task: Task, run_started_at: Optional[int] = No
 
 
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
-    """Absolute on-disk paths so the worker's file tools read them directly
-    (remote terminal backends need the attachments dir mounted)."""
+    """Attachment ids for ``kanban_attachment_read``, which serves the bytes through the
+    board connection from any host; the board-host path is kept for local readers."""
     if not attachments:
         return
     lines.append("## Attachments")
     lines.append(
-        "Files attached to this task. Read them with the file/terminal "
-        "tools at the absolute paths below:"
+        "Files attached to this task. Read one with `kanban_attachment_read(attachment_id=<id>)` "
+        "(works on any host). The path after the arrow exists only on the board host:"
     )
     for att in attachments:
         size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
         size_str = f", {size_kb} KB" if size_kb else ""
         ctype = f", {att.content_type}" if att.content_type else ""
-        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+        lines.append(f"- id {att.id} `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
     lines.append("")
 
 

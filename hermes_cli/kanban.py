@@ -35,6 +35,7 @@ from hermes_cli.kanban_output import (
 # versions carry the workspace-refusal flag, pin badge and home/pin/no_worker
 # fields the handlers here render (FOLLOWUP: port into kanban_output, then import).
 from hermes_cli.kanban_admit import cmd_admit as _cmd_admit
+from hermes_cli.kanban_studio_allowlist import cmd_studio_override as _cmd_studio_override
 from hermes_cli.kanban_boards import _dispatch_boards
 for _name in ("_cmd_daemon", "_kanban_config", "_cmd_dispatch", "_cmd_gc", "_cmd_repair",
               "_cmd_tail", "_cmd_watch", "_cmd_reclaim_workspaces"):
@@ -597,7 +598,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     # kanban_db.add_comment marks the author "(subagent)".
     "claim", "attach", "attach-rm", "complete", "edit", "update", "block",
     "schedule", "unblock", "requeue", "workspace", "reopen", "promote", "triage-resolve",
-    "archive", "dispatch", "admit", "daemon", "repair",
+    "archive", "dispatch", "admit", "studio-override", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review", "sendback",
     "gc", "reclaim-workspaces",
@@ -1118,6 +1119,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 home_fallback=bool(boomerang) and not is_dispatcher_owned_worker_context())
             from hermes_cli.kanban_boomerang_default import wake_route
             route = wake_route(conn, task_id)
+            from hermes_cli.kanban_create_placement import preview_line
+            placement_line = None if getattr(args, "json", False) else preview_line(conn, task_id)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1168,6 +1171,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
         for _note in _placement_notes:
             print(f"placement: {task_id}: {_note}", file=sys.stderr)
+        if placement_line:  # t_0a5740f3: where the card will run and which line decided it
+            print(f"placement: {task_id}: {placement_line}", file=sys.stderr)
 
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
@@ -5294,6 +5299,7 @@ _HANDLERS = {
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "triage-resolve": _cmd_triage_resolve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch, "admit": _cmd_admit,
+    "studio-override": _cmd_studio_override,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "home-index": _cmd_home_index, "session-closeout": _cmd_session_closeout,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat, "resource": _cmd_resource,

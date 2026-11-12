@@ -533,21 +533,37 @@ def declares_requirements(body: Optional[str]) -> bool:
 
 
 def needs_allowed_hosts(body: Optional[str], pool, *,
-                        honor_declared: bool = False) -> Optional[Tuple[str, ...]]:
+                        honor_declared: bool = False,
+                        prose_advisory: bool = False) -> Optional[Tuple[str, ...]]:
     """None when the body names no Studio-only resource; else the enabled
     pool hosts whose fresh reach-matrix ``caps`` cover every need (``()`` =
     none: the card runs on the Studio or waits, never spills).
     ``honor_declared`` (the capability layer enforces this tick): a body with
     an explicit ``requires:`` line is judged by that line, not by prose
-    (None, t_6d9e7d90)."""
+    (None, t_6d9e7d90). ``prose_advisory`` (t_c82eded0,
+    ``kanban.placement.prose_pins_advisory``): a need no pool host covers is
+    advice, never a hold (None); a covering set still narrows the take."""
     if honor_declared and declares_requirements(body):
         return None
     needs = card_needs(body)
     if not needs:
         return None
     caps = getattr(pool, "caps", None) or {}
-    return tuple(h.name for h in (getattr(pool, "pool_hosts", ()) or ())
-                 if needs <= caps.get(h.name.lower(), frozenset()))
+    hosts = tuple(h.name for h in (getattr(pool, "pool_hosts", ()) or ())
+                  if needs <= caps.get(h.name.lower(), frozenset()))
+    return None if prose_advisory and not hosts else hosts
+
+
+def card_need_evidence(body: Optional[str]) -> Dict[str, str]:
+    """``{need: the text that matched}`` for :func:`card_needs` (the advisory a
+    prose-only need leaves on the placement event, t_c82eded0)."""
+    work = without_header_lines(body)
+    out: Dict[str, str] = {}
+    for name, rx in CARD_NEEDS:
+        m = rx.search(work)
+        if m:
+            out[name] = m.group(0).strip()[:120]
+    return out
 
 
 def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
@@ -902,9 +918,15 @@ def _sudo_before_break(remote: str) -> bool:
 def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
                      pin_hosts: Iterable[str] = (),
                      ssh_hosts: Optional[Collection[str]] = None,
-                     canon: Optional[Mapping[str, str]] = None) -> Optional[str]:
+                     canon: Optional[Mapping[str, str]] = None,
+                     served: Collection[str] = ()) -> Optional[str]:
     """The Studio-only ACCESS the card needs, or None: ``ssh-root:<host>`` or
     ``control-plane-read`` (first hit; ssh-root wins on a tie).
+
+    ``served`` (t_79c2259b): ssh aliases whose root access a capability of the
+    map serves on pool hosts (``capabilities.<cap>.ssh_root``, enforced this
+    tick). Such an ``ssh-root:<alias>`` is not Studio-only; the capability
+    layer judges it as a HARD requirement, so the scan moves on to the next hit.
 
     ``ssh-root:<host>``: a body line ``ssh [opts] [user@]<alias> ... sudo ...``
     for a probed alias, with :func:`host_bound_targets`' discipline: only the
@@ -922,6 +944,7 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
     pins = {PIN_ANY, PIN_STUDIO, *(h.lower() for h in (pin_hosts or ()))}
     known = None if ssh_hosts is None else {h.lower() for h in ssh_hosts}
     canon = {k.lower(): v for k, v in (canon or {}).items()}
+    served_set = {s.lower() for s in (served or ()) if s}
     cp_read = False
     for line in (body or "").splitlines():
         m = HOST_PIN_RE.match(line)
@@ -942,6 +965,8 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
                 continue
             at = re.search(rf"(?<![\w.-]){re.escape(target)}(?![\w-])", rest)
             if at and _sudo_before_break(rest[at.end():]):
+                if w in served_set:
+                    continue
                 return _reasons.ssh_root(canon.get(w, w))
         if not cp_read and any(_live_control_plane_path(m.group(1))
                                for m in _CONTROL_PLANE_PATH_RE.finditer(line)):
@@ -1239,7 +1264,9 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
              body_signals: bool = True,
              worktree_hosts: Optional[Tuple[str, ...]] = None,
-             studio_reasons: Optional[frozenset] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+             studio_reasons: Optional[frozenset] = None,
+             prose_advisory: bool = False,
+             access_served: Collection[str] = ()) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1280,6 +1307,10 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     studio`` pin holds only when the card's ``requires:`` line names one of
     them; a bare one is dropped and the card is judged unpinned. None = every
     Studio pin holds (kill switch, or no capability map this tick).
+
+    ``prose_advisory`` (t_c82eded0, ``kanban.placement.prose_pins_advisory``):
+    the body word lists (``STUDIO_BODY_RE``, :data:`CARD_NEEDS`) never keep the
+    card on the Studio; the caller records them as an advisory.
     """
     kind = workspace_kind or "scratch"
     if kind != "scratch" and not (kind == "worktree" and worktree_hosts):
@@ -1309,7 +1340,9 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     # no pin and no reach matrix can move it. Decided before host_reach (Momus
     # pass 2 R-F: a stale matrix must not decide the name) and before every pin
     # branch (a pool pin is a contradiction the dispatcher parks needs_input).
-    access = access_bound_for(body, pool)
+    # ``access_served`` (t_79c2259b): ssh-root aliases a pool capability serves; ``requires`` above
+    # already carries that capability as a HARD requirement when no candidate host has it.
+    access = access_bound_for(body, pool, served=access_served)
     if access is not None:
         return False, _reasons.access_bound(access), None
     pin, ignored, _dropped = effective_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None),
@@ -1337,7 +1370,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
             return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
             return False, _reasons.HOST_REACH, None
-    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals)
+    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals,
+                                     prose_advisory=prose_advisory)
     if need_hosts is not None:
         if pin not in (None, PIN_ANY) and pin not in need_hosts:
             return False, STUDIO_NEEDS_RULE, None
@@ -1354,13 +1388,14 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
         return True, None, "pin"
     if soft_rule:
         return False, soft_rule, None
-    affinity = studio_affinity(body, skills, pool, manifest=manifest, body_signals=body_signals)
+    affinity = studio_affinity(body, skills, pool, manifest=manifest, body_signals=body_signals,
+                               prose_advisory=prose_advisory)
     if affinity is not None:
         return False, affinity[0], None
     return True, None, "policy"
 
 
-def access_bound_for(body: Optional[str], pool) -> Optional[str]:
+def access_bound_for(body: Optional[str], pool, *, served: Collection[str] = ()) -> Optional[str]:
     """:func:`access_bound_cap` against this pool's alias vocabulary: the
     reach-matrix aliases plus every known pool host (the same set
     :func:`reach_allowed_hosts` binds on), canonicalised by ``pin_aliases``."""
@@ -1368,7 +1403,7 @@ def access_bound_for(body: Optional[str], pool) -> Optional[str]:
     aliases = (*(getattr(pool, "reach_aliases", ()) or ()), *(h.lower() for h in pool_hosts))
     return access_bound_cap(body, aliases, pin_hosts=pool_hosts,
                             ssh_hosts=getattr(pool, "ssh_hosts", None),
-                            canon=getattr(pool, "pin_aliases", None))
+                            canon=getattr(pool, "pin_aliases", None), served=served)
 
 
 def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
@@ -1450,7 +1485,8 @@ def reached_aliases(reach: Mapping[str, Mapping[str, int]], aliases: Iterable[st
 
 def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
                     manifest: Optional[Mapping[str, str]] = None,
-                    body_signals: bool = True) -> Optional[Tuple[str, str]]:
+                    body_signals: bool = True,
+                    prose_advisory: bool = False) -> Optional[Tuple[str, str]]:
     """``(rule, matched_by)`` when the card's WORK is bound to the Studio's state
     (signed-in browsers, Messages.app, a macOS GUI session), else None.
 
@@ -1460,7 +1496,8 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
     ``studio_manifest``), the card body (rule ``studio_body``), and the
     Studio-only resources the body names that no pool host covers (rule
     ``studio_needs``, :func:`card_needs`). An explicit
-    ``host:`` pin is decided before this and wins.
+    ``host:`` pin is decided before this and wins. ``prose_advisory``
+    (t_c82eded0): the two body sources never bind; attached skills still do.
     """
     names = [s for s in (skills or ()) if isinstance(s, str)]
     bound = set(pool.studio_bound_skills or ())
@@ -1477,12 +1514,13 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
         # outrank it (t_6d9e7d90). With the layer off the declaration is
         # enforced by nothing, so the prose signals stay (Prism cf1b3bd689e8).
         return None
-    m = STUDIO_BODY_RE.search(body or "") if body_signals else None
+    m = STUDIO_BODY_RE.search(body or "") if body_signals and not prose_advisory else None
     if m:
         return "studio_body", f"body:{m.group(0)}"
     # Studio-only resources the body names (t_aea826a9): bound unless some
     # pool host's fresh reach-matrix caps cover every one of them.
-    if needs_allowed_hosts(body, pool, honor_declared=not body_signals) == ():
+    if needs_allowed_hosts(body, pool, honor_declared=not body_signals,
+                           prose_advisory=prose_advisory) == ():
         return STUDIO_NEEDS_RULE, "needs:" + ",".join(sorted(card_needs(body)))
     return None
 
@@ -2479,10 +2517,14 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     probed: Dict[str, dict] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
-        sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
+        active = h.enabled and h.state == "active"
+        free = count_free(h, running) if active else 0
+        # allocd on: probe a host past its count too, so _take_allocd (structural_free) can ask allocd for it.
+        # `free` stays the real count for every take that does not ask allocd (t_2158f095, Prism cba00e400ff4).
+        ask = free > 0 or (active and signal.allocd == "on")
+        sample = _probe_states(probe, h, ask, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
+               "band": None, "band_reason": "", "why": "", "probed": ask, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             if signal.placement_table is not None:

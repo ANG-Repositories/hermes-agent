@@ -1003,7 +1003,8 @@ def test_every_cli_verb_reaching_a_guarded_writer_binds_the_actor():
     funcs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
     # Upstream moved verb bodies into kanban_ops / kanban_boards (re-imported by kanban.py).
     from hermes_cli import kanban_admit as _kad, kanban_boards as _kbo, kanban_ops as _kop
-    for _m in (_kop, _kbo, _kad):
+    from hermes_cli import kanban_studio_allowlist as _ksa
+    for _m in (_kop, _kbo, _kad, _ksa):
         for _n in _ast.parse(_module_src(_m)).body:
             if isinstance(_n, _ast.FunctionDef):
                 funcs.setdefault(_n.name, _n)

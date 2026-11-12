@@ -11531,6 +11531,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     loop.set_exception_handler(_gateway_loop_exception_handler)
 
     if threading.current_thread() is threading.main_thread():
+        # A fork-without-exec child must not deliver its signals into this loop's wakeup fd (t_5e351ab7).
+        from gateway.fork_signal_reset import install_fork_signal_reset
+        install_fork_signal_reset()
         # add_signal_handler raises NotImplementedError on Windows; SIGUSR1 is POSIX-only.
         handlers = [(sig, shutdown_signal_handler, (sig,)) for sig in (signal.SIGINT, signal.SIGTERM)]
         if hasattr(signal, "SIGUSR1"):
