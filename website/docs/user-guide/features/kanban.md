@@ -1324,6 +1324,16 @@ rejection), or `off` (no entry warning, notice, or derivation). Legacy booleans
 remain supported: `true` means `refuse`, `false` means `off`. Refusal is not armed
 by default. An absent or invalid capability map retains the existing safe-local behavior.
 
+Card prose alone never pins a card to the Studio
+(`kanban.placement.prose_pins_advisory`, root config, read per tick, default
+`true`). A `CARD_NEEDS` match, a body-sniffed capability or a skill named in the
+body is recorded as the `placement` event's `advisory` list plus one card comment
+starting `placement advisory:`, and the card starts on a pool host. If the work
+really needs the Studio, the worker blocks with `kind=capability` and the
+dispatcher re-routes it once to `host: studio` with a `requires:` word. A
+`requires:` line, an attached skill, a `host:` pin or a structural fact still
+holds a card. `false` restores the old prose holds.
+
 Legacy bare pins can still reach dispatch. The dispatcher logs their removal at
 WARNING (rate-limited per card) and persists one card comment beginning
 `[placement] bare host: studio dropped: add requires:`. Repeated ticks and
