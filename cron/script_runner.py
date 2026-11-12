@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +43,13 @@ _SHUTDOWN_WAIT_S = 20.0
 _SKEW_CONFIRM_S = 2.0
 _WARN_EVERY_S = 3600.0
 _REFUSED_ENV = ("HERMES_MACHINE_ID", "_HERMES_CRON_EXTERNAL_WORKER")
+# Land hold before the bounded skew drain kills (t_3c08d829): the fleet's home helper, relative to
+# the fleet root. It publishes the restart-pending record (the home-reconcile tick starts no new
+# land), waits while a live land marker exists (bounded by SGR_LAND_WAIT_SECS) and always exits 0.
+_LAND_WAIT_HELPER = ("skills-shared", "hermes-harness", "safe-gateway-restart", "scripts",
+                     "land_wait.py")
+# Past the helper's own bound (SGR_LAND_WAIT_SECS) the runner stops waiting for it and kills it.
+_LAND_WAIT_SLACK_S = 30.0
 
 
 def _now_iso() -> str:
@@ -157,6 +165,24 @@ def _inflight_finish_requested() -> List[tuple]:
     return out
 
 
+def _land_wait_helper() -> Path:
+    """``<fleet root>/skills-shared/.../land_wait.py``; the fleet root is the process home with a
+    ``profiles/<p>`` suffix stripped."""
+    from hermes_constants import get_process_hermes_home
+
+    home = get_process_hermes_home()
+    if home.parent.name == "profiles":
+        home = home.parent.parent
+    return home.joinpath(*_LAND_WAIT_HELPER)
+
+
+def _land_wait_budget_s() -> float:
+    try:
+        return float(os.environ.get("SGR_LAND_WAIT_SECS", "1200")) + _LAND_WAIT_SLACK_S
+    except ValueError:
+        return 1200.0 + _LAND_WAIT_SLACK_S
+
+
 def _boot_code_sha() -> Optional[str]:
     try:
         from gateway.code_skew import current_code_sha
@@ -235,6 +261,11 @@ class ScriptRunner:
         self._skew_bounded = False
         self._skew_withhold: set = set()
         self._bound_polled = False
+        # Land hold (t_3c08d829): None = not started; a Popen = helper running; True = settled.
+        self._land_hold: Any = None
+        self._land_hold_deadline = 0.0
+        self._land_hold_started = 0.0
+        self._land_hold_lock = threading.Lock()
         self._reasons: Dict[str, Optional[str]] = {}
         self._last_ok: Dict[str, str] = {}
         self._tick_started: Dict[str, str] = {}
@@ -408,6 +439,11 @@ class ScriptRunner:
         """Called from ``main``'s 0.5 s stop poll: evaluate the drain bound once, the moment it is
         crossed. The ticker cycle (``RUNNER_CYCLE_S`` = 60) alone can land a few ms short of it and
         hold the drain another whole cycle (t_af461294 drill: 180 s, not 120 s)."""
+        if self.draining and not self.sigterm and isinstance(self._land_hold, subprocess.Popen):
+            # A land hold is running: proceed within 0.5 s of the helper's exit (t_3c08d829).
+            if self._land_hold.poll() is not None or time.monotonic() >= self._land_hold_deadline:
+                self._check_skew_bound()
+            return
         if (not self.draining or self._bound_polled or self.sigterm
                 or time.monotonic() - self._draining_mono < float(lanes.RUNNER_SKEW_DRAIN_MAX_S)):
             return
@@ -434,6 +470,8 @@ class ScriptRunner:
                                   "script runner code-skew drain waiting: finish requested, %s",
                                   names)
                 return
+            if not self._land_hold_settled():
+                return
             logger.warning("script runner code-skew drain bounded: re-fire available; %d script(s) "
                            "in flight past %s s, terminating them (one re-fire each) and exiting 0; "
                            "re-fire withheld for re-fire-spent failing job(s): %s",
@@ -442,6 +480,74 @@ class ScriptRunner:
             self._skew_withhold = failed
             self._skew_bounded = True
             self.request_shutdown()
+
+    def _land_hold_settled(self) -> bool:
+        """Hold the bounded kill while a home-reconcile land is writing the live tree (t_3c08d829).
+
+        A kill inside that write leaves the tick's land-killed latch, and every later tick refuses
+        until an operator clears it. Starts ``land_wait.py default --owner <runner pid>`` once
+        (non-blocking: the ticker and main's 0.5 s poll come back here) and returns True once it
+        has exited. A missing helper, a start failure, a non-zero exit or a helper past
+        ``SGR_LAND_WAIT_SECS`` + slack never blocks the drain: one log line, then True. The
+        restart-pending record it leaves is owned by this pid, so it lapses when the runner exits.
+        ``SGR_LAND_WAIT=0`` makes the helper return at once."""
+        with self._land_hold_lock:
+            hold = self._land_hold
+            if hold is True:
+                return True
+            if hold is None:
+                helper = _land_wait_helper()
+                if not helper.is_file():
+                    logger.warning("script runner code-skew drain: land hold skipped: no helper at "
+                                   "%s", helper)
+                    self._land_hold = True
+                    return True
+                try:
+                    self._land_hold = subprocess.Popen(
+                        [sys.executable, str(helper), "default", "--owner", str(os.getpid())],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, start_new_session=True)
+                except Exception as exc:  # noqa: BLE001 - the hold must never block the drain
+                    logger.warning("script runner code-skew drain: land hold skipped: helper "
+                                   "start failed (%s: %s)", type(exc).__name__, exc)
+                    self._land_hold = True
+                    return True
+                self._land_hold_started = time.monotonic()
+                self._land_hold_deadline = self._land_hold_started + _land_wait_budget_s()
+                return False
+            rc = hold.poll()
+            if rc is None and time.monotonic() < self._land_hold_deadline:
+                return False
+            if rc is None:
+                with contextlib.suppress(Exception):
+                    os.killpg(hold.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
+                with contextlib.suppress(Exception):
+                    hold.wait(5)
+            out = ""
+            with contextlib.suppress(Exception):
+                out = (hold.stdout.read() or b"").decode("utf-8", "replace").strip()
+                hold.stdout.close()
+            waited = round(time.monotonic() - self._land_hold_started)
+            if rc is None:
+                logger.warning("script runner code-skew drain: land hold helper still running "
+                               "after %d s; killed it, proceeding%s", waited,
+                               f" ({out})" if out else "")
+            elif rc != 0:
+                logger.warning("script runner code-skew drain: land hold helper exited %d after "
+                               "%d s; proceeding%s", rc, waited, f" ({out})" if out else "")
+            elif out:
+                logger.warning("script runner code-skew drain: land hold %d s: %s", waited,
+                               " | ".join(out.splitlines()))
+            self._land_hold = True
+            return True
+
+    def end_land_hold(self) -> None:
+        """Kill a still-running land-hold helper on exit (the drain ended without a kill). Its
+        restart-pending record names this pid, so the tick ignores it once the runner is gone."""
+        hold = self._land_hold
+        if isinstance(hold, subprocess.Popen) and hold.poll() is None:
+            with contextlib.suppress(Exception):
+                os.killpg(hold.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
 
     def _check_host(self) -> None:
         try:
@@ -1075,6 +1181,7 @@ def main(argv: Optional[list] = None) -> int:
             logger.error("cron script runner ticker thread exited; exiting 1")
             return 1
         runner.poll_skew_bound()
+    runner.end_land_hold()
     if runner.sigterm:
         return runner.shutdown()
     thread.join(timeout=_SHUTDOWN_WAIT_S)
