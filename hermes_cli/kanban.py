@@ -977,6 +977,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     pin_refusal = kanban_access_bound_pin.refusal(args.body)
     if pin_refusal:
         return _err(f"kanban create: {pin_refusal}", 2)
+    studio = kanban_access_bound_pin.studio_refusal(args.body)
+    if studio:
+        return _err(f"kanban create: {studio}", 2)
     handoff, handoff_row = kanban_access_bound_pin.handoff_check(
         "create", None, getattr(args, "assignee", None), title=args.title)
     if handoff:
