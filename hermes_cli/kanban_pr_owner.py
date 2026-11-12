@@ -332,17 +332,23 @@ def pr_cards(conn: sqlite3.Connection, target: tuple) -> list:
     """Every non-archived card working on ``target``, oldest first: ``[(id, status, assignee)]``."""
     repo, n = target
     meta_like = (f"%{repo}#{n}%", f"%{repo}/pull/{n}%")
-    # R8 moves a long-done card's runs to kanban-archive.db; its tasks row stays (t_589fb988).
-    archived = sorted(_kar.task_ids_with_run_metadata_like(conn, meta_like))
+    # Live first, then the archive, then the tasks rows of archived ids: R8 commits the archive before it
+    # deletes the live runs, so a move between the two reads is seen by one of them (t_589fb988, t_78dbef10).
     rows = conn.execute(
-        "SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND ("
+        "SELECT id, status, assignee, created_at, rowid FROM tasks WHERE status != 'archived' AND ("
         "title LIKE ? OR idempotency_key LIKE ? OR id IN (SELECT task_id FROM task_runs "
-        "WHERE metadata LIKE ? OR metadata LIKE ?)"
-        + (" OR id IN (%s)" % ",".join("?" * len(archived)) if archived else "")
-        # rowid, not id: ids are random hex, so a same-second tie on id is a coin flip.
-        + ") ORDER BY created_at, rowid",
-        (f"%#{n}%", f"rebase:{repo}#{n}@%", *meta_like, *archived),
+        "WHERE metadata LIKE ? OR metadata LIKE ?))",
+        (f"%#{n}%", f"rebase:{repo}#{n}@%", *meta_like),
     ).fetchall()
+    # R8 moves a long-done card's runs to kanban-archive.db; its tasks row stays.
+    archived = sorted(_kar.task_ids_with_run_metadata_like(conn, meta_like))
+    seen = {r[0] for r in rows}
+    if archived:
+        rows += [r for r in conn.execute(
+            "SELECT id, status, assignee, created_at, rowid FROM tasks WHERE status != 'archived' "
+            "AND id IN (%s)" % ",".join("?" * len(archived)), archived).fetchall() if r[0] not in seen]
+    # rowid, not id: ids are random hex, so a same-second tie on id is a coin flip.
+    rows.sort(key=lambda r: (r[3], r[4]))
     return [(r[0], r[1], r[2]) for r in rows if target in card_pr_targets(conn, r[0], archived=True)]
 
 
