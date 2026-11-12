@@ -78,7 +78,10 @@ NONE_WORD = "none"   # reserved: ``requires: none`` overrides every SOFT require
 HARD, SOFT = "hard", "soft"
 # matched_by values, in the order a pin is attributed (declared beats skill).
 DECLARED, SKILL, NAMED_SKILL, BODY = "declared", "skill", "named_skill", "body"
-_SOURCE_RANK = {DECLARED: 0, SKILL: 1, NAMED_SKILL: 2, BODY: 3}
+# ``ssh <alias> ... sudo`` on an alias a capability serves (t_79c2259b): a structural access fact, not
+# prose, so no body/prose advisory path may drop it while access_bound releases the alias (Prism 86b7cb2c2b27).
+ACCESS = "access"
+_SOURCE_RANK = {DECLARED: 0, ACCESS: 1, SKILL: 2, NAMED_SKILL: 3, BODY: 4}
 PROSE_SOURCES = frozenset({NAMED_SKILL, BODY})   # inferred from card text, never declared (t_c82eded0)
 
 RULE_PREFIX = "requires:"
@@ -140,6 +143,10 @@ class CapabilityMap:
     # Read-only per-host transport observations. Missing/malformed legs fail closed;
     # advertising a browser daemon is not proof that an identity lease is reachable.
     browser_remote: Mapping[str, Mapping[str, bool]] = field(default_factory=dict)
+    # ``ssh-root:<alias>`` access a capability serves (``capabilities.<cap>.ssh_root: [alias, ...]``,
+    # t_79c2259b): alias (lower) -> capability. An access-bound card on a mapped alias is judged as a
+    # HARD requirement of that capability, not pinned to the Studio.
+    ssh_root: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
@@ -285,6 +292,9 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
             raise ValueError(f"capabilities.{cap} must be an object")
         if "soft" in row and not isinstance(row["soft"], bool):
             raise ValueError(f"capabilities.{cap}.soft must be true or false")
+        roots = row.get("ssh_root", [])
+        if not isinstance(roots, list) or not all(isinstance(a, str) and a for a in roots):
+            raise ValueError(f"capabilities.{cap}.ssh_root must be a list of ssh aliases")
         terms = row.get("sniff", [])
         if not isinstance(terms, list) or not all(isinstance(t, str) and t for t in terms):
             raise ValueError(f"capabilities.{cap}.sniff must be a list of regexes")
@@ -401,6 +411,9 @@ def map_from_bytes(map_bytes: Optional[bytes], index_bytes: Optional[bytes], *,
                                                      if isinstance(row["browser_remote"], dict) else {})
                                          for h, row in (doc["hosts"].items() if error is None else ())
                                          if "browser_remote" in row},
+                         ssh_root={a.lower(): cap for cap, row in (doc["capabilities"].items()
+                                                                   if error is None else ())
+                                   for a in row.get("ssh_root", ())},
                          index_unverified=unverified if index_error is None else None)
 
 
@@ -486,6 +499,33 @@ def _named_skill_re(name: str):
                       rf"|(?<![\w-]){n}`?[ \t]+skill\b", re.IGNORECASE)
 
 
+def ssh_root_hits(body: Optional[str], cmap: CapabilityMap) -> List[Tuple[str, str]]:
+    """``[(alias, capability)]`` for every ``ssh <alias> ... sudo`` body line whose alias the
+    map's ``ssh_root`` lists, with the access-bound deriver's own parse (t_79c2259b)."""
+    if not cmap.ssh_root:
+        return []
+    from hermes_cli import kanban_worker_pool as _kwp
+    found: List[str] = []
+    while True:
+        hit = _kwp.access_bound_cap(body, cmap.ssh_root.keys(), served=found)
+        prefix = _kwp._reasons.ACCESS_SSH_ROOT + ":"
+        if not hit or not hit.startswith(prefix):
+            break
+        found.append(hit[len(prefix):])
+    return [(a, cmap.ssh_root[a]) for a in found]
+
+
+def served_ssh_root(ctx: Optional[CapabilityTick]) -> frozenset:
+    """Aliases whose ssh-root access a pool capability carries this tick, so :func:`access_bound_cap`
+    stops treating it as Studio-only: the capability is ENFORCED (a real hold, placed only on the hosts
+    that advertise it), or every pool host advertises it (nowhere to land without it). Layer off, a
+    malformed map, or a warn-mode capability some pool host lacks: empty (today's Studio-only rule)."""
+    if ctx is None or not ctx.cmap.valid or ctx.mode == OFF:
+        return frozenset()
+    return frozenset(a for a, cap in ctx.cmap.ssh_root.items()
+                     if ctx.mode_of(cap) == ENFORCE or _satisfied(cap, ctx, None))
+
+
 def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
            ) -> Tuple[List[Requirement], bool]:
     """``(requirements, none_declared)`` for one card, every source.
@@ -526,6 +566,10 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
             if _named_skill_re(name).search(text):
                 for c in caps:
                     reqs.append(Requirement(cap_of(c), SOFT, NAMED_SKILL, name))
+    for alias, cap in ssh_root_hits(body, cmap):
+        # ``ssh <alias> ... sudo`` on an alias a capability serves (t_79c2259b): HARD, like a
+        # declared word, because the work cannot run without that access.
+        reqs.append(Requirement(cap_of(cap), HARD, ACCESS, f"ssh-root:{alias}"))
     seen = set()
     for cap, rx in cmap.sniff:
         if cap in seen:
@@ -679,6 +723,8 @@ def _source_text(req: Requirement) -> str:
         return f"skill {req.term} named in the body"
     if req.matched_by == DECLARED:
         return f"requires: {req.term}"
+    if req.matched_by == ACCESS:
+        return f"body {req.term} (ssh ... sudo)"
     return f'body "{req.term}"'
 
 
@@ -700,6 +746,8 @@ def pin_comment(req: Requirement, known: Iterable[str], *, host: str = STUDIO_HO
         undo = "To let it spill, add a line `host: any` or `requires: none`."
     elif req.matched_by == DECLARED:
         undo = "To let it spill, remove the `requires:` line."
+    elif req.matched_by == ACCESS:
+        undo = f"To let it spill, advertise {req.cap} on a pool host or remove the ssh ... sudo line."
     else:
         undo = f"To let it spill, remove the skill {req.term} from the card."
     return (f"{head}. This card needs a capability no pool host has, so it runs on the "
@@ -947,6 +995,8 @@ def held_comment(affinity: Mapping[str, Any], line: Optional[str]) -> str:
         undo = "or replace that line with `requires: none`"
     elif req.matched_by == SKILL:
         undo = f"or remove the skill {req.term} from the card"
+    elif req.matched_by == ACCESS:
+        undo = "or remove the ssh ... sudo line"
     else:
         undo = "or add a line `requires: none`"
     return (f"{HELD_PREFIX} {cap} from {_source_text(req)}{where}. No host that may run this card "
