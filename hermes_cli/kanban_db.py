@@ -2977,7 +2977,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     resources           TEXT NOT NULL DEFAULT '[]',
     -- Where this run executed (t_8bfdcc07): a pool host id, or 'studio' for a
     -- local run. NULL = legacy row or a run that never spawned.
-    host                TEXT
+    host                TEXT,
+    -- Why this run started no worker (t_4b313c15): operator | synthetic | refused.
+    -- NULL = a worker ran (its `placement` event says where), the run is open, or a legacy row.
+    no_worker_class     TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -9316,7 +9319,7 @@ def _end_run(
     if run_id is None:
         return None
     metadata = _carry_run_counters(conn, run_id, metadata)
-    conn.execute(
+    closed = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -9331,6 +9334,8 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
+    if closed.rowcount == 1:
+        _stamp_no_worker_class(conn, run_id)
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     # A pool run's headroom reservation ends with the run (t_d6ce856e), once
     # the run row is COMMITTED: a rolled-back end keeps its promise (Prism 441fe743030f).
@@ -9340,6 +9345,40 @@ def _end_run(
         from hermes_cli.kanban_db_connect import on_commit
         on_commit(conn, lambda: _kh.release_run_reservation(_rid, _via))
     return run_id
+
+
+NO_WORKER_OPERATOR = "operator"    # a human / human:* lane row (review verdict, operator transition): no process
+NO_WORKER_SYNTHETIC = "synthetic"  # zero-duration run written for a card nobody claimed (_synthesize_ended_run)
+NO_WORKER_REFUSED = "refused"      # claimed, closed before any worker started (workspace_refused, spawn_failed, ...)
+
+
+def _is_operator_profile(profile: Optional[str]) -> bool:
+    p = str(profile or "")
+    return p == HUMAN_REVIEWER_SENTINEL or p.startswith(HUMAN_REVIEWER_SENTINEL + ":")
+
+
+def _stamp_no_worker_class(conn: sqlite3.Connection, run_id: int, *, synthetic: bool = False,
+                           worker_pid: Optional[int] = None) -> None:
+    """At a run's close, record why it started no worker (t_4b313c15). A run with a worker pid or a ``spawned``
+    event is left NULL: its ``placement`` event is the record. A spawn landing after the close clears the class
+    again (``_set_worker_pid``'s claim-lost branch), so a class never stands beside a worker. ``worker_pid`` is
+    the pid a closer read BEFORE its own UPDATE cleared the column (Prism 31803cfc0dc0): a pid-only legacy run
+    is a worker run, not a refused one."""
+    if worker_pid:
+        return
+    row = conn.execute("SELECT profile, worker_pid FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
+    if row is None or row["worker_pid"]:
+        return
+    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ('spawned', 'worker_registered', "
+                    "'placement') LIMIT 1", (int(run_id),)).fetchone() is not None:
+        return
+    if _is_operator_profile(row["profile"]):
+        cls = NO_WORKER_OPERATOR
+    elif synthetic:
+        cls = NO_WORKER_SYNTHETIC
+    else:
+        cls = NO_WORKER_REFUSED
+    conn.execute("UPDATE task_runs SET no_worker_class = ? WHERE id = ?", (cls, int(run_id)))
 
 
 def _carry_run_counters(conn: sqlite3.Connection, run_id: int, metadata: Optional[dict]) -> Optional[dict]:
@@ -9448,7 +9487,9 @@ def _synthesize_ended_run(
             now, now,
         ),
     )
-    return int(cur.lastrowid or 0)
+    run_id = int(cur.lastrowid or 0)
+    _stamp_no_worker_class(conn, run_id, synthetic=True)
+    return run_id
 
 
 # ---------------------------------------------------------------------------
@@ -16418,6 +16459,8 @@ def _reclaim_dangling_run(
         (task_id, *statuses),
     ).fetchone()
     if stale and stale["current_run_id"]:
+        prior = conn.execute("SELECT worker_pid FROM task_runs WHERE id = ?",
+                             (int(stale["current_run_id"]),)).fetchone()
         conn.execute(
             """
             UPDATE task_runs
@@ -16429,6 +16472,7 @@ def _reclaim_dangling_run(
             """,
             (note, now, int(stale["current_run_id"])),
         )
+        _stamp_no_worker_class(conn, int(stale["current_run_id"]), worker_pid=prior[0] if prior else None)
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
@@ -20692,6 +20736,7 @@ def end_orphaned_terminal_runs(
             )
             if cur.rowcount != 1:
                 continue
+            _stamp_no_worker_class(conn, run_id, worker_pid=pid)
             conn.execute(
                 "UPDATE tasks SET current_run_id = NULL "
                 "WHERE id = ? AND current_run_id = ?",

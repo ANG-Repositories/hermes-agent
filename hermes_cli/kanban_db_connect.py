@@ -1392,6 +1392,8 @@ _TASK_RUN_COLUMNS = (
     ("resources", "resources TEXT NOT NULL DEFAULT '[]'"),
     # Where the run executed (t_8bfdcc07): pool host id or 'studio'.
     ("host", "host TEXT"),
+    # Why the run started no worker (t_4b313c15): operator | synthetic | refused; NULL = a worker ran / legacy.
+    ("no_worker_class", "no_worker_class TEXT"),
 )
 
 
@@ -1742,7 +1744,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT, resources TEXT NOT NULL DEFAULT '[]', host TEXT)",
+        " error TEXT, resources TEXT NOT NULL DEFAULT '[]', host TEXT, no_worker_class TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
