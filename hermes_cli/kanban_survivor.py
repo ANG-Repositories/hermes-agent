@@ -3937,19 +3937,23 @@ def git(repo,*args,i=None):
  if r.returncode: raise RuntimeError('git proof failed')
  return r.stdout.decode('utf-8','surrogateescape')
 '''+_STRANDED_SRC+r'''def durable(d,sha):
- a=[];p=[]
- try:
-  for r in git(d,'remote').split(): a+=[(r,*l.split('\t')) for l in git(d,'ls-remote',r).splitlines()]
-  if any(s==sha for _,s,_ in a): return 1
-  for f in '','HEAD','refs/heads/':
-   for r in {x[0] for x in a} if f else ():
-    m=[s for q,s,n in a if q==r and n.startswith(f) and s not in p]
+ u=0
+ for r in git(d,'remote').split():
+  try:
+   a=[l.split('\t') for l in git(d,'ls-remote',r).splitlines()]
+   if any(s==sha for s,_ in a): return 1
+   l=git(d,'remote','get-url',r).strip();q=os.path.join(d,l)
+   if os.path.isdir(q):
+    if git(q,'rev-parse','--is-shallow-repository').strip()!='false': raise OSError
+   elif not l.startswith(('https://github.com/','git@github.com:')): raise OSError
+   p=[]
+   for f in '','refs/heads/':
+    m=[s for s,n in a if f and n.startswith(f) and s not in p]
     if m: git(d,'fetch','-q','--no-tags','--no-write-fetch-head',r,*m)
-   p={l.split()[0] for l in git(d,'cat-file','--batch-check',i=''.join(s+'\n' for _,s,_ in a)).splitlines() if l.split()[1]=='commit'} if a else p
-   if p and git(d,'rev-list','--count','--stdin',i='HEAD\n'+''.join('^'+s+'\n' for s in p)).strip()=='0': return 1
-  sh=git(d,'rev-parse','--is-shallow-repository').strip()=='true'
- except Exception: raise RuntimeError('remote unreadable: HEAD durability unknown')
- if sh: raise RuntimeError('shallow clone: HEAD durability unknown')
+    p=[l.split()[0] for l in git(d,'cat-file','--batch-check',i=''.join(s+'\n' for s,_ in a)).splitlines() if l.split()[1]=='commit'] if a else p
+    if p and git(d,'rev-list','--count','--stdin',i='HEAD\n'+''.join('^'+s+'\n' for s in p)).strip()=='0': return 1
+  except Exception: u=1
+ if u or git(d,'rev-parse','--is-shallow-repository').strip()!='false': raise RuntimeError('HEAD durability unknown')
 def res(s):
  q=[x for x in s.rstrip('/').split('/') if x]
  ds=q if s.endswith('/') else q[:-1]
