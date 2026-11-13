@@ -749,7 +749,8 @@ def drop_for_refusal(conn, task_id: str, workspace: Optional[str], hosts: Mappin
     of it and remove the staging dir a carry may have left on a pool host (the host of its live job, else of its last
     started / resumable-failed record), under that (host, path) carry lock. The returned payload is written as
     ``workspace_carry_admission_refused``, so a later refused tick finds it and does nothing. None: nothing to drop
-    (no carry started, already recorded) or not now (a copy still running, another dispatcher holds the lock)."""
+    (no carry started, already recorded) or not now (a copy still running, another dispatcher holds the lock, the
+    remove failed: the next refused tick tries again from the started record)."""
     if not workspace:
         return None
     workspace = str(Path(workspace))
@@ -764,12 +765,7 @@ def drop_for_refusal(conn, task_id: str, workspace: Optional[str], hosts: Mappin
             host, workspace = hit[0].host, hit[0].workspace
         _failed.pop(task_id, None)
     if host is None:
-        last = _last(conn, task_id, workspace)
-        if last is None or not (last[0] == STARTED_EVENT
-                                or (last[0] == FAILED_EVENT and last[1].get("state") == "resumable")):
-            return None
-        name = last[1].get("host")
-        host = next((h for n, h in hosts.items() if isinstance(name, str) and n.lower() == name.lower()), None)
+        host = stale_host(conn, task_id, workspace, hosts, "")
         if host is None:
             return None
     fd = _try_lock(lock_path(lock_dir, host.name, workspace))
@@ -779,6 +775,8 @@ def drop_for_refusal(conn, task_id: str, workspace: Optional[str], hosts: Mappin
         removed = remove_staging(host, workspace, runner)
     finally:
         _unlock(fd)
+    if not removed:
+        return None   # Prism 8309def60720: no event, so the next refused tick retries (its started record remains)
     return {"host": host.name, "path": workspace, "staging": staging_path(workspace), "staging_removed": removed,
             "reason": reason[:300]}
 

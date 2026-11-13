@@ -934,6 +934,25 @@ def test_a_staging_dir_left_by_an_earlier_carry_is_removed_when_admission_refuse
     assert not any(c[0] == "rsync" for c in loop.calls)
 
 
+def test_a_failed_staging_remove_records_nothing_and_is_retried(board, loop, tmp_path, monkeypatch):
+    """Prism 8309def60720: a refusal whose staging remove failed writes no event, so the next refused tick removes it."""
+    with kb.connect_closing() as conn:
+        tid, path, _private = _protected_symlink_card(conn, board, tmp_path, monkeypatch)
+        kb._append_event(conn, tid, kcb.STARTED_EVENT, {"host": "ace-ai", "path": str(path), "background": True})
+        conn.commit()
+        left = Path(loop._map(kcb.staging_path(str(path))))
+        left.mkdir(parents=True)
+        real_remove = kcb.remove_staging
+        monkeypatch.setattr(kcb, "remove_staging", lambda *a, **k: False)
+        _tick_full(conn, defer_pool_clone=True)
+        assert _events(conn, tid, kcb.REFUSED_EVENT) == [] and left.exists()
+        monkeypatch.setattr(kcb, "remove_staging", real_remove)
+        _tick_full(conn, defer_pool_clone=True)
+        refused = _events(conn, tid, kcb.REFUSED_EVENT)
+    assert len(refused) == 1 and refused[0]["staging_removed"] is True
+    assert not left.exists()
+
+
 def test_a_refresh_whose_submit_raises_is_not_handed_over_as_done(board, loop, tmp_path, monkeypatch):
     """Prism 64edba28c538: done_at / seen_done are cleared only once the refresh submit has returned."""
     lock_dir = tmp_path / "locks"
