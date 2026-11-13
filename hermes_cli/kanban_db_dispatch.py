@@ -5987,11 +5987,19 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
     # checkout location) when the real holder is the lineage link; with one, the reason is linked:<edge>.
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
+        _branch = _kb._row_get(row, "branch_name")
+        if (_branch or "").strip() and not getattr(plan, "continuation_dry_run", False):
+            # t_0a0c9ddc: a stale branch_name (t_1e785f52: the archived parent's) on a tree that sits, pushed, on
+            # its own branch follows the tree, instead of holding own_tree_off_branch every tick.
+            _stale = _kwt.stale_branch(row["id"], row["workspace_path"], _kwt.board_default_workdir(board),
+                                       _branch, allow_studio_tree=last_resort)
+            if _stale is not None and _kwt.rebind_branch(conn, row["id"], _branch, _stale[0], _stale[1], _stale[2]):
+                _branch = _stale[1]
         # t_1d2c5939: derived mode ports any GitHub repo to every pool host (no hand list), pushing an
         # unpushed card branch first; wt_why names why a card still stays local.
         port = _kwt.port_for(row["id"], row["workspace_path"],
                              _kwt.board_default_workdir(board), _fleet_dir,
-                             branch=_kb._row_get(row, "branch_name"),
+                             branch=_branch,
                              allow_studio_tree=last_resort,
                              pool_hosts=tuple(plan.config.hosts or ()), why=wt_why)
         if port is not None:
