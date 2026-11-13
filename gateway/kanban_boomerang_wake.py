@@ -1222,12 +1222,14 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
 
     ``fork_died``: skip ONLY the "owner comment newer than handback" rule (a dead fork's original
     wake is still owed, t_525de3f0); the release/hold and merged-PR rules are still evaluated.
+    An EVENT_CURSOR_ROWS wake is never refused by the merged-PR rule (t_59d62680).
     """
     if os.environ.get("BOOMERANG_STALE_GUARD") == "0":
         return None
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_open_pr as _op
 
+    own_event = (entry.get("row") or entry.get("kind")) in EVENT_CURSOR_ROWS
     conn = _readonly(kb, entry.get("board"))
     try:
         task = kb.get_task(conn, entry["task_id"])
@@ -1237,7 +1239,7 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             "AND kind IN ('review_requested', 'completed') AND (? IS NULL OR id <= ?) "
             "ORDER BY id DESC LIMIT 1", (entry["task_id"], event_id, event_id)).fetchone()
         cursor_at = handback["created_at"] if handback else None
-        if handback and event_id is not None and (entry.get("row") or entry.get("kind")) in EVENT_CURSOR_ROWS:
+        if handback and event_id is not None and own_event:
             own = conn.execute("SELECT created_at FROM task_events WHERE task_id = ? AND id = ?",
                                (entry["task_id"], event_id)).fetchone()
             if own:
@@ -1261,11 +1263,14 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
                             "(fork died; original wake re-delivered) delegation=%s",
                             entry.get("task_id"), _OWNER_COMMENT_NEWER, entry.get("delegation_id"))
         refs = []
-        if handback:
+        # t_59d62680: the merged-PR rule is about the HANDBACK (its review is moot once merged). An own-event row
+        # carries its own occurrence: a deploy probe / watcher queued after the merge that failed is still owed.
+        if handback and not own_event:
             payload = json.loads(handback["payload"] or "{}")
             refs = _handback_refs(kb, conn, None, payload, handback["run_id"])
         # Preserve the claim's PR even if a newer handback now names another one.
-        refs = list(refs) + list(_op.extract_pr_refs(entry.get("pr")))
+        if not own_event:
+            refs = list(refs) + list(_op.extract_pr_refs(entry.get("pr")))
     finally:
         conn.close()
     health_fn = _health_fn()
