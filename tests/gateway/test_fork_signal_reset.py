@@ -168,6 +168,7 @@ _RENDEZVOUS_HARNESS = textwrap.dedent(r"""
         pid = os.fork()
         if pid == 0:
             time.sleep(5)
+            sys.stdout.flush()
             os._exit(7)
         await asyncio.sleep(0.3)
         os.kill(pid, signal.SIGTERM)
@@ -218,3 +219,80 @@ def test_without_rendezvous_step_child_survives_and_unlocks_parent():
     assert res["child"] == "survived", res
     assert res["lock_held"] is False, res
     assert (res["record"], res["token"]) == (True, True), res
+
+
+# The atexit path: cleanup_on_exit() also registers _cleanup_role with atexit, and a forked child that
+# exits normally runs it. The loop holds the asyncio SIGTERM handler but is not running at fork, so the
+# child's sys.exit(0) is a plain interpreter exit (unwinding a forked asyncio.run is version-dependent).
+# argv[2] == "keepfds": the after-fork step without the lock-fd close / _lock_handles.clear() (mutation).
+_RENDEZVOUS_ATEXIT_HARNESS = textwrap.dedent(r"""
+    import asyncio, fcntl, json, os, signal, sys, tempfile, time
+    sys.path.insert(0, sys.argv[1])
+    os.environ["HERMES_GATEWAY_LOCK_DIR"] = tempfile.mkdtemp()
+    from gateway import host_rendezvous as hr
+    from gateway.fork_signal_reset import install_fork_signal_reset
+    if sys.argv[2] == "keepfds":
+        def _keep_fds():
+            hr._cleanup_roles.clear()
+            for signum, prev in tuple(hr._prev_signal_handlers.items()):
+                if signal.getsignal(signum) is hr._handle_terminating_signal:
+                    signal.signal(signum, signal.SIG_DFL if prev is None else prev)
+            hr._prev_signal_handlers.clear()
+        hr.forget_owner_state_in_forked_child = _keep_fds
+
+    loop = asyncio.new_event_loop()
+    assert install_fork_signal_reset()
+    loop.add_signal_handler(signal.SIGTERM, lambda: None)
+    assert hr.claim_host_lock(hr.ROLE_SERVE)[0] is hr.HostLockOutcome.ACQUIRED
+    hr.publish_record(hr.ROLE_SERVE, host="127.0.0.1", port=9119, token="live-session-token")
+    hr.cleanup_on_exit(hr.ROLE_SERVE)
+    sys.stdout.flush()
+    pid = os.fork()
+    if pid == 0:
+        sys.exit(0)  # normal interpreter exit: atexit runs whatever cleanup the child still holds
+    deadline = time.monotonic() + 20
+    done, status = os.waitpid(pid, os.WNOHANG)
+    while not done and time.monotonic() < deadline:
+        time.sleep(0.05)
+        done, status = os.waitpid(pid, os.WNOHANG)
+    if not done:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        child = "hung"
+    elif os.WIFSIGNALED(status):
+        child = "signal:%d" % os.WTERMSIG(status)
+    else:
+        child = "exit:%d" % os.WEXITSTATUS(status)
+    with open(hr.lock_path(hr.ROLE_SERVE), "a+") as fh:  # a fresh open contends with the parent's flock
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_held = False
+        except OSError:
+            lock_held = True
+    print(json.dumps({"child": child, "lock_held": lock_held,
+                      "record": hr.record_path(hr.ROLE_SERVE).exists(),
+                      "token": hr.token_path(hr.ROLE_SERVE).exists()}))
+    sys.stdout.flush()
+    os._exit(0)  # skip the parent's own atexit cleanup; the temp lock dir is throwaway
+""")
+
+
+def _run_rendezvous_atexit(mode: str) -> dict:
+    out = subprocess.run([sys.executable, "-c", _RENDEZVOUS_ATEXIT_HARNESS, str(REPO), mode],
+                         capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_rendezvous_owner_child_normal_exit_keeps_parent_lock():
+    """A forked child that exits normally runs the atexit _cleanup_role it inherited; closing and
+    forgetting its copies of the lock fds is what keeps that from unlocking the LIVE parent."""
+    res = _run_rendezvous_atexit("fix")
+    assert res == {"child": "exit:0", "lock_held": True, "record": True, "token": True}, res
+
+
+def test_without_lock_fd_close_normal_child_exit_unlocks_parent():
+    """The mutation: the after-fork step without the fd close / _lock_handles.clear()."""
+    res = _run_rendezvous_atexit("keepfds")
+    assert res["child"] == "exit:0", res
+    assert res["lock_held"] is False, res
