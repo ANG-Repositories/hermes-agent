@@ -198,11 +198,70 @@ def test_step4_redispatch_arm_fails_on_any_lost_line(env, monkeypatch):
     assert "ZERO `warning boomerang-wake lost t_5m0ce007` lines in the origin chat | FAIL" in text
 
 
-def test_step4_redispatch_arm_needs_the_second_child_to_finish(env, monkeypatch):
-    """The `handled` line must carry the REDISPATCHED delegation, not the cut child's."""
-    rc, text = _step4_with(env, monkeypatch, drop_log=["t_5m0ce007 handled action=close delegation=deleg_s4a0002"])
+def _step4_with_restart_claim(env, monkeypatch, outcome, *, delegation="deleg_s4a0002", chat_line=None):
+    """Step 4 with the #restart1 claim of t_5m0ce007 rewritten: ``outcome=None`` drops the claim."""
+    fx = _copy_fixtures(env["tmp"])
+    state = fx / "fake_boomerang_wake.json"
+    doc = json.loads(state.read_text())
+    key = "bv2-smoke|t_5m0ce007|71#restart1"
+    if outcome is None:
+        doc["claims"].pop(key)
+    else:
+        doc["claims"][key].update(outcome=outcome, delegation_id=delegation)
+    state.write_text(json.dumps(doc))
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    chat = fx / "fake_origin_chat.jsonl"
+    if chat_line is not None:
+        chat.write_text("".join(ln + "\n" for ln in chat.read_text().splitlines()
+                                if "boomerang handled t_5m0ce007" not in ln)
+                        + json.dumps({"ts": 1792379910.0, "content": chat_line}) + "\n")
+    monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
+    return run.main(["--step", "4", "--dry-run"]), env["evidence"].read_text()
+
+
+def test_step4_second_child_complete_passes(env, monkeypatch):
+    rc, text = _step4_with_restart_claim(env, monkeypatch, "complete")
+    assert "the second child handled the card (delegation deleg_s4a0002) | PASS" in text
+    assert "terminal outcome=complete" in text
+    assert rc == 0
+
+
+def test_step4_second_child_surfaced_passes(env, monkeypatch):
+    """11-12 18:06 live run: the retry child surfaced the card; the gateway closed the claim `surfaced`
+    (a HANDLED_OUTCOMES member) and posted the `child surfaced` wake, not a `boomerang handled` row."""
+    rc, text = _step4_with_restart_claim(
+        env, monkeypatch, "surfaced",
+        chat_line="[boomerang-wake] child surfaced t_5m0ce007 (completed, fork, 57s): forced completion, not accepted")
+    assert "the second child handled the card (delegation deleg_s4a0002) | PASS" in text
+    assert "terminal outcome=surfaced" in text
+    assert "`[boomerang-wake] child surfaced t_5m0ce007` after the restart | PASS" in text
+    assert rc == 0
+
+
+@pytest.mark.parametrize("outcome", ["failed", "lost"])
+def test_step4_second_child_failed_or_lost_fails(env, monkeypatch, outcome):
+    rc, text = _step4_with_restart_claim(env, monkeypatch, outcome)
     assert rc == 1
     assert "the second child handled the card (delegation deleg_s4a0002) | FAIL" in text
+    assert f"terminal outcome={outcome} (not in the gateway's HANDLED_OUTCOMES" in text
+
+
+def test_step4_second_child_without_a_terminal_restart_claim_fails(env, monkeypatch):
+    rc, text = _step4_with_restart_claim(env, monkeypatch, None)
+    assert rc == 1
+    assert "no terminal `#restartN` claim for t_5m0ce007 (delegation deleg_s4a0002)" in text
+
+
+def test_step4_second_child_claim_must_be_the_redispatched_delegation(env, monkeypatch):
+    """A terminal #restart claim of another delegation is not the second child's verdict."""
+    rc, text = _step4_with_restart_claim(env, monkeypatch, "complete", delegation="deleg_other")
+    assert rc == 1
+    assert "the second child handled the card (delegation deleg_s4a0002) | FAIL" in text
+
+
+def test_step4_handled_set_is_the_gateways_own():
+    from gateway.kanban_boomerang_wake import HANDLED_OUTCOMES
+    assert run._gateway_handled_outcomes() is HANDLED_OUTCOMES
 
 
 def test_step4_fallback_arm_fails_without_resurface(env, monkeypatch):

@@ -77,6 +77,14 @@ def re_boomerang_wake_line(card: str) -> re.Pattern:
     return re.compile(r"boomerang handled " + re.escape(card) + r" \((?P<kind>[^)\s]+)\):\s*(?P<outcome>\S.*)")
 
 
+def re_restart_done_line(card: str) -> re.Pattern:
+    """Step 4 redispatch arm: the origin-chat line of a HANDLED retry child. Either the passive
+    ``boomerang handled <card>`` row, or the ``[boomerang-wake] child surfaced <card> (...)`` wake
+    the gateway posts when the child's verdict was to surface (finding_text, outcome ``surfaced``)."""
+    c = re.escape(card)
+    return re.compile(r"boomerang handled " + c + r" \([^)\s]+\):\s*\S|\[boomerang-wake\] child surfaced " + c + r" \(")
+
+
 def re_failed_line(card: str) -> re.Pattern:
     return re.compile(_WARN + r"boomerang-wake failed\s+(?:for\s+)?" + re.escape(card) + r":\s*(?P<reason>\S.*)")
 
@@ -1124,6 +1132,33 @@ def _claim_running(path: Path, card: str) -> dict | None:
     return None
 
 
+def _gateway_handled_outcomes() -> frozenset:
+    """The gateway's own HANDLED_OUTCOMES (imported, never copied, so the harness cannot drift)."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from gateway.kanban_boomerang_wake import HANDLED_OUTCOMES
+    return HANDLED_OUTCOMES
+
+
+def _restart_claim_terminal(path: Path, card: str, delegation: str) -> tuple[str, dict] | None:
+    """The card's terminal ``<key>#restartN`` claim (the redispatched child's), else None. With
+    ``delegation`` set only that child's claim counts; otherwise the newest N."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    found = []
+    for key, entry in ((doc.get("claims") or {}).items() if isinstance(doc, dict) else ()):
+        m = re.search(r"#restart(\d+)$", str(key))
+        if (m and isinstance(entry, dict) and entry.get("task_id") == card and entry.get("state") == "terminal"
+                and (not delegation or entry.get("delegation_id") == delegation)):
+            found.append((int(m.group(1)), key, entry))
+    if not found:
+        return None
+    _n, key, entry = max(found, key=lambda t: t[0])
+    return key, entry
+
+
 def _prespend_retry(ctx: Ctx, rep: StepReport, card: str) -> bool:
     """Fallback arm: spend the card's restart retry (``restart_spent[card]=1``) in the scratch state
     file while its child is running, so the reconciler must refuse the redispatch (`retry spent`).
@@ -1359,15 +1394,28 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
     second = re_redis.search(redis).groupdict().get("delegation") or ""
     rep.check(f"{arm}: the redispatch is a NEW child", PASS if second and second != first else FAIL,
               f"first delegation {first or '?'} -> redispatched {second or '?'}")
-    re_handled = re.compile(ctx.plan["expect"]["handled_log_regex"].format(card=re.escape(card)))
-    handled = ctx.poll(lambda: find_log(log, re_handled, after_ts=after,
-                                        pred=lambda m: m.groupdict().get("delegation") == second), ctx.timeout)
-    rep.check(f"{arm}: the second child handled the card (delegation {second or '?'})",
-              PASS if handled else FAIL, handled or f"no line matching /{re_handled.pattern}/ for {second}")
-    if handled:
-        rep.raw.append(f"--- log match ({arm})\n{handled}")
-    done = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card), after_ts=after), ctx.timeout)
-    rep.check(f"{arm}: origin chat `boomerang handled {card} (<kind>): <summary>` after the restart",
+    # 11-12 18:06: "handled" is the gateway's own verdict on the #restartN claim, not one log spelling.
+    # A retry child that surfaces the card is a handled wake (outcome `surfaced`); failed/lost are not.
+    label = f"{arm}: the second child handled the card (delegation {second or '?'})"
+    path = wake_state_path(ctx.live)
+    if path is None:
+        rep.check(label, SKIP, "live needs BV2_WAKE_STATE (the scratch gateway's kanban_boomerang_wake.json)")
+    else:
+        handled_set = _gateway_handled_outcomes()
+        term = ctx.poll(lambda: _restart_claim_terminal(path, card, second), ctx.timeout)
+        if not term:
+            rep.check(label, FAIL, f"no terminal `#restartN` claim for {card} (delegation {second or '?'}) in {path} "
+                                   f"within {ctx.timeout:.0f}s")
+        else:
+            key, entry = term
+            outcome = entry.get("outcome")
+            rep.check(label, PASS if outcome in handled_set else FAIL,
+                      f"claim `{key}` terminal outcome={outcome}"
+                      + ("" if outcome in handled_set else f" (not in the gateway's HANDLED_OUTCOMES; "
+                                                          f"reason={entry.get('reason')})"))
+    done = ctx.poll(lambda: find_chat(chat, re_restart_done_line(card), after_ts=after), ctx.timeout)
+    rep.check(f"{arm}: origin chat `boomerang handled {card} (<kind>): <summary>` or "
+              f"`[boomerang-wake] child surfaced {card}` after the restart",
               PASS if done else FAIL, done.content if done else "absent")
     if done:
         rep.raw.append(f"--- chat match ({arm})\n{done.content}")
