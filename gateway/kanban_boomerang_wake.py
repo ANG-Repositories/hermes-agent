@@ -12,8 +12,10 @@ dispatches a crash retry. It survives a gateway restart, and it resets when the 
 ``completed``/``archived`` (or when Ace surfaces-and-acts on it: :meth:`reset`).
 ``restart_spent[task_id]`` is a separate budget: the gateway-restart redispatches spent on the card's
 current wake. It never touches ``retries`` and a handled wake (``HANDLED_OUTCOMES``) clears it, so the
-restart retry is per wake while ``retries`` (crash retry + blocked assessment) stays per card lifetime
-(t_a256e37c).
+restart retry is per wake while ``retries`` (crash retry only) stays per card lifetime (t_a256e37c).
+``blocked_spent[task_id]`` is the blocked assessment's budget (t_5701751b): a handled wake clears it,
+except the blocked assessment's own ``retry`` verdict, so a worker that re-blocks after a retry with no
+handled wake in between still ends at the owner.
 
 Writes go through write-temp + ``os.replace`` under a process-wide lock: both wake paths
 run on threads of the ONE gateway process that owns this ``HERMES_HOME`` (spec §5.4,
@@ -47,6 +49,19 @@ HANDLED_OUTCOMES = frozenset({
 })
 
 _LOCK = threading.Lock()
+
+
+def _clears_blocked(entry: dict, outcome: object) -> bool:
+    """t_5701751b: a handled terminal outcome clears ``blocked_spent``, except the blocked assessment's
+    own ``retry`` (block, retry, re-block with no handled wake between must still reach the owner)."""
+    return outcome in HANDLED_OUTCOMES and not (entry.get("row") == "blocked_assess" and outcome == "retry")
+
+
+def _claimed_at(entry: dict) -> float:
+    try:
+        return float(entry.get("claimed_at") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 # t_827d5940: pending-handback retry backoff and dead-letter bounds; terminal-claim retention.
 BACKOFF_BASE_S = 10.0              # first retry 10 s after the first failed attempt, doubling...
@@ -92,7 +107,7 @@ class BoomerangWakeState:
             raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return {}
-        return self._migrate(raw) if isinstance(raw, dict) else {}
+        return self._migrate_blocked(self._migrate(raw)) if isinstance(raw, dict) else {}
 
     @classmethod
     def _migrate(cls, data: dict) -> dict:
@@ -116,6 +131,39 @@ class BoomerangWakeState:
                 if not retries[tid]:
                     del retries[tid]
         data["retries"], data["restart_spent"] = retries, spent
+        return data
+
+    @classmethod
+    def _migrate_blocked(cls, data: dict) -> dict:
+        """A pre-t_5701751b file has no ``blocked_spent``: a blocked assessment spent ``retries``. Move
+        the count the card's spending ``blocked_assess`` claims account for (capped by the counter)
+        from ``retries`` to the new map. The card starts cleared when a handled terminal claim (not a
+        blocked assessment) was claimed after its newest such assessment, else at ``blocked_spent=1``.
+        Crash-spent counts stay. Persisted by the next write, so it runs once. A count whose claim was
+        already pruned (CLAIM_TTL_S) cannot be told from a crash spend and stays in ``retries``."""
+        if isinstance(data.get("blocked_spent"), dict):
+            return data
+        retries, claims = cls._retries_of(data), cls._claims_of(data)
+        assessed: dict = {}
+        for k, v in claims.items():
+            if (isinstance(v, dict) and v.get("task_id") and v.get("row") == "blocked_assess"
+                    and "#restart" not in str(k) and not v.get("restart_redispatch")
+                    and not v.get("blocked_budget_exhausted")):
+                n, at = assessed.get(str(v["task_id"]), (0, 0.0))
+                assessed[str(v["task_id"])] = (n + 1, max(at, _claimed_at(v)))
+        spent = {}
+        for tid, (n, at) in assessed.items():
+            moved = min(n, retries.get(tid, 0))
+            if not moved:
+                continue
+            retries[tid] -= moved
+            if not retries[tid]:
+                del retries[tid]
+            if not any(isinstance(v, dict) and str(v.get("task_id")) == tid and v.get("row") != "blocked_assess"
+                       and v.get("state") == STATE_TERMINAL and v.get("outcome") in HANDLED_OUTCOMES
+                       and _claimed_at(v) > at for v in claims.values()):
+                spent[tid] = 1
+        data["retries"], data["blocked_spent"] = retries, spent
         return data
 
     def _write(self, data: dict) -> None:
@@ -175,8 +223,8 @@ class BoomerangWakeState:
             return spent[tid]
 
     @staticmethod
-    def _restart_spent_of(data: dict) -> dict:
-        raw = data.get("restart_spent")
+    def _restart_spent_of(data: dict, field: str = "restart_spent") -> dict:
+        raw = data.get(field)
         if not isinstance(raw, dict):
             return {}
         out = {}
@@ -191,19 +239,25 @@ class BoomerangWakeState:
         with _LOCK:
             return self._restart_spent_of(self._read()).get(str(task_id), 0)
 
+    def blocked_spent(self, task_id: str) -> int:
+        with _LOCK:
+            return self._restart_spent_of(self._read(), "blocked_spent").get(str(task_id), 0)
+
     def reset_counters(self, task_id: str) -> bool:
-        """Drop ``task_id``'s counters (``retries`` and ``restart_spent``); True when one existed.
+        """Drop ``task_id``'s counters (``retries``, ``restart_spent``, ``blocked_spent``); True when one existed.
 
         Not ``reset``: the loop-reachability gate binds calls by name, so ``ContextVar.reset``
         in ``_deliver_one`` resolved here and read as an on-loop fsync (t_630c5160)."""
         with _LOCK:
             data = self._read()
             retries, spent = self._retries_of(data), self._restart_spent_of(data)
+            blocked = self._restart_spent_of(data, "blocked_spent")
             had = retries.pop(str(task_id), None) is not None
             had = spent.pop(str(task_id), None) is not None or had
+            had = blocked.pop(str(task_id), None) is not None or had
             if not had:
                 return False
-            data["retries"], data["restart_spent"] = retries, spent
+            data["retries"], data["restart_spent"], data["blocked_spent"] = retries, spent, blocked
             self._write(data)
             return True
 
@@ -233,14 +287,14 @@ class BoomerangWakeState:
             if key in claims:
                 return False
             # A restart redispatch (``<key>#restartN``) re-runs a wake whose original claim already
-            # took its blocked-assessment budget; it must not spend ``retries`` again (t_a256e37c).
+            # took its blocked-assessment budget; it must not spend it again (t_a256e37c).
             if entry.get("row") == "blocked_assess" and not entry.get("restart_redispatch"):
-                retries = self._retries_of(data)
-                spent = int(retries.get(entry["task_id"], 0))
+                blocked = self._restart_spent_of(data, "blocked_spent")   # t_5701751b: own budget
+                spent = int(blocked.get(str(entry["task_id"]), 0))
                 entry["blocked_budget_exhausted"] = spent >= 1
                 if not entry["blocked_budget_exhausted"]:
-                    retries[entry["task_id"]] = spent + 1
-                    data["retries"] = retries
+                    blocked[str(entry["task_id"])] = spent + 1
+                    data["blocked_spent"] = blocked
             claims[key] = dict(entry)
             data["claims"] = claims
             self._write(data)
@@ -277,6 +331,10 @@ class BoomerangWakeState:
                 spent = self._restart_spent_of(data)   # t_a256e37c: per-wake restart budget
                 spent.pop(str(entry["task_id"]), None)
                 data["restart_spent"] = spent
+                if _clears_blocked(entry, fields["outcome"]):   # t_5701751b: per handled wake
+                    blocked = self._restart_spent_of(data, "blocked_spent")
+                    blocked.pop(str(entry["task_id"]), None)
+                    data["blocked_spent"] = blocked
             entry = {**entry, **fields}
             claims[key] = entry
             data["claims"] = claims
