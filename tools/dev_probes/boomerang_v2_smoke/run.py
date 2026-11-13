@@ -1192,9 +1192,19 @@ def _s4_hold_home_turn(ctx: Ctx, rep: StepReport, arm: str, card: str, pid_path:
 
     Order: wait for the child's first model call (agent.log, tagged with the child's session id), send
     the hold turn (``plan.commands.s4_hold_turn``: a foreground ``sleep`` longer than the drain), wait
-    until the scratch gateway counts it as active work (``gateway_state.json`` ``active_agents``)."""
+    until the scratch gateway counts it as active work (``gateway_state.json`` ``active_agents``).
+
+    The hold must stay in the HOME session (a turn in another session would time the drain out but its
+    interrupt never reaches this child), so the retry child forks a transcript that ends with it. The
+    hold therefore never names the card: only ``{chat}`` is filled, and a ``{card}`` placeholder is
+    refused (11-12 12:18 run: the retry child read "hold for <card>" as the card's deliverable)."""
     hold = ctx.plan.get("commands", {}).get("s4_hold_turn")
-    shown = "$ " + shlex.join(fill(hold or ["<plan.commands.s4_hold_turn>"], chat=ctx.chat_id, card=card))
+    if hold and any("{card}" in str(part) for part in hold):
+        rep.check(f"{arm}: hold turn does not name the card", FAIL,
+                  "plan.commands.s4_hold_turn uses {card}: the retry child forks the home transcript and would "
+                  "take the hold turn for the card's deliverable")
+        return False
+    shown = "$ " + shlex.join(fill(hold or ["<plan.commands.s4_hold_turn>"], chat=ctx.chat_id))
     if not ctx.live:
         rep.commands.append(shown + "   # dry-run: not executed")
         return True
@@ -1221,7 +1231,7 @@ def _s4_hold_home_turn(ctx: Ctx, rep: StepReport, arm: str, card: str, pid_path:
     if not call:
         return False
     rep.raw.append(f"--- agent.log match ({arm})\n{call}")
-    argv = [os.path.expanduser(a) for a in fill(hold, chat=ctx.chat_id, card=card)]
+    argv = [os.path.expanduser(a) for a in fill(hold, chat=ctx.chat_id)]
     print(shown, flush=True)
     try:
         # puppet.py posts, then polls for a reply until --wait; the hold turn will not reply in time,

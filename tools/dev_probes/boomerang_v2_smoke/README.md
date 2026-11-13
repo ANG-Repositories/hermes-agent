@@ -48,6 +48,12 @@ How the shutdown interrupt reaches a boomerang child, read from the code on main
   `gateway_state.json` `active_agents` is non-zero. Only then does it ask for the restart. The drain
   now times out on the home turn, its interrupt fans out to the child mid-call, and `run_entry` sees
   `status=interrupted` while `_draining` is set.
+- The hold must be a turn of the HOME session (a turn in another session times the drain out, but its
+  interrupt never reaches this child), so the retry child forks a home transcript that ends with the
+  interrupted hold. On 11-12 12:18 the hold named the card and the retry child took "run sleep 120 ...
+  reply S4-HOLD-DONE" for the card's deliverable (`request_changes` on the done fixture card). The hold
+  therefore never names the card: `s4_hold_turn` gets `{chat}` only, a `{card}` in it FAILs the arm
+  unsent, and the lane's message says it is harness scaffolding that later turns must ignore.
 - Without `s4_hold_turn` in the plan the arm records INCOMPLETE up front. If the hold turn is held
   but the shutdown line is still absent, read the old boot's `drain done ... timed_out=` line and the
   `PHASE=drain_timeout_turn` lines: a timed-out drain with no shutdown line is a #283 defect (the

@@ -263,7 +263,7 @@ def _hold_fixture(tmp_path, monkeypatch, *, model_call: bool, goes_active: bool)
     monkeypatch.setenv("BV2_GATEWAY_LOG", str(home / "logs" / "gateway.log"))
     ctx = run.Ctx.__new__(run.Ctx)
     ctx.live, ctx.timeout, ctx.tick, ctx.chat_id = True, 0.5, 0.05, "c"
-    ctx.plan = {"commands": {"s4_hold_turn": [sys.executable, str(hold), "{chat}", "{card}"]},
+    ctx.plan = {"commands": {"s4_hold_turn": [sys.executable, str(hold), "{chat}"]},
                 "expect": {}}
     return ctx, home / "gateway.pid", order
 
@@ -274,7 +274,7 @@ def test_step4_hold_turn_sent_only_after_the_childs_model_call(env, tmp_path, mo
     ctx, pid_path, order = _hold_fixture(tmp_path, monkeypatch, model_call=True, goes_active=True)
     rep = run.StepReport(4, "t", "live")
     assert run._s4_hold_home_turn(ctx, rep, "redispatch arm", "t_s4", pid_path) is True
-    assert order.read_text() == "hold c t_s4\n"
+    assert order.read_text() == "hold c\n"
     assert [c.result for c in rep.checks] == [run.PASS, run.PASS, run.PASS], [(c.name, c.detail) for c in rep.checks]
     assert "SENT id=1570000000000000001" in rep.checks[-1].detail
 
@@ -287,13 +287,24 @@ def test_step4_hold_turn_not_sent_before_the_child_calls_the_model(env, tmp_path
     assert rep.checks[-1].result == run.FAIL and "made a model call" in rep.checks[-1].name
 
 
+def test_step4_hold_turn_refuses_a_hold_that_names_the_card(env, tmp_path, monkeypatch):
+    """t_409de482 round 2: the retry child forks the home transcript, which ends with the hold turn; a hold
+    naming the card was taken for the card's deliverable (11-12 12:18), so a {card} hold is refused unsent."""
+    ctx, pid_path, order = _hold_fixture(tmp_path, monkeypatch, model_call=True, goes_active=True)
+    ctx.plan["commands"]["s4_hold_turn"].append("hold for {card}")
+    rep = run.StepReport(4, "t", "live")
+    assert run._s4_hold_home_turn(ctx, rep, "redispatch arm", "t_s4", pid_path) is False
+    assert not order.exists(), "a hold naming the card was sent"
+    assert rep.checks[-1].result == run.FAIL and "does not name the card" in rep.checks[-1].name
+
+
 def test_step4_hold_turn_fails_when_the_gateway_never_counts_it(env, tmp_path, monkeypatch):
     ctx, pid_path, order = _hold_fixture(tmp_path, monkeypatch, model_call=True, goes_active=False)
     real_poll = run.Ctx.poll
     monkeypatch.setattr(run.Ctx, "poll", lambda self, fn, window: real_poll(self, fn, min(window, 0.3)))
     rep = run.StepReport(4, "t", "live")
     assert run._s4_hold_home_turn(ctx, rep, "redispatch arm", "t_s4", pid_path) is False
-    assert order.read_text() == "hold c t_s4\n"
+    assert order.read_text() == "hold c\n"
     assert rep.checks[-1].result == run.FAIL and "active_agents stayed 0" in rep.checks[-1].detail
 
 
