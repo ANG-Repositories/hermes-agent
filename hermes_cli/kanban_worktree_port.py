@@ -793,6 +793,64 @@ def _on_branch(tree: Path, branch: str, runner: Callable) -> bool:
     return getattr(proc, "returncode", 1) == 0 and (proc.stdout or "").strip() == branch
 
 
+# -- stale branch_name (t_0a0c9ddc) ------------------------------------------------------------------------------
+# t_1e785f52 (2026-11-12, 2 h in ready): tasks.branch_name still named the archived parent's branch (commits the
+# tree lacks) while the card's own tree sat on its PR branch == origin. Every tick judged own_tree_off_branch, a
+# structural hold studio-override cannot clear. A tree on another NAMED branch whose HEAD is that branch's origin
+# tip holds nothing origin lacks: branch_name follows the tree. Anything else keeps today's refusal.
+BRANCH_REBOUND_EVENT = "branch_rebound"
+_NEVER_REBIND = frozenset({"main", "master"})
+
+
+def stale_branch(task_id: str, workspace_path: Optional[str], board_default: Optional[str], branch: str,
+                 runner: Callable = subprocess.run, *, allow_studio_tree: bool = False
+                 ) -> Optional[Tuple[str, str, str]]:
+    """``(own tree, the branch it is on, HEAD)`` when the card's own tree is on a named branch other than
+    ``branch`` and its HEAD is ``origin/<that branch>``; else None. Never a default branch. Read-only."""
+    top, own, refusal = workspace_repo(task_id, workspace_path, board_default, allow_studio_tree=allow_studio_tree)
+    if top is None or refusal is not None:
+        return None
+    if own is None:
+        cand = top / ".worktrees" / task_id
+        if not cand.exists() or _own_tree_of(cand, top) is not None:
+            return None
+        own = cand
+    cur = _tree_git(own, runner, "branch", "--show-current")
+    cur = (cur.stdout or "").strip() if cur is not None and getattr(cur, "returncode", 1) == 0 else ""
+    if not cur or cur == branch or cur in _NEVER_REBIND:
+        return None
+    head = _tree_head(own, runner)
+    if not head:
+        return None
+    # The remote itself, never a local ref (Prism 9c711a6dd8f7, aef8b937133f): its default branch must resolve and
+    # differ from ``cur``, and its live tip of ``cur`` must be HEAD. Unreadable or unresolved = keep the refusal.
+    ls = _tree_git(own, runner, "ls-remote", "--symref", "origin", "HEAD", f"refs/heads/{cur}")
+    if ls is None or getattr(ls, "returncode", 1) != 0:
+        return None
+    dflt, tip = None, ""
+    for line in (ls.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "ref:" and parts[2] == "HEAD":
+            dflt = parts[1]
+        elif len(parts) == 2 and parts[1] == f"refs/heads/{cur}":
+            tip = parts[0]
+    if not dflt or dflt == f"refs/heads/{cur}" or head != tip:
+        return None
+    return str(own), cur, head
+
+
+def rebind_branch(conn, task_id: str, old: str, tree: str, new: str, head: str) -> bool:
+    """Point ``branch_name`` at ``new`` (CAS on ``old``, unclaimed only) and record ``branch_rebound``."""
+    from hermes_cli import kanban_db as _kb
+    with _kb.write_txn(conn):
+        cur = conn.execute("UPDATE tasks SET branch_name=? WHERE id=? AND branch_name IS ? AND claim_lock IS NULL",
+                           (new, task_id, old))
+        if cur.rowcount != 1:
+            return False
+        _kb._append_event(conn, task_id, BRANCH_REBOUND_EVENT, {"from": old, "to": new, "head": head, "tree": tree})
+    return True
+
+
 def _origin_tip(repo: Path, branch: str, runner: Callable) -> Optional[str]:
     """Origin's current sha of ``refs/heads/<branch>``, read from the remote itself ("" = absent), None on error."""
     try:
