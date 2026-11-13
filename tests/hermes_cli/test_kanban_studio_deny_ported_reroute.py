@@ -499,3 +499,101 @@ def test_a_handed_over_card_never_materializes_on_a_pool_host(kanban_home, clean
             kwt.materialize_handover(conn, task, task.workspace_path, _pool_host(),
                                      runner=lambda argv, **kw: ran.append(argv))
     assert task.workspace_path == f"{path}-from-ace-ai" and ran == []
+
+
+def _tag_repos(root):
+    """remote.git with main + an annotated tag on a commit no branch holds (courierwatch-v1 shape)."""
+    import os
+    import subprocess
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+    def git(repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True,
+                              env=env).stdout.strip()
+
+    def clone(name):
+        d = root / name
+        git(root, "clone", "-q", str(root / "remote.git"), str(d))
+        return d
+
+    git(root, "init", "-q", "--bare", "remote.git")
+    seed = clone("seed")
+    (seed / "f.txt").write_text("one\n")
+    git(seed, "add", "f.txt")
+    git(seed, "commit", "-qm", "one")
+    git(seed, "push", "-q", "origin", "HEAD")
+    git(seed, "checkout", "-q", "--detach")
+    (seed / "f.txt").write_text("off-branch\n")
+    git(seed, "commit", "-qam", "off-branch")
+    git(seed, "tag", "-a", "-m", "v1", "courierwatch-v1")
+    git(seed, "push", "-q", "origin", "refs/tags/courierwatch-v1")
+    return git, clone, env
+
+
+def test_stranded_probe_ignores_a_tag_origin_already_has(tmp_path):
+    """t_19c48fb7: a clean clone that fetched an origin tag sitting on no remote branch is NOT stranded (the old
+    `rev-list --branches --tags --not --remotes` returned the tag's commit and held the card port_stranded); a
+    local-only tag on an unpushed commit and an unpushed branch commit ARE stranded; unreadable remote tags hold."""
+    import subprocess
+    import sys
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+
+    def proof(path):
+        return subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(path), "check"], capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    clean = clone("clean")
+    assert git(clean, "tag", "-l") == "courierwatch-v1"
+    assert git(clean, "rev-list", "--tags", "--not", "--remotes")  # the old probe's false positive
+    r = proof(clean)
+    assert (r.returncode, r.stdout.strip()) == (0, git(clean, "rev-parse", "HEAD")), r.stderr
+
+    local_tag = clone("local_tag")
+    git(local_tag, "checkout", "-q", "--detach")
+    (local_tag / "f.txt").write_text("mine\n")
+    git(local_tag, "commit", "-qam", "mine")
+    git(local_tag, "tag", "mine-v1")
+    git(local_tag, "checkout", "-q", "-")
+    r = proof(local_tag)
+    assert r.returncode == 13 and "local commits not on any remote" in r.stderr, (r.returncode, r.stderr)
+
+    moved_tag = clone("moved_tag")  # same NAME as origin's tag, different object: still local work
+    git(moved_tag, "checkout", "-q", "--detach")
+    (moved_tag / "f.txt").write_text("retagged\n")
+    git(moved_tag, "commit", "-qam", "retagged")
+    git(moved_tag, "tag", "-f", "-a", "-m", "v1 moved", "courierwatch-v1")
+    git(moved_tag, "checkout", "-q", "-")
+    r = proof(moved_tag)
+    assert r.returncode == 13 and "local commits not on any remote" in r.stderr, (r.returncode, r.stderr)
+
+    branch = clone("branch")
+    (branch / "f.txt").write_text("two\n")
+    git(branch, "commit", "-qam", "two")
+    r = proof(branch)
+    assert r.returncode == 13 and "local commits not on any remote" in r.stderr, (r.returncode, r.stderr)
+
+    blind = clone("blind")  # origin tags unreadable: unknown, held -- never "clean"
+    git(blind, "remote", "set-url", "origin", str(root / "gone.git"))
+    r = proof(blind)
+    assert r.returncode == 13 and "unknown" in r.stderr, (r.returncode, r.stderr)
+
+
+def test_reclaim_uses_the_same_stranded_predicate(tmp_path):
+    """kanban_reclaim's call site: the origin-tag clone is clean, an unpushed commit holds, unreadable tags hold."""
+    from hermes_cli import kanban_reclaim as kr
+    root = tmp_path.resolve()
+    git, clone, _env = _tag_repos(root)
+    clean = clone("clean")
+    assert kr._repo_dirt(clean, "clean", root, {clean}, []) is None
+    branch = clone("branch")
+    (branch / "f.txt").write_text("two\n")
+    git(branch, "commit", "-qam", "two")
+    with pytest.raises(kr.ReclaimHeld, match="local commits not on any remote"):
+        kr._repo_dirt(branch, "branch", root, {branch}, [])
+    blind = clone("blind")
+    git(blind, "remote", "set-url", "origin", str(root / "gone.git"))
+    with pytest.raises(kr.ReclaimHeld, match="unknown"):
+        kr._repo_dirt(blind, "blind", root, {blind}, [])
