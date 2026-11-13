@@ -218,25 +218,14 @@ def decompose_triage_task(
                     f"{root_origin}\n\n{child_body}"
                     if (child_body or "").strip() else root_origin
                 )
-            conn.execute(
-                "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by, session_id, boomerang_wake) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    new_id,
-                    title,
-                    child_body,
-                    assignee,
-                    child_ws_kind,
-                    child_ws_path,
-                    tenant,
-                    now,
-                    (author or "decomposer"),
-                    root_home,
-                    1 if child_boomerang else 0,
-                ),
-            )
+            # The one task INSERT, with the stored-body check (t_41763e36).
+            _kb._insert_task_row(conn, {
+                'id': new_id, 'title': title, 'body': child_body, 'assignee': assignee,
+                'status': 'todo', 'workspace_kind': child_ws_kind,
+                'workspace_path': child_ws_path, 'tenant': tenant, 'created_at': now,
+                'created_by': (author or "decomposer"), 'session_id': root_home,
+                'boomerang_wake': 1 if child_boomerang else 0,
+            })
             write_card_boomerang_wake(conn, new_id, 1 if child_boomerang else 0)
             _append_event(
                 conn, new_id, "created",
@@ -291,51 +280,3 @@ def decompose_triage_task(
     if auto_promote:
         recompute_ready(conn)
     return child_ids
-
-
-def _insert_decomposed_child(
-    conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
-    author: Optional[str], now: int,
-) -> str:
-    """Insert one decomposed child as ``todo`` (linked under the root later so
-    the dispatcher only ever sees a coherent graph); returns its id.
-
-    Workspace: per-child override wins, else inherit the root's kind. Path
-    inherits only when kinds match (a 'dir' child must not point at the
-    root's worktree) and NEVER for worktrees — siblings dispatch concurrently
-    and one shared checkout would put them all on the first sibling's branch
-    with no lock; leaving it unset makes dispatch materialize a fresh
-    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
-    """
-    from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
-    )
-
-    root_ws_kind = root_row["workspace_kind"] or "scratch"
-    child_ws_kind = child.get("workspace_kind") or root_ws_kind
-    if child.get("workspace_path"):
-        child_ws_path = child.get("workspace_path")
-    elif child_ws_kind == "worktree":
-        child_ws_path = None
-    elif child_ws_kind == root_ws_kind:
-        child_ws_path = root_row["workspace_path"]
-    else:
-        child_ws_path = None
-    new_id = _new_task_id()
-    body = child.get("body")
-    conn.execute(
-        "INSERT INTO tasks "
-        "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
-        (
-            new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
-        ),
-    )
-    _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
-    )
-    inherit_creator_origin(conn, new_id, root_id, created_at=now)
-    return new_id

@@ -234,3 +234,116 @@ def test_failfast_reroute_writes_a_reasoned_line(board, monkeypatch):
     assert "studio-state" in khc.declared_words(body), body
     assert body.rstrip().endswith("requires: studio-state (re-routed after STUDIO_STATE_ABSENT on ace-ai)")
     _all_stored_pass()
+
+
+# ── t_41763e36: three gaps after agent PR 303 ────────────────────────────────────────────────────
+
+def test_tool_result_carries_the_not_inherited_line(board):
+    """The creating agent reads the tool result, not the process stderr."""
+    from tools import kanban_tools as kt
+    parent = _parent()
+    out = json.loads(kt._handle_create({"board": "default", "title": "child", "assignee": "peer",
+                                        "body": "child work", "parents": [parent],
+                                        "parents_kind": "derived-from", "unhomed": True}))
+    assert out.get("ok") is True, out
+    note = out.get("requires_not_inherited") or ""
+    assert note.startswith(f"{kri.NOT_INHERITED_PREFIX}studio-state (from {parent})"), out
+    plain = json.loads(kt._handle_create({"board": "default", "title": "orphan", "assignee": "peer",
+                                          "body": "work", "unhomed": True}))
+    assert "requires_not_inherited" not in plain, plain
+
+
+def test_failure_ownership_card_with_a_bare_pin_is_refused_like_create_task(board):
+    """kanban_failure_ownership inserts its owner card itself; the stored-body check still runs."""
+    from hermes_cli import kanban_failure_ownership as fo
+    key = json.dumps([1, "fleet", "", "github.com", 1, 2, ".github/workflows/ci.yml", [],
+                      [["os", "linux"]], "suite", "unit:invocation", "pytest-node", "tests/t.py::t"],
+                     separators=(",", ":"))
+    obs = fo.Observation(key=key, source_key="red", result="failure", sha="a" * 40, run_id=1,
+                         attempt=1, job_id=1, lineage=("a" * 40,), policy_generation=1)
+    with kbc.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE failure_producers SET enabled=1,enrolled=1")
+            conn.execute("UPDATE failure_authority SET mode='on'")
+        ref = fo.publish_evidence(conn, json.dumps(fo.asdict(obs)).encode(), verifier=lambda _: obs)
+        card = fo.prepare_card(conn, title="repair", body="fix the red\nrequires: studio-state",
+                               assignee=None, session_id="operator")
+        result = fo.observe_failure(conn, ref, producer="ci-red-owner", card_spec=card)
+        assert result.action == "EVIDENCE_PENDING" and result.card_id is None, result
+        assert REFUSAL in result.reason, result
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+        with pytest.raises(kri.StoredBodyRefused, match=REFUSAL):    # the same refusal create_task gives
+            kb.create_task(conn, title="repair", assignee="peer", body="fix the red\nrequires: studio-state")
+        reasoned = fo.prepare_card(conn, title="repair", assignee=None, session_id="operator",
+                                   body="fix the red\nrequires: studio-state (reads the live board file)")
+        assert fo.reconcile_pending(conn, producer="ci-red-owner", card_spec=reasoned)[0].card_id
+    _all_stored_pass()
+
+
+_INSERT_TASKS_RE = __import__("re").compile(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+[\"'`]?tasks\b", __import__("re").I)
+
+
+def _unchecked_task_inserts(root: Path):
+    """Every ``INSERT INTO tasks`` in shipped Python outside ``kanban_db._insert_task_row``."""
+    import ast
+    hits = []
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        if rel.parts[0] in {"tests", ".venv", "venv", "node_modules", ".git", "website", "web"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if not _INSERT_TASKS_RE.search(text):
+            continue
+        allowed = set()
+        if rel.as_posix() == "hermes_cli/kanban_db.py":
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.FunctionDef) and node.name == "_insert_task_row":
+                    allowed = set(range(node.lineno, node.end_lineno + 1))
+        for n, line in enumerate(text.splitlines(), 1):
+            if _INSERT_TASKS_RE.search(line) and n not in allowed:
+                hits.append(f"{rel}:{n}")
+    return hits
+
+
+def test_every_task_insert_goes_through_the_checked_path():
+    """Source contract: _insert_task_row is the one INSERT INTO tasks; it runs the stored-body check.
+    A new raw insert anywhere in shipped code fails here: route it through kanban_db._insert_task_row."""
+    repo = Path(__file__).resolve().parents[2]
+    assert _unchecked_task_inserts(repo) == []
+    import inspect
+    assert "stored_refusal" in inspect.getsource(kb._insert_task_row)
+
+
+def test_source_contract_catches_a_planted_insert(tmp_path):
+    (tmp_path / "hermes_cli").mkdir()
+    (tmp_path / "hermes_cli" / "kanban_db.py").write_text(
+        "def _insert_task_row(conn, f):\n    conn.execute('INSERT INTO tasks (id) VALUES (?)', (1,))\n")
+    assert _unchecked_task_inserts(tmp_path) == []
+    (tmp_path / "hermes_cli" / "new_writer.py").write_text(
+        "def mint(conn):\n    conn.execute(\n        \"INSERT OR IGNORE INTO tasks (id, body) VALUES (?, ?)\", (1, 'b'))\n")
+    assert _unchecked_task_inserts(tmp_path) == ["hermes_cli/new_writer.py:3"]
+
+
+def test_parent_rehomed_before_the_write_lock_keeps_the_inherited_line(board, monkeypatch):
+    """kanban_db create_task re-resolves the home under the write lock and rebuilds the body from the
+    caller's text; the inherited ``requires:`` line used to be lost on that rebuild."""
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="peer", body=PARENT, session_id="sess-a")
+    real = kb._resolve_birth_session
+    calls = []
+
+    def racing(c, *a, **k):
+        out = real(c, *a, **k)
+        calls.append(out)
+        if len(calls) == 1:
+            with kbc.connect_closing() as other:
+                other.execute("UPDATE tasks SET session_id = 'sess-b' WHERE id = ?", (parent,))
+                other.commit()
+        return out
+
+    monkeypatch.setattr(kb, "_resolve_birth_session", racing)
+    with kbc.connect_closing() as conn:
+        child = kb.create_task(conn, title="child", assignee="peer", body="child work", parents=[parent])
+        assert kb.get_task(conn, child).session_id == "sess-b"       # the race really happened
+    assert len(calls) == 2 and calls[0] != calls[1], calls
+    assert "docker" in khc.declared_words(_body(child)), _body(child)

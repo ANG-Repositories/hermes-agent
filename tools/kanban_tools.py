@@ -1733,10 +1733,13 @@ def _handle_create(args: dict, **kw) -> str:
         from hermes_cli.kanban_boomerang_default import wake_route
         from hermes_cli.kanban_create_placement import preview_line
         placement = preview_line(conn, new_tid)  # t_0a5740f3: where it will run, which line decided it
+        from hermes_cli.kanban_requires_inherit import not_inherited_note
+        not_inherited = not_inherited_note(conn, new_tid)  # t_41763e36: the caller sees it here
         # ``wake_route``: whether any chat will actually be woken (never assumed).
         return _ok(task_id=new_tid, **landed, **gate, subscribed=subscribed,
                    wake_route=wake_route(conn, new_tid),
                    **({"placement": placement} if placement else {}),
+                   **({"requires_not_inherited": not_inherited} if not_inherited else {}),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
