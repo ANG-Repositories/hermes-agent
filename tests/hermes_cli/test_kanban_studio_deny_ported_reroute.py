@@ -581,12 +581,69 @@ def test_stranded_probe_ignores_a_tag_origin_already_has(tmp_path):
     assert r.returncode == 13 and "unknown" in r.stderr, (r.returncode, r.stderr)
 
 
+def test_remote_proof_tip_equality_mutant_holds_the_behind_clone(tmp_path, monkeypatch):
+    """Mutation: drop the reachability walk (tip-equality only, the pre-t_3af8cae9 rule) and the test below is red."""
+    from hermes_cli import kanban_survivor as ks
+    mutant = ks._REMOTE_PROOF.replace("for f in '','HEAD','refs/heads/':", "for f in ():")
+    assert mutant != ks._REMOTE_PROOF
+    monkeypatch.setattr(ks, "_REMOTE_PROOF", mutant)
+    with pytest.raises(AssertionError, match="HEAD has no independently durable ref"):
+        test_remote_proof_head_reachable_not_tip_equal(tmp_path)
+
+
+def test_remote_proof_head_reachable_not_tip_equal(tmp_path):
+    """t_3af8cae9: a clean clone whose HEAD is one commit behind origin's branch tip (main moved after the claim; the
+    clone never fetched it) is NOT held -- the old proof wanted HEAD to be the exact TIP of a remote ref and held
+    t_6e7909d1/t_a982e7eb `HEAD has no independently durable ref`. A detached commit on no remote ref IS held; a
+    remote that cannot be read holds as unknown, never clean."""
+    import subprocess
+    import sys
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    git(root / "remote.git", "tag", "-d", "courierwatch-v1")  # no tags: the stranded() tag read is not the gate here
+
+    def proof(path):
+        return subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(path), "check"], capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    behind, detached, blind = clone("behind"), clone("detached"), clone("blind")
+    seed = root / "seed"
+    branch = git(behind, "symbolic-ref", "--short", "HEAD")
+    git(seed, "checkout", "-q", "-B", branch, f"origin/{branch}")
+    (seed / "f.txt").write_text("two\n")
+    git(seed, "commit", "-qam", "two")
+    git(seed, "push", "-q", "origin", branch)
+    head, tip = git(behind, "rev-parse", "HEAD"), git(seed, "rev-parse", "HEAD")
+    assert git(seed, "rev-parse", "HEAD~1") == head != tip
+    assert head not in git(behind, "ls-remote", "origin")  # no remote ref is AT the clone's HEAD
+    r = proof(behind)
+    assert (r.returncode, r.stdout.strip()) == (0, head), r.stderr
+
+    git(detached, "checkout", "-q", "--detach")
+    (detached / "f.txt").write_text("mine\n")
+    git(detached, "commit", "-qam", "mine")
+    r = proof(detached)
+    assert r.returncode == 13 and "HEAD has no independently durable ref" in r.stderr, (r.returncode, r.stderr)
+
+    git(blind, "remote", "set-url", "origin", str(root / "gone.git"))
+    r = proof(blind)
+    assert r.returncode == 13 and "unknown" in r.stderr, (r.returncode, r.stderr)
+
+
 def test_reclaim_uses_the_same_stranded_predicate(tmp_path):
     """kanban_reclaim's call site: the origin-tag clone is clean, an unpushed commit holds, unreadable tags hold."""
     from hermes_cli import kanban_reclaim as kr
     root = tmp_path.resolve()
     git, clone, _env = _tag_repos(root)
     clean = clone("clean")
+    assert kr._repo_dirt(clean, "clean", root, {clean}, []) is None
+    seed = root / "seed"  # t_3af8cae9: origin moves on; the clone's HEAD is now behind the tip, still not held
+    br = git(clean, "symbolic-ref", "--short", "HEAD")
+    git(seed, "checkout", "-q", "-B", br, f"origin/{br}")
+    (seed / "f.txt").write_text("moved\n")
+    git(seed, "commit", "-qam", "moved")
+    git(seed, "push", "-q", "origin", br)
     assert kr._repo_dirt(clean, "clean", root, {clean}, []) is None
     branch = clone("branch")
     (branch / "f.txt").write_text("two\n")

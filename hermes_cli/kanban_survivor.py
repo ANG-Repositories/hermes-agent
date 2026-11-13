@@ -3932,11 +3932,25 @@ F=("*.pyc", ".coverage")
 p=Path(sys.argv[1])
 if not p.is_absolute() or str(p.resolve())!=str(p) or p.is_symlink(): sys.exit(12)
 if not p.exists(): sys.exit(0)
-def git(repo,*args):
- r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=12,stdin=subprocess.DEVNULL)
+def git(repo,*args,i=None):
+ r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=8 if args[0]=='fetch' else 12,**({'input':i.encode()} if i else {'stdin':subprocess.DEVNULL}))
  if r.returncode: raise RuntimeError('git proof failed')
  return r.stdout.decode('utf-8','surrogateescape')
-'''+_STRANDED_SRC+r'''def res(s):
+'''+_STRANDED_SRC+r'''def durable(d,sha):
+ a=[];p=[]
+ try:
+  for r in git(d,'remote').split(): a+=[(r,*l.split('\t')) for l in git(d,'ls-remote',r).splitlines()]
+  if any(s==sha for _,s,_ in a): return 1
+  for f in '','HEAD','refs/heads/':
+   for r in {x[0] for x in a} if f else ():
+    m=[s for q,s,n in a if q==r and n.startswith(f) and s not in p]
+    if m: git(d,'fetch','-q','--no-tags','--no-write-fetch-head',r,*m)
+   p={l.split()[0] for l in git(d,'cat-file','--batch-check',i=''.join(s+'\n' for _,s,_ in a)).splitlines() if l.split()[1]=='commit'} if a else p
+   if p and git(d,'rev-list','--count','--stdin',i='HEAD\n'+''.join('^'+s+'\n' for s in p)).strip()=='0': return 1
+  sh=git(d,'rev-parse','--is-shallow-repository').strip()=='true'
+ except Exception: raise RuntimeError('remote unreadable: HEAD durability unknown')
+ if sh: raise RuntimeError('shallow clone: HEAD durability unknown')
+def res(s):
  q=[x for x in s.rstrip('/').split('/') if x]
  ds=q if s.endswith('/') else q[:-1]
  return bool(q) and (any(x in R for x in ds) or (not s.endswith('/') and any(fnmatch.fnmatchcase(q[-1],f) for f in F)))
@@ -3961,10 +3975,7 @@ def prove(d):
   if git(d,'stash','list'): raise RuntimeError('stashes')
   w=stranded(git,d)
   if w: raise RuntimeError(w)
-  sha=git(d,'rev-parse','HEAD').strip()
-  remotes=git(d,'remote').splitlines()
-  if not any(any(line.split()[0]==sha for line in git(d,'ls-remote',remote).splitlines()) for remote in remotes):
-   raise RuntimeError('HEAD has no independently durable ref')
+  if not durable(d,git(d,'rev-parse','HEAD').strip()): raise RuntimeError('HEAD has no independently durable ref')
   return
  for f in d.iterdir():
   if f.is_symlink() or not f.is_dir(): raise RuntimeError('unpreserved scratch files')
