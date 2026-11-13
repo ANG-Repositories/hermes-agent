@@ -363,7 +363,8 @@ def pre_failover(agent: Any, reason: Any,
         # on class; only quota_model / rate_upstream / refusal / unclassified
         # reach their old behaviour.
         skip = fp.skips_quota_gate(cls)
-        plan = FailoverPlan(cls, window, skip, skip, False, ra, reset)
+        plan = FailoverPlan(cls, window, skip,
+                            fp.skips_legacy_arm(cls, getattr(agent, "provider", "")), False, ra, reset)
         if on_fallback(agent):
             key = key_for(agent)
             state = _state(key)

@@ -27,7 +27,7 @@ from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
     STATUS_EXHAUSTED, _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
-    credential_pool_matches_provider, resolve_runtime_pool_key,
+    credential_pool_matches_provider, relay_lane_quota_is_relays, resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
@@ -1006,6 +1006,13 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
     if current_entry is None:
         current_entry = pool.current()
     current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
+    if current_last_status == STATUS_EXHAUSTED and relay_lane_quota_is_relays(
+        getattr(pool, "provider", None), getattr(current_entry, "last_error_code", None),
+        getattr(current_entry, "failure_reason", None),
+    ):
+        # t_d780729d: a stored seat-quota row on a relay lane is not evidence; the relay's
+        # refusal on THIS request is. Take the normal retry-then-rotate path.
+        current_last_status = None
     if current_last_status == STATUS_EXHAUSTED:
         _ra().logger.info(
             "Credential already exhausted (last_status=%s) — rotating immediately instead of retrying",
