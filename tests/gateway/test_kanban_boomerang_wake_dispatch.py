@@ -2195,6 +2195,28 @@ def test_blocked_assessment_runs_again_after_a_handled_wake(env, first):
     assert state.blocked_spent(tid) == 1 and state.retries(tid) == 0
 
 
+def test_blocked_surface_then_reblock_runs_a_second_assessment(env):
+    """(a') block -> assessment surfaces -> block again, nothing else between: the surfaced assessment
+    is a handled wake (the owner was told), so it clears its own spend and the second one runs
+    (Apollo ruling on Prism 0a3f8a38c114)."""
+    tid = _card(env)
+    _sub(tid)
+    _block(tid)
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "surface"))
+    state = ah.BoomerangWakeState()
+    assert state.get_claim(entry["key"])["outcome"] == "surfaced"
+    assert state.blocked_spent(tid) == 0
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+    _block(tid, "failed again")
+    _tick(env)
+    second = env["dispatched"][-1]
+    assert second is not entry and second["blocked_budget_exhausted"] is False
+    assert state.blocked_spent(tid) == 1 and state.retries(tid) == 0
+
+
 def test_blocked_retry_then_reblock_without_a_handled_wake_reaches_the_owner(env):
     """(b) block -> assess retry -> worker blocks again, nothing handled between: exhausted, one
     owner line, and the retry verdict did not refill the budget."""
@@ -2237,10 +2259,10 @@ def test_pre_blocked_spent_file_migrates_once(tmp_path):
     path = tmp_path / "kanban_boomerang_wake.json"
     path.write_text(json.dumps({
         "retries": {"t_blk": 1, "t_blk_handled": 1, "t_crash": 1, "t_both": 2, "t_both_handled": 2,
-                    "t_retry_only": 1},
+                    "t_retry_only": 1, "t_two_blk": 2, "t_blk_open": 1},
         "restart_spent": {"t_blk": 1},
         "claims": {
-            # blocked-only, nothing handled after it
+            # blocked-only, newest assessment surfaced: a handled wake itself, starts cleared
             "b|t_blk|1": {"task_id": "t_blk", "row": "blocked_assess", "state": "terminal",
                           "outcome": "surfaced", "claimed_at": 100.0},
             "b|t_blk|1#restart1": {"task_id": "t_blk", "row": "blocked_assess", "restart_redispatch": True,
@@ -2268,16 +2290,30 @@ def test_pre_blocked_spent_file_migrates_once(tmp_path):
             # a crash spend with no blocked_assess claim on file
             "b|t_retry_only|1": {"task_id": "t_retry_only", "row": "completed", "state": "terminal",
                                  "outcome": "complete", "claimed_at": 100.0},
+            # two assessments with a reset between (old claim() spent only at 0): retries 2 = 1 blocked +
+            # 1 crash, so only ONE moves and the crash spend stays (Prism 49788caba26d); the newest
+            # assessment ended ``retry`` with nothing handled after it, so it starts spent
+            "b|t_two_blk|1": {"task_id": "t_two_blk", "row": "blocked_assess", "state": "terminal",
+                              "outcome": "surfaced", "claimed_at": 100.0},
+            "b|t_two_blk|2": {"task_id": "t_two_blk", "row": "crash_first_occurrence", "state": "terminal",
+                              "outcome": "retry", "claimed_at": 150.0},
+            "b|t_two_blk|3": {"task_id": "t_two_blk", "row": "blocked_assess", "state": "terminal",
+                              "outcome": "retry", "claimed_at": 200.0},
+            # an assessment still open: starts spent
+            "b|t_blk_open|1": {"task_id": "t_blk_open", "row": "blocked_assess", "claimed_at": 100.0},
         }}))
     state = ah.BoomerangWakeState(path)
     got = {t: (state.retries(t), state.blocked_spent(t), state.restart_spent(t))
-           for t in ("t_blk", "t_blk_handled", "t_crash", "t_both", "t_both_handled", "t_retry_only")}
-    assert got == {"t_blk": (0, 1, 1), "t_blk_handled": (0, 0, 0), "t_crash": (1, 0, 0),
-                   "t_both": (1, 1, 0), "t_both_handled": (1, 0, 0), "t_retry_only": (1, 0, 0)}
+           for t in ("t_blk", "t_blk_handled", "t_crash", "t_both", "t_both_handled", "t_retry_only",
+                     "t_two_blk", "t_blk_open")}
+    assert got == {"t_blk": (0, 0, 1), "t_blk_handled": (0, 0, 0), "t_crash": (1, 0, 0),
+                   "t_both": (1, 1, 0), "t_both_handled": (1, 0, 0), "t_retry_only": (1, 0, 0),
+                   "t_two_blk": (1, 1, 0), "t_blk_open": (0, 1, 0)}
     state.bump_retry("t_crash")
     doc = json.loads(path.read_text())
-    assert doc["retries"] == {"t_crash": 2, "t_both": 1, "t_both_handled": 1, "t_retry_only": 1}
-    assert doc["blocked_spent"] == {"t_blk": 1, "t_both": 1}
+    assert doc["retries"] == {"t_crash": 2, "t_both": 1, "t_both_handled": 1, "t_retry_only": 1,
+                              "t_two_blk": 1}
+    assert doc["blocked_spent"] == {"t_both": 1, "t_two_blk": 1, "t_blk_open": 1}
     # migrated once: a later blocked claim spends the new map, never ``retries``
     assert state.claim("b|t_crash|9", {"task_id": "t_crash", "row": "blocked_assess"})
     assert (state.retries("t_crash"), state.blocked_spent("t_crash")) == (2, 1)

@@ -137,8 +137,9 @@ class BoomerangWakeState:
     def _migrate_blocked(cls, data: dict) -> dict:
         """A pre-t_5701751b file has no ``blocked_spent``: a blocked assessment spent ``retries``. Move
         the count the card's spending ``blocked_assess`` claims account for (capped by the counter)
-        from ``retries`` to the new map. The card starts cleared when a handled terminal claim (not a
-        blocked assessment) was claimed after its newest such assessment, else at ``blocked_spent=1``.
+        from ``retries`` (at most 1 per card) to the new map. The card starts cleared when a terminal claim
+        at or after its newest such assessment (that one included) clears per ``_clears_blocked``, else
+        at ``blocked_spent=1``.
         Crash-spent counts stay. Persisted by the next write, so it runs once. A count whose claim was
         already pruned (CLAIM_TTL_S) cannot be told from a crash spend and stays in ``retries``."""
         if isinstance(data.get("blocked_spent"), dict):
@@ -153,15 +154,19 @@ class BoomerangWakeState:
                 assessed[str(v["task_id"])] = (n + 1, max(at, _claimed_at(v)))
         spent = {}
         for tid, (n, at) in assessed.items():
-            moved = min(n, retries.get(tid, 0))
+            # The old claim() spent ``retries`` only at 0, so at most ONE blocked spend survives in it;
+            # more claims on file means a reset zeroed the earlier ones (Prism 49788caba26d).
+            moved = min(1, retries.get(tid, 0))
             if not moved:
                 continue
             retries[tid] -= moved
             if not retries[tid]:
                 del retries[tid]
-            if not any(isinstance(v, dict) and str(v.get("task_id")) == tid and v.get("row") != "blocked_assess"
-                       and v.get("state") == STATE_TERMINAL and v.get("outcome") in HANDLED_OUTCOMES
-                       and _claimed_at(v) > at for v in claims.values()):
+            # Same rule as the runtime (_clears_blocked), applied from the newest assessment on, that
+            # assessment included: it starts spent only when it ended ``retry``, failed, was lost or is
+            # still open, and nothing handled came after it (Apollo ruling on Prism 0a3f8a38c114).
+            if not any(isinstance(v, dict) and str(v.get("task_id")) == tid and v.get("state") == STATE_TERMINAL
+                       and _clears_blocked(v, v.get("outcome")) and _claimed_at(v) >= at for v in claims.values()):
                 spent[tid] = 1
         data["retries"], data["blocked_spent"] = retries, spent
         return data

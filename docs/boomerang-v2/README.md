@@ -173,16 +173,19 @@ Three budgets live in that file, one per kind of automatic second try (t_5701751
 | `blocked_spent[task_id]` | a blocked assessment (`blocked_assess` claim) | any claim on the card going terminal with a handled outcome (list below), except the blocked assessment's own `retry` verdict. Also the `retries` resets. |
 | `restart_spent[task_id]` | a gateway-restart redispatch | any claim on the card going terminal with a handled outcome. Also the `retries` resets. |
 
-A card gets one blocked assessment per handled wake: block, assessment (surface), a later handled
-wake (a review handled, a complete, an acknowledge), block again, and the second block is assessed.
-The assessment's own `retry` does not refill its budget, so block, `retry`, block again with no
-handled wake in between ends at the owner (`blocked assessment budget exhausted; owner assessment
-required`) rather than looping on worker runs. A `#restartN` redispatch of a blocked assessment
-spends none of the three. A state file from before this change (no `blocked_spent`) is migrated on
-first read: the count a card's spending `blocked_assess` claims account for (capped by its `retries`)
-leaves `retries`; the card starts cleared when a handled non-blocked claim was claimed after its newest
-assessment, else at `blocked_spent=1`. Crash spends stay, and a blocked spend whose claim was already
-pruned (7 days) cannot be told apart from one and stays in `retries`. The next write persists it.
+A card gets one automatic blocked assessment without a handled wake in between. Any handled wake
+clears the budget, the assessment's own included: an assessment that surfaces to the owner (or ends
+stale/superseded) is itself a handled wake, so the next block is assessed again. The one case that
+stays spent has no owner in the loop: the assessment says `retry` and the worker blocks again, which
+ends at the owner (`blocked assessment budget exhausted; owner assessment required`) rather than
+looping on worker runs. An assessment that fails or is lost also stays spent. A `#restartN`
+redispatch of a blocked assessment spends none of the three. A state file from before this change
+(no `blocked_spent`) is migrated on first read: at most one count per card with a spending
+`blocked_assess` claim on file leaves `retries` (the old code spent it only at 0). The card starts
+cleared when a claim at or after its newest assessment, that assessment included, ended with a
+clearing outcome (same rule as above), else at `blocked_spent=1`. Crash spends stay, and a blocked
+spend whose claim was already pruned (7 days) cannot be told apart from one and stays in `retries`.
+The next write persists it.
 
 ## 4. The boomerang wake level
 
