@@ -599,6 +599,7 @@ def _manage_thinking_signatures(
     )
     contiguous = preserve_thinking and thinking_window == "contiguous"
     last_assistant_idx = next((i for i in range(len(result) - 1, -1, -1) if result[i].get("role") == "assistant"), None)
+    volatile_idx = None
     for idx, m in _assistant_block_lists(result):
         if is_kimi:
             pass  # shared cleanup below still strips cache markers + the flag
@@ -609,20 +610,68 @@ def _manage_thinking_signatures(
                 if _block_type(b) not in _THINKING_TYPES or not (b.get("signature") or b.get("data"))
             ]
             m["content"] = new_content or [_text_block("(empty)")]
-        elif is_third_party or (idx != last_assistant_idx and not contiguous):
-            m["content"] = _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
-        elif idx != last_assistant_idx:
-            # Orphan-stripping mutated THIS turn: every signature on it is dead, same as the latest-turn rule.
-            keep = [] if m.get("_thinking_signature_invalidated") else _keep_signed_thinking_only(m["content"])
-            m["content"] = (keep or _strip_thinking(m["content"])) or [_text_block("(thinking elided)")]
+        elif is_third_party or idx != last_assistant_idx:
+            m["content"] = _older_turn_thinking(m, contiguous=contiguous and not is_third_party)
         else:
+            as_older = _older_turn_thinking(m, contiguous=contiguous)
             new_content = _keep_valid_latest_thinking(m["content"], bool(m.get("_thinking_signature_invalidated")))
             m["content"] = new_content or [_text_block("(empty)")]
+            if _wire_blocks(m["content"]) != _wire_blocks(as_older):
+                volatile_idx = idx
         # cache_control on thinking blocks interferes with signature validation.
         for b in m["content"]:
             if _block_type(b) in _THINKING_TYPES:
                 b.pop("cache_control", None)
         m.pop("_thinking_signature_invalidated", None)  # internal flag, never on the wire
+    if volatile_idx is not None:
+        _hoist_markers_before(result, volatile_idx)
+
+
+def _older_turn_thinking(m: Dict[str, Any], *, contiguous: bool) -> List[Any]:
+    """The thinking an assistant turn is sent with once it is no longer the latest one."""
+    if not contiguous:
+        return _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
+    # Orphan-stripping mutated THIS turn: every signature on it is dead, same as the latest-turn rule.
+    keep = [] if m.get("_thinking_signature_invalidated") else _keep_signed_thinking_only(m["content"])
+    return (keep or _strip_thinking(m["content"])) or [_text_block("(thinking elided)")]
+
+
+def _wire_blocks(blocks: List[Any]) -> List[Any]:
+    """Blocks as the cache compares them: ``cache_control`` is not part of the prefix bytes."""
+    return [{k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b for b in blocks]
+
+
+def _hoist_markers_before(result: List[Dict[str, Any]], volatile_idx: int) -> None:
+    """Move every cache breakpoint at or after ``volatile_idx`` onto the messages before it.
+
+    The latest assistant turn is sent with its thinking now and without it next request
+    (``_keep_valid_latest_thinking`` vs ``_older_turn_thinking``), so its bytes change and a
+    breakpoint on or after it writes an entry no later request can read: every thinking tool-loop
+    step re-wrote the whole conversation on the a-family lanes (t_65e9cc2c). The messages before it
+    are final, so their breakpoints are read back next request. The final message is exempt: no
+    later request reuses a request that ends on it, and nothing follows it to move markers from.
+    """
+    if volatile_idx >= len(result) - 1:
+        return
+    removed: List[Dict[str, Any]] = []
+    for m in result[volatile_idx:]:
+        content = m.get("content")
+        if isinstance(cc := m.pop("cache_control", None), dict):
+            removed.append(cc)
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and isinstance(cc := b.pop("cache_control", None), dict):
+                removed.append(cc)
+    for m in reversed(result[:volatile_idx]):
+        if not removed:
+            break
+        if isinstance(m.get("content"), str):  # same prompt bytes as one text block
+            m["content"] = [_text_block(m["content"])]
+        content = m.get("content")
+        if not isinstance(content, list) or any(_cache_control_of(b) for b in content) or m.get("cache_control"):
+            continue
+        carrier = next((b for b in reversed(content) if isinstance(b, dict) and _block_type(b) not in _THINKING_TYPES), None)
+        if carrier is not None:
+            carrier["cache_control"] = dict(removed.pop())
 
 
 def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
