@@ -605,3 +605,70 @@ def test_first_ingest_after_rebind_logs_one_info_line(tmp_path, caplog):
     assert len(lines) == 1
     assert f"session={SESSION}" in lines[0] and f"incoming={len(history)}" in lines[0]
     assert "reason=replayed history anchored on stored tool calls" in lines[0] and "appended=1" in lines[0]
+
+
+def _first_ingest_lines(caplog):
+    return [r.getMessage() for r in caplog.records if "first ingest after rebind" in r.getMessage()]
+
+
+class TestFirstIngestLogLineOnEveryCaller:
+    """t_f4a72542: after the 17:35 boot the line fired for 1 of 25 sessions; it
+    wrapped only ingest(). Every caller of _ingest_messages can carry the first
+    ingest after a rebind, so each must log it exactly once."""
+
+    def _rebound(self, tmp_path, caplog):
+        stored, history = _restart_resume_shape()
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        fresh = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        fresh.on_session_start(SESSION, platform="discord")
+        assert fresh._ingest_cursor_needs_reconcile
+        caplog.set_level("INFO", logger="plugins.context_engine.lcm.engine")
+        return fresh, history, n0
+
+    def _assert_one_line(self, tmp_path, caplog, history, n0):
+        lines = _first_ingest_lines(caplog)
+        assert len(lines) == 1, lines
+        appended = _rows(tmp_path) - n0
+        assert appended == 1
+        assert f"session={SESSION}" in lines[0] and f"incoming={len(history)}" in lines[0]
+        assert "reason=replayed history anchored on stored tool calls" in lines[0]
+        assert lines[0].endswith(f"appended={appended}")
+
+    def test_turn_start_preflight_first_ingest_logs_once(self, tmp_path, caplog):
+        # The path a gateway boot resume takes: agent/turn_context_compaction.py
+        # _engine_preflight_maintenance -> should_compress_preflight ingests the
+        # resumed transcript BEFORE the model call, so the post_llm_call ingest()
+        # finds the reconcile flag already consumed.
+        fresh, history, n0 = self._rebound(tmp_path, caplog)
+        fresh.should_compress_preflight([dict(m) for m in history])
+        self._assert_one_line(tmp_path, caplog, history, n0)
+        fresh.ingest([dict(m) for m in history] + [{"role": "assistant", "content": "ok"}])
+        assert len(_first_ingest_lines(caplog)) == 1
+
+    def test_compress_first_ingest_logs_once(self, tmp_path, caplog):
+        # Pre-API / threshold / gateway hygiene compaction of a resumed transcript.
+        fresh, history, n0 = self._rebound(tmp_path, caplog)
+        fresh.compress([dict(m) for m in history], current_tokens=10)
+        self._assert_one_line(tmp_path, caplog, history, n0)
+        fresh.ingest([dict(m) for m in history] + [{"role": "assistant", "content": "ok"}])
+        assert len(_first_ingest_lines(caplog)) == 1
+
+    def test_lcm_tool_call_first_ingest_logs_once(self, tmp_path, caplog):
+        fresh, history, n0 = self._rebound(tmp_path, caplog)
+        fresh.handle_tool_call("lcm_grep", {"query": "handoff"}, messages=[dict(m) for m in history])
+        self._assert_one_line(tmp_path, caplog, history, n0)
+
+    def test_session_end_flush_first_ingest_logs_once(self, tmp_path, caplog):
+        fresh, history, n0 = self._rebound(tmp_path, caplog)
+        fresh.on_session_end(SESSION, [dict(m) for m in history])
+        self._assert_one_line(tmp_path, caplog, history, n0)
+
+    def test_ingest_first_ingest_logs_once(self, tmp_path, caplog):
+        fresh, history, n0 = self._rebound(tmp_path, caplog)
+        fresh.ingest([dict(m) for m in history])
+        self._assert_one_line(tmp_path, caplog, history, n0)
+        fresh.ingest([dict(m) for m in history] + [{"role": "assistant", "content": "ok"}])
+        assert len(_first_ingest_lines(caplog)) == 1
