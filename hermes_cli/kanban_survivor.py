@@ -3929,6 +3929,7 @@ exec(_STRANDED_SRC)
 # accepted ONLY from a GitHub remote (G; never shallow, cannot borrow this clone's objects) and only for a clone
 # with no alternates, grafts, refs/replace, shallow file or partial-clone setting (unsupported:<shape>, held).
 # Refuse, don't model: those shapes change what rev-list calls an ancestor (Prism 4ad6b4e63f59, 051b2f1f71e3).
+# A refs/replace ref holds even at an exact tip: its target may live only here (Prism b6d2f9d152e3).
 _REMOTE_PROOF = r'''import os,sys,subprocess,shutil,fnmatch,re
 os.environ['GIT_NO_REPLACE_OBJECTS']='1'
 G=('https://github.com/','git@github.com:','ssh://git@github.com/');U='HEAD durability unknown'
@@ -3950,7 +3951,7 @@ def git(repo,*args,i=None):
   except Exception:w=U;continue
   if any(s==sha for s,_ in A[r]):return 1
  e=lambda x:(d/git(d,'rev-parse','--git-path',x).strip()).exists()
- for k,t in('alternates',e('objects/info/alternates')),('grafts',e('info/grafts')),('replace_refs',git(d,'for-each-ref','refs/replace')),('shallow',e('shallow')),('partial_clone',re.search(r'partialclone=.|\.promisor=(true|yes|on|1)$',git(d,'config','-l').lower(),re.M)):
+ for k,t in('alternates',e('objects/info/alternates')),('grafts',e('info/grafts')),('shallow',e('shallow')),('partial_clone',re.search(r'partialclone=.|\.promisor=(true|yes|on|1)$',git(d,'config','-l').lower(),re.M)):
   if t:raise E('unsupported:'+k)
  for r,a in A.items():
   if not git(d,'ls-remote','--get-url',r).startswith(G):w=w or 'unsupported:remote_not_github';continue
@@ -3983,6 +3984,7 @@ def prove(d):
   if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st):raise E('dirty, ignored or untracked work')
   if any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2):raise E('skip-worktree or assume-unchanged files')
   if git(d,'stash','list'):raise E('stashes')
+  if git(d,'for-each-ref','refs/replace'):raise E('unsupported:replace_refs')
   w=stranded(git,d)
   if w:raise E(w)
   if not durable(d,git(d,'rev-parse','HEAD').strip()):raise E('HEAD has no independently durable ref')

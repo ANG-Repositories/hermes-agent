@@ -706,6 +706,23 @@ def test_remote_proof_ignores_local_grafts_and_replace_refs(tmp_path):
         assert r.returncode == 13 and why in r.stderr, (why, r.returncode, r.stdout, r.stderr)
 
 
+def test_remote_proof_holds_a_replace_ref_even_at_the_exact_tip(tmp_path):
+    """Prism b6d2f9d152e3 repro: HEAD is the exact remote tip, but refs/replace/<HEAD> points at a commit that
+    exists only in this clone (refs/replace is under no branch, so stranded() never sees it). Deleting the clone
+    loses it: HELD unsupported:replace_refs, before the tip match."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    git(root / "remote.git", "tag", "-d", "courierwatch-v1")
+    d = clone("tip")
+    head = git(d, "rev-parse", "HEAD")
+    assert head in git(d, "ls-remote", "origin")
+    x = git(d, "commit-tree", "-m", "only here", git(d, "rev-parse", "HEAD^{tree}"))
+    git(d, "replace", head, x)
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    r = _run(_REMOTE_PROOF, d, env)
+    assert r.returncode == 13 and "unsupported:replace_refs" in r.stderr, (r.returncode, r.stdout, r.stderr)
+
+
 def test_remote_proof_holds_a_shared_local_remote_that_borrows_the_clone(tmp_path):
     """Prism 4ad6b4e63f59 repro: the only remote is a `clone --shared` of the clone itself (its objects ARE the
     clone's). Its branch holds a child of HEAD, so HEAD is "reachable" there, but deleting the clone destroys the
