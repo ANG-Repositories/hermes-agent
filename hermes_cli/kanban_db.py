@@ -6277,7 +6277,11 @@ def _workspace_of_copy(conn: sqlite3.Connection, of: str, kind: Optional[str],
 def _insert_task_row(conn, fields):
     """SQL-only insertion shared by legacy create and prevalidated authority create.
 
-    Caller owns the transaction and validation. No hooks or network here.
+    Caller owns the transaction and validation. No network here. The one hook read is the
+    studio-requires-reason check on the body being stored (t_1aea9763, t_41763e36): every task
+    INSERT goes through this function (tests/hermes_cli/test_kanban_requires_inherit.py pins
+    that), so no create path stores a body the rule refuses. Raises StoredBodyRefused (a
+    ValueError); same kill switch and fail-open as the caller-side check.
     """
     if not conn.in_transaction:
         raise RuntimeError('task insert requires write transaction')
@@ -6285,6 +6289,10 @@ def _insert_task_row(conn, fields):
     allowed = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
     if not columns or not set(columns) <= allowed:
         raise ValueError('unknown task column')
+    from hermes_cli import kanban_requires_inherit as _kri
+    _stored_why = _kri.stored_refusal(fields.get('body'))
+    if _stored_why:
+        raise _kri.StoredBodyRefused(f"kanban create: stored body: {_stored_why}")
     conn.execute('INSERT INTO tasks (' + ','.join(columns) + ') VALUES (' +
                  ','.join('?' for _ in columns) + ')', tuple(fields.values()))
 
@@ -6716,6 +6724,9 @@ def create_task(
                         inherited_origin
                         or format_origin_line(session_id, created_by=created_by),
                     )
+                    # The rebuild starts from the caller's body; keep the inherited line (t_41763e36).
+                    if _inherited_line:
+                        body = (body or '') + '\n' + _inherited_line
                 ruled_mint = None
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
@@ -6903,10 +6914,7 @@ def create_task(
                         "(tool: i_mean_blocks) if the parent closing really is the gate.",
                         time_gate_hit or "",
                     )
-                # The body every create path stores, after every append (t_1aea9763).
-                _stored_why = _kri.stored_refusal(body)
-                if _stored_why:
-                    raise _kri.StoredBodyRefused(f"kanban create: stored body: {_stored_why}")
+                # _insert_task_row checks the body every create path stores (t_1aea9763).
                 _insert_task_row(conn, {
                     'id': task_id,
                     'title': title.strip(),

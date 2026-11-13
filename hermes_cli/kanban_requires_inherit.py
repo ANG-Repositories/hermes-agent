@@ -81,6 +81,16 @@ def report_not_inherited(conn, task_id: str, dropped: List[Tuple[str, str]]) -> 
     print(f"kanban create: {task_id}: {NOT_INHERITED_PREFIX}{named}", file=sys.stderr)
 
 
+def not_inherited_note(conn, task_id: str) -> Optional[str]:
+    """The card's ``requires not inherited`` comment, or None: the kanban_create tool returns it
+    so the creating agent sees it, not only stderr (t_41763e36)."""
+    row = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND author = 'dispatcher' "
+        "AND substr(body, 1, ?) = ? ORDER BY id LIMIT 1",
+        (task_id, len(NOT_INHERITED_PREFIX), NOT_INHERITED_PREFIX)).fetchone()
+    return row[0] if row else None
+
+
 def stored_refusal(body: Optional[str]) -> Optional[str]:
     """studio-requires-reason on the body to be STORED, or None (allowed / kill switch / fail open)."""
     from hermes_cli import kanban_access_bound_pin as kabp
