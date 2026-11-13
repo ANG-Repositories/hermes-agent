@@ -3921,13 +3921,17 @@ def stranded(git,d,extra=()):
 exec(_STRANDED_SRC)
 
 
-# The remote deleter's proof, shipped as ONE argv over ssh (keep it < 4 KB: fleet-nas seccomp note).
+# The remote deleter's proof, shipped as ONE argv over ssh. Linux caps one argv string at MAX_ARG_STRLEN
+# (128 KiB); the test pins it < 8 KB so it stays reviewable (t_f47e4e3f: a 64 KB argv ran on ace-media, ci-box and
+# fleet-nas; the fleet-nas seccomp note is middlewared's cron exec filter, not an argv length limit).
 # Only independently durable CLEAN repositories (or an empty dir) may be removed remotely. Untracked
 # scratch/dirty work is held, never mistaken for the Studio's empty copy of the same path. Dirt that is
 # all residue (R/F == _RESIDUE_DIRS/_RESIDUE_FILES, untracked or ignored, no hidden-edit flag) is clean.
-# HEAD durability (t_3af8cae9): an exact remote tip passes as before. "Reachable from an advertised head" is
-# accepted ONLY from a GitHub remote (G; never shallow, cannot borrow this clone's objects) and only for a clone
-# with no alternates, grafts, refs/replace, shallow file or partial-clone setting (unsupported:<shape>, held).
+# HEAD durability (t_3af8cae9, t_f47e4e3f): the clone must have no alternates, grafts, refs/replace, shallow file
+# or partial-clone setting, and EVERY remote's effective url must be GitHub (G; never shallow, cannot borrow this
+# clone's objects), else held unsupported:<shape> before either answer. Then HEAD is durable when it is an
+# advertised tip, or an ancestor of one: first the advertised heads already in this clone (no fetch), then the
+# remote's HEAD, then the remaining heads (hermes-home advertises ~1,200; fetching them all cost 6 s of 12).
 # Refuse, don't model: those shapes change what rev-list calls an ancestor (Prism 4ad6b4e63f59, 051b2f1f71e3).
 # A refs/replace ref holds even at an exact tip: its target may live only here (Prism b6d2f9d152e3).
 _REMOTE_PROOF = r'''import os,sys,subprocess,shutil,fnmatch,re
@@ -3945,20 +3949,25 @@ def git(repo,*args,i=None):
  if r.returncode:raise E('git proof failed')
  return r.stdout.decode('utf-8','surrogateescape')
 '''+_STRANDED_SRC+r'''def durable(d,sha):
- A={};w=''
- for r in git(d,'remote').split():
-  try:A[r]=[l.split('\t')for l in git(d,'ls-remote',r).splitlines()]
-  except Exception:w=U;continue
-  if any(s==sha for s,_ in A[r]):return 1
  e=lambda x:(d/git(d,'rev-parse','--git-path',x).strip()).exists()
  for k,t in('alternates',e('objects/info/alternates')),('grafts',e('info/grafts')),('shallow',e('shallow')),('partial_clone',re.search(r'partialclone=.|\.promisor=(true|yes|on|1)$',git(d,'config','-l').lower(),re.M)):
   if t:raise E('unsupported:'+k)
- for r,a in A.items():
-  if not git(d,'ls-remote','--get-url',r).startswith(G):w=w or 'unsupported:remote_not_github';continue
+ n=git(d,'remote').split();w=''
+ for r in n:
+  if not git(d,'ls-remote','--get-url',r).startswith(G):raise E('unsupported:remote_not_github')
+ for r in n:
   try:
+   a=[l.split('\t')for l in git(d,'ls-remote',r).splitlines()]
+   if any(s==sha for s,_ in a):return 1
    m=[s for s,x in a if x.startswith('refs/heads/')]
-   if m:git(d,'fetch','-q','--no-tags','--no-write-fetch-head',r,*m)
-   if m and git(d,'rev-list','--count','--stdin',i='HEAD\n'+''.join('^'+s+'\n'for s in m))=='0\n':return 1
+   k={l.split()[0]for l in git(d,'cat-file','--batch-check',i=''.join(s+'\n'for s in m)).splitlines()if l.split()[1:2]==['commit']}
+   c=0
+   for t in([],[s for s,x in a if x=='HEAD'],m):
+    t=sorted(set(t)-k)
+    if t:git(d,'fetch','-q','--no-tags','--no-write-fetch-head',r,*t);k|=set(t)
+    elif c:continue
+    c=1
+    if k and git(d,'rev-list','--count','--stdin',i=sha+'\n'+''.join('^'+s+'\n'for s in k))=='0\n':return 1
   except Exception:w=U
  if w:raise E(w)
 def res(s):
