@@ -144,3 +144,77 @@ def test_kill_switch_skips_registration(monkeypatch):
     monkeypatch.setattr(os, "register_at_fork", lambda **kw: calls.append(kw))
     assert mod.install_fork_signal_reset() is False
     assert calls == []
+
+
+# A gateway that owns a host role: asyncio SIGTERM handler, then host_rendezvous.cleanup_on_exit()
+# wraps it (start_gateway's order). argv[2] == "stub" disables the new after-fork step (mutation arm).
+_RENDEZVOUS_HARNESS = textwrap.dedent(r"""
+    import asyncio, fcntl, json, os, signal, sys, tempfile, time
+    sys.path.insert(0, sys.argv[1])
+    os.environ["HERMES_GATEWAY_LOCK_DIR"] = tempfile.mkdtemp()
+    from gateway import host_rendezvous as hr
+    from gateway.fork_signal_reset import install_fork_signal_reset
+    if sys.argv[2] == "stub":
+        hr.forget_owner_state_in_forked_child = lambda: None
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        fired = []
+        assert install_fork_signal_reset()
+        loop.add_signal_handler(signal.SIGTERM, lambda: fired.append(1))
+        assert hr.claim_host_lock(hr.ROLE_SERVE)[0] is hr.HostLockOutcome.ACQUIRED
+        hr.publish_record(hr.ROLE_SERVE, host="127.0.0.1", port=9119, token="live-session-token")
+        hr.cleanup_on_exit(hr.ROLE_SERVE)
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(5)
+            os._exit(7)
+        await asyncio.sleep(0.3)
+        os.kill(pid, signal.SIGTERM)
+        await asyncio.sleep(0.8)
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if not done:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            child = "survived"
+        elif os.WIFSIGNALED(status):
+            child = "signal:%d" % os.WTERMSIG(status)
+        else:
+            child = "exit:%d" % os.WEXITSTATUS(status)
+        with open(hr.lock_path(hr.ROLE_SERVE), "a+") as fh:  # a fresh open contends with the parent's flock
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_held = False
+            except OSError:
+                lock_held = True
+        print(json.dumps({"parent_fired": bool(fired), "child": child, "lock_held": lock_held,
+                          "record": hr.record_path(hr.ROLE_SERVE).exists(),
+                          "token": hr.token_path(hr.ROLE_SERVE).exists(),
+                          "wrapper": signal.getsignal(signal.SIGTERM) is hr._handle_terminating_signal}))
+
+    asyncio.run(main())
+""")
+
+
+def _run_rendezvous(mode: str) -> dict:
+    out = subprocess.run([sys.executable, "-c", _RENDEZVOUS_HARNESS, str(REPO), mode],
+                         capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_rendezvous_owner_child_dies_of_sigterm_and_parent_keeps_its_role():
+    """t_89c3a411: the cleanup wrapper no longer swallows the child's SIGTERM or drops the parent's lock."""
+    res = _run_rendezvous("fix")
+    assert res == {"parent_fired": False, "child": "signal:15", "lock_held": True,
+                   "record": True, "token": True, "wrapper": True}, res
+
+
+def test_without_rendezvous_step_child_survives_and_unlocks_parent():
+    """The mutation: the wrapper chains to asyncio's no-op (child survives) and its cleanup's
+    flock(LOCK_UN) on the inherited fd releases the LIVE parent's host lock. The record and token
+    survive only because clear_record() refuses another pid's record."""
+    res = _run_rendezvous("stub")
+    assert res["child"] == "survived", res
+    assert res["lock_held"] is False, res
+    assert (res["record"], res["token"]) == (True, True), res

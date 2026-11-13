@@ -8,13 +8,15 @@ reaped a gateway fork, gateway drained and restarted). CPython 3.12+ resets the 
 fork; it still leaves the no-op handler, so such a child ignores SIGTERM.
 
 The after-fork hook here does both, in the child only: wakeup fd off, and every signal whose
-handler is asyncio's no-op back to its default (SIGINT to ``default_int_handler``). Each step is
+handler is asyncio's no-op back to its default (SIGINT to ``default_int_handler``), after unwinding
+``gateway.host_rendezvous``'s SIGTERM cleanup wrapper and its role/lock state. Each step is
 guarded, so a failure never breaks the fork. Kill switch: ``HERMES_GATEWAY_FORK_SIGNAL_RESET=0``.
 """
 from __future__ import annotations
 
 import os
 import signal
+import sys
 
 KILL_SWITCH_ENV = "HERMES_GATEWAY_FORK_SIGNAL_RESET"
 _registered = False
@@ -34,6 +36,14 @@ def reset_signal_plumbing_in_child() -> None:
         signal.set_wakeup_fd(-1)
     except Exception:
         pass
+    # host_rendezvous's SIGTERM wrapper sits on top of the no-op and runs the parent's role
+    # cleanup; unwind it first (t_89c3a411). Only when already imported: never import after fork.
+    rendezvous = sys.modules.get("gateway.host_rendezvous")
+    if rendezvous is not None:
+        try:
+            rendezvous.forget_owner_state_in_forked_child()
+        except Exception:
+            pass
     noop = _asyncio_noop()
     if noop is None:
         return
