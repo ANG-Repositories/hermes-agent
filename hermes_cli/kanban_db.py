@@ -8768,6 +8768,17 @@ def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = Fal
         validate_fields(conn, [("comment", body)])
 
 
+def check_comment_hold(task_id: str, author: str, body: str) -> None:
+    """Refuse a ``deadman: hold`` line the deadman would not honour, judged on the author as
+    :func:`add_comment` STORES it (subagent marker included). A caller that writes its comment after
+    a lifecycle transition calls this first, so a refusal never strands the transition (Prism e233b2a07b96)."""
+    from hermes_cli.kanban_close_on_guard import check_hold_author
+
+    if _is_delegated_child() and not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+        author = author.strip() + SUBAGENT_AUTHOR_MARKER
+    check_hold_author(task_id, author, body)
+
+
 # Bound on an unhonoured ``--author`` label kept for forensics (see add_comment).
 _CLAIMED_AUTHOR_MAX = 200
 
@@ -8823,6 +8834,9 @@ def add_comment(
             raise ValueError(f"claimed_author longer than {_CLAIMED_AUTHOR_MAX} chars")
         claimed_author = claimed_author.strip()
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
+    # A granted write is judged in _add_comment_txn after the grant validated, so the grant's own refusal wins.
+    if grant_id is None:
+        check_comment_hold(task_id, author, body)
     now = int(time.time())
     if grant_id is not None:
         return _add_granted_comment(
@@ -8943,6 +8957,9 @@ def _add_comment_txn(
         if grant_id is not None:
             ksg.validate_comment(conn, grant_id, task_id, signer, body,
                                  caller_session_ref=session_ref, now=now)
+            from hermes_cli.kanban_close_on_guard import check_hold_author
+
+            check_hold_author(task_id, author, body)  # grant-marked author, as stored
             cur = conn.execute(
                 "INSERT INTO task_comments "
                 "(task_id, author, body, run_id, session_ref, created_at, grant_id) "

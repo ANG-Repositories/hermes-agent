@@ -576,3 +576,86 @@ def test_ordinary_unverified_comment_still_posts(board, monkeypatch, capsys):
         assert _post(monkeypatch, "default", board, body) == 0
         assert _last_author(board) == ("unverified:default", body)
         assert "Comment added" in capsys.readouterr().out
+
+
+# ── t_5a5e36db: agent PR 299 refused the unverified hold in the CLI verb only.
+# The kanban_comment tool (probe F, stored ``unverified:default``) and a worker
+# run (probe G, stored under the worker's name) still stored a hold the deadman
+# ignores. The refusal now sits in kanban_db.add_comment, which every door shares.
+
+
+def _tool_comment(tid, body):
+    from tools import kanban_tools as kt
+
+    return json.loads(kt._handle_comment({"task_id": tid, "body": body}))
+
+
+@pytest.mark.parametrize("profile,author", [("default", "unverified:default"), ("daedalus", "daedalus")])
+def test_tool_deadman_hold_from_non_operator_is_refused_and_writes_nothing(board, monkeypatch, profile, author):
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    before = _comment_rows(board)
+    out = _tool_comment(board, HOLD)
+    assert "ok" not in out, out
+    msg = json.dumps(out)
+    assert f"from {author} holds nothing" in msg and "--author apollo" in msg and kb.OPERATOR_TOKEN_ENV in msg
+    assert _comment_rows(board) == before
+
+
+def test_worker_run_deadman_hold_is_refused_and_writes_nothing(board, monkeypatch, capsys):
+    import os
+
+    _seed_worker_run(board, os.getpid())
+    before = _comment_rows(board)
+    capsys.readouterr()
+    assert _post(monkeypatch, "default", board, HOLD) != 0
+    assert _comment_rows(board) == before
+    out = capsys.readouterr()
+    assert "Comment added" not in out.out
+    err = out.err.strip()
+    assert len(err.splitlines()) == 1
+    assert "from daedalus holds nothing" in err and "--author apollo" in err and "not posted" in err
+
+
+def test_worker_run_hold_shapes_pr299_allows_still_post(board, monkeypatch):
+    import os
+
+    _seed_worker_run(board, os.getpid())
+    for body in ("the deadman: hold line is ignored mid-sentence", "> deadman: hold 2099-01-01T00:00:00Z",
+                 "`deadman: hold 2099-01-01T00:00:00Z`", "deadman: hold", "deadman: STOP"):
+        monkeypatch.setenv("HERMES_PROFILE", "default")
+        assert _tool_comment(board, body).get("ok") is True, body
+        assert _last_author(board) == ("daedalus", body)
+
+
+def test_add_comment_refuses_hold_from_any_writer(board):
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="holds nothing"):
+            kb.add_comment(conn, board, "unverified:default", HOLD)
+        with pytest.raises(ValueError, match="holds nothing"):
+            kb.add_comment(conn, board, "apollo (subagent)", HOLD)
+        kb.add_comment(conn, board, "apollo", HOLD)
+    assert _last_author(board) == ("apollo", HOLD)
+
+
+# Prism e233b2a07b96: block/schedule write their status comment AFTER the transition, so a hold
+# refused in add_comment left the card blocked with no comment. The hold is judged before the transition.
+@pytest.mark.parametrize("verb", ["block", "schedule"])
+def test_lifecycle_reason_with_hold_is_refused_before_the_transition(board, monkeypatch, verb):
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    with kb.connect() as conn:
+        status = kb.get_task(conn, board).status
+    before = _comment_rows(board)
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    argv = ["kanban", "--board", "default", verb, board, "waiting\n" + HOLD]
+    argv[5:5] = ["--at", "2099-01-01T00:00:00+00:00"] if verb == "schedule" else ["--kind", "needs_input"]
+    try:
+        rc = kc.kanban_command(top.parse_args(argv))
+    except ValueError as exc:
+        assert "holds nothing" in str(exc)
+        rc = 1
+    assert rc != 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, board).status == status
+    assert _comment_rows(board) == before
