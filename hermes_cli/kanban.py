@@ -3091,6 +3091,11 @@ def _cmd_claim_unheld(args: argparse.Namespace) -> int:
     return 0
 
 
+# Comment lines only an operator author makes count; the home deadman reads a
+# hold with this exact pattern on ANY line (review_deadman_core._HOLD_RE).
+_OPERATOR_ONLY_GRAMMAR = re.compile(r"^\s*deadman:\s*hold\s+(\S+)", re.I | re.M)
+
+
 def _cmd_comment(args: argparse.Namespace) -> int:
     """Append a comment, attributed to the session that invoked this CLI.
 
@@ -3149,6 +3154,17 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             f"({kb.OPERATOR_TOKEN_ENV}); commenting as {author!r}, "
             "the requested author is kept as claimed_author",
             file=sys.stderr,
+        )
+    from hermes_cli.kanban_identity import UNVERIFIED_AUTHOR_PREFIX
+
+    if author.startswith(UNVERIFIED_AUTHOR_PREFIX) and _OPERATOR_ONLY_GRAMMAR.search(body):
+        # An unverified hold printed "Comment added" and held nothing: the
+        # deadman honours operator authors only (t_238f3f04). Refuse, write nothing.
+        token_file = str(kb.operator_token_path()).replace(str(Path.home()), "~", 1)
+        return _err(
+            f"`deadman: hold` from {author} holds nothing; post it as the operator: "
+            f"{kb.OPERATOR_TOKEN_ENV}=$(cat {token_file}) hermes kanban comment "
+            f"{args.task_id} --author apollo '<body>'; not posted"
         )
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:

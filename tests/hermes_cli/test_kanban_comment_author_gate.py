@@ -506,3 +506,73 @@ def test_multiplexer_serving_the_profile_counts_as_its_gateway(board, monkeypatc
     )
     assert ki._operator_gateway_pids("aegis") == frozenset({os.getppid()})
     assert _bare_comment(monkeypatch, "aegis", board) == "aegis"
+
+
+
+# ── t_238f3f04: a `deadman: hold <ISO>` stored as ``unverified:<name>`` holds
+# nothing (the deadman honours operator_identity.comment_can_hold authors
+# only), yet it printed "Comment added" and exited 0: 132 such rows in 12 h,
+# two tier-2 pages to Ace. An unverified hold is now refused, nothing written.
+
+HOLD = "deadman: hold 2099-01-01T00:00:00Z (waits on Prism)"
+# The deadman reader's honoured authors (home scripts/lib/operator_identity.py
+# HUMAN_OPERATORS); an ``unverified:`` row is never one of them.
+_HONOURED = ("apollo", "ace", "default", "human", "aegis")
+
+
+def _post(monkeypatch, profile, tid, body, author=None, token=None):
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    if token is None:
+        monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, token)
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    argv = ["kanban", "--board", "default", "comment", tid, body]
+    if author:
+        argv[5:5] = ["--author", author]
+    return kc.kanban_command(top.parse_args(argv))
+
+
+def _last_author(tid):
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT author, body FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+    return row["author"], row["body"]
+
+
+@pytest.mark.parametrize("body", [HOLD, "Waiting on CI.\ndeadman: hold 2099-01-01T00:00:00Z"])
+def test_unverified_deadman_hold_is_refused_and_writes_nothing(board, monkeypatch, capsys, body):
+    before = _comment_rows(board)
+    capsys.readouterr()
+    assert _post(monkeypatch, "default", board, body) != 0
+    assert _comment_rows(board) == before
+    out = capsys.readouterr()
+    assert "Comment added" not in out.out
+    err = out.err.strip()
+    assert len(err.splitlines()) == 1
+    assert "unverified:default" in err and "not posted" in err
+    assert f"{kb.OPERATOR_TOKEN_ENV}=$(cat ~/.hermes/kanban/operator-token)" in err
+    assert "--author apollo" in err
+
+
+def test_deadman_hold_from_proven_session_is_stored_and_honoured(board, monkeypatch, operator_gateway):
+    assert _post(monkeypatch, "default", board, HOLD) == 0
+    author, body = _last_author(board)
+    assert (author, body) == ("default", HOLD)
+    assert author in _HONOURED
+
+
+def test_deadman_hold_with_token_is_stored_and_honoured(board, monkeypatch):
+    assert _post(monkeypatch, "default", board, HOLD, author="apollo", token=TOKEN) == 0
+    author, body = _last_author(board)
+    assert (author, body) == ("apollo", HOLD)
+    assert author in _HONOURED
+
+
+def test_ordinary_unverified_comment_still_posts(board, monkeypatch, capsys):
+    for body in ("progress: waiting on CI", "the deadman: hold line is ignored mid-sentence"):
+        assert _post(monkeypatch, "default", board, body) == 0
+        assert _last_author(board) == ("unverified:default", body)
+        assert "Comment added" in capsys.readouterr().out
