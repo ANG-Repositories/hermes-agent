@@ -865,3 +865,339 @@ def test_three_gib_120k_entries_is_carried_and_the_tick_returns_fast(board, loop
     assert (tid, "ace-ai") in spawned
     assert kcb.census(str(dest))[1] == entries and file_bytes(dest) == file_bytes(path)
     assert tick_s < 5.0
+
+
+# -- workspace admission runs before any copy (t_681a9c5e; Prism 2a7982d8eadd) --------------------------------------
+
+def _protected_symlink_card(conn, board, tmp_path, monkeypatch):
+    """A card whose recorded workspace root is protected (a ``workspace_mount_roots`` row, its parent the mount) and
+    whose workspace path has been replaced by a symlink to a private directory outside that root."""
+    tid, path = _card(conn)
+    root = kb.workspaces_root()
+    with kb.write_txn(conn):
+        conn.execute("INSERT INTO workspace_mount_roots(root, mount_path) VALUES (?, ?)", (str(root), str(root.parent)))
+    real_ismount = os.path.ismount
+    monkeypatch.setattr("os.path.ismount", lambda p: Path(p) == root.parent or real_ismount(p))
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "secret.txt").write_text("private\n")
+    import shutil
+    shutil.rmtree(path)
+    path.symlink_to(private, target_is_directory=True)
+    return tid, path, private
+
+
+@pytest.mark.parametrize("defer", [True, False], ids=["background", "one_shot"])
+def test_a_workspace_admission_refuses_starts_no_carry(board, loop, tmp_path, monkeypatch, defer):
+    """The background gate runs the claim's admission on the row's workspace first: a symlinked workspace root is
+    refused before anything is counted or copied, and the refusal is the card's wait reason."""
+    with kb.connect_closing() as conn:
+        tid, path, private = _protected_symlink_card(conn, board, tmp_path, monkeypatch)
+        # the per-row admission the ready loop runs earlier in the tick is bypassed here so the gate's own check is
+        # what is under test (the path can be swapped for a link between the two)
+        monkeypatch.setattr(kb, "_workspace_admission_refused", lambda *a, **k: False)
+        res, spawned = _tick_full(conn, defer_pool_clone=defer)
+        if kcb._jobs.get(tid):
+            _wait_done(tid)
+        started = _events(conn, tid, kcb.STARTED_EVENT)
+    assert spawned == []
+    assert started == []
+    assert not any(c[0] == "rsync" for c in loop.calls), loop.calls
+    assert "workspace symlink escape" in res.placement_waits[tid], res.placement_waits
+    assert not Path(loop._map(kcb.staging_path(str(path)))).exists()
+    assert (private / "secret.txt").read_text() == "private\n"
+
+
+@pytest.mark.parametrize("where", ["carry_gate", "ready_loop"])
+def test_a_staging_dir_left_by_an_earlier_carry_is_removed_when_admission_refuses(board, loop, tmp_path,
+                                                                                 monkeypatch, where):
+    """An earlier carry (a started event, its staging dir on the host) and then the workspace becomes a symlink out of
+    the root: whichever admission refuses first in the tick (the ready loop's, or the carry gate's when the path was
+    swapped in between) removes the staging dir under the carry lock and says so in one event."""
+    with kb.connect_closing() as conn:
+        tid, path, _private = _protected_symlink_card(conn, board, tmp_path, monkeypatch)
+        kb._append_event(conn, tid, kcb.STARTED_EVENT, {"host": "ace-ai", "path": str(path), "background": True})
+        conn.commit()
+        if where == "carry_gate":
+            monkeypatch.setattr(kb, "_workspace_admission_refused", lambda *a, **k: False)
+        left = Path(loop._map(kcb.staging_path(str(path))))
+        left.mkdir(parents=True)
+        (left / "secret.txt").write_text("copied earlier\n")
+        res, spawned = _tick_full(conn, defer_pool_clone=True)
+        refused = _events(conn, tid, kcb.REFUSED_EVENT)
+        _tick_full(conn, defer_pool_clone=True)            # a second refused tick records nothing new
+        assert len(_events(conn, tid, kcb.REFUSED_EVENT)) == 1
+    why = res.placement_waits.get(tid) or dict(res.workspace_refused).get(tid)
+    assert spawned == [] and "workspace symlink escape" in why, (res.placement_waits, res.workspace_refused)
+    assert not left.exists()
+    assert refused and refused[-1]["host"] == "ace-ai" and refused[-1]["staging_removed"] is True
+    assert not any(c[0] == "rsync" for c in loop.calls)
+
+
+def test_a_failed_staging_remove_records_nothing_and_is_retried(board, loop, tmp_path, monkeypatch):
+    """Prism 8309def60720: a refusal whose staging remove failed writes no event, so the next refused tick removes it."""
+    with kb.connect_closing() as conn:
+        tid, path, _private = _protected_symlink_card(conn, board, tmp_path, monkeypatch)
+        kb._append_event(conn, tid, kcb.STARTED_EVENT, {"host": "ace-ai", "path": str(path), "background": True})
+        conn.commit()
+        left = Path(loop._map(kcb.staging_path(str(path))))
+        left.mkdir(parents=True)
+        real_remove = kcb.remove_staging
+        monkeypatch.setattr(kcb, "remove_staging", lambda *a, **k: False)
+        _tick_full(conn, defer_pool_clone=True)
+        assert _events(conn, tid, kcb.REFUSED_EVENT) == [] and left.exists()
+        monkeypatch.setattr(kcb, "remove_staging", real_remove)
+        _tick_full(conn, defer_pool_clone=True)
+        refused = _events(conn, tid, kcb.REFUSED_EVENT)
+    assert len(refused) == 1 and refused[0]["staging_removed"] is True
+    assert not left.exists()
+
+
+def test_a_staging_copy_is_kept_when_the_source_workspace_is_gone(board, loop, tmp_path, monkeypatch):
+    """Prism 9ec61b3d7d14: admission refuses because the source is lost (stranded_by_mount_loss): the finished staging
+    copy may be the only copy of the work, so it stays and no refusal is recorded."""
+    from hermes_cli import kanban_db_dispatch as kdd
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        kb._append_event(conn, tid, kcb.STARTED_EVENT, {"host": "ace-ai", "path": str(path), "background": True})
+        conn.commit()
+        left = Path(loop._map(kcb.staging_path(str(path))))
+        left.mkdir(parents=True)
+        (left / "work.txt").write_text("the only copy\n")
+        import shutil
+        shutil.rmtree(path)                                 # the source is gone, not a policy violation
+        row = {"id": tid, "workspace_path": str(path)}
+        kdd._drop_refused_carry(conn, row, _plan(free=2), "default", f"stranded_by_mount_loss: {path}")
+        refused = _events(conn, tid, kcb.REFUSED_EVENT)
+    assert (left / "work.txt").read_text() == "the only copy\n"
+    assert refused == []
+
+
+def test_the_carry_gate_admits_the_path_it_copies(board, loop, tmp_path, monkeypatch):
+    """Prism e310afb55ca1: the row's workspace (what the carry copies) is a symlink out of the root; the task read back
+    names a safe path. The gate must not admit the safe path and copy the row's: it copies nothing this tick."""
+    import dataclasses
+    with kb.connect_closing() as conn:
+        tid, path, _private = _protected_symlink_card(conn, board, tmp_path, monkeypatch)
+        monkeypatch.setattr(kb, "_workspace_admission_refused", lambda *a, **k: False)
+        safe = path.parent / (path.name + "-safe")
+        safe.mkdir()
+        real_get = kb.get_task
+        monkeypatch.setattr(kb, "get_task", lambda c, t: (dataclasses.replace(real_get(c, t), workspace_path=str(safe))
+                                                          if t == tid else real_get(c, t)))
+        res, spawned = _tick_full(conn, defer_pool_clone=False)
+        started = _events(conn, tid, kcb.STARTED_EVENT)
+    assert spawned == [] and started == []
+    assert not any(c[0] == "rsync" for c in loop.calls), loop.calls
+
+
+def test_a_refresh_whose_submit_raises_is_not_handed_over_as_done(board, loop, tmp_path, monkeypatch):
+    """Prism 64edba28c538: done_at / seen_done are cleared only once the refresh submit has returned."""
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setattr(kcb, "FRESH_S", 0.0)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        host = _plan(free=2).hosts["ace-ai"]
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "started"
+        _wait_done(tid)
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "done"
+
+        class Broken:
+            def submit(self, *a, **k):
+                raise RuntimeError("pool shut down")
+        real_executor = kcb._executor
+        monkeypatch.setattr(kcb, "_executor", lambda: Broken())
+        with pytest.raises(RuntimeError):
+            kcb.poll(tid, host, str(path), lock_dir)   # the refresh could not be submitted
+        monkeypatch.setattr(kcb, "_executor", real_executor)
+        state, job = kcb.poll(tid, host, str(path), lock_dir)
+        assert state == "running"                       # the refresh is retried, never skipped
+        _wait_done(tid)
+        monkeypatch.setattr(kcb, "FRESH_S", 3600.0)
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "done"
+        kcb.take(tid, host, str(path))
+        kcb.release(job)
+
+
+# -- advisory read of PR 290 at d92b75eb, operator items 4 to 7 + the gitlink refusal (t_681a9c5e) -------------------
+
+def test_finalize_replaces_a_symlinked_workspace_path_never_writes_through_it(board, loop, tmp_path):
+    """Item 4: the workspace path on the host is a symlink to a dir holding one file. After finalize the path is a
+    real directory with the staged files, and the old target is untouched."""
+    with kb.connect_closing() as conn:
+        _tid, path = _card(conn)
+    host = _plan(free=2).hosts["ace-ai"]
+    dest = Path(loop._map(str(path)))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "link-target"
+    target.mkdir()
+    (target / "theirs.txt").write_text("theirs\n")
+    dest.symlink_to(target, target_is_directory=True)
+    staging = Path(loop._map(kcb.staging_path(str(path))))
+    staging.mkdir(parents=True)
+    (staging / "notes.md").write_text("staged\n")
+    kcb.finalize(host, str(path), runner=loop)
+    assert not dest.is_symlink() and dest.is_dir()
+    assert (dest / "notes.md").read_text() == "staged\n" and not (dest / "theirs.txt").exists()
+    assert sorted(p.name for p in target.iterdir()) == ["theirs.txt"]
+    assert (target / "theirs.txt").read_text() == "theirs\n"
+    assert not staging.exists()
+
+
+def _linked_worktree(tmp_path, tmp_path_factory, path, branch):
+    origin = _origin_with_many_files(tmp_path_factory.mktemp("origin"), 5)
+    home = tmp_path / "home"
+    _g("clone", "-q", str(origin), str(home))
+    wt = path / "repo"
+    _g("worktree", "add", "-q", "-b", branch, str(wt), cwd=home)
+    return home, wt
+
+
+def test_a_modified_file_with_the_size_and_mtime_of_head_arrives_modified(board, loop, tmp_path, tmp_path_factory,
+                                                                          monkeypatch):
+    """Item 5: same size, same mtime second, different content than the version the host checked out: the files step
+    sends it. The host's checkout is given the Studio file's mtime just before the files rsync (the clash the quick
+    check misses: a checkout and an edit in the same second, or a reused checkout)."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        _home, wt = _linked_worktree(tmp_path, tmp_path_factory, path, "card/q")
+        f = wt / "tracked.txt"
+        assert f.read_text() == "v1\n"
+        f.write_text("v2\n")                                        # same size as "v1\n"
+        real = loop.__call__
+
+        def same_mtime(argv, **kw):
+            if argv[0] == "rsync" and "--files-from=-" in argv:
+                host_copy = Path(loop._map(kcb.staging_path(str(path)))) / "repo" / "tracked.txt"
+                assert host_copy.read_text() == "v1\n"
+                st = f.stat()
+                os.utime(host_copy, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return real(argv, **kw)
+        monkeypatch.setattr(kcb, "_run", same_mtime)
+        _carry_until_claimed(conn, tid)
+    assert (Path(loop._map(str(wt))) / "tracked.txt").read_text() == "v2\n"
+
+
+def test_a_local_origin_the_host_cannot_clone_falls_back_to_the_full_bundle(board, loop, tmp_path, tmp_path_factory,
+                                                                            monkeypatch):
+    """Item 6: a checkout whose origin is a Studio-local path that does not exist on the host: the clone on the host
+    fails, the carry falls back to the full bundle once, and HEAD matches."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        home, wt = _linked_worktree(tmp_path, tmp_path_factory, path, "card/l")
+        (wt / "new.txt").write_text("unpushed\n")
+        _g("add", "new.txt", cwd=wt)
+        _g("commit", "-qm", "unpushed", cwd=wt)
+        url = _g("remote", "get-url", "origin", cwd=home)
+        assert url.startswith("/")
+        # the host side: that local path does not exist there (the loopback runs on this machine, so the remote
+        # clone is pointed at a path that is absent; the Studio side keeps its real origin refs)
+        real = kcb._origin_url
+        monkeypatch.setattr(kcb, "_origin_url", lambda repo: str(tmp_path / "no-such-origin.git"))
+        before = _git_view(wt)
+        waits, _spawned = _carry_until_claimed(conn, tid)
+        rebuilt = _events(conn, tid, kwh.CARRIED_EVENT)[-1]["background"]["rebuilt"]
+        assert not _events(conn, tid, kcb.FAILED_EVENT), waits
+        monkeypatch.setattr(kcb, "_origin_url", real)
+    got = _git_view(Path(loop._map(str(wt))))
+    assert rebuilt[0]["full_bundle"] is True
+    assert (got[0], got[3]) == (before[0], before[3])
+
+
+def test_the_mirror_warm_fetch_survives_a_branch_checked_out_by_another_workspace(tmp_path):
+    """Operator 23:40 item A (t_e38aba52 23:26): the host's mirror has a branch checked out by another workspace's
+    worktree. The rebuild's warm fetch must not be refused for it: origin's new HEAD reaches the mirror, the branch the
+    other workspace has checked out is not moved, and the rebuild succeeds."""
+    up = tmp_path / "up"
+    _g("init", "-q", str(up))
+    (up / "a").write_text("a\n")
+    _g("add", "a", cwd=up)
+    _g("commit", "-qm", "a", cwd=up)
+    _g("branch", "feat", cwd=up)
+    mirror = tmp_path / "m.git"
+    _g("clone", "-q", "--mirror", str(up), str(mirror))
+    # another workspace's linked worktree on the mirror with feat checked out (written by hand: the suite's guard
+    # refuses `git worktree`); git's fetch reads exactly these files to refuse "checked out at"
+    other = tmp_path / "other"
+    other.mkdir()
+    admin = mirror / "worktrees" / "other"
+    admin.mkdir(parents=True)
+    (admin / "HEAD").write_text("ref: refs/heads/feat\n")
+    (admin / "commondir").write_text("../..\n")
+    (admin / "gitdir").write_text(f"{other}/.git\n")
+    (other / ".git").write_text(f"gitdir: {admin}\n")
+    feat_before = _g("--git-dir", str(mirror), "rev-parse", "refs/heads/feat")
+    for name in ("b", "c"):                               # origin moves main AND the checked-out branch
+        if name == "c":
+            _g("checkout", "-q", "feat", cwd=up)
+        (up / name).write_text(name + "\n")
+        _g("add", name, cwd=up)
+        _g("commit", "-qm", name, cwd=up)
+    _g("checkout", "-q", "main", cwd=up)
+    head = _g("rev-parse", "HEAD", cwd=up)
+    bundle = tmp_path / "b.bundle"
+    _g("bundle", "create", str(bundle), "HEAD", cwd=up)
+    plan = {"head": head, "url": str(up), "branch": "main", "stash": (), "exclude": None}
+    proc = subprocess.run(["bash", "-c", kcb.rebuild_script(str(tmp_path / "dest"), plan, head, str(mirror))],
+                          input=bundle.read_bytes(), capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    assert b"refusing to fetch" not in proc.stderr, proc.stderr
+    assert subprocess.run(["git", "--git-dir", str(mirror), "cat-file", "-e", head + "^{commit}"]).returncode == 0
+    assert _g("--git-dir", str(mirror), "rev-parse", "refs/heads/feat") == feat_before
+    assert _g("rev-parse", "HEAD", cwd=tmp_path / "dest") == head
+
+
+def test_a_full_bundle_records_what_the_host_lacked(board, loop, tmp_path, tmp_path_factory, monkeypatch):
+    """Operator 23:40 item B: a rebuild that falls back to the full bundle says why (the prerequisite git named)."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        _home, wt = _linked_worktree(tmp_path, tmp_path_factory, path, "card/r")
+        monkeypatch.setattr(kcb, "_origin_url", lambda repo: str(tmp_path / "no-such-origin.git"))
+        _carry_until_claimed(conn, tid)
+        rebuilt = _events(conn, tid, kwh.CARRIED_EVENT)[-1]["background"]["rebuilt"]
+    assert rebuilt[0]["full_bundle"] is True
+    assert "lacks these prerequisite commits" in rebuilt[0]["full_reason"], rebuilt
+
+
+def test_a_refreshed_rebuild_drops_an_ignored_file_deleted_on_the_studio(board, loop, tmp_path, tmp_path_factory,
+                                                                         monkeypatch):
+    """Item 7: the staging dir holds an ignored file from a first carry; the source no longer has it; after the second
+    carry (a refresh into the same staging dir) it is gone."""
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setattr(kcb, "FRESH_S", 0.0)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        _home, wt = _linked_worktree(tmp_path, tmp_path_factory, path, "card/i")
+        (wt / "secret.env").write_text("ignored\n")
+        (wt / "kept.env").write_text("still here\n")
+        host = _plan(free=2).hosts["ace-ai"]
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "started"
+        _wait_done(tid)
+        staged = Path(loop._map(kcb.staging_path(str(path)))) / "repo"
+        assert (staged / "secret.env").exists()
+        (wt / "secret.env").unlink()
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "done"
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "running"   # the refresh, into the same staging dir
+        _wait_done(tid)
+        monkeypatch.setattr(kcb, "FRESH_S", 3600.0)
+        state, job = kcb.poll(tid, host, str(path), lock_dir)
+        assert state == "done", job
+        assert not (staged / "secret.env").exists()
+        assert (staged / "kept.env").read_text() == "still here\n"
+        kcb.take(tid, host, str(path))
+        kcb.release(job)
+
+
+def test_a_rebuilt_checkout_that_tracks_a_submodule_is_refused(board, loop, tmp_path, tmp_path_factory):
+    """A rebuilt checkout with a gitlink is refused (the rebuild carries neither .git/modules nor the submodule's
+    files), so the capped rule decides the card. Nothing is copied."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        _home, wt = _linked_worktree(tmp_path, tmp_path_factory, path, "card/s")
+        sha = _g("rev-parse", "HEAD", cwd=wt)
+        _g("update-index", "--add", "--cacheinfo", f"160000,{sha},sub", cwd=wt)
+        _g("commit", "-qm", "gitlink", cwd=wt)
+        job = kcb.Job(tid, _plan(free=2).hosts["ace-ai"], str(path))
+        with pytest.raises(kcb.CarryRefused, match="submodule"):
+            kcb.run(job)
+    assert not any(c[0] == "rsync" for c in loop.calls)

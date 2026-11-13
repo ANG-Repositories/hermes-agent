@@ -54,6 +54,7 @@ BACKGROUND = "background"          # the dispatcher's carry_out value for a card
 STARTED_EVENT = "workspace_carry_started"
 PROGRESS_EVENT = "workspace_carry_progress"
 FAILED_EVENT = "workspace_carry_failed"
+REFUSED_EVENT = "workspace_carry_admission_refused"   # t_681a9c5e: admission refused the card; its carry is dropped
 PENDING = "carry_pending"
 NO_ROOM = "carry_no_room"
 FAILED = "carry_failed"
@@ -216,6 +217,10 @@ def plan_rebuild(src: str, rel: str, others=()) -> dict:
     head = _git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", ok=(0, 1)).decode().strip()
     if not head:
         raise CarryRefused(f"checkout {rel}: no commit at HEAD, and its git dir does not travel")
+    # a tracked gitlink (submodule): the rebuild carries neither .git/modules nor the submodule's files, so the capped
+    # rule decides such a card (t_681a9c5e)
+    if any(ln.startswith(b"160000 ") for ln in _git(repo, "ls-files", "--stage", "-z").split(b"\0")):
+        raise CarryRefused(f"checkout {rel}: tracks a submodule (gitlink), which a rebuild does not carry")
     branch = _git(repo, "symbolic-ref", "-q", "--short", "HEAD", ok=(0, 1)).decode().strip()
     # operator 18:55 11-12 item 1: the stash follows kanban.placement.worktree_stash_carry (default off), as in PR 253.
     # A linked worktree sees the whole shared list of the Studio home repo (other sessions' work): off, no entry rides
@@ -305,10 +310,16 @@ def rebuild_script(dest: str, plan: dict, idx: str, mirror: Optional[str]) -> st
     if mirror:
         m = ('"$HOME"/' + shlex.quote(mirror[2:])) if mirror.startswith("~/") else shlex.quote(mirror)
     if url:
+        # the mirror's own refspec (refs/*:refs/*) is refused whole when another workspace on the host has one of its
+        # branches checked out (t_e38aba52 23:26, operator 23:40 item A), leaving the mirror stale: warm it with
+        # origin's default branch only, into a ref no worktree can have checked out
         get = ((f"if [ -d {m}/objects ]; then git -c gc.auto=0 -c fetch.prune=false --git-dir={m} fetch -q "
-                f"--no-write-fetch-head origin || true; fi; "
+                f"--no-write-fetch-head origin +HEAD:refs/carry/origin-head || true; fi; "
                 f"git clone -q --no-checkout --reference-if-able {m} --dissociate \"$url\" \"$d\"; ") if m else
                "git clone -q --no-checkout \"$url\" \"$d\"; ")
+        # an origin the host cannot clone (a Studio-local path, t_681a9c5e item 6): an empty repo instead; the bundle
+        # check below then exits NEEDS_FULL_RC and the caller resends the full bundle, which needs no origin
+        get = f"if ! {{ {get}}}; then rm -rf -- \"$d\"; git init -q \"$d\"; fi; "
         reuse = "[ -d \"$d/.git\" ] && [ \"$(git -C \"$d\" remote get-url origin 2>/dev/null)\" = \"$url\" ]"
     else:
         get = "git init -q \"$d\"; "   # no origin to clone: the full bundle carries every commit
@@ -327,9 +338,11 @@ def rebuild_script(dest: str, plan: dict, idx: str, mirror: Optional[str]) -> st
             f"d={d}; url={shlex.quote(url or '')}; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; "
             f"if {reuse}; then :; else rm -rf -- \"$d\"; mkdir -p -- \"$(dirname \"$d\")\"; {get}fi; cd \"$d\"; "
             "if ! git bundle verify -q \"$t\" >/dev/null 2>&1; then git fetch -q origin >/dev/null 2>&1 || true; "
-            f"git bundle verify -q \"$t\" >/dev/null 2>&1 || exit {NEEDS_FULL_RC}; fi; "
+            # what verify said (the prerequisite commits the host lacks) is the full_reason (operator 23:40 item B)
+            "v=$(git bundle verify \"$t\" 2>&1 >/dev/null) || { printf '\\nneed-full: %s\\n' \"$(echo $v)\" >&2; "
+            f"exit {NEEDS_FULL_RC}; }}; fi; "
             "git bundle unbundle \"$t\" >/dev/null; " + checkout +
-            f"git reset -q --hard {head}; git clean -fdq; git read-tree {shlex.quote(idx)}; "
+            f"git reset -q --hard {head}; git clean -fdxq; git read-tree {shlex.quote(idx)}; "
             "git stash clear; " + stores + exclude +
             f"[ \"$(git rev-parse HEAD)\" = {head} ] || exit 5; "
             "have=$(git stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
@@ -353,6 +366,7 @@ def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rs
     slug = _kwt._SLUG_RE.match(plan["url"] or "")
     mirror = f"{_kwt.DERIVED_MIRROR_ROOT}/{slug.group(1)}.git" if slug else None
     full = plan["url"] is None
+    full_reason = "no GitHub or local origin" if full else None
     while True:
         bundle, idx = make_bundle(plan, full=full)
         proc = runner(_ssh_argv(host, rebuild_script(dest, plan, idx, mirror)), input=bundle, capture_output=True,
@@ -360,6 +374,9 @@ def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rs
         rc = getattr(proc, "returncode", 1)
         if rc == NEEDS_FULL_RC and not full:
             full = True  # the pool clone lacks a commit the Studio's origin refs have: send every commit
+            e = getattr(proc, "stderr", b"") or b""
+            e = e.decode("utf-8", "replace") if isinstance(e, bytes) else str(e)
+            full_reason = e.rpartition("need-full: ")[2].strip()[:300] or "bundle prerequisites missing on the host"
             continue
         if rc != 0:
             raise RuntimeError(f"rebuild of {rel} on {host.name} rc={rc}: {_err(proc)}")
@@ -374,11 +391,14 @@ def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rs
         payload = "".join(p.rstrip("/") + "\0" for p in plan["files"]).encode("utf-8", "surrogateescape")
         # a listed dir holding a nested rebuilt checkout: that checkout is rebuilt on its own, never sent as files
         excl = [f"--exclude=/{n}/" for n in plan["nested"]]
-        proc = runner([*rsync_base, "-r", *excl, "--from0", "--files-from=-", "--", f"{plan['repo']}/",
+        # -I: every listed file is known to differ from HEAD; the quick check would skip one whose size and mtime
+        # equal the checked-out version's and leave HEAD's bytes on the host (t_681a9c5e item 5)
+        proc = runner([*rsync_base, "-r", "-I", *excl, "--from0", "--files-from=-", "--", f"{plan['repo']}/",
                        f"{host.target}:{dest}/"], input=payload, capture_output=True, **kw)
         if getattr(proc, "returncode", 1) != 0:
             raise RuntimeError(f"rebuild of {rel} on {host.name}: files rc={proc.returncode}: {_err(proc)}")
-    return {"rel": rel, "bundle_bytes": len(bundle), "full_bundle": full, "files": len(plan["files"]),
+    return {"rel": rel, "bundle_bytes": len(bundle), "full_bundle": full,
+            **({"full_reason": full_reason} if full else {}), "files": len(plan["files"]),
             "deleted": len(plan["deleted"]), "stash": len(plan["stash"]),
             **({"stash_left": plan["stash_left"]} if plan.get("stash_left") else {})}
 
@@ -479,7 +499,10 @@ def finalize(host: PoolHost, workspace: str, runner: Optional[Callable] = None) 
     0e52f77edd32; ``-I`` so a file of equal size and mtime is still copied: Prism 707d9e8389dd). Raises when the staging dir is missing or the move fails (the staging dir stays)."""
     dest = workspace.rstrip("/")
     s, w = shlex.quote(staging_path(dest)), shlex.quote(dest)
-    proc = _ssh(host, f"[ -d {s} ] || exit 4; if rmdir -- {w} 2>/dev/null || [ ! -e {w} ]; then mv -- {s} {w}; "
+    # a workspace path that is a symlink on the host loses the link itself (never its target) and gets the staging
+    # dir moved into place (t_681a9c5e item 4: rsync into it would write the files into the link's target)
+    proc = _ssh(host, f"[ -d {s} ] || exit 4; if [ -L {w} ]; then rm -f -- {w} || exit 6; fi; "
+                      f"if rmdir -- {w} 2>/dev/null || [ ! -e {w} ]; then mv -- {s} {w}; "
                       f"else rsync -a -I -- {s}/ {w}/ && rm -rf -- {s}; fi", runner, FINALIZE_TIMEOUT_S)
     if getattr(proc, "returncode", 1) != 0:
         raise RuntimeError(f"carry to {host.name}: finalize rc={getattr(proc, 'returncode', '?')}: "
@@ -571,8 +594,16 @@ def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start:
                 # Prism 38c86a910163: a copy that waited (no slot, no claim) is refreshed before it is claimed; the
                 # second rsync into the same staging dir sends only what changed on the Studio since, under the
                 # lock this job still holds
+                # Prism 64edba28c538: a submit that raises leaves the job as it was (restored below, never cleared
+                # first and left so), so the next poll tries the refresh again instead of handing the stale copy over
+                # as done. Cleared before the submit: the refresh thread sets done_at itself when it finishes.
+                prev = job.done_at, job.seen_done
                 job.done_at, job.seen_done = None, False
-                job.future = _executor().submit(run, job, runner)
+                try:
+                    job.future = _executor().submit(run, job, runner)
+                except BaseException:
+                    job.done_at, job.seen_done = prev
+                    raise
                 return "running", job
             if exc is None:
                 job.seen_done = True
@@ -670,14 +701,15 @@ def progress_payload(job: Job) -> dict:
 
 # -- the card's carry history (DB): what binds the card to a host while a carry is in flight --------------------
 
-_KINDS = (STARTED_EVENT, FAILED_EVENT)
+_KINDS = (STARTED_EVENT, FAILED_EVENT, REFUSED_EVENT)
 
 
 def _last(conn, task_id: str, workspace: Optional[str]) -> Optional[Tuple[str, dict]]:
     """The newest started / failed / carried event of this card for ``workspace``, as (kind, payload)."""
     from hermes_cli.kanban_worker_hosts import CARRIED_EVENT
-    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN (?,?,?) "
-                       "ORDER BY id DESC LIMIT 1", (task_id, *_KINDS, CARRIED_EVENT)).fetchone()
+    kinds = (*_KINDS, CARRIED_EVENT)
+    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN (%s) "
+                       "ORDER BY id DESC LIMIT 1" % ",".join("?" * len(kinds)), (task_id, *kinds)).fetchone()
     if row is None:
         return None
     try:
@@ -719,6 +751,44 @@ def stale_host(conn, task_id: str, workspace: Optional[str], hosts: Mapping[str,
     if not isinstance(name, str) or name.lower() == host.lower():
         return None
     return next((h for n, h in hosts.items() if n.lower() == name.lower()), None)
+
+
+def drop_for_refusal(conn, task_id: str, workspace: Optional[str], hosts: Mapping[str, PoolHost], lock_dir: Path,
+                     reason: str, runner: Optional[Callable] = None) -> Optional[dict]:
+    """Workspace admission refused the card (t_681a9c5e, Prism 2a7982d8eadd): forget this process's finished carry
+    of it and remove the staging dir a carry may have left on a pool host (the host of its live job, else of its last
+    started / resumable-failed record), under that (host, path) carry lock. The returned payload is written as
+    ``workspace_carry_admission_refused``, so a later refused tick finds it and does nothing. None: nothing to drop
+    (no carry started, already recorded) or not now (a copy still running, another dispatcher holds the lock, the
+    remove failed: the next refused tick tries again from the started record)."""
+    if not workspace:
+        return None
+    workspace = str(Path(workspace))
+    host: Optional[PoolHost] = None
+    with _lock:
+        hit = _jobs.get(task_id)
+        if hit is not None:
+            if hit[0].future is not None and not hit[0].future.done():
+                return None   # the copy is running: its rsync is not stopped mid-write; dropped once it finished
+            del _jobs[task_id]
+            release(hit[0])
+            host, workspace = hit[0].host, hit[0].workspace
+        _failed.pop(task_id, None)
+    if host is None:
+        host = stale_host(conn, task_id, workspace, hosts, "")
+        if host is None:
+            return None
+    fd = _try_lock(lock_path(lock_dir, host.name, workspace))
+    if fd is None:
+        return None
+    try:
+        removed = remove_staging(host, workspace, runner)
+    finally:
+        _unlock(fd)
+    if not removed:
+        return None   # Prism 8309def60720: no event, so the next refused tick retries (its started record remains)
+    return {"host": host.name, "path": workspace, "staging": staging_path(workspace), "staging_removed": removed,
+            "reason": reason[:300]}
 
 
 def reset() -> None:
