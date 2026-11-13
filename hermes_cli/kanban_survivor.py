@@ -3925,35 +3925,41 @@ exec(_STRANDED_SRC)
 # Only independently durable CLEAN repositories (or an empty dir) may be removed remotely. Untracked
 # scratch/dirty work is held, never mistaken for the Studio's empty copy of the same path. Dirt that is
 # all residue (R/F == _RESIDUE_DIRS/_RESIDUE_FILES, untracked or ignored, no hidden-edit flag) is clean.
-_REMOTE_PROOF = r'''import os,sys,subprocess,shutil,fnmatch
+# HEAD durability (t_3af8cae9): an exact remote tip passes as before. "Reachable from an advertised head" is
+# accepted ONLY from a GitHub remote (G; never shallow, cannot borrow this clone's objects) and only for a clone
+# with no alternates, grafts, refs/replace, shallow file or partial-clone setting (unsupported:<shape>, held).
+# Refuse, don't model: those shapes change what rev-list calls an ancestor (Prism 4ad6b4e63f59, 051b2f1f71e3).
+_REMOTE_PROOF = r'''import os,sys,subprocess,shutil,fnmatch,re
+os.environ['GIT_NO_REPLACE_OBJECTS']='1'
+G=('https://github.com/','git@github.com:','ssh://git@github.com/');U='HEAD durability unknown'
 from pathlib import Path
+E=RuntimeError
 R=("__pycache__", ".pytest_cache", ".venv", "node_modules", ".mypy_cache", ".ruff_cache")
 F=("*.pyc", ".coverage")
 p=Path(sys.argv[1])
 if not p.is_absolute() or str(p.resolve())!=str(p) or p.is_symlink(): sys.exit(12)
 if not p.exists(): sys.exit(0)
 def git(repo,*args,i=None):
- r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=8 if args[0]=='fetch' else 12,**({'input':i.encode()} if i else {'stdin':subprocess.DEVNULL}))
- if r.returncode: raise RuntimeError('git proof failed')
+ r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=12,input=(i or '').encode())
+ if r.returncode:raise E('git proof failed')
  return r.stdout.decode('utf-8','surrogateescape')
 '''+_STRANDED_SRC+r'''def durable(d,sha):
- u=0
+ A={};w=''
  for r in git(d,'remote').split():
+  try:A[r]=[l.split('\t')for l in git(d,'ls-remote',r).splitlines()]
+  except Exception:w=U;continue
+  if any(s==sha for s,_ in A[r]):return 1
+ e=lambda x:(d/git(d,'rev-parse','--git-path',x).strip()).exists()
+ for k,t in('alternates',e('objects/info/alternates')),('grafts',e('info/grafts')),('replace_refs',git(d,'for-each-ref','refs/replace')),('shallow',e('shallow')),('partial_clone',re.search(r'partialclone=.|\.promisor=(true|yes|on|1)$',git(d,'config','-l').lower(),re.M)):
+  if t:raise E('unsupported:'+k)
+ for r,a in A.items():
+  if not git(d,'ls-remote','--get-url',r).startswith(G):w=w or 'unsupported:remote_not_github';continue
   try:
-   a=[l.split('\t') for l in git(d,'ls-remote',r).splitlines()]
-   if any(s==sha for s,_ in a): return 1
-   l=git(d,'remote','get-url',r).strip();q=os.path.join(d,l)
-   if os.path.isdir(q):
-    if git(q,'rev-parse','--is-shallow-repository').strip()!='false': raise OSError
-   elif not l.startswith(('https://github.com/','git@github.com:')): raise OSError
-   p=[]
-   for f in '','refs/heads/':
-    m=[s for s,n in a if f and n.startswith(f) and s not in p]
-    if m: git(d,'fetch','-q','--no-tags','--no-write-fetch-head',r,*m)
-    p=[l.split()[0] for l in git(d,'cat-file','--batch-check',i=''.join(s+'\n' for s,_ in a)).splitlines() if l.split()[1]=='commit'] if a else p
-    if p and git(d,'rev-list','--count','--stdin',i='HEAD\n'+''.join('^'+s+'\n' for s in p)).strip()=='0': return 1
-  except Exception: u=1
- if u or git(d,'rev-parse','--is-shallow-repository').strip()!='false': raise RuntimeError('HEAD durability unknown')
+   m=[s for s,x in a if x.startswith('refs/heads/')]
+   if m:git(d,'fetch','-q','--no-tags','--no-write-fetch-head',r,*m)
+   if m and git(d,'rev-list','--count','--stdin',i='HEAD\n'+''.join('^'+s+'\n'for s in m))=='0\n':return 1
+  except Exception:w=U
+ if w:raise E(w)
 def res(s):
  q=[x for x in s.rstrip('/').split('/') if x]
  ds=q if s.endswith('/') else q[:-1]
@@ -3972,17 +3978,17 @@ def h(d):
 def prove(d):
  g=d/'.git'
  if g.is_symlink() or g.exists():
-  if g.is_symlink() or g.is_file(): raise RuntimeError('registered worktree or redirected .git requires git worktree remove')
+  if g.is_symlink() or g.is_file():raise E('registered worktree or redirected .git requires git worktree remove')
   st=[r for r in git(d,'status','--porcelain=v1','-z','--untracked-files=all','--ignored','--ignore-submodules=none').split('\0') if r]
-  if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st): raise RuntimeError('dirty, ignored or untracked work')
-  if any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
-  if git(d,'stash','list'): raise RuntimeError('stashes')
+  if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st):raise E('dirty, ignored or untracked work')
+  if any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2):raise E('skip-worktree or assume-unchanged files')
+  if git(d,'stash','list'):raise E('stashes')
   w=stranded(git,d)
-  if w: raise RuntimeError(w)
-  if not durable(d,git(d,'rev-parse','HEAD').strip()): raise RuntimeError('HEAD has no independently durable ref')
+  if w:raise E(w)
+  if not durable(d,git(d,'rev-parse','HEAD').strip()):raise E('HEAD has no independently durable ref')
   return
  for f in d.iterdir():
-  if f.is_symlink() or not f.is_dir(): raise RuntimeError('unpreserved scratch files')
+  if f.is_symlink() or not f.is_dir():raise E('unpreserved scratch files')
   prove(f)
 try:
  prove(p)

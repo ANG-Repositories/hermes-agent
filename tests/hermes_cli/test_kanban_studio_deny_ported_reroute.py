@@ -581,12 +581,42 @@ def test_stranded_probe_ignores_a_tag_origin_already_has(tmp_path):
     assert r.returncode == 13 and "unknown" in r.stderr, (r.returncode, r.stderr)
 
 
+def _gh(root, monkeypatch=None):
+    """The proof certifies only GitHub remotes. A test remote is a local bare repo, so the test proof also accepts
+    URLs under `root` (G gets one extra prefix). `url.<bare>.insteadOf=https://github.com/...` does NOT work for
+    this: the proof reads the URL git actually fetches from (`ls-remote --get-url`, insteadOf applied), so a
+    rewritten GitHub URL is a local path and is held (test_remote_proof_refuses_each_unsupported_shape)."""
+    from hermes_cli import kanban_survivor as ks
+    g = "G=('https://github.com/',"
+    assert ks._REMOTE_PROOF.count(g) == 1
+    return ks._REMOTE_PROOF.replace(g, g + repr(str(root) + "/") + ",")
+
+
+def _run(script, path, env):
+    import subprocess
+    import sys
+    return subprocess.run([sys.executable, "-c", script, str(path), "check"], capture_output=True, text=True,
+                          env=env, timeout=60)
+
+
+def _moved(root, git, clone, *names):
+    """Clones of remote.git, then origin's branch moves one commit on: each clone's HEAD is behind the tip."""
+    git(root / "remote.git", "tag", "-d", "courierwatch-v1")  # no tags: the stranded() tag read is not the gate
+    ds = [clone(n) for n in names]
+    seed, branch = root / "seed", git(ds[0], "symbolic-ref", "--short", "HEAD")
+    git(seed, "checkout", "-q", "-B", branch, f"origin/{branch}")
+    (seed / "f.txt").write_text("two\n")
+    git(seed, "commit", "-qam", "two")
+    git(seed, "push", "-q", "origin", branch)
+    return ds, git(seed, "rev-parse", "HEAD~1"), git(seed, "rev-parse", "HEAD")
+
+
 def test_remote_proof_tip_equality_mutant_holds_the_behind_clone(tmp_path, monkeypatch):
     """Mutation: drop the reachability walk (tip-equality only, the pre-t_3af8cae9 rule) and the test below is red."""
     from hermes_cli import kanban_survivor as ks
-    mutant = ks._REMOTE_PROOF.replace("for f in '','refs/heads/':", "for f in ():")
-    assert mutant != ks._REMOTE_PROOF
-    monkeypatch.setattr(ks, "_REMOTE_PROOF", mutant)
+    anchor = "if m and git(d,'rev-list'"
+    assert ks._REMOTE_PROOF.count(anchor) == 1
+    monkeypatch.setattr(ks, "_REMOTE_PROOF", ks._REMOTE_PROOF.replace(anchor, "if 0 and git(d,'rev-list'"))
     with pytest.raises(AssertionError, match="HEAD has no independently durable ref"):
         test_remote_proof_head_reachable_not_tip_equal(tmp_path)
 
@@ -596,47 +626,30 @@ def test_remote_proof_head_reachable_not_tip_equal(tmp_path):
     clone never fetched it) is NOT held -- the old proof wanted HEAD to be the exact TIP of a remote ref and held
     t_6e7909d1/t_a982e7eb `HEAD has no independently durable ref`. A detached commit on no remote ref IS held; a
     remote that cannot be read holds as unknown, never clean."""
-    import subprocess
-    import sys
-    from hermes_cli.kanban_survivor import _REMOTE_PROOF
     root = tmp_path.resolve()
     git, clone, env = _tag_repos(root)
-    git(root / "remote.git", "tag", "-d", "courierwatch-v1")  # no tags: the stranded() tag read is not the gate here
-
-    def proof(path):
-        return subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(path), "check"], capture_output=True,
-                              text=True, env=env, timeout=60)
-
-    behind, detached, blind = clone("behind"), clone("detached"), clone("blind")
-    seed = root / "seed"
-    branch = git(behind, "symbolic-ref", "--short", "HEAD")
-    git(seed, "checkout", "-q", "-B", branch, f"origin/{branch}")
-    (seed / "f.txt").write_text("two\n")
-    git(seed, "commit", "-qam", "two")
-    git(seed, "push", "-q", "origin", branch)
-    head, tip = git(behind, "rev-parse", "HEAD"), git(seed, "rev-parse", "HEAD")
-    assert git(seed, "rev-parse", "HEAD~1") == head != tip
+    (behind, detached, blind), head, tip = _moved(root, git, clone, "behind", "detached", "blind")
+    proof = _gh(root)
+    assert git(behind, "rev-parse", "HEAD") == head != tip
     assert head not in git(behind, "ls-remote", "origin")  # no remote ref is AT the clone's HEAD
-    r = proof(behind)
+    r = _run(proof, behind, env)
     assert (r.returncode, r.stdout.strip()) == (0, head), r.stderr
 
     git(detached, "checkout", "-q", "--detach")
     (detached / "f.txt").write_text("mine\n")
     git(detached, "commit", "-qam", "mine")
-    r = proof(detached)
+    r = _run(proof, detached, env)
     assert r.returncode == 13 and "HEAD has no independently durable ref" in r.stderr, (r.returncode, r.stderr)
 
     git(blind, "remote", "set-url", "origin", str(root / "gone.git"))
-    r = proof(blind)
+    r = _run(proof, blind, env)
     assert r.returncode == 13 and "unknown" in r.stderr, (r.returncode, r.stderr)
 
 
 def test_remote_proof_holds_head_a_shallow_remote_lacks(tmp_path):
     """Prism 813395673ff1 repro: full local history A -> B, branch reset to A with B still cached, the ONLY remote a
-    depth-1 clone holding B and not A. Local reachability from cached B proves nothing about the remote: HELD."""
-    import subprocess
-    import sys
-    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    depth-1 clone holding B and not A. Local reachability from cached B proves nothing about the remote: HELD
+    (a path remote gives no ancestry proof)."""
     root = tmp_path.resolve()
     git, clone, env = _tag_repos(root)
     git(root / "remote.git", "tag", "-d", "courierwatch-v1")
@@ -651,38 +664,103 @@ def test_remote_proof_holds_head_a_shallow_remote_lacks(tmp_path):
     git(full, "reset", "-q", "--hard", a)
     git(full, "fetch", "-q", "origin")
     assert git(full, "cat-file", "-t", b) == "commit" and git(full, "merge-base", "--is-ancestor", a, b) == ""
-    r = subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(full), "check"], capture_output=True, text=True,
-                       env=env, timeout=60)
-    assert r.returncode == 13 and "unknown" in r.stderr, (r.returncode, r.stderr)
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    r = _run(_REMOTE_PROOF, full, env)
+    assert r.returncode == 13 and "unsupported:remote_not_github" in r.stderr, (r.returncode, r.stderr)
 
 
 def test_remote_proof_one_readable_remote_proves_despite_an_unreadable_one(tmp_path):
     """Prism P2 329090a45473: decide per remote. An unreadable first remote does not hold a clone a second remote
     proves; unknown only when no remote proves."""
-    import subprocess
-    import sys
-    from hermes_cli.kanban_survivor import _REMOTE_PROOF
     root = tmp_path.resolve()
     git, clone, env = _tag_repos(root)
-    git(root / "remote.git", "tag", "-d", "courierwatch-v1")
-    behind, seed = clone("behind"), root / "seed"
-    branch = git(behind, "symbolic-ref", "--short", "HEAD")
-    git(seed, "checkout", "-q", "-B", branch, f"origin/{branch}")
-    (seed / "f.txt").write_text("two\n")
-    git(seed, "commit", "-qam", "two")
-    git(seed, "push", "-q", "origin", branch)
+    (behind,), _, _ = _moved(root, git, clone, "behind")
     git(behind, "remote", "rename", "origin", "zz")
     git(behind, "remote", "add", "aa", str(root / "gone.git"))
     assert git(behind, "remote").split() == ["aa", "zz"]
-
-    def proof():
-        return subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(behind), "check"], capture_output=True,
-                              text=True, env=env, timeout=60)
-    r = proof()
+    r = _run(_gh(root), behind, env)
     assert r.returncode == 0, r.stderr
     git(behind, "remote", "set-url", "zz", str(root / "gone2.git"))
-    r = proof()
+    r = _run(_gh(root), behind, env)
     assert r.returncode == 13 and "unknown" in r.stderr, (r.returncode, r.stderr)
+
+
+def test_remote_proof_ignores_local_grafts_and_replace_refs(tmp_path):
+    """Prism 051b2f1f71e3 repro: the remote holds A -> B; the clone has a detached, unpushed H parented by A and a
+    local graft (or replace ref) making B descend from H. Reachability must be the remote's history: HELD."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    (graft, replace), a, b = _moved(root, git, clone, "graft", "replace")
+    for d, why in ((graft, "unsupported:grafts"), (replace, "unsupported:replace_refs")):
+        git(d, "checkout", "-q", "--detach", a)
+        (d / "f.txt").write_text("H\n")
+        git(d, "commit", "-qam", "H")
+        h = git(d, "rev-parse", "HEAD")
+        git(d, "fetch", "-q", "origin")  # B cached locally
+        if d is graft:
+            (d / ".git" / "info" / "grafts").write_text(f"{b} {h}\n")
+        else:
+            git(d, "replace", "--graft", b, h)
+        assert git(d, "merge-base", "--is-ancestor", h, b) == ""  # the forged history says H is on the remote
+        r = _run(_gh(root), d, env)
+        assert r.returncode == 13 and why in r.stderr, (why, r.returncode, r.stdout, r.stderr)
+
+
+def test_remote_proof_holds_a_shared_local_remote_that_borrows_the_clone(tmp_path):
+    """Prism 4ad6b4e63f59 repro: the only remote is a `clone --shared` of the clone itself (its objects ARE the
+    clone's). Its branch holds a child of HEAD, so HEAD is "reachable" there, but deleting the clone destroys the
+    remote's copy too: HELD, a path remote gives no ancestry proof."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    git(root / "remote.git", "tag", "-d", "courierwatch-v1")
+    d = clone("borrowed")
+    git(d, "checkout", "-q", "--detach")
+    for msg in ("H", "H2"):
+        (d / "f.txt").write_text(msg + "\n")
+        git(d, "commit", "-qam", msg)
+    git(root, "clone", "-q", "--bare", "--shared", str(d), "dep.git")
+    git(root / "dep.git", "update-ref", "refs/heads/h2", git(d, "rev-parse", "HEAD"))
+    git(d, "reset", "-q", "--hard", "HEAD~1")
+    git(d, "remote", "set-url", "origin", str(root / "dep.git"))
+    assert (root / "dep.git" / "objects" / "info" / "alternates").is_file()
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    r = _run(_REMOTE_PROOF, d, env)
+    assert r.returncode == 13 and "unsupported:remote_not_github" in r.stderr, (r.returncode, r.stderr)
+
+
+def test_remote_proof_refuses_each_unsupported_shape(tmp_path):
+    """Apollo ruling t_3af8cae9-refuse-dont-model: reachability is accepted only for a GitHub remote and a clone with
+    no alternates, grafts, replace refs, shallow file or partial-clone setting. Each refusal FIRES on a behind clone
+    that otherwise passes (the control), with its own reason."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    names = ("control", "alternates", "grafts", "replace_refs", "shallow", "partial_clone", "path", "insteadof")
+    ds, a, b = _moved(root, git, clone, *names)
+    d = dict(zip(names, ds))
+    (d["alternates"] / ".git" / "objects" / "info" / "alternates").write_text(str(root / "remote.git" / "objects") + "\n")
+    (d["grafts"] / ".git" / "info" / "grafts").write_text(f"{a}\n")
+    git(d["replace_refs"], "fetch", "-q", "origin")
+    git(d["replace_refs"], "replace", "--graft", b)
+    (d["shallow"] / ".git" / "shallow").write_text(f"{a}\n")
+    git(d["partial_clone"], "config", "remote.origin.promisor", "true")
+    gh = "https://github.com/o/r.git"
+    git(d["insteadof"], "config", f"url.{root / 'remote.git'}.insteadOf", gh)
+    git(d["insteadof"], "remote", "set-url", "origin", gh)
+    assert git(d["insteadof"], "ls-remote", "--get-url", "origin") == str(root / "remote.git")
+    proof = _gh(root)
+    r = _run(proof, d["control"], env)
+    assert (r.returncode, r.stdout.strip()) == (0, a), r.stderr
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    r = _run(_REMOTE_PROOF, d["path"], env)  # the shipped proof: a path remote is not GitHub
+    assert r.returncode == 13 and "unsupported:remote_not_github" in r.stderr, r.stderr
+    r = _run(_REMOTE_PROOF, d["insteadof"], env)  # a github.com URL rewritten to a path is still a path
+    assert r.returncode == 13 and "unsupported:remote_not_github" in r.stderr, r.stderr
+    for why in ("alternates", "grafts", "replace_refs", "shallow", "partial_clone"):
+        r = _run(proof, d[why], env)
+        assert r.returncode == 13 and f"unsupported:{why}" in r.stderr, (why, r.returncode, r.stderr)
+    git(d["control"], "pull", "-q", "--ff-only")  # exact tip: still accepted by the shipped proof, any remote
+    r = _run(_REMOTE_PROOF, d["control"], env)
+    assert (r.returncode, r.stdout.strip()) == (0, b), r.stderr
 
 
 def test_reclaim_uses_the_same_stranded_predicate(tmp_path):
