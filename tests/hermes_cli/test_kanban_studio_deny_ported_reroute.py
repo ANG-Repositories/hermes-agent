@@ -427,7 +427,6 @@ def test_the_remote_proof_check_mode_against_real_repos(tmp_path):
     import os
     import subprocess
     import sys
-    from hermes_cli.kanban_survivor import _REMOTE_PROOF
     root = tmp_path.resolve()
     env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
                GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
@@ -437,7 +436,7 @@ def test_the_remote_proof_check_mode_against_real_repos(tmp_path):
                               env=env).stdout.strip()
 
     def proof(path):
-        return subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(path), "check"], capture_output=True,
+        return subprocess.run([sys.executable, "-c", _gh(root), str(path), "check"], capture_output=True,
                               text=True, env=env, timeout=60)
 
     def clone(name):
@@ -537,12 +536,11 @@ def test_stranded_probe_ignores_a_tag_origin_already_has(tmp_path):
     local-only tag on an unpushed commit and an unpushed branch commit ARE stranded; unreadable remote tags hold."""
     import subprocess
     import sys
-    from hermes_cli.kanban_survivor import _REMOTE_PROOF
     root = tmp_path.resolve()
     git, clone, env = _tag_repos(root)
 
     def proof(path):
-        return subprocess.run([sys.executable, "-c", _REMOTE_PROOF, str(path), "check"], capture_output=True,
+        return subprocess.run([sys.executable, "-c", _gh(root), str(path), "check"], capture_output=True,
                               text=True, env=env, timeout=60)
 
     clean = clone("clean")
@@ -582,8 +580,9 @@ def test_stranded_probe_ignores_a_tag_origin_already_has(tmp_path):
 
 
 def _gh(root, monkeypatch=None):
-    """The proof certifies only GitHub remotes. A test remote is a local bare repo, so the test proof also accepts
-    URLs under `root` (G gets one extra prefix). `url.<bare>.insteadOf=https://github.com/...` does NOT work for
+    """The proof certifies only GitHub remotes, for the exact-tip answer too (t_f47e4e3f). A test remote is a local
+    bare repo, so the TEST proof also accepts URLs under `root`: G gets one extra prefix in this text copy only; the
+    shipped _REMOTE_PROOF has no env, flag or path hook that widens G. `url.<bare>.insteadOf=https://github.com/...` does NOT work for
     this: the proof reads the URL git actually fetches from (`ls-remote --get-url`, insteadOf applied), so a
     rewritten GitHub URL is a local path and is held (test_remote_proof_refuses_each_unsupported_shape)."""
     from hermes_cli import kanban_survivor as ks
@@ -614,7 +613,7 @@ def _moved(root, git, clone, *names):
 def test_remote_proof_tip_equality_mutant_holds_the_behind_clone(tmp_path, monkeypatch):
     """Mutation: drop the reachability walk (tip-equality only, the pre-t_3af8cae9 rule) and the test below is red."""
     from hermes_cli import kanban_survivor as ks
-    anchor = "if m and git(d,'rev-list'"
+    anchor = "if k and git(d,'rev-list'"
     assert ks._REMOTE_PROOF.count(anchor) == 1
     monkeypatch.setattr(ks, "_REMOTE_PROOF", ks._REMOTE_PROOF.replace(anchor, "if 0 and git(d,'rev-list'"))
     with pytest.raises(AssertionError, match="HEAD has no independently durable ref"):
@@ -775,9 +774,15 @@ def test_remote_proof_refuses_each_unsupported_shape(tmp_path):
     for why in ("alternates", "grafts", "replace_refs", "shallow", "partial_clone"):
         r = _run(proof, d[why], env)
         assert r.returncode == 13 and f"unsupported:{why}" in r.stderr, (why, r.returncode, r.stderr)
-    git(d["control"], "pull", "-q", "--ff-only")  # exact tip: still accepted by the shipped proof, any remote
-    r = _run(_REMOTE_PROOF, d["control"], env)
+    git(d["control"], "pull", "-q", "--ff-only")  # exact tip: accepted only from a GitHub remote (t_f47e4e3f)
+    r = _run(proof, d["control"], env)
     assert (r.returncode, r.stdout.strip()) == (0, b), r.stderr
+    r = _run(_REMOTE_PROOF, d["control"], env)
+    assert r.returncode == 13 and "unsupported:remote_not_github" in r.stderr, r.stderr
+    git(d["shallow"], "pull", "-q", "--ff-only")  # the shape refusals run before the exact-tip answer too
+    assert b in git(d["shallow"], "ls-remote", "origin")
+    r = _run(proof, d["shallow"], env)
+    assert r.returncode == 13 and "unsupported:shallow" in r.stderr, (r.returncode, r.stderr)
 
 
 def test_reclaim_uses_the_same_stranded_predicate(tmp_path):
@@ -803,3 +808,136 @@ def test_reclaim_uses_the_same_stranded_predicate(tmp_path):
     git(blind, "remote", "set-url", "origin", str(root / "gone.git"))
     with pytest.raises(kr.ReclaimHeld, match="unknown"):
         kr._repo_dirt(blind, "blind", root, {blind}, [])
+
+
+def test_remote_proof_holds_an_exact_tip_on_a_shared_local_remote(tmp_path):
+    """t_f47e4e3f (neg-318.sh row KNOWN): clone d at X; `git clone --bare --shared d r.git`; d's origin -> r.git.
+    r.git advertises X exactly, but its objects ARE d's: deleting d destroys the only copy. HELD, never rc 0."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    git(root / "remote.git", "tag", "-d", "courierwatch-v1")
+    d = clone("d")
+    x = git(d, "rev-parse", "HEAD")
+    git(root, "clone", "-q", "--bare", "--shared", str(d), "r.git")
+    git(d, "remote", "set-url", "origin", str(root / "r.git"))
+    git(d, "fetch", "-q", "--prune", "origin")
+    assert x in git(d, "ls-remote", "origin") and (root / "r.git" / "objects" / "info" / "alternates").is_file()
+    from hermes_cli.kanban_survivor import _REMOTE_PROOF
+    r = _run(_REMOTE_PROOF, d, env)
+    assert r.returncode == 13 and "unsupported:remote_not_github" in r.stderr, (r.returncode, r.stdout, r.stderr)
+    assert (d / ".git").is_dir()
+
+
+def test_remote_proof_holds_when_any_remote_is_not_github(tmp_path):
+    """t_f47e4e3f: one rule for both answers. A GitHub remote that proves HEAD at its exact tip does not license a
+    clone that also carries a non-GitHub remote (the refusal runs before either answer)."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    git(root / "remote.git", "tag", "-d", "courierwatch-v1")
+    d = clone("d")
+    r = _run(_gh(root), d, env)
+    assert r.returncode == 0, r.stderr
+    elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere.git"
+    git(root, "init", "-q", "--bare", str(elsewhere))
+    git(d, "remote", "add", "zz", str(elsewhere))
+    r = _run(_gh(root), d, env)
+    assert r.returncode == 13 and "unsupported:remote_not_github" in r.stderr, (r.returncode, r.stderr)
+
+
+_CAP_GIT = r'''#!/bin/sh
+case " $* " in *" fetch "*)
+  n=$(printf '%s\n' "$@" | grep -cE '^[0-9a-f]{40}$'); echo "$n" >> "$CAP_LOG"
+  [ "$n" -gt "$CAP_N" ] && { echo "fetch of $n ids refused" >&2; exit 1; } ;;
+esac
+exec "$CAP_REAL" "$@"
+'''
+
+
+def _fetch_cap(root, env, cap):
+    """A `git` first on PATH that logs each fetch's id count and refuses a fetch of more than `cap` ids: the
+    stand-in for a remote with more heads than the proof's 12 s budget can fetch (hermes-home: 1,181 heads)."""
+    import os
+    import shutil
+    bindir = root / "capbin"
+    bindir.mkdir()
+    (bindir / "git").write_text(_CAP_GIT)
+    (bindir / "git").chmod(0o755)
+    log = root / "fetches.log"
+    return dict(env, PATH=str(bindir) + os.pathsep + env.get("PATH", ""), CAP_LOG=str(log), CAP_N=str(cap),
+                CAP_REAL=shutil.which("git")), log
+
+
+def _side_heads(root, git, tip, n):
+    """`n` extra branch heads on remote.git, each a child of `tip`, written in the bare repo (no clone has them)."""
+    import subprocess
+    bare = root / "remote.git"
+    tree = git(bare, "rev-parse", f"{tip}^{{tree}}")
+    shas = [git(bare, "commit-tree", "-p", tip, "-m", f"side {i}", tree) for i in range(n)]
+    subprocess.run(["git", "-C", str(bare), "update-ref", "--stdin"], check=True, text=True,
+                   input="".join(f"create refs/heads/side-{i} {s}\n" for i, s in enumerate(shas)))
+
+
+def test_remote_proof_does_not_fetch_every_head(tmp_path):
+    """t_f47e4e3f: the ancestry answer fetched EVERY advertised head (hermes-home: 6 s of the 12 s budget). With
+    300 extra heads and a git that refuses a fetch of more than 2 ids, a clone behind the remote's default branch
+    is still proved: the remote's HEAD alone answers it (one fetch of one id)."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    (behind,), head, tip = _moved(root, git, clone, "behind")
+    _side_heads(root, git, tip, 300)
+    assert len(git(behind, "ls-remote", "--heads", "origin").splitlines()) == 301
+    capped, log = _fetch_cap(root, env, 2)
+    r = _run(_gh(root), behind, capped)
+    assert (r.returncode, r.stdout.strip()) == (0, head), (r.returncode, r.stderr)
+    assert log.read_text().split() == ["1"], log.read_text()
+
+
+def test_remote_proof_cheap_answer_needs_no_fetch(tmp_path):
+    """t_f47e4e3f: HEAD is an ancestor of an advertised head the clone already holds (main moved on, the clone
+    fetched it, its branch did not advance): proved with NO fetch at all."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    (behind,), head, tip = _moved(root, git, clone, "behind")
+    _side_heads(root, git, tip, 3)
+    git(behind, "fetch", "-q", "origin")
+    assert git(behind, "rev-parse", "HEAD") == head and git(behind, "cat-file", "-t", tip) == "commit"
+    capped, log = _fetch_cap(root, env, 0)
+    r = _run(_gh(root), behind, capped)
+    assert (r.returncode, r.stdout.strip()) == (0, head), (r.returncode, r.stderr)
+    assert not log.exists(), log.read_text()
+
+
+def test_remote_proof_falls_back_to_the_other_heads(tmp_path):
+    """t_f47e4e3f: HEAD is on a non-default branch only and that branch's tip is not in the clone: the cheap answer
+    and the remote's HEAD do not prove it, the remaining heads do (one fetch). A commit on no remote head holds."""
+    root = tmp_path.resolve()
+    git, clone, env = _tag_repos(root)
+    git(root / "remote.git", "tag", "-d", "courierwatch-v1")
+    d, other = clone("d"), clone("other")
+    git(other, "checkout", "-q", "-b", "side")
+    (other / "f.txt").write_text("side\n")
+    git(other, "commit", "-qam", "side 1")
+    mine = git(other, "rev-parse", "HEAD")
+    (other / "f.txt").write_text("side2\n")
+    git(other, "commit", "-qam", "side 2")
+    git(other, "push", "-q", "origin", "side")
+    git(d, "fetch", "-q", "origin", "side")
+    git(d, "checkout", "-q", "--detach", mine)
+    git(d, "update-ref", "-d", "refs/remotes/origin/side")
+    git(d, "reflog", "expire", "--expire=now", "--all")
+    git(d, "gc", "-q", "--prune=now")
+    side = git(d, "ls-remote", "origin", "refs/heads/side").split()[0]
+    assert subprocess_rc(d, "cat-file", "-e", side) != 0  # the side tip is not in the clone
+    capped, log = _fetch_cap(root, env, 2)
+    r = _run(_gh(root), d, capped)
+    assert (r.returncode, r.stdout.strip()) == (0, mine), (r.returncode, r.stderr)
+    assert log.read_text().split() == ["1"], log.read_text()
+    (d / "f.txt").write_text("mine\n")
+    git(d, "commit", "-qam", "mine")
+    r = _run(_gh(root), d, env)
+    assert r.returncode == 13 and "HEAD has no independently durable ref" in r.stderr, (r.returncode, r.stderr)
+
+
+def subprocess_rc(repo, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True).returncode
