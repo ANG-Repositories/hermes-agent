@@ -268,6 +268,29 @@ def test_stale_surface_ignores_non_owner_comments(env, author, body):
         assert ah.stale_surface_reason(entry) is None
 
 
+@pytest.mark.parametrize("row,comment_at,stale", [
+    ("mechanical_wake", 1793844766, None),                                   # hold BEFORE the event: deliver
+    ("mechanical_wake", 1793846000, "owner comment newer than handback"),     # owner acted AFTER the event
+    ("review_deadman", 1793844766, "owner comment newer than handback"),      # deadman stays on the handback cursor
+])
+def test_stale_surface_event_cursor_for_own_event_rows(env, row, comment_at, stale):
+    """t_df97e311 (t_707d4196, 2026-11-13 03:01-03:10): the operator posted a hold comment after the handback and
+    queued a detached job; the job's mechanical_wake surface was refused as "owner comment newer than handback" though
+    the event came AFTER the comment. RED on 5eee3813fa for the first case."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "apollo", "holding: attribution job queued", comment_at))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, row, "{}", 1793845000))
+    entry = _claimed_entry(env, tid, row=row, kind=row)
+    env["health"][(REPO, 71)] = {"state": "open"}
+    assert ah.stale_surface_reason(entry) == stale
+
+
 @pytest.mark.parametrize("assignee", ["apollo", "human:apollo"])
 def test_stale_surface_bot_comment_does_not_hide_owner_release(env, assignee):
     tid = _card(env)
