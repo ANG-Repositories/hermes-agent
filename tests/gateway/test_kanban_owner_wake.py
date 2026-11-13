@@ -180,6 +180,19 @@ def test_e_red_or_dirty_handback_wakes_owner(env):
     assert "red: tests (3.11)" in text and "dirty" in text
 
 
+def test_red_handback_on_review_hold_lane_does_not_wake(env):
+    """t_54f4fde6: a red handback parked on kanban.review_hold_assignee is no decision yet: no owner wake."""
+    _cfg(review_hold_assignee="review-hold")
+    env["health"][("ANG-Ventures/hermes-agent", 1702)] = {
+        "state": "open", "mergeable_state": "dirty", "failing": ["tests (3.11)"]}
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, reviewer="review-hold",
+                          summary="PR ANG-Ventures/hermes-agent#1702 ready")
+        assert conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "review-hold"
+    assert _tick(env) == []
+
+
 # --- the three non-triggers -----------------------------------------------------
 
 
