@@ -372,3 +372,47 @@ def refusal(author: str, body: str) -> Optional[str]:
     except CloseOnLineRefused as exc:
         return str(exc)
     return None
+
+
+# ── deadman hold (t_238f3f04, t_5a5e36db) ─────────────────────────────────────────────────────────────
+# The home review deadman reads a hold with this exact pattern on ANY line (review_deadman_core._HOLD_RE) and
+# honours it only when operator_identity.comment_can_hold(author, body). A hold any other author stores printed
+# "Comment added"/ok and held nothing: refused here, in add_comment, so the CLI, the kanban_comment tool and a
+# worker run share one check.
+HOLD_RE = re.compile(r"^\s*deadman:\s*hold\s+(\S+)", re.I | re.M)
+
+
+class HoldAuthorRefused(ValueError):
+    """A ``deadman: hold <ISO>`` line under an author the deadman does not honour."""
+
+
+def _kernel_can_hold(author: str) -> bool:
+    """The deadman's author rule when the fleet library is absent: an operator label, never ``unverified:``,
+    a subagent or a bot (operator_identity.is_operator, MACHINE_SUFFIXES)."""
+    from hermes_cli.kanban_identity import UNVERIFIED_AUTHOR_PREFIX, is_operator_label
+
+    a = str(author or "").strip().lower()
+    if a.startswith(UNVERIFIED_AUTHOR_PREFIX) or a.endswith(("(subagent)", "[bot]")):
+        return False
+    return is_operator_label(a)
+
+
+def check_hold_author(task_id: str, author: str, body: str) -> None:
+    """Raise :class:`HoldAuthorRefused` when ``body`` carries a hold line ``author`` cannot hold with."""
+    if not HOLD_RE.search(body or ""):
+        return
+    fn = getattr(_load("operator_identity"), "comment_can_hold", None)
+    try:
+        ok = bool(fn(author, body)) if fn is not None else _kernel_can_hold(author)
+    except Exception:  # noqa: BLE001 -- an unreadable fleet predicate falls back to the kernel rule
+        ok = _kernel_can_hold(author)
+    if ok:
+        return
+    from hermes_cli import kanban_db as kb
+
+    token_file = str(kb.operator_token_path()).replace(str(Path.home()), "~", 1)
+    raise HoldAuthorRefused(
+        f"`deadman: hold` from {str(author).strip()} holds nothing; post it as the operator: "
+        f"{kb.OPERATOR_TOKEN_ENV}=$(cat {token_file}) hermes kanban comment "
+        f"{task_id} --author apollo '<body>'; not posted"
+    )

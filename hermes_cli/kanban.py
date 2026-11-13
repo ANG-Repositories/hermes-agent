@@ -43,7 +43,7 @@ for _name in ("_cmd_daemon", "_kanban_config", "_cmd_dispatch", "_cmd_gc", "_cmd
 from hermes_cli import kanban_verb_input as kvi
 from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
-from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
+from hermes_cli.kanban_close_on_guard import HoldAuthorRefused, ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 from hermes_cli.kanban_parser import (
     HUMAN_CREATED_BY, _LIVE_BAND_OPERATORS, create_default_priority, live_band_default,
@@ -3091,11 +3091,6 @@ def _cmd_claim_unheld(args: argparse.Namespace) -> int:
     return 0
 
 
-# Comment lines only an operator author makes count; the home deadman reads a
-# hold with this exact pattern on ANY line (review_deadman_core._HOLD_RE).
-_OPERATOR_ONLY_GRAMMAR = re.compile(r"^\s*deadman:\s*hold\s+(\S+)", re.I | re.M)
-
-
 def _cmd_comment(args: argparse.Namespace) -> int:
     """Append a comment, attributed to the session that invoked this CLI.
 
@@ -3155,17 +3150,6 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             "the requested author is kept as claimed_author",
             file=sys.stderr,
         )
-    from hermes_cli.kanban_identity import UNVERIFIED_AUTHOR_PREFIX
-
-    if author.startswith(UNVERIFIED_AUTHOR_PREFIX) and _OPERATOR_ONLY_GRAMMAR.search(body):
-        # An unverified hold printed "Comment added" and held nothing: the
-        # deadman honours operator authors only (t_238f3f04). Refuse, write nothing.
-        token_file = str(kb.operator_token_path()).replace(str(Path.home()), "~", 1)
-        return _err(
-            f"`deadman: hold` from {author} holds nothing; post it as the operator: "
-            f"{kb.OPERATOR_TOKEN_ENV}=$(cat {token_file}) hermes kanban comment "
-            f"{args.task_id} --author apollo '<body>'; not posted"
-        )
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
         if run_id is None:
@@ -3180,6 +3164,9 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             )
         except ReleaseSuperseded as exc:
             return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
+        except HoldAuthorRefused as exc:
+            # The deadman honours a hold only from comment_can_hold authors (t_238f3f04).
+            return _err(str(exc))
         except kb.FlagshipAssigneeRefused as exc:
             # A `flagship override:` body is the authorization record itself;
             # only flagship authority writes one (Prism 7a9e431141ad).
