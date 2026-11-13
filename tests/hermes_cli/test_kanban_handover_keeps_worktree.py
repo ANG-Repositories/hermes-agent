@@ -399,3 +399,32 @@ def test_the_review_lane_starts_a_handed_over_card_at_the_clone_head(kanban_home
     assert task.id in [t for t, _h in spawned], (spawned, res)
     tree = studio / ".worktrees" / task.id
     assert _git(tree, "rev-parse", "HEAD") == heads[0]
+
+
+# -- Prism round 2 on #319 ----------------------------------------------------------------------------------------
+
+def test_a_scratch_recovery_overtaken_by_a_newer_hand_over_writes_nothing(mounted_root, monkeypatch):
+    """3d337a9df692 (r2): a hand-over B that lands while recovery creates A's dir wins; A's document is not
+    appended after B, so materialize_handover still reads B."""
+    from tests.hermes_cli.test_kanban_studio_deny_ported_reroute import _ported_card
+    with kb.connect_closing() as conn:
+        tid, pool = _ported_card(conn)
+        a, b = f"{pool}-from-ace-ai", f"{pool}-from-ace-media"
+        doc = {"from_host": "ace-ai", "workspace": pool, "path": a, "repo": SLUG, "mirror": "~/m.git",
+               "branch": f"wt/{tid}", "head": None, "missing": ["studio-state"]}
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (a, tid))
+            kb._append_event(conn, tid, kwt.HANDOVER_EVENT, doc)
+        task = kb.get_task(conn, tid)
+        real = kwt._make_scratch
+
+        def racing(path):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (b, tid))
+                kb._append_event(conn, tid, kwt.HANDOVER_EVENT, {**doc, "from_host": "ace-media", "path": b})
+            return real(path)
+        monkeypatch.setattr(kwt, "_make_scratch", racing)
+        assert kwt.recover_handover(conn, task) is None
+        evs = _handovers(conn, tid)
+        assert evs[-1]["path"] == b and "recovered" not in evs[-1], evs[-1]
+        assert _card(conn, tid)[1] == b

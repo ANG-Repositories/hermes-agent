@@ -1744,10 +1744,9 @@ def recover_handover(conn, task) -> Optional[str]:
         # (Prism 3d337a9df692: a truthy label with the dir still missing re-admitted without end).
         if not _make_scratch(path) or not os.path.isdir(path):
             return None
-        with _kb.write_txn(conn):
-            _kb._append_event(conn, task.id, HANDOVER_EVENT, {**doc, "kind": "scratch", "recovered": label})
-        _log.warning("kanban dispatch: %s task=%s -> scratch:%s (created)", label, task.id, path)
-        return label
+        kind, new = "scratch", path
+    # Conditional on the row still being this hand-over's, for both kinds (Prism 3d337a9df692 r2): a newer
+    # hand-over that lands meanwhile wins, and its document stays the newest one materialize_handover reads.
     with _kb.write_txn(conn):
         cur = conn.execute("UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=? AND workspace_path IS ? "
                            "AND claim_lock IS NULL", (kind, new, task.id, path))
