@@ -2306,17 +2306,46 @@ def test_pre_blocked_spent_file_migrates_once(tmp_path):
     got = {t: (state.retries(t), state.blocked_spent(t), state.restart_spent(t))
            for t in ("t_blk", "t_blk_handled", "t_crash", "t_both", "t_both_handled", "t_retry_only",
                      "t_two_blk", "t_blk_open")}
+    # a card with a crash_first_occurrence claim on file is not moved (Prism 91fa13dd6411)
     assert got == {"t_blk": (0, 0, 1), "t_blk_handled": (0, 0, 0), "t_crash": (1, 0, 0),
-                   "t_both": (1, 1, 0), "t_both_handled": (1, 0, 0), "t_retry_only": (1, 0, 0),
-                   "t_two_blk": (1, 1, 0), "t_blk_open": (0, 1, 0)}
+                   "t_both": (2, 0, 0), "t_both_handled": (2, 0, 0), "t_retry_only": (1, 0, 0),
+                   "t_two_blk": (2, 0, 0), "t_blk_open": (0, 1, 0)}
     state.bump_retry("t_crash")
     doc = json.loads(path.read_text())
-    assert doc["retries"] == {"t_crash": 2, "t_both": 1, "t_both_handled": 1, "t_retry_only": 1,
-                              "t_two_blk": 1}
-    assert doc["blocked_spent"] == {"t_both": 1, "t_two_blk": 1, "t_blk_open": 1}
+    assert doc["retries"] == {"t_crash": 2, "t_both": 2, "t_both_handled": 2, "t_retry_only": 1,
+                              "t_two_blk": 2}
+    assert doc["blocked_spent"] == {"t_blk_open": 1}
     # migrated once: a later blocked claim spends the new map, never ``retries``
     assert state.claim("b|t_crash|9", {"task_id": "t_crash", "row": "blocked_assess"})
     assert (state.retries("t_crash"), state.blocked_spent("t_crash")) == (2, 1)
+
+
+def _pre_blocked_file(path, claims, retries):
+    path.write_text(json.dumps({"retries": retries, "restart_spent": {}, "claims": claims}))
+    return ah.BoomerangWakeState(path)
+
+
+def test_migration_keeps_an_unattributable_count_with_a_crash_claim(tmp_path):
+    """Prism 91fa13dd6411 repro: assess (surfaced), reset_counters, crash retry. ``retries=1`` is the
+    crash spend; the old assessment claim is still on file. The count stays in ``retries``."""
+    state = _pre_blocked_file(tmp_path / "s.json", {
+        "b|t|1": {"task_id": "t", "row": "blocked_assess", "state": "terminal", "outcome": "surfaced",
+                  "claimed_at": 100.0},
+        "b|t|2": {"task_id": "t", "row": "crash_first_occurrence", "state": "terminal", "outcome": "retry",
+                  "claimed_at": 200.0},
+    }, {"t": 1})
+    assert (state.retries("t"), state.blocked_spent("t")) == (1, 0)
+    state.bump_restart_retry("t")   # persist the migration
+    doc = json.loads((tmp_path / "s.json").read_text())
+    assert doc["retries"] == {"t": 1} and doc["blocked_spent"] == {}
+
+
+def test_migration_still_moves_a_card_with_only_blocked_claims(tmp_path):
+    state = _pre_blocked_file(tmp_path / "s.json", {
+        "b|t|1": {"task_id": "t", "row": "blocked_assess", "state": "terminal", "outcome": "retry",
+                  "claimed_at": 100.0},
+    }, {"t": 1})
+    assert (state.retries("t"), state.blocked_spent("t")) == (0, 1)
 
 
 def test_restart_redispatch_of_a_blocked_assessment_spends_no_budget(tmp_path):

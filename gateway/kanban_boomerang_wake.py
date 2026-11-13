@@ -140,7 +140,8 @@ class BoomerangWakeState:
         from ``retries`` (at most 1 per card) to the new map. The card starts cleared when a terminal claim
         at or after its newest such assessment (that one included) clears per ``_clears_blocked``, else
         at ``blocked_spent=1``.
-        Crash-spent counts stay. Persisted by the next write, so it runs once. A count whose claim was
+        Crash-spent counts stay; a card with a ``crash_first_occurrence`` claim on file is not moved at
+        all. Persisted by the next write, so it runs once. A count whose claim was
         already pruned (CLAIM_TTL_S) cannot be told from a crash spend and stays in ``retries``."""
         if isinstance(data.get("blocked_spent"), dict):
             return data
@@ -152,8 +153,15 @@ class BoomerangWakeState:
                     and not v.get("blocked_budget_exhausted")):
                 n, at = assessed.get(str(v["task_id"]), (0, 0.0))
                 assessed[str(v["task_id"])] = (n + 1, max(at, _claimed_at(v)))
+        crashed = {str(v["task_id"]) for v in claims.values()
+                   if isinstance(v, dict) and v.get("task_id") and v.get("row") == "crash_first_occurrence"}
         spent = {}
         for tid, (n, at) in assessed.items():
+            # A crash retry is claimed under ``crash_first_occurrence``: with one on file the count
+            # cannot be attributed (a reset may have zeroed the blocked spend first), so it stays a
+            # crash spend and the card gets no ``blocked_spent`` entry (Prism 91fa13dd6411).
+            if tid in crashed:
+                continue
             # The old claim() spent ``retries`` only at 0, so at most ONE blocked spend survives in it;
             # more claims on file means a reset zeroed the earlier ones (Prism 49788caba26d).
             moved = min(1, retries.get(tid, 0))

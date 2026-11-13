@@ -185,6 +185,8 @@ redispatch of a blocked assessment spends none of the three. A state file from b
 cleared when a claim at or after its newest assessment, that assessment included, ended with a
 clearing outcome (same rule as above), else at `blocked_spent=1`. Crash spends stay, and a blocked
 spend whose claim was already pruned (7 days) cannot be told apart from one and stays in `retries`.
+A card that also has a `crash_first_occurrence` claim on file is not moved at all: its count cannot
+be attributed, so it stays a crash spend and the card gets no `blocked_spent` entry.
 The next write persists it.
 
 ## 4. The boomerang wake level
