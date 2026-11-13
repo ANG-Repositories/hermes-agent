@@ -305,13 +305,15 @@ def _unchecked_task_inserts(root: Path):
     return hits
 
 
-def test_every_task_insert_goes_through_the_checked_path():
+def test_every_task_insert_goes_through_the_checked_path(board):
     """Source contract: _insert_task_row is the one INSERT INTO tasks; it runs the stored-body check.
     A new raw insert anywhere in shipped code fails here: route it through kanban_db._insert_task_row."""
     repo = Path(__file__).resolve().parents[2]
     assert _unchecked_task_inserts(repo) == []
-    import inspect
-    assert "stored_refusal" in inspect.getsource(kb._insert_task_row)
+    with kbc.connect_closing() as conn:
+        with kb.write_txn(conn), pytest.raises(kri.StoredBodyRefused, match=REFUSAL):
+            kb._insert_task_row(conn, {"id": "t_00000001", "title": "x", "body": "w\nrequires: studio-state"})
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_source_contract_catches_a_planted_insert(tmp_path):

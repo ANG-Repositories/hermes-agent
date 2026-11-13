@@ -86,7 +86,8 @@ def not_inherited_note(conn, task_id: str) -> Optional[str]:
     so the creating agent sees it, not only stderr (t_41763e36)."""
     row = conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND author = 'dispatcher' "
-        "AND body LIKE ? ORDER BY id LIMIT 1", (task_id, NOT_INHERITED_PREFIX + "%")).fetchone()
+        "AND substr(body, 1, ?) = ? ORDER BY id LIMIT 1",
+        (task_id, len(NOT_INHERITED_PREFIX), NOT_INHERITED_PREFIX)).fetchone()
     return row[0] if row else None
 
 
