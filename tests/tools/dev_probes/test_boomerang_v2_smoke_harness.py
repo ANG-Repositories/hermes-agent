@@ -93,17 +93,17 @@ def _copy_fixtures(tmp_path: Path) -> Path:
 def test_step1_fails_when_needs_input_is_boomerang_woken(env, monkeypatch):
     fx = _copy_fixtures(env["tmp"])
     with open(fx / "fake_origin_chat.jsonl", "a") as fh:
-        fh.write(json.dumps({"ts": 1792378999.0, "content": "[boomerang-wake] t_5m0ce002 - closed it"}) + "\n")
+        fh.write(json.dumps({"ts": 1792378999.0, "content": "boomerang handled t_5m0ce002 (needs_input): closed it"}) + "\n")
     monkeypatch.setenv("BV2_ORIGIN_CHAT", str(fx / "fake_origin_chat.jsonl"))
     assert run.main(["--step", "1", "--dry-run"]) == 1
-    assert "needs_input card t_5m0ce002: no `[boomerang-wake]` line | FAIL" in env["evidence"].read_text()
+    assert "needs_input card t_5m0ce002: no `boomerang handled` line | FAIL" in env["evidence"].read_text()
 
 
 def test_step1_fails_without_the_boomerang_wake_line(env, monkeypatch):
     fx = _copy_fixtures(env["tmp"])
     chat = fx / "fake_origin_chat.jsonl"
     lines = chat.read_text().splitlines()
-    kept = [ln for ln in lines if not json.loads(ln)["content"].startswith("[boomerang-wake] t_5m0ce001")]
+    kept = [ln for ln in lines if not json.loads(ln)["content"].startswith("boomerang handled t_5m0ce001")]
     assert len(kept) == len(lines) - 1
     chat.write_text("".join(ln + "\n" for ln in kept))
     monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
@@ -198,11 +198,70 @@ def test_step4_redispatch_arm_fails_on_any_lost_line(env, monkeypatch):
     assert "ZERO `warning boomerang-wake lost t_5m0ce007` lines in the origin chat | FAIL" in text
 
 
-def test_step4_redispatch_arm_needs_the_second_child_to_finish(env, monkeypatch):
-    """The `handled` line must carry the REDISPATCHED delegation, not the cut child's."""
-    rc, text = _step4_with(env, monkeypatch, drop_log=["t_5m0ce007 handled action=close delegation=deleg_s4a0002"])
+def _step4_with_restart_claim(env, monkeypatch, outcome, *, delegation="deleg_s4a0002", chat_line=None):
+    """Step 4 with the #restart1 claim of t_5m0ce007 rewritten: ``outcome=None`` drops the claim."""
+    fx = _copy_fixtures(env["tmp"])
+    state = fx / "fake_boomerang_wake.json"
+    doc = json.loads(state.read_text())
+    key = "bv2-smoke|t_5m0ce007|71#restart1"
+    if outcome is None:
+        doc["claims"].pop(key)
+    else:
+        doc["claims"][key].update(outcome=outcome, delegation_id=delegation)
+    state.write_text(json.dumps(doc))
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    chat = fx / "fake_origin_chat.jsonl"
+    if chat_line is not None:
+        chat.write_text("".join(ln + "\n" for ln in chat.read_text().splitlines()
+                                if "boomerang handled t_5m0ce007" not in ln)
+                        + json.dumps({"ts": 1792379910.0, "content": chat_line}) + "\n")
+    monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
+    return run.main(["--step", "4", "--dry-run"]), env["evidence"].read_text()
+
+
+def test_step4_second_child_complete_passes(env, monkeypatch):
+    rc, text = _step4_with_restart_claim(env, monkeypatch, "complete")
+    assert "the second child handled the card (delegation deleg_s4a0002) | PASS" in text
+    assert "terminal outcome=complete" in text
+    assert rc == 0
+
+
+def test_step4_second_child_surfaced_passes(env, monkeypatch):
+    """11-12 18:06 live run: the retry child surfaced the card; the gateway closed the claim `surfaced`
+    (a HANDLED_OUTCOMES member) and posted the `child surfaced` wake, not a `boomerang handled` row."""
+    rc, text = _step4_with_restart_claim(
+        env, monkeypatch, "surfaced",
+        chat_line="[boomerang-wake] child surfaced t_5m0ce007 (completed, fork, 57s): forced completion, not accepted")
+    assert "the second child handled the card (delegation deleg_s4a0002) | PASS" in text
+    assert "terminal outcome=surfaced" in text
+    assert "`[boomerang-wake] child surfaced t_5m0ce007` after the restart | PASS" in text
+    assert rc == 0
+
+
+@pytest.mark.parametrize("outcome", ["failed", "lost"])
+def test_step4_second_child_failed_or_lost_fails(env, monkeypatch, outcome):
+    rc, text = _step4_with_restart_claim(env, monkeypatch, outcome)
     assert rc == 1
     assert "the second child handled the card (delegation deleg_s4a0002) | FAIL" in text
+    assert f"terminal outcome={outcome} (not in the gateway's HANDLED_OUTCOMES" in text
+
+
+def test_step4_second_child_without_a_terminal_restart_claim_fails(env, monkeypatch):
+    rc, text = _step4_with_restart_claim(env, monkeypatch, None)
+    assert rc == 1
+    assert "no terminal `#restartN` claim for t_5m0ce007 (delegation deleg_s4a0002)" in text
+
+
+def test_step4_second_child_claim_must_be_the_redispatched_delegation(env, monkeypatch):
+    """A terminal #restart claim of another delegation is not the second child's verdict."""
+    rc, text = _step4_with_restart_claim(env, monkeypatch, "complete", delegation="deleg_other")
+    assert rc == 1
+    assert "the second child handled the card (delegation deleg_s4a0002) | FAIL" in text
+
+
+def test_step4_handled_set_is_the_gateways_own():
+    from gateway.kanban_boomerang_wake import HANDLED_OUTCOMES
+    assert run._gateway_handled_outcomes() is HANDLED_OUTCOMES
 
 
 def test_step4_fallback_arm_fails_without_resurface(env, monkeypatch):
@@ -221,19 +280,116 @@ def test_step4_fallback_arm_needs_the_retry_spent_reason(env, monkeypatch):
 
 
 def test_step4_fallback_prespend_writes_only_the_cards_retry(env, tmp_path, monkeypatch):
-    """Live fallback arm: retries[card]=1 lands in BV2_WAKE_STATE, every other key is kept."""
+    """Live fallback arm: restart_spent[card]=1 lands in BV2_WAKE_STATE, every other key is kept
+    (``retries``, the crash/blocked budget, included)."""
     state = tmp_path / "kanban_boomerang_wake.json"
     state.write_text(json.dumps({"claims": {"b|t_s4|9": {"task_id": "t_s4", "state": "running",
                                                          "delegation_id": "d1", "child_session": "c1"}},
-                                 "retries": {"t_other": 1}, "future_key": [1]}))
+                                 "retries": {"t_other": 1}, "restart_spent": {"t_x": 1},
+                                 "future_key": [1]}))
     ctx = run.Ctx.__new__(run.Ctx)
     ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
     rep = run.StepReport(4, "t", "live")
     monkeypatch.setenv("BV2_WAKE_STATE", str(state))
     assert run._prespend_retry(ctx, rep, "t_s4")
     doc = json.loads(state.read_text())
-    assert doc["retries"] == {"t_other": 1, "t_s4": 1}
+    assert doc["restart_spent"] == {"t_x": 1, "t_s4": 1}
+    assert doc["retries"] == {"t_other": 1}
     assert doc["future_key"] == [1] and doc["claims"]["b|t_s4|9"]["state"] == "running"
+
+
+def test_step4_prespent_state_is_retry_spent_for_the_gateways_own_reconciler(env, tmp_path, monkeypatch):
+    """The fallback arm's pre-spent file, read by the gateway's own BoomerangWakeState and
+    _restart_refusal, refuses the redispatch as `retry spent` (#286 moved that budget to
+    ``restart_spent``; a ``retries`` write would let the redispatch through)."""
+    import time as _time
+    from gateway import kanban_boomerang_wake as bw
+
+    state = tmp_path / "kanban_boomerang_wake.json"
+    entry = {"task_id": "t_s4", "state": "running", "delegation_id": "d1", "child_session": "c1",
+             "board": "bv2-smoke-x", "status": "ready", "claimed_at": _time.time(), "max_minutes": 45}
+    state.write_text(json.dumps({"claims": {"bv2-smoke-x|t_s4|9": entry}}))
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    assert run._prespend_retry(ctx, run.StepReport(4, "t", "live"), "t_s4")
+    # Card unchanged since the claim: without the pre-spend the gateway would redispatch (None).
+    monkeypatch.setattr(bw, "card_snapshot", lambda board, tid: {"status": "ready"})
+    gw_state = bw.BoomerangWakeState(state)
+    assert bw._restart_refusal(dict(entry), bw.BoomerangWakeState(tmp_path / "fresh.json"), _time.time()) is None
+    assert bw._restart_refusal(dict(entry), gw_state, _time.time()) == "retry spent"
+
+
+def _hold_fixture(tmp_path, monkeypatch, *, model_call: bool, goes_active: bool):
+    """A scratch home on disk: wake state with the child's session, agent.log, gateway_state.json,
+    and a fake hold command that records the order it ran in and (optionally) flips active_agents."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "gateway").mkdir()
+    state = home / "gateway" / "kanban_boomerang_wake.json"
+    state.write_text(json.dumps({"claims": {"b|t_s4|9": {"task_id": "t_s4", "state": "running",
+                                                         "delegation_id": "d1", "child_session": "20261112_child"}}}))
+    (home / "logs" / "gateway.log").write_text("")
+    call = ("2026-11-12 11:00:00,000 INFO [20261112_child] agent.conversation_loop: API call #1: "
+            "model=m provider=p in=1 out=1 total=2 latency=1.0s\n") if model_call else ""
+    (home / "logs" / "agent.log").write_text("2026-11-12 10:59:59,000 INFO [20261112_home] agent.conversation_loop: "
+                                             "API call #1: model=m\n" + call)
+    gw_state = home / "gateway_state.json"
+    gw_state.write_text(json.dumps({"active_agents": 0}))
+    order = tmp_path / "order.txt"
+    hold = tmp_path / "hold.py"
+    hold.write_text("import json, sys\n"
+                    f"open({str(order)!r}, 'a').write('hold ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+                    + (f"json.dump({{'active_agents': 1}}, open({str(gw_state)!r}, 'w'))\n" if goes_active else "")
+                    + "print('SENT id=1570000000000000001 channel=c text=x')\nprint('replies: 0 (waited 5s)')\n"
+                    "sys.exit(1)\n")
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    monkeypatch.setenv("BV2_GATEWAY_LOG", str(home / "logs" / "gateway.log"))
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live, ctx.timeout, ctx.tick, ctx.chat_id = True, 0.5, 0.05, "c"
+    ctx.plan = {"commands": {"s4_hold_turn": [sys.executable, str(hold), "{chat}"]},
+                "expect": {}}
+    return ctx, home / "gateway.pid", order
+
+
+def test_step4_hold_turn_sent_only_after_the_childs_model_call(env, tmp_path, monkeypatch):
+    """t_409de482: the drain only times out on a home turn, so the hold is sent once the child is mid-call,
+    and the arm only proceeds once the scratch gateway counts that turn as active."""
+    ctx, pid_path, order = _hold_fixture(tmp_path, monkeypatch, model_call=True, goes_active=True)
+    rep = run.StepReport(4, "t", "live")
+    assert run._s4_hold_home_turn(ctx, rep, "redispatch arm", "t_s4", pid_path) is True
+    assert order.read_text() == "hold c\n"
+    assert [c.result for c in rep.checks] == [run.PASS, run.PASS, run.PASS], [(c.name, c.detail) for c in rep.checks]
+    assert "SENT id=1570000000000000001" in rep.checks[-1].detail
+
+
+def test_step4_hold_turn_not_sent_before_the_child_calls_the_model(env, tmp_path, monkeypatch):
+    ctx, pid_path, order = _hold_fixture(tmp_path, monkeypatch, model_call=False, goes_active=True)
+    rep = run.StepReport(4, "t", "live")
+    assert run._s4_hold_home_turn(ctx, rep, "redispatch arm", "t_s4", pid_path) is False
+    assert not order.exists(), "the hold turn was sent before the child made a model call"
+    assert rep.checks[-1].result == run.FAIL and "made a model call" in rep.checks[-1].name
+
+
+def test_step4_hold_turn_refuses_a_hold_that_names_the_card(env, tmp_path, monkeypatch):
+    """t_409de482 round 2: the retry child forks the home transcript, which ends with the hold turn; a hold
+    naming the card was taken for the card's deliverable (11-12 12:18), so a {card} hold is refused unsent."""
+    ctx, pid_path, order = _hold_fixture(tmp_path, monkeypatch, model_call=True, goes_active=True)
+    ctx.plan["commands"]["s4_hold_turn"].append("hold for {card}")
+    rep = run.StepReport(4, "t", "live")
+    assert run._s4_hold_home_turn(ctx, rep, "redispatch arm", "t_s4", pid_path) is False
+    assert not order.exists(), "a hold naming the card was sent"
+    assert rep.checks[-1].result == run.FAIL and "does not name the card" in rep.checks[-1].name
+
+
+def test_step4_hold_turn_fails_when_the_gateway_never_counts_it(env, tmp_path, monkeypatch):
+    ctx, pid_path, order = _hold_fixture(tmp_path, monkeypatch, model_call=True, goes_active=False)
+    real_poll = run.Ctx.poll
+    monkeypatch.setattr(run.Ctx, "poll", lambda self, fn, window: real_poll(self, fn, min(window, 0.3)))
+    rep = run.StepReport(4, "t", "live")
+    assert run._s4_hold_home_turn(ctx, rep, "redispatch arm", "t_s4", pid_path) is False
+    assert order.read_text() == "hold c\n"
+    assert rep.checks[-1].result == run.FAIL and "active_agents stayed 0" in rep.checks[-1].detail
 
 
 def test_step4_live_prespend_refuses_without_an_explicit_state_file(env, monkeypatch):
@@ -283,13 +439,27 @@ def test_live_requires_home_session_and_origin_chat(env, monkeypatch):
 
 def test_contract_line_matchers_accept_both_spellings():
     card = "t_abc12345"
-    assert run.re_boomerang_wake_line(card).search(f"[boomerang-wake] {card} \u2014 Landed #12")
-    assert run.re_boomerang_wake_line(card).search(f"[boomerang-wake] {card} - Landed #12")
-    assert not run.re_boomerang_wake_line(card).search(f"[boomerang-wake] {card}9 - x")
+    m = run.re_boomerang_wake_line(card).search(f"boomerang handled {card} (completed): Landed #12")
+    assert m and m.group("kind") == "completed" and m.group("outcome") == "Landed #12"
+    assert not run.re_boomerang_wake_line(card).search(f"boomerang handled {card}9 (completed): x")
     assert run.re_failed_line(card).search(f"\u26a0\ufe0f boomerang-wake failed for {card}: boom")
     assert run.re_failed_line(card).search(f"warning boomerang-wake failed {card}: boom")
     m = run.re_notifier_line(card).search(f"x kanban notifier: boomerang-wake {card} disposition=surface")
     assert m and m.group("disp") == "surface"
+
+
+def test_handled_line_matches_the_gateways_own_handback_row():
+    """t_409de482: the check reads the line the gateway builds, not a copy of the spec's spelling."""
+    sys.path.insert(0, str(REPO))
+    from gateway.kanban_boomerang_wake import handback_row
+
+    card = "t_abc12345"
+    _deleg, row = handback_row({"task_id": card, "delegation_id": "d1", "row": "completed"},
+                               {"summary": "verified: PR merged"})
+    m = run.re_boomerang_wake_line(card).search(row["line"])
+    assert m and m.group("kind") == "completed" and m.group("outcome") == "verified: PR merged", row["line"]
+    # The spec's spelling, which two live step-4 runs (2026-11-12) waited for in vain, is not the line.
+    assert not run.re_boomerang_wake_line(card).search(f"[boomerang-wake] {card} - verified")
 
 
 FAKE_GATEWAY_KANBAN = r"""#!/usr/bin/env python3
@@ -314,7 +484,7 @@ elif verb == "complete":
     with open(os.environ["BV2_GATEWAY_LOG"], "a") as fh:
         fh.write(f"{stamp} INFO gateway.kanban_watchers: kanban notifier: boomerang-wake {card} disposition=auto\n")
     with open(os.environ["BV2_ORIGIN_CHAT"], "a") as fh:
-        fh.write(json.dumps({"ts": time.time(), "content": f"[boomerang-wake] {card} \u2014 verified"}) + "\n")
+        fh.write(json.dumps({"ts": time.time(), "content": f"boomerang handled {card} (completed): verified"}) + "\n")
 elif verb == "block":
     card = argv[argv.index("block") + 1]
     with open(os.environ["BV2_GATEWAY_LOG"], "a") as fh:
@@ -398,7 +568,7 @@ def test_step4_late_completion_is_watched_for_a_full_window(env, monkeypatch):
             seen.append(window)
             return fn()
     src = (HARNESS_DIR / "run.py").read_text()
-    i = src.index("no late `[boomerang-wake]")
+    i = src.index("no late `boomerang handled")
     assert "ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.tick_window)" in src[i - 400:i]
 
 
@@ -536,7 +706,7 @@ elif verb == "complete":
     title = open(os.path.join(state, "cards", card)).read()
     logline(f"gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake {card} disposition=auto")
     if "forced child failure" not in title:
-        say(f"[boomerang-wake] {card} \u2014 verified")
+        say(f"boomerang handled {card} (completed): verified")
 elif verb == "comment":
     card = argv[argv.index("comment") + 1]
     logline(f"gateway.kanban_boomerang_wake: kanban boomerang-wake: boomerang-wake superseded {card}: "
@@ -705,14 +875,14 @@ def test_step4_prespend_retries_when_the_gateway_writes_in_between(env, tmp_path
     """Prism 1c04b69ce0b6: a gateway write between the snapshot and the replace is never discarded."""
     state = tmp_path / "kanban_boomerang_wake.json"
     claim = {"task_id": "t_s4", "state": "running", "delegation_id": "d1", "child_session": "c1"}
-    state.write_text(json.dumps({"claims": {"a": claim}, "retries": {}}))
+    state.write_text(json.dumps({"claims": {"a": claim}, "restart_spent": {}}))
     monkeypatch.setenv("BV2_WAKE_STATE", str(state))
     real_mkstemp, fired = run.tempfile.mkstemp, []
 
     def racing_mkstemp(*a, **k):   # the gateway saves claim B right after the harness took its snapshot
         if not fired:
             fired.append(1)
-            state.write_text(json.dumps({"claims": {"a": claim, "b": {"task_id": "t_b"}}, "retries": {}}))
+            state.write_text(json.dumps({"claims": {"a": claim, "b": {"task_id": "t_b"}}, "restart_spent": {}}))
         return real_mkstemp(*a, **k)
 
     monkeypatch.setattr(run.tempfile, "mkstemp", racing_mkstemp)
@@ -720,5 +890,5 @@ def test_step4_prespend_retries_when_the_gateway_writes_in_between(env, tmp_path
     ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
     assert run._prespend_retry(ctx, run.StepReport(4, "t", "live"), "t_s4")
     doc = json.loads(state.read_text())
-    assert set(doc["claims"]) == {"a", "b"} and doc["retries"] == {"t_s4": 1}
+    assert set(doc["claims"]) == {"a", "b"} and doc["restart_spent"] == {"t_s4": 1}
 
