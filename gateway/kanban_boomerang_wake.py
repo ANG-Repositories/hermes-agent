@@ -1205,6 +1205,13 @@ def _verify_land_inherited(entry: dict, verdict: dict, kb: Any, conn: Any) -> Op
 
 
 _OWNER_COMMENT_NEWER = "owner comment newer than handback"
+#: t_df97e311: rows whose wake event is its OWN occurrence (a job ended, the card blocked or crashed), not a summary
+#: of the last handback. For these "the owner already acted" means an owner comment newer than THAT event: a hold
+#: comment posted after the handback but before the event (the review deadman asks for one, and the next step is
+#: usually to queue a watcher) did not act on it (t_707d4196, 2026-11-13). Left on the handback cursor:
+#: review_deadman (its event summarizes the handback), completed / own_repo_review_* (the event IS the handback),
+#: changes_requested (the event is the owner's own send-back; its comment is that act).
+EVENT_CURSOR_ROWS = frozenset({"mechanical_wake", "blocked_assess", "crash_first_occurrence"})
 
 
 def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[str]:
@@ -1229,6 +1236,12 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             "SELECT id, created_at, payload, run_id FROM task_events WHERE task_id = ? "
             "AND kind IN ('review_requested', 'completed') AND (? IS NULL OR id <= ?) "
             "ORDER BY id DESC LIMIT 1", (entry["task_id"], event_id, event_id)).fetchone()
+        cursor_at = handback["created_at"] if handback else None
+        if handback and event_id is not None and (entry.get("row") or entry.get("kind")) in EVENT_CURSOR_ROWS:
+            own = conn.execute("SELECT created_at FROM task_events WHERE task_id = ? AND id = ?",
+                               (entry["task_id"], event_id)).fetchone()
+            if own:
+                cursor_at = max(cursor_at, own["created_at"])
         owner = str(entry.get("assignee") or _field(task, "assignee") or "")
         owners = {name.removeprefix("human:") for name in
                   (owner, str(_field(task, "assignee") or "")) if name}
@@ -1241,7 +1254,7 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             newest = max(comments, key=lambda c: (c.created_at, c.id))
             if re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M):
                 return "owner release/hold line"
-            if handback and newest.created_at > handback["created_at"]:
+            if cursor_at is not None and newest.created_at > cursor_at:
                 if not fork_died:
                     return _OWNER_COMMENT_NEWER
                 logger.info("kanban boomerang-wake: stale rule bypassed task=%s reason=%s "
