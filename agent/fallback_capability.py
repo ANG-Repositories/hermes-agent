@@ -162,11 +162,20 @@ CONTENTALIAS_ERROR_CODES: Mapping[str, BridgeCode] = {
                                    "upstream error, body withheld by the alias layer", ours=False),
     # Not a refusal: the alias layer's upstream READ failed (reader.go: any non-EOF
     # source error -> stream_transport). On the Studio dtlr/alr units that leg runs
-    # through the seat's box forwarder (tinyproxy :18814); the 9 sightings 11-04..11-12
-    # all sat on a forwarder `connection refused` / `unexpected EOF` (t_6e7909d1).
-    "stream_transport": BridgeCode(_LANE, "box forwarder refused the connection",
-                                   "the seat's box forwarder refused or dropped the upstream connection"),
+    # through the seat's box forwarder (tinyproxy :18814), but a timeout or reset from
+    # upstream through a healthy forwarder carries the same code, so the default names
+    # the leg, not a culprit. The forwarder is named only on evidence in the error text
+    # (CONTENTALIAS_FORWARDER_REFUSED, t_6e7909d1).
+    "stream_transport": BridgeCode(_LANE, "upstream connection failed",
+                                   "the unit's upstream connection failed on the box forwarder leg "
+                                   "(the forwarder refused or dropped it, or the upstream dropped it)",
+                                   ours=False),
 }
+# stream_transport whose error text shows the box forwarder refused the dial
+# (sub-vps-19 2026-11-12 22:52 PT: needrestart restarted tinyproxy mid-turn).
+CONTENTALIAS_FORWARDER_REFUSED = BridgeCode(_LANE, "box forwarder refused the connection",
+                                            "the seat's box forwarder refused the upstream connection")
+_FORWARDER_REFUSED_RE = re.compile(r"connection refused|:18814\b", re.IGNORECASE)
 
 
 def contentalias_entry(code: str) -> Optional[BridgeCode]:
@@ -177,9 +186,14 @@ def contentalias_entry(code: str) -> Optional[BridgeCode]:
     return CONTENTALIAS_ERROR_CODES.get(c[len(CONTENTALIAS_PREFIX):], CONTENTALIAS_GENERIC)
 
 
-def bridge_code_entry(code: Any) -> Optional[BridgeCode]:
-    """The :class:`BridgeCode` row of a bridge or content-alias machine code."""
+def bridge_code_entry(code: Any, text: Any = None) -> Optional[BridgeCode]:
+    """The :class:`BridgeCode` row of a bridge or content-alias machine code.
+    ``text`` (the error's own words) can only sharpen ``stream_transport`` to the
+    forwarder row, on evidence it carries (``connection refused`` / ``:18814``)."""
     c = str(code or "").strip().lower()
+    if (c == CONTENTALIAS_PREFIX + "stream_transport"
+            and _FORWARDER_REFUSED_RE.search(str(text or ""))):
+        return CONTENTALIAS_FORWARDER_REFUSED
     return BRIDGE_ERROR_CODES.get(c) or contentalias_entry(c)
 
 
