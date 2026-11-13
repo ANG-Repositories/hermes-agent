@@ -1521,6 +1521,9 @@ def convert(conn, task, workspace: str, branch: str, *, host: str, slug: str,
     """Persist the port: the card is now a scratch card at ``workspace``."""
     from hermes_cli import kanban_db as _kb
     with _kb.write_txn(conn):
+        # t_7eb1cbbb: the row still holds the declared workspace (the caller only re-pointed the in-memory task);
+        # record it so a later hand-over off this host restores it instead of leaving the card scratch.
+        kind, path = declared_workspace(conn, task.id)
         # Fenced to the launching run: the tick has the board lock handed back here (t_f60f502f).
         cur = conn.execute("UPDATE tasks SET workspace_kind='scratch', workspace_path=?, branch_name=? "
                            "WHERE id=? AND status='running' AND current_run_id IS ?",
@@ -1529,8 +1532,25 @@ def convert(conn, task, workspace: str, branch: str, *, host: str, slug: str,
             raise _kb.ClaimLost(f"{task.id}: run {task.current_run_id} no longer owns the card")
         _kb._append_event(conn, task.id, PORTED_EVENT,
                           {"host": host, "repo": slug, "mirror": mirror, "branch": branch,
-                           "workspace": workspace}, run_id=task.current_run_id)
+                           "workspace": workspace, "declared_kind": kind, "declared_path": path},
+                          run_id=task.current_run_id)
     task.workspace_kind, task.workspace_path, task.branch_name = "scratch", workspace, branch
+
+
+def declared_workspace(conn, task_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(kind, path)`` the card was given before any port made it scratch (t_7eb1cbbb): the row while it is not
+    ported yet, else the newest port event's ``declared_*``, else the ``created`` event (ports written before
+    the port recorded it)."""
+    row = conn.execute("SELECT workspace_kind, workspace_path FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is not None and (row[0] or "scratch") != "scratch":
+        return row[0], row[1]
+    _id, port = _newest_event(conn, task_id, PORTED_EVENT)
+    if port.get("declared_kind"):
+        return port.get("declared_kind"), port.get("declared_path")
+    _id, created = _newest_event(conn, task_id, "created")
+    if _id is not None and created.get("workspace_kind"):
+        return created.get("workspace_kind"), created.get("workspace_path")
+    return (row[0], row[1]) if row is not None else (None, None)
 
 
 def board_default_workdir(board: Optional[str]) -> Optional[str]:
@@ -1658,8 +1678,12 @@ def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts,
         return memo[1]
     host = next((h for h in pool_hosts or () if h.name.lower() == host_name.lower()), None)
     ok, got = (False, "port host is not in the worker registry") if host is None else probe_clone(host, old, runner)
-    new = f"{old}-from-{host_name.lower()}"
-    if ok and os.path.lexists(new):
+    # t_7eb1cbbb: a card declared ``worktree:<repo>`` goes back to that worktree (the spawn puts its branch at the
+    # clone's head first, :func:`materialize_handover`); only a card declared scratch gets a fresh scratch path.
+    kind, new = declared_workspace(conn, tid)
+    if kind != "worktree":
+        kind, new = "scratch", f"{old}-from-{host_name.lower()}"
+    if ok and kind == "scratch" and os.path.lexists(new):
         ok, got = False, f"hand-over target {new} already exists here; it is never reused"
     if not ok:
         reason = held(got)
@@ -1667,17 +1691,64 @@ def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts,
         return reason
     if dry_run:
         return None
-    payload = {"from_host": host_name, "workspace": old, "path": new, "repo": port.get("repo"),
+    payload = {"from_host": host_name, "workspace": old, "path": new, "kind": kind, "repo": port.get("repo"),
                "mirror": port.get("mirror"), "branch": port.get("branch") or f"wt/{tid}", "head": got or None,
                "missing": missing}
+    if not got:
+        payload["head_note"] = "no clone at the port path: the branch on origin is used"
     with _kb.write_txn(conn):
-        cur = conn.execute("UPDATE tasks SET workspace_path=?, origin_host=CASE WHEN lower(COALESCE(origin_host,''))=? "
-                           "THEN NULL ELSE origin_host END WHERE id=? AND workspace_path IS ? AND claim_lock IS NULL",
-                           (new, host_name.lower(), tid, old))
+        cur = conn.execute("UPDATE tasks SET workspace_kind=?, workspace_path=?, origin_host=CASE WHEN "
+                           "lower(COALESCE(origin_host,''))=? THEN NULL ELSE origin_host END "
+                           "WHERE id=? AND workspace_path IS ? AND claim_lock IS NULL",
+                           (kind, new, host_name.lower(), tid, old))
         if cur.rowcount != 1:
             return held("the card changed under the hand-over; retried next tick")
         _kb._append_event(conn, tid, HANDOVER_EVENT, payload)
+    if kind == "scratch":
+        _make_scratch(new)
     return None
+
+
+def _make_scratch(path: str) -> None:
+    """Create the scratch path a hand-over recorded, so admission never reads it as a lost mount (t_7eb1cbbb).
+    A failure is logged; :func:`recover_handover` retries it on the next admission."""
+    from hermes_cli.kanban_worker_hosts import WORKSPACE_MODE
+    try:
+        os.makedirs(path, mode=int(WORKSPACE_MODE, 8), exist_ok=True)
+    except OSError as exc:
+        _log.warning("kanban hand-over: could not create %s: %s", path, exc)
+
+
+HANDOVER_NEVER_CREATED = "handover_target_never_created"
+
+
+def recover_handover(conn, task) -> Optional[str]:
+    """Re-point a card whose persisted path is the newest hand-over's own target that never came to exist (no run
+    spawned on it since): back to its declared worktree, or the scratch path created (t_7eb1cbbb, t_6e7909d1 sat
+    28 min refused ``stranded_by_mount_loss`` on a mounted volume). Returns the recovery label, else None (any
+    other missing path is not this case and stays fail-closed). The caller re-admits."""
+    from hermes_cli import kanban_db as _kb
+    ev_id, doc = _newest_event(conn, task.id, HANDOVER_EVENT)
+    path = task.workspace_path
+    if ev_id is None or not path or doc.get("path") != path or os.path.lexists(path):
+        return None
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='spawned' AND id>? LIMIT 1",
+                    (task.id, ev_id)).fetchone():
+        return None
+    kind, new = declared_workspace(conn, task.id)
+    if kind != "worktree":
+        kind, new = "scratch", path
+    label = f"{HANDOVER_NEVER_CREATED}: {path}"
+    with _kb.write_txn(conn):
+        cur = conn.execute("UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=? AND workspace_path IS ? "
+                           "AND claim_lock IS NULL", (kind, new, task.id, path))
+        if cur.rowcount != 1:
+            return None
+        _kb._append_event(conn, task.id, HANDOVER_EVENT, {**doc, "kind": kind, "path": new, "recovered": label})
+    if kind == "scratch":
+        _make_scratch(new)
+    _log.warning("kanban dispatch: %s task=%s -> %s:%s", label, task.id, kind, new)
+    return label
 
 
 def materialize_handover(conn, task, workspace: str, placed_host=None, runner: Callable = subprocess.run) -> bool:
@@ -1694,6 +1765,8 @@ def materialize_handover(conn, task, workspace: str, placed_host=None, runner: C
         # The hand-over is to the Studio only (hard_missing: no pool host serves the need; operator ruling 13:36,
         # Prism d6cfdbb53981). A pool placement here would leave no port binding for its clone: refuse it.
         raise RuntimeError(f"hand-over of {task.id} is to the Studio only; refusing a start on {placed_host.name}")
+    if doc.get("kind") == "worktree":
+        return _prepare_handover_branch(task, doc, branch, sha, runner)
     script = clone_script(workspace, doc["repo"], mirror, branch, url=handover_url(doc["repo"]), sha=sha,
                           exact=bool(sha))
     proc = runner(["sh", "-c", script], capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -1701,4 +1774,37 @@ def materialize_handover(conn, task, workspace: str, placed_host=None, runner: C
     if proc.returncode != 0:
         raise RuntimeError(f"hand-over clone of {doc['repo']} into {workspace} failed rc={proc.returncode}: "
                            f"{(proc.stderr or '').strip()[:200]}")
+    return True
+
+
+def _prepare_handover_branch(task, doc: dict, branch: str, sha: Optional[str], runner: Callable) -> bool:
+    """A worktree card handed back to its declared repo (t_7eb1cbbb): put the card's local branch at the head the
+    port clone held (``sha``; else origin's branch tip) BEFORE the worktree is made, so the Studio run starts where
+    the pool run stopped. A local branch that does not contain that head raises (a spawn failure: its work is never
+    reset). No head and no origin branch: False, the worktree branches off the trunk as a fresh card does."""
+    repo = workspace_repo(task.id, task.workspace_path, None, allow_studio_tree=True)[0]
+    if repo is None:
+        raise RuntimeError(f"hand-over of {task.id}: {task.workspace_path} is not in a git repo")
+    slug = origin_slug(repo, runner)
+    if slug and doc.get("repo") and slug.lower() != str(doc["repo"]).lower():
+        raise RuntimeError(f"hand-over of {task.id}: {repo} is {slug}, the port cloned {doc['repo']}")
+
+    def git(*args):
+        return runner(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8",
+                      errors="replace", timeout=CLONE_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    target = sha or f"refs/remotes/origin/{branch}"
+    if git("rev-parse", "-q", "--verify", f"{target}^{{commit}}").returncode != 0:
+        if sha:
+            raise RuntimeError(f"hand-over of {task.id}: head {sha} of {branch} is not in {repo} or on origin")
+        return False
+    if git("rev-parse", "-q", "--verify", f"refs/heads/{branch}").returncode == 0:
+        if git("merge-base", "--is-ancestor", target, f"refs/heads/{branch}").returncode != 0:
+            raise RuntimeError(f"hand-over of {task.id}: local {branch} in {repo} does not contain {target}; "
+                               "nothing reset, operator: reconcile it")
+        return True
+    made = git("branch", "--no-track", branch, target)
+    if made.returncode != 0:
+        raise RuntimeError(f"hand-over of {task.id}: git branch {branch} {target} failed: "
+                           f"{(made.stderr or '').strip()[:200]}")
     return True

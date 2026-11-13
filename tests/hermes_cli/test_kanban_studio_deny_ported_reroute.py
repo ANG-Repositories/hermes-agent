@@ -107,7 +107,8 @@ def test_rerouted_ported_card_is_handed_over_and_waits_on_studio_default_deny(ka
     assert route[1].startswith("studio_default_deny:studio-state ("), route
     assert clean_clone == [("ace-ai", path)]
     assert new == f"{path}-from-ace-ai" and new != path
-    assert ev == {"from_host": "ace-ai", "workspace": path, "path": new, "repo": "NousResearch/hermes-agent",
+    assert ev == {"from_host": "ace-ai", "workspace": path, "path": new, "kind": "scratch",
+                  "repo": "NousResearch/hermes-agent",
                   "mirror": "~/.hermes/mirrors/x.git", "branch": f"wt/{tid}", "head": "abc123",
                   "missing": ["studio-state"]}
 
