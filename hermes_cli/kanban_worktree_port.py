@@ -1795,7 +1795,8 @@ def _prepare_handover_branch(task, doc: dict, branch: str, sha: Optional[str], r
     if repo is None:
         raise RuntimeError(f"hand-over of {task.id}: {task.workspace_path} is not in a git repo")
     slug = origin_slug(repo, runner)
-    if slug and doc.get("repo") and slug.lower() != str(doc["repo"]).lower():
+    # Exact: doc["repo"] was written by origin_slug() on this same repo at port time.
+    if slug and doc.get("repo") and slug != str(doc["repo"]):
         raise RuntimeError(f"hand-over of {task.id}: {repo} is {slug}, the port cloned {doc['repo']}")
 
     def git(*args):
