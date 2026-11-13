@@ -339,7 +339,7 @@ def rebuild_script(dest: str, plan: dict, idx: str, mirror: Optional[str]) -> st
             f"if {reuse}; then :; else rm -rf -- \"$d\"; mkdir -p -- \"$(dirname \"$d\")\"; {get}fi; cd \"$d\"; "
             "if ! git bundle verify -q \"$t\" >/dev/null 2>&1; then git fetch -q origin >/dev/null 2>&1 || true; "
             # what verify said (the prerequisite commits the host lacks) is the full_reason (operator 23:40 item B)
-            "v=$(git bundle verify -q \"$t\" 2>&1 >/dev/null) || { printf '\\nneed-full: %s\\n' \"$(echo $v)\" >&2; "
+            "v=$(git bundle verify \"$t\" 2>&1 >/dev/null) || { printf '\\nneed-full: %s\\n' \"$(echo $v)\" >&2; "
             f"exit {NEEDS_FULL_RC}; }}; fi; "
             "git bundle unbundle \"$t\" >/dev/null; " + checkout +
             f"git reset -q --hard {head}; git clean -fdxq; git read-tree {shlex.quote(idx)}; "

@@ -10052,8 +10052,9 @@ def _background_carry_gate(conn, row, host, spillover, board, defer: bool, out: 
     from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
     try:
         _task = _kb.get_task(conn, tid)
-        if _task is not None:
-            _kb._validate_workspace_admission(_task, board=board, conn=conn)
+        if _task is None or str(Path(_task.workspace_path or "")) != ws:
+            return pending   # Prism e310afb55ca1: admit the path this carry copies; a moved row waits a tick
+        _kb._validate_workspace_admission(_task, board=board, conn=conn)
     except WorkspaceUnavailable as exc:
         _drop_refused_carry(conn, row, spillover, board, str(exc))
         return str(exc)
@@ -10101,6 +10102,10 @@ def _drop_refused_carry(conn, row, spillover, board, reason: str) -> None:
     the host its live job or its last carry record names; with neither, no carry was started and nothing is done.
     One event per refusal names the host and whether the staging dir was removed. Never raises: the refusal stands."""
     from hermes_cli import kanban_carry_background as _kcb
+    if not os.path.lexists(str(row["workspace_path"] or "")):
+        # Prism 9ec61b3d7d14: the source is gone (stranded_by_mount_loss, workspaces_root_unmounted): the staging copy
+        # may be the only surviving copy of its work, so it stays for the operator's recovery
+        return
     try:
         payload = _kcb.drop_for_refusal(conn, row["id"], row["workspace_path"], getattr(spillover, "hosts", {}) or {},
                                         _kb.board_dir(board) / "carry-locks", reason)

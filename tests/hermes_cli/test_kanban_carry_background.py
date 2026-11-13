@@ -953,6 +953,44 @@ def test_a_failed_staging_remove_records_nothing_and_is_retried(board, loop, tmp
     assert not left.exists()
 
 
+def test_a_staging_copy_is_kept_when_the_source_workspace_is_gone(board, loop, tmp_path, monkeypatch):
+    """Prism 9ec61b3d7d14: admission refuses because the source is lost (stranded_by_mount_loss): the finished staging
+    copy may be the only copy of the work, so it stays and no refusal is recorded."""
+    from hermes_cli import kanban_db_dispatch as kdd
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        kb._append_event(conn, tid, kcb.STARTED_EVENT, {"host": "ace-ai", "path": str(path), "background": True})
+        conn.commit()
+        left = Path(loop._map(kcb.staging_path(str(path))))
+        left.mkdir(parents=True)
+        (left / "work.txt").write_text("the only copy\n")
+        import shutil
+        shutil.rmtree(path)                                 # the source is gone, not a policy violation
+        row = {"id": tid, "workspace_path": str(path)}
+        kdd._drop_refused_carry(conn, row, _plan(free=2), "default", f"stranded_by_mount_loss: {path}")
+        refused = _events(conn, tid, kcb.REFUSED_EVENT)
+    assert (left / "work.txt").read_text() == "the only copy\n"
+    assert refused == []
+
+
+def test_the_carry_gate_admits_the_path_it_copies(board, loop, tmp_path, monkeypatch):
+    """Prism e310afb55ca1: the row's workspace (what the carry copies) is a symlink out of the root; the task read back
+    names a safe path. The gate must not admit the safe path and copy the row's: it copies nothing this tick."""
+    import dataclasses
+    with kb.connect_closing() as conn:
+        tid, path, _private = _protected_symlink_card(conn, board, tmp_path, monkeypatch)
+        monkeypatch.setattr(kb, "_workspace_admission_refused", lambda *a, **k: False)
+        safe = path.parent / (path.name + "-safe")
+        safe.mkdir()
+        real_get = kb.get_task
+        monkeypatch.setattr(kb, "get_task", lambda c, t: (dataclasses.replace(real_get(c, t), workspace_path=str(safe))
+                                                          if t == tid else real_get(c, t)))
+        res, spawned = _tick_full(conn, defer_pool_clone=False)
+        started = _events(conn, tid, kcb.STARTED_EVENT)
+    assert spawned == [] and started == []
+    assert not any(c[0] == "rsync" for c in loop.calls), loop.calls
+
+
 def test_a_refresh_whose_submit_raises_is_not_handed_over_as_done(board, loop, tmp_path, monkeypatch):
     """Prism 64edba28c538: done_at / seen_done are cleared only once the refresh submit has returned."""
     lock_dir = tmp_path / "locks"
