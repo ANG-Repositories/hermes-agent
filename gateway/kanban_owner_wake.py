@@ -847,6 +847,10 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
             return None   # a plain ready card on a human assignee, not a scheduled wake
         item.update(trigger=TRIGGER_WOKE_NONSPAWNABLE, assignee=str((payload or {}).get("assignee") or ""))
     elif kind == "review_requested":
+        # t_54f4fde6: a handback parked on the review-hold lane is no decision yet; the hand-off to the
+        # operator writes a fresh review_requested that wakes as usual.
+        if kb.is_review_hold_assignee((payload or {}).get("reviewer")):
+            return None
         verdict = handback_pr_verdict(kb, conn, {"id": r["task_id"], "result": r["result"]}, payload,
                                       r["run_id"], pr_health, memo)
         if not verdict["state"]:

@@ -99,3 +99,36 @@ def test_tool_create_refuses_a_bare_studio_state_line(fleet, monkeypatch):
 def test_no_hook_module_fails_open(fleet, tmp_path):
     (fleet / "hooks" / "access_bound_create_policy.py").unlink()
     assert _cli_create(tmp_path, BARE) == 0
+
+
+# t_6524e9e8: a hook module with no create_refusal() fails open; the first such call per process says so in gateway.log.
+OLD_HOOK = '''
+def pool_hosts(root):
+    return set()
+def verdict(body, hosts):
+    return None
+'''
+
+
+def test_missing_create_refusal_logs_once_to_a_gateway_logger(fleet, monkeypatch, caplog):
+    import logging
+
+    from hermes_cli import kanban_access_bound_pin as pin
+    (fleet / "hooks" / "access_bound_create_policy.py").write_text(OLD_HOOK, encoding="utf-8")
+    monkeypatch.setattr(pin, "_missing_noted", False)
+    with caplog.at_level(logging.WARNING, logger="gateway"):
+        assert pin.studio_refusal(BARE) is None   # still fails open
+        assert pin.studio_refusal(BARE) is None
+    rows = [r for r in caplog.records if "has no create_refusal()" in r.getMessage()]
+    assert len(rows) == 1, [r.getMessage() for r in caplog.records]
+    assert rows[0].name.startswith("gateway") and "access_bound_create_policy.py" in rows[0].getMessage()
+
+
+def test_present_create_refusal_logs_nothing(fleet, monkeypatch, caplog):
+    import logging
+
+    from hermes_cli import kanban_access_bound_pin as pin
+    monkeypatch.setattr(pin, "_missing_noted", False)
+    with caplog.at_level(logging.WARNING, logger="gateway"):
+        assert pin.studio_refusal(BARE).startswith(REFUSAL)
+    assert not [r for r in caplog.records if "create_refusal" in r.getMessage()]

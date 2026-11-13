@@ -312,6 +312,22 @@ class TestUserRowGapIsNotSkipped:
         _rebuilt_agent_ingest(tmp_path, host)
         assert _count(tmp_path, "[kanban] a different wake") == 1
 
+    def test_user_row_differing_in_its_own_timestamp_ends_the_run(self, tmp_path):
+        # Prism 6017ce8a9844: a second timestamp with no note before it is the
+        # user's text; a row differing only there is a different row.
+        rows = [{"role": "system", "content": "You are Apollo."}]
+        for i in range(6):
+            rows.extend(_turn(i))
+        rows[9]["content"] = "[Thu 2026-11-12 09:00:00 PST] [Wed 2026-11-11 23:57:30 PST] report"
+        assert rows[9]["role"] == "user"
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in rows])
+        host = [dict(r) for r in rows[1:]]
+        host[8]["content"] = "[Thu 2026-11-12 09:00:00 PST] [Wed 2026-11-11 23:58:30 PST] report"
+        _rebuilt_agent_ingest(tmp_path, host)
+        assert _count(tmp_path, host[8]["content"]) == 1
+
 
 def _same_text_turn(i):
     # Same prompt every turn, only the timestamp prefix differs (goal-
@@ -394,3 +410,198 @@ class TestRepeatedCallIdsDoNotAnchor:
         new_turn = poll()
         _rebuilt_agent_ingest(tmp_path, new_turn)
         assert _rows(tmp_path) == n0 + len(new_turn)
+
+
+_NOTE = "[Triggering message id: `{}` — use as `message_id` for reply/react/pin via the discord tools.]\n\n"
+
+
+def _restart_resume_shape():
+    """Stored rows and resumed host history of live session 20261112_092254_4cd44442
+    at the 10:39:22 gateway boot (role order copied from the real 108-row ingest).
+
+    The stored user rows were written from the live API-bound message, so they
+    carry the Discord triggering note after the timestamp. The history a
+    restarted gateway resumes from has the note stripped
+    (gateway/run_inbound.py strip_discord_triggering_note); the newest host row,
+    built for the live turn, still carries it.
+    """
+    roles = (
+        "uatuattattattatatattattatattatatatattattauattattatatatatatatatatatatatatat"
+        "tatattatatatatatatatatatauatatata"
+    )
+    stored = [{"role": "system", "content": "You are Apollo."}]
+    for i in range(10):
+        stored += _turn(900 + i)
+    host = []
+    for k, role in enumerate(roles):
+        if role == "u":
+            ts = f"[Thu 2026-11-12 09:{k % 60:02d}:44 PST] "
+            text = f"[Ace] request {k}: make a handoff"
+            stored.append({"role": "user", "content": ts + _NOTE.format(1570492307449446000 + k) + text})
+            host.append({"role": "user", "content": ts + text})
+        elif role == "t":
+            row = {"role": "tool", "tool_call_id": f"toolu_01{k:04d}RPcWTmy5", "content": f'{{"output": "result {k}"}}'}
+            stored.append(row)
+            host.append(dict(row))
+        else:
+            n_tools = len(roles[k + 1:]) - len(roles[k + 1:].lstrip("t"))
+            row = {"role": "assistant", "content": "" if n_tools else f"Answer {k}."}
+            if n_tools:
+                row["tool_calls"] = [{
+                    "id": f"toolu_01{k + 1 + j:04d}RPcWTmy5", "type": "function",
+                    "function": {"name": "terminal", "arguments": f'{{"command": "step {k + 1 + j}"}}'},
+                } for j in range(n_tools)]
+            stored.append(row)
+            host.append(dict(row))
+    new_user = {"role": "user", "content": "[Thu 2026-11-12 10:40:36 PST] " + _NOTE.format(1570508630308954122) + "[Ace] new"}
+    return stored, host + [new_user]
+
+
+class TestGatewayRestartResumeWithDiscordNote:
+    """t_17732be2: at the 10:39 boot the clean-tail session 20261112_092254_4cd44442
+    (78 tool rows, 78 distinct call ids) re-stored its whole 108-row slice: the
+    walk ended at host row 0, a user row that differs from the stored one only by
+    the Discord triggering note, before any call id was matched."""
+
+    def test_restart_resume_appends_only_the_new_user_row(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        fresh = _rebuilt_agent_ingest(tmp_path, history)
+        assert fresh._last_ingest_reconciliation["reason"] == "replayed history anchored on stored tool calls"
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_restart_system_note_ahead_of_the_timestamp_is_matched(self, tmp_path):
+        # Session 20261108_093540_fa4b70b9 at the 10:39 boot: the host row puts the
+        # gateway's restart note ahead of a second timestamp; the stored row has neither.
+        stored, history = _restart_resume_shape()
+        ts, text = "[Thu 2026-11-12 06:43:10 PST] ", "[kanban wake] Card t_b40ec765 waits in review"
+        note = ("[System note: The previous turn was interrupted by a gateway shutdown; the gateway "
+                "is now back online. Do NOT re-execute old tool calls.]\n\n")
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user" and _NOTE[:20] in r["content"])
+        stored[s_idx] = {"role": "user", "content": ts + text}
+        history[0] = {"role": "user", "content": ts + note + ts + text}
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_gap_user_row_with_other_text_behind_the_note_is_stored(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        # A host user row the store never got: same timestamp, other text.
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        history[idx] = {"role": "user", "content": history[idx]["content"] + " (edited)"}
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
+
+
+# Head row of the history the gateway resumed session 20261024_..._9b06a4 from at
+# the 10:39:22 boot (state.db, loaded by load_transcript); trimmed goal text.
+_RESUMED_SCAFFOLD_HEAD = {
+    "role": "user",
+    "content": (
+        "[Current user objective preserved from compacted history]\n"
+        "[Thu 2026-11-12 08:45:04 PST] [Continuing toward your standing goal]\n"
+        "Goal: Every open item of this session's lineage is finished and proven."
+    ),
+}
+
+
+class TestRestartResumeOfCompactedSession:
+    """t_17732be2 send-back: 13 of 18 sessions at the 10:39 boot resumed from a
+    compacted transcript, [preserved-objective scaffold] + the stored tail. The
+    reconcile returned cursor 1 ("skipped scaffold-only prefix") and never ran
+    the anchored walk, so every row after the scaffold was stored again."""
+
+    def test_scaffold_head_then_stored_tail_appends_only_the_new_row(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        fresh = _rebuilt_agent_ingest(tmp_path, [dict(_RESUMED_SCAFFOLD_HEAD)] + history)
+        assert fresh._last_ingest_reconciliation["reason"] == "replayed history anchored on stored tool calls"
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_scaffold_head_then_gap_row_is_stored(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        history[idx] = {"role": "user", "content": history[idx]["content"] + " (edited)"}
+        eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng._store.append_batch(SESSION, [dict(r) for r in stored])
+        _rebuilt_agent_ingest(tmp_path, [dict(_RESUMED_SCAFFOLD_HEAD)] + history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
+
+
+def _persisted_marker(path, preview):
+    # The host form of a spilled tool result (session ..63465a4e,
+    # toolu_018BRyyoksKKzPxJwMuPpDrS at the 10:39 boot).
+    return (
+        "<persisted-output>\nThis tool result was too large (104,100 characters, 101.7 KB).\n"
+        f"Full output saved to: {path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        f"Preview (first 1500 chars):\n{preview}\n...\n</persisted-output>"
+    )
+
+
+class TestRestartResumeOfPersistedOutputMarker:
+    """t_17732be2 send-back: session ..63465a4e (live 678 re-stored at the 10:39
+    boot). With large-output externalization off, the store's write path adds a
+    "[LCM persisted-output marker identity: preview_sha256=...]" line to a
+    spilled tool result; the resumed history holds the marker without it, so
+    the anchored walk ended at that row."""
+
+    def _shape(self, tmp_path, host_preview):
+        spill = tmp_path / "spillover" / "toolu_018BRyyoksKKzPxJwMuPpDrS.txt"
+        spill.parent.mkdir()
+        spill.write_text('{"success": true, "name": "session-card-overview"}' + "x" * 104_100)
+        cfg = _cfg(tmp_path)
+        cfg.large_output_externalization_enabled = False
+        stored, history = _restart_resume_shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "tool" and i > 30)
+        s_idx = next(i for i, r in enumerate(stored) if r.get("tool_call_id") == history[idx]["tool_call_id"])
+        preview = '{"success": true, "name": "session-card-overview"}'
+        stored[s_idx] = dict(stored[s_idx], content=_persisted_marker(spill, preview))
+        history[idx] = dict(history[idx], content=_persisted_marker(spill, host_preview))
+        eng = LCMEngine(config=cfg, hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        eng.ingest([dict(r) for r in stored])
+        n0 = _rows(tmp_path)
+        assert "[LCM persisted-output marker identity:" in "".join(
+            r[0] for r in sqlite3.connect(str(tmp_path / "lcm.db")).execute(
+                "SELECT content FROM messages WHERE session_id=? AND role='tool'", (SESSION,)))
+        fresh = LCMEngine(config=cfg, hermes_home=str(tmp_path))
+        fresh.on_session_start(SESSION, platform="discord")
+        fresh.ingest([dict(m) for m in history])
+        return n0, history[idx]
+
+    def test_marker_without_write_path_lines_appends_only_the_new_row(self, tmp_path):
+        n0, _ = self._shape(tmp_path, '{"success": true, "name": "session-card-overview"}')
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_marker_with_another_preview_is_stored(self, tmp_path):
+        n0, row = self._shape(tmp_path, '{"success": true, "name": "another-skill"}')
+        assert _rows(tmp_path) > n0 + 1
+
+
+def test_first_ingest_after_rebind_logs_one_info_line(tmp_path, caplog):
+    # A restart is judged from agent.log: one INFO line per session per rebuild.
+    stored, history = _restart_resume_shape()
+    eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+    eng.on_session_start(SESSION, platform="discord")
+    eng._store.append_batch(SESSION, [dict(r) for r in stored])
+    caplog.set_level("INFO", logger="plugins.context_engine.lcm.engine")
+    fresh = _rebuilt_agent_ingest(tmp_path, history)
+    fresh.ingest([dict(m) for m in history] + [{"role": "assistant", "content": "ok"}])
+    lines = [r.getMessage() for r in caplog.records if "first ingest after rebind" in r.getMessage()]
+    assert len(lines) == 1
+    assert f"session={SESSION}" in lines[0] and f"incoming={len(history)}" in lines[0]
+    assert "reason=replayed history anchored on stored tool calls" in lines[0] and "appended=1" in lines[0]

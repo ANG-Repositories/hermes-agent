@@ -3948,6 +3948,9 @@ def prove(d):
   prove(f)
 try:
  prove(p)
+ if sys.argv[2:]==['check']:
+  print(git(p,'rev-parse','HEAD').strip() if (p/'.git').is_dir() else '')
+  sys.exit(0)
  shutil.rmtree(p)
  print('removed')
 except Exception as e:

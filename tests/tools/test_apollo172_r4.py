@@ -31,6 +31,11 @@ def test_exported_shellopts_pipefail_reaches_the_command(env):
 
 
 def test_exported_bashopts_reaches_the_command(env):
+    # bash imports BASHOPTS from the environment only since 4.1; macOS runners resolve the stock
+    # /bin/bash 3.2, where neither spawn path can honour it (both arms read 'off', main run 43259635914).
+    version = env.execute("echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}")["output"].strip().splitlines()[-1]
+    if tuple(int(p) for p in version.split(".")) < (4, 1):
+        pytest.skip(f"bash {version} predates BASHOPTS import (4.1)")
     env.env["BASHOPTS"] = "nullglob"
     result = env.execute("shopt -q nullglob && echo on || echo off")
     assert result["output"].strip().splitlines()[-1] == "on", result

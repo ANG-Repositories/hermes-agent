@@ -55,6 +55,20 @@ _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from co
 # the note, gateway/run.py; " " after the timestamp, message_timestamps.py).
 _USER_ROW_SYSTEM_NOTE_PREFIX = re.compile(r"^\[System note: [^\]]*\](?:\n\n)?")
 _USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]{2,5}\] ?")
+# gateway/run_inbound.py discord_triggering_note + the "\n\n" it is joined with.
+_USER_ROW_DISCORD_NOTE_PREFIX = re.compile(
+    r"^\[Triggering message id: `[^`\n]*` — use as `message_id` for reply/react/pin via the discord tools\.\](?:\n\n)?"
+)
+# Lines ingest_protection adds before </persisted-output> on the write path.
+_INLINE_PERSISTED_OUTPUT_METADATA_LINES = re.compile(
+    r"\r?\n\[LCM persisted-output (?:marker identity: preview_sha256=[0-9a-f]{64}"
+    r"|file generation: size=\d+; mtime_ns=\d+; ctime_ns=\d+)\](?=\r?\n(?:\[LCM persisted-output [^\r\n]*\]\r?\n)*</persisted-output>\s*$)"
+)
+_USER_ROW_WRAPPER_PREFIXES = (
+    _USER_ROW_SYSTEM_NOTE_PREFIX,
+    _USER_ROW_TIMESTAMP_PREFIX,
+    _USER_ROW_DISCORD_NOTE_PREFIX,
+)
 
 
 class ReconcileMixin:
@@ -937,6 +951,16 @@ class ReconcileMixin:
                 if not self._effective_replay_identities(messages[:cursor])
                 else "replayed durable tail"
             )
+            if reason == "skipped scaffold-only prefix":
+                # A restarted gateway resumes a compacted session as
+                # [preserved-objective scaffold] + the stored tail it kept
+                # (t_17732be2: 13 of 18 sessions at the 10:39 boot). The
+                # scaffold proves nothing about the rows after it, so prove
+                # those the same way as a scaffold-free resume.
+                anchored = self._tool_call_anchored_replay_cursor(messages[cursor:], stored_rows)
+                if anchored > 0:
+                    cursor += anchored
+                    reason = "replayed history anchored on stored tool calls"
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason=reason,
@@ -1065,7 +1089,10 @@ class ReconcileMixin:
         repeated "[<timestamp>] proceed" answered identically). Nothing in the
         rows tells such a turn from a re-render of the stored one.
         """
-        stored_ids = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
+        stored_ids = [
+            self._strip_inline_persisted_output_metadata(self._message_replay_identity(row, stored_row=True))
+            for row in stored_rows
+        ]
         id_uses: dict[str, int] = {}
         for row in stored_rows:
             if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
@@ -1081,7 +1108,9 @@ class ReconcileMixin:
         offset = None
         for idx, msg in enumerate(messages):
             if str(msg.get("role") or "") == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
-                pos = stored_tool_pos.get(self._message_replay_identity(msg))
+                pos = stored_tool_pos.get(
+                    self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
+                )
                 if pos is not None:
                     offset = pos - idx
                     break
@@ -1096,7 +1125,7 @@ class ReconcileMixin:
             role = str(msg.get("role") or "")
             if role != str(stored_rows[pos].get("role") or ""):
                 break
-            identity = self._message_replay_identity(msg)
+            identity = self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
             if identity != stored_ids[pos]:
                 if role == "user" and self._user_row_rerender_key(identity[1]) in (
                     "", self._user_row_rerender_key(stored_ids[pos][1]),
@@ -1113,6 +1142,27 @@ class ReconcileMixin:
         return cursor
 
     @staticmethod
+    def _strip_inline_persisted_output_metadata(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        """A tool row's identity without the lines the store's write path adds.
+
+        With large-output externalization off, the write path appends
+        ``[LCM persisted-output marker identity: preview_sha256=...]`` (a digest
+        of the marker's own preview) and may append a file-generation line to a
+        persisted-output marker (ingest_protection.py). The history a restarted
+        gateway resumes from carries the marker without them (t_17732be2,
+        session ..63465a4e at the 10:39 boot), so the anchored walk compares
+        both sides with those lines removed. The marker text itself, preview
+        included, must still be identical.
+        """
+        role, content, tool_call_id, tool_calls = identity
+        if role != "tool" or not isinstance(content, str) or "</persisted-output>" not in content:
+            return identity
+        stripped = _INLINE_PERSISTED_OUTPUT_METADATA_LINES.sub("", content)
+        return (role, stripped, tool_call_id, tool_calls)
+
+    @staticmethod
     def _user_row_rerender_key(content: Any) -> str:
         """A user row's content with the host's re-render variance removed.
 
@@ -1121,14 +1171,38 @@ class ReconcileMixin:
         re-renders a stored user row in three ways only: trailing whitespace
         dropped, a leading ``[System note: ...]`` block added or dropped, and a
         leading ``[Wed 2026-11-11 23:57:30 PST]`` timestamp added or dropped.
+        A gateway restart adds a fourth (t_17732be2, session
+        20261112_092254_4cd44442): the stored row carries the Discord
+        ``[Triggering message id: ...]`` note after the timestamp, and the
+        history the restarted gateway resumes from has it stripped. The
+        wrappers stack in either order: after a restart the host row reads
+        ``[ts] [System note: ...interrupted by a gateway shutdown...]\\n\\n[ts]
+        <text>`` against a stored ``[ts] <text>`` (session
+        20261108_093540_fa4b70b9 at the 10:39 boot), so leading wrappers are
+        removed in whatever order they appear, each at most once, except that
+        a system note opens room for one more timestamp (the gateway stamps the
+        note and the text after it). A second timestamp with no note between
+        is the user's own text and stays in the key.
         Each wrapper goes with the one separator the gateway writes after it;
         leading whitespace of the text itself is kept (indentation is content).
         Anything else is a different row. An empty key means the host emptied
         the row: skipping it drops no content, so the caller accepts it.
         """
         text = str(content or "").rstrip()
-        text = _USER_ROW_SYSTEM_NOTE_PREFIX.sub("", text, count=1)
-        return _USER_ROW_TIMESTAMP_PREFIX.sub("", text, count=1)
+        left = {wrapper: 1 for wrapper in _USER_ROW_WRAPPER_PREFIXES}
+        while True:
+            for wrapper in _USER_ROW_WRAPPER_PREFIXES:
+                if not left[wrapper]:
+                    continue
+                rest = wrapper.sub("", text, count=1)
+                if rest != text:
+                    text = rest
+                    left[wrapper] -= 1
+                    if wrapper is _USER_ROW_SYSTEM_NOTE_PREFIX:
+                        left[_USER_ROW_TIMESTAMP_PREFIX] = 1
+                    break
+            else:
+                return text
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

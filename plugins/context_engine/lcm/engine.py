@@ -1846,7 +1846,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     messages,
                     conversation_id=self._conversation_id,
                 )
+                first_after_rebind = bool(self._ingest_cursor_needs_reconcile)
+                if first_after_rebind:
+                    rows_before = self._store.get_session_count(self._session_id)
+                    rec_before = self._last_ingest_reconciliation
                 self._ingest_messages(messages)
+                if first_after_rebind:
+                    # One line per session per agent rebuild: how a restart is judged.
+                    rec = self._last_ingest_reconciliation
+                    rec = {} if rec is rec_before or not rec else rec
+                    logger.info(
+                        "LCM first ingest after rebind: session=%s incoming=%d reason=%s cursor=%s appended=%d",
+                        self._session_id,
+                        len(messages),
+                        rec.get("reason", "none"),
+                        rec.get("cursor"),
+                        self._store.get_session_count(self._session_id) - rows_before,
+                    )
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(

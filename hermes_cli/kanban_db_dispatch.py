@@ -5916,7 +5916,20 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         # placement.continuation says; an absent host waits, never re-clones.
         from hermes_cli import kanban_worktree_port as _kwt
         _ported = _kwt.ported_host(conn, row["id"], row["workspace_path"])
-        if _ported:
+        _missing = _kwt.hard_missing(row, caps, _ported) if _ported else []
+        if _missing:
+            # t_f914c529: the card now needs what the port host cannot serve (t_cf13ff3b: re-routed with
+            # requires: studio-state after a ci-box run). Hand it over once the clone there is proven clean and
+            # pushed; else it waits named on that host and clone. Any other ported card keeps its bind.
+            _held = _kwt.release_port_bind(conn, row, _ported, _missing, getattr(plan.config, "pool_hosts", ()) or (),
+                                           dry_run=getattr(plan, "continuation_dry_run", False))
+            if _held is not None:
+                if rules_out is not None:
+                    rules_out[row["id"]] = _kwt.STRANDED_PREFIX
+                return "wait", _held
+            _now = conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            row = {**{k: row[k] for k in row.keys()}, "workspace_path": _now[0] if _now else row["workspace_path"]}
+        elif _ported:
             bind = (_kwt.PORT_BIND_RULE, row["id"], _ported)
         else:
             # A carried local_files card's real workspace is the copy on the host it was carried to
@@ -8813,6 +8826,11 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
+                if not dry_run:
+                    # t_f914c529: a card handed over off its port host gets its branch at the clone's head here,
+                    # in a fresh path (never a directory that happened to exist); a failure is a spawn failure.
+                    from hermes_cli import kanban_worktree_port as _kwt
+                    _kwt.materialize_handover(conn, claimed, str(workspace), placed_host)
                 if placed_host is not None and claimed.id in _carry_rows and not dry_run:
                     # local_files continuity overflow (t_e604c0f9): the Studio was full, so the card's
                     # Studio scratch dir goes to the chosen host first, same path; a failure is a spawn

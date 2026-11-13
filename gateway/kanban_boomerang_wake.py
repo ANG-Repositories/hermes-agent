@@ -10,6 +10,10 @@ automatic retries a crash-class wake has already spent on a card (spec §5.4, D-
 ``wake_disposition`` reads it (one retry, then surface); the dispatcher bumps it when it
 dispatches a crash retry. It survives a gateway restart, and it resets when the card reaches
 ``completed``/``archived`` (or when Ace surfaces-and-acts on it: :meth:`reset`).
+``restart_spent[task_id]`` is a separate budget: the gateway-restart redispatches spent on the card's
+current wake. It never touches ``retries`` and a handled wake (``HANDLED_OUTCOMES``) clears it, so the
+restart retry is per wake while ``retries`` (crash retry + blocked assessment) stays per card lifetime
+(t_a256e37c).
 
 Writes go through write-temp + ``os.replace`` under a process-wide lock: both wake paths
 run on threads of the ONE gateway process that owns this ``HERMES_HOME`` (spec §5.4,
@@ -34,8 +38,25 @@ STATE_FILENAME = "kanban_boomerang_wake.json"
 LEGACY_STATE_FILENAME = "kanban_auto_handle.json"
 # Events after which a card's retry budget starts over.
 RESET_KINDS = frozenset({"completed", "archived"})
+# t_a256e37c: a claim that goes terminal with one of these outcomes HANDLED its wake (the executor
+# accepted the child's verdict, or the wake was correctly dropped). It clears the card's
+# ``restart_spent``, so the next restart cut gets its quiet redispatch again. ``failed``/``lost``/``stopped``/``dispatch_failed``/``redispatched_after_restart`` do not.
+HANDLED_OUTCOMES = frozenset({
+    "complete", "request_changes", "redispatch", "retry", "handled", "land_inherited", "acknowledge",
+    "comment_why_waits", "surfaced", "stale", "superseded", "superseded-by-terminal",
+})
 
 _LOCK = threading.Lock()
+
+# t_827d5940: pending-handback retry backoff and dead-letter bounds; terminal-claim retention.
+BACKOFF_BASE_S = 10.0              # first retry 10 s after the first failed attempt, doubling...
+BACKOFF_MAX_S = 15 * 60.0          # ...to a 15 min ceiling
+DEAD_LETTER_AFTER_S = 24 * 3600.0  # a part still undeliverable this long after the row was created
+DEAD_LETTER_KEEP = 500             # newest dead-letter records kept in the state file
+CLAIM_TTL_S = 7 * 86400.0          # terminal claims older than this are pruned
+CLAIM_PRUNE_EVERY_S = 3600.0
+#: Kill switch for the backoff, dead-letter and claim pruning (present = pre-t_827d5940 behaviour).
+BACKOFF_STOP_FILE = "boomerang-handback-backoff.disabled"
 
 
 def state_path() -> Path:
@@ -71,7 +92,31 @@ class BoomerangWakeState:
             raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return {}
-        return raw if isinstance(raw, dict) else {}
+        return self._migrate(raw) if isinstance(raw, dict) else {}
+
+    @classmethod
+    def _migrate(cls, data: dict) -> dict:
+        """A pre-t_a256e37c file has no ``restart_spent``: a restart redispatch spent ``retries``
+        and left a ``<key>#restartN`` claim. Move the count those claims account for (capped by the
+        counter) from ``retries`` to ``restart_spent``. Every write persists the map, so this runs
+        once per file and later reads never reseed (Prism f05ecc4393cf)."""
+        if isinstance(data.get("restart_spent"), dict):
+            return data
+        retries, seen = cls._retries_of(data), {}
+        for k, v in cls._claims_of(data).items():
+            if "#restart" in str(k) and isinstance(v, dict) and v.get("task_id"):
+                tid = str(v["task_id"])
+                seen[tid] = seen.get(tid, 0) + 1
+        spent = {}
+        for tid, n in seen.items():
+            moved = min(n, retries.get(tid, 0))
+            if moved:
+                spent[tid] = moved
+                retries[tid] -= moved
+                if not retries[tid]:
+                    del retries[tid]
+        data["retries"], data["restart_spent"] = retries, spent
+        return data
 
     def _write(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,22 +163,54 @@ class BoomerangWakeState:
             self._write(data)
             return retries[str(task_id)]
 
-    def reset(self, task_id: str) -> bool:
-        """Drop ``task_id``'s counter; True when one existed."""
+    def bump_restart_retry(self, task_id: str) -> int:
+        """A restart redispatch: one more on ``task_id``'s restart budget (``retries`` untouched);
+        returns the new ``restart_spent`` count."""
         with _LOCK:
             data = self._read()
-            retries = self._retries_of(data)
-            if str(task_id) not in retries:
+            spent, tid = self._restart_spent_of(data), str(task_id)
+            spent[tid] = spent.get(tid, 0) + 1
+            data["restart_spent"] = spent
+            self._write(data)
+            return spent[tid]
+
+    @staticmethod
+    def _restart_spent_of(data: dict) -> dict:
+        raw = data.get("restart_spent")
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def restart_spent(self, task_id: str) -> int:
+        with _LOCK:
+            return self._restart_spent_of(self._read()).get(str(task_id), 0)
+
+    def reset_counters(self, task_id: str) -> bool:
+        """Drop ``task_id``'s counters (``retries`` and ``restart_spent``); True when one existed.
+
+        Not ``reset``: the loop-reachability gate binds calls by name, so ``ContextVar.reset``
+        in ``_deliver_one`` resolved here and read as an on-loop fsync (t_630c5160)."""
+        with _LOCK:
+            data = self._read()
+            retries, spent = self._retries_of(data), self._restart_spent_of(data)
+            had = retries.pop(str(task_id), None) is not None
+            had = spent.pop(str(task_id), None) is not None or had
+            if not had:
                 return False
-            del retries[str(task_id)]
-            data["retries"] = retries
+            data["retries"], data["restart_spent"] = retries, spent
             self._write(data)
             return True
 
     def observe_event(self, task_id: str, kind: str) -> bool:
         """Reset the counter when ``kind`` ends the card's retry budget (completed/archived)."""
         if str(kind or "") in RESET_KINDS:
-            return self.reset(task_id)
+            return self.reset_counters(task_id)
         return False
 
     # --- single-owner claims (P3b, spec §5.4 pass-1 B3 / pass-2 RC-4) -----------------
@@ -155,7 +232,9 @@ class BoomerangWakeState:
             claims = self._claims_of(data)
             if key in claims:
                 return False
-            if entry.get("row") == "blocked_assess":
+            # A restart redispatch (``<key>#restartN``) re-runs a wake whose original claim already
+            # took its blocked-assessment budget; it must not spend ``retries`` again (t_a256e37c).
+            if entry.get("row") == "blocked_assess" and not entry.get("restart_redispatch"):
                 retries = self._retries_of(data)
                 spent = int(retries.get(entry["task_id"], 0))
                 entry["blocked_budget_exhausted"] = spent >= 1
@@ -193,6 +272,11 @@ class BoomerangWakeState:
                 if handback is not None:
                     self._write(data)
                 return None
+            if (fields.get("state") == STATE_TERMINAL and entry.get("state") != STATE_TERMINAL
+                    and fields.get("outcome") in HANDLED_OUTCOMES and entry.get("task_id")):
+                spent = self._restart_spent_of(data)   # t_a256e37c: per-wake restart budget
+                spent.pop(str(entry["task_id"]), None)
+                data["restart_spent"] = spent
             entry = {**entry, **fields}
             claims[key] = entry
             data["claims"] = claims
@@ -248,6 +332,73 @@ class BoomerangWakeState:
         with _LOCK:
             return {k: dict(v) for k, v in self._handbacks_of(self._read()).items() if isinstance(v, dict)}
 
+    # --- dead letters (t_827d5940): ``dead_letters[delegation_id]`` = parts that could never be
+    # delivered (permanent send error, or still undeliverable past DEAD_LETTER_AFTER_S). Kept for the
+    # operator to read; never retried.
+
+    def dead_letter(self, delegation_id: str, record: dict, *, left: list) -> None:
+        """Move the dead parts out of the pending row in ONE write: the row keeps ``left`` (dropped
+        when empty) and ``record`` joins ``dead_letters`` (newest DEAD_LETTER_KEEP kept)."""
+        with _LOCK:
+            data = self._read()
+            rows = self._handbacks_of(data)
+            if left and isinstance(rows.get(delegation_id), dict):
+                rows[delegation_id] = {**rows[delegation_id], "parts": list(left)}
+            else:
+                rows.pop(delegation_id, None)
+            data["handbacks"] = rows
+            raw = data.get("dead_letters")
+            dead = dict(raw) if isinstance(raw, dict) else {}
+            prev = dead.get(delegation_id) if isinstance(dead.get(delegation_id), dict) else {}
+            reasons = {**(prev.get("reasons") if isinstance(prev.get("reasons"), dict) else {}),
+                       **(record.get("reasons") if isinstance(record.get("reasons"), dict) else {})}
+            dead[delegation_id] = {**prev, **record, "reasons": reasons,
+                                   "parts": sorted(set(prev.get("parts") or []) | set(record.get("parts") or []))}
+            if len(dead) > DEAD_LETTER_KEEP:
+                order = sorted(dead, key=lambda k: float((dead[k] or {}).get("dead_at") or 0) if isinstance(dead[k], dict) else 0)
+                for k in order[:len(dead) - DEAD_LETTER_KEEP]:
+                    dead.pop(k, None)
+            data["dead_letters"] = dead
+            self._write(data)
+
+    def dead_letters(self) -> dict:
+        if not self.path.exists():
+            return {}
+        with _LOCK:
+            raw = self._read().get("dead_letters")
+            return {k: dict(v) for k, v in (raw or {}).items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+
+    def prune_claims(self, now: float, ttl_s: float) -> int:
+        """Drop TERMINAL claims finished (else claimed) more than ``ttl_s`` ago, except a claim a
+        pending handback still names. Open/cancelled claims are never pruned. One write, only when
+        something goes; returns the number dropped."""
+        with _LOCK:
+            data = self._read()
+            claims = self._claims_of(data)
+            keep = {r.get("claim_key") for r in self._handbacks_of(data).values() if isinstance(r, dict)}
+            # an open claim's ``#restartN`` successor is what reconcile closes it against
+            keep |= {k for k in claims if "#restart" in k
+                     and isinstance(claims.get(k.split("#restart", 1)[0]), dict)
+                     and claims[k.split("#restart", 1)[0]].get("state") != STATE_TERMINAL}
+            cut = now - ttl_s
+            drop = []
+            for k, v in claims.items():
+                if not isinstance(v, dict) or v.get("state") != STATE_TERMINAL or k in keep:
+                    continue
+                try:
+                    at = float(v.get("finished_at") or v.get("claimed_at") or now)
+                except (TypeError, ValueError):
+                    continue
+                if at < cut:
+                    drop.append(k)
+            if not drop:
+                return 0
+            for k in drop:
+                del claims[k]
+            data["claims"] = claims
+            self._write(data)
+            return len(drop)
+
 
 # ==========================================================================================
 # P3b: auto-dispatch (spec §5.5), verdict executor (§5.8, D-19), reconciler (§5.7).
@@ -257,6 +408,7 @@ class BoomerangWakeState:
 # ==========================================================================================
 
 import asyncio  # noqa: E402
+import contextvars  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import time as _time  # noqa: E402
@@ -892,10 +1044,18 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                 raise RuntimeError(f"request_changes on a {status} card")
             _send_back("; ".join(str(f).strip() for f in verdict.get("findings") or [] if str(f).strip()))
         elif action == "redispatch" and status == "review":
+            # RC-4 (never the child's pick): the worker is the implementer the board's own review
+            # handoff names, which request_changes restores. The claim-time assignee of a review
+            # card is the REVIEWER (human:apollo); handing it back parked the card in todo with no
+            # worker (t_1c893466: t_b17af713, t_6dc9df18, t_38246203).
+            implementer = kb._review_handoff_implementer(conn, tid)  # noqa: SLF001
+            if not kb.is_worker_assignee(implementer):
+                raise RuntimeError(f"redispatch: review handoff names no worker implementer ({implementer})")
             _send_back(summary)
-            current = entry.get("assignee")   # RC-4: the CURRENT assignee only, never the child's pick
-            if current and getattr(kb.get_task(conn, tid), "assignee", None) != current:
-                kb.assign_task(conn, tid, current, worker_ok=True)
+            after = kb.get_task(conn, tid)
+            if not kb.is_worker_assignee(getattr(after, "assignee", None)) or kb._operator_todo(after):  # noqa: SLF001
+                raise RuntimeError(f"redispatch left the card {getattr(after, 'status', None)} on "
+                                   f"{getattr(after, 'assignee', None)}, no worker will spawn")
         elif status == "blocked" or entry.get("row") == "blocked_assess":
             kwargs = {"expect_block_event": int(entry["event_id"])} if entry.get("row") == "blocked_assess" else {}
             if entry.get("row") == "blocked_assess":
@@ -1114,6 +1274,15 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
                         "summary": summary, "surface": True, **finding}
             if getattr(task, "status", None) != "blocked":
                 return {"ok": False, "action": action, "reason": "state moved", "summary": summary}
+        if action in ("redispatch", "retry"):
+            task = kb.get_task(conn, live["task_id"])
+            if kb._operator_todo(task):  # noqa: SLF001
+                # t_1c893466: a todo card on a human lane has no worker to redispatch; requeue would
+                # refuse it ("requeue refused: ... is 'todo'"). Say so plainly, write nothing.
+                why = (f"card is todo on {task.assignee}: a human lane, no worker to {action}; "
+                       f"the operator acts on it or reassigns it to a worker")
+                return {"ok": False, "action": "surface", "surface": True, **finding,
+                        "reason": why, "summary": why, "detail": f"{why} (child said: {finding['detail']})"}
         if action == "land_inherited":
             degraded = _verify_land_inherited(live, verdict, kb, conn)
             if degraded:
@@ -1165,6 +1334,9 @@ PART_TURN, PART_LINE = "turn", "line"
 # Delegations whose pending row is being sent right now (the run_entry drain and the tick drain
 # share one event loop; the check-and-add below never awaits, so it is the whole mutex).
 _DELIVERING: set = set()
+# t_827d5940: why the current part's send failed (``error``, ``permanent``); post_line/resurface
+# write it, _deliver_one reads it. A fresh throwaway dict outside a drain.
+_SEND_FAILURE: "contextvars.ContextVar[dict]" = contextvars.ContextVar("boomerang_send_failure")
 
 
 def _delivered_parts(kb: Any, conn: Any, task_id: str, delegation_id: str) -> set:
@@ -1244,8 +1416,81 @@ def _mark_delivered(board: Optional[str], task_id: str, delegation_id: str, part
         conn.close()
 
 
-async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: str, row: dict) -> int:
+def backoff_enabled() -> bool:
+    """t_827d5940 kill switch: False while ``<HERMES_HOME>/state/boomerang-handback-backoff.disabled``
+    exists (every pending row is retried every tick again, nothing dead-letters, no claim is pruned)."""
+    from hermes_constants import get_hermes_home
+
+    return not (get_hermes_home() / "state" / BACKOFF_STOP_FILE).exists()
+
+
+def retry_delay(attempts: int) -> float:
+    """Seconds to wait after the ``attempts``-th failed attempt: 10 s doubling to 15 min."""
+    if attempts <= 0:
+        return 0.0
+    return min(BACKOFF_BASE_S * (2 ** min(attempts - 1, 20)), BACKOFF_MAX_S)
+
+
+def _due(row: dict, now: float) -> bool:
+    try:
+        attempts = int(row.get("attempts") or 0)
+        last = float(row.get("last_attempt_at") or 0)
+    except (TypeError, ValueError):
+        return True
+    return attempts <= 0 or now - last >= retry_delay(attempts)
+
+
+def _permanent_send_error(error: str, kind: Optional[str]) -> bool:
+    """A send the route can never take: the target chat/thread is gone (Discord 404 10003)."""
+    return kind == "not_found" or bool(_DISCORD_UNKNOWN_CHANNEL.search(error or ""))
+
+
+# Discord's own shape: HTTP status 404 then JSON code 10003, as whole tokens (a channel id that
+# merely contains the digits "10003" must not read as permanent; Prism b36991a3b989).
+_DISCORD_UNKNOWN_CHANNEL = re.compile(r"(?<!\d)404\D{1,20}?(?<!\d)10003(?!\d)")
+
+
+def _dead_letter_comment(row: dict, delegation_id: str, body: str) -> None:
+    from hermes_cli import kanban_db as kb
+
+    try:
+        conn = kb.connect(board=row.get("board"))
+        try:
+            if not any(c.author == AUTHOR and c.body == body for c in kb.list_comments(conn, row["task_id"])):
+                with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+                    kb.add_comment(conn, row["task_id"], AUTHOR, body)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: dead-letter comment on %s not written: %s", row.get("task_id"), exc)
+
+
+def _dead_letter(state: BoomerangWakeState, delegation_id: str, row: dict, dead: dict, left: list,
+                 now: float) -> None:
+    """State first (the row stops retrying), then one #logs line and one card comment."""
+    attempts = int(row.get("attempts") or 0) + 1
+    age_h = max(0.0, now - float(row.get("created_at") or now)) / 3600
+    why = "; ".join(f"{p}: {r}" for p, r in dead.items())
+    record = {"task_id": row.get("task_id"), "board": row.get("board"), "parts": sorted(dead),
+              "reasons": dict(dead), "dead_at": now, "created_at": row.get("created_at"), "attempts": attempts,
+              "home_sid": row.get("home_sid"), "route": row.get("route"), "line": row.get("line"),
+              "turn": str(row.get("turn") or "")[:500] or None, "claim_key": row.get("claim_key")}
+    state.dead_letter(delegation_id, record, left=left)
+    text = (f"boomerang-wake dead-letter {row.get('task_id')}: delegation {delegation_id} not delivered "
+            f"after {attempts} attempt(s) over {age_h:.1f}h ({why})")
+    logger.warning("kanban boomerang-wake: %s", text)
+    try:
+        post_logs(text)
+    except Exception as exc:
+        logger.debug("kanban boomerang-wake: #logs line failed: %s", exc)
+    _dead_letter_comment(row, delegation_id, f"{MARKER} dead-letter: {why} (delegation {delegation_id})")
+
+
+async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: str, row: dict,
+                       *, backoff: bool = False) -> int:
     entry = dict(row, delegation_id=delegation_id)
+    now = _time.time()
+    failures: dict = {}
     try:
         done = await asyncio.to_thread(_board_delivered, row.get("board"), row["task_id"], delegation_id)
     except Exception as exc:   # unreadable board: send; the state row still dedupes
@@ -1272,11 +1517,17 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
             if why:
                 await asyncio.to_thread(state.drop_handback, delegation_id)
                 return sent
-        if part == PART_TURN:
-            ok = await resurface(runner, entry, row.get("turn"))
-        else:
-            ok = await post_line(runner, entry, str(row.get("line") or ""))
+        fail: dict = {}
+        token = _SEND_FAILURE.set(fail)
+        try:
+            if part == PART_TURN:
+                ok = await resurface(runner, entry, row.get("turn"))
+            else:
+                ok = await post_line(runner, entry, str(row.get("line") or ""))
+        finally:
+            _SEND_FAILURE.reset(token)
         if not ok:
+            failures[part] = fail
             if part == PART_TURN and row.get("warn_on_failure") and PART_LINE not in done and PART_LINE not in left:
                 # A refused turn owes its warning line too; persist it before the send.
                 left.append(PART_LINE)
@@ -1291,9 +1542,24 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
             logger.warning("kanban boomerang-wake: delivered marker for %s not written: %s", row["task_id"], exc)
         if part == PART_TURN and row.get("claim_key"):
             await asyncio.to_thread(state.update_claim, row["claim_key"], resurface_delivered=True)
+    if left and backoff:
+        age = now - float(row.get("created_at") or now)
+        dead = {}
+        for part in left:
+            fail = failures.get(part) or {}
+            err = str(fail.get("error") or "not delivered")
+            if fail.get("permanent"):
+                dead[part] = f"permanent: {err}"
+            elif age >= DEAD_LETTER_AFTER_S:
+                dead[part] = f"undeliverable for {age / 3600:.0f}h: {err}"
+        if dead:
+            left = [p for p in left if p not in dead]
+            await asyncio.to_thread(_dead_letter, state, delegation_id, row, dead, left, now)
+            if not left:
+                return sent
     if left:
         await asyncio.to_thread(state.update_handback, delegation_id, parts=left,
-                                attempts=int(row.get("attempts") or 0) + 1, last_attempt_at=_time.time())
+                                attempts=int(row.get("attempts") or 0) + 1, last_attempt_at=now)
         logger.info("kanban boomerang-wake: %s handback pending parts=%s attempts=%d delegation=%s",
                     row["task_id"], left, int(row.get("attempts") or 0) + 1, delegation_id)
     else:
@@ -1302,16 +1568,25 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
 
 
 async def deliver_handbacks(runner: Any, state: BoomerangWakeState, *,
-                            delegation_id: Optional[str] = None) -> int:
-    """Drain pending handbacks (all, or one delegation's); returns the parts delivered."""
+                            delegation_id: Optional[str] = None, paced: bool = False) -> int:
+    """Drain pending handbacks (all, or one delegation's); returns the parts delivered.
+
+    t_827d5940: ``paced`` (the reconcile tick, the one retry loop) skips a row that already failed
+    until ``retry_delay(attempts)`` has passed since its last attempt: no send, no state write while
+    it waits. A permanent send error, or a part still undeliverable DEAD_LETTER_AFTER_S after the row
+    was created, moves to ``dead_letters``. The kill switch (``backoff_enabled``) turns all of it off."""
     rows = await asyncio.to_thread(state.handbacks)
+    backoff = await asyncio.to_thread(backoff_enabled)
+    now = _time.time()
     sent = 0
     for did, row in rows.items():
         if (delegation_id is not None and did != delegation_id) or did in _DELIVERING:
             continue
+        if paced and backoff and not _due(row, now):
+            continue
         _DELIVERING.add(did)
         try:
-            sent += await _deliver_one(runner, state, did, row)
+            sent += await _deliver_one(runner, state, did, row, backoff=backoff)
         except Exception as exc:
             logger.warning("kanban boomerang-wake: handback %s not delivered: %s", did, exc)
         finally:
@@ -1322,8 +1597,10 @@ async def deliver_handbacks(runner: Any, state: BoomerangWakeState, *,
 async def post_line(runner: Any, entry: dict, text: str) -> bool:
     """One line to the claim's origin chat (the subscription's chat, or the home session's).
 
-    True only on the adapter's receipt (``SendResult.success is True``)."""
+    True only on the adapter's receipt (``SendResult.success is True``). A refused send records
+    ``error`` and ``permanent`` (the target is gone) in ``_SEND_FAILURE``."""
     route = entry.get("route") or {}
+    failure = _SEND_FAILURE.get({})
     try:
         adapter = runner._kanban_route_adapter(route.get("platform"), route.get("profile"))  # noqa: SLF001
         if adapter is None:
@@ -1331,9 +1608,12 @@ async def post_line(runner: Any, entry: dict, text: str) -> bool:
         meta = {"thread_id": route["thread_id"]} if route.get("thread_id") else {}
         res = await adapter.send(route.get("chat_id"), text, metadata=meta)
         if getattr(res, "success", None) is not True:
-            raise RuntimeError(f"send not confirmed: {getattr(res, 'error', None) or res!r}")
+            err = str(getattr(res, "error", None) or res)
+            failure["permanent"] = _permanent_send_error(err, getattr(res, "error_kind", None))
+            raise RuntimeError(f"send not confirmed: {err}")
         return True
     except Exception as exc:
+        failure["error"] = str(exc)[:300]
         logger.warning("kanban boomerang-wake: line for %s not posted (%s): %s", entry.get("task_id"), exc, text)
         return False
 
@@ -1375,7 +1655,9 @@ def record_surface(entry: dict, summary: str) -> bool:
 
 
 async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> bool:
-    """Re-deliver the original wake text (or ``text``) to the card's home session as a normal wake."""
+    """Re-deliver the original wake text (or ``text``) to the card's home session as a normal wake.
+    A refusal is recorded in ``_SEND_FAILURE`` (the delivery drain's per-part slot)."""
+    failure = _SEND_FAILURE.get({})
     from gateway import kanban_home_route as _hr
     from gateway import kanban_owner_wake as _ow
 
@@ -1391,6 +1673,7 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
                                        home_sid, _hr.read_session_row)
         if home is None or not _ow.is_chat_origin(home):
             logger.warning("kanban boomerang-wake: no live home for %s; wake not re-surfaced", entry.get("task_id"))
+            failure["error"] = "no live home session"
             return False
         card = {"board": entry.get("board"), "task_id": entry["task_id"], "title": entry.get("title"),
                 "items": [{"kind": entry.get("kind"), "trigger": "boomerang_wake_resurface",
@@ -1399,10 +1682,12 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
                                     [card])
         if ok is not True:   # no admission receipt (busy queue at cap, no handler): not delivered
             logger.warning("kanban boomerang-wake: turn for %s not admitted by the adapter", entry.get("task_id"))
+            failure["error"] = "turn not admitted"
             return False
         return True
     except Exception as exc:
         logger.warning("kanban boomerang-wake: re-surface of %s failed: %s", entry.get("task_id"), exc)
+        failure["error"] = str(exc)[:300]
         return False
 
 
@@ -1596,7 +1881,17 @@ def _run_child_delegate(parent: Any, goal: str, mode: str) -> tuple:
     # from the placeholder final_response (also used by watchdogs and provider failures).
     if res.get("status") == "interrupted" and res.get("interrupt_message") == _INTERRUPT_REASON_STOP:
         return "stopped", "stopped by /stop"
+    if res.get("status") == "interrupted":
+        # ``summary`` of an interrupted child is its partial output (t_abf5cae7: a reason read
+        # "child interrupted: **Delegation ID ...**"); the cause is the message or the placeholder.
+        return "interrupted", str(res.get("interrupt_message") or res.get("error") or "no interrupt reason recorded")
     return str(res.get("status") or "failed"), str(res.get("summary") or res.get("error") or "")
+
+
+def _gateway_stopping(runner: Any) -> bool:
+    """The gateway is draining for a stop/restart: an interrupt now is the shutdown's, not a fault."""
+    event = getattr(runner, "_shutdown_event", None)
+    return getattr(runner, "_draining", False) is True or bool(event is not None and event.is_set())
 
 
 def find_live_child(delegation_id: str) -> Optional[dict]:
@@ -1688,6 +1983,13 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
                                                 "closed_at": _now_iso(), "reason": "completed"})
     except Exception as exc:
         logger.debug("kanban boomerang-wake: ledger close failed: %s", exc)
+    if status == "interrupted" and _gateway_stopping(runner):
+        # The shutdown cut the child (t_abf5cae7): leave the claim OPEN so the next boot's
+        # reconcile takes _restart_redispatch_or_lost (one retry, one INFO line), as for a kill.
+        await asyncio.to_thread(state.update_claim, key, interrupted_by_shutdown=True)
+        logger.info("kanban boomerang-wake: %s child interrupted by gateway shutdown; claim left open for "
+                    "the next boot delegation=%s", live["task_id"], live.get("delegation_id"))
+        return
     if status != "completed":
         reason = "stopped by /stop" if status == "stopped" else f"child {status}: {_first_line(final, 200)}"
         await _fail(runner, live, reason, state, fork_died=status != "stopped")
@@ -1767,6 +2069,8 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         "child_session": None, "subagent_id": None, "state": STATE_CLAIMED,
         "claimed_at": _time.time(), "max_minutes": MAX_MINUTES, "resurfaced": False,
     }
+    if redispatch:
+        entry["restart_redispatch"] = True
     if not await asyncio.to_thread(state.claim, key, entry):
         logger.info("kanban boomerang-wake: %s already claimed; %s does nothing", key, path)
         return False
@@ -1960,6 +2264,31 @@ async def _cancel_then_resurface(runner: Any, entry: dict, state: BoomerangWakeS
         await _lost(runner, entry, "timeout", state)
 
 
+#: state path -> wall time of the last claim prune (at most one per CLAIM_PRUNE_EVERY_S).
+_LAST_PRUNE: dict = {}
+
+
+async def _maybe_prune_claims(state: BoomerangWakeState, now: float) -> int:
+    """t_827d5940: terminal claims were never pruned (5,237 rows on 2026-11-12). Drop terminal claims
+    older than CLAIM_TTL_S; open claims and claims a pending handback names stay. The dedupe that
+    reads claims (``has_claim`` on a wake event) only sees events the notifier/owner-wake cursors
+    have not passed, which never lag a week."""
+    key = str(state.path)
+    if now - _LAST_PRUNE.get(key, 0.0) < CLAIM_PRUNE_EVERY_S:
+        return 0
+    _LAST_PRUNE[key] = now
+    try:
+        if not await asyncio.to_thread(backoff_enabled):
+            return 0
+        n = await asyncio.to_thread(state.prune_claims, now, CLAIM_TTL_S)
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: claim prune failed: %s", exc)
+        return 0
+    if n:
+        logger.info("kanban boomerang-wake: pruned %d terminal claim(s) older than %.0fd", n, CLAIM_TTL_S / 86400)
+    return n
+
+
 async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional[BoomerangWakeState] = None,
                     cancel_wait_s: float = CANCEL_WAIT_S) -> int:
     """Gateway startup + every tick. Open claims with no terminal handoff: a dead child →
@@ -1969,11 +2298,14 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
     state = state or BoomerangWakeState()
     if not state.path.exists():
         return 0
-    try:   # the one retry loop for undelivered handbacks
-        await deliver_handbacks(runner, state)
+    try:   # the one retry loop for undelivered handbacks (paced: t_827d5940 backoff)
+        await deliver_handbacks(runner, state, paced=True)
     except Exception as exc:
         logger.warning("kanban boomerang-wake: handback drain failed: %s", exc)
+    if _gateway_stopping(runner):
+        return 0   # a draining gateway's open claims belong to the next boot (t_abf5cae7)
     now = _time.time() if now is None else now
+    await _maybe_prune_claims(state, now)
     handled = 0
     claims = await asyncio.to_thread(state.claims)
     for key, entry in claims.items():
@@ -2082,13 +2414,14 @@ async def _superseded_by_terminal(runner: Any, entry: dict, reason: str, state: 
 
 def _restart_refusal(entry: dict, state: BoomerangWakeState, now: float) -> Optional[str]:
     """Why a claim whose child a restart killed may NOT be redispatched (None = it may):
-    the D-13 retry is spent, the card left the claim-time status, or the claim's budget ran out."""
+    this wake's restart retry is spent, the card left the claim-time status, or the claim's budget
+    ran out. Reads ``restart_spent`` only: ``retries`` (crash/blocked) is a separate budget."""
     from gateway.kanban_wake_disposition import MAX_AUTO_RETRIES
 
     budget = float(entry.get("max_minutes") or MAX_MINUTES) * 60
     if entry.get("state") == STATE_CANCELLED or now - float(entry.get("claimed_at") or 0) > budget:
         return "budget expired"
-    if state.retries(entry["task_id"]) >= MAX_AUTO_RETRIES:
+    if state.restart_spent(entry["task_id"]) >= MAX_AUTO_RETRIES:
         return "retry spent"
     if not entry.get("status") or card_snapshot(entry.get("board"), entry["task_id"])["status"] != entry["status"]:
         return "card moved"
@@ -2103,7 +2436,7 @@ def _restart_successor(key: str, claims: dict) -> Optional[str]:
 
 
 async def _restart_redispatch_or_lost(runner: Any, entry: dict, state: BoomerangWakeState, now: float) -> None:
-    """A restart killed this claim's child: spend the card's D-13 retry on a fresh child for the
+    """A restart killed this claim's child: spend the wake's restart retry on a fresh child for the
     same card and wake (quiet: one INFO line), else today's ``_lost`` with the reason why not."""
     from gateway.kanban_wake_disposition import AUTO, MAX_AUTO_RETRIES, Disposition
 
@@ -2114,7 +2447,7 @@ async def _restart_redispatch_or_lost(runner: Any, entry: dict, state: Boomerang
     if why:
         await _lost(runner, entry, f"gateway restart, {why}", state)
         return
-    spent = await asyncio.to_thread(state.bump_retry, entry["task_id"])
+    spent = await asyncio.to_thread(state.bump_restart_retry, entry["task_id"])
     new_key = f"{entry['key']}#restart{spent}"
     try:
         await dispatch(runner, board=entry.get("board"), key=new_key,

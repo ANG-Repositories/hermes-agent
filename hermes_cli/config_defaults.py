@@ -2581,6 +2581,10 @@ DEFAULT_CONFIG = {
         # default: a review request with no reviewer is refused rather than
         # leaving the implementer as its own reviewer.
         "review_assignee": None,
+        # Machine holder for a handback whose PR is still open (t_54f4fde6): the card waits there, not on
+        # review_assignee, until hermes-home's land evaluator hands it on once CI/Prism settle (or after 120 min).
+        # None/blank/human:* = off: today's routing (the kill switch).
+        "review_hold_assignee": None,
         # Minutes an unclaimed review card may sit before it is reported
         # stale. Non-positive/invalid values fall back to 30.
         "review_stale_minutes": 30,
