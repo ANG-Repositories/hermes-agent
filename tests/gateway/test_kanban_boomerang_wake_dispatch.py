@@ -408,7 +408,10 @@ def test_block_resolved_retry_and_budget(env):
     assert second["blocked_budget_exhausted"] is True
     _run(env, second, "completed", "must not run")
     assert len(env["adapter"].handled) == 1
-    assert ah.BoomerangWakeState().retries(tid) == 1
+    state = ah.BoomerangWakeState()
+    # t_5701751b: the retry verdict did not refill the blocked budget; the crash budget is untouched
+    assert (state.blocked_spent(tid), state.retries(tid)) == (1, 0)
+    assert state.get_claim(second["key"])["outcome"] == "failed"
 
 
 @pytest.mark.parametrize("auto,on", [(False, True), (True, False)])
@@ -614,7 +617,7 @@ def test_block_claim_concurrent_budget(env):
     for thread in threads:
         thread.join()
     assert sorted(results) == [False, True]
-    assert state.retries("t") == 1
+    assert state.blocked_spent("t") == 1 and state.retries("t") == 0
 
 
 def test_block_lost_child_reconciles_to_owner_once(env):
@@ -632,7 +635,7 @@ def test_block_lost_child_reconciles_to_owner_once(env):
     asyncio.run(ah.reconcile(env["runner"], state=state))
     redo = env["dispatched"][-1]
     assert redo["key"] == entry["key"] + "#restart1" and not redo.get("blocked_budget_exhausted")
-    assert state.retries(tid) == 1 and env["adapter"].handled == []
+    assert state.blocked_spent(tid) == 1 and state.retries(tid) == 0 and env["adapter"].handled == []
     _kill(env, redo)
     asyncio.run(ah.reconcile(env["runner"], state=state))
     asyncio.run(ah.reconcile(env["runner"], state=state))
@@ -2097,14 +2100,14 @@ def test_bare_retries_file_migrates_restart_counts_once(tmp_path):
 
 
 def test_blocked_spent_card_cut_by_restart_is_redispatched_quietly(env, caplog):
-    """Apollo 12:25: a card whose ``retries`` is 1 from a blocked assessment, cut by a restart, is
-    redispatched quietly and ``retries`` stays 1 (t_b41d322b's case)."""
+    """Apollo 12:25: a card whose blocked budget is spent, cut by a restart, is redispatched quietly
+    and the blocked budget stays spent (t_b41d322b's case; own counter since t_5701751b)."""
     tid = _card(env)
     _worker_close(tid)
     state = ah.BoomerangWakeState()
     assert state.claim("default:" + tid + ":blk", {"task_id": tid, "row": "blocked_assess"})
-    state.update_claim("default:" + tid + ":blk", state=ah.STATE_TERMINAL, outcome="surfaced")
-    assert state.retries(tid) == 1
+    state.update_claim("default:" + tid + ":blk", state=ah.STATE_TERMINAL, outcome="failed")
+    assert state.blocked_spent(tid) == 1
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
     _kill(env, entry)
     with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
@@ -2113,7 +2116,7 @@ def test_blocked_spent_card_cut_by_restart_is_redispatched_quietly(env, caplog):
     assert old["outcome"] == "redispatched_after_restart", old
     assert env["adapter"].sent == [] and env["adapter"].handled == []
     assert " lost reason=" not in caplog.text
-    assert state.retries(tid) == 1 and state.restart_spent(tid) == 1
+    assert state.blocked_spent(tid) == 1 and state.retries(tid) == 0 and state.restart_spent(tid) == 1
 
 
 def test_restart_redispatch_does_not_exhaust_the_blocked_assessment(env):
@@ -2129,7 +2132,7 @@ def test_restart_redispatch_does_not_exhaust_the_blocked_assessment(env):
     blk = {"task_id": tid, "row": "blocked_assess"}
     assert state.claim("default:" + tid + ":blk", blk)
     assert state.get_claim("default:" + tid + ":blk")["blocked_budget_exhausted"] is False
-    assert state.retries(tid) == 1
+    assert state.blocked_spent(tid) == 1 and state.retries(tid) == 0
 
 
 def test_legacy_seed_is_migrated_once_and_a_crash_retry_is_not_refunded(tmp_path):
@@ -2146,3 +2149,213 @@ def test_legacy_seed_is_migrated_once_and_a_crash_retry_is_not_refunded(tmp_path
     assert state.restart_spent("t") == 0
     state.update_claim("b|t|2", state=ah.STATE_TERMINAL, outcome="retry")
     assert state.retries("t") == 1, "a stale restart claim refunded the crash retry"
+
+
+# --- t_5701751b: the blocked-assessment budget is per handled wake ------------------------------
+
+
+def _block(tid, reason="service unavailable") -> None:
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": reason})  # noqa: SLF001
+
+
+def _resolved_retry(entry) -> str:
+    return _verdict(entry, "retry", evidence=["health probe: healthy"],
+                    block_resolution={"resolved": True, "authority": "existing", "check": "health probe: healthy"})
+
+
+def _handled_review_wake(state, tid, n=1) -> None:
+    """A later non-blocked wake on the card whose verdict the executor accepted."""
+    key = f"default:{tid}:review{n}"
+    assert state.claim(key, {"task_id": tid, "row": "own_repo_review_red", "claimed_at": time.time()})
+    state.update_claim(key, state=ah.STATE_TERMINAL, outcome="request_changes")
+
+
+@pytest.mark.parametrize("first", ["surface", "retry"])
+def test_blocked_assessment_runs_again_after_a_handled_wake(env, first):
+    """(a) block -> assess (surface / retry) -> a later handled review wake -> block again: the
+    second assessment runs (was: ``blocked_budget_exhausted`` for the card's lifetime)."""
+    tid = _card(env)
+    _sub(tid)
+    _block(tid)
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "surface") if first == "surface" else _resolved_retry(entry))
+    state = ah.BoomerangWakeState()
+    assert state.get_claim(entry["key"])["outcome"] == ("surfaced" if first == "surface" else "retry")
+    _handled_review_wake(state, tid)
+    assert state.blocked_spent(tid) == 0
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+    _block(tid, "failed again")
+    _tick(env)
+    second = env["dispatched"][-1]
+    assert second is not entry and second["blocked_budget_exhausted"] is False
+    assert state.blocked_spent(tid) == 1 and state.retries(tid) == 0
+
+
+def test_blocked_surface_then_reblock_runs_a_second_assessment(env):
+    """(a') block -> assessment surfaces -> block again, nothing else between: the surfaced assessment
+    is a handled wake (the owner was told), so it clears its own spend and the second one runs
+    (Apollo ruling on Prism 0a3f8a38c114)."""
+    tid = _card(env)
+    _sub(tid)
+    _block(tid)
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _verdict(entry, "surface"))
+    state = ah.BoomerangWakeState()
+    assert state.get_claim(entry["key"])["outcome"] == "surfaced"
+    assert state.blocked_spent(tid) == 0
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+    _block(tid, "failed again")
+    _tick(env)
+    second = env["dispatched"][-1]
+    assert second is not entry and second["blocked_budget_exhausted"] is False
+    assert state.blocked_spent(tid) == 1 and state.retries(tid) == 0
+
+
+def test_blocked_retry_then_reblock_without_a_handled_wake_reaches_the_owner(env):
+    """(b) block -> assess retry -> worker blocks again, nothing handled between: exhausted, one
+    owner line, and the retry verdict did not refill the budget."""
+    tid = _card(env)
+    _sub(tid)
+    _block(tid)
+    _tick(env)
+    entry = env["dispatched"][0]
+    _run(env, entry, "completed", _resolved_retry(entry))
+    state = ah.BoomerangWakeState()
+    assert state.get_claim(entry["key"])["outcome"] == "retry"
+    assert state.blocked_spent(tid) == 1, "the blocked assessment's own retry refilled its budget"
+    _block(tid, "failed again")
+    _tick(env)
+    second = env["dispatched"][-1]
+    assert second["blocked_budget_exhausted"] is True
+    _run(env, second, "completed", "must not run")
+    assert len(env["adapter"].handled) == 1
+    assert state.get_claim(second["key"])["reason"] == "blocked assessment budget exhausted; owner assessment required"
+
+
+def test_handled_wake_clears_blocked_but_not_the_crash_retry(tmp_path):
+    """(c) the crash retry (``retries``) is per card lifetime: a handled wake clears only
+    ``blocked_spent`` and ``restart_spent``."""
+    state = ah.BoomerangWakeState(tmp_path / "s.json")
+    state.bump_retry("t")
+    state.bump_restart_retry("t")
+    assert state.claim("b|t|1", {"task_id": "t", "row": "blocked_assess"})
+    state.update_claim("b|t|1", state=ah.STATE_TERMINAL, outcome="failed")
+    assert (state.retries("t"), state.restart_spent("t"), state.blocked_spent("t")) == (1, 1, 1)
+    assert state.claim("b|t|2", {"task_id": "t", "row": "completed"})
+    state.update_claim("b|t|2", state=ah.STATE_TERMINAL, outcome="complete")
+    assert (state.retries("t"), state.restart_spent("t"), state.blocked_spent("t")) == (1, 0, 0)
+
+
+def test_pre_blocked_spent_file_migrates_once(tmp_path):
+    """(d) a live-shaped file from before t_5701751b: ``retries`` holds crash and blocked spends. The
+    blocked share moves out; a handled non-blocked claim newer than the assessment starts the card
+    cleared, else ``blocked_spent=1``; crash spends stay; the next write persists it once."""
+    path = tmp_path / "kanban_boomerang_wake.json"
+    path.write_text(json.dumps({
+        "retries": {"t_blk": 1, "t_blk_handled": 1, "t_crash": 1, "t_both": 2, "t_both_handled": 2,
+                    "t_retry_only": 1, "t_two_blk": 2, "t_blk_open": 1},
+        "restart_spent": {"t_blk": 1},
+        "claims": {
+            # blocked-only, newest assessment surfaced: a handled wake itself, starts cleared
+            "b|t_blk|1": {"task_id": "t_blk", "row": "blocked_assess", "state": "terminal",
+                          "outcome": "surfaced", "claimed_at": 100.0},
+            "b|t_blk|1#restart1": {"task_id": "t_blk", "row": "blocked_assess", "restart_redispatch": True,
+                                   "state": "terminal", "outcome": "lost", "claimed_at": 101.0},
+            # blocked-only, a handled review wake after it
+            "b|t_blk_handled|1": {"task_id": "t_blk_handled", "row": "blocked_assess", "state": "terminal",
+                                  "outcome": "retry", "claimed_at": 100.0},
+            "b|t_blk_handled|2": {"task_id": "t_blk_handled", "row": "own_repo_review_red", "state": "terminal",
+                                  "outcome": "request_changes", "claimed_at": 200.0},
+            # crash-only
+            "b|t_crash|1": {"task_id": "t_crash", "row": "crash_first_occurrence", "state": "terminal",
+                            "outcome": "retry", "claimed_at": 100.0},
+            # both, handled wake BEFORE the assessment, a later exhausted block spent nothing
+            "b|t_both|1": {"task_id": "t_both", "row": "crash_first_occurrence", "state": "terminal",
+                           "outcome": "retry", "claimed_at": 50.0},
+            "b|t_both|2": {"task_id": "t_both", "row": "blocked_assess", "state": "terminal",
+                           "outcome": "retry", "claimed_at": 100.0},
+            "b|t_both|3": {"task_id": "t_both", "row": "blocked_assess", "blocked_budget_exhausted": True,
+                           "state": "terminal", "outcome": "failed", "claimed_at": 300.0},
+            # both, a handled wake after the assessment
+            "b|t_both_handled|1": {"task_id": "t_both_handled", "row": "blocked_assess", "state": "terminal",
+                                   "outcome": "surfaced", "claimed_at": 100.0},
+            "b|t_both_handled|2": {"task_id": "t_both_handled", "row": "crash_first_occurrence",
+                                   "state": "terminal", "outcome": "retry", "claimed_at": 200.0},
+            # a crash spend with no blocked_assess claim on file
+            "b|t_retry_only|1": {"task_id": "t_retry_only", "row": "completed", "state": "terminal",
+                                 "outcome": "complete", "claimed_at": 100.0},
+            # two assessments with a reset between (old claim() spent only at 0): retries 2 = 1 blocked +
+            # 1 crash, so only ONE moves and the crash spend stays (Prism 49788caba26d); the newest
+            # assessment ended ``retry`` with nothing handled after it, so it starts spent
+            "b|t_two_blk|1": {"task_id": "t_two_blk", "row": "blocked_assess", "state": "terminal",
+                              "outcome": "surfaced", "claimed_at": 100.0},
+            "b|t_two_blk|2": {"task_id": "t_two_blk", "row": "crash_first_occurrence", "state": "terminal",
+                              "outcome": "retry", "claimed_at": 150.0},
+            "b|t_two_blk|3": {"task_id": "t_two_blk", "row": "blocked_assess", "state": "terminal",
+                              "outcome": "retry", "claimed_at": 200.0},
+            # an assessment still open: starts spent
+            "b|t_blk_open|1": {"task_id": "t_blk_open", "row": "blocked_assess", "claimed_at": 100.0},
+        }}))
+    state = ah.BoomerangWakeState(path)
+    got = {t: (state.retries(t), state.blocked_spent(t), state.restart_spent(t))
+           for t in ("t_blk", "t_blk_handled", "t_crash", "t_both", "t_both_handled", "t_retry_only",
+                     "t_two_blk", "t_blk_open")}
+    # a card with a crash_first_occurrence claim on file is not moved (Prism 91fa13dd6411)
+    assert got == {"t_blk": (0, 0, 1), "t_blk_handled": (0, 0, 0), "t_crash": (1, 0, 0),
+                   "t_both": (2, 0, 0), "t_both_handled": (2, 0, 0), "t_retry_only": (1, 0, 0),
+                   "t_two_blk": (2, 0, 0), "t_blk_open": (0, 1, 0)}
+    state.bump_retry("t_crash")
+    doc = json.loads(path.read_text())
+    assert doc["retries"] == {"t_crash": 2, "t_both": 2, "t_both_handled": 2, "t_retry_only": 1,
+                              "t_two_blk": 2}
+    assert doc["blocked_spent"] == {"t_blk_open": 1}
+    # migrated once: a later blocked claim spends the new map, never ``retries``
+    assert state.claim("b|t_crash|9", {"task_id": "t_crash", "row": "blocked_assess"})
+    assert (state.retries("t_crash"), state.blocked_spent("t_crash")) == (2, 1)
+
+
+def _pre_blocked_file(path, claims, retries):
+    path.write_text(json.dumps({"retries": retries, "restart_spent": {}, "claims": claims}))
+    return ah.BoomerangWakeState(path)
+
+
+def test_migration_keeps_an_unattributable_count_with_a_crash_claim(tmp_path):
+    """Prism 91fa13dd6411 repro: assess (surfaced), reset_counters, crash retry. ``retries=1`` is the
+    crash spend; the old assessment claim is still on file. The count stays in ``retries``."""
+    state = _pre_blocked_file(tmp_path / "s.json", {
+        "b|t|1": {"task_id": "t", "row": "blocked_assess", "state": "terminal", "outcome": "surfaced",
+                  "claimed_at": 100.0},
+        "b|t|2": {"task_id": "t", "row": "crash_first_occurrence", "state": "terminal", "outcome": "retry",
+                  "claimed_at": 200.0},
+    }, {"t": 1})
+    assert (state.retries("t"), state.blocked_spent("t")) == (1, 0)
+    state.bump_restart_retry("t")   # persist the migration
+    doc = json.loads((tmp_path / "s.json").read_text())
+    assert doc["retries"] == {"t": 1} and doc["blocked_spent"] == {}
+
+
+def test_migration_still_moves_a_card_with_only_blocked_claims(tmp_path):
+    state = _pre_blocked_file(tmp_path / "s.json", {
+        "b|t|1": {"task_id": "t", "row": "blocked_assess", "state": "terminal", "outcome": "retry",
+                  "claimed_at": 100.0},
+    }, {"t": 1})
+    assert (state.retries("t"), state.blocked_spent("t")) == (0, 1)
+
+
+def test_restart_redispatch_of_a_blocked_assessment_spends_no_budget(tmp_path):
+    """(e) a ``#restartN`` redispatch of a blocked_assess claim leaves all three counters as they were."""
+    state = ah.BoomerangWakeState(tmp_path / "s.json")
+    state.bump_retry("t")
+    state.bump_restart_retry("t")
+    assert state.claim("b|t|1", {"task_id": "t", "row": "blocked_assess"})
+    before = (state.retries("t"), state.restart_spent("t"), state.blocked_spent("t"))
+    assert before == (1, 1, 1)
+    assert state.claim("b|t|1#restart1", {"task_id": "t", "row": "blocked_assess", "restart_redispatch": True})
+    assert not state.get_claim("b|t|1#restart1").get("blocked_budget_exhausted")
+    assert (state.retries("t"), state.restart_spent("t"), state.blocked_spent("t")) == before

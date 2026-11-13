@@ -165,6 +165,30 @@ Retries (D-13): a crash-class event gets one automatic retry. The count is persi
 reaches `completed`/`archived` or when Ace surfaces-and-acts on it. The second occurrence
 surfaces. The crash-class budget is per card lifetime; the restart budget below is per wake.
 
+Three budgets live in that file, one per kind of automatic second try (t_5701751b):
+
+| Budget | Spent by | Cleared by |
+|---|---|---|
+| `retries[task_id]` | a crash-class retry (D-13) | the card reaching `completed`/`archived`, or Ace surfacing-and-acting. Per card lifetime. |
+| `blocked_spent[task_id]` | a blocked assessment (`blocked_assess` claim) | any claim on the card going terminal with a handled outcome (list below), except the blocked assessment's own `retry` verdict. Also the `retries` resets. |
+| `restart_spent[task_id]` | a gateway-restart redispatch | any claim on the card going terminal with a handled outcome. Also the `retries` resets. |
+
+A card gets one automatic blocked assessment without a handled wake in between. Any handled wake
+clears the budget, the assessment's own included: an assessment that surfaces to the owner (or ends
+stale/superseded) is itself a handled wake, so the next block is assessed again. The one case that
+stays spent has no owner in the loop: the assessment says `retry` and the worker blocks again, which
+ends at the owner (`blocked assessment budget exhausted; owner assessment required`) rather than
+looping on worker runs. An assessment that fails or is lost also stays spent. A `#restartN`
+redispatch of a blocked assessment spends none of the three. A state file from before this change
+(no `blocked_spent`) is migrated on first read: at most one count per card with a spending
+`blocked_assess` claim on file leaves `retries` (the old code spent it only at 0). The card starts
+cleared when a claim at or after its newest assessment, that assessment included, ended with a
+clearing outcome (same rule as above), else at `blocked_spent=1`. Crash spends stay, and a blocked
+spend whose claim was already pruned (7 days) cannot be told apart from one and stays in `retries`.
+A card that also has a `crash_first_occurrence` claim on file is not moved at all: its count cannot
+be attributed, so it stays a crash spend and the card gets no `blocked_spent` entry.
+The next write persists it.
+
 ## 4. The boomerang wake level
 
 A card has one subscription level, and it is the only setting. There is no config knob, no
@@ -268,10 +292,10 @@ second restart surfaces (no second automatic redispatch).
 outcome (`complete`, `request_changes`, `redispatch`, `retry`, `handled`, `land_inherited`,
 `acknowledge`, `comment_why_waits`, `surfaced`, `stale`, `superseded`, `superseded-by-terminal`),
 `restart_spent` is cleared, so the next restart cut on the card is redispatched quietly again.
-`failed`, `lost`, `stopped` and `dispatch_failed` clear nothing. `retries` stays the shared
-per-card-lifetime budget of the crash-class retry (D-13) and the blocked assessment: a restart
-neither reads nor spends it, so a block-spent card still gets its quiet restart redispatch and a
-restart redispatch never exhausts the next blocked assessment. A state file from before this change
+`failed`, `lost`, `stopped` and `dispatch_failed` clear nothing. `retries` stays the
+per-card-lifetime budget of the crash-class retry (D-13); the blocked assessment has its own
+`blocked_spent` (table in §3). A restart neither reads nor spends either, so a block-spent card still
+gets its quiet restart redispatch and a restart redispatch never exhausts the next blocked assessment. A state file from before this change
 (no `restart_spent`) is migrated on first read: the count a card's `<key>#restartN` claims account
 for (capped by its `retries`) moves from `retries` to `restart_spent`, and the next write persists it.
 
