@@ -37,6 +37,7 @@ def _no_host_browser_use_cli():
 
 
 _PROC_TAG_ENV = "HERMES_TEST_PROC_TAG"
+_EXIT_GRACE_S = 5.0
 # The live-system guard patches os.kill per test and refuses a pid outside the test's subtree, which a
 # daemon reparented to pid 1 is; the tag re-read right before the signal is the ownership proof instead.
 _REAL_KILL = __import__("os").kill
@@ -58,9 +59,10 @@ def _real_psutil():
             sys.modules["psutil"] = stubbed
 
 
-def _end_tagged_processes(tag: str, since: float) -> list:
+def _end_tagged_processes(tag: str, since: float, kill: bool = True) -> list:
     """SIGKILL every live process of this user started at/after ``since`` whose environment carries
-    ``tag`` (any parent: a daemon that double-forked to pid 1 counts); returns one line per process."""
+    ``tag`` (any parent: a daemon that double-forked to pid 1 counts); returns one line per process.
+    ``kill=False`` only lists them."""
     import os
     import signal
 
@@ -80,6 +82,8 @@ def _end_tagged_processes(tag: str, since: float) -> list:
                 if proc.environ().get(_PROC_TAG_ENV) != tag or proc.status() == psutil.STATUS_ZOMBIE:
                     continue
                 ended.append(f"pid {proc.pid} ppid {proc.ppid()} {' '.join(proc.cmdline())[:160]}")
+                if not kill:
+                    continue
                 if pidfd is not None:
                     signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                 elif proc.is_running():
@@ -110,6 +114,12 @@ def _browser_test_leaves_no_process(request, monkeypatch):
     since = time.time()
     monkeypatch.setenv(_PROC_TAG_ENV, tag)
     yield
+    # agent-browser's ``close`` returns before its session daemon has exited (measured on Linux: still
+    # alive right after close, gone 0.5 s later), so give tagged processes a bounded grace to exit
+    # on their own; one still alive after it is a leak.
+    deadline = time.monotonic() + _EXIT_GRACE_S
+    while _end_tagged_processes(tag, since, kill=False) and time.monotonic() < deadline:
+        time.sleep(0.1)
     ended = _end_tagged_processes(tag, since)
     if ended:
         pytest.fail(f"test left {len(ended)} process(es) it started alive at teardown: {ended}", pytrace=False)
