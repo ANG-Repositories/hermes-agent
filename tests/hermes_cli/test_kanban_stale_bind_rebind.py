@@ -38,6 +38,7 @@ def stale_card(kanban_home, anchor, tmp_path, monkeypatch):
     """t_1e785f52's shape: branch_name names the archived parent's branch (commits the tree lacks); the card's own
     .worktrees/<id> is on the PR branch, pushed to origin."""
     bare = _origin_with_push(anchor, tmp_path)
+    _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=bare)  # a resolvable remote default, whatever the host's init
     monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: SLUG)
     monkeypatch.setattr(kbd, "_studio_last_resort", lambda fleet_dir: True)
     _commit(anchor, "base")
@@ -137,3 +138,36 @@ def test_card_ported_to_a_host_its_requires_rules_out_is_released_in_one_tick(ka
     assert not route[1].startswith("not_portable:requires"), route
     assert route[0] == "wait" and route[1].startswith("studio_default_deny:studio-state"), route
     assert row["workspace_path"] == f"{path}-from-ci-box" and row["origin_host"] is None
+
+
+# -- Prism round 1 (9c711a6dd8f7, aef8b937133f): proof comes from the remote itself, never a local ref ------------
+
+def _no_rebind(tid, parent_branch):
+    with kb.connect_closing() as conn:
+        kbd._route_row(conn, _row(conn, tid), _plan(free=2))
+        assert _row(conn, tid)["branch_name"] == parent_branch
+        assert _events(conn, tid, REBOUND) == []
+
+
+def test_a_tree_on_a_custom_remote_default_is_never_rebound(stale_card):
+    """9c711a6dd8f7: remote default is the tree's branch and no local refs/remotes/origin/HEAD exists."""
+    tid, wt, bare, parent_branch = stale_card
+    _git("symbolic-ref", "HEAD", f"refs/heads/{PR_BRANCH}", cwd=bare)
+    subprocess.run(["git", "-C", str(wt), "symbolic-ref", "-d", "refs/remotes/origin/HEAD"], capture_output=True)
+    subprocess.run(["git", "-C", str(wt), "update-ref", "-d", "refs/remotes/origin/HEAD"], capture_output=True)
+    assert not _ref(wt, "refs/remotes/origin/HEAD")
+    _no_rebind(tid, parent_branch)
+
+
+def test_an_unresolvable_remote_default_refuses_the_rebind(stale_card):
+    tid, _wt, bare, parent_branch = stale_card
+    _git("symbolic-ref", "HEAD", "refs/heads/no-such-branch", cwd=bare)
+    _no_rebind(tid, parent_branch)
+
+
+def test_a_stale_tracking_ref_is_not_proof_of_push(stale_card):
+    """aef8b937133f: origin/<branch> still equals HEAD locally, but the branch is gone from the remote."""
+    tid, wt, bare, parent_branch = stale_card
+    _git("branch", "-D", PR_BRANCH, cwd=bare)
+    assert _ref(wt, f"refs/remotes/origin/{PR_BRANCH}") == _ref(wt, "HEAD")
+    _no_rebind(tid, parent_branch)

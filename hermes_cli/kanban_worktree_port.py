@@ -819,13 +819,22 @@ def stale_branch(task_id: str, workspace_path: Optional[str], board_default: Opt
     cur = (cur.stdout or "").strip() if cur is not None and getattr(cur, "returncode", 1) == 0 else ""
     if not cur or cur == branch or cur in _NEVER_REBIND:
         return None
-    dflt = _tree_git(own, runner, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
-    if dflt is not None and (dflt.stdout or "").strip() == f"origin/{cur}":
-        return None
     head = _tree_head(own, runner)
-    tip = _tree_git(own, runner, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{cur}")
-    tip = (tip.stdout or "").strip() if tip is not None and getattr(tip, "returncode", 1) == 0 else ""
-    if not head or head != tip:
+    if not head:
+        return None
+    # The remote itself, never a local ref (Prism 9c711a6dd8f7, aef8b937133f): its default branch must resolve and
+    # differ from ``cur``, and its live tip of ``cur`` must be HEAD. Unreadable or unresolved = keep the refusal.
+    ls = _tree_git(own, runner, "ls-remote", "--symref", "origin", "HEAD", f"refs/heads/{cur}")
+    if ls is None or getattr(ls, "returncode", 1) != 0:
+        return None
+    dflt, tip = None, ""
+    for line in (ls.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "ref:" and parts[2] == "HEAD":
+            dflt = parts[1]
+        elif len(parts) == 2 and parts[1] == f"refs/heads/{cur}":
+            tip = parts[0]
+    if not dflt or dflt == f"refs/heads/{cur}" or head != tip:
         return None
     return str(own), cur, head
 
