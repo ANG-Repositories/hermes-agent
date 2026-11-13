@@ -656,8 +656,7 @@ def test_a_checkout_with_most_tracked_files_absent_is_rebuilt_with_them_absent(b
         for d in wt.glob("src*"):
             subprocess.run(["rm", "-rf", "--", str(d)], check=True)
         before = _git_view(wt)
-        deleted = sum(1 for ln in before[1].splitlines() if ln.startswith(" D "))
-        assert deleted == n
+        assert len(_g("ls-files", "-d", cwd=wt).splitlines()) == n   # every tracked src file absent, 0 others
         _waits, _spawned = _carry_until_claimed(conn, tid)
         rebuilt = _events(conn, tid, kwh.CARRIED_EVENT)[-1]["background"]["rebuilt"]
     dest = Path(loop._map(str(wt)))
