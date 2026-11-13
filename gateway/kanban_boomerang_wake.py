@@ -1222,7 +1222,8 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
 
     ``fork_died``: skip ONLY the "owner comment newer than handback" rule (a dead fork's original
     wake is still owed, t_525de3f0); the release/hold and merged-PR rules are still evaluated.
-    An EVENT_CURSOR_ROWS wake is never refused by the merged-PR rule (t_59d62680).
+    An EVENT_CURSOR_ROWS wake is never refused by the merged-PR rule, and a release/hold line refuses it only
+    when posted after its own event (t_59d62680).
     """
     if os.environ.get("BOOMERANG_STALE_GUARD") == "0":
         return None
@@ -1239,11 +1240,14 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             "AND kind IN ('review_requested', 'completed') AND (? IS NULL OR id <= ?) "
             "ORDER BY id DESC LIMIT 1", (entry["task_id"], event_id, event_id)).fetchone()
         cursor_at = handback["created_at"] if handback else None
-        if handback and event_id is not None and own_event:
+        hold_cursor = None   # t_59d62680: own-event rows refuse on a release/hold line only if it is newer than this
+        if event_id is not None and own_event:
             own = conn.execute("SELECT created_at FROM task_events WHERE task_id = ? AND id = ?",
                                (entry["task_id"], event_id)).fetchone()
             if own:
-                cursor_at = max(cursor_at, own["created_at"])
+                hold_cursor = max(cursor_at, own["created_at"]) if handback else own["created_at"]
+                if handback:
+                    cursor_at = hold_cursor
         owner = str(entry.get("assignee") or _field(task, "assignee") or "")
         owners = {name.removeprefix("human:") for name in
                   (owner, str(_field(task, "assignee") or "")) if name}
@@ -1254,7 +1258,8 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
                     and c.author in owners]
         if comments:
             newest = max(comments, key=lambda c: (c.created_at, c.id))
-            if re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M):
+            if (re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M)
+                    and (hold_cursor is None or newest.created_at > hold_cursor)):
                 return "owner release/hold line"
             if cursor_at is not None and newest.created_at > cursor_at:
                 if not fork_died:

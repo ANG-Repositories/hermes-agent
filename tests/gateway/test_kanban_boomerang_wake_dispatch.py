@@ -316,6 +316,27 @@ def test_stale_surface_merged_pr_rule_spares_own_event_rows(env, row, stale):
     assert ah.stale_surface_reason(entry) == stale
 
 
+@pytest.mark.parametrize("row,hold_at,stale", [
+    ("mechanical_wake", 1793844766, None),                        # hold posted BEFORE the job's event: deliver
+    ("mechanical_wake", 1793845100, "owner release/hold line"),   # hold posted AFTER the event: operator acted
+    ("review_deadman", 1793844766, "owner release/hold line"),    # handback row: unchanged
+])
+def test_stale_surface_hold_line_uses_the_own_event_cursor(env, row, hold_at, stale):
+    """t_59d62680 (Apollo send-back): the release/hold-line rule had no cursor, so a deadman-hold the operator posted
+    and THEN queued a probe refused the probe's failure wake. RED on 56c32023b3 for the first case."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "apollo", "deadman-hold: deploy probe queued", hold_at))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, row, "{}", 1793845000))
+    entry = _claimed_entry(env, tid, row=row, kind=row)
+    assert ah.stale_surface_reason(entry) == stale
+
+
 @pytest.mark.parametrize("assignee", ["apollo", "human:apollo"])
 def test_stale_surface_bot_comment_does_not_hide_owner_release(env, assignee):
     tid = _card(env)
