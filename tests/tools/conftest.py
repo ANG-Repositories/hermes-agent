@@ -40,10 +40,7 @@ _PROC_TAG_ENV = "HERMES_TEST_PROC_TAG"
 # The live-system guard patches os.kill per test and refuses a pid outside the test's subtree, which a
 # daemon reparented to pid 1 is; the tag re-read right before the signal is the ownership proof instead.
 _REAL_KILL = __import__("os").kill
-try:  # bound now: tests stub sys.modules["psutil"] with fakes, and the teardown check must not see them
-    import psutil as _psutil
-except ImportError:  # pragma: no cover - psutil is a runtime dependency
-    _psutil = None
+import psutil as _psutil  # bound now: tests stub sys.modules["psutil"] with fakes, and the check must not see them
 
 
 @contextlib.contextmanager
@@ -74,12 +71,24 @@ def _end_tagged_processes(tag: str, since: float) -> list:
                 if proc.pid == os.getpid() or proc.info["create_time"] < since - 1 or (
                         proc.info["uids"] and proc.info["uids"].real != os.getuid()):
                     continue
+                # Pin the process before reading its tag, so the signal cannot reach a reused pid:
+                # a pidfd on Linux; elsewhere psutil's create_time identity check right before the kill.
+                pidfd = os.pidfd_open(proc.pid) if hasattr(os, "pidfd_open") else None
+            except (psutil.Error, OSError):
+                continue
+            try:
                 if proc.environ().get(_PROC_TAG_ENV) != tag or proc.status() == psutil.STATUS_ZOMBIE:
                     continue
                 ended.append(f"pid {proc.pid} ppid {proc.ppid()} {' '.join(proc.cmdline())[:160]}")
-                _REAL_KILL(proc.pid, signal.SIGKILL)
+                if pidfd is not None:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                elif proc.is_running():
+                    _REAL_KILL(proc.pid, signal.SIGKILL)
             except (psutil.Error, OSError):
                 continue
+            finally:
+                if pidfd is not None:
+                    os.close(pidfd)
     return ended
 
 
@@ -94,7 +103,7 @@ def _browser_test_leaves_no_process(request, monkeypatch):
     import time
     import uuid
 
-    if _psutil is None or sys.platform == "win32" or not request.node.path.name.startswith("test_browser"):
+    if sys.platform == "win32" or not request.node.path.name.startswith("test_browser"):
         yield
         return
     tag = uuid.uuid4().hex
