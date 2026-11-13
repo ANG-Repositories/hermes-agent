@@ -310,8 +310,11 @@ def rebuild_script(dest: str, plan: dict, idx: str, mirror: Optional[str]) -> st
     if mirror:
         m = ('"$HOME"/' + shlex.quote(mirror[2:])) if mirror.startswith("~/") else shlex.quote(mirror)
     if url:
+        # the mirror's own refspec (refs/*:refs/*) is refused whole when another workspace on the host has one of its
+        # branches checked out (t_e38aba52 23:26, operator 23:40 item A), leaving the mirror stale: warm it with
+        # origin's default branch only, into a ref no worktree can have checked out
         get = ((f"if [ -d {m}/objects ]; then git -c gc.auto=0 -c fetch.prune=false --git-dir={m} fetch -q "
-                f"--no-write-fetch-head origin || true; fi; "
+                f"--no-write-fetch-head origin +HEAD:refs/carry/origin-head || true; fi; "
                 f"git clone -q --no-checkout --reference-if-able {m} --dissociate \"$url\" \"$d\"; ") if m else
                "git clone -q --no-checkout \"$url\" \"$d\"; ")
         # an origin the host cannot clone (a Studio-local path, t_681a9c5e item 6): an empty repo instead; the bundle
@@ -335,7 +338,9 @@ def rebuild_script(dest: str, plan: dict, idx: str, mirror: Optional[str]) -> st
             f"d={d}; url={shlex.quote(url or '')}; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; "
             f"if {reuse}; then :; else rm -rf -- \"$d\"; mkdir -p -- \"$(dirname \"$d\")\"; {get}fi; cd \"$d\"; "
             "if ! git bundle verify -q \"$t\" >/dev/null 2>&1; then git fetch -q origin >/dev/null 2>&1 || true; "
-            f"git bundle verify -q \"$t\" >/dev/null 2>&1 || exit {NEEDS_FULL_RC}; fi; "
+            # what verify said (the prerequisite commits the host lacks) is the full_reason (operator 23:40 item B)
+            "v=$(git bundle verify -q \"$t\" 2>&1 >/dev/null) || { printf '\\nneed-full: %s\\n' \"$(echo $v)\" >&2; "
+            f"exit {NEEDS_FULL_RC}; }}; fi; "
             "git bundle unbundle \"$t\" >/dev/null; " + checkout +
             f"git reset -q --hard {head}; git clean -fdxq; git read-tree {shlex.quote(idx)}; "
             "git stash clear; " + stores + exclude +
@@ -361,6 +366,7 @@ def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rs
     slug = _kwt._SLUG_RE.match(plan["url"] or "")
     mirror = f"{_kwt.DERIVED_MIRROR_ROOT}/{slug.group(1)}.git" if slug else None
     full = plan["url"] is None
+    full_reason = "no GitHub or local origin" if full else None
     while True:
         bundle, idx = make_bundle(plan, full=full)
         proc = runner(_ssh_argv(host, rebuild_script(dest, plan, idx, mirror)), input=bundle, capture_output=True,
@@ -368,6 +374,9 @@ def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rs
         rc = getattr(proc, "returncode", 1)
         if rc == NEEDS_FULL_RC and not full:
             full = True  # the pool clone lacks a commit the Studio's origin refs have: send every commit
+            e = getattr(proc, "stderr", b"") or b""
+            e = e.decode("utf-8", "replace") if isinstance(e, bytes) else str(e)
+            full_reason = e.rpartition("need-full: ")[2].strip()[:300] or "bundle prerequisites missing on the host"
             continue
         if rc != 0:
             raise RuntimeError(f"rebuild of {rel} on {host.name} rc={rc}: {_err(proc)}")
@@ -388,7 +397,8 @@ def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rs
                        f"{host.target}:{dest}/"], input=payload, capture_output=True, **kw)
         if getattr(proc, "returncode", 1) != 0:
             raise RuntimeError(f"rebuild of {rel} on {host.name}: files rc={proc.returncode}: {_err(proc)}")
-    return {"rel": rel, "bundle_bytes": len(bundle), "full_bundle": full, "files": len(plan["files"]),
+    return {"rel": rel, "bundle_bytes": len(bundle), "full_bundle": full,
+            **({"full_reason": full_reason} if full else {}), "files": len(plan["files"]),
             "deleted": len(plan["deleted"]), "stash": len(plan["stash"]),
             **({"stash_left": plan["stash_left"]} if plan.get("stash_left") else {})}
 

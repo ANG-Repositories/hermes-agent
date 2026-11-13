@@ -1066,6 +1066,61 @@ def test_a_local_origin_the_host_cannot_clone_falls_back_to_the_full_bundle(boar
     assert (got[0], got[3]) == (before[0], before[3])
 
 
+def test_the_mirror_warm_fetch_survives_a_branch_checked_out_by_another_workspace(tmp_path):
+    """Operator 23:40 item A (t_e38aba52 23:26): the host's mirror has a branch checked out by another workspace's
+    worktree. The rebuild's warm fetch must not be refused for it: origin's new HEAD reaches the mirror, the branch the
+    other workspace has checked out is not moved, and the rebuild succeeds."""
+    up = tmp_path / "up"
+    _g("init", "-q", str(up))
+    (up / "a").write_text("a\n")
+    _g("add", "a", cwd=up)
+    _g("commit", "-qm", "a", cwd=up)
+    _g("branch", "feat", cwd=up)
+    mirror = tmp_path / "m.git"
+    _g("clone", "-q", "--mirror", str(up), str(mirror))
+    # another workspace's linked worktree on the mirror with feat checked out (written by hand: the suite's guard
+    # refuses `git worktree`); git's fetch reads exactly these files to refuse "checked out at"
+    other = tmp_path / "other"
+    other.mkdir()
+    admin = mirror / "worktrees" / "other"
+    admin.mkdir(parents=True)
+    (admin / "HEAD").write_text("ref: refs/heads/feat\n")
+    (admin / "commondir").write_text("../..\n")
+    (admin / "gitdir").write_text(f"{other}/.git\n")
+    (other / ".git").write_text(f"gitdir: {admin}\n")
+    feat_before = _g("--git-dir", str(mirror), "rev-parse", "refs/heads/feat")
+    for name in ("b", "c"):                               # origin moves main AND the checked-out branch
+        if name == "c":
+            _g("checkout", "-q", "feat", cwd=up)
+        (up / name).write_text(name + "\n")
+        _g("add", name, cwd=up)
+        _g("commit", "-qm", name, cwd=up)
+    _g("checkout", "-q", "main", cwd=up)
+    head = _g("rev-parse", "HEAD", cwd=up)
+    bundle = tmp_path / "b.bundle"
+    _g("bundle", "create", str(bundle), "HEAD", cwd=up)
+    plan = {"head": head, "url": str(up), "branch": "main", "stash": (), "exclude": None}
+    proc = subprocess.run(["bash", "-c", kcb.rebuild_script(str(tmp_path / "dest"), plan, head, str(mirror))],
+                          input=bundle.read_bytes(), capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    assert b"refusing to fetch" not in proc.stderr, proc.stderr
+    assert subprocess.run(["git", "--git-dir", str(mirror), "cat-file", "-e", head + "^{commit}"]).returncode == 0
+    assert _g("--git-dir", str(mirror), "rev-parse", "refs/heads/feat") == feat_before
+    assert _g("rev-parse", "HEAD", cwd=tmp_path / "dest") == head
+
+
+def test_a_full_bundle_records_what_the_host_lacked(board, loop, tmp_path, tmp_path_factory, monkeypatch):
+    """Operator 23:40 item B: a rebuild that falls back to the full bundle says why (the prerequisite git named)."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        _home, wt = _linked_worktree(tmp_path, tmp_path_factory, path, "card/r")
+        monkeypatch.setattr(kcb, "_origin_url", lambda repo: str(tmp_path / "no-such-origin.git"))
+        _carry_until_claimed(conn, tid)
+        rebuilt = _events(conn, tid, kwh.CARRIED_EVENT)[-1]["background"]["rebuilt"]
+    assert rebuilt[0]["full_bundle"] is True
+    assert "lacks these prerequisite commits" in rebuilt[0]["full_reason"], rebuilt
+
+
 def test_a_refreshed_rebuild_drops_an_ignored_file_deleted_on_the_studio(board, loop, tmp_path, tmp_path_factory,
                                                                          monkeypatch):
     """Item 7: the staging dir holds an ignored file from a first carry; the source no longer has it; after the second
