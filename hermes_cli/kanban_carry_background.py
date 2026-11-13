@@ -217,9 +217,16 @@ def plan_rebuild(src: str, rel: str, others=()) -> dict:
     if not head:
         raise CarryRefused(f"checkout {rel}: no commit at HEAD, and its git dir does not travel")
     branch = _git(repo, "symbolic-ref", "-q", "--short", "HEAD", ok=(0, 1)).decode().strip()
-    stash = _kwh.stash_entries(repo)
-    if stash is None:
-        raise RuntimeError(f"checkout {rel}: stash unreadable")
+    # operator 18:55 11-12 item 1: the stash follows kanban.placement.worktree_stash_carry (default off), as in PR 253.
+    # A linked worktree sees the whole shared list of the Studio home repo (other sessions' work): off, no entry rides
+    # the bundle, the host's list stays empty and how many stayed on the Studio is recorded (stash_left).
+    stash_left = None
+    if _kwh.stash_carry_on():
+        stash = _kwh.stash_entries(repo)
+        if stash is None:
+            raise RuntimeError(f"checkout {rel}: stash unreadable")
+    else:
+        stash, stash_left = (), _kwh.stash_count(repo)
     dirs = _kwh._gitfile_dirs(repo)
     common = dirs[1] if dirs else os.path.realpath(os.path.join(repo, ".git"))
     gitdir = dirs[0] if dirs else common
@@ -241,7 +248,7 @@ def plan_rebuild(src: str, rel: str, others=()) -> dict:
     deleted = sorted(p for p in changed if _keep(p) and not os.path.lexists(os.path.join(repo, p)))
     url = _origin_url(repo)
     return {"rel": rel, "repo": repo, "url": url, "nested": sorted(nested), "branch": branch, "head": head, "stash": stash,
-            "files": files, "deleted": deleted, "gitdir": gitdir, "common": common,
+            "stash_left": stash_left, "files": files, "deleted": deleted, "gitdir": gitdir, "common": common,
             "exclude": Path(exclude_file).read_bytes() if os.path.isfile(exclude_file) else None}
 
 
@@ -260,7 +267,8 @@ def make_bundle(plan: dict, full: bool = False) -> Tuple[bytes, str]:
     try:
         bare, out = os.path.join(tmp, "b.git"), os.path.join(tmp, "carry.bundle")
         _git(tmp, "init", "-q", "--bare", bare)
-        with open(os.path.join(bare, "objects", "info", "alternates"), "w", encoding="utf-8") as f:
+        # a WRITE (mode "w"), flagged as a read by the lint: policy is reads utf-8-sig, writes utf-8 (git reads no BOM)
+        with open(os.path.join(bare, "objects", "info", "alternates"), "w", encoding="utf-8") as f:  # windows-footgun: ok
             f.write(objects + "\n")
         g = bare
         # a COPY of the index: write-tree may store its cache-tree back into the file it reads
@@ -371,7 +379,8 @@ def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rs
         if getattr(proc, "returncode", 1) != 0:
             raise RuntimeError(f"rebuild of {rel} on {host.name}: files rc={proc.returncode}: {_err(proc)}")
     return {"rel": rel, "bundle_bytes": len(bundle), "full_bundle": full, "files": len(plan["files"]),
-            "deleted": len(plan["deleted"]), "stash": len(plan["stash"])}
+            "deleted": len(plan["deleted"]), "stash": len(plan["stash"]),
+            **({"stash_left": plan["stash_left"]} if plan.get("stash_left") else {})}
 
 
 class Job:

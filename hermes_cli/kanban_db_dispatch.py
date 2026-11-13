@@ -8860,6 +8860,9 @@ def _dispatch_once_locked(
                     # arrive with no stash; how many shared entries stayed on the Studio rides the event and a comment
                     _left = {c["rel"]: c["stash_left"] for c in (_split or {}).get("clones", ())
                              if c.get("stash_left")}
+                    # t_f3a411c2 (operator 18:55 item 1): the background rebuild follows the same knob and record
+                    _left.update({r["rel"]: r["stash_left"] for r in (_bg_stats or {}).get("rebuilt", ())
+                                  if r.get("stash_left")})
                     with _kbc.write_txn(conn):
                         # "workspace" = the stored path at carry time, "path" = the spelling persisted just
                         # below; carried_host() binds on either (Prism 34bd0265a601).

@@ -533,11 +533,19 @@ def _carry_until_claimed(conn, tid, ticks=6):
     raise AssertionError(f"never claimed; waits: {waits}")
 
 
+@pytest.mark.parametrize("stash_carry", [False, True], ids=["stash_carry_off_default", "stash_carry_on"])
 def test_a_linked_worktree_of_a_repo_outside_the_workspace_is_rebuilt_with_its_state(board, loop, tmp_path,
-                                                                                       tmp_path_factory):
+                                                                                       tmp_path_factory, monkeypatch,
+                                                                                       stash_carry):
     """Item 1a: over 20,000 entries, a linked worktree whose git dir lives outside the workspace (as every waiting
     card's ./repo does: ~/.hermes/.git/worktrees/repoN), with one unpushed commit, one modified tracked file, one
-    untracked file, one ignored file and one stash entry. HEAD, status and the stash list match on the pool host."""
+    untracked file, one ignored file and one stash entry. HEAD, status and branch match on the pool host.
+
+    The stash follows kanban.placement.worktree_stash_carry (operator 18:55 11-12 item 1; PR 253's knob). Off (the
+    default): a linked worktree's stash list is the Studio home repo's SHARED list (other sessions' work), so no entry
+    rides the bundle, the host's list is empty, and the carried event and a comment say how many stayed. On: the
+    lists are equal."""
+    monkeypatch.setattr(kwh, "stash_carry_on", lambda kcfg=None: stash_carry)
     origin = _origin_with_many_files(tmp_path_factory.mktemp("origin"), kwh.CARRY_MAX_ENTRIES + 500)
     home = tmp_path / "home"
     _g("clone", "-q", str(origin), str(home))
@@ -559,20 +567,107 @@ def test_a_linked_worktree_of_a_repo_outside_the_workspace_is_rebuilt_with_its_s
         _g("add", "staged.txt", cwd=wt)
         assert kcb.census(str(path))[1] > kwh.CARRY_MAX_ENTRIES
         before = _git_view(wt)
+        assert before[2]                                    # the source has one stash entry
         waits, _spawned = _carry_until_claimed(conn, tid)
         ev = _events(conn, tid, kwh.CARRIED_EVENT)[-1]
         assert not _events(conn, tid, kcb.FAILED_EVENT)
+        comments = _comments(conn, tid)
     dest = Path(loop._map(str(wt)))
     assert (dest / ".git").is_dir()                        # a self-contained checkout on the pool host
-    assert _git_view(dest) == before
+    after = _git_view(dest)
+    assert (after[0], after[1], after[3]) == (before[0], before[1], before[3])   # HEAD, status, branch
     assert (dest / "secret.env").read_text() == "ignored\n" and (dest / "scratch.txt").read_text() == "untracked\n"
     assert _g("diff", "--cached", "--name-only", cwd=dest) == "staged.txt"
     assert all("over the carry" not in w for w in waits), waits   # item 1c
     rebuilt = ev["background"]["rebuilt"]
-    assert [r["rel"] for r in rebuilt] == ["repo"] and rebuilt[0]["stash"] == 1
+    assert [r["rel"] for r in rebuilt] == ["repo"]
+    if stash_carry:
+        assert after[2] == before[2] and rebuilt[0]["stash"] == 1
+        assert "stash_left" not in ev and "stash_left" not in rebuilt[0]
+    else:
+        assert after[2] == ""                               # nothing of the shared list is stored on the host
+        assert rebuilt[0]["stash"] == 0 and rebuilt[0]["stash_left"] == 1
+        assert ev["stash_left"] == {"repo": 1}
+        assert any("1 stash entries of repo stayed on the Studio" in c for c in comments), comments
     # the tracked files travelled through the clone, not rsync: only the changed / untracked / ignored ones did
     assert rebuilt[0]["files"] <= 4
     assert _git_view(wt) == before                          # the Studio checkout is untouched
+
+
+def test_a_nested_checkout_with_a_detached_head_is_rebuilt_detached(board, loop, tmp_path, tmp_path_factory):
+    """Operator 18:55 item 4 (t_e9ccad78's shape): ./repo is a linked worktree on a branch and ./repo/base, nested in
+    it, a second linked worktree at a DETACHED HEAD. Each is rebuilt on its own; HEAD, status and branch (empty =
+    detached) equal the source, and repo never sends base's files as its own."""
+    origin = _origin_with_many_files(tmp_path_factory.mktemp("origin"), 50)
+    home = tmp_path / "home"
+    _g("clone", "-q", str(origin), str(home))
+    base_sha = _g("rev-parse", "HEAD", cwd=home)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        repo = path / "repo"
+        _g("worktree", "add", "-q", "-b", "card/n", str(repo), cwd=home)
+        (repo / "work.txt").write_text("on the branch\n")
+        _g("add", "work.txt", cwd=repo)
+        _g("commit", "-qm", "unpushed", cwd=repo)
+        base = repo / "base"
+        _g("worktree", "add", "-q", "--detach", str(base), base_sha, cwd=home)
+        (base / "tracked.txt").write_text("edited in base\n")
+        (base / "base-only.txt").write_text("untracked in base\n")
+        views = {r: _git_view(r) for r in (repo, base)}
+        assert views[base][3] == "" and views[base][0] == base_sha    # detached
+        _waits, _spawned = _carry_until_claimed(conn, tid)
+        rebuilt = _events(conn, tid, kwh.CARRIED_EVENT)[-1]["background"]["rebuilt"]
+    assert [r["rel"] for r in rebuilt] == ["repo", "repo/base"]
+    for src, view in views.items():
+        dest = Path(loop._map(str(src)))
+        got = _git_view(dest)
+        assert (got[0], got[1], got[3]) == (view[0], view[1], view[3]), src
+    dest_base = Path(loop._map(str(base)))
+    assert subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=dest_base).returncode == 1   # detached
+    assert (dest_base / "base-only.txt").read_text() == "untracked in base\n"
+    assert not (Path(loop._map(str(repo))) / "base-only.txt").exists()
+
+
+def test_a_checkout_with_most_tracked_files_absent_is_rebuilt_with_them_absent(board, loop, tmp_path,
+                                                                                tmp_path_factory, capsys,
+                                                                                monkeypatch):
+    """Operator 18:55 item 4 (t_b3b69464 h1clone's shape: 30,549 deleted paths, 0 files): a linked worktree whose
+    tracked files are almost all deleted from its working tree (not from the index). The pool host ends up with the
+    clone at the same HEAD and the same paths absent (git status shows the same `` D`` lines). The delete step's wall
+    time is printed. ``CARRY_DELETED_N`` sets how many tracked files (default 20,500; 31,000 = the replay's size)."""
+    n = int(os.environ.get("CARRY_DELETED_N", kwh.CARRY_MAX_ENTRIES + 500))
+    origin = _origin_with_many_files(tmp_path_factory.mktemp("origin"), n)
+    home = tmp_path / "home"
+    _g("clone", "-q", str(origin), str(home))
+    timing = {}
+    real = loop.__call__
+
+    def spy(argv, **kw):
+        t0 = time.monotonic()
+        out = real(argv, **kw)
+        if argv[0] == "ssh" and "xargs -0 rm -rf --" in argv[-1]:
+            timing["delete_s"] = time.monotonic() - t0
+        return out
+    monkeypatch.setattr(kcb, "_run", spy)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        wt = path / "repo"
+        _g("worktree", "add", "-q", "-b", "card/d", str(wt), cwd=home)
+        for d in wt.glob("src*"):
+            subprocess.run(["rm", "-rf", "--", str(d)], check=True)
+        before = _git_view(wt)
+        deleted = sum(1 for ln in before[1].splitlines() if ln.startswith(" D "))
+        assert deleted == n
+        _waits, _spawned = _carry_until_claimed(conn, tid)
+        rebuilt = _events(conn, tid, kwh.CARRIED_EVENT)[-1]["background"]["rebuilt"]
+    dest = Path(loop._map(str(wt)))
+    got = _git_view(dest)
+    assert (got[0], got[1], got[3]) == (before[0], before[1], before[3])
+    assert rebuilt[0]["deleted"] == n and rebuilt[0]["files"] == 0
+    assert not any(dest.glob("src*/*"))                     # no deleted file came back
+    with capsys.disabled():
+        print(f"\nDELETED-PATHS CARRY: {n} paths, delete step {timing['delete_s']:.2f} s, "
+              f"bundle {rebuilt[0]['bundle_bytes']} B")
 
 
 def test_a_clone_borrowing_objects_through_alternates_is_rebuilt_self_contained(board, loop, tmp_path,
