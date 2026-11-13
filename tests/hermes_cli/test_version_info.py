@@ -146,6 +146,7 @@ def test_code_identity_retries_missing_commit_and_caches_recovery(tmp_path, monk
     available = git_failure != "no_repo"
     monkeypatch.setattr(version_info, "_resolve_repo_dir", lambda: tmp_path if available else None)
     recovered = False
+    head = "a" * 40
     head_reads = []
 
     def run_git(command, **kwargs):
@@ -155,7 +156,7 @@ def test_code_identity_retries_missing_commit_and_caches_recovery(tmp_path, monk
                 if git_failure == "timeout":
                     raise subprocess.TimeoutExpired(command, 3)
                 return subprocess.CompletedProcess(command, 128, "", "git failed")
-            return subprocess.CompletedProcess(command, 0, "a" * 40, "")
+            return subprocess.CompletedProcess(command, 0, head, "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(version_info.subprocess, "run", run_git)
@@ -163,7 +164,7 @@ def test_code_identity_retries_missing_commit_and_caches_recovery(tmp_path, monk
     recovered = available = True
     assert version_info.get_code_identity()["sha"] == "a" * 40
     reads_after_recovery = len(head_reads)
-    recovered = False
+    head = "b" * 40  # The checkout advances, but this process still runs the recovered boot.
     assert version_info.get_code_identity()["sha"] == "a" * 40
     assert len(head_reads) == reads_after_recovery
 
