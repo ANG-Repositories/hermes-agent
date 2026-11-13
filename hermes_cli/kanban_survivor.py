@@ -3899,6 +3899,28 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         raise _refusal(reason) from exc
 
 
+# "Does this clone hold commits no remote has?" (t_19c48fb7). ONE source, exec'd here for local callers
+# (kanban_reclaim) and spliced into _REMOTE_PROOF for the ssh probe. Unpushed BRANCH commits (plus any
+# `extra` revs, e.g. HEAD) are stranded. A tag is stranded only when its commit is off every remote AND
+# the remote does not advertise that same tag: `rev-list --tags --not --remotes` alone read a clean
+# clone as stranded whenever origin carries a tag on no branch (courierwatch-v1, port_stranded on
+# t_6e7909d1/t_a982e7eb). `git(d,*args)->str` must raise on failure: unreadable remote tags = unknown,
+# and the caller holds, never "clean". Returns the stranded reason or ''.
+_STRANDED_SRC = r'''
+def stranded(git,d,extra=()):
+ if git(d,'rev-list','--branches',*extra,'--not','--remotes').strip(): return 'local commits not on any remote'
+ if not git(d,'rev-list','--tags','--not','--remotes').strip(): return ''
+ seen=set()
+ for r in git(d,'remote').split():
+  try: seen|={tuple(l.split('\t')) for l in git(d,'ls-remote','--tags',r).splitlines()}
+  except Exception: raise RuntimeError('remote tags unreadable: stranded work unknown')
+ own=[n for s,n in (l.split(' ',1) for l in git(d,'for-each-ref','--format=%(objectname) %(refname)','refs/tags').splitlines()) if (s,n) not in seen]
+ if own and git(d,'rev-list',*own,'--not','--remotes').strip(): return 'local commits not on any remote'
+ return ''
+'''
+exec(_STRANDED_SRC)
+
+
 # The remote deleter's proof, shipped as ONE argv over ssh (keep it < 4 KB: fleet-nas seccomp note).
 # Only independently durable CLEAN repositories (or an empty dir) may be removed remotely. Untracked
 # scratch/dirty work is held, never mistaken for the Studio's empty copy of the same path. Dirt that is
@@ -3914,7 +3936,7 @@ def git(repo,*args):
  r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=12,stdin=subprocess.DEVNULL)
  if r.returncode: raise RuntimeError('git proof failed')
  return r.stdout.decode('utf-8','surrogateescape')
-def res(s):
+'''+_STRANDED_SRC+r'''def res(s):
  q=[x for x in s.rstrip('/').split('/') if x]
  ds=q if s.endswith('/') else q[:-1]
  return bool(q) and (any(x in R for x in ds) or (not s.endswith('/') and any(fnmatch.fnmatchcase(q[-1],f) for f in F)))
@@ -3937,7 +3959,8 @@ def prove(d):
   if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st): raise RuntimeError('dirty, ignored or untracked work')
   if any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
   if git(d,'stash','list'): raise RuntimeError('stashes')
-  if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')
+  w=stranded(git,d)
+  if w: raise RuntimeError(w)
   sha=git(d,'rev-parse','HEAD').strip()
   remotes=git(d,'remote').splitlines()
   if not any(any(line.split()[0]==sha for line in git(d,'ls-remote',remote).splitlines()) for remote in remotes):
