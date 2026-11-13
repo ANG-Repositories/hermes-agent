@@ -16,6 +16,14 @@ from tests.hermes_cli.test_kanban_studio_last_resort import _write_policy
 
 
 @pytest.fixture(autouse=True)
+def _carry_caps_on(monkeypatch):
+    """t_f3a411c2: this suite pins the capped in-tick carry (kanban.placement.carry_caps: true, the kill switch).
+    The default background carry with no cap is test_kanban_carry_background.py."""
+    from hermes_cli import kanban_carry_background as _kcb
+    monkeypatch.setattr(_kcb, "caps_on", lambda kcfg=None: True)
+
+
+@pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     kwh._carry_scan_cache.clear()
     kwh._carry_waiting.clear()

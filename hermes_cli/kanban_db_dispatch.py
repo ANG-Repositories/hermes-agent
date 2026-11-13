@@ -6064,7 +6064,20 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
         ok2, rule2, class2 = _kwp.portable(workspace_has_content=False, **_portable_kw)
         shared = ok2 and _kb._kwh.carry_path_shared(conn, row["id"], row["workspace_path"])
         split = None
-        if (ok2 and not shared
+        from hermes_cli import kanban_carry_background as _kcb
+        if (ok2 and not shared and _kb._kwh.carry_path_safe(row["workspace_path"]) and not _kcb.caps_on()
+                and not _kcb.refused(conn, row["id"], row["workspace_path"])):
+            # t_f3a411c2 (Ace 2026-11-12 09:25, "no cap"): no size walk in the tick and no size cap; the copy runs
+            # in the background (kanban_carry_background) and the card is claimed once it has finished. While a
+            # carry is in flight the card is pinned to the host holding its staging dir.
+            ok, rule, route_class, carried = ok2, rule2, class2, True
+            carry_out[row["id"]] = _kcb.BACKGROUND
+            _bg_host = _kcb.inflight_host(row["id"], str(Path(row["workspace_path"])))
+            if _bg_host is not None:
+                if rules_out is not None:
+                    rules_out[row["id"]] = _pr.LOCAL_FILES
+                return "pin", _bg_host
+        elif (ok2 and not shared
                 and _kb._kwh.carry_size_ok(row["workspace_path"], budget=carry_budget)):
             ok, rule, route_class, carried = ok2, rule2, class2, True
             carry_out[row["id"]] = True
@@ -7469,6 +7482,7 @@ def _dispatch_once_locked(
     row_rules: dict = {}  # task id -> portable() rule, for the placement record
     _worktree_ports: dict = {}  # worktree card -> (repo, mirror, hosts) (t_6d9e7d90)
     _carry_rows: dict = {}  # local_files card -> True: local while the gate admits, else carried (t_e604c0f9)
+    _bg_carries: dict = {}  # card -> finished background carry Job, collected at its claim (t_f3a411c2)
     _studio_why: dict = {}  # card -> the capability that justified its local route (t_9965b8d5)
     _prose_adv: dict = {}   # card -> prose-only Studio signals recorded, not enforced (t_c82eded0)
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
@@ -8710,6 +8724,16 @@ def _dispatch_once_locked(
                 spillover.release(placed_host, _rid)
                 result.placement_waits[row["id"]] = f"{_kwt.CLONE_PENDING}:{placed_host.name}"
                 continue
+        if not dry_run and placed_host is not None and _carry_rows.get(row["id"]) == "background":
+            # t_f3a411c2: the workspace carry runs off the tick; the card is claimed once it has finished.
+            _bt0 = time.monotonic()
+            _bg_wait = _background_carry_gate(conn, row, placed_host, spillover, board, defer_pool_clone,
+                                              _bg_carries)
+            result.carry_scan_ms += (time.monotonic() - _bt0) * 1000.0
+            if _bg_wait is not None:
+                spillover.release(placed_host, _rid)
+                result.placement_waits[row["id"]] = _bg_wait
+                continue
         if _take_refusal is not None and placed_host is None:
             result.take_refusals[row["id"]] = _take_refusal
         if dry_run:
@@ -8820,9 +8844,15 @@ def _dispatch_once_locked(
                     # Studio scratch dir goes to the chosen host first, same path; a failure is a spawn
                     # failure (claim released, reservation refunded), never an empty-dir run.
                     _split = _carry_rows.get(claimed.id)
+                    _bg = _split == "background"
                     _split = _split if isinstance(_split, dict) else None
                     _staged = None
-                    if _split:
+                    _bg_stats = None
+                    if _bg:
+                        # t_f3a411c2: the copy finished off the tick (staging dir on the host); move it into place.
+                        _bg_stats = _finalize_background_carry(claimed.id, placed_host, str(workspace),
+                                                               _bg_carries)
+                    elif _split:
                         # P2 c-38aac54b3e75a212: refuse before the rsync copies anything to the pool host. The stash
                         # bundle it builds (bounded, StashBundleTimeout = a WorkspaceUnavailable) is reused below.
                         _staged = _kb._kwh.carry_clones_check(placed_host, str(workspace), _split["clones"],
@@ -8838,6 +8868,9 @@ def _dispatch_once_locked(
                     # arrive with no stash; how many shared entries stayed on the Studio rides the event and a comment
                     _left = {c["rel"]: c["stash_left"] for c in (_split or {}).get("clones", ())
                              if c.get("stash_left")}
+                    # t_f3a411c2 (operator 18:55 item 1): the background rebuild follows the same knob and record
+                    _left.update({r["rel"]: r["stash_left"] for r in (_bg_stats or {}).get("rebuilt", ())
+                                  if r.get("stash_left")})
                     with _kbc.write_txn(conn):
                         # "workspace" = the stored path at carry time, "path" = the spelling persisted just
                         # below; carried_host() binds on either (Prism 34bd0265a601).
@@ -8846,7 +8879,8 @@ def _dispatch_once_locked(
                                            "path": str(workspace),
                                            **({"recloned": [{k: c[k] for k in ("rel", "slug", "branch", "sha")}
                                                             for c in _split["clones"]]} if _split else {}),
-                                           **({"stash_left": _left} if _left else {})},
+                                           **({"stash_left": _left} if _left else {}),
+                                           **({"background": _bg_stats} if _bg_stats else {})},
                                           run_id=claimed.current_run_id)
                     if _left:
                         _kb.add_comment(conn, claimed.id, "dispatcher", (
@@ -9970,6 +10004,96 @@ def _run_started_at(task: Task, board: Optional[str]) -> int:
         except Exception as exc:
             _kb._log.debug("kanban worker: run start unreadable for %s (%s)", task.id, exc)
     return int(time.time())
+
+
+def _background_carry_gate(conn, row, host, spillover, board, defer: bool, out: dict) -> Optional[str]:
+    """None when this card's workspace carry to ``host`` has finished (the Job is put in ``out`` for the claim),
+    else the wait reason (t_f3a411c2). The gateway tick (``defer``) starts the carry in the background and returns at
+    once; a one-shot tick (CLI, admit) runs it here, as the pool clone does. Every start, progress line and failure
+    is an event on the card; a failure is also a comment naming what it left on the host."""
+    from hermes_cli import kanban_carry_background as _kcb
+    tid = row["id"]
+    ws = str(Path(row["workspace_path"]))
+    lock_dir = _kb.board_dir(board) / "carry-locks"
+    stale = _kcb.stale_host(conn, tid, ws, getattr(spillover, "hosts", {}) or {}, host.name)
+    pending = f"{_kcb.PENDING}:{host.name}"
+
+    def _event(kind, payload):
+        try:
+            with _kbc.write_txn(conn):
+                _kb._append_event(conn, tid, kind, payload)
+        except Exception as exc:  # a carry record must never stop the tick
+            _kb._log.warning("kanban dispatch: %s event for %s not written: %s", kind, tid, exc)
+
+    def _failed(job, exc):
+        state = _kcb.failure_state(job, exc)
+        why = _kcb.wait_reason(exc, host.name)
+        _event(_kcb.FAILED_EVENT, {**_kcb.progress_payload(job), "state": state, "reason": str(exc)[:300],
+                                   **({"stale_cleaned": job.stale_cleaned} if job.stale_cleaned is not None else {})})
+        what = {"refused": "nothing copied; the capped carry rule decides this card from now on",
+                "clean": "nothing of this card on the host",
+                "resumable": f"partial copy kept at {_kcb.staging_path(ws)} on {host.name}; the next attempt there "
+                             "resumes it, one to another host removes it first"}[state]
+        try:
+            with _kbc.write_txn(conn):
+                _kb.add_comment(conn, tid, "dispatcher", f"workspace carry to {host.name} failed ({state}): {exc}. "
+                                                         f"{what}.")
+        except Exception as cexc:
+            _kb._log.warning("kanban dispatch: carry comment for %s not written: %s", tid, cexc)
+        return why
+
+    if not defer:
+        # Operator 16:40 item 2: a one-shot tick (CLI dispatch, admit) holds the board tick lock for its whole run, so
+        # it copies inline only what the old caps bounded (CARRY_MAX_BYTES / CARRY_MAX_ENTRIES, the bounded cached
+        # walk, each copy step under CARRY_TIMEOUT_SECONDS). A bigger dir waits carry_pending for the gateway's
+        # next tick, which carries it in the background; admit prints `held: carry_pending:<host>: ...`.
+        if not _kb._kwh.carry_size_ok(ws):
+            return (f"{pending}: larger than a one-shot tick copies ({_kb._kwh.CARRY_MAX_BYTES} bytes / "
+                    f"{_kb._kwh.CARRY_MAX_ENTRIES} entries); the gateway dispatcher carries it off the tick")
+        job = _kcb.Job(tid, host, ws, stale, lock_dir)
+        job.timeout = _kb._kwh.CARRY_TIMEOUT_SECONDS
+        _event(_kcb.STARTED_EVENT, {"host": host.name, "path": ws, "background": False})
+        try:
+            if not _kcb.run_sync(job, lock_dir):
+                return pending  # another dispatcher is carrying it
+        except Exception as exc:
+            return _failed(job, exc)
+        out[tid] = job
+        return None
+    state, detail = _kcb.poll(tid, host, ws, lock_dir, stale=stale)
+    if state == "started":
+        _event(_kcb.STARTED_EVENT, {"host": host.name, "path": ws, "background": True})
+        return pending
+    if state == "running":
+        if _kcb.progress_due(detail):
+            _event(_kcb.PROGRESS_EVENT, _kcb.progress_payload(detail))
+        return pending
+    if state == "busy":
+        return pending
+    if state == "backoff":
+        return detail
+    if state == "failed":
+        return _failed(*detail)
+    if state == "done":
+        out[tid] = detail
+        return None
+    return pending
+
+
+def _finalize_background_carry(task_id: str, host, workspace: str, carries: dict) -> dict:
+    """At the claim: move the finished staging copy onto the workspace on ``host`` and return the carry's numbers for
+    the ``workspace_carried`` event. Raises (a spawn failure; the staging dir stays for the next attempt)."""
+    from hermes_cli import kanban_carry_background as _kcb
+    job = carries.pop(task_id, None)
+    if job is None or job.workspace != str(Path(workspace)) or job.host.name != host.name:
+        raise RuntimeError(f"{_kcb.PENDING}: no finished carry of {workspace} to {host.name} for this claim")
+    try:
+        _kcb.take(task_id, host, job.workspace)
+        t0 = time.monotonic()
+        _kcb.finalize(host, job.workspace)  # under the carry lock taken at the start (Prism b198d365c020)
+    finally:
+        _kcb.release(job)
+    return {**job.stats, "finalize_s": round(time.monotonic() - t0, 2)}
 
 
 def _pool_clone_job(task_id: str, branch_name, host, wt_port, workspace, board: Optional[str] = None) -> tuple:

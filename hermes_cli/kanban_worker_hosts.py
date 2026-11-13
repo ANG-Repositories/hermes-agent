@@ -519,6 +519,8 @@ def local_workspace_binding(path: Optional[str], *, runner: Callable = subproces
 # its gate admits; when it does not, the dir is carried to the chosen pool host (same path) and the card runs there.
 # The bounds keep the in-tick scan and copy short; they are a cost bound, not a capacity count: a bigger dir keeps
 # the old rule (Studio or wait).
+# t_f3a411c2: these two caps and the in-tick copy now apply only under ROOT kanban.placement.carry_caps: true (the
+# kill switch); by default the carry has no size cap and runs off the tick (kanban_carry_background).
 CARRY_MAX_BYTES = 1024 ** 3
 CARRY_MAX_ENTRIES = 20000
 CARRY_TIMEOUT_SECONDS = 300
@@ -879,12 +881,13 @@ def split_worktree_loss(workspace: str, recs, runner: Callable = subprocess.run)
     return None
 
 
-def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
+def carried_gitdir_loss(workspace: str, carried, rebuilt, nested: bool = True) -> Optional[str]:
     """None, or the reason a set-aside path carried AS FILES would arrive with a dangling git dir (Prism 805c10f0cb3d,
     78347eb52e27). The carry copies the workspace to the SAME path on the pool host minus the ``rebuilt`` rels, so a
     linked worktree in ``carried`` keeps a working ``.git`` only when its gitdir and common dir sit inside the
     workspace and outside every rebuilt rel. A gitdir that no longer exists on the Studio (a dead stub) loses nothing
-    by the copy. Anything unreadable fails closed."""
+    by the copy. Anything unreadable fails closed. ``nested`` False (t_f3a411c2): only the checkout at each carried rel
+    itself, not the repos below it."""
     try:
         ws = os.path.realpath(workspace).rstrip("/") + "/"
         gone = tuple(os.path.realpath(os.path.join(workspace, r)).rstrip("/") + "/" for r in rebuilt)
@@ -972,6 +975,8 @@ def carried_gitdir_loss(workspace: str, carried, rebuilt) -> Optional[str]:
                 lost = _repo_loss(d, name)
                 if lost is not None:
                     return lost
+            if not nested:
+                break
             try:
                 with os.scandir(d) as scan:
                     subs = [e for e in scan if e.name != ".git" and e.is_dir(follow_symlinks=False)]
