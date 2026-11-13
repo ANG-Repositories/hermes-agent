@@ -5927,8 +5927,11 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
                 if rules_out is not None:
                     rules_out[row["id"]] = _kwt.STRANDED_PREFIX
                 return "wait", _held
-            _now = conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (row["id"],)).fetchone()
-            row = {**{k: row[k] for k in row.keys()}, "workspace_path": _now[0] if _now else row["workspace_path"]}
+            # t_7eb1cbbb: the hand-over may restore the declared kind (worktree) as well as the path.
+            _now = conn.execute("SELECT workspace_kind, workspace_path FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            row = {**{k: row[k] for k in row.keys()},
+                   "workspace_kind": _now[0] if _now else row["workspace_kind"],
+                   "workspace_path": _now[1] if _now else row["workspace_path"]}
         elif _ported:
             bind = (_kwt.PORT_BIND_RULE, row["id"], _ported)
         else:
@@ -8835,6 +8838,12 @@ def _dispatch_once_locked(
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
                              host=placed_host.name, slug=_wt_port[0], mirror=_wt_mirror)
             elif claimed.workspace_kind == "worktree":
+                if not dry_run:
+                    # t_7eb1cbbb: a worktree card handed back off its port host gets its branch at the clone's head
+                    # before the worktree is made from it; a failure is a spawn failure.
+                    from hermes_cli import kanban_worktree_port as _kwt
+                    _kwt.materialize_handover(conn, claimed, str(claimed.workspace_path or ""), placed_host,
+                                              board=board)
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
@@ -9343,6 +9352,11 @@ def _dispatch_once_locked(
             )
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
+                # t_7eb1cbbb (Prism 5d4d8720fd73): a handed-over card reviewed before any Studio run gets its
+                # branch at the clone's head before the worktree is made, as on the ready lane.
+                from hermes_cli import kanban_worktree_port as _kwt
+                _kwt.materialize_handover(conn, claimed, str(claimed.workspace_path or ""), _review_origin_host,
+                                          board=board)
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)

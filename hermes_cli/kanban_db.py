@@ -17611,6 +17611,19 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,
                 )
+        # t_7eb1cbbb: the missing dir is the hand-over's own target that never
+        # came to exist (mount fine, no run since): not a lost mount. Restore
+        # the declared worktree (or create the scratch path) and re-admit.
+        if (
+            not dry_run
+            and reason.startswith("stranded_by_mount_loss:")
+            and task.status in ("ready", "review")
+        ):
+            from hermes_cli import kanban_worktree_port as _kwt
+            if _kwt.recover_handover(conn, task):
+                return _workspace_admission_refused(
+                    conn, task_id, result, board=board, dry_run=dry_run,
+                )
         # ``stranded_by_mount_loss`` is only reached after ``validate_mount``
         # passed: the mount is present, the card's dir is not. When no worker
         # has spawned since the card's last completion, kanban itself reaped
