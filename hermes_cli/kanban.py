@@ -3824,6 +3824,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         if reason:
             kb._validate_comment_args(author, f"BLOCKED: {reason}", conn=conn)
+            for tid in ids:
+                kb.check_comment_hold(tid, author, f"BLOCKED: {reason}")
         for tid in ids:
             # Provenance before the transition: blocking ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
@@ -3901,6 +3903,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if reason:
             kb._validate_comment_args(author, f"SCHEDULED: {reason}", conn=conn)
+            for tid in ids:
+                kb.check_comment_hold(tid, author, f"SCHEDULED: {reason}")
         for tid in ids:
             current = kb.get_task(conn, tid)
             # An already-scheduled card only gets its wake time (re)set; the
@@ -4187,6 +4191,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         if worker_run is None:
             # Before any write: the human-lane mirror comment lands after the transition (t_ebc8eb87).
             kb._validate_comment_args(_profile_author(), sendback_body, conn=conn)
+            kb.check_comment_hold(tid, _profile_author(), sendback_body)
         if operator is not None and worker_run is not None:
             # A dispatched reviewer run always carries full coverage.
             print(

@@ -635,3 +635,27 @@ def test_add_comment_refuses_hold_from_any_writer(board):
             kb.add_comment(conn, board, "apollo (subagent)", HOLD)
         kb.add_comment(conn, board, "apollo", HOLD)
     assert _last_author(board) == ("apollo", HOLD)
+
+
+# Prism e233b2a07b96: block/schedule write their status comment AFTER the transition, so a hold
+# refused in add_comment left the card blocked with no comment. The hold is judged before the transition.
+@pytest.mark.parametrize("verb", ["block", "schedule"])
+def test_lifecycle_reason_with_hold_is_refused_before_the_transition(board, monkeypatch, verb):
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    with kb.connect() as conn:
+        status = kb.get_task(conn, board).status
+    before = _comment_rows(board)
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    argv = ["kanban", "--board", "default", verb, board, "waiting\n" + HOLD]
+    argv[5:5] = ["--at", "2099-01-01T00:00:00+00:00"] if verb == "schedule" else ["--kind", "needs_input"]
+    try:
+        rc = kc.kanban_command(top.parse_args(argv))
+    except ValueError as exc:
+        assert "holds nothing" in str(exc)
+        rc = 1
+    assert rc != 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, board).status == status
+    assert _comment_rows(board) == before
