@@ -68,3 +68,20 @@ def test_bridge_error_code_reads_the_wrapped_contentalias_code():
 
 def test_table_covers_the_seen_codes():
     assert set(SEEN) - {"store_lock"} <= set(CONTENTALIAS_ERROR_CODES)
+
+
+def test_stream_transport_names_the_box_forwarder_not_the_alias_layer():
+    """t_6e7909d1: sub-vps-19 2026-11-12 22:52 PT. unattended-upgrade restarted the seat's
+    tinyproxy, the Studio dpx unit's upstream dial got `connection refused` on :18814, and the
+    banner said "content-alias refused ... the DPX alias layer refused the turn". stream_transport
+    is the alias layer's upstream READ failing, so the line names the forwarder."""
+    wire = ("the interactive session reported an upstream error row for this turn "
+            "(API Error: contentalias:stream_transport)")
+    row = _row_for(_bridge_err("contentalias:stream_transport", 400, wire,
+                               {**HDRS, "x-relay-seat": "sub-vps-19"}), 400)
+    assert fp.head_label_override(row) == "box forwarder refused the connection"
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert "box forwarder refused or dropped the upstream connection" in text, text
+    assert "on sub-vps-19" in text, text
+    assert "alias layer refused" not in text and "at the DPX alias layer" not in text, text
+    assert "Anthropic" not in text.replace("ours, not Anthropic", ""), text
