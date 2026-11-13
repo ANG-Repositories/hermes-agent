@@ -316,15 +316,20 @@ def test_gateway_tick_never_runs_the_orphan_sweep_inline(sweep_conn, monkeypatch
 
     def sweep(c, board=None):
         threads.append(threading.get_ident())
-        release.wait(5)
+        release.wait(60)
         return {"t_aaaaaaaa": [{"pid": 4242}]}
 
     monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans", sweep)
-    t0 = time.monotonic()
-    first = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default", defer_maintenance=True)
-    assert time.monotonic() - t0 < 4.0, "the tick waited on the sweep"
-    assert first.orphans_reaped == {}
-    release.set()
+    try:
+        first = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default", defer_maintenance=True)
+        # The sweep cannot finish until `release` is set, so a tick that waited on it would return with
+        # it done (or never return). Judged on the sweep's state, not a wall-clock bound (t_7c61c59d:
+        # a loaded CI runner took 4.65 s for a tick that never waited).
+        jobs = list(kbd._ORPHAN_SWEEP_JOBS.values())
+        assert jobs and not any(f.done() for f in jobs), "the tick waited on the sweep"
+        assert first.orphans_reaped == {}
+    finally:
+        release.set()
     _drain_sweeps()
     assert threads and ticker not in threads
     second = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default", defer_maintenance=True)
