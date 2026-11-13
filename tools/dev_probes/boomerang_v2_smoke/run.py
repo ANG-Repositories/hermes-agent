@@ -31,8 +31,8 @@ once, whole. --live runs the commands against the scratch board, reads the gatew
 its current end and polls until each expectation is met or its window closes.
 
 The harness never edits config, never restarts anything and never writes to a board whose
-slug does not start with "bv2-smoke". Its one other write is step 4's fallback arm: retries[<card>]=1
-into BV2_WAKE_STATE (required live, never defaulted), so the restart finds the D-13 retry spent.
+slug does not start with "bv2-smoke". Its one other write is step 4's fallback arm: restart_spent[<card>]=1
+into BV2_WAKE_STATE (required live, never defaulted), so the restart finds the restart retry spent.
 Steps that need Apollo print the exact action and wait for a line in the ack file (see README.md).
 
 Exit: 0 every check PASS; 1 any FAIL; 3 no FAIL but something INCOMPLETE/SKIP; 2 usage.
@@ -1101,7 +1101,7 @@ def _boot_id(path: Path) -> str | None:
 
 
 def wake_state_path(live: bool) -> Path | None:
-    """The scratch gateway's boomerang-wake state file (claims + D-13 ``retries``). Live it must be
+    """The scratch gateway's boomerang-wake state file (claims + ``restart_spent``/``retries``). Live it must be
     named explicitly: the fallback arm WRITES it, and a default would be the fleet gateway's own."""
     spec = os.environ.get("BV2_WAKE_STATE", "").strip()
     if spec:
@@ -1125,20 +1125,23 @@ def _claim_running(path: Path, card: str) -> dict | None:
 
 
 def _prespend_retry(ctx: Ctx, rep: StepReport, card: str) -> bool:
-    """Fallback arm: spend the card's D-13 retry (``retries[card]=1``) in the scratch state file
-    while its child is running, so the reconciler must refuse the redispatch (`retry spent`).
+    """Fallback arm: spend the card's restart retry (``restart_spent[card]=1``) in the scratch state
+    file while its child is running, so the reconciler must refuse the redispatch (`retry spent`).
+    ``_restart_refusal`` reads ``restart_spent`` only (#286); ``retries`` (crash/blocked) is left alone.
     Same write shape as the gateway's own (temp + os.replace); unknown keys are kept."""
     path = wake_state_path(ctx.live)
+    label = f"restart_spent[{card}] pre-spent (restart retry)"
     if path is None:
-        rep.check(f"retries[{card}] pre-spent", SKIP, "live needs BV2_WAKE_STATE (the SCRATCH gateway's "
+        rep.check(label, SKIP, "live needs BV2_WAKE_STATE (the SCRATCH gateway's "
                   "<home>/gateway/kanban_boomerang_wake.json); never defaulted to the fleet's")
         return False
-    shown = f"# write retries[{card}]=1 into {path}"
+    shown = f"# write restart_spent[{card}]=1 into {path}"
     if not ctx.live:
         rep.commands.append(shown + "   # dry-run: not written")
         return True
     running = ctx.poll(lambda: _claim_running(path, card), ctx.timeout)
-    rep.check(f"claim for {card} is `running` with its child session recorded before the retry is pre-spent", PASS if running else FAIL,
+    rep.check(f"claim for {card} is `running` with its child session recorded before the restart retry is pre-spent",
+              PASS if running else FAIL,
               f"delegation {running.get('delegation_id')}" if running else f"no running claim in {path}")
     if not running:
         return False
@@ -1148,9 +1151,9 @@ def _prespend_retry(ctx: Ctx, rep: StepReport, card: str) -> bool:
     for _attempt in range(20):
         before = path.read_bytes()
         doc = json.loads(before.decode("utf-8-sig"))
-        retries = doc.get("retries") if isinstance(doc.get("retries"), dict) else {}
-        retries[card] = 1
-        doc["retries"] = retries
+        spent = doc.get("restart_spent") if isinstance(doc.get("restart_spent"), dict) else {}
+        spent[card] = 1
+        doc["restart_spent"] = spent
         fd, tmp = tempfile.mkstemp(prefix=".bv2-prespend-", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, sort_keys=True)
@@ -1161,14 +1164,14 @@ def _prespend_retry(ctx: Ctx, rep: StepReport, card: str) -> bool:
         os.replace(tmp, path)
         break
     else:
-        rep.check(f"retries[{card}] pre-spent", FAIL, f"{path} kept changing under the compare-and-swap")
+        rep.check(label, FAIL, f"{path} kept changing under the compare-and-swap")
         return False
     after = json.loads(path.read_text(encoding="utf-8-sig"))
-    readback = after.get("retries", {}).get(card)
+    readback = (after.get("restart_spent") or {}).get(card)
     if set(after.get("claims") or {}) != set(doc.get("claims") or {}):
         readback = f"claims changed across the write: {sorted(set(after.get('claims') or {}) ^ set(doc.get('claims') or {}))}"
-    rep.commands.append(shown + f"   # readback retries[{card}]={readback}")
-    rep.check(f"retries[{card}] pre-spent", PASS if readback == 1 else FAIL, f"readback {readback!r}")
+    rep.commands.append(shown + f"   # readback restart_spent[{card}]={readback}")
+    rep.check(label, PASS if readback == 1 else FAIL, f"readback {readback!r}")
     return readback == 1
 
 
@@ -1374,7 +1377,7 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
 
 
 def _s4_fallback_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path: Path) -> None:
-    """Fallback: the card's D-13 retry is already spent, so the reconciler re-surfaces the wake and
+    """Fallback: the card's restart retry is already spent, so the reconciler re-surfaces the wake and
     posts `lost ... (reason: gateway restart, retry spent)`; no redispatch, no late completion."""
     arm = "fallback arm"
     cut = _s4_cut_child(ctx, rep, log, chat, pid_path, "s4_fallback",
@@ -1417,7 +1420,7 @@ def step4(ctx: Ctx) -> StepReport:
     rep.notes.append(f"the harness never restarts anything; gateway pid file `{pid_path}` boot_id at start: "
                      f"`{_boot_id(pid_path)}`; wake state `{wake_state_path(ctx.live)}`")
     rep.notes.append("arm 1 (redispatch): retry unspent -> quiet redispatch, second child finishes the card")
-    rep.notes.append("arm 2 (fallback): retries[card]=1 written before the restart -> lost (retry spent) + re-surface")
+    rep.notes.append("arm 2 (fallback): restart_spent[card]=1 written before the restart -> lost (retry spent) + re-surface")
     _s4_redispatch_arm(ctx, rep, log, chat, pid_path)
     _s4_fallback_arm(ctx, rep, log, chat, pid_path)
     return rep

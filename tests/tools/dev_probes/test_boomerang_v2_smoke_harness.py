@@ -221,19 +221,44 @@ def test_step4_fallback_arm_needs_the_retry_spent_reason(env, monkeypatch):
 
 
 def test_step4_fallback_prespend_writes_only_the_cards_retry(env, tmp_path, monkeypatch):
-    """Live fallback arm: retries[card]=1 lands in BV2_WAKE_STATE, every other key is kept."""
+    """Live fallback arm: restart_spent[card]=1 lands in BV2_WAKE_STATE, every other key is kept
+    (``retries``, the crash/blocked budget, included)."""
     state = tmp_path / "kanban_boomerang_wake.json"
     state.write_text(json.dumps({"claims": {"b|t_s4|9": {"task_id": "t_s4", "state": "running",
                                                          "delegation_id": "d1", "child_session": "c1"}},
-                                 "retries": {"t_other": 1}, "future_key": [1]}))
+                                 "retries": {"t_other": 1}, "restart_spent": {"t_x": 1},
+                                 "future_key": [1]}))
     ctx = run.Ctx.__new__(run.Ctx)
     ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
     rep = run.StepReport(4, "t", "live")
     monkeypatch.setenv("BV2_WAKE_STATE", str(state))
     assert run._prespend_retry(ctx, rep, "t_s4")
     doc = json.loads(state.read_text())
-    assert doc["retries"] == {"t_other": 1, "t_s4": 1}
+    assert doc["restart_spent"] == {"t_x": 1, "t_s4": 1}
+    assert doc["retries"] == {"t_other": 1}
     assert doc["future_key"] == [1] and doc["claims"]["b|t_s4|9"]["state"] == "running"
+
+
+def test_step4_prespent_state_is_retry_spent_for_the_gateways_own_reconciler(env, tmp_path, monkeypatch):
+    """The fallback arm's pre-spent file, read by the gateway's own BoomerangWakeState and
+    _restart_refusal, refuses the redispatch as `retry spent` (#286 moved that budget to
+    ``restart_spent``; a ``retries`` write would let the redispatch through)."""
+    import time as _time
+    from gateway import kanban_boomerang_wake as bw
+
+    state = tmp_path / "kanban_boomerang_wake.json"
+    entry = {"task_id": "t_s4", "state": "running", "delegation_id": "d1", "child_session": "c1",
+             "board": "bv2-smoke-x", "status": "ready", "claimed_at": _time.time(), "max_minutes": 45}
+    state.write_text(json.dumps({"claims": {"bv2-smoke-x|t_s4|9": entry}}))
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    assert run._prespend_retry(ctx, run.StepReport(4, "t", "live"), "t_s4")
+    # Card unchanged since the claim: without the pre-spend the gateway would redispatch (None).
+    monkeypatch.setattr(bw, "card_snapshot", lambda board, tid: {"status": "ready"})
+    gw_state = bw.BoomerangWakeState(state)
+    assert bw._restart_refusal(dict(entry), bw.BoomerangWakeState(tmp_path / "fresh.json"), _time.time()) is None
+    assert bw._restart_refusal(dict(entry), gw_state, _time.time()) == "retry spent"
 
 
 def _hold_fixture(tmp_path, monkeypatch, *, model_call: bool, goes_active: bool):
@@ -791,14 +816,14 @@ def test_step4_prespend_retries_when_the_gateway_writes_in_between(env, tmp_path
     """Prism 1c04b69ce0b6: a gateway write between the snapshot and the replace is never discarded."""
     state = tmp_path / "kanban_boomerang_wake.json"
     claim = {"task_id": "t_s4", "state": "running", "delegation_id": "d1", "child_session": "c1"}
-    state.write_text(json.dumps({"claims": {"a": claim}, "retries": {}}))
+    state.write_text(json.dumps({"claims": {"a": claim}, "restart_spent": {}}))
     monkeypatch.setenv("BV2_WAKE_STATE", str(state))
     real_mkstemp, fired = run.tempfile.mkstemp, []
 
     def racing_mkstemp(*a, **k):   # the gateway saves claim B right after the harness took its snapshot
         if not fired:
             fired.append(1)
-            state.write_text(json.dumps({"claims": {"a": claim, "b": {"task_id": "t_b"}}, "retries": {}}))
+            state.write_text(json.dumps({"claims": {"a": claim, "b": {"task_id": "t_b"}}, "restart_spent": {}}))
         return real_mkstemp(*a, **k)
 
     monkeypatch.setattr(run.tempfile, "mkstemp", racing_mkstemp)
@@ -806,5 +831,5 @@ def test_step4_prespend_retries_when_the_gateway_writes_in_between(env, tmp_path
     ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
     assert run._prespend_retry(ctx, run.StepReport(4, "t", "live"), "t_s4")
     doc = json.loads(state.read_text())
-    assert set(doc["claims"]) == {"a", "b"} and doc["retries"] == {"t_s4": 1}
+    assert set(doc["claims"]) == {"a", "b"} and doc["restart_spent"] == {"t_s4": 1}
 
