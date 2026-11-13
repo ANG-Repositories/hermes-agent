@@ -8825,15 +8825,13 @@ def add_comment(
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     from hermes_cli.kanban_close_on_guard import check_hold_author
 
-    # Judged on the author as STORED (grant / subagent marker included): the deadman reads that row.
-    if grant_id is not None:
-        from hermes_cli.kanban_sign_grants import granted_author
-
-        check_hold_author(task_id, granted_author(author, grant_id), body)
-    elif _is_delegated_child() and not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
-        check_hold_author(task_id, author.strip() + SUBAGENT_AUTHOR_MARKER, body)
-    else:
-        check_hold_author(task_id, author, body)
+    # Judged on the author as STORED (subagent marker included): the deadman reads that row. A granted
+    # write is judged in _add_comment_txn after the grant validated, so the grant's own refusal wins.
+    if grant_id is None:
+        if _is_delegated_child() and not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+            check_hold_author(task_id, author.strip() + SUBAGENT_AUTHOR_MARKER, body)
+        else:
+            check_hold_author(task_id, author, body)
     now = int(time.time())
     if grant_id is not None:
         return _add_granted_comment(
@@ -8954,6 +8952,9 @@ def _add_comment_txn(
         if grant_id is not None:
             ksg.validate_comment(conn, grant_id, task_id, signer, body,
                                  caller_session_ref=session_ref, now=now)
+            from hermes_cli.kanban_close_on_guard import check_hold_author
+
+            check_hold_author(task_id, author, body)  # grant-marked author, as stored
             cur = conn.execute(
                 "INSERT INTO task_comments "
                 "(task_id, author, body, run_id, session_ref, created_at, grant_id) "
