@@ -1679,7 +1679,8 @@ def _route_chat_session(store: Any, route: Optional[dict]) -> Any:
         plat = str(getattr(o.platform, "value", o.platform) or "")
         if not _hr.same_chat(target, plat, o.chat_id, getattr(o, "thread_id", "") or ""):
             continue
-        if want and getattr(o, "profile", None) and o.profile != want:
+        # A named route profile needs a session of that profile; unset means "default".
+        if want and (getattr(o, "profile", None) or "default") != want:
             continue
         return e
     return None

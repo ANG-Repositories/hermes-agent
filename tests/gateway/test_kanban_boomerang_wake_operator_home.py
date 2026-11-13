@@ -120,3 +120,17 @@ def test_session_homed_card_is_unchanged(env, clock, monkeypatch):  # noqa: F811
     asyncio.run(ah.deliver_handbacks(env["runner"], state))
     assert "del-gone" in state.handbacks() and state.dead_letters() == {}
     assert len(env["adapter"].handled) == 1
+
+
+def test_route_chat_session_requires_the_named_profile():
+    """Prism 5674c71176df: an unset session profile is "default", not a wildcard for a named one."""
+    from types import SimpleNamespace as NS
+
+    def sess(name, profile):
+        return NS(name=name, origin=NS(platform="discord", chat_id=CHAT, thread_id="", profile=profile))
+
+    store = NS(list_sessions=lambda: [sess("unset", None), sess("work", "work")])
+    route = {"platform": "discord", "chat_id": CHAT, "profile": "work"}
+    assert ah._route_chat_session(store, route).name == "work"
+    assert ah._route_chat_session(store, {**route, "profile": "default"}).name == "unset"
+    assert ah._route_chat_session(store, {**route, "profile": None}).name == "unset"
