@@ -7801,12 +7801,17 @@ def assign_task(
             )
         if hold_handoff and row["status"] == "review" and is_review_hold_assignee(row["assignee"]):
             # The operator's review starts now: a fresh review entry (deadman clock, owner wake),
-            # same implementer, so a later send-back still restores the worker.
+            # same implementer, so a later send-back still restores the worker. It keeps the replaced entry's
+            # run id (t_1e4649b7), so the owner wake still finds a PR named only in that run's metadata.
+            replaced = conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
             _append_event(conn, task_id, "review_requested", {
                 "summary": f"review hold: checks settled, handed to {profile}",
                 "implementer": _review_handoff_implementer(conn, task_id),
                 "reviewer": profile, "handed_from": row["assignee"],
-            })
+            }, run_id=replaced["run_id"] if replaced else None)
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee", "status") if sends_back else ("assignee",))
     return True
@@ -14661,7 +14666,22 @@ def configured_review_hold_assignee() -> Optional[str]:
         return None
     if not isinstance(value, str) or not value.strip() or is_human_reviewer(value):
         return None
-    return value.strip().lower()
+    name = value.strip().lower()
+    try:
+        from hermes_cli.profiles import profile_exists
+        installed = profile_exists(name)
+    except Exception:
+        installed = False
+    if installed:
+        # t_1e4649b7: a holder that is (or later becomes) an installed profile would be spawned as a reviewer.
+        if name not in _REVIEW_HOLD_PROFILE_LOGGED:
+            _REVIEW_HOLD_PROFILE_LOGGED.add(name)
+            _log.warning("kanban.review_hold_assignee=%r is an installed profile; treating the knob as unset", name)
+        return None
+    return name
+
+
+_REVIEW_HOLD_PROFILE_LOGGED: set = set()
 
 
 def is_review_hold_assignee(assignee: Optional[str]) -> bool:

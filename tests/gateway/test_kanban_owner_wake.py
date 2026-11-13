@@ -193,6 +193,33 @@ def test_red_handback_on_review_hold_lane_does_not_wake(env):
     assert _tick(env) == []
 
 
+def test_hold_handoff_to_operator_wakes_on_red_pr_from_run_metadata(env):
+    """t_1e4649b7: the hold -> operator hand-off writes a fresh review_requested; it keeps the implementation
+    run, so a PR named only in that run's metadata still wakes the owner when it is red."""
+    from hermes_cli import kanban_open_pr as op
+    _cfg(review_hold_assignee="review-hold", review_assignee="human:apollo")
+    env["monkeypatch"].setattr(op, "_default_query", lambda: (lambda repo, n: {"state": "OPEN"}))
+    url = "https://github.com/ANG-Ventures/hermes-agent/pull/1703"
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.claim_task(conn, tid)
+        run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assert kb.complete_task(conn, tid, summary="shipped", metadata={"pr_url": url},
+                                expected_run_id=run_id) is True
+        assert conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "review-hold"
+    assert _tick(env) == []   # parked on the hold: no decision yet
+    env["adapter"].handled.clear()
+    env["health"][("ANG-Ventures/hermes-agent", 1703)] = {
+        "state": "open", "mergeable_state": "clean", "failing": ["tests (3.11)"]}
+    with kb.connect_closing() as conn:
+        assert kb.assign_task(conn, tid, "human:apollo") is True
+        last = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' "
+                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
+        assert "1703" not in last, "the PR must come from the run metadata, not the hand-off summary"
+    text = _one_turn(env, _tick(env))
+    assert "ANG-Ventures/hermes-agent#1703" in text and "red: tests (3.11)" in text
+
+
 # --- the three non-triggers -----------------------------------------------------
 
 

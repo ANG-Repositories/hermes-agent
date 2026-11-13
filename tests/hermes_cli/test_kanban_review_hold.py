@@ -78,6 +78,24 @@ def test_knob_unset_stream_equals_today(kanban_home):
         assert (row["status"], row["assignee"]) == ("review", "human:apollo")
 
 
+@pytest.mark.parametrize("name", ["worker", "human:apollo"])
+def test_knob_naming_an_installed_profile_or_human_lane_routes_as_unset(kanban_home, monkeypatch, caplog, name):
+    """t_1e4649b7: a holder that is (or later becomes) a real profile would be spawned as a reviewer; a
+    human:* name is the operator lane. Either way the knob is treated as unset."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda n: n == "worker")
+    _set_knob(kanban_home, name)
+    assert kb.configured_review_hold_assignee() is None
+    assert not kb.is_review_hold_assignee(name)
+    with kb.connect() as conn:
+        tid = _handback(conn)
+        assert _shape(_stream(conn, tid)) == TODAY
+        row = conn.execute("SELECT status, assignee FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert (row["status"], row["assignee"]) == ("review", "human:apollo")
+    if name == "worker":
+        assert "review_hold_assignee" in caplog.text
+
+
 def test_knob_set_parks_on_holder_and_is_not_awaiting_a_human(kanban_home):
     _set_knob(kanban_home, HOLD)
     with kb.connect() as conn:
