@@ -398,16 +398,37 @@ def _kernel_can_hold(author: str) -> bool:
 
 
 def check_hold_author(task_id: str, author: str, body: str) -> None:
-    """Raise :class:`HoldAuthorRefused` when ``body`` carries a hold line ``author`` cannot hold with."""
+    """Raise :class:`HoldAuthorRefused` when ``body`` carries a hold line ``author`` cannot hold with.
+
+    A kernel/automation author (:data:`MACHINE_AUTHORS`) is never refused: its body quotes free text (a
+    boomerang-wake summary, a dispatcher reason), the deadman ignores that author by name, and refusing it
+    would drop the whole comment, sometimes after the write it records (t_5b3065cf). Stored and logged."""
     if not HOLD_RE.search(body or ""):
         return
-    fn = getattr(_load("operator_identity"), "comment_can_hold", None)
+    if str(author or "").strip().lower() in MACHINE_AUTHORS:
+        logger.info("kanban comment by %s on %s quotes a deadman hold line; stored, holds nothing",
+                    str(author).strip(), task_id)
+        return
+    lib = _load("operator_identity")
+    fn = getattr(lib, "comment_can_hold", None)
     try:
         ok = bool(fn(author, body)) if fn is not None else _kernel_can_hold(author)
     except Exception:  # noqa: BLE001 -- an unreadable fleet predicate falls back to the kernel rule
         ok = _kernel_can_hold(author)
     if ok:
         return
+    is_op = getattr(lib, "is_operator", None)
+    try:
+        author_ok = bool(is_op(author)) if is_op is not None else False
+    except Exception:  # noqa: BLE001 -- unreadable: fall back to the author message
+        author_ok = False
+    if author_ok:
+        # The author can hold; the body is what the deadman reads as automation (t_5b3065cf).
+        raise HoldAuthorRefused(
+            f"`deadman: hold` in a comment the deadman reads as automation (it leads with a marker such as "
+            f"[review-merge-pass], or carries a machine review_coverage record) holds nothing, even from "
+            f"{str(author).strip()}; post the hold line alone in its own comment, no marker; not posted"
+        )
     from hermes_cli import kanban_db as kb
 
     token_file = str(kb.operator_token_path()).replace(str(Path.home()), "~", 1)
