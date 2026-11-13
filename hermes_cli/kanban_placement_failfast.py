@@ -106,12 +106,14 @@ def prior_reroutes(conn, task_id: str) -> int:
         (task_id, REROUTE_EVENT)).fetchone()[0])
 
 
-def _with_requires_line(body: Optional[str], cap: str) -> str:
+def _with_requires_line(body: Optional[str], cap: str, note: str) -> str:
+    """Append ``requires: <cap> (<note>)``: a reasoned line hermes-home create_refusal() accepts (t_1aea9763)."""
     from hermes_cli.kanban_host_capabilities import declared_words
+    from hermes_cli.kanban_studio_pin import requires_line
     text = body or ""
     if cap in declared_words(text):
         return text
-    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + f"requires: {cap}\n"
+    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + requires_line(cap, note) + "\n"
 
 
 def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
@@ -150,7 +152,7 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
             if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
                 return None
             if prior_reroutes(conn, task_id) == 0:
-                body = _with_requires_line(row["body"], cap)
+                body = _with_requires_line(row["body"], cap, f"re-routed after {token} on {host or 'a pool host'}")
                 # A reviewer run goes back to the review queue, never to ready (#1963 Prism).
                 back_to = kb._retry_status_for_run(conn, task_id, int(run_id))
                 conn.execute(
@@ -164,7 +166,7 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
                                   "to": back_to},
                                  run_id=int(run_id))
                 kb.add_comment(conn, task_id, "dispatcher",
-                               f're-routed: {cap}, ran on {host}; I added "requires: {cap}" to the body. '
+                               f're-routed: {cap}, ran on {host}; I added a "requires: {cap} (...)" line to the body. '
                                f"Delete that line to undo.")
                 decided = "rerouted"
         if decided:

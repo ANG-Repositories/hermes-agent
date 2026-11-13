@@ -95,7 +95,7 @@ def test_reroute_then_needs_input_never_triage(board, monkeypatch):
     assert kwe.block_on_rail_absent(RAIL) is True
     t = _task(tid)
     assert t.status == "ready"
-    assert t.body.rstrip().endswith("requires: browser-session")
+    assert t.body.rstrip().endswith("requires: browser-session (re-routed after BROWSER_RAIL_ABSENT on ace-ai)")
     ev = _events(tid, pff.REROUTE_EVENT)
     assert ev[0].pop("after_comment_id") == 0          # continuation causality snapshot (360354deb8ab)
     assert ev == [{"from": "ace-ai", "cap": "browser-session", "run_id": run1, "token": "BROWSER_RAIL_ABSENT",
@@ -731,7 +731,7 @@ def test_cli_only_preload_is_refused_before_anything_renders(board, monkeypatch,
         csq._run_single_query_mode(cli, "do it", None, True, True)
     assert exc.value.code == 0 and cli.calls == []
     t = _task(tid)
-    assert t.status == "ready" and t.body.rstrip().endswith("requires: browser-session")
+    assert t.status == "ready" and t.body.rstrip().endswith("requires: browser-session (re-routed after BROWSER_RAIL_ABSENT on ace-ai)")
 
 
 @pytest.mark.parametrize("body", ["requires: never-defined-cap", "plain\nrequires: browser-session, never-defined-cap"])

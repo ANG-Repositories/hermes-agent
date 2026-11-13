@@ -6574,20 +6574,12 @@ def create_task(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),
     )
-    # Only hard parent declarations inherit; body sniffs never do.
-    from hermes_cli.kanban_host_capabilities import declared_words
-    _inherited_requires = set()
-    for _parent in parents:
-        _prow = conn.execute('SELECT body,skills FROM tasks WHERE id=?', (_parent,)).fetchone()
-        if _prow:
-            _inherited_requires.update(w for w in declared_words(_prow[0]) if w != 'none')
-            from hermes_cli import kanban_host_capabilities as _khc_inherit
-            _cmap = _khc_inherit.load_map(kanban_home() / 'fleet')
-            if _cmap is not None:
-                _reqs, _none = _khc_inherit.derive(_prow[0], _json_or(_prow[1]) or [], _cmap)
-                _inherited_requires.update(r.cap.removeprefix('unknown:') for r in _reqs if r.strength == 'hard')
-    if _inherited_requires:
-        body = (body or '') + '\nrequires: ' + ', '.join(sorted(_inherited_requires))
+    # Only hard parent declarations inherit; body sniffs and Studio-only words never do (t_1aea9763).
+    from hermes_cli import kanban_requires_inherit as _kri
+    _inherited_line, _not_inherited = _kri.inherited_line(
+        conn, parents, kanban_home() / 'fleet', continues=continues)
+    if _inherited_line:
+        body = (body or '') + '\n' + _inherited_line
 
 
     # Inherit the board's scoped project when the caller didn't name one, so a
@@ -6911,6 +6903,10 @@ def create_task(
                         "(tool: i_mean_blocks) if the parent closing really is the gate.",
                         time_gate_hit or "",
                     )
+                # The body every create path stores, after every append (t_1aea9763).
+                _stored_why = _kri.stored_refusal(body)
+                if _stored_why:
+                    raise _kri.StoredBodyRefused(f"kanban create: stored body: {_stored_why}")
                 _insert_task_row(conn, {
                     'id': task_id,
                     'title': title.strip(),
@@ -7124,6 +7120,7 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
             report_notices(conn, task_id, pin_notices)
+            _kri.report_not_inherited(conn, task_id, _not_inherited)
             if overlap_hits:
                 # After commit, fire-and-forget: a create never waits on Discord.
                 _kov.notify_logs(board, task_id, overlap_hits)
