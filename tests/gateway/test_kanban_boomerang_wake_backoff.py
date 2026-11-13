@@ -105,13 +105,14 @@ def test_failing_row_is_attempted_a_bounded_number_of_times_per_hour(env, clock,
 
 
 def test_no_live_home_turn_dead_letters_after_the_bound(env, clock):  # noqa: F811
-    """The t_31c2626f shape: a turn whose home session is not live here, 85 h old."""
+    """A turn whose home session is not live here, 85 h old. (t_31c2626f was operator-homed; an
+    operator home now resolves through its route chat, t_1637dd3e, so a gone session stands in.)"""
     tid = _card(env)
     logs: list = []
     env["monkeypatch"].setattr(ah, "post_logs", logs.append)
     state = ah.BoomerangWakeState()
     state.put_handback("del-home", _row(tid, parts=[ah.PART_TURN], created_at=T0 - 85 * 3600,
-                                        home_sid="operator:apollo", turn="wake text"))
+                                        home_sid="20261019_999999_gone", turn="wake text"))
     _ticks(env, clock, 30)
     assert state.handbacks() == {}
     dead = state.dead_letters()["del-home"]

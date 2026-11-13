@@ -1654,11 +1654,53 @@ def record_surface(entry: dict, summary: str) -> bool:
         conn.close()
 
 
+def _operator_home(home_sid: Any) -> bool:
+    return str(home_sid or "").strip().startswith("operator:")
+
+
+def _route_chat_session(store: Any, route: Optional[dict]) -> Any:
+    """t_1637dd3e: the newest live session of the handback's ``route`` chat (the subscription chat
+    the line part goes to), or None. Stands in for the home of an ``operator:<name>`` card, which
+    has no session of its own; the card's owner is not changed."""
+    from gateway import kanban_home_route as _hr
+    from gateway import kanban_owner_wake as _ow
+
+    route = route or {}
+    platform = str(route.get("platform") or "").strip().lower()
+    chat = str(route.get("chat_id") or "").strip()
+    if store is None or not platform or not chat:
+        return None
+    target = _hr.HomeTarget(platform, chat, str(route.get("thread_id") or "").strip())
+    want = route.get("profile")
+    for e in store.list_sessions():   # newest first
+        o = getattr(e, "origin", None)
+        if not _ow.is_chat_origin(e):
+            continue
+        plat = str(getattr(o.platform, "value", o.platform) or "")
+        if not _hr.same_chat(target, plat, o.chat_id, getattr(o, "thread_id", "") or ""):
+            continue
+        # A named route profile needs a session of that profile; unset means "default".
+        if want and (getattr(o, "profile", None) or "default") != want:
+            continue
+        return e
+    return None
+
+
+def resolve_home(store: Any, home_sid: str, route: Optional[dict]) -> Any:
+    """The live session a claim acts for: the card's home (``resolve_owner``), or for an
+    ``operator:`` home the route chat's live session (blocking; worker thread)."""
+    from gateway import kanban_home_route as _hr
+    from gateway import kanban_owner_wake as _ow
+
+    if _operator_home(home_sid):
+        return _route_chat_session(store, route)
+    return _ow.resolve_owner(store, home_sid, _hr.read_session_row)
+
+
 async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> bool:
     """Re-deliver the original wake text (or ``text``) to the card's home session as a normal wake.
     A refusal is recorded in ``_SEND_FAILURE`` (the delivery drain's per-part slot)."""
     failure = _SEND_FAILURE.get({})
-    from gateway import kanban_home_route as _hr
     from gateway import kanban_owner_wake as _ow
 
     try:
@@ -1669,11 +1711,13 @@ async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> boo
             current = await asyncio.to_thread(_ow.read_card, kb, entry.get("board"), entry["task_id"])
             # Never fall back to a former owner when a card was rehomed or lost its home.
             home_sid = (current or {}).get("session_id") or ""
-        home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
-                                       home_sid, _hr.read_session_row)
+        home = await asyncio.to_thread(resolve_home, getattr(runner, "session_store", None),
+                                       home_sid, entry.get("route"))
         if home is None or not _ow.is_chat_origin(home):
             logger.warning("kanban boomerang-wake: no live home for %s; wake not re-surfaced", entry.get("task_id"))
             failure["error"] = "no live home session"
+            # An operator home has no session to come back: settle the part now (t_1637dd3e).
+            failure["permanent"] = _operator_home(home_sid)
             return False
         card = {"board": entry.get("board"), "task_id": entry["task_id"], "title": entry.get("title"),
                 "items": [{"kind": entry.get("kind"), "trigger": "boomerang_wake_resurface",
@@ -1712,12 +1756,11 @@ def _card_status(entry: dict) -> str:
 
 async def _home_is_live(runner: Any, entry: dict) -> bool:
     """True when the card's home session is a live chat origin (the precondition ``resurface`` needs)."""
-    from gateway import kanban_home_route as _hr
     from gateway import kanban_owner_wake as _ow
 
     try:
-        home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
-                                       entry.get("home_sid") or "", _hr.read_session_row)
+        home = await asyncio.to_thread(resolve_home, getattr(runner, "session_store", None),
+                                       entry.get("home_sid") or "", entry.get("route"))
         return home is not None and bool(_ow.is_chat_origin(home))
     except Exception as exc:   # unknown = not provably live: keep the chat line
         logger.debug("kanban boomerang-wake: home check for %s failed: %s", entry.get("task_id"), exc)
@@ -1828,12 +1871,10 @@ def _db_parent(runner: Any, home: Any) -> Any:
 async def resolve_parent(runner: Any, entry: dict, *, wait_s: float = PARENT_BUSY_WAIT_S) -> tuple:
     """``(parent_agent, inherit_mode)`` per §5.5: idle live agent → fork requested (eligibility
     decides); mid-turn → wait <= ``wait_s`` (inside the dispatch task, never the tick) then
-    the DB fold; no live agent → summary from the session DB."""
-    from gateway import kanban_home_route as _hr
-    from gateway import kanban_owner_wake as _ow
-
-    home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
-                                   entry.get("home_sid") or "", _hr.read_session_row)
+    the DB fold; no live agent → summary from the session DB. An ``operator:`` home uses the route
+    chat's live session as the parent (t_1637dd3e)."""
+    home = await asyncio.to_thread(resolve_home, getattr(runner, "session_store", None),
+                                   entry.get("home_sid") or "", entry.get("route"))
     if home is None:
         raise RuntimeError("home session not live here")
     deadline = _time.monotonic() + wait_s
@@ -1936,12 +1977,9 @@ async def _note_child_session(entry: dict, state: BoomerangWakeState) -> None:
 
 async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None:
     """Bind the owner's profile for all background resolution and execution."""
-    from gateway import kanban_home_route as _hr
-    from gateway import kanban_owner_wake as _ow
-
     try:
-        home = await asyncio.to_thread(_ow.resolve_owner, getattr(runner, "session_store", None),
-                                       entry.get("home_sid") or "", _hr.read_session_row)
+        home = await asyncio.to_thread(resolve_home, getattr(runner, "session_store", None),
+                                       entry.get("home_sid") or "", entry.get("route"))
         if home is None:
             raise RuntimeError("home session not live here")
         async with runner._async_profile_scope_for_source(home.origin):
