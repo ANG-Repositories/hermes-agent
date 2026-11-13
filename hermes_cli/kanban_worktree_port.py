@@ -1709,7 +1709,7 @@ def release_port_bind(conn, row, host_name: str, missing: List[str], pool_hosts,
     return None
 
 
-def _make_scratch(path: str) -> None:
+def _make_scratch(path: str) -> bool:
     """Create the scratch path a hand-over recorded, so admission never reads it as a lost mount (t_7eb1cbbb).
     A failure is logged; :func:`recover_handover` retries it on the next admission."""
     from hermes_cli.kanban_worker_hosts import WORKSPACE_MODE
@@ -1717,6 +1717,8 @@ def _make_scratch(path: str) -> None:
         os.makedirs(path, mode=int(WORKSPACE_MODE, 8), exist_ok=True)
     except OSError as exc:
         _log.warning("kanban hand-over: could not create %s: %s", path, exc)
+        return False
+    return True
 
 
 HANDOVER_NEVER_CREATED = "handover_target_never_created"
@@ -1736,22 +1738,28 @@ def recover_handover(conn, task) -> Optional[str]:
                     (task.id, ev_id)).fetchone():
         return None
     kind, new = declared_workspace(conn, task.id)
-    if kind != "worktree":
-        kind, new = "scratch", path
     label = f"{HANDOVER_NEVER_CREATED}: {path}"
+    if kind != "worktree":
+        # Scratch: the row already holds the path, so recovery IS creating it. Failing that is no recovery
+        # (Prism 3d337a9df692: a truthy label with the dir still missing re-admitted without end).
+        if not _make_scratch(path) or not os.path.isdir(path):
+            return None
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task.id, HANDOVER_EVENT, {**doc, "kind": "scratch", "recovered": label})
+        _log.warning("kanban dispatch: %s task=%s -> scratch:%s (created)", label, task.id, path)
+        return label
     with _kb.write_txn(conn):
         cur = conn.execute("UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=? AND workspace_path IS ? "
                            "AND claim_lock IS NULL", (kind, new, task.id, path))
         if cur.rowcount != 1:
             return None
         _kb._append_event(conn, task.id, HANDOVER_EVENT, {**doc, "kind": kind, "path": new, "recovered": label})
-    if kind == "scratch":
-        _make_scratch(new)
     _log.warning("kanban dispatch: %s task=%s -> %s:%s", label, task.id, kind, new)
     return label
 
 
-def materialize_handover(conn, task, workspace: str, placed_host=None, runner: Callable = subprocess.run) -> bool:
+def materialize_handover(conn, task, workspace: str, placed_host=None, runner: Callable = subprocess.run, *,
+                         board: Optional[str] = None) -> bool:
     """Fill a handed-over card's fresh workspace with its branch at the head the port clone held, once (no ``spawned``
     after the hand-over), here on the Studio. Raises on failure or a pool placement (a spawn failure). True = cloned."""
     ev_id, doc = _newest_event(conn, task.id, HANDOVER_EVENT)
@@ -1766,7 +1774,7 @@ def materialize_handover(conn, task, workspace: str, placed_host=None, runner: C
         # Prism d6cfdbb53981). A pool placement here would leave no port binding for its clone: refuse it.
         raise RuntimeError(f"hand-over of {task.id} is to the Studio only; refusing a start on {placed_host.name}")
     if doc.get("kind") == "worktree":
-        return _prepare_handover_branch(task, doc, branch, sha, runner)
+        return _prepare_handover_branch(task, doc, branch, sha, runner, board=board)
     script = clone_script(workspace, doc["repo"], mirror, branch, url=handover_url(doc["repo"]), sha=sha,
                           exact=bool(sha))
     proc = runner(["sh", "-c", script], capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -1777,12 +1785,14 @@ def materialize_handover(conn, task, workspace: str, placed_host=None, runner: C
     return True
 
 
-def _prepare_handover_branch(task, doc: dict, branch: str, sha: Optional[str], runner: Callable) -> bool:
+def _prepare_handover_branch(task, doc: dict, branch: str, sha: Optional[str], runner: Callable, *,
+                             board: Optional[str] = None) -> bool:
     """A worktree card handed back to its declared repo (t_7eb1cbbb): put the card's local branch at the head the
     port clone held (``sha``; else origin's branch tip) BEFORE the worktree is made, so the Studio run starts where
     the pool run stopped. A local branch that does not contain that head raises (a spawn failure: its work is never
     reset). No head and no origin branch: False, the worktree branches off the trunk as a fresh card does."""
-    repo = workspace_repo(task.id, task.workspace_path, None, allow_studio_tree=True)[0]
+    # A pathless worktree card's repo is the board's default_workdir, as at port time (Prism e1c1afcd8647).
+    repo = workspace_repo(task.id, task.workspace_path, board_default_workdir(board), allow_studio_tree=True)[0]
     if repo is None:
         raise RuntimeError(f"hand-over of {task.id}: {task.workspace_path} is not in a git repo")
     slug = origin_slug(repo, runner)
@@ -1792,7 +1802,14 @@ def _prepare_handover_branch(task, doc: dict, branch: str, sha: Optional[str], r
     def git(*args):
         return runner(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8",
                       errors="replace", timeout=CLONE_TIMEOUT_S, stdin=subprocess.DEVNULL)
-    git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    fetched = git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    if fetched.returncode != 0 and not sha:
+        # Without a recorded head only origin knows where the branch is (Prism 50ba052e20b3): an absent branch
+        # (ls-remote rc 2) branches off the trunk; a transport failure must not, nor may a stale cached ref.
+        if git("ls-remote", "--exit-code", "--heads", "origin", branch).returncode != 2:
+            raise RuntimeError(f"hand-over of {task.id}: could not fetch {branch} from origin: "
+                               f"{(fetched.stderr or '').strip()[:200]}")
+        return False
     target = sha or f"refs/remotes/origin/{branch}"
     if git("rev-parse", "-q", "--verify", f"{target}^{{commit}}").returncode != 0:
         if sha:

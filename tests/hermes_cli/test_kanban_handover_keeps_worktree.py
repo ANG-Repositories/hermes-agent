@@ -321,3 +321,81 @@ def test_admit_spawns_the_handed_over_worktree_card_at_the_clone_head(operator, 
     assert spawned == [(tid, "worktree", str(tree))], res
     assert kind == "worktree"
     assert _git(tree, "rev-parse", "HEAD") == heads[0] and _git(tree, "branch", "--show-current") == f"wt/{tid}"
+
+
+# -- Prism round 1 on #319 ----------------------------------------------------------------------------------------
+
+def test_no_head_and_an_unreachable_origin_fails_the_spawn(kanban_home, studio_repo):
+    """50ba052e20b3: with no recorded head, a failed fetch is not "the branch is absent"; trunk is never used."""
+    studio, heads, push_branch = studio_repo
+    with kb.connect_closing() as conn:
+        task = _handed_over_task(conn, studio, push_branch, None)
+        _git(studio, "remote", "set-url", "origin", str(studio.parent / "gone.git"))
+        with pytest.raises(RuntimeError, match="could not fetch"):
+            kwt.materialize_handover(conn, task, str(studio))
+    assert subprocess.run(["git", "-C", str(studio), "rev-parse", "-q", "--verify", f"refs/heads/wt/{task.id}"],
+                          capture_output=True).returncode != 0
+
+
+def test_no_head_and_no_branch_on_a_reachable_origin_branches_off_trunk(kanban_home, studio_repo):
+    """Control for 50ba052e20b3: an origin that answers "no such branch" still means a fresh branch."""
+    studio, heads, _push = studio_repo
+    with kb.connect_closing() as conn:
+        task = _handed_over_task(conn, studio, lambda b: None, None)
+        assert kwt.materialize_handover(conn, task, str(studio)) is False
+
+
+def test_a_scratch_target_that_cannot_be_created_is_not_recovered(mounted_root, monkeypatch):
+    """3d337a9df692: recovery that leaves the dir missing returns None and writes nothing (no re-admit loop)."""
+    from tests.hermes_cli.test_kanban_studio_deny_ported_reroute import _ported_card
+    with kb.connect_closing() as conn:
+        tid, pool = _ported_card(conn)
+        new = f"{pool}-from-ace-ai"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (new, tid))
+            kb._append_event(conn, tid, kwt.HANDOVER_EVENT, {
+                "from_host": "ace-ai", "workspace": pool, "path": new, "repo": SLUG, "mirror": "~/m.git",
+                "branch": f"wt/{tid}", "head": None, "missing": ["studio-state"]})
+        before = len(_handovers(conn, tid))
+
+        def boom(*a, **k):
+            raise OSError(13, "denied")
+        monkeypatch.setattr(kwt.os, "makedirs", boom)
+        assert kwt.recover_handover(conn, kb.get_task(conn, tid)) is None
+        result = kbd.DispatchResult()
+        assert kb._workspace_admission_refused(conn, tid, result, board="default", dry_run=False) is True
+        assert len(_handovers(conn, tid)) == before
+    assert result.stranded_by_mount_loss == [tid]
+
+
+def test_a_pathless_worktree_card_uses_the_board_default_repo(kanban_home, studio_repo):
+    """e1c1afcd8647 / 217145c4d8eb: workspace_path NULL -> the board's default_workdir, as at port time."""
+    from hermes_cli import kanban_db_workspace as kbw
+    studio, heads, push_branch = studio_repo
+    kb.write_board_metadata(board=None, default_workdir=str(studio))
+    with kb.connect_closing() as conn:
+        task = _handed_over_task(conn, studio, push_branch, heads[0])
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_path=NULL WHERE id=?", (task.id,))
+            kb._append_event(conn, task.id, kwt.HANDOVER_EVENT, {**_handovers(conn, task.id)[-1], "path": None})
+        task = kb.get_task(conn, task.id)
+        assert kwt.materialize_handover(conn, task, "", board=None) is True
+        tree, branch = kbw._resolve_worktree_workspace(task)
+    assert _git(tree, "rev-parse", "HEAD") == heads[0] and branch == f"wt/{task.id}"
+
+
+def test_the_review_lane_starts_a_handed_over_card_at_the_clone_head(kanban_home, studio_repo, monkeypatch):
+    """f17fcaeafe5b / 5d4d8720fd73: a card reviewed before any Studio run gets the handed-over head too."""
+    from tests.hermes_cli.test_kanban_worker_pool import _tick
+    _cfg(kanban_home, True, ["review_lane", "studio-state"])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    monkeypatch.setattr(kwt, "origin_slug", lambda repo, runner=None: SLUG)
+    studio, heads, push_branch = studio_repo
+    with kb.connect_closing() as conn:
+        task = _handed_over_task(conn, studio, push_branch, heads[0])
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task.id,))
+        conn.commit()
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=2)
+    assert task.id in [t for t, _h in spawned], (spawned, res)
+    tree = studio / ".worktrees" / task.id
+    assert _git(tree, "rev-parse", "HEAD") == heads[0]

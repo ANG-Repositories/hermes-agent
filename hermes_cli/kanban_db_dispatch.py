@@ -8842,7 +8842,8 @@ def _dispatch_once_locked(
                     # t_7eb1cbbb: a worktree card handed back off its port host gets its branch at the clone's head
                     # before the worktree is made from it; a failure is a spawn failure.
                     from hermes_cli import kanban_worktree_port as _kwt
-                    _kwt.materialize_handover(conn, claimed, str(claimed.workspace_path or ""), placed_host)
+                    _kwt.materialize_handover(conn, claimed, str(claimed.workspace_path or ""), placed_host,
+                                              board=board)
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
@@ -9351,6 +9352,11 @@ def _dispatch_once_locked(
             )
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
+                # t_7eb1cbbb (Prism 5d4d8720fd73): a handed-over card reviewed before any Studio run gets its
+                # branch at the clone's head before the worktree is made, as on the ready lane.
+                from hermes_cli import kanban_worktree_port as _kwt
+                _kwt.materialize_handover(conn, claimed, str(claimed.workspace_path or ""), _review_origin_host,
+                                          board=board)
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
