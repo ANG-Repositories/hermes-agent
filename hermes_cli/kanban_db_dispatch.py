@@ -8587,6 +8587,10 @@ def _dispatch_once_locked(
         if _kb._card_skills_refused(conn, row["id"], row_assignee, result, dry_run=dry_run):
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
+            if not dry_run and row["workspace_path"]:
+                # t_681a9c5e: a carry started before the refusal leaves nothing on the pool host
+                _drop_refused_carry(conn, row, spillover, board,
+                                    next((r for t, r in result.workspace_refused if t == row["id"]), "refused"))
             continue
         if admit_floor is not None:
             # kanban admit's measured-danger floor, under this lock, after every
@@ -10042,6 +10046,18 @@ def _background_carry_gate(conn, row, host, spillover, board, defer: bool, out: 
             _kb._log.warning("kanban dispatch: carry comment for %s not written: %s", tid, cexc)
         return why
 
+    # t_681a9c5e (Prism 2a7982d8eadd): the claim's workspace admission runs on the row's workspace before a carry is
+    # started or resumed, so a path the protected-root policy refuses (a workspace symlinked out of its root) is never
+    # copied to a pool host. The refusal is the wait reason, worded as the claim's; the claim-time check stays.
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    try:
+        _task = _kb.get_task(conn, tid)
+        if _task is not None:
+            _kb._validate_workspace_admission(_task, board=board, conn=conn)
+    except WorkspaceUnavailable as exc:
+        _drop_refused_carry(conn, row, spillover, board, str(exc))
+        return str(exc)
+
     if not defer:
         # Operator 16:40 item 2: a one-shot tick (CLI dispatch, admit) holds the board tick lock for its whole run, so
         # it copies inline only what the old caps bounded (CARRY_MAX_BYTES / CARRY_MAX_ENTRIES, the bounded cached
@@ -10078,6 +10094,21 @@ def _background_carry_gate(conn, row, host, spillover, board, defer: bool, out: 
         out[tid] = detail
         return None
     return pending
+
+
+def _drop_refused_carry(conn, row, spillover, board, reason: str) -> None:
+    """Admission refused the card (t_681a9c5e): drop its carry and remove the staging dir a carry left on a pool host,
+    the host its live job or its last carry record names; with neither, no carry was started and nothing is done.
+    One event per refusal names the host and whether the staging dir was removed. Never raises: the refusal stands."""
+    from hermes_cli import kanban_carry_background as _kcb
+    try:
+        payload = _kcb.drop_for_refusal(conn, row["id"], row["workspace_path"], getattr(spillover, "hosts", {}) or {},
+                                        _kb.board_dir(board) / "carry-locks", reason)
+        if payload is not None:
+            with _kbc.write_txn(conn):
+                _kb._append_event(conn, row["id"], _kcb.REFUSED_EVENT, payload)
+    except Exception as exc:
+        _kb._log.warning("kanban dispatch: refused carry of %s not dropped: %s", row["id"], exc)
 
 
 def _finalize_background_carry(task_id: str, host, workspace: str, carries: dict) -> dict:
