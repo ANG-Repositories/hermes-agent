@@ -1846,23 +1846,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     messages,
                     conversation_id=self._conversation_id,
                 )
-                first_after_rebind = bool(self._ingest_cursor_needs_reconcile)
-                if first_after_rebind:
-                    rows_before = self._store.get_session_count(self._session_id)
-                    rec_before = self._last_ingest_reconciliation
                 self._ingest_messages(messages)
-                if first_after_rebind:
-                    # One line per session per agent rebuild: how a restart is judged.
-                    rec = self._last_ingest_reconciliation
-                    rec = {} if rec is rec_before or not rec else rec
-                    logger.info(
-                        "LCM first ingest after rebind: session=%s incoming=%d reason=%s cursor=%s appended=%d",
-                        self._session_id,
-                        len(messages),
-                        rec.get("reason", "none"),
-                        rec.get("cursor"),
-                        self._store.get_session_count(self._session_id) - rows_before,
-                    )
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
@@ -5899,6 +5883,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return redacted_replay_messages
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Persist new messages; log the first ingest after a rebind, whatever the caller.
+
+        The reconcile flag is consumed inside ``_ingest_messages_unlogged``; the
+        INFO line fires exactly when this call consumed it (t_f4a72542).
+        """
+        if not self._ingest_cursor_needs_reconcile:
+            return self._ingest_messages_unlogged(messages)
+        rows_before = self._store.get_session_count(self._session_id)
+        rec_before = self._last_ingest_reconciliation
+        result = self._ingest_messages_unlogged(messages)
+        if not self._ingest_cursor_needs_reconcile:
+            # One line per session per agent rebuild: how a restart is judged.
+            rec = self._last_ingest_reconciliation
+            rec = {} if rec is rec_before or not rec else rec
+            logger.info(
+                "LCM first ingest after rebind: session=%s incoming=%d reason=%s cursor=%s appended=%d",
+                self._session_id,
+                len(messages),
+                rec.get("reason", "none"),
+                rec.get("cursor"),
+                self._store.get_session_count(self._session_id) - rows_before,
+            )
+        return result
+
+    def _ingest_messages_unlogged(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
