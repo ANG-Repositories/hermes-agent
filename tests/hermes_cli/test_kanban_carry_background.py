@@ -46,19 +46,21 @@ class Loopback:
 
     def __call__(self, argv, **kw):
         kw.pop("stdin", None)
+        if "input" not in kw:
+            kw["stdin"] = subprocess.DEVNULL
         env = dict(os.environ)
         if self.fake_bin is not None:
             env["PATH"] = f"{self.fake_bin}:{env['PATH']}"
         if argv[0] == "ssh":
             self.calls.append(("ssh", self._map(argv[-1])))
-            return subprocess.run(["bash", "-c", self._map(argv[-1])], env=env, stdin=subprocess.DEVNULL, **kw)
+            return subprocess.run(["bash", "-c", self._map(argv[-1])], env=env, **kw)
         assert argv[0] == "rsync", argv
         i = argv.index("-e")
         local = argv[:i] + argv[i + 2:]
         local[-1] = self._map(local[-1].split(":", 1)[1])
         self.calls.append(("rsync", local))
         if self.kill_rsync_after_files is None:
-            proc = subprocess.run(local, env=env, stdin=subprocess.DEVNULL, **kw)
+            proc = subprocess.run(local, env=env, **kw)
             self.rsync_rc.append(proc.returncode)
             return proc
         dest = Path(local[-1])
@@ -380,7 +382,7 @@ def test_a_kept_sync_carry_is_refreshed_in_a_process_that_never_started_a_backgr
         tid, path = _card(conn)
         host = _plan(free=2).hosts["ace-ai"]
         job = kcb.Job(tid, host, str(path), None, lock_dir)
-        assert kcb.run_sync(job, lock_dir, runner=loop)
+        assert kcb.run_sync(job, lock_dir, runner=loop)   # its own tick handed it to a claim, which was skipped
         assert kcb.poll(tid, host, str(path), lock_dir)[0] == "running"
         _wait_done(tid)
         monkeypatch.setattr(kcb, "FRESH_S", 3600.0)
@@ -403,6 +405,9 @@ def test_a_finished_copy_that_waited_is_refreshed_before_the_claim(board, loop, 
         (path / "notes.md").write_bytes(b"v2\n")
         later = time.time() + 5
         os.utime(path / "notes.md", (later, later))   # an edit after the copy: rsync's quick check sees the mtime
+        # the first look at a finished copy hands it to the claim whatever its age (operator 16:40 item 4); a claim
+        # that passed it over (no slot) lets the next look refresh it
+        assert kcb.poll(tid, host, str(path), lock_dir)[0] == "done"
         assert kcb.poll(tid, host, str(path), lock_dir)[0] == "running"   # the refresh, off the tick
         _wait_done(tid)
         monkeypatch.setattr(kcb, "FRESH_S", 3600.0)
@@ -482,6 +487,248 @@ def test_caps_knob_parsing():
     assert kcb.caps_on({"placement": {"carry_caps": True}}) is True
     assert kcb.caps_on({"placement": {"carry_caps": "off"}}) is False
     assert kcb.caps_on({"placement": {"carry_caps": "on"}}) is True
+
+
+# -- checkouts whose git dir does not travel: rebuilt on the pool host (operator 16:40 11-12, item 1) ---------------
+
+def _g(*args, cwd=None):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main",
+                           "-c", "commit.gpgsign=false", *args], cwd=cwd, check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+def _origin_with_many_files(tmp_path: Path, n: int) -> Path:
+    """A bare origin whose main holds ``n`` tracked files (they never travel: the pool clone gets them). ``tmp_path``
+    must lie outside the loopback's Studio root: the loopback rewrites that root in every remote script."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _g("init", "-q", str(seed))
+    for i in range(n):
+        d = seed / f"src{i // 1000}"
+        d.mkdir(exist_ok=True)
+        (d / f"f{i}.txt").write_text(f"{i}\n")
+    (seed / "tracked.txt").write_text("v1\n")
+    (seed / ".gitignore").write_text("*.env\n__pycache__/\n")
+    _g("add", "-A", cwd=seed)
+    _g("commit", "-qm", "base", cwd=seed)
+    origin = tmp_path / "origin.git"
+    _g("clone", "-q", "--bare", str(seed), str(origin))
+    return origin
+
+
+def _git_view(repo: Path):
+    return (_g("rev-parse", "HEAD", cwd=repo), _g("status", "--porcelain", cwd=repo), _g("stash", "list", cwd=repo),
+            _g("branch", "--show-current", cwd=repo))
+
+
+def _carry_until_claimed(conn, tid, ticks=6):
+    waits = []
+    for _ in range(ticks):
+        res, spawned = _tick_full(conn, defer_pool_clone=True)
+        if tid in res.placement_waits:
+            waits.append(res.placement_waits[tid])
+        if (tid, "ace-ai") in spawned:
+            return waits, spawned
+        _wait_done(tid)
+    raise AssertionError(f"never claimed; waits: {waits}")
+
+
+def test_a_linked_worktree_of_a_repo_outside_the_workspace_is_rebuilt_with_its_state(board, loop, tmp_path,
+                                                                                       tmp_path_factory):
+    """Item 1a: over 20,000 entries, a linked worktree whose git dir lives outside the workspace (as every waiting
+    card's ./repo does: ~/.hermes/.git/worktrees/repoN), with one unpushed commit, one modified tracked file, one
+    untracked file, one ignored file and one stash entry. HEAD, status and the stash list match on the pool host."""
+    origin = _origin_with_many_files(tmp_path_factory.mktemp("origin"), kwh.CARRY_MAX_ENTRIES + 500)
+    home = tmp_path / "home"
+    _g("clone", "-q", str(origin), str(home))
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        wt = path / "repo"
+        _g("worktree", "add", "-q", "-b", "card/x", str(wt), cwd=home)
+        assert (wt / ".git").is_file()
+        assert kwh.carried_gitdir_loss(str(path), (".",), ()) is not None  # the check that refused before
+        (wt / "tracked.txt").write_text("stashed\n")
+        _g("stash", "push", "-q", "-m", "a stash", cwd=wt)
+        (wt / "new.txt").write_text("committed, not pushed\n")
+        _g("add", "new.txt", cwd=wt)
+        _g("commit", "-qm", "unpushed", cwd=wt)
+        (wt / "tracked.txt").write_text("modified\n")
+        (wt / "scratch.txt").write_text("untracked\n")
+        (wt / "secret.env").write_text("ignored\n")
+        (wt / "staged.txt").write_text("staged\n")
+        _g("add", "staged.txt", cwd=wt)
+        assert kcb.census(str(path))[1] > kwh.CARRY_MAX_ENTRIES
+        before = _git_view(wt)
+        waits, _spawned = _carry_until_claimed(conn, tid)
+        ev = _events(conn, tid, kwh.CARRIED_EVENT)[-1]
+        assert not _events(conn, tid, kcb.FAILED_EVENT)
+    dest = Path(loop._map(str(wt)))
+    assert (dest / ".git").is_dir()                        # a self-contained checkout on the pool host
+    assert _git_view(dest) == before
+    assert (dest / "secret.env").read_text() == "ignored\n" and (dest / "scratch.txt").read_text() == "untracked\n"
+    assert _g("diff", "--cached", "--name-only", cwd=dest) == "staged.txt"
+    assert all("over the carry" not in w for w in waits), waits   # item 1c
+    rebuilt = ev["background"]["rebuilt"]
+    assert [r["rel"] for r in rebuilt] == ["repo"] and rebuilt[0]["stash"] == 1
+    # the tracked files travelled through the clone, not rsync: only the changed / untracked / ignored ones did
+    assert rebuilt[0]["files"] <= 4
+    assert _git_view(wt) == before                          # the Studio checkout is untouched
+
+
+def test_a_clone_borrowing_objects_through_alternates_is_rebuilt_self_contained(board, loop, tmp_path,
+                                                                                tmp_path_factory):
+    """Item 1b: a clone whose objects/info/alternates points outside the workspace (the Studio mirror). On the pool
+    host it holds every object itself: ``git fsck --connectivity-only`` passes with the alternates target gone."""
+    origin = _origin_with_many_files(tmp_path_factory.mktemp("origin"), kwh.CARRY_MAX_ENTRIES + 500)
+    mirror = tmp_path / "mirror.git"
+    _g("clone", "-q", "--mirror", str(origin), str(mirror))
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        clone = path / "clone"
+        _g("clone", "-q", "--reference", str(mirror), str(origin), str(clone))
+        assert (clone / ".git" / "objects" / "info" / "alternates").exists()
+        _g("checkout", "-q", "-b", "card/y", cwd=clone)
+        (clone / "more.txt").write_text("unpushed\n")
+        _g("add", "more.txt", cwd=clone)
+        _g("commit", "-qm", "unpushed", cwd=clone)
+        (clone / "tracked.txt").write_text("modified\n")
+        before = _git_view(clone)
+        waits, _spawned = _carry_until_claimed(conn, tid)
+    dest = Path(loop._map(str(clone)))
+    assert not (dest / ".git" / "objects" / "info" / "alternates").exists()
+    mirror.rename(tmp_path / "mirror-gone.git")             # the alternates target absent
+    _g("fsck", "--connectivity-only", cwd=dest)
+    assert _git_view(dest) == before
+    assert all("over the carry" not in w for w in waits), waits   # item 1c
+
+
+def test_a_checkout_with_no_usable_origin_rides_a_full_bundle(board, loop, tmp_path):
+    """A linked worktree of a repo whose origin is neither GitHub nor a local path: every commit rides the bundle."""
+    home = tmp_path / "home"
+    _g("init", "-q", str(home))
+    (home / "a.txt").write_text("a\n")
+    _g("add", "a.txt", cwd=home)
+    _g("commit", "-qm", "a", cwd=home)
+    _g("remote", "add", "origin", "git@gitlab.example:x/y.git", cwd=home)
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        wt = path / "wt"
+        _g("worktree", "add", "-q", "-b", "card/z", str(wt), cwd=home)
+        (wt / "a.txt").write_text("edited\n")
+        before = _git_view(wt)
+        waits, _spawned = _carry_until_claimed(conn, tid)
+        rebuilt = _events(conn, tid, kwh.CARRIED_EVENT)[-1]["background"]["rebuilt"]
+    assert rebuilt[0]["full_bundle"] is True
+    assert _git_view(Path(loop._map(str(wt)))) == before
+
+
+def test_one_shot_tick_never_copies_past_the_old_caps_under_the_tick_lock(board, loop):
+    """Item 2: a one-shot tick (CLI dispatch, admit) holds the board tick lock throughout, so a dir over the old caps
+    is not copied there: the card waits carry_pending, nothing is copied and no lock is taken; the gateway's tick
+    carries it."""
+    files = {f"d{i // 1000}/f{i}": b"x" for i in range(kwh.CARRY_MAX_ENTRIES + 10)}
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn, files)
+        res, spawned = _tick_full(conn)
+        assert spawned == []
+        assert res.placement_waits[tid].startswith("carry_pending:ace-ai: larger than a one-shot tick copies")
+        assert not any(c[0] == "rsync" for c in loop.calls)
+        assert not _events(conn, tid, kcb.STARTED_EVENT)
+        _waits, spawned = _carry_until_claimed(conn, tid)    # the gateway tick (defer) carries it
+    assert (tid, "ace-ai") in spawned
+
+
+def test_one_shot_copy_steps_are_bounded_by_the_old_timeout(board, loop, monkeypatch):
+    """Item 2: the inline copy runs each step under CARRY_TIMEOUT_SECONDS, as before this card."""
+    seen = []
+    real = loop.__call__
+
+    def spy(argv, **kw):
+        if argv[0] == "rsync":
+            seen.append(kw.get("timeout"))
+        return real(argv, **kw)
+    monkeypatch.setattr(kcb, "_run", spy)
+    with kb.connect_closing() as conn:
+        tid, _path = _card(conn)
+        _res, spawned = _tick_full(conn)
+    assert (tid, "ace-ai") in spawned and seen == [kwh.CARRY_TIMEOUT_SECONDS]
+
+
+def test_a_finished_copy_is_claimed_even_when_ticks_are_further_apart_than_fresh_s(board, loop, monkeypatch):
+    """Item 4: ticks more than FRESH_S apart. The first tick that sees the finished copy claims it; it is not
+    refreshed into another copy on every tick."""
+    monkeypatch.setattr(kcb, "FRESH_S", 0.0)    # every finished copy counts as older than FRESH_S
+    with kb.connect_closing() as conn:
+        tid, _path = _card(conn)
+        _tick_full(conn, defer_pool_clone=True)
+        _wait_done(tid)
+        time.sleep(0.01)
+        _res, spawned = _tick_full(conn, defer_pool_clone=True)
+    assert (tid, "ace-ai") in spawned
+    assert sum(1 for c in loop.calls if c[0] == "rsync") == 1
+
+
+def test_finalize_into_a_nonempty_workspace_copies_a_file_of_equal_size_and_mtime(board, loop, tmp_path):
+    """Prism 707d9e8389dd: the merge finalize must not skip a staged file whose size and mtime equal the old one."""
+    with kb.connect_closing() as conn:
+        _tid, path = _card(conn)
+    host = _plan(free=2).hosts["ace-ai"]
+    dest = Path(loop._map(str(path)))
+    dest.mkdir(parents=True)
+    (dest / "notes.md").write_text("old\n")
+    (dest / "keep").write_text("k\n")
+    staging = Path(loop._map(kcb.staging_path(str(path))))
+    staging.mkdir(parents=True)
+    (staging / "notes.md").write_text("new\n")
+    st = (dest / "notes.md").stat()
+    os.utime(staging / "notes.md", ns=(st.st_atime_ns, st.st_mtime_ns))
+    kcb.finalize(host, str(path), runner=loop)
+    assert (dest / "notes.md").read_text() == "new\n" and not staging.exists()
+
+
+# -- cases of the capped suites (pinned to carry_caps: true there) re-covered on the default background path --------
+
+def test_default_path_a_carried_card_reruns_on_the_carry_host_and_is_never_carried_again(board, loop):
+    """test_kanban_studio_pins_and_carry::test_a_carried_card_reruns_on_the_carry_host_never_on_the_stale_studio_copy,
+    on the background path: the workspace_carried event binds every later run to the carry host."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        _carry_until_claimed(conn, tid)
+        assert kwh.carried_host(conn, tid, str(path)) == "ace-ai"
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?", (tid,))
+        conn.commit()
+        n = sum(1 for c in loop.calls if c[0] == "rsync")
+        _res, spawned = _tick_full(conn, defer_pool_clone=True)
+        assert len(_events(conn, tid, kcb.STARTED_EVENT)) == 1
+    assert (tid, "ace-ai") in spawned
+    assert sum(1 for c in loop.calls if c[0] == "rsync") == n   # no second copy over the remote work
+
+
+def test_default_path_a_shared_workspace_is_never_carried(board, loop):
+    """test_kanban_studio_pins_and_carry::test_a_shared_workspace_is_never_carried, on the background path."""
+    with kb.connect_closing() as conn:
+        tid, path = _card(conn)
+        other = kb.create_task(conn, title="o", assignee="alpha")
+        kbw.set_workspace_path(conn, other, str(path))
+        _res, spawned = _tick_full(conn, defer_pool_clone=True)
+        assert not _events(conn, tid, kcb.STARTED_EVENT)
+    assert all(t != tid for t, _h in spawned) and loop.calls == []
+
+
+def test_default_path_a_failed_finalize_is_a_spawn_failure_never_an_empty_dir_run(board, loop, monkeypatch):
+    """test_kanban_studio_pins_and_carry::test_local_files_carry_failure_is_a_spawn_failure_never_an_empty_dir_run,
+    on the background path: a finalize that fails releases the claim; no worker starts and no carried event."""
+    def boom(*a, **k):
+        raise RuntimeError("finalize rc=1")
+    monkeypatch.setattr(kcb, "finalize", boom)
+    with kb.connect_closing() as conn:
+        tid, _path = _card(conn)
+        _tick_full(conn, defer_pool_clone=True)
+        _wait_done(tid)
+        _res, spawned = _tick_full(conn, defer_pool_clone=True)
+        assert not _events(conn, tid, kwh.CARRIED_EVENT)
+        status = kb.get_task(conn, tid).status
+    assert all(t != tid for t, _h in spawned) and status != "running"
 
 
 # -- the acceptance fixture: >= 3 GiB, >= 120,000 entries (opt-in) --------------------------------------------------

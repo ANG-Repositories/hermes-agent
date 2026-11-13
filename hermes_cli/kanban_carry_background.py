@@ -7,13 +7,14 @@ card wait. Here the tick only STARTS the carry (a background thread) and moves o
 
 The carry, in order (all in the background thread):
 
-1. census: bytes and entries of the source (no cap, no wall bound), and the git-dir check a file copy needs
-   (``carried_gitdir_loss``): a checkout whose git dir would not travel is REFUSED here and the card keeps the capped
-   rule (split carry / wait) as before;
+1. census: bytes and entries of the source (no cap, no wall bound) and, in the same walk, every git checkout in it.
+   A checkout whose git dir would not travel as files (``carried_gitdir_loss``: a linked worktree of a repo outside
+   the workspace, a clone borrowing objects through alternates) is REBUILT on the pool host from origin plus one git
+   bundle (see "checkouts whose git dir does not travel" below), never refused for it;
 2. the destination is prepared (the same mkdir every placed run gets) and its free space read; ``need > free`` is the
    one size refusal left: ``No room on <host>: need N, free M``;
 3. ``rsync -a --partial --delete`` over fleet ssh into a STAGING dir next to the workspace (``.carry-<leaf>``), never
-   into the workspace itself. An interrupted copy leaves only the staging dir, which the next attempt on that host
+   into the workspace itself (the rebuilt checkouts excluded, then rebuilt inside it). An interrupted copy leaves only the staging dir, which the next attempt on that host
    resumes; a later carry to another host removes it first.
 
 At the claim the staging dir is moved onto the workspace path in one ssh call (``finalize``), and the existing
@@ -22,6 +23,9 @@ At the claim the staging dir is moved onto the workspace path in one ssh call (`
 Events on the card: ``workspace_carry_started`` / ``workspace_carry_progress`` (at most one a minute) /
 ``workspace_carry_failed`` (``state``: clean | resumable | refused) / ``workspace_carried`` (with bytes, entries,
 seconds and the CPU the Studio paid).
+
+A one-shot tick (CLI dispatch, admit: no ``defer``) holds the board tick lock throughout, so it copies inline only a
+dir within the old caps, each copy step under CARRY_TIMEOUT_SECONDS; a bigger one waits for the gateway's tick.
 
 Kill switch: ROOT ``kanban.placement.carry_caps: true`` restores the in-tick carry and its two caps exactly.
 """
@@ -93,24 +97,34 @@ class CarryNoRoom(WorkspaceUnavailable, RuntimeError):
 
 
 class CarryRefused(RuntimeError):
-    """The files cannot travel as files (a git dir outside the workspace); the capped rule decides the card."""
+    """Nothing can be carried at all (a path that is not shell-inert, a checkout with no commit whose git dir does
+    not travel); the capped rule decides the card."""
 
 
-def census(path: str) -> Tuple[int, int]:
-    """``(bytes, entries)`` of ``path``: every entry below it, symlinks counted and never followed. No cap."""
+def census(path: str, repos: Optional[Dict[str, int]] = None) -> Tuple[int, int]:
+    """``(bytes, entries)`` of ``path``: every entry below it, symlinks counted and never followed. No cap.
+    ``repos`` (t_f3a411c2 item 1): filled in the same walk with every checkout (a dir holding ``.git``, ``.`` = the
+    root) -> the bytes below it outside its ``.git``, which is what a rebuild of it checks out on the pool host."""
     total = entries = 0
-    pending = [path]
+    pending = [(path, ".", None)]
     while pending:
-        current = pending.pop()
+        current, rel, owner = pending.pop()
         if current != path and os.path.islink(current):
             continue
         with os.scandir(current) as scan:
-            for entry in scan:
-                entries += 1
-                info = entry.stat(follow_symlinks=False)
-                total += info.st_size
-                if stat.S_ISDIR(info.st_mode):
-                    pending.append(entry.path)
+            batch = list(scan)
+        if repos is not None and any(e.name == ".git" for e in batch):
+            owner = rel
+            repos.setdefault(owner, 0)
+        for entry in batch:
+            entries += 1
+            info = entry.stat(follow_symlinks=False)
+            total += info.st_size
+            if repos is not None and owner is not None and entry.name != ".git":
+                repos[owner] += info.st_size
+            if stat.S_ISDIR(info.st_mode):
+                child = entry.name if rel == "." else f"{rel}/{entry.name}"
+                pending.append((entry.path, child, None if entry.name == ".git" else owner))
     return total, entries
 
 
@@ -146,6 +160,220 @@ def remove_staging(host: PoolHost, workspace: str, runner: Optional[Callable] = 
     return getattr(proc, "returncode", 1) == 0
 
 
+# -- checkouts whose git dir does not travel: rebuilt on the pool host (operator 16:40 11-12, item 1) ---------------
+# A linked worktree of the Studio's home repo (``.git`` a file pointing into ~/.hermes/.git/worktrees) or a clone
+# borrowing objects through objects/info/alternates cannot be copied as files: its git dir stays behind. Such a
+# checkout is REBUILT on the pool host instead (the operator's suggested shape): a clone of its origin through the
+# host's mirror, then ONE git bundle over the same fleet ssh holding every commit the Studio's origin-tracking refs do
+# not have (unpushed work, the stash entries, and the staged index recorded as one commit), then HEAD, index and stash
+# set from it, and only the files that differ from HEAD (modified, untracked, ignored minus regenerable caches) sent by
+# rsync. The ~36,000 tracked files of a checkout never travel. Nothing is pushed anywhere: the pool host only READS
+# origin. A checkout with no GitHub/local origin, or whose bundle lacks a prerequisite even after a fetch of origin,
+# gets a FULL bundle (every commit it needs) and is cloned from that, so no git state is a reason to wait.
+
+GIT_TIMEOUT_S = 600
+
+
+def _git(repo: Optional[str], *args, env: Optional[dict] = None, input: Optional[bytes] = None,
+         ok=(0,)) -> bytes:
+    argv = ["git", "--no-optional-locks"] + (["-C", repo] if repo else []) + list(args)
+    proc = subprocess.run(argv, capture_output=True, input=input, timeout=GIT_TIMEOUT_S,
+                          env=env, **({} if input is not None else {"stdin": subprocess.DEVNULL}))
+    if proc.returncode not in ok:
+        raise RuntimeError(f"git {' '.join(args[:3])} in {repo}: rc={proc.returncode}: "
+                           f"{proc.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    return proc.stdout
+
+
+def rebuilds_of(src: str, repos) -> Tuple[str, ...]:
+    """The checkouts among ``repos`` (workspace-relative, ``.`` = the root) whose git dir would not travel with a
+    file copy, shallowest first."""
+    from hermes_cli import kanban_worker_hosts as _kwh
+    out = [r for r in repos if _kwh.carried_gitdir_loss(src, (r,), (), nested=False) is not None]
+    return tuple(sorted(out, key=lambda r: (0 if r == "." else r.count("/") + 1, r)))
+
+
+def _origin_url(repo: str) -> Optional[str]:
+    """The URL the pool host clones from: GitHub (normalised to https, as every pool clone is) or a local path.
+    None: anything else (the checkout then rides a full bundle)."""
+    from hermes_cli import kanban_worktree_port as _kwt
+    raw = _git(repo, "remote", "get-url", "origin", ok=(0, 2, 128)).decode("utf-8", "replace").strip()
+    m = _kwt._SLUG_RE.match(raw)
+    if m:
+        return f"https://github.com/{m.group(1)}.git"
+    if raw.startswith("/") or raw.startswith("file://"):
+        return raw
+    return None
+
+
+def plan_rebuild(src: str, rel: str, others=()) -> dict:
+    """What the pool host needs to rebuild the checkout ``src/rel`` (read-only on the Studio): origin url (or None),
+    branch, HEAD, the stash entries, the files that differ from HEAD and the paths deleted since HEAD. The bundle is
+    built by :func:`make_bundle`. ``others``: the other rebuilt checkouts; one nested in this one is never listed as
+    its files. Raises CarryRefused when there is nothing to rebuild from (no commit at HEAD)."""
+    from hermes_cli import kanban_worker_hosts as _kwh
+    repo = os.path.join(src, rel) if rel != "." else src
+    head = _git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", ok=(0, 1)).decode().strip()
+    if not head:
+        raise CarryRefused(f"checkout {rel}: no commit at HEAD, and its git dir does not travel")
+    branch = _git(repo, "symbolic-ref", "-q", "--short", "HEAD", ok=(0, 1)).decode().strip()
+    stash = _kwh.stash_entries(repo)
+    if stash is None:
+        raise RuntimeError(f"checkout {rel}: stash unreadable")
+    dirs = _kwh._gitfile_dirs(repo)
+    common = dirs[1] if dirs else os.path.realpath(os.path.join(repo, ".git"))
+    gitdir = dirs[0] if dirs else common
+    exclude_file = os.path.join(common, "info", "exclude")
+    nul = lambda b: [p for p in b.decode("utf-8", "surrogateescape").split("\0") if p]  # noqa: E731
+    changed = nul(_git(repo, "diff", "HEAD", "--name-only", "-z", "--no-renames", "--ignore-submodules=none"))
+    untracked = nul(_git(repo, "ls-files", "-z", "--others", "--exclude-standard", "--directory"))
+    ignored = [p for p in nul(_git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+                                   "--directory"))
+               if not _kwh.regenerable_cache(p.rstrip("/"))]
+    pre = "" if rel == "." else rel + "/"
+    nested = {o[len(pre):] for o in others if o != rel and (rel == "." or o.startswith(pre))}
+
+    def _keep(p: str) -> bool:
+        q = p.rstrip("/")
+        return not any(q == n or q.startswith(n + "/") for n in nested)
+    files = sorted({p for p in changed + untracked + ignored
+                    if _keep(p) and os.path.lexists(os.path.join(repo, p.rstrip("/")))})
+    deleted = sorted(p for p in changed if _keep(p) and not os.path.lexists(os.path.join(repo, p)))
+    url = _origin_url(repo)
+    return {"rel": rel, "repo": repo, "url": url, "nested": sorted(nested), "branch": branch, "head": head, "stash": stash,
+            "files": files, "deleted": deleted, "gitdir": gitdir, "common": common,
+            "exclude": Path(exclude_file).read_bytes() if os.path.isfile(exclude_file) else None}
+
+
+def make_bundle(plan: dict, full: bool = False) -> Tuple[bytes, str]:
+    """``(bundle bytes, index commit)`` for ``plan``: HEAD, the stash entries and the staged index (one commit on
+    HEAD), less every commit the checkout's ``refs/remotes/origin/*`` already have (the pool clone fetched those from
+    origin) unless ``full``. Built in a throwaway bare repo that borrows the checkout's objects through an alternate:
+    nothing in the checkout or its common dir is written."""
+    import shutil
+    import tempfile
+    objects = os.path.realpath(os.path.join(plan["common"], "objects"))
+    have = [] if full or not plan["url"] else [
+        ln.split()[0] for ln in _git(plan["repo"], "for-each-ref", "--format=%(objectname) %(objecttype)",
+                                     "refs/remotes/origin").decode().splitlines() if ln.endswith(" commit")]
+    tmp = tempfile.mkdtemp(prefix="kanban-carry-")
+    try:
+        bare, out = os.path.join(tmp, "b.git"), os.path.join(tmp, "carry.bundle")
+        _git(tmp, "init", "-q", "--bare", bare)
+        with open(os.path.join(bare, "objects", "info", "alternates"), "w", encoding="utf-8") as f:
+            f.write(objects + "\n")
+        g = bare
+        # a COPY of the index: write-tree may store its cache-tree back into the file it reads
+        index = os.path.join(tmp, "index")
+        if os.path.exists(os.path.join(plan["gitdir"], "index")):
+            shutil.copyfile(os.path.join(plan["gitdir"], "index"), index)
+        tree = _git(g, "write-tree", env=dict(os.environ, GIT_INDEX_FILE=index)).decode().strip()
+        idx = _git(g, "-c", "user.name=kanban-carry", "-c", "user.email=kanban-carry@localhost",
+                   "commit-tree", tree, "-p", plan["head"], "-m", f"kanban carry: index of {plan['rel']}"
+                   ).decode().strip()
+        refs = [("refs/carry/head", plan["head"]), ("refs/carry/index", idx)] + \
+            [(f"refs/carry/stash/{i}", e[0]) for i, e in enumerate(plan["stash"])]
+        for ref, sha in refs:
+            _git(g, "update-ref", ref, sha)
+        spec = "\n".join([r for r, _s in refs] + [f"^{h}" for h in have]) + "\n"
+        _git(g, "bundle", "create", out, "--stdin", input=spec.encode())
+        return Path(out).read_bytes(), idx
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+NEEDS_FULL_RC = 10
+
+
+def rebuild_script(dest: str, plan: dict, idx: str, mirror: Optional[str]) -> str:
+    """Remote sh, the bundle on stdin. Clone origin at ``dest`` (through the mirror; a dir that already is a clone of
+    that origin is reused, so a refresh fetches nothing new), or with no origin clone the (full) bundle itself; then
+    unbundle, put HEAD / index / stash where the Studio has them, and PROVE HEAD and the stash list (rc 5 / rc 8).
+    rc 10: the bundle's prerequisites are missing even after one fetch of origin (the caller resends it full)."""
+    d = shlex.quote(dest)
+    head = shlex.quote(plan["head"])
+    url = plan["url"]
+    m = None
+    if mirror:
+        m = ('"$HOME"/' + shlex.quote(mirror[2:])) if mirror.startswith("~/") else shlex.quote(mirror)
+    if url:
+        get = ((f"if [ -d {m}/objects ]; then git -c gc.auto=0 -c fetch.prune=false --git-dir={m} fetch -q "
+                f"--no-write-fetch-head origin || true; fi; "
+                f"git clone -q --no-checkout --reference-if-able {m} --dissociate \"$url\" \"$d\"; ") if m else
+               "git clone -q --no-checkout \"$url\" \"$d\"; ")
+        reuse = "[ -d \"$d/.git\" ] && [ \"$(git -C \"$d\" remote get-url origin 2>/dev/null)\" = \"$url\" ]"
+    else:
+        get = "git init -q \"$d\"; "   # no origin to clone: the full bundle carries every commit
+        reuse = "false"
+    checkout = (f"git checkout -q -f -B {shlex.quote(plan['branch'])} {head}; " if plan["branch"]
+                else f"git checkout -q -f --detach {head}; ")
+    stores = "".join(f"git -c user.name=kanban-carry -c user.email=kanban-carry@localhost stash store -q -m "
+                     f"{shlex.quote(e[2])} {e[0]}; " for e in reversed(tuple(plan["stash"])))
+    want = shlex.quote(" ".join(e[0] for e in plan["stash"]))
+    exclude = ""
+    if plan.get("exclude") is not None:
+        exclude = (f"mkdir -p .git/info; printf %s {shlex.quote(plan['exclude'].decode('utf-8', 'surrogateescape'))}"
+                   " > .git/info/exclude; ")
+    return ("set -e; " + (f"export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0={m}; "
+                          if m else "") +
+            f"d={d}; url={shlex.quote(url or '')}; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; "
+            f"if {reuse}; then :; else rm -rf -- \"$d\"; mkdir -p -- \"$(dirname \"$d\")\"; {get}fi; cd \"$d\"; "
+            "if ! git bundle verify -q \"$t\" >/dev/null 2>&1; then git fetch -q origin >/dev/null 2>&1 || true; "
+            f"git bundle verify -q \"$t\" >/dev/null 2>&1 || exit {NEEDS_FULL_RC}; fi; "
+            "git bundle unbundle \"$t\" >/dev/null; " + checkout +
+            f"git reset -q --hard {head}; git clean -fdq; git read-tree {shlex.quote(idx)}; "
+            "git stash clear; " + stores + exclude +
+            f"[ \"$(git rev-parse HEAD)\" = {head} ] || exit 5; "
+            "have=$(git stash list --format=%H | tr '\\n' ' ' | sed 's/ $//'); "
+            f"[ \"$have\" = {want} ] || exit 8")
+
+
+def _err(proc) -> str:
+    e = getattr(proc, "stderr", b"") or b""
+    return (e.decode("utf-8", "replace") if isinstance(e, bytes) else str(e)).strip()[:200]
+
+
+def carry_rebuild(host: PoolHost, staging: str, plan: dict, runner: Callable, rsync_base: list,
+                  timeout: Optional[float]) -> Dict[str, object]:
+    """Rebuild one checkout of ``plan`` under ``staging`` on ``host``: its git state from origin + the bundle, then
+    the paths deleted since HEAD removed, then the files that differ from HEAD sent by rsync. Returns what was sent;
+    raises RuntimeError naming the step."""
+    from hermes_cli import kanban_worktree_port as _kwt
+    kw = {"timeout": timeout} if timeout else {}
+    rel = plan["rel"]
+    dest = staging if rel == "." else f"{staging}/{rel}"
+    slug = _kwt._SLUG_RE.match(plan["url"] or "")
+    mirror = f"{_kwt.DERIVED_MIRROR_ROOT}/{slug.group(1)}.git" if slug else None
+    full = plan["url"] is None
+    while True:
+        bundle, idx = make_bundle(plan, full=full)
+        proc = runner(_ssh_argv(host, rebuild_script(dest, plan, idx, mirror)), input=bundle, capture_output=True,
+                      **kw)
+        rc = getattr(proc, "returncode", 1)
+        if rc == NEEDS_FULL_RC and not full:
+            full = True  # the pool clone lacks a commit the Studio's origin refs have: send every commit
+            continue
+        if rc != 0:
+            raise RuntimeError(f"rebuild of {rel} on {host.name} rc={rc}: {_err(proc)}")
+        break
+    if plan["deleted"]:
+        payload = "".join(p + "\0" for p in plan["deleted"]).encode("utf-8", "surrogateescape")
+        proc = runner(_ssh_argv(host, f"cd {shlex.quote(dest)} && xargs -0 rm -rf --"), input=payload,
+                      capture_output=True, **kw)
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError(f"rebuild of {rel} on {host.name}: deletions rc={proc.returncode}: {_err(proc)}")
+    if plan["files"]:
+        payload = "".join(p.rstrip("/") + "\0" for p in plan["files"]).encode("utf-8", "surrogateescape")
+        # a listed dir holding a nested rebuilt checkout: that checkout is rebuilt on its own, never sent as files
+        excl = [f"--exclude=/{n}/" for n in plan["nested"]]
+        proc = runner([*rsync_base, "-r", *excl, "--from0", "--files-from=-", "--", f"{plan['repo']}/",
+                       f"{host.target}:{dest}/"], input=payload, capture_output=True, **kw)
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError(f"rebuild of {rel} on {host.name}: files rc={proc.returncode}: {_err(proc)}")
+    return {"rel": rel, "bundle_bytes": len(bundle), "full_bundle": full, "files": len(plan["files"]),
+            "deleted": len(plan["deleted"]), "stash": len(plan["stash"])}
+
+
 class Job:
     """One background carry. ``phase``: queued, census, space, copy, copied. ``stats`` once copied."""
 
@@ -164,6 +392,9 @@ class Job:
         self.stale_cleaned: Optional[bool] = None
         self.fd: Optional[int] = None  # the (host, path) carry lock, held from the start through the finalize
         self.done_at: Optional[float] = None
+        self.rebuilt: Tuple[str, ...] = ()
+        self.timeout: Optional[float] = None  # a total bound on each copy step: one-shot (run_sync) carries only
+        self.seen_done = False  # a poll already handed this finished copy to a claim (see poll's refresh rule)
 
     def elapsed(self) -> float:
         return time.monotonic() - self.t0
@@ -179,11 +410,17 @@ def run(job: Job, runner: Optional[Callable] = None) -> Dict[str, object]:
         raise CarryRefused(f"{src!r} is not a shell-inert path")
     dest = src
     job.phase = "census"
-    job.bytes, job.entries = census(src)
-    # Prism b68c58398adb: from the workspace root itself, so a checkout rooted AT the workspace is checked too
-    lost = _kwh.carried_gitdir_loss(src, (".",), ())
-    if lost is not None:
-        raise CarryRefused(lost)
+    repos: Dict[str, int] = {}
+    job.bytes, job.entries = census(src, repos)
+    # t_f3a411c2 item 1: a checkout whose git dir would not travel as files (a linked worktree of a repo outside the
+    # workspace, a clone borrowing objects through alternates; Prism b68c58398adb: the root counts too) is rebuilt on
+    # the pool host from origin + a bundle, never refused for it. The census walk above found the checkouts.
+    rebuild = rebuilds_of(src, sorted(repos))
+    for rel in rebuild:
+        if rel != "." and not _kwh.carry_path_safe(f"{src}/{rel}"):
+            raise CarryRefused(f"checkout {rel!r} is not a shell-inert path and its git dir does not travel")
+    plans = [plan_rebuild(src, rel, rebuild) for rel in rebuild]
+    job.rebuilt = tuple(rebuild)
     if job.stale is not None and job.stale.name != job.host.name:
         # a resumable staging dir an earlier attempt left on another host: that host is cleaned first, under that
         # host's carry lock (Prism 4d42b4210a5a); while another dispatcher holds it, the dir is left alone
@@ -199,22 +436,29 @@ def run(job: Job, runner: Optional[Callable] = None) -> Dict[str, object]:
     _kwh.prepare_remote_workspace(job.host, dest, runner)
     free, staged = remote_space(job.host, dest, runner)
     job.staged_before = staged
-    need = max(0, job.bytes - staged)
+    # what lands on the host: the workspace as counted, plus each rebuilt checkout's git dir, estimated at the size
+    # of its checked-out files (a pack is smaller than the tree it holds)
+    need = max(0, job.bytes + sum(repos[r] for r in rebuild) - staged)
     if need > free:
         raise CarryNoRoom(job.host.name, need, free, staged)
     job.phase = "copy"
     ssh = _ssh_argv(job.host, "")[:-2]
-    proc = runner(["rsync", "-a", "--partial", "--delete", f"--timeout={RSYNC_IO_TIMEOUT_S}",
-                   "-e", " ".join(shlex.quote(a) for a in ssh), "--", f"{src}/",
-                   f"{job.host.target}:{staging_path(dest)}/"],
-                  capture_output=True, text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
-    if getattr(proc, "returncode", 1) != 0:
-        raise RuntimeError(f"rsync rc={getattr(proc, 'returncode', '?')}: "
-                           f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+    base = ["rsync", "-a", "--partial", f"--timeout={RSYNC_IO_TIMEOUT_S}", "-e", " ".join(shlex.quote(a) for a in ssh)]
+    if "." not in rebuild:
+        # everything outside the rebuilt checkouts travels as files; --delete never touches an excluded dir, so a
+        # rebuilt checkout already in the staging dir (a resumed or refreshed carry) is kept and only updated below
+        excl = [f"--exclude=/{rel}/" for rel in rebuild]
+        proc = runner([*base, "--delete", *excl, "--", f"{src}/", f"{job.host.target}:{staging_path(dest)}/"],
+                      capture_output=True, text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                      **({"timeout": job.timeout} if job.timeout else {}))
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError(f"rsync rc={getattr(proc, 'returncode', '?')}: "
+                               f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+    rebuilt = [carry_rebuild(job.host, staging_path(dest), plan, runner, base, job.timeout) for plan in plans]
     job.phase = "copied"
     job.stats = {"bytes": job.bytes, "entries": job.entries, "seconds": round(time.monotonic() - t0, 2),
                  "cpu_s": round((time.thread_time() - cpu0) + (_children_cpu() - ch0), 2),
-                 "staging": staging_path(dest)}
+                 "staging": staging_path(dest), **({"rebuilt": rebuilt} if rebuilt else {})}
     job.done_at = time.monotonic()
     return job.stats
 
@@ -223,11 +467,11 @@ def finalize(host: PoolHost, workspace: str, runner: Optional[Callable] = None) 
     """Move the finished staging dir onto the workspace path on ``host`` (one ssh call). An empty or absent
     workspace is replaced whole; one that already holds files gets the staging merged over it with rsync, as the
     in-tick carry did (never deleted from; a destination symlink is replaced, never written through: Prism
-    0e52f77edd32). Raises when the staging dir is missing or the move fails (the staging dir stays)."""
+    0e52f77edd32; ``-I`` so a file of equal size and mtime is still copied: Prism 707d9e8389dd). Raises when the staging dir is missing or the move fails (the staging dir stays)."""
     dest = workspace.rstrip("/")
     s, w = shlex.quote(staging_path(dest)), shlex.quote(dest)
     proc = _ssh(host, f"[ -d {s} ] || exit 4; if rmdir -- {w} 2>/dev/null || [ ! -e {w} ]; then mv -- {s} {w}; "
-                      f"else rsync -a -- {s}/ {w}/ && rm -rf -- {s}; fi", runner, FINALIZE_TIMEOUT_S)
+                      f"else rsync -a -I -- {s}/ {w}/ && rm -rf -- {s}; fi", runner, FINALIZE_TIMEOUT_S)
     if getattr(proc, "returncode", 1) != 0:
         raise RuntimeError(f"carry to {host.name}: finalize rc={getattr(proc, 'returncode', '?')}: "
                            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
@@ -312,14 +556,17 @@ def poll(task_id: str, host: PoolHost, workspace: str, lock_dir: Path, *, start:
             if not job.future.done():
                 return "running", job
             exc = job.future.exception()
-            if exc is None and job.done_at is not None and now - job.done_at > FRESH_S:
+            # Operator 16:40 item 4: a finished copy is handed to a claim at least once, whatever its age, so ticks
+            # more than FRESH_S apart still claim it; only a copy a claim already passed over is refreshed.
+            if exc is None and job.done_at is not None and now - job.done_at > FRESH_S and job.seen_done:
                 # Prism 38c86a910163: a copy that waited (no slot, no claim) is refreshed before it is claimed; the
                 # second rsync into the same staging dir sends only what changed on the Studio since, under the
                 # lock this job still holds
-                job.done_at = None
+                job.done_at, job.seen_done = None, False
                 job.future = _executor().submit(run, job, runner)
                 return "running", job
             if exc is None:
+                job.seen_done = True
                 return "done", job
             del _jobs[task_id]
             release(job)
@@ -386,6 +633,7 @@ def run_sync(job: Job, lock_dir: Path, runner: Optional[Callable] = None) -> boo
     if fd is None:
         return False
     job.fd, job.lock_dir = fd, job.lock_dir or lock_dir
+    job.seen_done = True  # this tick claims it
     try:
         stats = run(job, runner)
     except BaseException:

@@ -10032,7 +10032,15 @@ def _background_carry_gate(conn, row, host, spillover, board, defer: bool, out: 
         return why
 
     if not defer:
+        # Operator 16:40 item 2: a one-shot tick (CLI dispatch, admit) holds the board tick lock for its whole run, so
+        # it copies inline only what the old caps bounded (CARRY_MAX_BYTES / CARRY_MAX_ENTRIES, the bounded cached
+        # walk, each copy step under CARRY_TIMEOUT_SECONDS). A bigger dir waits carry_pending for the gateway's
+        # next tick, which carries it in the background; admit prints `held: carry_pending:<host>: ...`.
+        if not _kb._kwh.carry_size_ok(ws):
+            return (f"{pending}: larger than a one-shot tick copies ({_kb._kwh.CARRY_MAX_BYTES} bytes / "
+                    f"{_kb._kwh.CARRY_MAX_ENTRIES} entries); the gateway dispatcher carries it off the tick")
         job = _kcb.Job(tid, host, ws, stale, lock_dir)
+        job.timeout = _kb._kwh.CARRY_TIMEOUT_SECONDS
         _event(_kcb.STARTED_EVENT, {"host": host.name, "path": ws, "background": False})
         try:
             if not _kcb.run_sync(job, lock_dir):
