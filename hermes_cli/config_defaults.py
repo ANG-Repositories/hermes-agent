@@ -1662,6 +1662,9 @@ DEFAULT_CONFIG = {
         # A kanban-eligible unit whose card cannot spawn: "detached" runs it as a detached child process
         # (survives a restart; never a gateway thread). "in_process" is the kill switch (t_49e02567).
         "background_kanban_fallback": "detached",
+        # delegate_task placement="pool" (t_30537365): "opt_in" lets a task run its terminal/file commands on a
+        # fleet pool host leased from the allocator; "off" ignores the field (kill switch).
+        "pool_placement": "off",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
