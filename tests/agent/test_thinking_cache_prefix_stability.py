@@ -292,3 +292,36 @@ def test_a_session_carrying_kept_thinking_compacts_before_the_limit(lane_registr
     assert cc._stale_thinking_on_wire() is True
     assert cc.should_compress(kept) is True and kept < limit
     assert cc.should_compress(latest_only) is False  # charging the newest turn only would not fire
+
+
+def test_tail_walk_and_preflight_agree_when_only_requested_provider_names_the_lane(lane_registry):
+    """A named relay resolves as ``provider="custom"`` with the lane in ``requested_provider``.
+    The compressor holds no ``requested_provider``; bound to its agent it must still give the
+    preflight's answer, or a thinking-heavy session looks over threshold to preflight and fully
+    tail-protected to the walk (Prism e401e23b1d4b)."""
+    import weakref
+    from unittest.mock import patch
+
+    from agent.context_compressor import ContextCompressor
+    from agent.turn_context import _agent_stale_thinking_on_wire
+    from run_agent import AIAgent
+
+    route = dict(api_mode="anthropic_messages", provider="custom", model="claude-opus-5-5",
+                 base_url="http://127.0.0.1:1/unregistered")
+    class _Agent(SimpleNamespace):  # weak-referenceable, as AIAgent is
+        __slots__ = ("__weakref__",)
+
+    agent = _Agent(requested_provider="claude-alr", tools=None, **route)
+    assert _agent_stale_thinking_on_wire(agent) is True
+    cc = ContextCompressor(quiet_mode=True, config_context_length=200_000, **route)
+    cc._route_owner = weakref.ref(agent)
+    assert cc._stale_thinking_on_wire() is True
+    lane_registry["window"] = "latest"  # kill switch: both sides flip together
+    assert _agent_stale_thinking_on_wire(agent) is False and cc._stale_thinking_on_wire() is False
+
+    with (patch("model_tools.get_tool_definitions", return_value=[]),
+          patch("model_tools.check_toolset_requirements", return_value={}),
+          patch("agent.process_bootstrap.OpenAI")):
+        real = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",  # gitleaks:allow
+                       quiet_mode=True, skip_context_files=True, skip_memory=True)
+    assert real.context_compressor._route_owner() is real  # init binds the walk to its agent

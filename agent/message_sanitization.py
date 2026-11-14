@@ -797,9 +797,10 @@ def stale_thinking_reaches_wire(api_mode: Any, provider: Any, model: Any, base_u
         return True
     if (api_mode or "") != "anthropic_messages":
         return False
-    from agent.preserved_thinking import replays_all_thinking
+    from agent.preserved_thinking import WINDOW_CONTIGUOUS, resolve_preserve_thinking
 
-    return replays_all_thinking(provider, requested_provider, base_url)
+    enabled, window, _ = resolve_preserve_thinking(provider, requested_provider, base_url)
+    return enabled and window == WINDOW_CONTIGUOUS
 
 
 def apply_reasoning_content_policy(source_msg: dict, api_msg: dict, needs_thinking_pad: bool) -> None:

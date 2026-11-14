@@ -243,17 +243,6 @@ def preserve_thinking_window(provider: Optional[str], requested_provider: Option
     return resolve_preserve_thinking(provider, requested_provider, base_url)[1]
 
 
-def replays_all_thinking(provider: Optional[str], requested_provider: Optional[str] = None,
-                         base_url: Optional[str] = None) -> bool:
-    """True when every assistant turn's thinking rides the wire (flag on, window ``contiguous``).
-
-    The compaction trigger and the tail-budget walks then charge every turn's thinking, so kept
-    thinking brings compaction forward instead of pushing a request over the model limit.
-    """
-    enabled, window, _ = resolve_preserve_thinking(provider, requested_provider, base_url)
-    return enabled and window == WINDOW_CONTIGUOUS
-
-
 def strip_thinking_at_boundary(message: Dict[str, Any]) -> Dict[str, Any]:
     """Drop thinking blocks from a compaction-kept assistant row's replay channels.
 
