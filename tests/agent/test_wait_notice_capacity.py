@@ -251,19 +251,53 @@ def test_turn_start_restore_unchanged_when_relay_has_capacity_or_is_silent(monke
     assert fw.restore_allowed(_restoring_agent(), probe=False).allowed is True
 
 
-def test_eligibility_answer_is_marked_ineligible_when_relay_capacity_is_exhausted(monkeypatch):
-    """Rebuild path: the overlay makes every model_eligible reader hold."""
+def _alr_primary_agent():
+    """A primary on an /eligibility relay lane (claude-alr), currently on its fallback."""
+    return SimpleNamespace(provider="claude-btpr", model=FABLE,
+                           base_url="http://127.0.0.1:18820/v1", session_id="s1",
+                           _primary_runtime={"provider": "claude-alr", "model": FABLE,
+                                             "base_url": DTLR},
+                           _rate_limited_until=0, _current_turn_id="s1:2")
+
+
+def test_eligibility_fn_returns_the_relays_own_answer_untouched(monkeypatch):
+    """Prism P2 (8020d4ad): the capacity hold lives in ``_primary_capacity_hold`` only;
+    ``/eligibility`` answers are no longer rewritten from the capacity probe."""
     from agent import fallback_policy as fp
     from agent import fallback_wiring as fw
 
     _relay(monkeypatch, exhausted=25, eligible=0)
     raw = fp.parse_eligibility({"instance_id": "6:18816", "bound_eligible": True,
                                 "model_eligible": True, "snapshot_age_s": 1})
-    got = fw._with_relay_capacity(raw, DTLR, FABLE)
-    assert (got.model_eligible, got.bound_eligible, got.model_eligible_known) == (False, False, True)
-    _relay(monkeypatch, exhausted=23, eligible=2)
-    rc.clear_cache()
-    assert fw._with_relay_capacity(raw, DTLR, FABLE) is raw
+    monkeypatch.setattr(fp, "fetch_eligibility", lambda *a, **k: raw)
+    assert not hasattr(fw, "_with_relay_capacity")
+    assert fw._eligibility_fn(_alr_primary_agent())() is raw
+
+
+@pytest.mark.parametrize("exhausted,eligible,returns", [(25, 0, False), (23, 2, True)])
+def test_fallback_failed_never_returns_to_an_exhausted_primary(monkeypatch, exhausted, eligible, returns):
+    """The fallback fails with a quota class and /eligibility says the primary seat is
+    fine: the return to the primary is still held while the relay reports the primary
+    model exhausted (the gate the removed overlay used to cover)."""
+    from agent import fallback_policy as fp
+    from agent import fallback_wiring as fw
+    from agent import agent_runtime_helpers as arh
+
+    _relay(monkeypatch, exhausted=exhausted, eligible=eligible)
+    eligible_answer = fp.parse_eligibility({"instance_id": "6:18816", "bound_eligible": True,
+                                            "model_eligible": True, "snapshot_age_s": 1})
+    monkeypatch.setattr(fp, "fetch_eligibility", lambda *a, **k: eligible_answer)
+    st = SimpleNamespace(active=True, ff_disabled_until=0.0, primary_provider="claude-alr")
+    monkeypatch.setattr(fw, "sticky_policy_enabled", lambda: True)
+    monkeypatch.setattr(fw, "failure_class", lambda agent, reason: ("quota_seat", None))
+    monkeypatch.setattr(fw, "on_fallback", lambda agent: True)
+    monkeypatch.setattr(fw, "key_for", lambda agent: SimpleNamespace(primary_provider="claude-alr"))
+    monkeypatch.setattr(fw, "_state", lambda key: st)
+    restored = []
+    monkeypatch.setattr(arh, "restore_primary_runtime", lambda agent, **k: restored.append(k) or True)
+    plan = fw.pre_failover(_alr_primary_agent(), "rate_limit")
+    assert plan.returned is returns
+    assert bool(restored) is returns
 
 
 def test_budget_cut_episode_holds_on_an_ineligible_relay_answer():
@@ -315,3 +349,108 @@ def test_rebuilt_session_resumes_its_fallback_while_primary_is_exhausted():
         with mock.patch.object(fp, "record_return", lambda *a, **k: st):
             free = fp.decide_rebuild(store, key, T0, live_session_id="s1", capacity_hold=lambda: None)
         assert free.action == "return"
+
+
+# -- Prism 8020d4ad: redirect escape + probe stampede ----------------------------
+
+def _serve(handler_cls):
+    import http.server
+    import threading
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_probe_never_follows_a_redirect_off_the_checked_origin(monkeypatch):
+    """Prism P1: /health 302 -> another origin must not be requested. The repro used
+    ``Location: http://169.254.169.254/latest/meta-data/``; a second loopback server
+    stands in for it so the test can see whether the opener went there."""
+    import http.server
+
+    hits = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            body = json.dumps({"fable_allowance": {"exhausted": 25, "of": 25}, "model": FABLE,
+                               "eligible_count": 0}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    target = _serve(Target)
+    elsewhere = f"http://127.0.0.1:{target.server_port}/latest/meta-data/"
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", elsewhere)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    relay = _serve(Redirector)
+    try:
+        monkeypatch.setattr(rc, "fetch_json", rc._http_get_json)
+        monkeypatch.setattr(rc, "PROBE_TIMEOUT_S", 2.0)
+        cap = rc.model_capacity(f"http://127.0.0.1:{relay.server_port}/v1", FABLE)
+        assert hits == []          # the redirect target was never requested
+        assert cap is None         # a redirect is unknown capacity, never "exhausted"
+        assert rc._http_get_json(f"http://127.0.0.1:{relay.server_port}/health", 2.0) is None
+        assert hits == []
+    finally:
+        relay.shutdown()
+        target.shutdown()
+
+
+def test_concurrent_waiters_share_one_probe(monkeypatch):
+    """Prism P2: N sessions asking at once while the cache is cold cause one probe
+    (one /health + one /eligibility), and all of them get its answer."""
+    import threading
+    import time as _t
+
+    calls = []
+    gate = threading.Event()
+
+    def slow_fetch(url, timeout):
+        calls.append(url)
+        gate.wait(5)
+        if url.endswith("/health"):
+            return {"fable_allowance": {"exhausted": 25, "of": 25, "earliest_reset": RESET}}
+        return {"model": FABLE, "eligible_count": 0, "model_eligible": False}
+
+    monkeypatch.setattr(rc, "fetch_json", slow_fetch)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(rc.model_capacity(DTLR, FABLE)))
+               for _ in range(8)]
+    for t in threads:
+        t.start()
+    deadline = _t.monotonic() + 5
+    while not calls and _t.monotonic() < deadline:
+        _t.sleep(0.01)
+    _t.sleep(0.3)                  # every thread has reached model_capacity by now
+    gate.set()
+    for t in threads:
+        t.join(5)
+    assert len(calls) == 2, calls
+    assert len(results) == 8 and all(r == results[0] for r in results)
+    assert rc.exhausted(results[0])
+
+
+def test_inflight_probe_that_raises_releases_waiters(monkeypatch):
+    def boom(url, timeout):
+        raise RuntimeError("seam failure")
+
+    monkeypatch.setattr(rc, "fetch_json", boom)
+    with pytest.raises(RuntimeError):
+        rc.model_capacity(DTLR, FABLE)
+    assert rc._INFLIGHT == {}
+    assert rc.model_capacity(DTLR, FABLE) is None   # cached unknown, no stuck waiter

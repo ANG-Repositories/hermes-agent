@@ -227,11 +227,9 @@ def _eligibility_fn(agent: Any):
             return None
         provider, model, base_url, sid = route
         if provider.strip().lower() in ("claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf"):
-            elig = fp.fetch_eligibility(base_url, model=model, session=sid or None)
-        else:
-            elig = fp.fetch_eligibility(base_url, model=model,
-                                        user=f"hermes-sess:{sid}" if sid else None)
-        return _with_relay_capacity(elig, base_url, model)
+            return fp.fetch_eligibility(base_url, model=model, session=sid or None)
+        return fp.fetch_eligibility(base_url, model=model,
+                                    user=f"hermes-sess:{sid}" if sid else None)
 
     def _cached():
         turn = getattr(agent, "_current_turn_id", None)
@@ -274,24 +272,6 @@ def _primary_capacity_hold(agent: Any) -> Optional[str]:
     except Exception:  # noqa: BLE001 — unknown is never a hold
         logger.debug("relay capacity hold check failed", exc_info=True)
         return None
-
-
-def _with_relay_capacity(elig: Optional["fp.Eligibility"], base_url: str,
-                         model: str) -> Optional["fp.Eligibility"]:
-    """An ``/eligibility`` answer, marked model-ineligible when the relay's own capacity
-    answer says the model cannot be served (so every return gate that reads
-    ``model_eligible`` holds the session on its fallback, rebuilds included)."""
-    if elig is None:
-        return None
-    try:
-        from agent.fork_ext.relay_capacity import exhausted, model_capacity
-        if exhausted(model_capacity(base_url, model)):
-            import dataclasses
-            return dataclasses.replace(elig, model_eligible=False, bound_eligible=False,
-                                       model_eligible_known=True)
-    except Exception:  # noqa: BLE001
-        logger.debug("relay capacity overlay failed", exc_info=True)
-    return elig
 
 
 def _bench_fn(agent: Any, key: StickyKey, now: float):
@@ -421,7 +401,9 @@ def pre_failover(agent: Any, reason: Any,
         if on_fallback(agent):
             key = key_for(agent)
             state = _state(key)
-            if state is not None and state.active:
+            # The relay's capacity answer for the primary model is read in one place,
+            # _primary_capacity_hold, at each gate that can put a session back on it.
+            if state is not None and state.active and not _primary_capacity_hold(agent):
                 d = fp.fallback_failed_allowed(
                     state, cls, now, primary_provider=key.primary_provider,
                     eligibility=_eligibility_fn(agent),

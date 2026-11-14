@@ -11,7 +11,9 @@ This module reads the relay's own answer, on loopback only:
 * ``GET /eligibility?model=<m>`` -> ``eligible_count`` / ``model_eligible``.
 
 One read per (relay, model) per :data:`CACHE_TTL_S`, shared by every session on the
-process (12 waiting sessions must not mean 12 probes per poll). Any failure is
+process (12 waiting sessions must not mean 12 probes per poll); callers that arrive
+while that read is in flight wait for it instead of starting their own. Redirects are
+never followed (the loopback check covers only the URL built here). Any failure is
 ``None``: unknown is never read as "no capacity".
 """
 
@@ -32,12 +34,26 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _LOCK = threading.Lock()
 #: (origin, model) -> (fetched_at_monotonic, capacity dict or None)
 _CACHE: dict = {}
+#: (origin, model) -> Event set when the one in-flight probe for that key has stored
+#: its answer; concurrent callers wait on it instead of probing too.
+_INFLIGHT: dict = {}
+#: Longest a caller waits on another caller's probe (two GETs at PROBE_TIMEOUT_S).
+_INFLIGHT_WAIT_S = 2 * PROBE_TIMEOUT_S + 0.5
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is never followed: the loopback check covers only the URL we built,
+    so a 3xx to another host (e.g. a metadata endpoint) would escape it. A refused
+    redirect surfaces as an HTTPError, i.e. unknown capacity."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
 
 
 def _http_get_json(url: str, timeout: float) -> Optional[dict]:
     try:
-        # Loopback only, never through an env proxy.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Loopback only: never through an env proxy, never across a redirect.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect())
         with opener.open(url, timeout=timeout) as resp:
             if getattr(resp, "status", 200) != 200:
                 return None
@@ -114,9 +130,25 @@ def model_capacity(base_url: Any, model: Any, *, now: Optional[float] = None) ->
         hit = _CACHE.get(key)
         if hit is not None and now - hit[0] < CACHE_TTL_S:
             return hit[1]
-    cap = _read(origin, model)
-    with _LOCK:
-        _CACHE[key] = (now, cap)
+        done = _INFLIGHT.get(key)
+        leader = done is None
+        if leader:
+            done = _INFLIGHT[key] = threading.Event()
+    if not leader:
+        # Another caller is probing this key: share its answer (unknown if it is late).
+        done.wait(_INFLIGHT_WAIT_S)
+        with _LOCK:
+            hit = _CACHE.get(key)
+        return hit[1] if hit is not None and hit[0] >= now - CACHE_TTL_S else None
+    cap = None
+    try:
+        cap = _read(origin, model)
+    finally:
+        with _LOCK:
+            _CACHE[key] = (now, cap)
+            if _INFLIGHT.get(key) is done:
+                del _INFLIGHT[key]
+        done.set()
     return cap
 
 

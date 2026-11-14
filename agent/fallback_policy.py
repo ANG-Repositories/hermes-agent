@@ -987,6 +987,9 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
             # cold/compaction branches below would only replay the refusal).
             # A budget cut counts too (2026-11-13: a 600 s cut on claude-dtlr/Fable
             # with 23/25 seats drained returned to Fable next turn and looped).
+            # This reads the session-scoped /eligibility answer on any relay URL; the
+            # loopback-only capacity probe is a separate gate (fallback_wiring.
+            # _primary_capacity_hold) and is not folded into this answer.
             # Unreachable / stale -> None -> the branches below, unchanged; so is an
             # answer without a ``model_eligible`` key (an older relay build).
             elig = eligibility()
