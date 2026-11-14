@@ -756,6 +756,20 @@ class TestRestartResumeOfMergedUserTurn:
         _rebuilt_agent_ingest(tmp_path, history)
         assert _rows(tmp_path) == n0 + 1
 
+    def test_unchanged_pasted_timestamp_in_a_rewrapped_row_is_not_stored_again(self, tmp_path):
+        """Prism 2efa6eb1a00c: the same pasted stamp in a row whose leading wrappers
+        differ still matches."""
+        stored, history = self._shape()
+        pasted = "\n\n[Fri 2026-11-13 20:21:33 PST] failure"
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user"
+                     and r["content"].endswith(history[idx]["content"].split("] ", 1)[1]))
+        stored[s_idx] = dict(stored[s_idx], content=stored[s_idx]["content"] + pasted)
+        history[idx] = {"role": "user", "content": history[idx]["content"] + pasted}
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
 
 class TestRestartResumeOfTwiceStoredUserTurn:
     """t_ca2c9470: session 20261023_031240_9df89e67 at the 21:22:26 boot stored 89
