@@ -877,6 +877,23 @@ class TestRestartResumeOverStoredOnlyRows:
         _rebuilt_agent_ingest(tmp_path, history)
         assert _count(tmp_path, _OP_INTERRUPTED["content"]) == 2
 
+    def test_resent_prompt_matched_provisionally_before_a_realignment_is_stored(self, tmp_path):
+        # Prism cb28d89fa826 (head 4f1b0444): the user re-sends the interrupted
+        # prompt. Its row re-render-matches the old one, the walk re-aligns past
+        # the residue on the next tool call, and the re-sent prompt must be
+        # re-checked there instead of passed.
+        nxt = _turn(2)
+        stored = ([{"role": "system", "content": "You are Apollo."}] + _turn(0) + _turn(1)
+                  + [{"role": "user", "content": "[Thu 2026-11-12 10:00:00 PST] proceed"}, dict(_OP_INTERRUPTED),
+                     {"role": "user", "content": "[System note: The previous turn was interrupted by a gateway "
+                                                 "shutdown; the gateway is now back online.]"}]
+                  + nxt[1:])
+        resent = {"role": "user", "content": "[Fri 2026-11-13 09:00:00 PST] proceed"}
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, _turn(0) + _turn(1) + [resent] + nxt[1:]
+                              + [{"role": "user", "content": "[kanban] a genuinely new wake"}])
+        assert _count(tmp_path, resent["content"]) == 1
+
 
 class TestRestartRewrittenToolResult:
     """t_99e38df0, session 20261109_011227_2e109b: at the walk's position the store

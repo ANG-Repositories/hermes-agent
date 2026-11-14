@@ -1184,13 +1184,17 @@ class ReconcileMixin:
                 # turn's residue, or turns stored between two moved dedup
                 # copies; t_99e38df0). Re-align on the next host row that is a
                 # once-stored tool call, only forward: stored rows are skipped,
-                # host rows never, and each one still has to match.
+                # host rows never, and each one still has to match: the walk
+                # resumes at the first host row not passed, so provisional user
+                # rows matched under the old offset are checked again (Prism
+                # cb28d89fa826, a re-sent prompt after an interrupted turn).
                 anchor = next(
                     (at - j for j, at in enumerate(anchor_pos[idx:], start=idx) if at is not None),
                     None,
                 )
                 if anchor is not None and anchor > offset:
                     offset = anchor
+                    idx = cursor
                     continue
                 break
             if role == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
