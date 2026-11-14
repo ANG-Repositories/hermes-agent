@@ -1209,17 +1209,21 @@ class ReconcileMixin:
         user rows with "\\n\\n" (agent_runtime_helpers._merge_consecutive_users),
         the live row was stored as ``[ts] <a>\\n\\n[ts] [Triggering ...]\\n\\n<b>``,
         and the restarted gateway rebuilds it from the clean parts as
-        ``<a>\\n\\n<b>``. So the wrappers are removed at the start of every part,
-        each part with its own budget. Accepted limit: user text that itself
-        starts a paragraph with a wrapper is keyed without it.
+        ``<a>\\n\\n<b>``. A merge boundary is proven only by the gateway's own
+        per-message timestamp opening the part, so a later part loses that
+        timestamp and the triggering note after it, nothing else. Any other
+        paragraph, a ``[System note: ...]`` one included, is content and stays
+        in the key.
         """
-        parts = []
-        rest = str(content or "").rstrip()
-        while True:
-            part, separator, rest = ReconcileMixin._strip_user_row_wrappers(rest).partition("\n\n")
+        key, separator, rest = ReconcileMixin._strip_user_row_wrappers(str(content or "").rstrip()).partition("\n\n")
+        parts = [key]
+        while separator:
+            stamped = _USER_ROW_TIMESTAMP_PREFIX.sub("", rest, count=1)
+            if stamped != rest:
+                rest = _USER_ROW_DISCORD_NOTE_PREFIX.sub("", stamped, count=1)
+            part, separator, rest = rest.partition("\n\n")
             parts.append(part)
-            if not separator:
-                return "\n\n".join(parts)
+        return "\n\n".join(parts)
 
     @staticmethod
     def _strip_user_row_wrappers(text: str) -> str:

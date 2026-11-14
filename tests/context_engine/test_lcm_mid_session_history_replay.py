@@ -715,6 +715,20 @@ class TestRestartResumeOfMergedUserTurn:
         _rebuilt_agent_ingest(tmp_path, history)
         assert _count(tmp_path, history[idx]["content"]) == 1
 
+    def test_interior_wrapper_led_paragraph_the_store_lacks_is_stored(self, tmp_path):
+        """Prism 33e6e68e02a5: only a gateway timestamp proves a merge boundary, so
+        an interior "[System note: ...]" paragraph is content, not a wrapper."""
+        stored, history = self._shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user"
+                     and r["content"].endswith(history[idx]["content"].split("] ", 1)[1]))
+        stored[s_idx] = dict(stored[s_idx], content=stored[s_idx]["content"] + "\n\n[Ace] B")
+        history[idx] = {"role": "user", "content": (
+            history[idx]["content"] + "\n\n[System note: payment failed]\n\n[Ace] B")}
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
+
 
 class TestRestartResumeOfTwiceStoredUserTurn:
     """t_ca2c9470: session 20261023_031240_9df89e67 at the 21:22:26 boot stored 89
