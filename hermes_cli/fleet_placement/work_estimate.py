@@ -174,6 +174,8 @@ def _estimate(klass, host, history, seed, *, p, window, min_rows):
     history = list(history)
     seed = seed or Estimate()
     base = klass.split(":", 1)[0]
+    v = dict.fromkeys((*AXES, "cpu_s", "wall_s"))
+    source = "seed"
     for k in ((klass, base) if base != klass else (klass,)):
         rows = sorted((r for r in history if r.get("class") == k), key=lambda r: float(r.get("at") or 0.0))
         here = [r for r in rows if r.get("host") == host]
@@ -181,21 +183,25 @@ def _estimate(klass, host, history, seed, *, p, window, min_rows):
             if len(pick) < min_rows:
                 continue
             last = pick[-window:]
-            v = {ax: (_axis(last, ax, p) if sum(_num(r.get(ax)) and r[ax] >= 0 for r in last) >= min_rows else None)
-                 for ax in ("cpus", "ram_gb", "gpu_mib", "cpu_s", "wall_s")}
-            for ax in v:                                  # a corroborated step change, never one outlier
+            # Resolve each axis independently; a sparse host axis still gets the
+            # fleet/base-class measurements before falling back to its seed.
+            if source == "seed":
+                source = f"p{int(p * 100)}:{k}@{where} n={len(last)}"
+            for ax in v:
+                if v[ax] is not None:
+                    continue
+                if sum(_num(r.get(ax)) and r[ax] >= 0 for r in last) < min_rows:
+                    continue
+                v[ax] = _axis(last, ax, p)
                 step = _step_floor(last, ax, v[ax])
                 if step is not None:
                     v[ax] = step
-            seeded = [ax for ax in AXES if v[ax] is None]
-            return Estimate(cpus=max(FLOOR["cpus"], v["cpus"] if v["cpus"] is not None else seed.cpus),
-                            ram_gb=max(FLOOR["ram_gb"], v["ram_gb"] if v["ram_gb"] is not None else seed.ram_gb),
-                            gpu_mib=max(FLOOR["gpu_mib"], v["gpu_mib"] if v["gpu_mib"] is not None else seed.gpu_mib),
-                            cpu_s=v["cpu_s"], wall_s=v["wall_s"],
-                            source=f"p{int(p * 100)}:{k}@{where} n={len(last)}"), seeded
-    return (dataclasses.replace(seed, cpus=max(FLOOR["cpus"], seed.cpus), ram_gb=max(FLOOR["ram_gb"], seed.ram_gb),
-                                gpu_mib=max(FLOOR["gpu_mib"], seed.gpu_mib), source="seed"),
-            list(AXES))
+    if source == "seed":
+        return (dataclasses.replace(seed, cpus=max(FLOOR["cpus"], seed.cpus), ram_gb=max(FLOOR["ram_gb"], seed.ram_gb),
+                                    gpu_mib=max(FLOOR["gpu_mib"], seed.gpu_mib), source="seed"), list(AXES))
+    seeded = [ax for ax in AXES if v[ax] is None]
+    return Estimate(**{ax: max(FLOOR[ax], v[ax] if v[ax] is not None else getattr(seed, ax)) for ax in AXES},
+                    cpu_s=v["cpu_s"], wall_s=v["wall_s"], source=source), seeded
 
 
 def table_seed_for(table):

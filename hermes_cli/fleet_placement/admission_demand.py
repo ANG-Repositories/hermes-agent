@@ -65,7 +65,14 @@ def _root(root: Optional[Path] = None) -> Path:
     if root is not None:
         return Path(root)
     env = os.environ.get("PLACEMENT_HOME")
-    return Path(env) if env else Path(__file__).resolve().parents[2]
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parents[2]
+    try:   # t_5d7db1b6: a release of the fleet home answers the home (its receipt names the home, never a release)
+        from fleet_root import release_home
+    except ImportError:   # a partial copy without the resolver is never a release
+        return here
+    return Path(release_home(here) or here)
 
 
 def _say(key: str, msg: str) -> None:
@@ -1045,6 +1052,7 @@ def _demand_of(doc, now: float, max_age: float, host: str,
     if now - float(at) > max_age or float(at) - now > max_age:
         return None
     hosts = doc.get("hosts")
+    spread = 1
     if hosts is not None:
         if not isinstance(hosts, list):
             return None
@@ -1057,10 +1065,12 @@ def _demand_of(doc, now: float, max_age: float, host: str,
         names = {((resolve(str(h)) if resolve else None) or str(h)).lower() for h in hosts}
         if want.lower() not in names:
             return None
+        spread = len(names)      # the queue's units start on one of these hosts, never on each (t_d8103e2f)
     cpus, ram, gpu = unit.get("cpus"), unit.get("ram_gb"), unit.get("gpu_mib", 0.0)
     if not (_num(cpus) and _num(ram) and _num(gpu) and cpus >= 0 and ram >= 0 and gpu >= 0):
         return None
-    return admission.Demand(wl, q, admission.Estimate(float(cpus), float(ram), float(gpu), f"demand:{wl}"))
+    return admission.Demand(wl, q, admission.Estimate(float(cpus), float(ram), float(gpu), f"demand:{wl}"),
+                            hosts=spread)
 
 
 def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: Optional[float] = None,
@@ -1135,7 +1145,7 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
                 verdict = admission.DoorVerdict(int(v["admittable"]), v["binding"], v["deficit_cpu"], min(v["at"], now))
             unit = dm.unit if dm else (waiting[0].need if waiting else admission.Estimate())
             dm = admission.Demand(workload, dm.queued if dm else queued, unit,
-                                  tuple(waiting), verdict, state["at"])
+                                  tuple(waiting), verdict, state["at"], dm.hosts if dm else 1)
         if dm is not None:
             out.append(dm)
     return out
@@ -1146,7 +1156,7 @@ def door_document(d: admission.Demand) -> dict:
             "unit": dataclasses.asdict(d.unit),
             "waiting": [{"id": u.id, "at": u.at, "need_cpu": u.need.cpus,
                          "need_mem_gb": u.need.ram_gb, "asap": u.asap} for u in d.waiting],
-            "verdict": dataclasses.asdict(d.verdict) if d.verdict else None}
+            "verdict": dataclasses.asdict(d.verdict) if d.verdict else None, "hosts": d.hosts}
 
 
 def doors_from_document(doc: Mapping, *, now: float) -> List[admission.Demand]:
@@ -1183,7 +1193,9 @@ def doors_from_document(doc: Mapping, *, now: float) -> List[admission.Demand]:
         # the aggregate queue count is its own fact (legacy holdback), never the bounded window's length (6e3523a0dbe8)
         q = row.get("queued")
         queued = q if type(q) is int and q >= 0 else len(waiting)
-        out.append(admission.Demand(row["workload"], queued, need, tuple(waiting), verdict, at))
+        h = row.get("hosts")
+        out.append(admission.Demand(row["workload"], queued, need, tuple(waiting), verdict, at,
+                                    h if type(h) is int and h >= 1 else 1))
     return out
 
 

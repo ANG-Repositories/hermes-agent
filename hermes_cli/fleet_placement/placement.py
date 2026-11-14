@@ -160,7 +160,18 @@ def fleet_root(root: Optional[Path] = None) -> Path:
         return resolve_root(root, source_file=__file__, package=__package__)
     if root is not None:
         return Path(root)
-    return Path(os.environ["PLACEMENT_HOME"]) if os.environ.get("PLACEMENT_HOME") else Path(__file__).resolve().parents[2]
+    return Path(os.environ["PLACEMENT_HOME"]) if os.environ.get("PLACEMENT_HOME") else _tree_root()
+
+
+def _tree_root() -> Path:
+    """The tree this file sits in; a release of the fleet home answers the home (t_5d7db1b6: during the 11-13 cut
+    allocd's root became releases/<x>/, which holds no admission receipt, and it refused every request 503)."""
+    here = Path(__file__).resolve().parents[2]
+    try:
+        from fleet_root import release_home
+    except ImportError:   # a partial copy without the resolver is never a release
+        return here
+    return Path(release_home(here) or here)
 
 
 def _num(v) -> bool:
@@ -252,6 +263,9 @@ class HostSpec:
     vm_cpus: Optional[int] = None
     # t_58366dea: "ac_only" = closed unless the sample shows AC power and sleep disabled (power_refusal); None = no gate
     power_policy: Optional[str] = None
+    # t_7566ba56: ((job_class, cpus), ...) from consumers.<c>.ramp_cpus: an unsettled lease of that class is charged its
+    # measured first-90-s CPU (admission.Limits.ramp_cpus); () = full estimate. A malformed value is dropped, never fatal
+    ramp_cpus: tuple = ()
 
     @property
     def cpu_capacity(self) -> float:
@@ -703,7 +717,9 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
             st_speed_src="measured" if "st_speed" in meas else "seed",
             pressure_from=h.get("pressure_from"), vm_cpus=vm_cpus, power_policy=h.get("power_policy"),
             enrolled=frozenset(c for c, v in h["consumers"].items()
-                               if isinstance(v, dict) and v.get("eligible") is True))
+                               if isinstance(v, dict) and v.get("eligible") is True),
+            ramp_cpus=tuple((job_class_for(c), float(v["ramp_cpus"])) for c, v in h["consumers"].items()
+                            if isinstance(v, dict) and _num(v.get("ramp_cpus")) and v["ramp_cpus"] >= 0))
     for hid, s in list(hosts.items()):
         # a guest runs on its source's power: the source's power_policy binds it too, so another venue on the same
         # machine never bypasses the AC-only gate (Prism ed3ec771df33)
@@ -1188,7 +1204,7 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
         h.reason = refused
         return h
     if mode == "utilization":
-        return _headroom_utilization(h, spec, sample, fp, need=need, leases=leases, reserved=reserved)
+        return _headroom_utilization(h, spec, sample, fp, need=need, leases=leases, reserved=reserved, now=now)
     if h.load is None or h.mem_available_gb is None:
         h.reason = "closed:unmeasured " + ("load" if h.load is None else "memory")
         return h
@@ -1301,7 +1317,8 @@ def _limits(spec: HostSpec) -> "admission.Limits":
     # PSI cpu avg10 >= 40 / avg60 >= 25 and a saturated cpu axis REFUSE (FWA F1, t_d456e9cd). scorer v1 restores it.
     return admission.Limits(mem_reserve_gb=spec.mem_reserve_gb,
                             cpu_saturable=spec.cpu_saturable and spec.scorer == "v1", r2c=spec.scorer == "v2",
-                            unmeasurable=tuple(a for a in spec.unmeasurable_axes if a.startswith("psi_")))
+                            unmeasurable=tuple(a for a in spec.unmeasurable_axes if a.startswith("psi_")),
+                            psi_cpu_busy_floor=admission.PSI_CPU_BUSY_FLOOR, ramp_cpus=spec.ramp_cpus)
 
 
 def need_of(fp: Footprint) -> "admission.Estimate":
@@ -1447,7 +1464,7 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
 
 
 def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footprint, *, need, leases,
-                          reserved: Optional[Footprint]) -> Headroom:
+                          reserved: Optional[Footprint], now: Optional[float] = None) -> Headroom:
     need = need or need_of(fp)
     row, lim = _sample_row(spec, sample), _limits(spec)
     leases = list(leases or ())
@@ -1456,11 +1473,12 @@ def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footp
         h.psi_cpu_some10, h.psi_cpu_some60 = sample.psi_cpu_some10, sample.psi_cpu_some60
         h.occupancy, h.occupancy_src = sample.occupancy
         h.capacity = spec.cpu_capacity
-    v = admission.admit(row, need, leases, host=spec.name, limits=lim)
+    v = admission.admit(row, need, leases, host=spec.name, limits=lim, now=now)
     h.need, h.cpu_busy, h.binding = need, sample.cpu_busy, v.binding
     if "mem_gb" in v.free and "cpu" in v.free and _num(sample.ncpu):
         h.mem_gb, h.cores = v.free["mem_gb"], v.free["cpu"] * float(sample.ncpu)    # cores = CPUs of room left
-    held = admission.live_leases(leases, spec.name, row.get("at"))   # the leases admit() counted (Prism 8e3aa5ad12d5)
+    # the leases admit() counted, at admit()'s price (Prism 8e3aa5ad12d5; ramp t_7566ba56)
+    held = admission.live_leases(leases, spec.name, row.get("at"), ramp=dict(lim.ramp_cpus), now=now)
     h.reserved_gb, h.reserved_threads = held.ram_gb, held.cpus
     if fp.scratch_gb > 0 and _num(sample.scratch_free_gb):
         h.scratch_gb = float(sample.scratch_free_gb) - (reserved.scratch_gb if reserved else 0.0) - fp.scratch_gb
@@ -1474,7 +1492,7 @@ def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footp
     if not v.ok:
         h.reason = f"closed:{v.reason}"
         return h
-    h.score = admission.score(row, need, leases, host=spec.name, limits=lim)
+    h.score = admission.score(row, need, leases, host=spec.name, limits=lim, now=now)
     if spec.scorer == "v2":
         h.fraction = h.score            # choose() multiplies it by st_speed^alpha among the eligible (R2c, D2)
     h.eligible = True
@@ -1580,7 +1598,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     v = admission.admit_class(_sample_row(spec, sample), dmd.workload_of(consumer), ctx.need(hid),
                               ctx.leases,
                               demand=demand, priority=priority, limits=_limits(spec), host=hid,
-                              class_line=class_line(dmd.workload_of(consumer), hid, root=root))
+                              class_line=class_line(dmd.workload_of(consumer), hid, root=root), now=now)
     return v.ok, (v.reason or f"ok (binding {v.binding})")
 
 
@@ -1798,7 +1816,7 @@ def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, n
 
     def verdict(need):
         return admission.admit_class(row, workload, need, leases, demand=demand, priority=priority, limits=lim,
-                                     host=spec.name)
+                                     host=spec.name, now=_now(now))
     return verdict
 
 
@@ -1826,7 +1844,7 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
                     else Footprint(ram_gb=0.0, threads=0.0, scratch_gb=held_scr))
     busy = f"cpu_busy {sample.cpu_busy:g}" if _num(sample.cpu_busy) else "cpu_busy ?"
     one = headroom(spec, sample, fp, consumer=consumer, closed_when=closed_when, mode="utilization", need=need,
-                   leases=leases, reserved=reserved)
+                   leases=leases, reserved=reserved, now=_now(now))
     rule = _band_class_rule(spec, sample, consumer, leases, now=now, root=root, table=table)
     v1 = rule(need) if rule else None
     if v1 is not None and not v1.ok and not v1.reason.startswith("unmeasured"):
@@ -1836,7 +1854,7 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
             return None, [one.reason]
         return "hot", [f"{one.reason} ({busy}, utilization)"]
     two = headroom(spec, sample, fp.plus(fp), consumer=consumer, closed_when=closed_when, mode="utilization",
-                   need=need.plus(need), leases=leases, reserved=reserved)
+                   need=need.plus(need), leases=leases, reserved=reserved, now=_now(now))
     room = f"headroom {one.mem_gb:.1f} GB / {one.cores:.1f} cpus after one job ({busy}, utilization)"
     if v1 is not None and not v1.ok:                 # the class rule cannot measure an axis: unknown, as headroom()
         return None, [f"closed:{v1.reason}"]

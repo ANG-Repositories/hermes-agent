@@ -164,6 +164,7 @@ class AdmitResult:
     band: Optional[str] = None
     detail: Optional[dict] = None
     consumer: str = ""                # the reservation's owner (release/renew send this consumer's token)
+    job_id: Optional[str] = None       # pass back to admit(job_id=...) when retrying a deferred request
 
 
 def url() -> str:
@@ -851,6 +852,7 @@ def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0,
     ``candidates`` = restrict the scorer to these hosts (renew's re-admit pins the job's host with it).
     ``unified`` = ask allocd to run the ONE rule (admit_class) on its own ledger for the booked row; a grant that ran it
     carries ``unified: true`` in its detail (Prism 11efd32500fc). ``stale_after_s`` = the caller's sample freshness.
+    Retry a deferred result with ``job_id=result.job_id``: allocd may have committed the timed-out request.
     Raises ``Refused`` on a terminal answer (4xx, empty/unreadable token file): the fallback never runs for it."""
     t0 = time.monotonic()
     tok = _token(consumer, root=root)                 # FIRST: an unreadable token refuses even with the router off
@@ -870,18 +872,19 @@ def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0,
         if code == 200 and isinstance(out, dict) and out.get("host") and out.get("reservation_id"):
             rid = out["reservation_id"]          # both non-empty (Prism 5f29877ec7ef): a 200 missing either is garbled
             _OWNER[_state_key(rid, root)] = consumer
-            return AdmitResult(out["host"], rid, "", "allocd", out.get("rule") or "", out.get("band"), out, consumer)
+            return AdmitResult(out["host"], rid, "", "allocd", out.get("rule") or "", out.get("band"), out, consumer, job_id)
         if code == 409:                    # final whatever the body shape (Prism 5bebc530350f)
             out = out if isinstance(out, dict) else {}
-            return AdmitResult(None, None, str(out.get("reason") or "refused"), "allocd", "", None, out, consumer)
+            return AdmitResult(None, None, str(out.get("reason") or "refused"), "allocd", "", None, out, consumer, job_id)
         raise Unreachable(f"unexpected reply {code}")
     except Unreachable as exc:
         if not fallback:
             raise
         if _allocd_slow(exc, t0, "admit", consumer, job_id=job_id, root=root):
-            return AdmitResult(None, None, "allocd_slow", "deferred", consumer=consumer)
-        return _fallback_admit(consumer, job_id=job_id, ttl_s=ttl_s, klass=klass, footprint=footprint,
-                               job_kw=dict(job or {}), previous=previous, why=str(exc), t0=t0, candidates=candidates, root=root)
+            return AdmitResult(None, None, "allocd_slow", "deferred", consumer=consumer, job_id=job_id)
+        result = _fallback_admit(consumer, job_id=job_id, ttl_s=ttl_s, klass=klass, footprint=footprint,
+                                 job_kw=dict(job or {}), previous=previous, why=str(exc), t0=t0, candidates=candidates, root=root)
+        return dataclasses.replace(result, job_id=job_id)
 
 
 def shadow_admit(consumer: str, *, job_id: Optional[str] = None, klass: Optional[str] = None,
