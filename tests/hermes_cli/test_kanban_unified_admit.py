@@ -711,3 +711,35 @@ def test_dry_run_replays_each_simulated_takes_own_footprint(home):
     plan.release(plan.hosts["ace-ai"])                                             # refund the 3-thread take
     assert plan._sim_leases["ace-ai"] == []
     assert plan.take("alpha", pin="ace-ai", job=small) is not None, plan.refusal    # 0.80 + 1/32 fits again
+
+
+def test_deferred_allocd_admit_retries_with_the_same_key(monkeypatch):
+    """Prism 6e478f43c7ea: a deferred admit (allocd slow but healthy) may still commit its row. The card's next tick
+    must retry under the SAME admission key, so allocd's reuse_job returns that row instead of booking a second lease;
+    a fresh key per tick leaked one reservation per slow reply until its TTL."""
+    from hermes_cli.fleet_placement import alloc_client
+    keys: list = []
+    replies = iter(["deferred", "allocd", "allocd"])
+
+    def fake_admit(consumer, *, job_id=None, **kw):
+        keys.append(job_id)
+        src = next(replies)
+        if src == "deferred":
+            return alloc_client.AdmitResult(None, None, "allocd_slow", "deferred", consumer=consumer, job_id=job_id)
+        return alloc_client.AdmitResult("ace-ai", "r1", "", "allocd", consumer=consumer, job_id=job_id)
+
+    monkeypatch.setattr(alloc_client, "admit", fake_admit)
+    monkeypatch.setattr(kh, "unified_active", lambda plan: False)
+    monkeypatch.setattr(kh, "allocd_request", lambda plan, names, job: {})
+    monkeypatch.setattr(kh, "_DEFERRED", {})
+    plan = SimpleNamespace(signal=SimpleNamespace(policy=SimpleNamespace(stale_after_s=60.0)))
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").source == "deferred"
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").reservation_id == "r1"
+    kh.allocd_admit(plan, ["ace-ai"], None, "t_card")             # granted: the next take is a new admission
+    assert keys[0].startswith("t_card#") and keys[1] == keys[0], keys
+    assert keys[2] != keys[0] and keys[2].startswith("t_card#"), keys
+
+
+def test_deferred_key_expires_with_the_reservation_ttl(monkeypatch):
+    monkeypatch.setattr(kh, "_DEFERRED", {"t_card": ("t_card#old", time.time() - kh.RESERVE_TTL_S - 1)})
+    assert kh._deferred_key("t_card") is None and kh._DEFERRED == {}
