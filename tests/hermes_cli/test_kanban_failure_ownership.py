@@ -341,6 +341,38 @@ def test_legacy_writer_floor(board):
     assert admit(board,observation()).action=='REPAIR'
 
 
+# Census (hermes-home scripts/lib/failure_producer_census.md): every real caller identity and legacy key namespace.
+LEGACY_MINTS = (
+    dict(created_by='main-tip-red'), dict(created_by='main-tip-red-rollup'), dict(created_by='landing-queue'),
+    dict(created_by='ci-red-owner'), dict(created_by='main-green-streak'),
+    dict(idempotency_key='main-tip-red:o/r/u/t:abcdef123456'), dict(idempotency_key='main-tip-red-rollup:standing'),
+    dict(signature='main-tip-red-rollup:standing'), dict(idempotency_key='ci-red-owner:o/r@abc'),
+    dict(idempotency_key='main-red:fam:2026-11-14'), dict(idempotency_key='ci-advisory-landed:o/r@abc'),
+)
+
+
+def test_mixed_writer_cannot_bypass_authority_while_mode_on(board):
+    """S5 item 4 (t_b8c1b185): with mode != preserve, a legacy direct mint (no core protocol marker) by any census
+    identity or namespace is refused even before any producer is enrolled; preserve mode keeps legacy semantics; the
+    core admission path still creates."""
+    for i, extra in enumerate(LEGACY_MINTS):
+        with kb.write_txn(board):
+            kb._insert_task_row(board, dict(id='pre%d' % i, title='old', status='ready', created_at=1, **extra))
+    with kb.write_txn(board):
+        board.execute("UPDATE failure_authority SET mode='on'")
+    assert board.execute('SELECT count(*) FROM failure_producers WHERE enrolled=1').fetchone()[0] == 0
+    for i, extra in enumerate(LEGACY_MINTS):
+        with pytest.raises(sqlite3.IntegrityError, match='incompatible writer'):
+            with kb.write_txn(board):
+                kb._insert_task_row(board, dict(id='bypass%d' % i, title='bad', status='ready', created_at=1,
+                                                **extra))
+    human = kb.create_task(board, title='human project', session_id='operator', session_explicit=True)
+    assert kb.get_task(board, human) is not None              # unregistered creates are outside the floor
+    enroll(board)
+    assert admit(board, observation()).action == 'REPAIR'     # the authority path carries the marker
+    assert board.execute("SELECT count(*) FROM tasks WHERE id LIKE 'bypass%'").fetchone()[0] == 0
+
+
 def _race_worker(path,root,index,barrier,queue):
     assert Path(path).resolve().is_relative_to(Path(root).resolve())
     conn=kb.connect(Path(path))
