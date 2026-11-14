@@ -1125,9 +1125,11 @@ class ReconcileMixin:
         offset = next((pos - idx for idx, pos in enumerate(anchor_pos) if pos is not None), None)
         if offset is None or offset < 0:
             return 0
-        stored_id_uses: dict[tuple[Any, ...], int] = {}
+        # A host tool row's identity counts as stored elsewhere only while the
+        # store holds a copy that no host row has passed yet (Prism cb28d89fa826).
+        unused_stored: dict[tuple[Any, ...], int] = {}
         for identity in stored_ids:
-            stored_id_uses[identity] = stored_id_uses.get(identity, 0) + 1
+            unused_stored[identity] = unused_stored.get(identity, 0) + 1
         cursor = 0
         matched_ids: set[str] = set()
         idx = 0
@@ -1166,12 +1168,15 @@ class ReconcileMixin:
                 if (
                     role == stored_role == "tool"
                     and str(msg.get("tool_call_id") or "") == str(stored_rows[pos].get("tool_call_id") or "")
-                    and stored_id_uses.get(identity)
+                    and unused_stored.get(identity, 0) >= host_ids[idx:].count(identity)
                 ):
                     # The store holds this tool row verbatim elsewhere, and here
                     # the same call with other content: a restart rewrote the
                     # result (t_99e38df0, session 20261109_011227_2e109b: host
                     # "[Command interrupted]", stored "[Orphan recovery: ...]").
+                    # Every host copy of it from here on needs its own unused
+                    # stored copy, so none of them is passed unstored.
+                    unused_stored[identity] -= 1
                     cursor = idx + 1
                     idx += 1
                     continue
@@ -1190,6 +1195,7 @@ class ReconcileMixin:
                 break
             if role == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
                 matched_ids.add(str(msg.get("tool_call_id")))
+            unused_stored[identity] -= 1
             cursor = idx + 1
             idx += 1
         if len(matched_ids) < 2:

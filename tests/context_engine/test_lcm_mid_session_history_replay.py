@@ -905,3 +905,25 @@ class TestRestartRewrittenToolResult:
         _stored_into(tmp_path, stored)
         _rebuilt_agent_ingest(tmp_path, history)
         assert _count(tmp_path, _INTERRUPTED) == 1
+
+    def test_result_whose_one_stored_copy_an_earlier_row_matched_is_stored(self, tmp_path):
+        # Prism cb28d89fa826: a reused call id repeats a result the store holds
+        # once, and the earlier host row already matched that copy.
+        second = _turn(2)
+        second[2] = dict(second[2], content="different result")
+        _stored_into(tmp_path, [{"role": "system", "content": "You are Apollo."}]
+                     + _turn(0) + _turn(1) + _turn(2) + second)
+        new_user = {"role": "user", "content": "[kanban] a genuinely new wake"}
+        _rebuilt_agent_ingest(tmp_path, _turn(0) + _turn(1) + _turn(2) + _turn(2) + [new_user])
+        assert _count(tmp_path, _turn(2)[2]["content"]) >= 2  # duplicate over loss
+
+    def test_result_whose_one_stored_copy_a_later_row_matches_is_stored(self, tmp_path):
+        # The same loss with the order reversed: the rewritten copy comes first,
+        # and the sole verbatim copy belongs to the later host row.
+        first = _turn(2)
+        first[2] = dict(first[2], content="different result")
+        _stored_into(tmp_path, [{"role": "system", "content": "You are Apollo."}]
+                     + _turn(0) + _turn(1) + first + _turn(2))
+        new_user = {"role": "user", "content": "[kanban] a genuinely new wake"}
+        _rebuilt_agent_ingest(tmp_path, _turn(0) + _turn(1) + _turn(2) + _turn(2) + [new_user])
+        assert _count(tmp_path, _turn(2)[2]["content"]) >= 2  # duplicate over loss
