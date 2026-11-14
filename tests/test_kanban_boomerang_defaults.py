@@ -214,18 +214,30 @@ def test_gateway_create_persists_level(tmp_path, monkeypatch, opt_out):
         assert kbn.list_notify_subs(conn, created["task_id"])[0]["delivery_mode"] == "notify+wake"
 
 
-@pytest.mark.parametrize("owner", [False, True])
-def test_deadman_owner_comment_since_review(tmp_path, monkeypatch, owner):
+@pytest.mark.parametrize("owner,after_event,switch_off,acted", [
+    (False, True, False, False),
+    (True, True, False, True),
+    (True, False, False, False),   # t_a6da8394: a comment before the deadman event is what it already weighed
+    (True, False, True, True),     # BOOMERANG_DEADMAN_TRIGGER_CURSOR=0: any owner comment since the review
+])
+def test_deadman_owner_comment_since_review(tmp_path, monkeypatch, owner, after_event, switch_off, acted):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    if switch_off:
+        monkeypatch.setenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", "0")
+    else:
+        monkeypatch.delenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", raising=False)
     kb.init_db()
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="deadman", assignee="human:apollo")
         kb._append_event(conn, tid, "review_requested", {})
-        kb.add_comment(conn, tid, "human:apollo" if owner else "worker", "CI pending")
+        if not after_event:
+            kb.add_comment(conn, tid, "human:apollo" if owner else "worker", "CI pending")
         kb._append_event(conn, tid, "review_deadman", {})
         event_id = kb.max_event_id(conn)
-    assert bw.deadman_owner_acted(dict(task_id=tid, row="review_deadman", event_id=event_id)) is owner
+        if after_event:
+            kb.add_comment(conn, tid, "human:apollo" if owner else "worker", "CI pending")
+    assert bw.deadman_owner_acted(dict(task_id=tid, row="review_deadman", event_id=event_id)) is acted
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -236,10 +248,10 @@ def test_run_entry_deadman_passive_delivery(tmp_path, monkeypatch, stale):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="scratch live deadman", assignee="human:apollo")
         kb._append_event(conn, tid, "review_requested", {})
-        if stale:
-            kb.add_comment(conn, tid, "human:apollo", "already landed")
         kb._append_event(conn, tid, "review_deadman", {})
         event_id = kb.max_event_id(conn)
+        if stale:   # t_a6da8394: the owner acts after the deadman fired
+            kb.add_comment(conn, tid, "human:apollo", "already landed")
     state = bw.BoomerangWakeState(tmp_path / "claims.json")
     entry = dict(key="claim", task_id=tid, board=None, row="review_deadman", kind="review_deadman",
                  event_id=event_id, delegation_id="d2", verdict_nonce="abcd", route={}, mode="fork")
