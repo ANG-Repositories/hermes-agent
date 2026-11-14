@@ -1068,8 +1068,9 @@ class ReconcileMixin:
         alignment between host rows and stored rows. From host row 0 the rows
         are then compared position by position: assistant/tool/system rows must
         be identical, user rows must be equal under ``_user_row_rerender_key``
-        (the host re-renders them). A user row matched only through that key
-        (or emptied) is provisional: the cursor passes it only when a later row
+        (the host re-renders them) and must not carry a different gateway
+        timestamp. A user row matched only through that key (or emptied) is
+        provisional: the cursor passes it only when a later row
         in the run matches by full identity, so a run that ends right after it
         leaves it to be appended. Where the store holds rows the host does not
         (an interrupted turn's residue, turns left between moved dedup copies),
@@ -1159,7 +1160,10 @@ class ReconcileMixin:
             if role != stored_role or identity != stored_ids[pos]:
                 if role == stored_role == "user" and (
                     self._user_row_rerender_key(identity[1]) == ""
-                    or self._user_row_rerenders_stored(identity[1], stored_ids[pos][1])
+                    or (
+                        self._user_row_rerenders_stored(identity[1], stored_ids[pos][1])
+                        and not self._user_row_stamps_differ(identity[1], stored_ids[pos][1])
+                    )
                 ):
                     # Provisional: the cursor passes it only when a later row
                     # in the run matches by full identity.
@@ -1184,17 +1188,17 @@ class ReconcileMixin:
                 # turn's residue, or turns stored between two moved dedup
                 # copies; t_99e38df0). Re-align on the next host row that is a
                 # once-stored tool call, only forward: stored rows are skipped,
-                # host rows never, and each one still has to match: the walk
-                # resumes at the first host row not passed, so provisional user
-                # rows matched under the old offset are checked again (Prism
-                # cb28d89fa826, a re-sent prompt after an interrupted turn).
+                # host rows never, and each one still has to match. A user row
+                # passed provisionally under the old offset keeps that match:
+                # under the new one it lands on the residue (Prism cb28d89fa826,
+                # head 6f864616). A re-sent prompt is never provisional, since
+                # its gateway timestamp differs from the stored one.
                 anchor = next(
                     (at - j for j, at in enumerate(anchor_pos[idx:], start=idx) if at is not None),
                     None,
                 )
                 if anchor is not None and anchor > offset:
                     offset = anchor
-                    idx = cursor
                     continue
                 break
             if role == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
@@ -1291,6 +1295,37 @@ class ReconcileMixin:
                     return False
             sep, rest = next_sep, next_rest
         return not host_sep
+
+    @staticmethod
+    def _user_row_stamps_differ(host: Any, stored: Any) -> bool:
+        """Whether both user rows carry a gateway timestamp on their text and they differ.
+
+        The host re-renders a stored row by adding or dropping its timestamp,
+        never by changing it, so two different stamps are two sends: a re-sent
+        prompt after an interrupted turn, not a re-render of the old one (Prism
+        cb28d89fa826). The stamp compared is the one right before the text; a
+        restart's ``[ts] [System note: ...]`` opening carries its own.
+        """
+
+        def text_stamp(content: Any) -> str:
+            text, stamp = str(content or ""), ""
+            left = {wrapper: 1 for wrapper in _USER_ROW_WRAPPER_PREFIXES}
+            while True:
+                for wrapper in _USER_ROW_WRAPPER_PREFIXES:
+                    found = wrapper.match(text) if left[wrapper] else None
+                    if found and found.end():
+                        text = text[found.end():]
+                        left[wrapper] -= 1
+                        if wrapper is _USER_ROW_SYSTEM_NOTE_PREFIX:
+                            left[_USER_ROW_TIMESTAMP_PREFIX] = 1
+                        elif wrapper is _USER_ROW_TIMESTAMP_PREFIX:
+                            stamp = found.group(0).strip()
+                        break
+                else:
+                    return stamp
+
+        host_stamp, stored_stamp = text_stamp(host), text_stamp(stored)
+        return bool(host_stamp and stored_stamp and host_stamp != stored_stamp)
 
     @staticmethod
     def _strip_user_row_wrappers(text: str) -> str:

@@ -879,20 +879,32 @@ class TestRestartResumeOverStoredOnlyRows:
 
     def test_resent_prompt_matched_provisionally_before_a_realignment_is_stored(self, tmp_path):
         # Prism cb28d89fa826 (head 4f1b0444): the user re-sends the interrupted
-        # prompt. Its row re-render-matches the old one, the walk re-aligns past
-        # the residue on the next tool call, and the re-sent prompt must be
-        # re-checked there instead of passed.
-        nxt = _turn(2)
-        stored = ([{"role": "system", "content": "You are Apollo."}] + _turn(0) + _turn(1)
-                  + [{"role": "user", "content": "[Thu 2026-11-12 10:00:00 PST] proceed"}, dict(_OP_INTERRUPTED),
-                     {"role": "user", "content": "[System note: The previous turn was interrupted by a gateway "
-                                                 "shutdown; the gateway is now back online.]"}]
-                  + nxt[1:])
+        # prompt. Its text equals the old one, the walk re-aligns past the
+        # residue on the next tool call, and the re-sent prompt must not be
+        # passed as the old one.
         resent = {"role": "user", "content": "[Fri 2026-11-13 09:00:00 PST] proceed"}
-        _stored_into(tmp_path, stored)
-        _rebuilt_agent_ingest(tmp_path, _turn(0) + _turn(1) + [resent] + nxt[1:]
-                              + [{"role": "user", "content": "[kanban] a genuinely new wake"}])
+        _stored_into(tmp_path, self._interrupted_prompt_store())
+        _rebuilt_agent_ingest(tmp_path, _turn(0) + _turn(1) + [resent] + _turn(2)[1:] + [self._NEW])
         assert _count(tmp_path, resent["content"]) == 1
+
+    def test_rerendered_prompt_before_a_realignment_appends_only_the_new_row(self, tmp_path):
+        # Prism cb28d89fa826 (head 6f864616): the host dropped the stored
+        # prompt's timestamp. The walk re-aligns past the residue, and the
+        # prompt keeps its match; the resumed turn is not stored again.
+        n0 = _stored_into(tmp_path, self._interrupted_prompt_store())
+        _rebuilt_agent_ingest(tmp_path, _turn(0) + _turn(1) + [{"role": "user", "content": "proceed"}]
+                              + _turn(2)[1:] + [self._NEW])
+        assert _rows(tmp_path) == n0 + 1
+
+    _NEW = {"role": "user", "content": "[kanban] a genuinely new wake"}
+
+    @staticmethod
+    def _interrupted_prompt_store():
+        return ([{"role": "system", "content": "You are Apollo."}] + _turn(0) + _turn(1)
+                + [{"role": "user", "content": "[Thu 2026-11-12 10:00:00 PST] proceed"}, dict(_OP_INTERRUPTED),
+                   {"role": "user", "content": "[System note: The previous turn was interrupted by a gateway "
+                                               "shutdown; the gateway is now back online.]"}]
+                + _turn(2)[1:])
 
 
 class TestRestartRewrittenToolResult:
