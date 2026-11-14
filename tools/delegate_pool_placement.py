@@ -75,7 +75,6 @@ def mode() -> str:
 @dataclass
 class PoolLease:
     host: str                 # pool host id (fleet-roles name)
-    target: str               # user@ssh_host the commands run as
     reservation_id: str
     env_key: str
     workspace: str
@@ -86,7 +85,14 @@ class PoolLease:
 
 
 def _safe_id(child_task_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(child_task_id or "")) or uuid.uuid4().hex[:12]
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(child_task_id or "")) or "child"
+
+
+def _lease_slug(child_task_id: str) -> str:
+    """One id per lease for the env key, remote workspace and ssh control scope. The child id alone is not
+    unique enough: _safe_id is lossy, child ids carry only 8 hex chars, and the workspace sits on a scratch
+    root other gateways' children share, which release() deletes."""
+    return f"{_safe_id(child_task_id)}-{uuid.uuid4().hex[:12]}"
 
 
 def _pool_hosts() -> List[object]:
@@ -97,10 +103,10 @@ def _pool_hosts() -> List[object]:
     return [h for h in cfg.pool_hosts if h.enabled and h.state == "active"]
 
 
-def _workspace_for(child_task_id: str) -> str:
+def _workspace_for(slug: str) -> str:
     """Same absolute path on every pool host: the default board's scratch root, which pool workers write."""
     from hermes_cli import kanban_db as kb
-    return str(kb.workspaces_root() / f"delegate-{_safe_id(child_task_id)}")
+    return str(kb.workspaces_root() / f"delegate-{slug}")
 
 
 def _admit(child_task_id: str, hosts: List[object]):
@@ -158,20 +164,19 @@ def acquire(child_task_id: str, placement) -> Tuple[Optional[PoolLease], Optiona
     if host is None:
         return _fallback("no_lease", rid)
     from hermes_cli import kanban_headroom as kh
+    slug = _lease_slug(child_task_id)
     try:
-        workspace = _workspace_for(child_task_id)
+        workspace = _workspace_for(slug)
         from hermes_cli.kanban_worker_hosts import placement_env, prepare_remote_workspace
         prepare_remote_workspace(host, workspace)  # the probe: proves ssh + a writable root (bounded, 8 s)
         values = placement_env(host, workspace)
-        values["TERMINAL_SSH_CONTROL_SCOPE"] = f"dlg-{_safe_id(child_task_id)}"
+        values["TERMINAL_SSH_CONTROL_SCOPE"] = f"dlg-{slug}"
     except Exception as exc:
         kh.release_alloc(rid)
         return _fallback("probe_failed", f"probe of {host.name} failed ({type(exc).__name__}: {exc})")
-    lease = PoolLease(host=host.name, target=host.target, reservation_id=rid,
-                      env_key=f"{ENV_KEY_PREFIX}{_safe_id(child_task_id)}", workspace=workspace,
-                      values=values, pool_host=host)
-    threading.Thread(target=_renew_loop, args=(lease,), daemon=True,
-                     name=f"delegate-pool-renew-{_safe_id(child_task_id)}").start()
+    lease = PoolLease(host=host.name, reservation_id=rid, env_key=f"{ENV_KEY_PREFIX}{slug}",
+                      workspace=workspace, values=values, pool_host=host)
+    threading.Thread(target=_renew_loop, args=(lease,), daemon=True, name=f"delegate-pool-renew-{slug}").start()
     _count("placed")
     logger.info("delegate pool placement: child %s placed on %s (%s), reservation %s",
                 child_task_id, host.name, host.target, rid)

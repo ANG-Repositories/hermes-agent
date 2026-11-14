@@ -18,6 +18,8 @@ from tests.tools.test_delegate_late_completion import (  # noqa: F401
 )
 from tools import delegate_pool_placement as dpp
 
+_REAL_LEASE_SLUG = dpp._lease_slug
+
 _HOST = types.SimpleNamespace(name="ace-ai", ssh_host="192.0.2.16", ssh_user="kanbanw", ssh_port=22,
                               enabled=True, state="active", target="kanbanw@192.0.2.16")
 
@@ -35,6 +37,7 @@ def pool(monkeypatch):
 
     monkeypatch.setattr(dpp, "_admit", _admit)
     monkeypatch.setattr(dpp, "_workspace_for", lambda cid: f"/srv/ws/delegate-{cid}")
+    monkeypatch.setattr(dpp, "_lease_slug", lambda cid: cid)  # deterministic keys; the real one is tested below
     import hermes_cli.kanban_worker_hosts as kwh
     monkeypatch.setattr(kwh, "prepare_remote_workspace", lambda host, ws: rec["probe"].append((host.name, ws)))
     import hermes_cli.kanban_headroom as kh
@@ -102,6 +105,23 @@ def test_placed_lease_carries_the_kwlb_ssh_values(pool):
     assert v["TERMINAL_SSH_CONTROL_SCOPE"] == "dlg-sa-1"
     assert pool["probe"] == [("ace-ai", "/srv/ws/delegate-sa-1")]
     assert dpp.counters() == {"placed": 1}
+
+
+def test_two_leases_for_one_child_id_share_no_key(pool, monkeypatch):
+    # Prism 5a85f4228eb5: the child id is lossy (_safe_id) and short, and release() deletes the workspace on a
+    # scratch root other gateways share, so every lease gets its own slug.
+    monkeypatch.setattr(dpp, "_lease_slug", _REAL_LEASE_SLUG)
+    a, _ = dpp.acquire("sa/1", "pool")
+    b, _ = dpp.acquire("sa_1", "pool")  # same _safe_id
+    c, _ = dpp.acquire("", "pool")
+    leases = [a, b, c]
+    for attr in ("env_key", "workspace"):
+        assert len({getattr(x, attr) for x in leases}) == 3, attr
+    assert len({x.values["TERMINAL_SSH_CONTROL_SCOPE"] for x in leases}) == 3
+    for x in leases:  # one slug per lease: env key, workspace and control scope agree
+        slug = x.env_key[len(dpp.ENV_KEY_PREFIX):]
+        assert x.workspace.endswith(f"delegate-{slug}") and x.values["TERMINAL_SSH_CONTROL_SCOPE"] == f"dlg-{slug}"
+    assert a.env_key.startswith("delegate-pool:sa_1-")
 
 
 def test_bound_scope_and_env_key_are_the_childs_only(pool, monkeypatch):
