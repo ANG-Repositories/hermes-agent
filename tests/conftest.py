@@ -1296,6 +1296,10 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
 # provisions it on first use with the canonical provision_root (anchor = the nearest existing ancestor, receipt in that
 # anchor) and hands that receipt to the call. A test that sets PLACEMENT_ROOT_RECEIPT itself keeps it. A root under
 # the REAL kanban root is never provisioned (the write guard above owns that refusal).
+# TEST_PLACEMENT_ROOT_RECEIPT is the placeholder the gateway suite sets so the dispatcher's boot check
+# (root_receipt_missing, logged at ERROR) stays quiet in tests; it names no real receipt, so this fixture treats it as
+# unset and still provisions each test's own root.
+TEST_PLACEMENT_ROOT_RECEIPT = "/nonexistent/hermes-tests/placement-root-receipt"
 
 
 @pytest.fixture(autouse=True)
@@ -1312,7 +1316,8 @@ def _provisioned_placement_roots(_hermetic_environment, monkeypatch):
         return
 
     def _receipt_path(root, receipt=None):
-        if receipt is not None or os.environ.get("PLACEMENT_ROOT_RECEIPT"):
+        env_receipt = os.environ.get("PLACEMENT_ROOT_RECEIPT")
+        if receipt is not None or (env_receipt and env_receipt != TEST_PLACEMENT_ROOT_RECEIPT):
             return orig(root, receipt)
         root = Path(root).absolute()
         try:
