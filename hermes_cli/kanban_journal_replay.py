@@ -56,6 +56,7 @@ class ReplayResult:
         self.orphan_task_ids: set = set()
         self.grant_ids_dropped = 0
         self.grants_revoked = 0
+        self.grants_closed = 0
         self.snapshot_ts: float = 0.0
 
     def as_dict(self) -> dict:
@@ -68,6 +69,7 @@ class ReplayResult:
             "orphan_task_ids": sorted(self.orphan_task_ids),
             "grant_ids_dropped": self.grant_ids_dropped,
             "grants_revoked": self.grants_revoked,
+            "grants_closed": self.grants_closed,
             "snapshot_ts": self.snapshot_ts,
         }
 
@@ -141,6 +143,9 @@ def replay_into(
         has_grants_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sign_grants'"
         ).fetchone() is not None
+        has_grant_closed_col = has_grants_table and any(
+            r[1] == "closed_at" for r in conn.execute("PRAGMA table_info(sign_grants)").fetchall()
+        )
 
         known = {
             str(r[0]) for r in conn.execute("SELECT id FROM tasks").fetchall()
@@ -250,6 +255,19 @@ def replay_into(
                         "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND task_id = ? "
                         "AND revoked_at IS NULL",
                         (int(ts if revoked_at is None else revoked_at), payload["grant_id"], task_id),
+                    ).rowcount
+                continue
+
+            if kind == "sign_grant_closed":
+                # A grant closed after the snapshot comes back closed (t_4548202f): no new write, its rows stand
+                # until expiry. A revoked grant stays revoked; a pre-column snapshot skips it (the grant then
+                # lapses at its expiry, still bounded).
+                if task_id and payload.get("grant_id") and has_grant_closed_col:
+                    closed_at = payload.get("closed_at")
+                    result.grants_closed += conn.execute(
+                        "UPDATE sign_grants SET closed_at = ? WHERE grant_id = ? AND task_id = ? "
+                        "AND closed_at IS NULL AND revoked_at IS NULL",
+                        (int(ts if closed_at is None else closed_at), payload["grant_id"], task_id),
                     ).rowcount
                 continue
 

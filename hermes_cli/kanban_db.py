@@ -3073,6 +3073,7 @@ CREATE TABLE IF NOT EXISTS sign_grants (
     created_at         INTEGER NOT NULL,
     expires_at         INTEGER NOT NULL,
     revoked_at         INTEGER,
+    closed_at          INTEGER,            -- background batch ended normally: no new write, rows stand to expiry
     PRIMARY KEY (grant_id, task_id)
 );
 

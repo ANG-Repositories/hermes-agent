@@ -1496,6 +1496,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "task_comments", "grant_id", "grant_id TEXT"
             )
+    if _table_exists(conn, "sign_grants") and "closed_at" not in _column_names(conn, "sign_grants"):
+        # A background batch that ended normally closes its grant (t_4548202f).
+        _add_column_if_missing(conn, "sign_grants", "closed_at", "closed_at INTEGER")
 
     # task_links gained a ``kind`` column (blocks | derived-from). Every
     # pre-existing edge was created under the single gating semantics, so the
