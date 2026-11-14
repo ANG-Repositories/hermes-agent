@@ -2655,12 +2655,28 @@ def _run_single_child(
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
 
+        # Opt-in pool placement (delegation.pool_placement + task placement="pool", t_30537365): lease a
+        # fleet pool host for this child's terminal/file commands. Fails open to local with a loud goal line.
+        from tools import delegate_pool_placement as _dpp
+
+        _pool_lease, _pool_note = _dpp.acquire(child_task_id, getattr(child, "_delegate_placement", None))
+        if _pool_lease is not None:
+            child._pool_lease = _pool_lease
+            try:
+                from tools.terminal_tool import record_session_cwd as _rsc_pool
+
+                _rsc_pool(child_task_id, _pool_lease.workspace)
+            except Exception as e:
+                logger.debug("pool cwd seed failed: %s", e)
+        if _pool_note:
+            goal = goal + "\n\n" + _pool_note
+
         # Opt-in worktree isolation (delegation.worktree_isolation, inspired
         # by Muse Code's --subagent-worktree-isolation): give this child its
         # own git worktree branched from the parent repo's HEAD, and start its
         # terminal there. Git-only and local-backend-only; any failure
         # degrades silently to the shared-workspace behavior above.
-        if _get_worktree_isolation():
+        if _get_worktree_isolation() and _pool_lease is None:
             try:
                 from tools import subagent_worktree
 
@@ -2767,7 +2783,8 @@ def _run_single_child(
             _cron_token = _bind_child_cron_session(child)
             from agent.delegation_context import delegated_child_context
             try:
-                with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                with delegated_child_context(str(getattr(child, "session_id", "") or "")), \
+                        _dpp.bound(getattr(child, "_pool_lease", None)):
                     return child.run_conversation(
                         user_message=user_message,
                         task_id=child_task_id,
@@ -3353,6 +3370,11 @@ def _release_child_handles(
             child_pool.release_lease(leased_cred_id)
         except Exception as exc:
             logger.debug("Failed to release credential lease: %s", exc)
+
+    # Pool-placement host lease (delegation.pool_placement); idempotent, never raises.
+    from tools.delegate_pool_placement import release as _release_pool_lease
+
+    _release_pool_lease(getattr(child, "_pool_lease", None))
 
     # Remove child from active tracking
 
@@ -3963,8 +3985,16 @@ def _build_children(
             _ident_ref = getattr(child, "_progress_identity_ref", None)
             if isinstance(_ident_ref, dict):
                 _ident_ref["delegation_id"] = live_deleg_id
+        _attach_placement(child, t)
         children.append((i, t, child))
     return children, None
+
+
+def _attach_placement(child: Any, task: Any) -> None:
+    """Carry the task's ``placement`` (delegation.pool_placement) onto the built child for _run_single_child."""
+    if isinstance(task, dict) and task.get("placement") is not None:
+        with _quiet("Could not attach placement to child"):
+            child._delegate_placement = task.get("placement")
 
 
 def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
@@ -4519,6 +4549,7 @@ def delegate_task(
         # attribution (child-started background processes report under it).
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
+        _attach_placement(child, t)
         children.append((i, t, child))
 
     # Scoped board-signing grants (t_19c567a8): minted only now, bound to each built
@@ -5279,6 +5310,18 @@ DELEGATE_TASK_SCHEMA = {
                         ),
                         "role": _p(
                             "string", "Per-task role; overrides the top-level 'role'.", enum=["leaf", "orchestrator"],
+                        ),
+                        "placement": _p(
+                            "string",
+                            "Optional. 'pool' = run this child's terminal, file and execute_code commands on a fleet "
+                            "pool host (ci-box, ace-ai, ...) leased from the allocator, as the pool worker account "
+                            "with that host's own credentials; its model loop and the web/browser/kanban/memory "
+                            "tools stay here. Use it only for a child that needs nothing but a repo at a ref it can "
+                            "fetch itself: it must not read live state here (~/.hermes, state.db, logs, the vault, "
+                            "macOS tools) and must not edit your checkout (its edits stay on that host unless it "
+                            "pushes). Honoured only when delegation.pool_placement is opt_in; otherwise, or when no "
+                            "host can be leased, the child runs here as usual and its goal says so.",
+                            enum=["pool"],
                         ),
                         "sign_grant": _p(
                             "object",

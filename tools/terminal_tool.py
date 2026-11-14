@@ -657,6 +657,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
        else ``"default"``, which subagent ids collapse onto to share the parent's container.
     """
+    # A pool-placed delegate child (delegation.pool_placement) owns its own remote env, bound only inside its
+    # own turn: it must never share the parent's ``session:<key>`` env, nor the parent its.
+    from tools.delegate_pool_placement import bound_env_key
+    pool_key = bound_env_key()
+    if pool_key:
+        return pool_key
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
