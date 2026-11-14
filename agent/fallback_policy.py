@@ -1422,8 +1422,9 @@ def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
     seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
     detail = f"; {entry.detail}" if entry.detail else ""
     reporter = "the DPX alias layer" if code.startswith("contentalias:") else "the bridge"
-    origin = LANE_INCAPABLE_NOT_ANTHROPIC if entry.ours else f"reported by {reporter}"
-    return (f"{cause} — {st} {code} {where} ({origin})"
+    origin = (f" ({LANE_INCAPABLE_NOT_ANTHROPIC})" if entry.ours
+              else "" if where.startswith("reported by") else f" (reported by {reporter})")
+    return (f"{cause} — {st} {code} {where}{origin}"
             f"{seat_seg}{detail}{_pool_context(row)}")
 
 
