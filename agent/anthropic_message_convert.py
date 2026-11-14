@@ -564,16 +564,6 @@ def _keep_valid_latest_thinking(content: List[Any], signature_dead: bool) -> Lis
     return new_content
 
 
-def _keep_signed_thinking_only(content: List[Any]) -> List[Any]:
-    """Older assistant turn inside a contiguous preserved-thinking window: signed blocks are what
-    the API binds, an unsigned one is dropped exactly as the latest-only path strips it."""
-    return [
-        b for b in content
-        if _block_type(b) not in _THINKING_TYPES
-        or (b.get("data") if b.get("type") == "redacted_thinking" else b.get("signature"))
-    ]
-
-
 def _manage_thinking_signatures(
     result: List[Dict[str, Any]], base_url: str | None, model: str | None,
     *, preserve_thinking: bool = False, thinking_window: str = "latest",
@@ -588,7 +578,8 @@ def _manage_thinking_signatures(
     native path despite not being anthropic.com. ``preserve_thinking`` (the per-provider
     ``providers.<name>.preserve_thinking`` flag, resolved by the caller) does the same for a relay
     in front of Anthropic: first-party for THIS decision only. ``thinking_window="contiguous"``
-    keeps signed blocks on every assistant turn, not just the latest (``agent.preserved_thinking``).
+    sends every assistant turn as the latest one is sent (signed kept, unsigned demoted to text), so
+    no turn's bytes change between compactions (``agent.preserved_thinking``).
     """
     is_third_party = (
         _is_third_party_anthropic_endpoint(base_url) and not _is_nous_portal_endpoint(base_url) and not preserve_thinking
@@ -610,13 +601,16 @@ def _manage_thinking_signatures(
                 if _block_type(b) not in _THINKING_TYPES or not (b.get("signature") or b.get("data"))
             ]
             m["content"] = new_content or [_text_block("(empty)")]
-        elif is_third_party or idx != last_assistant_idx:
-            m["content"] = _older_turn_thinking(m, contiguous=contiguous and not is_third_party)
+        elif is_third_party or (idx != last_assistant_idx and not contiguous):
+            m["content"] = _older_turn_thinking(m)
         else:
-            as_older = _older_turn_thinking(m, contiguous=contiguous)
+            # A contiguous window sends every turn exactly as it was sent while it was the latest
+            # (t_d785218c): a turn's bytes never change between compactions, so each request reads
+            # the whole previous one back and there is nothing for the #317 hoist to move.
+            as_older = None if contiguous else _older_turn_thinking(m)
             new_content = _keep_valid_latest_thinking(m["content"], bool(m.get("_thinking_signature_invalidated")))
             m["content"] = new_content or [_text_block("(empty)")]
-            if _wire_blocks(m["content"]) != _wire_blocks(as_older):
+            if as_older is not None and _wire_blocks(m["content"]) != _wire_blocks(as_older):
                 volatile_idx = idx
         # cache_control on thinking blocks interferes with signature validation.
         for b in m["content"]:
@@ -627,13 +621,9 @@ def _manage_thinking_signatures(
         _hoist_markers_before(result, volatile_idx)
 
 
-def _older_turn_thinking(m: Dict[str, Any], *, contiguous: bool) -> List[Any]:
-    """The thinking an assistant turn is sent with once it is no longer the latest one."""
-    if not contiguous:
-        return _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
-    # Orphan-stripping mutated THIS turn: every signature on it is dead, same as the latest-turn rule.
-    keep = [] if m.get("_thinking_signature_invalidated") else _keep_signed_thinking_only(m["content"])
-    return (keep or _strip_thinking(m["content"])) or [_text_block("(thinking elided)")]
+def _older_turn_thinking(m: Dict[str, Any]) -> List[Any]:
+    """The thinking an assistant turn is sent with once it is no longer the latest one (window ``latest``)."""
+    return _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
 
 
 def _wire_blocks(blocks: List[Any]) -> List[Any]:

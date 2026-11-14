@@ -112,7 +112,8 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
         from agent.message_sanitization import stale_thinking_reaches_wire
 
         return stale_thinking_reaches_wire(
-            *(_str_attr(agent, k) for k in ("api_mode", "provider", "model", "base_url"))
+            *(_str_attr(agent, k) for k in ("api_mode", "provider", "model", "base_url")),
+            requested_provider=_str_attr(agent, "requested_provider"),
         )
     except Exception:
         return True
