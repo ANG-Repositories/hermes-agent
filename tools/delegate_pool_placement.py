@@ -243,14 +243,31 @@ def release(lease: Optional[PoolLease]) -> None:
         cleanup_vm(lease.env_key)
     except Exception as exc:
         logger.debug("delegate pool placement: env cleanup of %s failed: %s", lease.env_key, exc)
+    if lease.pool_host is not None and lease.workspace:
+        # The rm runs on the leased host, so it runs under the reservation; the reservation is released after.
+        _start_cleanup(lease)
+    else:
+        _release_reservation(lease)
+
+
+def _release_reservation(lease: PoolLease) -> None:
     try:
         from hermes_cli import kanban_headroom as kh
         kh.release_alloc(lease.reservation_id)
     except Exception as exc:
         logger.warning("delegate pool placement: release of %s failed (TTL bounds it): %s",
                        lease.reservation_id, exc)
-    if lease.pool_host is not None and lease.workspace:
-        threading.Thread(target=_remove_workspace, args=(lease,), daemon=True).start()
+
+
+def _remove_then_release(lease: PoolLease) -> None:
+    try:
+        _remove_workspace(lease)
+    finally:
+        _release_reservation(lease)
+
+
+def _start_cleanup(lease: PoolLease) -> None:
+    threading.Thread(target=_remove_then_release, args=(lease,), daemon=True).start()
 
 
 def _remove_workspace(lease: PoolLease) -> None:
@@ -258,6 +275,7 @@ def _remove_workspace(lease: PoolLease) -> None:
     try:
         from hermes_cli.kanban_worker_pool import _ssh_argv
         subprocess.run(_ssh_argv(lease.pool_host, f"rm -rf -- {shlex.quote(lease.workspace)}"),
-                       capture_output=True, timeout=_RM_TIMEOUT_S, stdin=subprocess.DEVNULL)
+                       capture_output=True, timeout=_RM_TIMEOUT_S, stdin=subprocess.DEVNULL,
+                       env={**os.environ, "ALLOC_RESERVATION": lease.reservation_id})
     except Exception as exc:
         logger.debug("delegate pool placement: workspace removal on %s failed: %s", lease.host, exc)
