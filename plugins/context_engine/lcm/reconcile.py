@@ -1133,8 +1133,8 @@ class ReconcileMixin:
                 and role != "user"
                 and str(stored_rows[pos].get("role") or "") == "user"
                 and str(stored_rows[pos - 1].get("role") or "") == "user"
-                and self._user_row_rerender_key(stored_ids[pos][1])
-                == self._user_row_rerender_key(stored_ids[pos - 1][1])
+                and self._user_row_rerender_key(stored_ids[pos][1], stored=True)
+                == self._user_row_rerender_key(stored_ids[pos - 1][1], stored=True)
             ):
                 offset += 1
                 pos += 1
@@ -1144,7 +1144,7 @@ class ReconcileMixin:
                 break
             if identity != stored_ids[pos]:
                 if role == "user" and self._user_row_rerender_key(identity[1]) in (
-                    "", self._user_row_rerender_key(stored_ids[pos][1]),
+                    "", self._user_row_rerender_key(stored_ids[pos][1], stored=True),
                 ):
                     # Provisional: the cursor passes it only when a later row
                     # in the run matches by full identity.
@@ -1179,7 +1179,7 @@ class ReconcileMixin:
         return (role, stripped, tool_call_id, tool_calls)
 
     @staticmethod
-    def _user_row_rerender_key(content: Any) -> str:
+    def _user_row_rerender_key(content: Any, stored: bool = False) -> str:
         """A user row's content with the host's re-render variance removed.
 
         Measured on the live store (session 20261108_093540_fa4b70b9, store_ids
@@ -1213,16 +1213,20 @@ class ReconcileMixin:
         per-message timestamp opening the part, so a later part loses that
         timestamp and the triggering note after it, nothing else. Any other
         paragraph, a ``[System note: ...]`` one included, is content and stays
-        in the key.
+        in the key. Only the stored side (``stored=True``) loses those interior
+        stamps: the rebuilt host row has none, so a stamp the host row carries
+        is its own content (a pasted log line) and stays in its key.
         """
         key, separator, rest = ReconcileMixin._strip_user_row_wrappers(str(content or "").rstrip()).partition("\n\n")
         parts = [key]
-        while separator:
+        while separator and stored:
             stamped = _USER_ROW_TIMESTAMP_PREFIX.sub("", rest, count=1)
             if stamped != rest:
                 rest = _USER_ROW_DISCORD_NOTE_PREFIX.sub("", stamped, count=1)
             part, separator, rest = rest.partition("\n\n")
             parts.append(part)
+        if separator:
+            parts.append(rest)
         return "\n\n".join(parts)
 
     @staticmethod
