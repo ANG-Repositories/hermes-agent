@@ -799,3 +799,109 @@ class TestRestartResumeOfTwiceStoredUserTurn:
         _stored_into(tmp_path, stored)
         _rebuilt_agent_ingest(tmp_path, history)
         assert _count(tmp_path, "A reply the store never got.") == 1
+
+
+_INTERRUPTED = '{"output": "detached-run: queued skills38-\\n\\n[Command interrupted]", "exit_code": 130, "error": null}'
+_ORPHAN = ("[Orphan recovery: interrupted side-effecting tool may have executed; its effect is UNKNOWN. "
+           "Inspect state before retrying.]")
+_OP_INTERRUPTED = {"role": "assistant", "content": "Operation interrupted."}
+
+
+def _tool_before_assistant(stored, history):
+    """A host tool row inside a tool loop (an assistant row follows) and its stored position."""
+    idx = next(i for i, m in enumerate(history)
+               if i > 40 and m["role"] == "tool" and history[i + 1]["role"] == "assistant")
+    s_idx = next(i for i, r in enumerate(stored) if r.get("tool_call_id") == history[idx]["tool_call_id"])
+    return idx, s_idx
+
+
+class TestRestartResumeOverStoredOnlyRows:
+    """t_99e38df0: four sessions at the 21:22:26 boot stored 121..414 resumed rows
+    again. The store holds rows at the walk's position that the host does not:
+    an interrupted turn's residue (20261104_055036_47653c, 13398830..13398832),
+    or later turns left visible ahead of moved dedup copies
+    (20261109_011227_2e109b, 13286509 and 13324816 before 13361599). The walk
+    re-aligns on the next once-stored tool call; every host row still matches."""
+
+    def test_interrupted_turn_residue_appends_only_the_new_row(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        idx, s_idx = _tool_before_assistant(stored, history)
+        cid = history[idx]["tool_call_id"]
+        history[idx] = dict(history[idx], content=_INTERRUPTED)
+        stored[s_idx] = dict(stored[s_idx], content=_INTERRUPTED)
+        history[idx + 1:idx + 1] = [dict(_OP_INTERRUPTED), {"role": "user", "content": ""}]
+        stored[s_idx + 1:s_idx + 1] = [
+            dict(_OP_INTERRUPTED),
+            {"role": "tool", "tool_call_id": cid, "content": _ORPHAN},
+            dict(_OP_INTERRUPTED),
+            {"role": "user", "content": "[System note: The previous turn was interrupted by a gateway shutdown; "
+                                        "the gateway is now back online.]"},
+        ]
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_turns_left_ahead_of_moved_dedup_copies_append_only_the_new_row(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        _, s_idx = _tool_before_assistant(stored, history)
+        stored[s_idx + 1:s_idx + 1] = [
+            {"role": "user", "content": "[Continuing toward your standing goal]\nGoal: Every open card in this chat's "
+                                        "session lineage is closed."},
+            {"role": "user", "content": "[Fri 2026-11-13 07:56:14 PST] Prism loop not converging: t_9fbd307d"},
+        ]
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_host_row_the_store_lacks_after_stored_only_rows_is_stored(self, tmp_path):
+        stored, history = _restart_resume_shape()
+        idx, s_idx = _tool_before_assistant(stored, history)
+        stored[s_idx + 1:s_idx + 1] = [
+            {"role": "user", "content": "[Fri 2026-11-13 07:56:14 PST] Prism loop not converging: t_9fbd307d"},
+            {"role": "assistant", "content": "Looking at it."},
+        ]
+        history.insert(idx + 1, {"role": "assistant", "content": "A reply the store never got."})
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, "A reply the store never got.") == 1
+
+    def test_repeat_of_rows_the_store_holds_once_is_stored(self, tmp_path):
+        # Re-aligning backward would match the repeat against the stored rows the
+        # first copy already matched.
+        stored, history = _restart_resume_shape()
+        idx, s_idx = _tool_before_assistant(stored, history)
+        residue = [dict(_OP_INTERRUPTED), {"role": "user", "content": ""}]
+        history[idx + 1:idx + 1] = [dict(m) for m in residue + residue]
+        stored[s_idx + 1:s_idx + 1] = [dict(m) for m in residue]
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, _OP_INTERRUPTED["content"]) == 2
+
+
+class TestRestartRewrittenToolResult:
+    """t_99e38df0, session 20261109_011227_2e109b: at the walk's position the store
+    holds call V3jF7cgwmu as "[Orphan recovery: ...]" (13399788, written after a
+    restart); the host holds "[Command interrupted]", which the store holds
+    verbatim in an earlier copy of the turn."""
+
+    def _shape(self, earlier_copy):
+        stored, history = _restart_resume_shape()
+        idx, s_idx = _tool_before_assistant(stored, history)
+        history[idx] = dict(history[idx], content=_INTERRUPTED)
+        stored[s_idx] = dict(stored[s_idx], content=_ORPHAN)
+        if earlier_copy:
+            call = max(i for i in range(idx) if history[i]["role"] == "assistant")
+            stored[1:1] = [dict(m) for m in history[call:idx + 1]]
+        return stored, history
+
+    def test_result_stored_verbatim_elsewhere_appends_only_the_new_row(self, tmp_path):
+        stored, history = self._shape(earlier_copy=True)
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_result_the_store_never_got_is_stored(self, tmp_path):
+        stored, history = self._shape(earlier_copy=False)
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, _INTERRUPTED) == 1

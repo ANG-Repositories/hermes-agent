@@ -1071,8 +1071,14 @@ class ReconcileMixin:
         (the host re-renders them). A user row matched only through that key
         (or emptied) is provisional: the cursor passes it only when a later row
         in the run matches by full identity, so a run that ends right after it
-        leaves it to be appended. The run ends at the first row that does not
-        match, so the cursor never passes a row that is not shown to be stored:
+        leaves it to be appended. Where the store holds rows the host does not
+        (an interrupted turn's residue, turns left between moved dedup copies),
+        the walk re-aligns forward on the next once-stored tool call and
+        re-checks the host row there; a host tool row whose call the store
+        holds here with other content counts as stored when the store holds
+        it verbatim elsewhere. Otherwise the run ends at the first row that
+        does not match, so the cursor never passes a row that is not shown to
+        be stored:
         a gap in the store (rows the host holds that were never written, e.g.
         the store-free compaction fallback marks its raw tail ingested) ends
         the run at its first row, whether the gap shows on an assistant row, a
@@ -1105,22 +1111,30 @@ class ReconcileMixin:
         for pos, (row, identity) in enumerate(zip(stored_rows, stored_ids)):
             if str(row.get("role") or "") == "tool" and str(row.get("tool_call_id") or "") in unique_ids:
                 stored_tool_pos[identity] = pos
-        offset = None
-        for idx, msg in enumerate(messages):
-            if str(msg.get("role") or "") == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
-                pos = stored_tool_pos.get(
-                    self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
-                )
-                if pos is not None:
-                    offset = pos - idx
-                    break
+        host_ids = [
+            self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg)) for msg in messages
+        ]
+        # Stored position of each host tool row whose once-stored call id is
+        # stored with this full identity; None for every other host row.
+        anchor_pos = [
+            stored_tool_pos.get(identity)
+            if str(msg.get("role") or "") == "tool" and str(msg.get("tool_call_id") or "") in unique_ids
+            else None
+            for msg, identity in zip(messages, host_ids)
+        ]
+        offset = next((pos - idx for idx, pos in enumerate(anchor_pos) if pos is not None), None)
         if offset is None or offset < 0:
             return 0
+        stored_id_uses: dict[tuple[Any, ...], int] = {}
+        for identity in stored_ids:
+            stored_id_uses[identity] = stored_id_uses.get(identity, 0) + 1
         cursor = 0
         matched_ids: set[str] = set()
-        for idx, msg in enumerate(messages):
+        idx = 0
+        while idx < len(messages):
+            msg = messages[idx]
             pos = idx + offset
-            identity = self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
+            identity = host_ids[idx]
             role = str(msg.get("role") or "")
             # The store can hold one user turn twice in a row, once per
             # rendering, where the host holds it once (t_ca2c9470, session
@@ -1139,20 +1153,45 @@ class ReconcileMixin:
                 pos += 1
             if pos >= len(stored_rows):
                 break
-            if role != str(stored_rows[pos].get("role") or ""):
-                break
-            if identity != stored_ids[pos]:
-                if role == "user" and (
+            stored_role = str(stored_rows[pos].get("role") or "")
+            if role != stored_role or identity != stored_ids[pos]:
+                if role == stored_role == "user" and (
                     self._user_row_rerender_key(identity[1]) == ""
                     or self._user_row_rerenders_stored(identity[1], stored_ids[pos][1])
                 ):
                     # Provisional: the cursor passes it only when a later row
                     # in the run matches by full identity.
+                    idx += 1
+                    continue
+                if (
+                    role == stored_role == "tool"
+                    and str(msg.get("tool_call_id") or "") == str(stored_rows[pos].get("tool_call_id") or "")
+                    and stored_id_uses.get(identity)
+                ):
+                    # The store holds this tool row verbatim elsewhere, and here
+                    # the same call with other content: a restart rewrote the
+                    # result (t_99e38df0, session 20261109_011227_2e109b: host
+                    # "[Command interrupted]", stored "[Orphan recovery: ...]").
+                    cursor = idx + 1
+                    idx += 1
+                    continue
+                # The store holds rows here the host does not (an interrupted
+                # turn's residue, or turns stored between two moved dedup
+                # copies; t_99e38df0). Re-align on the next host row that is a
+                # once-stored tool call, only forward: stored rows are skipped,
+                # host rows never, and each one still has to match.
+                anchor = next(
+                    (at - j for j, at in enumerate(anchor_pos[idx:], start=idx) if at is not None),
+                    None,
+                )
+                if anchor is not None and anchor > offset:
+                    offset = anchor
                     continue
                 break
             if role == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
                 matched_ids.add(str(msg.get("tool_call_id")))
             cursor = idx + 1
+            idx += 1
         if len(matched_ids) < 2:
             return 0
         return cursor
