@@ -70,7 +70,6 @@ def test_table_covers_the_seen_codes():
     assert set(SEEN) - {"store_lock"} <= set(CONTENTALIAS_ERROR_CODES)
 
 
-
 _ST_HDRS = {**HDRS, "x-relay-seat": "sub-vps-19"}
 _ST_WIRE = ("the interactive session reported an upstream error row for this turn "
             "(API Error: contentalias:stream_transport{})")
@@ -81,29 +80,15 @@ def _st_row(detail):
                                 _ST_HDRS), 400)
 
 
-@pytest.mark.parametrize("detail", [": connect: connection refused", ": connection refused"])
-def test_stream_transport_names_the_forwarder_only_on_refusal_evidence(detail):
-    """t_6e7909d1: sub-vps-19 2026-11-12 22:52 PT, needrestart restarted the seat's tinyproxy
-    and the dpx unit's dial to :18814 was refused. The banner said "content-alias refused ...
-    the DPX alias layer refused the turn"; with the refusal in the error text it names the
-    box forwarder, ours."""
-    row = _st_row(detail)
-    assert fp.head_label_override(row) == "box forwarder refused the connection"
-    text = fp.format_cause_rider(row, tz=UTC)
-    assert "box forwarder refused the upstream connection" in text, text
-    assert "(ours, not Anthropic) on sub-vps-19" in text, text
-    assert "alias layer refused" not in text and "at the DPX alias layer" not in text, text
-
-
-@pytest.mark.parametrize("detail", ["", ": read tcp 10.0.0.2:51234: i/o timeout",
+@pytest.mark.parametrize("detail", ["", ": connect: connection refused", ": read tcp 10.0.0.2:51234: i/o timeout",
                                     ": read: connection reset by peer",
                                     # Go's real format names the forwarder address for ANY failure on the leg
                                     ": read tcp 100.112.250.39:51234->100.112.189.89:18814: i/o timeout",
                                     ": read tcp 100.112.250.39:51234->100.112.189.89:18814: read: "
                                     "connection reset by peer"])
-def test_stream_transport_without_refusal_names_the_leg_not_a_culprit(detail):
-    """Any non-EOF upstream read error is stream_transport: a timeout or reset through a
-    healthy forwarder must not send the reader to the seat proxy."""
+def test_stream_transport_names_the_leg_not_a_culprit(detail):
+    """t_6e7909d1: any non-EOF upstream read error is stream_transport; the unit reports only the code
+    (stored rows carry no dial text), so no row names the forwarder or claims "not Anthropic"."""
     row = _st_row(detail)
     assert fp.head_label_override(row) == "upstream connection failed"
     text = fp.format_cause_rider(row, tz=UTC)
@@ -112,15 +97,3 @@ def test_stream_transport_without_refusal_names_the_leg_not_a_culprit(detail):
     assert "box forwarder refused" not in text, text
     assert "not Anthropic" not in text, text
     assert "alias layer refused" not in text and "at the DPX alias layer" not in text, text
-
-
-def test_classifier_reads_go_formats_on_the_forwarder_leg():
-    """Go names the forwarder address for every failure on the leg; only the refusal is the forwarder's.
-    Checked on the error text itself: the full dial line does not fit the stored err_head (ERR_HEAD_MAX)."""
-    from agent.fallback_capability import CONTENTALIAS_FORWARDER_REFUSED, bridge_code_entry
-    st = "contentalias:stream_transport"
-    assert bridge_code_entry(st, "dial tcp 100.112.189.89:18814: connect: connection refused") \
-        is CONTENTALIAS_FORWARDER_REFUSED
-    for t in ("read tcp 100.112.250.39:51234->100.112.189.89:18814: i/o timeout",
-              "read tcp 100.112.250.39:51234->100.112.189.89:18814: read: connection reset by peer"):
-        assert bridge_code_entry(st, t) is not CONTENTALIAS_FORWARDER_REFUSED, t

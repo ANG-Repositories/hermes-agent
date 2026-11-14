@@ -1416,7 +1416,7 @@ def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
     from agent.fallback_capability import bridge_code_entry, bridge_code_where
 
     code = _bridge_code(row) or ""
-    entry = bridge_code_entry(code, row.get("err_head"))
+    entry = bridge_code_entry(code)
     st = row.get("http_status") or "error"
     where = bridge_code_where(code)
     seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
@@ -1492,7 +1492,7 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
     if bcode:
         from agent.fallback_capability import bridge_code_entry
 
-        stated = bridge_code_entry(bcode, row.get("err_head")).cause
+        stated = bridge_code_entry(bcode).cause
         if stated:
             return stated
         if cls == LANE_INCAPABLE_CLASS:
@@ -2071,7 +2071,7 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
         # label (a 409 -> "bad request") does not (t_5d79bfea).
         from agent.fallback_capability import bridge_code_entry
 
-        entry = bridge_code_entry(bcode, row.get("err_head"))
+        entry = bridge_code_entry(bcode)
         if entry.head:
             return entry.head
         # No head of its own: the label is the rider's cause, from the same
