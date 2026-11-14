@@ -1120,12 +1120,28 @@ class ReconcileMixin:
         matched_ids: set[str] = set()
         for idx, msg in enumerate(messages):
             pos = idx + offset
+            identity = self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
+            role = str(msg.get("role") or "")
+            # The store can hold one user turn twice in a row, once per
+            # rendering, where the host holds it once (t_ca2c9470, session
+            # 20261023_031240_9df89e67: "[ts] <text>" then "<text>"). Step over
+            # the stored copy unless the host row is that user row itself;
+            # every host row still has to match.
+            while (
+                0 < pos < len(stored_rows)
+                and identity != stored_ids[pos]
+                and role != "user"
+                and str(stored_rows[pos].get("role") or "") == "user"
+                and str(stored_rows[pos - 1].get("role") or "") == "user"
+                and self._user_row_rerender_key(stored_ids[pos][1])
+                == self._user_row_rerender_key(stored_ids[pos - 1][1])
+            ):
+                offset += 1
+                pos += 1
             if pos >= len(stored_rows):
                 break
-            role = str(msg.get("role") or "")
             if role != str(stored_rows[pos].get("role") or ""):
                 break
-            identity = self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
             if identity != stored_ids[pos]:
                 if role == "user" and self._user_row_rerender_key(identity[1]) in (
                     "", self._user_row_rerender_key(stored_ids[pos][1]),
@@ -1187,8 +1203,26 @@ class ReconcileMixin:
         leading whitespace of the text itself is kept (indentation is content).
         Anything else is a different row. An empty key means the host emptied
         the row: skipping it drops no content, so the caller accepts it.
+
+        A merged turn re-renders part by part (t_ca2c9470, session
+        20261113_202135_169c983f at the 21:22 boot): the host joins consecutive
+        user rows with "\\n\\n" (agent_runtime_helpers._merge_consecutive_users),
+        the live row was stored as ``[ts] <a>\\n\\n[ts] [Triggering ...]\\n\\n<b>``,
+        and the restarted gateway rebuilds it from the clean parts as
+        ``<a>\\n\\n<b>``. So the wrappers are removed at the start of every part,
+        each part with its own budget. Accepted limit: user text that itself
+        starts a paragraph with a wrapper is keyed without it.
         """
-        text = str(content or "").rstrip()
+        parts = []
+        rest = str(content or "").rstrip()
+        while True:
+            part, separator, rest = ReconcileMixin._strip_user_row_wrappers(rest).partition("\n\n")
+            parts.append(part)
+            if not separator:
+                return "\n\n".join(parts)
+
+    @staticmethod
+    def _strip_user_row_wrappers(text: str) -> str:
         left = {wrapper: 1 for wrapper in _USER_ROW_WRAPPER_PREFIXES}
         while True:
             for wrapper in _USER_ROW_WRAPPER_PREFIXES:
