@@ -24,6 +24,7 @@ to the file without a migration.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,16 @@ def _clears_blocked(entry: dict, outcome: object) -> bool:
     """t_5701751b: a handled terminal outcome clears ``blocked_spent``, except the blocked assessment's
     own ``retry`` (block, retry, re-block with no handled wake between must still reach the owner)."""
     return outcome in HANDLED_OUTCOMES and not (entry.get("row") == "blocked_assess" and outcome == "retry")
+
+
+def _card_digest(card_text: object) -> Optional[str]:
+    """t_2f7fd11c: a claim keeps the digest of its dispatch-time ``[title, body]``, not the text
+    (61% of a 26 MB state file); None when ``card_text`` is not that pair."""
+    if not isinstance(card_text, (list, tuple)) or len(card_text) != 2:
+        return None
+    from hermes_cli.kanban_db import card_text_digest
+
+    return card_text_digest(card_text[0], card_text[1])
 
 
 def _claimed_at(entry: dict) -> float:
@@ -99,15 +110,37 @@ class BoomerangWakeState:
 
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = Path(path) if path is not None else state_path()
+        # sha256 of the bytes last read from / written to ``path`` (t_2f7fd11c: skip a no-op rewrite)
+        self._disk_sha: Optional[str] = None
 
     # --- file I/O (caller holds _LOCK) ---------------------------------------
 
     def _read(self) -> dict:
+        self._disk_sha = None
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            blob = self.path.read_bytes()
+            raw = json.loads(blob.decode("utf-8-sig"))
         except (OSError, ValueError):
             return {}
-        return self._migrate_blocked(self._migrate(raw)) if isinstance(raw, dict) else {}
+        self._disk_sha = hashlib.sha256(blob).hexdigest()
+        if not isinstance(raw, dict):
+            return {}
+        return self._migrate_card_text(self._migrate_blocked(self._migrate(raw)))
+
+    @staticmethod
+    def _migrate_card_text(data: dict) -> dict:
+        """t_2f7fd11c: a claim written before the digest carries ``assessed_card_text``; replace it
+        with ``assessed_card_digest`` (persisted by the next write, like the other migrations)."""
+        claims = data.get("claims")
+        if not isinstance(claims, dict):
+            return data
+        for entry in claims.values():
+            if isinstance(entry, dict) and "assessed_card_text" in entry:
+                text = entry.pop("assessed_card_text")
+                digest = _card_digest(text)
+                if digest is not None and "assessed_card_digest" not in entry:
+                    entry["assessed_card_digest"] = digest
+        return data
 
     @classmethod
     def _migrate(cls, data: dict) -> dict:
@@ -180,14 +213,20 @@ class BoomerangWakeState:
         return data
 
     def _write(self, data: dict) -> None:
+        """Replace the file with ``data``; no write when the bytes equal what ``_read`` just saw."""
+        blob = json.dumps(data, sort_keys=True).encode("utf-8")
+        sha = hashlib.sha256(blob).hexdigest()
+        if sha == self._disk_sha:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".boomerang-wake-", dir=str(self.path.parent))
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, sort_keys=True)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(blob)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            self._disk_sha = sha
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1137,10 +1176,10 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                     raise RuntimeError("restricted card requires owner assessment")
                 # Bind evidence to the dispatch snapshot, not freshly edited text.
                 # The DB checks it under its writer lock with the block-event CAS.
-                assessed_text = entry.get("assessed_card_text")
-                if not isinstance(assessed_text, list) or len(assessed_text) != 2:
+                digest = entry.get("assessed_card_digest") or _card_digest(entry.get("assessed_card_text"))
+                if not isinstance(digest, str):
                     raise RuntimeError("assessed card text unavailable")
-                kwargs["expect_card_text"] = tuple(assessed_text)
+                kwargs["expect_card_digest"] = digest
                 last_comment = entry.get("assessed_last_comment")
                 if not isinstance(last_comment, int):
                     raise RuntimeError("assessed comment revision unavailable")
@@ -2261,7 +2300,7 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         "event_ts": event_ts, "row": disposition.row, "mode": disposition.mode or "fork",
         "status": snap["status"], "assignee": snap["assignee"], "pr": snap["pr"], "head": snap["head"],
         "cursor_event_id": max(int(event_id), snap["top_event_id"]),
-        "assessed_card_text": snap["card_text"],
+        "assessed_card_digest": _card_digest(snap["card_text"]),
         "assessed_last_comment": snap["last_comment"],
         "home_sid": home_sid or "", "route": dict(route or {}), "path": path,
         "title": str(_field(task, "title") or "")[:160], "wake_text": wake_text,

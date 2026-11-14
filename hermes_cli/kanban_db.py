@@ -16626,6 +16626,12 @@ def _unblock_expectation_holds(
     return True
 
 
+def card_text_digest(title: Optional[str], body: Optional[str]) -> str:
+    """Stable digest of a card's ``(title, body)``: what ``unblock_task(expect_card_digest=)`` compares."""
+    raw = json.dumps([title, body]).encode("ascii")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 @_home_session_guarded("unblock")
 def unblock_task(
     conn: sqlite3.Connection,
@@ -16635,6 +16641,7 @@ def unblock_task(
     expect_block_event: Optional[int] = None,
     expect_last_comment: Optional[int] = None,
     expect_card_text: Optional[tuple] = None,
+    expect_card_digest: Optional[str] = None,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -16653,6 +16660,8 @@ def unblock_task(
     re-blocked or re-pointed in between returns False and is left alone.
     ``expect_card_text`` pins ``(title, body)`` under that same lock, for callers
     whose authorization decision depends on tags embedded in those fields.
+    ``expect_card_digest`` is the same pin as :func:`card_text_digest` of ``(title, body)``,
+    for a caller that persists the decision and should not store the text (t_2f7fd11c).
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -16666,6 +16675,10 @@ def unblock_task(
         if expect_card_text is not None:
             row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None or tuple(row) != expect_card_text:
+                return False
+        if expect_card_digest is not None:
+            row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or card_text_digest(row[0], row[1]) != expect_card_digest:
                 return False
         if (expect_block_event is not None or expect_last_comment is not None) and not (
             _unblock_expectation_holds(conn, task_id, expect_block_event, expect_last_comment)
