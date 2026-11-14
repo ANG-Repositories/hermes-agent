@@ -405,6 +405,21 @@ def test_a_permission_only_token_repair_clears_the_latch(door_fleet):
         token.chmod(0o600)
 
 
+def test_a_root_receipt_repair_clears_the_latch(door_fleet, monkeypatch, tmp_path):
+    """Prism f6e8a5c31293: a latch caused by missing root provisioning clears once PLACEMENT_ROOT_RECEIPT is set,
+    and again when the receipt file it names is repaired."""
+    monkeypatch.delenv("PLACEMENT_ROOT_RECEIPT", raising=False)
+    faults.latch("PLACEMENT_ROOT_RECEIPT required")
+    assert faults.latched()
+    receipt = tmp_path / "placement-root.json"
+    monkeypatch.setenv("PLACEMENT_ROOT_RECEIPT", str(receipt))
+    assert faults.latched() is None                       # env repaired: a fresh door attempt is allowed
+    faults.latch("receipt unreadable")
+    assert faults.latched()
+    receipt.write_text("{}", encoding="utf-8")
+    assert faults.latched() is None                       # receipt file created: cleared again
+
+
 def test_an_idle_publish_does_not_clear_a_publish_outage(door_fleet):
     """Prism 0056dc604414. RED on 605a9c86: with nothing waiting and nothing recorded, publish_waiting made no allocd
     call yet recorded publish success, so an idle tick after the backoff cleared the outage and paged recovery."""
