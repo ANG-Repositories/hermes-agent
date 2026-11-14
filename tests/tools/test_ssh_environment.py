@@ -55,6 +55,18 @@ class TestBuildSSHCommand:
                       "BatchMode=yes", "StrictHostKeyChecking=accept-new"):
             assert flag in cmd
 
+    @pytest.mark.parametrize("multiplex", [True, False])
+    def test_keepalive_flags(self, monkeypatch, multiplex):
+        """t_c20e3ec8: a host that dies mid-command sends no RST/FIN; without ServerAlive* the call
+        hangs to the tool timeout. With multiplexing this argv also starts the ControlMaster, the
+        process that owns the TCP connection, so the flags must ride every built command."""
+        monkeypatch.setattr(ssh_env, "_SSH_MULTIPLEX", multiplex)
+        env = SSHEnvironment(host="h", user="u")
+        argv = env._build_ssh_command()
+        for opt in ("ServerAliveInterval=5", "ServerAliveCountMax=2"):
+            assert argv[argv.index(opt) - 1] == "-o"
+        assert argv.index("ServerAliveInterval=5") < argv.index("u@h")
+
     def test_controlmaster_gated_off_on_windows(self, monkeypatch):
         """#73927: Windows OpenSSH has no Unix-domain ControlMaster, so the
         ControlPath/ControlMaster/ControlPersist options must be omitted —

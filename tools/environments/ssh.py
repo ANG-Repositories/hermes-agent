@@ -139,6 +139,11 @@ class SSHEnvironment(BaseEnvironment):
             cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",
                         "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])
         cmd.extend(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"])
+        # A host that dies mid-command sends no RST/FIN: without keepalives the call hangs until the
+        # tool timeout. sshd answers these, not the command, so a silent command stays up. Only the
+        # process that owns the TCP connection uses them: the ControlMaster, which inherits this argv
+        # from the first command that starts it (a mux client's own value is ignored).
+        cmd.extend(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"])
         # Names only; values ride the ssh client's own environment (never the remote command text).
         cmd.extend(arg for name in send_env for arg in ("-o", f"SendEnv={name}"))
         cmd.extend(self._target_flags("-p"))
