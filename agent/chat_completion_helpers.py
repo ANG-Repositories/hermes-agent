@@ -6200,9 +6200,11 @@ class _StreamingCall(StreamingWaitMonitor):
         in the chain: abort this attempt like an interrupt (no in-place retry), and let
         ``run`` raise ``FallbackWallBudgetExceeded`` so the loop fails over to the next
         lane in chain order, same model or not (t_452c6ead, t_778185f3)."""
-        logger.warning("No first byte from %s/%s within the fallback wall budget (%.0fs); cutting the attempt.",
-                       self.agent.provider, self.api_kwargs.get("model", "unknown"),
-                       (getattr(self.agent, "_wall_budget", None) or {}).get("budget_s", 0.0))
+        _wb_state = getattr(self.agent, "_wall_budget", None) or {}
+        if "cut_capacity" not in _wb_state:  # the early no-capacity cut logs its own line
+            logger.warning("No first byte from %s/%s within the fallback wall budget (%.0fs); cutting the attempt.",
+                           self.agent.provider, self.api_kwargs.get("model", "unknown"),
+                           _wb_state.get("budget_s", 0.0))
         # The banner names the lane, the budget clock and (if the relay sent headers
         # before the cut) the seat: captured before the teardown resets the attempt.
         from agent.fallback_wall_budget import elapsed as _wb_elapsed
@@ -6358,11 +6360,10 @@ class _StreamingCall(StreamingWaitMonitor):
             self.worker.start()
             self._monitor_loop()
         if self._wall_budget_cut:
-            from agent.fallback_wall_budget import FallbackWallBudgetExceeded
-            raise FallbackWallBudgetExceeded(
-                f"no first byte from {self.api_kwargs.get('model', 'the provider')} within the turn's "
-                "fallback wall budget (fallback.no_first_byte_budget_seconds); moving to the next lane",
-                **(getattr(self, "_wall_budget_cut_evidence", None) or {}))
+            # The budget cut, or the early cut for a model the relay says it cannot serve.
+            from agent.fallback_wall_budget import cut_exception
+            raise cut_exception(self.agent, self.api_kwargs.get("model"),
+                                **(getattr(self, "_wall_budget_cut_evidence", None) or {}))
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
