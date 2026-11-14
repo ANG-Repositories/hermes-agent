@@ -186,3 +186,112 @@ def test_same_second_comments_do_not_turn_an_expired_hold_into_an_act(tmp_path, 
         eid = _ev(conn, tid, "review_deadman", {}, ts)
         _cm(conn, tid, OWNER, "deadman: hold 2020-01-01T00:00:00Z", ts)
     assert bw.deadman_owner_acted(_entry(tid, eid, "d-same-second")) is False
+
+
+# --- a disposition answers the wake only after the event that last put the card into review ---------------------
+# Board rows (kind, created_at, payload keys that matter) from the review entry to the deadman event, in board order.
+# ``OWN`` marks the owner's disposition: written from Apollo's human session (here: session "apollo-sess", accepted
+# by a patched _session_is_owner, since the replay has no state.db). Other rows carry no owner provenance.
+OWN = "own"
+RESUME_REPLAYS = {
+    # t_8406de76: blocked by the owner 11-08 12:48, unblocked to review 11-09 08:01, deadman 2367105 11-10 02:11
+    "t_8406de76": ([("review_requested", 1794138993, {"reviewer": OWNER}),
+                    ("blocked", 1794170901, {"kind": "transient", "source_status": "review"}, OWN),
+                    ("unblocked", 1794240101, {"status": "review", "resume_status": "review"})],
+                   ("review_deadman", 1794305499, {"by": "review-failsafe-attended-read", "review_episode": 2184564,
+                                                   "waiting_min": 2775}), False),
+    # t_e7d728d3: completed by the owner 11-06, reopened to review, blocked, unblocked to review 11-08 19:52,
+    # deadman 2294413 11-08 21:54
+    "t_e7d728d3": ([("review_requested", 1793971907, {"reviewer": OWNER}),
+                    ("completed", 1793973250, {"result_len": 121}, OWN),
+                    ("reopened", 1794015937, {"to_status": "review", "assignee": OWNER}),
+                    ("blocked", 1794023492, {"kind": "transient", "source_status": "review"}),
+                    ("unblocked", 1794196339, {"status": "review", "resume_status": "review"})],
+                   ("review_deadman", 1794203663, {"by": "kanban-review-deadman", "episode": 2047184,
+                                                   "threshold_min": 15, "waiting_min": 15}), False),
+    # t_1d522c59: blocked by the owner 11-09 02:09, unblocked 06:45, promoted to review 07:58, deadman 2336145 11:51
+    "t_1d522c59": ([("review_requested", 1794197215, {"reviewer": OWNER}),
+                    ("review_deadman", 1794198665, {"by": "kanban-review-deadman", "episode": 2287721}),
+                    ("blocked", 1794218954, {"kind": "transient", "source_status": "review"}, OWN),
+                    ("unblocked", 1794235505, {"status": "review", "resume_status": "review"}),
+                    ("promoted", 1794239901, {"status": "review"})],
+                   ("review_deadman", 1794253908, {"by": "review-failsafe-attended-read", "review_episode": 2287721,
+                                                   "waiting_min": 944}), False),
+    # t_333519f1: the owner completed the card (2341843) after its review_requested, deadman 2341852 29 s later:
+    # still answered
+    "t_333519f1": ([("review_requested", 1794258993, {"reviewer": OWNER}),
+                    ("completed", 1794260404, {"result_len": 313}, OWN)],
+                   ("review_deadman", 1794260433, {"by": "kanban-review-deadman", "episode": 2340768,
+                                                   "threshold_min": 15, "waiting_min": 20}), True),
+}
+
+
+def _board_resume(tmp_path, monkeypatch, card):
+    from gateway import kanban_wake_defer as wd
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.delenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", raising=False)
+    monkeypatch.delenv("BOOMERANG_STALE_GUARD", raising=False)
+    monkeypatch.setattr(bw, "_health_fn", lambda: (lambda repo, n: {"state": "open"}))
+    monkeypatch.setattr(wd, "_session_is_owner", lambda conn, sid, *a: sid == "apollo-sess")
+    rows, deadman, _acted = RESUME_REPLAYS[card]
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title=f"{card} replay", assignee=OWNER)
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        conn.commit()
+        for kind, ts, payload, *own in rows:
+            eid = _ev(conn, tid, kind, payload, ts)
+            if own:
+                conn.execute("UPDATE task_events SET actor_profile = 'apollo', actor_session_id = 'apollo-sess' "
+                             "WHERE id = ?", (eid,))
+                conn.commit()
+        kind, ts, payload = deadman
+        wake = _ev(conn, tid, kind, payload, ts)
+    return tid, wake
+
+
+@pytest.mark.parametrize("card", sorted(RESUME_REPLAYS))
+def test_disposition_counts_only_after_the_last_review_entry(tmp_path, monkeypatch, card):
+    tid, wake = _board_resume(tmp_path, monkeypatch, card)
+    assert bw.deadman_owner_acted(_entry(tid, wake, f"d-{card}")) is RESUME_REPLAYS[card][2]
+
+
+@pytest.mark.parametrize("card", ["t_8406de76", "t_e7d728d3", "t_1d522c59"])
+def test_old_rule_dismissed_the_resumed_reviews(tmp_path, monkeypatch, card):
+    """The merged rule (cursor = latest review_requested) answered these wakes with the ended park; so does the kill
+    switch."""
+    tid, wake = _board_resume(tmp_path, monkeypatch, card)
+    monkeypatch.setenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", "0")
+    assert bw.deadman_owner_acted(_entry(tid, wake, f"d-{card}")) is True
+
+
+@pytest.mark.parametrize("card", ["t_8406de76", "t_e7d728d3", "t_1d522c59"])
+def test_resumed_review_wake_is_delivered_through_run_entry(tmp_path, monkeypatch, card):
+    tid, wake = _board_resume(tmp_path, monkeypatch, card)
+    did = f"del-{card}-replay"
+    entry = _entry(tid, wake, did)
+    state = bw.BoomerangWakeState(tmp_path / "claims.json")
+    state.claim(entry["key"], entry)
+
+    async def parent(*args):
+        return object(), "fork"
+    monkeypatch.setattr(bw, "parent_resolver", parent)
+    monkeypatch.setattr(bw, "ledger_append", lambda *a: None)
+    monkeypatch.setattr(bw, "build_goal", lambda entry: "attended read")
+    final = "<<<BOOMERANG-VERDICT nonce=abcd>>>\n" + json.dumps(
+        {"action": "surface", "summary": "review owed"}) + "\n<<<END-VERDICT>>>"
+    monkeypatch.setattr(bw, "run_child", lambda *args: ("completed", final))
+    turns = []
+
+    async def resurface(runner, e, text=None):
+        turns.append(text)
+        return True
+    monkeypatch.setattr(bw, "resurface", resurface)
+    sent = []
+    asyncio.run(bw.run_entry(_runner([], sent), entry, state))
+    assert sent == [f"boomerang handled {tid} (review_deadman): review owed"]
+    assert len(turns) == 1
+    with kb.connect_closing() as conn:
+        mine = [c.body for c in kb.list_comments(conn, tid) if c.body.endswith(f"(delegation {did})")]
+    assert not any("operator already acted" in b for b in mine)

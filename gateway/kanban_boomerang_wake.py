@@ -1455,12 +1455,34 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
 
 # --- delivery (event loop) ----------------------------------------------------------------
 
+def _review_entry_id(kb: Any, conn: Any, task_id: str, trigger: int) -> Optional[int]:
+    """Id of the event that last put the card into review at or before ``trigger``: a ``review_requested``, or a
+    resume into review with no new one (kanban_db._REVIEW_RESUME_KINDS: ``unblocked``/``promoted`` with ``status:
+    review``, ``reopened`` with ``to_status: review``). None when there is none."""
+    resume = kb._REVIEW_RESUME_KINDS  # noqa: SLF001
+    marks = ",".join("?" for _ in resume)
+    for r in conn.execute(
+            f"SELECT id, kind, payload FROM task_events WHERE task_id = ? AND id <= ? "
+            f"AND kind IN ('review_requested', {marks}) ORDER BY id DESC", (task_id, trigger, *resume)):
+        if r["kind"] == "review_requested":
+            return int(r["id"])
+        try:
+            payload = json.loads(r["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        if isinstance(payload, dict) and payload.get(resume[r["kind"]]) == "review":
+            return int(r["id"])
+    return None
+
+
 def deadman_owner_acted(entry: dict) -> bool:
     """Check operator provenance since review began, not merely since child dispatch.
 
     t_a6da8394: a comment counts only when newer than the deadman event itself and not an expired hold; any other
-    owner event counts only when it is a disposition (DEADMAN_ACTION_KINDS). BOOMERANG_DEADMAN_TRIGGER_CURSOR=0: any
-    owner event since the review began counts (the rule that dismissed t_9854b4b7's two wakes)."""
+    owner event counts only when it is a disposition (DEADMAN_ACTION_KINDS) newer than the event that last put the
+    card into review (:func:`_review_entry_id`; a park the review has since resumed from does not answer the wake).
+    BOOMERANG_DEADMAN_TRIGGER_CURSOR=0: any owner event since the latest review_requested counts (the rule that
+    dismissed t_9854b4b7's two wakes)."""
     if entry.get("row") != ROW_REVIEW_DEADMAN:
         return False
     from hermes_cli import kanban_db as kb
@@ -1476,6 +1498,9 @@ def deadman_owner_acted(entry: dict) -> bool:
         skip = None
         if deadman_trigger_cursor_enabled():
             trigger, now = int(entry.get("event_id") or 0), _time.time()
+            entered = _review_entry_id(kb, conn, entry["task_id"], trigger)
+            if entered is not None:
+                review = (entered,)
 
             def skip(ev: Any) -> bool:
                 if ev["kind"] != "commented":
