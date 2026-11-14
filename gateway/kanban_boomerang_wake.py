@@ -1246,17 +1246,22 @@ def _hold_expired(body: Any, now: float) -> bool:
 
 
 def _expired_hold_comment(conn: Any, task_id: str, event: Any, now: float) -> bool:
-    """The ``commented`` event's comment row(s) are expired holds (author + second match; the event may tick a second
-    after its row). No matching row: False, so the comment still counts as the owner acting."""
+    """The ``commented`` event's comment row is an expired hold. The event carries no comment id, so its row is found by
+    author + second (the event may tick a second after its row) + the payload's ``len`` (Prism d93e70e178e9: two owner
+    comments in one second). Every remaining candidate must be an expired hold; no candidate: False, so the comment
+    still counts as the owner acting."""
     try:
         payload = json.loads(event["payload"] or "{}")
     except ValueError:
         payload = {}
-    author = str((payload.get("author") if isinstance(payload, dict) else None) or "").strip()
+    payload = payload if isinstance(payload, dict) else {}
+    author = str(payload.get("author") or "").strip()
     ts = int(event["created_at"] or 0)
-    bodies = [r[0] for r in conn.execute(
+    bodies = [r[0] or "" for r in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND author = ? AND created_at BETWEEN ? AND ?",
         (task_id, author, ts - 1, ts))]
+    sized = [b for b in bodies if len(b) == payload.get("len")]
+    bodies = sized or bodies
     return bool(bodies) and all(_hold_expired(b, now) for b in bodies)
 
 

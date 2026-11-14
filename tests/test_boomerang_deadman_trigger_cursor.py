@@ -169,3 +169,20 @@ def test_owner_disposition_after_review_still_answers(tmp_path, monkeypatch, kin
         _ev(conn, tid, kind, {}, 1794600001)
     assert bw.deadman_owner_acted(_entry(tid, w1, "d-disp")) is True
     assert seen == [kind]
+
+
+def test_same_second_comments_do_not_turn_an_expired_hold_into_an_act(tmp_path, monkeypatch):
+    """Prism d93e70e178e9 repro: owner plain comment, the deadman event, then an expired hold, all in one second.
+    The only owner comment AFTER the event is the expired hold, so the wake is not answered."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.delenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", raising=False)
+    kb.init_db()
+    ts = 1794617789
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="same second", assignee=OWNER)
+        _ev(conn, tid, "review_requested", {}, ts - 3600)
+        _cm(conn, tid, OWNER, "looking at it now", ts)
+        eid = _ev(conn, tid, "review_deadman", {}, ts)
+        _cm(conn, tid, OWNER, "deadman: hold 2020-01-01T00:00:00Z", ts)
+    assert bw.deadman_owner_acted(_entry(tid, eid, "d-same-second")) is False
