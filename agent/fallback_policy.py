@@ -978,12 +978,15 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
         # verdict == "cap" (primary warm copy expired/absent) does NOT return
         # here: the fallback copy may still be warm, and D6 waits for
         # fallback_cold/compaction below (t_e001a935; no cap_expiry branch).
-        if (state.cls in RELAY_QUOTA_CLASSES and _relay_pooled(provider)
+        if ((state.cls in RELAY_QUOTA_CLASSES or state.cls == NO_FIRST_BYTE_BUDGET_CLASS)
+                and _relay_pooled(provider)
                 and eligibility is not None and not is_direct_pin(provider)):
             # t_d780729d: the episode's quota verdict was only a short local cache;
             # past it the relay's answer for this model decides. A relay that says
             # no seat can serve the model keeps the session on its fallback (the
             # cold/compaction branches below would only replay the refusal).
+            # A budget cut counts too (2026-11-13: a 600 s cut on claude-dtlr/Fable
+            # with 23/25 seats drained returned to Fable next turn and looped).
             # Unreachable / stale -> None -> the branches below, unchanged; so is an
             # answer without a ``model_eligible`` key (an older relay build).
             elig = eligibility()
@@ -1059,6 +1062,7 @@ class RebuildDecision(NamedTuple):
 
 def decide_rebuild(store: StickyStore, key: StickyKey, now: float, *,
                    live_session_id: Optional[str],
+                   capacity_hold: Optional[Callable[[], Optional[str]]] = None,
                    eligibility: Optional[EligibilityFn] = None,
                    direct_pin_benched: Optional[BenchFn] = None,
                    sticky_policy: bool = True,
@@ -1074,6 +1078,11 @@ def decide_rebuild(store: StickyStore, key: StickyKey, now: float, *,
         return RebuildDecision("store_unreadable", None, None)
     if state is None or not state.active:
         return RebuildDecision("primary", state, None)
+    held = capacity_hold() if capacity_hold is not None else None
+    if held:
+        # 2026-11-13: the primary's relay states it cannot serve the primary model;
+        # a rebuilt session resumes its fallback whatever the episode's class.
+        return RebuildDecision("resume", state, Decision(False, None, held))
     if state.cls in TRANSIENT_CLASSES:
         # A restart never resumes a transient episode, even inside its
         # cooldown: the rebuilt session starts on the primary and the normal
@@ -1972,7 +1981,7 @@ def relay_conn_without_evidence(row: Mapping[str, Any]) -> bool:
         return False
     if normalize_hop(row.get("hop")) or (row.get("seat") and row.get("seat") != "unknown"):
         return False
-    if row.get("class_source") in ("relay_header", "relay_stream") or row.get("relay_synthetic"):
+    if row.get("class_source") in ("relay_header", "relay_stream", "relay_probe") or row.get("relay_synthetic"):
         return False
     if row.get("http_status") is not None:  # an HTTP status means the relay answered
         return False
@@ -2058,7 +2067,7 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     name the real cause instead of the status-derived ``rate limit``. When
     this returns a label, ``_quota_window_suffix`` is not applied."""
     cls = row.get("trigger_class")
-    relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream")
+    relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream", "relay_probe")
                      or bool(row.get("relay_synthetic")))
     cause = _cause_phrase(row)
     if (cause in ("relay unavailable", "relay quota exhausted", "relay transport unavailable")

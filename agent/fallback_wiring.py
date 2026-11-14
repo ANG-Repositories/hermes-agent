@@ -227,9 +227,11 @@ def _eligibility_fn(agent: Any):
             return None
         provider, model, base_url, sid = route
         if provider.strip().lower() in ("claude-apr", "claude-alr", "claude-alrs", "claude-alrf", "claude-dalrs", "claude-dalrf"):
-            return fp.fetch_eligibility(base_url, model=model, session=sid or None)
-        return fp.fetch_eligibility(base_url, model=model,
-                                    user=f"hermes-sess:{sid}" if sid else None)
+            elig = fp.fetch_eligibility(base_url, model=model, session=sid or None)
+        else:
+            elig = fp.fetch_eligibility(base_url, model=model,
+                                        user=f"hermes-sess:{sid}" if sid else None)
+        return _with_relay_capacity(elig, base_url, model)
 
     def _cached():
         turn = getattr(agent, "_current_turn_id", None)
@@ -245,6 +247,51 @@ def _eligibility_fn(agent: Any):
         return cache.get((turn, _eligibility_route(agent)))
 
     return _cached
+
+
+def _primary_capacity_hold(agent: Any) -> Optional[str]:
+    """The refusal reason when the primary's relay states it has no capacity for the
+    primary model (every Fable seat's allowance used up, or no seat eligible), else None.
+
+    2026-11-13: a session fell back off claude-dtlr/claude-fable-5-2 after 600 s of
+    silence and the next turn "recovered" straight back to it while 23 of 25 seats had
+    no Fable allowance left, so every turn looped dtlr -> btpr -> alr -> dtlr."""
+    provider, model = primary_route(agent)
+    rt = getattr(agent, "_primary_runtime", None) or {}
+    base_url = str(rt.get("base_url") or "") if isinstance(rt, dict) else ""
+    try:
+        # Every pool relay face (alr, dtlr, btpr, bpr ...), not only the /eligibility
+        # warm-seat lanes: dtlr has no seat signal, so without this its episodes
+        # returned on the ``transient`` branch the moment the cooldown passed.
+        from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
+        if provider.strip().lower() not in _POOL_CAPABILITY_PROVIDERS or not base_url or not model:
+            return None
+        from agent.fork_ext.relay_capacity import capacity_phrase, exhausted, model_capacity
+        cap = model_capacity(base_url, model)
+        if not exhausted(cap):
+            return None
+        return f"relay: no capacity for {model} ({capacity_phrase(cap) or 'no seat eligible'})"
+    except Exception:  # noqa: BLE001 — unknown is never a hold
+        logger.debug("relay capacity hold check failed", exc_info=True)
+        return None
+
+
+def _with_relay_capacity(elig: Optional["fp.Eligibility"], base_url: str,
+                         model: str) -> Optional["fp.Eligibility"]:
+    """An ``/eligibility`` answer, marked model-ineligible when the relay's own capacity
+    answer says the model cannot be served (so every return gate that reads
+    ``model_eligible`` holds the session on its fallback, rebuilds included)."""
+    if elig is None:
+        return None
+    try:
+        from agent.fork_ext.relay_capacity import exhausted, model_capacity
+        if exhausted(model_capacity(base_url, model)):
+            import dataclasses
+            return dataclasses.replace(elig, model_eligible=False, bound_eligible=False,
+                                       model_eligible_known=True)
+    except Exception:  # noqa: BLE001
+        logger.debug("relay capacity overlay failed", exc_info=True)
+    return elig
 
 
 def _bench_fn(agent: Any, key: StickyKey, now: float):
@@ -265,6 +312,12 @@ def restore_allowed(agent: Any, *, probe: bool, now: Optional[float] = None) -> 
     rl_until = getattr(agent, "_rate_limited_until", 0) or 0
     if rl_until > time.monotonic():
         return fp.Decision(False, None, "cooldown")
+    if probe:
+        # Whatever ended the primary's last turn (a stall cut, a quota refusal, no
+        # sticky episode at all): never return to a model the relay says it cannot serve.
+        held = _primary_capacity_hold(agent)
+        if held:
+            return fp.Decision(False, None, held)
     if not sticky_policy_enabled():
         return fp.Decision(True, None, "sticky_policy off")
     now = time.time() if now is None else now
@@ -645,6 +698,7 @@ def decide_rebuild_for_agent(agent: Any, *, user_route: bool = False) -> str:
             return "primary"
         sid = str(getattr(agent, "session_id", "") or "") or None
         rd = fp.decide_rebuild(store(), key, now, live_session_id=sid,
+                               capacity_hold=lambda: _primary_capacity_hold(agent),
                                eligibility=_eligibility_fn(agent),
                                direct_pin_benched=_bench_fn(agent, key, now),
                                refusal_arm=warm_refusal_arm(key))

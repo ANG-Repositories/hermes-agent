@@ -50,6 +50,9 @@ TRIGGER_CLASSES = (
 # the exception, never from text: there is no error response (t_778185f3).
 NO_FIRST_BYTE_BUDGET_CLASS = "no_first_byte_budget"
 _BUDGET_CUT_EXC = "FallbackWallBudgetExceeded"
+# The early cut for a model the relay states it cannot serve (fallback_wall_budget):
+# the relay's quota_model, read from its /health + /eligibility answer.
+_RELAY_EXHAUSTED_EXC = "RelayModelExhausted"
 # OUR bridge/relay refused the request SHAPE for this lane (400
 # tui_tools_unsupported / tui_images_unsupported, relay mode_not_allowed):
 # named from the body's machine code, never from Anthropic text (t_1ed37625).
@@ -280,6 +283,8 @@ def classify_trigger(*, text: Optional[str] = None,
     """
     if exc_name == _BUDGET_CUT_EXC:
         return NO_FIRST_BYTE_BUDGET_CLASS, "harness"
+    if exc_name == _RELAY_EXHAUSTED_EXC:
+        return "quota_model", "relay_probe"
     h = _lower_headers(headers)
     rc = (h.get("x-relay-error-class") or "").strip().lower()
     if rc:
@@ -1030,7 +1035,8 @@ def stash_api_error(agent: Any, api_error: BaseException,
     """
     try:
         response = getattr(api_error, "response", None)
-        headers = _lower_headers(getattr(response, "headers", None))
+        headers = (_lower_headers(getattr(response, "headers", None))
+                   or _lower_headers(getattr(api_error, "relay_headers", None)))
         body = getattr(api_error, "body", None)
         if not isinstance(body, dict) and response is not None:
             # OpenAI SDK passes ``data.get("error", data)``: a relay's
