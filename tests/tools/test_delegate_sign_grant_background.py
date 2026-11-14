@@ -138,7 +138,7 @@ def test_background_grant_is_minted_live_through_the_batch_and_revoked_when_it_e
     def body(task_index, goal, child=None, parent_agent=None, **kw):
         seen["live"] = [r for r in _grant_rows() if r["revoked_at"] is None]
         seen["goal"] = goal
-        seen["owner"] = json.loads(_owner_file().read_text())
+        seen["owner"] = json.loads(_owner_file().read_text(encoding="utf-8-sig"))
         release.wait(10)
         return _ok(task_index, goal)
 
@@ -289,7 +289,7 @@ def test_gateway_start_sweep_revokes_grants_of_a_dead_owner_only(board, monkeypa
     root.mkdir(parents=True, exist_ok=True)
     pid = _dead_pid()
     (root / f"{pid}.json").write_text(json.dumps({"pid": pid, "started": 1, "grants": [
-        {"grant_id": dead[0]["grant_id"], "board": dead[0]["board"], "delegation_id": "d-dead"}]}))
+        {"grant_id": dead[0]["grant_id"], "board": dead[0]["board"], "delegation_id": "d-dead"}]}), encoding="utf-8")
     dsg.track_batch_grants(live, delegation_id="d-live")  # this live process owns it
 
     from gateway.run import GatewayRunner

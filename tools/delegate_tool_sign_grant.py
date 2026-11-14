@@ -258,7 +258,7 @@ def _owner_alive(pid: Any, started: Any) -> bool:
 
 def _read_owner(path) -> Optional[Dict[str, Any]]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError):

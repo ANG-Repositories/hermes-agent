@@ -27,7 +27,7 @@ def board(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     kb._INITIALIZED_PATHS.clear()
     assert str(kb.kanban_db_path()).startswith(str(tmp_path))
-    (home / "config.yaml").write_text("kanban:\n  sign_grants: 'on'\n")
+    (home / "config.yaml").write_text("kanban:\n  sign_grants: 'on'\n", encoding="utf-8")
     with kb.connect_closing() as conn:
         card = kb.create_task(conn, title="review card")
     monkeypatch.setattr("hermes_cli.kanban_identity.operator_label_proven", lambda name: True)
