@@ -5810,6 +5810,12 @@ class GatewayRunner(
             return {"claimed": 0, "queued": 0}
         self._async_delegation_recovery_boot_id = boot_id
 
+        # Before any unit relaunches: a background batch's signing grant dies with the process that ran the
+        # batch, and a relaunched generation never inherits it (t_4548202f). Never raises.
+        from tools.delegate_tool_sign_grant import sweep_orphaned_batch_grants
+
+        sweep_orphaned_batch_grants()
+
         from hermes_cli.config import load_config
         from hermes_cli.profiles import profiles_to_serve
         from tools.async_delegation import (

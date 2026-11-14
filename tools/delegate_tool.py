@@ -3685,6 +3685,12 @@ def _build_durable_background_spec(
     persisted_tasks = []
     for index, task in enumerate(task_list):
         persisted = copy.deepcopy(task)
+        # A relaunched generation never inherits a signing grant, nor the brief that says it holds one (t_4548202f).
+        persisted.pop("sign_grant", None)
+        from tools.delegate_tool_sign_grant import GOAL_BEFORE_GRANT
+
+        if GOAL_BEFORE_GRANT in persisted:
+            persisted["goal"] = persisted.pop(GOAL_BEFORE_GRANT)
         persisted["role"] = _normalize_role(task.get("role") or top_role)
         persisted["inherit_context"] = bool(
             task.get("inherit_context")
@@ -4254,6 +4260,14 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+    if _recovery_spec:
+        # A relaunched generation never inherits a grant (t_4548202f): its children are new sessions, and the
+        # grant of the generation that died is revoked by the gateway-start sweep.
+        from tools.delegate_tool_sign_grant import GOAL_BEFORE_GRANT
+
+        task_list = [{k: v for k, v in t.items() if k not in ("sign_grant", GOAL_BEFORE_GRANT)}
+                     if isinstance(t, dict) else t for t in task_list]
+        sign_grant = None
     if sign_grant:
         # Top-level grant: every task without its own gets one (each bound to its own child).
         task_list = [dict(t, sign_grant=t.get("sign_grant") or sign_grant) if isinstance(t, dict) else t
@@ -4525,19 +4539,38 @@ def delegate_task(
     # child's session and model, and revoked when the children's run ends.
     sign_grants: List[Dict[str, Any]] = []
     if any(isinstance(t, dict) and t.get("sign_grant") for _i, t, _c in children):
-        from tools.delegate_tool_sign_grant import SignGrantError, mint_for_children, register_turn_grants
+        from tools.delegate_tool_sign_grant import (
+            SignGrantError, mint_for_children, register_turn_grants, revoke_batch_grants, track_batch_grants,
+        )
 
-        if background:
-            return tool_error("sign_grant needs background=false: a grant ends with this turn")
         try:
             # All or nothing: any exception revokes what was already minted.
             sign_grants = mint_for_children(children, parent_agent, inherit_context=inherit_context,
-                                            inherit_mode=inherit_mode)
+                                            inherit_mode=inherit_mode, batch_bound=bool(background))
         except SignGrantError as exc:
             return tool_error(f"sign_grant refused: {exc}")
-        # Live until the PARENT's turn ends (the turn facade's finally revokes them) or expiry, whichever is first:
-        # the parent may still run the merge gate over the child's stamp in this turn.
-        register_turn_grants(parent_agent, sign_grants)
+        if background:
+            # Background (t_4548202f): the grant belongs to the BATCH, not the parent turn. The batch's own exit
+            # revokes it (runner finally, cancel, refused admission); the owner record lets a gateway start revoke
+            # it if this process dies first. No owner record, no grant.
+            try:
+                track_batch_grants(sign_grants, delegation_id=live_deleg_id)
+            except Exception as exc:
+                revoke_batch_grants(sign_grants)
+                logger.error("delegate_task: sign grant owner record unwritable (%s); grant revoked", exc)
+                return tool_error(f"sign_grant refused: the background grant's owner record could not be written "
+                                  f"({type(exc).__name__}); retry, or run the delegation in the foreground")
+        else:
+            # Live until the PARENT's turn ends (the turn facade's finally revokes them) or expiry, whichever is
+            # first: the parent may still run the merge gate over the child's stamp in this turn.
+            register_turn_grants(parent_agent, sign_grants)
+
+    def _end_batch_grants() -> None:
+        # Background grants end with their batch; a no-op for foreground (turn-bound) grants. Idempotent.
+        if background and sign_grants:
+            from tools.delegate_tool_sign_grant import revoke_batch_grants as _revoke_batch
+
+            _revoke_batch(sign_grants)
 
     # Record an accepted override only after task validation and child construction.
     # A rejected or unbuildable request must not leave a success-shaped audit.
@@ -4786,7 +4819,10 @@ def delegate_task(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
             )
-            _sync_result = _execute_and_aggregate()
+            try:
+                _sync_result = _execute_and_aggregate()
+            finally:
+                _end_batch_grants()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "
@@ -4855,11 +4891,17 @@ def delegate_task(
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
-            return _execute_and_aggregate(
-                honor_parent_interrupt=False, join_late=True
-            )
+            try:
+                return _execute_and_aggregate(
+                    honor_parent_interrupt=False, join_late=True
+                )
+            finally:
+                # Every batch exit (success, error, late join) ends its signing grants.
+                _end_batch_grants()
 
         def _batch_interrupt():
+            # Cancel and the stale monitor end the grants at once, even if a wedged child never lets the runner return.
+            _end_batch_grants()
             for _c in _child_agents:
                 try:
                     interrupted = request_hard_interrupt(_c, "Async delegation cancelled")
@@ -4905,6 +4947,7 @@ def delegate_task(
         from tools.delegate_tool_admission import reject_background_admission
 
         def _reject_admission(reason, dispatch=None):
+            _end_batch_grants()  # the batch never runs
             return reject_background_admission(
                 reason=reason, children=_child_agents, task_list=task_list,
                 live_deleg_id=live_deleg_id, live_writers=live_writers, dispatch=dispatch,
@@ -4949,6 +4992,9 @@ def delegate_task(
 
             _unit_cwd = (_durable_spec.get("execution") or {}).get("workspace_hint")
             _why_not = _akb.ineligible_reason(durable_spec=_durable_spec, children=_child_agents, cwd=_unit_cwd)
+            if _why_not is None and sign_grants:
+                # A grant is bound to the session of a child built HERE; a kanban unit rebuilds its children.
+                _why_not = "sign_grant"
             if _why_not is None:
                 _durable_spec["execution"]["runtime"] = "kanban"
                 _durable_spec["execution"]["route"] = _akb.parent_route(parent_agent, cfg)
@@ -4973,8 +5019,9 @@ def delegate_task(
         # So does a session-isolated sandbox (docker + container_persistent: false): children alias the
         # parent's per-session container by its live task id, and that container is never reused across
         # processes, so a detached worker would land in a fresh "default" sandbox without the session's files.
+        # A signing grant is bound to these in-process children's sessions (t_4548202f): it stays in-process too.
         if _kanban is None and _durable_spec is not None and _get_detached_background() and not _has_fork_child \
-                and not _terminal_session_isolated():
+                and not sign_grants and not _terminal_session_isolated():
             from tools.delegate_detached import spawn_mode
 
             if spawn_mode() != "degraded":
@@ -4987,36 +5034,40 @@ def delegate_task(
                             _teardown(_c, "detached_spawned")
 
                 _detached = {"live_delegation_id": live_deleg_id, "on_spawned": _on_detached_spawned}
-        dispatch = dispatch_async_delegation_batch(
-            goals=_goals,
-            context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
-            role=top_role,
-            model=creds["model"],
-            session_key=_session_key,
-            origin_ui_session_id=_origin_ui_session_id,
-            origin_session_id=_wake_sid,
-            parent_session_id=_parent_session_id,
-            runner=_batch_runner,
-            interrupt_fn=_batch_interrupt,
-            max_async_children=_get_max_async_children(),
-            durable_spec=_durable_spec,
-            current_boot_id=_gateway_boot_id,
-            detached=_detached,
-            kanban=_kanban,
-            # Reuse the live-transcript directory's id (when created) so the
-            # returned delegation_id matches cache/delegation/live/<id>/.
-            delegation_id=live_deleg_id,
-            progress_fn=_batch_progress,
-            # Upstream (#116000): persist the live-transcript locators on the unit's row before any
-            # worker starts, so an owner death replays the recovered event WITH the transcript tails
-            # the parent needs to continue. live_paths omits failed writers.
-            task_transcripts={str(_ti): str(live_writers[_ti].path) for _ti in range(len(live_writers))
-                              if live_writers[_ti] is not None
-                              and getattr(live_writers[_ti], "path", None) is not None},
-        )
+        try:
+            dispatch = dispatch_async_delegation_batch(
+                goals=_goals,
+                context=context,
+                # Metadata for the completion block only; subagents inherit the
+                # parent's toolsets (no model-facing toolsets arg).
+                toolsets=None,
+                role=top_role,
+                model=creds["model"],
+                session_key=_session_key,
+                origin_ui_session_id=_origin_ui_session_id,
+                origin_session_id=_wake_sid,
+                parent_session_id=_parent_session_id,
+                runner=_batch_runner,
+                interrupt_fn=_batch_interrupt,
+                max_async_children=_get_max_async_children(),
+                durable_spec=_durable_spec,
+                current_boot_id=_gateway_boot_id,
+                detached=_detached,
+                kanban=_kanban,
+                # Reuse the live-transcript directory's id (when created) so the
+                # returned delegation_id matches cache/delegation/live/<id>/.
+                delegation_id=live_deleg_id,
+                progress_fn=_batch_progress,
+                # Upstream (#116000): persist the live-transcript locators on the unit's row before any
+                # worker starts, so an owner death replays the recovered event WITH the transcript tails
+                # the parent needs to continue. live_paths omits failed writers.
+                task_transcripts={str(_ti): str(live_writers[_ti].path) for _ti in range(len(live_writers))
+                                  if live_writers[_ti] is not None
+                                  and getattr(live_writers[_ti], "path", None) is not None},
+            )
+        except BaseException:
+            _end_batch_grants()
+            raise
 
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
@@ -5283,9 +5334,9 @@ DELEGATE_TASK_SCHEMA = {
                         "sign_grant": _p(
                             "object",
                             "Optional scoped board-signing grant (needs kanban.sign_grants: on, inherit_context, "
-                            "background=false, and an operator session): {cards: [t_...], verbs: [verdict, approve, "
+                            "and an operator session): {cards: [t_...], verbs: [verdict, approve, "
                             "request_changes, release], expires_in_min: <=120 (default 45), by: 'reviewer'}. The child "
-                            "may sign comments as `by` on those cards only; the grant is revoked when its run ends.",
+                            "may sign comments as `by` on those cards only; the grant is revoked when its batch ends.",
                         ),
                     },
                     "required": ["goal"],
@@ -5361,9 +5412,7 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
     within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
     the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    from tools.delegate_tool_sign_grant import carries_sign_grant
-
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0 and not carries_sign_grant(args)
+    return not getattr(parent_agent, "_delegate_depth", 0) > 0
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 

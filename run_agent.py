@@ -1502,7 +1502,7 @@ class AIAgent(
         )
         # Top-level MODEL delegations always run in the background (handle returned, results re-enter as
         # messages). An ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous — it needs results in-turn and
-        # owns no gateway session; so does a delegation carrying a sign_grant (it ends with this turn).
+        # owns no gateway session. A sign_grant backgrounds too: the grant ends with its batch (t_4548202f).
         # The schema-level `background` param is intentionally ignored.
         return _delegate_task(
             goal=function_args.get("goal"), context=function_args.get("context"),

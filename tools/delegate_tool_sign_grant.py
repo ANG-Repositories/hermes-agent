@@ -4,14 +4,19 @@ The parent delegates a GRANT, not its identity (hermes_cli/kanban_sign_grants.py
 design). This module is the spawn half: it checks what only the parent process can see (it
 holds ``by`` itself, it is not a dispatched worker or a delegate child, the child inherited
 its context and runs on its model), mints the board rows bound to the child's session, tells
-the child how to sign and ledgers the grant. The grant is revoked when the PARENT's turn ends
-(``agent/turn_facade.py``, the turn's outer finally -> :func:`revoke_turn_grants`) or at its expiry, whichever is first:
-a grant never outlives the parent turn, and its stamps are void from then on.
+the child how to sign and ledgers the grant. A FOREGROUND grant is revoked when the PARENT's turn ends
+(``agent/turn_facade.py``, the turn's outer finally -> :func:`revoke_turn_grants`) or at its expiry, whichever is first.
+A BACKGROUND grant (t_4548202f) belongs to its batch instead: :func:`track_batch_grants` records it in this process's
+owner file, the batch's own exit (runner finally, cancel/stale interrupt, a refused admission) revokes it through
+:func:`revoke_batch_grants`, and a gateway start revokes every grant whose owner process is gone
+(:func:`sweep_orphaned_batch_grants`). Its stamps are void from revocation on.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -20,17 +25,6 @@ logger = logging.getLogger(__name__)
 
 class SignGrantError(ValueError):
     """The spawn's ``sign_grant`` was refused; no child is started."""
-
-
-def carries_sign_grant(args: Any) -> bool:
-    """A model-issued delegate_task with a top-level or per-task ``sign_grant``. Such a call runs SYNCHRONOUSLY on
-    the model dispatch paths: the grant ends with the parent's turn, so the child must finish inside it."""
-    if not isinstance(args, dict):
-        return False
-    if args.get("sign_grant"):
-        return True
-    tasks = args.get("tasks")
-    return isinstance(tasks, list) and any(isinstance(t, dict) and t.get("sign_grant") for t in tasks)
 
 
 def _spec(raw: Any) -> Optional[Dict[str, Any]]:
@@ -85,8 +79,14 @@ def _session_inherited(task: Dict[str, Any], inherit_context: Any, inherit_mode:
     return resolve_inherit_mode(ic, im) is not None
 
 
+#: The task's goal before the signing brief was appended: the durable restart intent persists this one, so a
+#: relaunched generation is never told it holds a grant (t_4548202f).
+GOAL_BEFORE_GRANT = "_goal_before_grant"
+
+
 def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
-                   inherit_context: Any = None, inherit_mode: Any = None) -> Optional[Dict[str, Any]]:
+                   inherit_context: Any = None, inherit_mode: Any = None,
+                   batch_bound: bool = False) -> Optional[Dict[str, Any]]:
     """Mint ``task['sign_grant']`` for ``child``; append the signing brief to ``task['goal']``.
 
     Returns the grant dict (``grant_id``, ``board``, ``cards`` ...) or None when the task
@@ -147,7 +147,8 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
     try:
         # The child carries its grants so a later model swap revokes them (revoke_on_model_drift).
         child.__dict__.setdefault("_held_sign_grants", []).append(dict(grant))
-        task["goal"] = str(task.get("goal") or "") + _brief(grant)
+        task.setdefault(GOAL_BEFORE_GRANT, task.get("goal"))
+        task["goal"] = str(task.get("goal") or "") + _brief(grant, batch_bound=batch_bound)
         _ledger({"event": "sign_grant", "grant_id": grant["grant_id"], "child": grant.get("child_id"),
                  "by": by, "board": board, "cards": len(cards), "verbs": grant["verbs"],
                  "expires_at": grant["expires_at"], "at": int(time.time())})
@@ -161,13 +162,14 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
 
 
 def mint_for_children(children: List[Any], parent_agent: Any, *, inherit_context: Any = None,
-                      inherit_mode: Any = None) -> List[Dict[str, Any]]:
+                      inherit_mode: Any = None, batch_bound: bool = False) -> List[Dict[str, Any]]:
     """Mint every child's grant, all or nothing: on ANY exception (a refusal, an error, an
     interrupt) the grants already minted are revoked before it propagates (Prism cd87b39be0ea)."""
     minted: List[Dict[str, Any]] = []
     try:
         for _i, t, child in children:
-            g = mint_for_child(t, child, parent_agent, inherit_context=inherit_context, inherit_mode=inherit_mode)
+            g = mint_for_child(t, child, parent_agent, inherit_context=inherit_context, inherit_mode=inherit_mode,
+                               batch_bound=batch_bound)
             if g:
                 minted.append(g)
     except BaseException:
@@ -177,7 +179,7 @@ def mint_for_children(children: List[Any], parent_agent: Any, *, inherit_context
     return minted
 
 
-def _brief(grant: Dict[str, Any]) -> str:
+def _brief(grant: Dict[str, Any], *, batch_bound: bool = False) -> str:
     cards = " ".join(grant["cards"])
     return (
         f"\n\n[signing grant {grant['grant_id']}] You may sign board comments as `{grant['by']}` on "
@@ -188,7 +190,8 @@ def _brief(grant: Dict[str, Any]) -> str:
         f"carrying a `review_coverage: {{...}}` line (verdict, head_sha, pr, by={grant['by']}); APPROVE needs verb "
         "approve, and a close-on line or close_on field needs verb release. The merge-gate readers that honour a live "
         "granted row live in hermes-home (home#7376, home#7570). Any other card, verb, or a PR your parent's runs "
-        "authored is refused, and so is a write from any session but yours; the grant ends with your parent's turn."
+        "authored is refused, and so is a write from any session but yours; the grant ends with "
+        + ("this delegation batch." if batch_bound else "your parent's turn.")
     )
 
 
@@ -224,6 +227,140 @@ def revoke_turn_grants(agent: Any) -> None:
     d["_sign_grants"] = remaining
     logger.error("sign grant(s) %s could not be revoked at turn end; marked revoke_failed, the next turn end "
                  "retries them and they lapse at their expiry at the latest", sorted(failed))
+
+
+# ── Background batches (t_4548202f) ─────────────────────────────────────────────────────────────────────
+# A background grant outlives the parent turn but never its batch. The batch runs in THIS process (delegate_tool keeps
+# a granted unit off the kanban and detached runtimes, whose children have other sessions), so the owner of record is
+# this process: one JSON file per process under the shared kanban root, written only by its owner. A gateway start
+# revokes the grants of every file whose process is gone; a relaunched generation is rebuilt without its grant.
+_BATCH_LOCK = threading.Lock()
+
+
+def _batch_dir():
+    from hermes_cli.kanban_db import kanban_home
+
+    return kanban_home() / "sign_grants" / "batches"
+
+
+def _process_started(pid: int) -> Any:
+    from gateway.status import get_process_start_time
+
+    return get_process_start_time(int(pid))
+
+
+def _owner_alive(pid: Any, started: Any) -> bool:
+    from gateway.status import _pid_exists, get_process_start_time, start_time_fingerprints_match
+
+    return bool(pid) and _pid_exists(int(pid)) and (
+        started is None or start_time_fingerprints_match(started, get_process_start_time(int(pid)) or 0))
+
+
+def _read_owner(path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        logger.warning("sign grant owner file %s is unreadable", path, exc_info=True)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_owner(path, data: Dict[str, Any]) -> None:
+    from utils import atomic_json_write
+
+    if data.get("grants"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, data)
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def track_batch_grants(grants: List[Dict[str, Any]], *, delegation_id: Optional[str]) -> None:
+    """Record ``grants`` as owned by a background batch of this process. Raises when the record cannot be written:
+    a grant the restart sweep cannot find would outlive a dead batch, so the caller revokes and refuses."""
+    if not grants:
+        return
+    pid = os.getpid()
+    started = _process_started(pid)
+    with _BATCH_LOCK:
+        path = _batch_dir() / f"{pid}.json"
+        data = _read_owner(path) or {}
+        if data.get("pid") != pid or data.get("started") != started:
+            stale = [g for g in data.get("grants") or () if isinstance(g, dict)]
+            if stale:
+                # A reused pid's file: its owner is dead, so its grants go now, not at the next gateway start.
+                revoke(stale)
+            data = {"pid": pid, "started": started, "grants": []}
+        data["grants"].extend({"grant_id": g["grant_id"], "board": g["board"], "delegation_id": delegation_id,
+                               "expires_at": g.get("expires_at")} for g in grants)
+        _write_owner(path, data)
+
+
+def _untrack(grant_ids: set) -> None:
+    pid = os.getpid()
+    with _BATCH_LOCK:
+        path = _batch_dir() / f"{pid}.json"
+        data = _read_owner(path)
+        if not data or data.get("pid") != pid:
+            return
+        data["grants"] = [g for g in data.get("grants") or () if str(g.get("grant_id")) not in grant_ids]
+        _write_owner(path, data)
+
+
+def revoke_batch_grants(grants: List[Dict[str, Any]]) -> None:
+    """Batch end: revoke the batch's grants and drop them from the owner file. Never raises; idempotent (the runner's
+    finally and the cancel path may both call it). A grant whose revoke fails twice stays in the owner file, so the
+    next gateway start retries it; its expiry bounds it meanwhile."""
+    if not grants:
+        return
+    try:
+        failed = set(revoke(grants))
+        if failed:
+            failed = set(revoke([g for g in grants if str(g.get("grant_id")) in failed]))
+        _untrack({str(g.get("grant_id")) for g in grants} - failed)
+        if failed:
+            logger.error("sign grant(s) %s could not be revoked at batch end; the next gateway start retries them "
+                         "and they lapse at their expiry at the latest", sorted(failed))
+    except Exception:
+        logger.error("sign grant batch-end revoke failed", exc_info=True)
+
+
+def sweep_orphaned_batch_grants() -> int:
+    """Gateway start: revoke every tracked grant whose owner process is not alive (a dead batch). Returns the number
+    revoked. Never raises. A live owner (another gateway, a CLI session) keeps its grants."""
+    revoked = 0
+    try:
+        root = _batch_dir()
+        files = sorted(root.glob("*.json")) if root.is_dir() else []
+    except Exception:
+        logger.warning("sign grant orphan sweep could not list owner files", exc_info=True)
+        return 0
+    for path in files:
+        try:
+            with _BATCH_LOCK:
+                data = _read_owner(path)
+                if data is None:
+                    continue
+                pid, started = data.get("pid"), data.get("started")
+                if _owner_alive(pid, started):
+                    continue
+                grants = [g for g in data.get("grants") or () if isinstance(g, dict) and g.get("grant_id")]
+                failed = set(revoke(grants))
+                data["grants"] = [g for g in grants if str(g.get("grant_id")) in failed]
+                _write_owner(path, data)
+            revoked += len(grants) - len(failed)
+            _ledger({"event": "sign_grant_orphan_sweep", "owner_pid": pid, "revoked": len(grants) - len(failed),
+                     "failed": sorted(failed), "at": int(time.time())})
+            logger.info("sign grant orphan sweep: owner pid %s is gone; revoked %d grant(s)%s", pid,
+                        len(grants) - len(failed), f", {len(failed)} failed (retried next start)" if failed else "")
+        except Exception:
+            logger.warning("sign grant orphan sweep failed for %s", path, exc_info=True)
+    return revoked
 
 
 def revoke_on_model_drift(agent: Any, model: Any) -> None:

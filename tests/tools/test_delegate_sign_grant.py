@@ -129,13 +129,8 @@ def test_delegate_task_grant_is_live_through_the_parent_turn_and_revoked_at_its_
             tasks=[{"goal": "review it", "inherit_context": True,
                     "sign_grant": {"cards": [board], "verbs": ["approve"]}}],
             parent_agent=parent))
-        refused = json.loads(delegate_task(
-            tasks=[{"goal": "review it", "inherit_context": True,
-                    "sign_grant": {"cards": [board], "verbs": ["approve"]}}],
-            background=True, parent_agent=parent))
     assert out["results"][0]["status"] == "completed", out
-    assert seen["live"] == 1 and "signing grant g-" in seen["goal"]
-    assert "background=false" in refused.get("error", ""), refused
+    assert seen["live"] == 1 and "signing grant g-" in seen["goal"] and "your parent's turn" in seen["goal"]
 
     def _live():
         with kb.connect_closing() as conn:
@@ -324,9 +319,9 @@ def test_mint_refuses_when_no_dispatched_model_is_known(board):
         dsg.mint_for_child(_task(board), child, parent)
 
 
-def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
-    """The LIVE model path (AIAgent._dispatch_delegate_task) forwards sign_grant and does not background it, so a
-    top-level session can actually mint; an ungranted top-level call keeps backgrounding."""
+def test_model_dispatch_path_backgrounds_a_granted_delegation(board):
+    """The LIVE model path (AIAgent._dispatch_delegate_task) forwards sign_grant and backgrounds it like any top-level
+    call: a background grant ends with its batch (t_4548202f, tests/tools/test_delegate_sign_grant_background.py)."""
     from unittest.mock import patch
 
     from run_agent import AIAgent
@@ -337,7 +332,7 @@ def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
         AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g", "sign_grant": {"cards": [board]}}]})
         AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g"}], "sign_grant": {"cards": [board]}})
         AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g"}]})
-    assert [kw["background"] for kw in seen] == [False, False, True]
+    assert [kw["background"] for kw in seen] == [True, True, True]
     assert seen[1]["sign_grant"] == {"cards": [board]}
 
 
