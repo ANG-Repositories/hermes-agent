@@ -175,7 +175,9 @@ CONTENTALIAS_ERROR_CODES: Mapping[str, BridgeCode] = {
 # (sub-vps-19 2026-11-12 22:52 PT: needrestart restarted tinyproxy mid-turn).
 CONTENTALIAS_FORWARDER_REFUSED = BridgeCode(_LANE, "box forwarder refused the connection",
                                             "the seat's box forwarder refused the upstream connection")
-_FORWARDER_REFUSED_RE = re.compile(r"connection refused|:18814\b", re.IGNORECASE)
+# Only the refusal itself: every upstream connection of a Studio unit goes to the forwarder, so
+# Go's error text names :18814 for ANY failure on the leg (timeout, reset), not only a refusal.
+_FORWARDER_REFUSED_RE = re.compile(r"connection refused", re.IGNORECASE)
 
 
 def contentalias_entry(code: str) -> Optional[BridgeCode]:
@@ -189,7 +191,7 @@ def contentalias_entry(code: str) -> Optional[BridgeCode]:
 def bridge_code_entry(code: Any, text: Any = None) -> Optional[BridgeCode]:
     """The :class:`BridgeCode` row of a bridge or content-alias machine code.
     ``text`` (the error's own words) can only sharpen ``stream_transport`` to the
-    forwarder row, on evidence it carries (``connection refused`` / ``:18814``)."""
+    forwarder row, on evidence it carries (``connection refused``)."""
     c = str(code or "").strip().lower()
     if (c == CONTENTALIAS_PREFIX + "stream_transport"
             and _FORWARDER_REFUSED_RE.search(str(text or ""))):
