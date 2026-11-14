@@ -7,9 +7,12 @@ its context and runs on its model), mints the board rows bound to the child's se
 the child how to sign and ledgers the grant. A FOREGROUND grant is revoked when the PARENT's turn ends
 (``agent/turn_facade.py``, the turn's outer finally -> :func:`revoke_turn_grants`) or at its expiry, whichever is first.
 A BACKGROUND grant (t_4548202f) belongs to its batch instead: :func:`track_batch_grants` records it in this process's
-owner file, the batch's own exit (runner finally, cancel/stale interrupt, a refused admission) revokes it through
-:func:`revoke_batch_grants`, and a gateway start revokes every grant whose owner process is gone
-(:func:`sweep_orphaned_batch_grants`). Its stamps are void from revocation on.
+owner file and the batch's own end decides it per child (:func:`end_batch_grants`): a child that returned
+``completed`` CLOSES its grant (no new write; what it signed stays valid until ``expires_at``, so land-on-approve and
+the parent's fold can still read the stamp), anything else REVOKES it (error, timeout, interrupt, cancel/stale
+interrupt, a refused admission, a dispatch exception), and a gateway start revokes every grant whose owner process is
+gone (:func:`sweep_orphaned_batch_grants`). A revoked grant's stamps are void from revocation on; a closed grant's
+stamps are void from its expiry on, or from a later revoke.
 """
 from __future__ import annotations
 
@@ -25,6 +28,17 @@ logger = logging.getLogger(__name__)
 
 class SignGrantError(ValueError):
     """The spawn's ``sign_grant`` was refused; no child is started."""
+
+
+def carries_sign_grant(args: Any) -> bool:
+    """A model-issued delegate_task with a top-level or per-task ``sign_grant``. Such a call runs in the
+    FOREGROUND on the model dispatch paths unless it passes ``background: true`` (t_4548202f)."""
+    if not isinstance(args, dict):
+        return False
+    if args.get("sign_grant"):
+        return True
+    tasks = args.get("tasks")
+    return isinstance(tasks, list) and any(isinstance(t, dict) and t.get("sign_grant") for t in tasks)
 
 
 def _spec(raw: Any) -> Optional[Dict[str, Any]]:
@@ -171,6 +185,7 @@ def mint_for_children(children: List[Any], parent_agent: Any, *, inherit_context
             g = mint_for_child(t, child, parent_agent, inherit_context=inherit_context, inherit_mode=inherit_mode,
                                batch_bound=batch_bound)
             if g:
+                g["task_index"] = _i  # the batch end decides close vs revoke from THIS child's result
                 minted.append(g)
     except BaseException:
         failed = set(revoke(minted))
@@ -191,7 +206,8 @@ def _brief(grant: Dict[str, Any], *, batch_bound: bool = False) -> str:
         "approve, and a close-on line or close_on field needs verb release. The merge-gate readers that honour a live "
         "granted row live in hermes-home (home#7376, home#7570). Any other card, verb, or a PR your parent's runs "
         "authored is refused, and so is a write from any session but yours; the grant ends with "
-        + ("this delegation batch." if batch_bound else "your parent's turn.")
+        + ("this delegation batch, and what you signed under it stays valid until that expiry time."
+           if batch_bound else "your parent's turn.")
     )
 
 
@@ -252,7 +268,8 @@ def _process_created(pid: int) -> Optional[float]:
 
     try:
         return float(psutil.Process(int(pid)).create_time())
-    except (psutil.NoSuchProcess, psutil.ZombieProcess, ProcessLookupError):
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, ProcessLookupError, psutil.AccessDenied):
+        # AccessDenied: the pid now belongs to a process we may not read, so it is not our gateway.
         return None
 
 
@@ -321,22 +338,35 @@ def untrack_batch_grants(grant_ids: set) -> None:
         _write_owner(path, data)
 
 
-def revoke_batch_grants(grants: List[Dict[str, Any]]) -> None:
-    """Batch end: revoke the batch's grants and drop them from the owner file. Never raises; idempotent (the runner's
-    finally and the cancel path may both call it). A grant whose revoke fails twice stays in the owner file, so the
-    next gateway start retries it; its expiry bounds it meanwhile."""
+def end_batch_grants(grants: List[Dict[str, Any]], results: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Batch end, decided per child: a grant whose child's entry in ``results`` has ``status == "completed"`` is
+    CLOSED (no new write; its rows stand until expiry); every other grant is REVOKED (rows void now). ``results``
+    None (cancel, stale interrupt, a refused admission, a dispatch exception, a runner that raised) revokes all.
+    Each ended grant leaves the owner file. Never raises; idempotent. A close that fails falls back to a revoke; a
+    grant whose revoke fails twice stays in the owner file, so the next gateway start retries it; its expiry bounds
+    it meanwhile."""
     if not grants:
         return
     try:
-        failed = set(revoke(grants))
+        done = {r.get("task_index") for r in results or () if isinstance(r, dict) and r.get("status") == "completed"}
+        closing = [g for g in grants if results is not None and g.get("task_index") in done]
+        revoking = [g for g in grants if g not in closing]
+        not_closed = set(close(closing))
+        revoking += [g for g in closing if str(g.get("grant_id")) in not_closed]
+        failed = set(revoke(revoking))
         if failed:
-            failed = set(revoke([g for g in grants if str(g.get("grant_id")) in failed]))
+            failed = set(revoke([g for g in revoking if str(g.get("grant_id")) in failed]))
         untrack_batch_grants({str(g.get("grant_id")) for g in grants} - failed)
         if failed:
             logger.error("sign grant(s) %s could not be revoked at batch end; the next gateway start retries them "
                          "and they lapse at their expiry at the latest", sorted(failed))
     except Exception:
-        logger.error("sign grant batch-end revoke failed", exc_info=True)
+        logger.error("sign grant batch-end close/revoke failed", exc_info=True)
+
+
+def revoke_batch_grants(grants: List[Dict[str, Any]]) -> None:
+    """Revoke every grant of a batch that did not end normally (see :func:`end_batch_grants`)."""
+    end_batch_grants(grants, None)
 
 
 def sweep_orphaned_batch_grants() -> int:
@@ -409,6 +439,24 @@ def revoke(grants: List[Dict[str, Any]]) -> List[str]:
             # Expiry still bounds it; say so loudly.
             logger.warning("sign grant %s could not be revoked; it lapses at its expiry",
                            g.get("grant_id"), exc_info=True)
+            failed.append(str(g.get("grant_id")))
+    return failed
+
+
+def close(grants: List[Dict[str, Any]]) -> List[str]:
+    """Close every grant in ``grants`` (its child completed); returns the grant ids that could not be closed.
+    Never raises."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_sign_grants as ksg
+
+    failed: List[str] = []
+    for g in grants or ():
+        try:
+            with kb.connect_closing(board=g["board"]) as conn:
+                ksg.close(conn, g["grant_id"])
+            _ledger({"event": "sign_grant_close", "grant_id": g["grant_id"], "at": int(time.time())})
+        except Exception:
+            logger.warning("sign grant %s could not be closed; revoking it instead", g.get("grant_id"), exc_info=True)
             failed.append(str(g.get("grant_id")))
     return failed
 

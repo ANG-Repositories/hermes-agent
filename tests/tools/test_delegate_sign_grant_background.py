@@ -1,6 +1,7 @@
 """Signing grants on BACKGROUND delegations (t_4548202f): the grant belongs to the batch, not the parent turn.
 
-Minted at spawn, revoked on every batch exit (success, error, cancel, refused admission), never inherited by a
+Minted at spawn, closed when its child completes (tests/tools/test_delegate_sign_grant_close.py), revoked on every
+other batch exit (error, cancel, refused admission), never inherited by a
 relaunched generation, and swept at gateway start when the process that owned the batch is gone. Drives the real
 delegate_task background dispatch (in-gateway thread path) over the real board; only the child build/run seams are
 patched. The foreground (turn-bound) contract stays in tests/tools/test_delegate_sign_grant.py.
@@ -115,6 +116,11 @@ def _grant_rows():
         return [dict(r) for r in conn.execute("SELECT grant_id, revoked_at FROM sign_grants")]
 
 
+def _promoted(card):
+    with kb.connect_closing() as conn:
+        return ksg.operator_rows_with_live_grants(conn, card)
+
+
 def _owner_file():
     return dsg._own_path()[0]
 
@@ -132,7 +138,7 @@ def _granted_write(card, gid):
                               grant_id=gid)
 
 
-def test_background_grant_is_minted_live_through_the_batch_and_revoked_when_it_ends(board, monkeypatch):
+def test_background_grant_is_minted_live_through_the_batch_and_closed_when_it_ends(board, monkeypatch):
     seen = {}
     release = threading.Event()
 
@@ -159,10 +165,10 @@ def test_background_grant_is_minted_live_through_the_batch_and_revoked_when_it_e
     assert f"signing grant {gid}" in seen["goal"] and "ends with this delegation batch" in seen["goal"]
     assert [g["grant_id"] for g in seen["owner"]["grants"]] == [gid]
     assert seen["owner"]["pid"] == os.getpid() and seen["owner"]["grants"][0]["delegation_id"] == out["delegation_id"]
-    # Batch over: revoked, owner record gone, and the child's late stamp is refused.
-    assert _grant_rows()[0]["revoked_at"] is not None
+    # Batch over, child completed: closed (not revoked), owner record gone, and the child's late stamp is refused.
+    assert _grant_rows()[0]["revoked_at"] is None
     assert not _owner_file().exists()
-    with pytest.raises(ksg.GrantRefused, match="revoked"):
+    with pytest.raises(ksg.GrantRefused, match="is closed"):
         _granted_write(board, gid)
 
 
@@ -177,6 +183,7 @@ def test_a_batch_that_raises_still_revokes_its_grant(board, monkeypatch):
     rows = _grant_rows()
     assert len(rows) == 1 and rows[0]["revoked_at"] is not None
     assert not _owner_file().exists()
+    assert _promoted(board) == []
 
 
 def test_cancelling_the_batch_revokes_its_grant_before_the_child_returns(board, monkeypatch):
@@ -334,6 +341,9 @@ def test_gateway_start_sweep_revokes_grants_of_a_dead_owner_only(board, monkeypa
     assert state[gp["grant_id"]] is not None
     assert state[live[0]["grant_id"]] is None
     assert not dead_file.exists() and not prior_file.exists()
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT closed_at FROM sign_grants WHERE grant_id = ?",
+                            (dead[0]["grant_id"],)).fetchone()[0] is None  # swept = revoked, never closed
     assert _owner_file().exists()
     dsg.revoke_batch_grants(live)
     assert not _owner_file().exists()

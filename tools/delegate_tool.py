@@ -4554,9 +4554,10 @@ def delegate_task(
         except SignGrantError as exc:
             return tool_error(f"sign_grant refused: {exc}")
         if _batch_owned:
-            # Background (t_4548202f): the grant belongs to the BATCH, not the parent turn. The batch's own exit
-            # revokes it (runner finally, cancel, refused admission); the owner record lets a gateway start revoke
-            # it if this process dies first. No owner record, no grant.
+            # Background (t_4548202f): the grant belongs to the BATCH, not the parent turn. The batch's own end
+            # closes it when its child completed and revokes it otherwise (runner finally, cancel, refused
+            # admission); the owner record lets a gateway start revoke it if this process dies first. No owner
+            # record, no grant.
             try:
                 track_batch_grants(sign_grants, delegation_id=live_deleg_id)
             except Exception as exc:
@@ -4569,12 +4570,23 @@ def delegate_task(
             # first: the parent may still run the merge gate over the child's stamp in this turn.
             register_turn_grants(parent_agent, sign_grants)
 
-    def _end_batch_grants() -> None:
-        # Background grants end with their batch; a no-op for foreground (turn-bound) grants. Idempotent.
-        if _batch_owned and sign_grants:
-            from tools.delegate_tool_sign_grant import revoke_batch_grants as _revoke_batch
+    _batch_grants_end_lock = threading.Lock()
+    _batch_grants_ended: List[bool] = []
 
-            _revoke_batch(sign_grants)
+    def _end_batch_grants(batch_results: Optional[List[Dict[str, Any]]] = None) -> None:
+        # Background grants end with their batch, once (the first end wins: a cancel racing the runner's finally
+        # never turns a revoke into a close, nor a close into a revoke). ``batch_results`` None revokes every
+        # grant; with results, a child that completed CLOSES its grant (its stamps stand until expiry) and any
+        # other child's grant is revoked. A no-op for foreground (turn-bound) grants.
+        if not (_batch_owned and sign_grants):
+            return
+        with _batch_grants_end_lock:
+            if _batch_grants_ended:
+                return
+            _batch_grants_ended.append(True)
+        from tools.delegate_tool_sign_grant import end_batch_grants as _end_batch
+
+        _end_batch(sign_grants, batch_results)
 
     # Record an accepted override only after task validation and child construction.
     # A rejected or unbuildable request must not leave a success-shaped audit.
@@ -4892,13 +4904,16 @@ def delegate_task(
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
+            _batch_out = None
             try:
-                return _execute_and_aggregate(
+                _batch_out = _execute_and_aggregate(
                     honor_parent_interrupt=False, join_late=True
                 )
+                return _batch_out
             finally:
-                # Every batch exit (success, error, late join) ends its signing grants.
-                _end_batch_grants()
+                # Every batch exit ends its signing grants: per child, close on completed, revoke otherwise; a
+                # runner that raised revokes all.
+                _end_batch_grants(_batch_out.get("results") if isinstance(_batch_out, dict) else None)
 
         def _batch_interrupt():
             # Cancel and the stale monitor end the grants at once, even if a wedged child never lets the runner return.
@@ -5337,7 +5352,9 @@ DELEGATE_TASK_SCHEMA = {
                             "Optional scoped board-signing grant (needs kanban.sign_grants: on, inherit_context, "
                             "and an operator session): {cards: [t_...], verbs: [verdict, approve, "
                             "request_changes, release], expires_in_min: <=120 (default 45), by: 'reviewer'}. The child "
-                            "may sign comments as `by` on those cards only; the grant is revoked when its batch ends.",
+                            "may sign comments as `by` on those cards only. Foreground (default): the grant ends with "
+                            "your turn. With background=true it ends with the batch: a completed child's stamps stay "
+                            "valid until expiry, any other outcome voids them.",
                         ),
                     },
                     "required": ["goal"],
@@ -5412,8 +5429,18 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     background — the model does not choose — for single tasks and fan-out batches alike (one async unit, one
     consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
     within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
-    the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    the intercept is bypassed. Direct Python callers keep the synchronous default.
+
+    A call carrying a ``sign_grant`` is the one place the model chooses: foreground by default (the grant is the
+    parent TURN's, so the parent can gate on the child's stamp in this turn), background only with an explicit
+    ``background: true`` (the grant then ends with its batch, t_4548202f)."""
+    from tools.delegate_tool_sign_grant import carries_sign_grant
+
+    if getattr(parent_agent, "_delegate_depth", 0) > 0:
+        return False
+    if carries_sign_grant(args):
+        return args.get("background") is True or str(args.get("background")).strip().lower() == "true"
+    return True
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 

@@ -319,9 +319,10 @@ def test_mint_refuses_when_no_dispatched_model_is_known(board):
         dsg.mint_for_child(_task(board), child, parent)
 
 
-def test_model_dispatch_path_backgrounds_a_granted_delegation(board):
-    """The LIVE model path (AIAgent._dispatch_delegate_task) forwards sign_grant and backgrounds it like any top-level
-    call: a background grant ends with its batch (t_4548202f, tests/tools/test_delegate_sign_grant_background.py)."""
+def test_model_dispatch_path_runs_a_granted_delegation_in_the_foreground_unless_asked(board):
+    """The LIVE model path (AIAgent._dispatch_delegate_task) forwards sign_grant and runs it in the foreground (turn-
+    bound, so the parent can gate on the stamp in this turn); an explicit background=true backgrounds it (the grant
+    then ends with its batch, t_4548202f); an ungranted top-level call keeps backgrounding."""
     from unittest.mock import patch
 
     from run_agent import AIAgent
@@ -332,7 +333,9 @@ def test_model_dispatch_path_backgrounds_a_granted_delegation(board):
         AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g", "sign_grant": {"cards": [board]}}]})
         AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g"}], "sign_grant": {"cards": [board]}})
         AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g"}]})
-    assert [kw["background"] for kw in seen] == [True, True, True]
+        AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g", "sign_grant": {"cards": [board]}}],
+                                                "background": True})
+    assert [kw["background"] for kw in seen] == [False, False, True, True]
     assert seen[1]["sign_grant"] == {"cards": [board]}
 
 
