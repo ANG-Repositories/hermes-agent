@@ -34,12 +34,14 @@ DISPATCH_CASES = ('test_dispatch_arm', 'test_stale_claim_ticket_retries_without_
                   'test_home_toggle_is_the_switch_observe_failure_reads',
                   'test_mutant_claim_without_recheck_spawns_the_healed_card')
 DISPATCH_EXPECTED = 9
+# Rollout arm (S5, t_b8c1b185): the rollback drill through hermes-home's operator CLI on the real core.
+ROLLOUT_CASES = ('test_rollback_drill_keeps_every_row_and_stops_producer_writes',)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--arm', choices=('atomic', 'crash', 'dispatch'), required=True)
-    parser.add_argument('--home-repo', type=Path, help='dispatch arm: the hermes-home checkout whose toggle CLI '
+    parser.add_argument('--arm', choices=('atomic', 'crash', 'dispatch', 'rollout'), required=True)
+    parser.add_argument('--home-repo', type=Path, help='dispatch/rollout arm: the hermes-home checkout whose toggle CLI '
                         'and producer rows are proved against the scratch board')
     parser.add_argument('--scratch', type=Path, required=True)
     parser.add_argument('--producers', type=int, default=4)
@@ -58,14 +60,18 @@ def main():
     if (args.producers, args.processes) != (4, 32):
         parser.error('this pinned acceptance requires 4 producers and 32 processes')
     home_repo = None
-    if args.arm == 'dispatch':
+    if args.arm in ('dispatch', 'rollout'):
         home_repo = args.home_repo.expanduser().resolve() if args.home_repo else None
         if home_repo is None or not (home_repo / 'scripts' / 'failure-ownership').is_file():
-            parser.error('--arm dispatch requires --home-repo <hermes-home checkout with scripts/failure-ownership>')
+            parser.error('--arm %s requires --home-repo <hermes-home checkout with scripts/failure-ownership>'
+                         % args.arm)
     root.mkdir(parents=True, exist_ok=True)
     if args.arm == 'dispatch':
         selected = DISPATCH_CASES
         target = 'tests/hermes_cli/test_failure_ownership_dispatch_arm.py'
+    elif args.arm == 'rollout':
+        selected = ROLLOUT_CASES
+        target = 'tests/hermes_cli/test_failure_ownership_rollout_arm.py'
     else:
         selected = ('test_real_32_process_four_producer_race' if args.arm == 'atomic'
                     else 'test_sigkill_transaction_boundary_retry')
@@ -97,7 +103,7 @@ def main():
             except ProcessLookupError:
                 pass
     verified = executed_arm(root / 'executed.xml', selected,
-                            {'atomic': 1, 'crash': 12, 'dispatch': DISPATCH_EXPECTED}[args.arm])
+                            {'atomic': 1, 'crash': 12, 'dispatch': DISPATCH_EXPECTED, 'rollout': 1}[args.arm])
     if rc == 0 and not verified:
         rc = 3
     extra = {}
@@ -105,6 +111,11 @@ def main():
         extra['cases'] = [json.loads(line.split('DISPATCH_ARM ', 1)[1]) for line in
                           (root / 'output.log').read_text(encoding='utf-8', errors='replace').splitlines()
                           if 'DISPATCH_ARM ' in line]
+        extra['home_repo'] = str(home_repo)
+    if args.arm == 'rollout':
+        extra['cases'] = [json.loads(line.split('ROLLOUT_ARM ', 1)[1].strip()) for line in
+                          (root / 'output.log').read_text(encoding='utf-8', errors='replace').splitlines()
+                          if 'ROLLOUT_ARM {' in line]
         extra['home_repo'] = str(home_repo)
     summary = dict(arm=args.arm, pid=child.pid, exit_code=rc, executed_verified=verified, **extra,
                    elapsed_seconds=time.monotonic()-started, command=command,

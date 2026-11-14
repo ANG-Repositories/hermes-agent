@@ -86,11 +86,16 @@ BEGIN
  AND b.binding_id=(SELECT MAX(y.binding_id) FROM failure_bindings y WHERE y.episode_id=e.episode_id AND y.card_id=NEW.id AND y.reason='owner_terminal')
  AND NOT EXISTS(SELECT 1 FROM failure_bindings x WHERE x.episode_id=e.episode_id AND x.state IN ('pending','bound'));
 END;
-CREATE TRIGGER IF NOT EXISTS failure_legacy_insert BEFORE INSERT ON tasks
-WHEN EXISTS(SELECT 1 FROM failure_producers WHERE enrolled=1)
- AND (NEW.created_by IN ('main-green-streak','ci-red-owner','main-tip-red','main_tip_red','landing-advisory','gate-C')
- OR NEW.signature GLOB 'main-tip-red:*' OR NEW.idempotency_key GLOB 'ci-red-owner:*'
- OR NEW.idempotency_key GLOB 'main-green-streak:*')
+DROP TRIGGER IF EXISTS failure_legacy_insert;
+CREATE TRIGGER failure_legacy_insert BEFORE INSERT ON tasks
+WHEN (EXISTS(SELECT 1 FROM failure_producers WHERE enrolled=1)
+ OR EXISTS(SELECT 1 FROM failure_authority WHERE singleton=1 AND mode<>'preserve'))
+ AND (NEW.created_by IN ('main-green-streak','ci-red-owner','main-tip-red','main_tip_red','main-tip-red-rollup',
+ 'landing-queue','landing-advisory','gate-C')
+ OR NEW.signature GLOB 'main-tip-red:*' OR NEW.signature GLOB 'main-tip-red-rollup:*'
+ OR NEW.idempotency_key GLOB 'ci-red-owner:*' OR NEW.idempotency_key GLOB 'main-green-streak:*'
+ OR NEW.idempotency_key GLOB 'main-red:*' OR NEW.idempotency_key GLOB 'main-tip-red:*'
+ OR NEW.idempotency_key GLOB 'main-tip-red-rollup:*' OR NEW.idempotency_key GLOB 'ci-advisory-landed:*')
  AND NOT EXISTS(SELECT 1 FROM failure_write_context WHERE singleton=1 AND protocol>=1)
 BEGIN SELECT RAISE(ABORT,'failure_authority: incompatible writer; retain source retry'); END;
 """
