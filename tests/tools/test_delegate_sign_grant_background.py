@@ -337,3 +337,12 @@ def test_gateway_start_sweep_revokes_grants_of_a_dead_owner_only(board, monkeypa
     assert _owner_file().exists()
     dsg.revoke_batch_grants(live)
     assert not _owner_file().exists()
+
+
+def test_a_pid_reused_within_one_second_names_another_owner_file(board, monkeypatch):
+    """Prism a6eae8ca8e9c: the owner file carries the creation time to the millisecond."""
+    paths = []
+    for created in (1700000000.1, 1700000000.9):
+        monkeypatch.setattr(dsg, "_process_created", lambda pid, _c=created: _c)
+        paths.append(dsg._own_path()[0])
+    assert paths[0] != paths[1]

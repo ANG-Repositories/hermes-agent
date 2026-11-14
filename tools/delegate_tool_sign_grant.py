@@ -268,7 +268,8 @@ def _own_path():
     created = _process_created(pid)
     if created is None:
         raise RuntimeError("this process's creation time is unreadable")
-    return _batch_dir() / f"{pid}-{int(created)}.json", pid, created
+    # Millisecond precision: a pid reused within the same second still names another file (Prism a6eae8ca8e9c).
+    return _batch_dir() / f"{pid}-{int(created * 1000)}.json", pid, created
 
 
 def _read_owner(path) -> Optional[Dict[str, Any]]:
