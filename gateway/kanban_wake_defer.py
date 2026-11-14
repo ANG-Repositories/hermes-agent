@@ -315,8 +315,12 @@ def verified_home_sid(conn: sqlite3.Connection, owner: str, home_sid: Any) -> Op
     return None
 
 
-def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
+def owner_acted(conn: sqlite3.Connection, row: dict,
+                skip: Optional[Callable[[sqlite3.Row], bool]] = None) -> Optional[str]:
     """Why the owner has already acted on the card since the deferred cursor, else None.
+
+    ``skip``: a predicate over each event row (id, kind, payload, created_at, ...); a row it
+    returns True for is never evidence (the review-deadman wake's trigger cursor, t_a6da8394).
 
     Evidence: a ``task_events`` row after the cursor written from the owner's
     own human session (:func:`_session_is_owner`), or a non-subagent ``commented`` event
@@ -331,12 +335,14 @@ def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
     task_id = row["task_id"]
     try:
         events = conn.execute(
-            "SELECT id, kind, payload, actor_profile, actor_session_id FROM task_events "
+            "SELECT id, kind, payload, actor_profile, actor_session_id, created_at FROM task_events "
             "WHERE task_id = ? AND id > ? ORDER BY id",
             (task_id, int(row.get("cursor") or 0)),
         ).fetchall()
         human: dict[tuple, bool] = {}  # one provenance probe per (sid, profile)
         for r in events:
+            if skip is not None and skip(r):
+                continue
             sid = r["actor_session_id"]
             profiles = [r["actor_profile"]]
             if r["kind"] == "commented":

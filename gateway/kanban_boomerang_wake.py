@@ -1213,6 +1213,57 @@ _OWNER_COMMENT_NEWER = "owner comment newer than handback"
 #: changes_requested (the event is the owner's own send-back; its comment is that act).
 EVENT_CURSOR_ROWS = frozenset({"mechanical_wake", "blocked_assess", "crash_first_occurrence"})
 
+#: t_a6da8394: review_deadman is on its OWN event cursor too (kill switch BOOMERANG_DEADMAN_TRIGGER_CURSOR=0 puts it
+#: back on the handback cursor above). The deadman fired because the owner went quiet past the threshold or a hold
+#: expired, so a comment posted before that event (the hold itself, a status note) is what the deadman already
+#: weighed, not an answer to it: t_9854b4b7 sat 141 min after two wakes were dismissed on the owner's own 08:10 hold
+#: comment. The owner acted only by a disposition after the review began (DEADMAN_ACTION_KINDS) or by a comment newer
+#: than the event that is not an expired `deadman: hold <ISO>`. A merged PR does not answer it either (the card is
+#: still in review, usually for an operator readback).
+DEADMAN_ACTION_KINDS = frozenset({"changes_requested", "completed", "blocked", "archived"})
+_DEADMAN_HOLD_RE = re.compile(r"^\s*deadman:\s*hold\s+(\S+)", re.I | re.M)
+
+
+def deadman_trigger_cursor_enabled() -> bool:
+    return os.environ.get("BOOMERANG_DEADMAN_TRIGGER_CURSOR") != "0"
+
+
+def _hold_until(iso: str) -> float:
+    """Epoch of a hold's ISO-8601 stamp ('Z' = UTC, naive = local), else 0 (an unreadable hold holds nothing)."""
+    s = (iso or "").strip().rstrip(".,;)")
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return 0.0
+
+
+def _hold_expired(body: Any, now: float) -> bool:
+    """True when ``body`` carries a `deadman: hold <ISO>` line and no such hold is still in force at ``now``."""
+    holds = _DEADMAN_HOLD_RE.findall(str(body or ""))
+    return bool(holds) and all(_hold_until(iso) <= now for iso in holds)
+
+
+def _expired_hold_comment(conn: Any, task_id: str, event: Any, now: float) -> bool:
+    """The ``commented`` event's comment row is an expired hold. The event carries no comment id, so its row is found by
+    author + second (the event may tick a second after its row) + the payload's ``len`` (Prism d93e70e178e9: two owner
+    comments in one second). Every remaining candidate must be an expired hold; no candidate: False, so the comment
+    still counts as the owner acting."""
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except ValueError:
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    author = str(payload.get("author") or "").strip()
+    ts = int(event["created_at"] or 0)
+    bodies = [r[0] or "" for r in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND author = ? AND created_at BETWEEN ? AND ?",
+        (task_id, author, ts - 1, ts))]
+    sized = [b for b in bodies if len(b) == payload.get("len")]
+    bodies = sized or bodies
+    return bool(bodies) and all(_hold_expired(b, now) for b in bodies)
+
 
 def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
@@ -1230,7 +1281,10 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_open_pr as _op
 
-    own_event = (entry.get("row") or entry.get("kind")) in EVENT_CURSOR_ROWS
+    row = entry.get("row") or entry.get("kind")
+    deadman_cursor = row == ROW_REVIEW_DEADMAN and deadman_trigger_cursor_enabled()
+    own_event = row in EVENT_CURSOR_ROWS or deadman_cursor
+    now = _time.time()
     conn = _readonly(kb, entry.get("board"))
     try:
         task = kb.get_task(conn, entry["task_id"])
@@ -1255,7 +1309,8 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         comments = [c for c in kb.list_comments(conn, entry["task_id"])
                     if str(c.author) not in {"boomerang-wake", "kanban-dispatcher"}
                     and not str(c.author).startswith("unverified:")
-                    and c.author in owners]
+                    and c.author in owners
+                    and not (deadman_cursor and _hold_expired(c.body, now))]
         if comments:
             newest = max(comments, key=lambda c: (c.created_at, c.id))
             if (re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M)
@@ -1401,7 +1456,11 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
 # --- delivery (event loop) ----------------------------------------------------------------
 
 def deadman_owner_acted(entry: dict) -> bool:
-    """Check operator provenance since review began, not merely since child dispatch."""
+    """Check operator provenance since review began, not merely since child dispatch.
+
+    t_a6da8394: a comment counts only when newer than the deadman event itself and not an expired hold; any other
+    owner event counts only when it is a disposition (DEADMAN_ACTION_KINDS). BOOMERANG_DEADMAN_TRIGGER_CURSOR=0: any
+    owner event since the review began counts (the rule that dismissed t_9854b4b7's two wakes)."""
     if entry.get("row") != ROW_REVIEW_DEADMAN:
         return False
     from hermes_cli import kanban_db as kb
@@ -1414,10 +1473,19 @@ def deadman_owner_acted(entry: dict) -> bool:
             "SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
             "AND id <= ? ORDER BY id DESC LIMIT 1",
             (entry["task_id"], entry.get("event_id") or 0)).fetchone()
+        skip = None
+        if deadman_trigger_cursor_enabled():
+            trigger, now = int(entry.get("event_id") or 0), _time.time()
+
+            def skip(ev: Any) -> bool:
+                if ev["kind"] != "commented":
+                    return ev["kind"] not in DEADMAN_ACTION_KINDS
+                return ev["id"] <= trigger or _expired_hold_comment(conn, entry["task_id"], ev, now)
         return bool(owner_acted(conn, {"task_id": entry["task_id"],
                                      "owner": _field(task, "assignee"),
                                      "home_sid": entry.get("home_sid"),
-                                     "cursor": review[0] if review else entry.get("event_id", 0)}))
+                                     "cursor": review[0] if review else entry.get("event_id", 0)},
+                                skip=skip))
     finally:
         conn.close()
 
