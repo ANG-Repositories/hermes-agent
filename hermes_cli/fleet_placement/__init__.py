@@ -50,3 +50,19 @@ def _demand_root(root=None) -> Path:
 
 
 placement.fleet_root = _fleet_root
+
+
+#: t_77aa2e0e: the fleet-root receipt the canonical admission_demand requires for every reservation/ledger write
+#: (``_receipt_path``). Unset in a gateway env = every kanban reservation write refuses, one error per write.
+ROOT_RECEIPT_ENV = "PLACEMENT_ROOT_RECEIPT"
+
+
+def root_receipt_missing(environ=None):
+    """One loud line for the gateway log when ``PLACEMENT_ROOT_RECEIPT`` is unset, else None. Startup check only:
+    the per-write refusal in admission_demand stays (fail closed); this names the cause once, at boot."""
+    env = os.environ if environ is None else environ
+    if (env.get(ROOT_RECEIPT_ENV) or "").strip():
+        return None
+    return (f"{ROOT_RECEIPT_ENV} is UNSET in this process: every kanban placement reservation write will refuse "
+            f"('{ROOT_RECEIPT_ENV} required'). Set it in the gateway's launchd EnvironmentVariables (the value "
+            f"ai.hermes.allocd.plist carries) and FULL-reload the gateway (kickstart does not reread plist env).")
