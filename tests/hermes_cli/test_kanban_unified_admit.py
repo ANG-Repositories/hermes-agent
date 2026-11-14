@@ -310,7 +310,7 @@ def _plan_mode(home, fleet, allocd, monkeypatch):
         from hermes_cli.fleet_placement import alloc_client
         (home / "var" / "alloc").mkdir(parents=True, exist_ok=True)
         (home / "var" / "alloc" / "router-off").write_text("", encoding="utf-8")
-        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: True)
+        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: True)
         # the fallback scores on the collector's document, not the plan's probe: the same fleet, written there
         (home / "var" / "fleet-pressure.json").write_text(json.dumps({"at": fleet.t0, "hosts": {
             h: {**json.loads(fleet.text(h)), "age_s": fleet.age, "load1": 10.0, "load5": 10.0} for h in HOSTS}}),
@@ -369,7 +369,7 @@ def test_pinned_take_books_the_learned_estimate_it_was_admitted_on(home, monkeyp
     t0 = time.time()
     hist = home / placement.CLASS_USAGE_REL
     hist.parent.mkdir(parents=True, exist_ok=True)
-    for i in range(6):
+    for i in range(10):    # work_estimate MIN_ROWS 10 (hermes-home t_d0c8e8f0)
         ad.record_actual(hist, job_class="kanban-worker-llm-wait", host="ace-ai", cpus=6.0, ram_gb=12.0,
                          at=t0 - 600 + i, job_id=f"t_h{i}")
     plan = _plan(home, Fleet(t0))
@@ -528,7 +528,7 @@ def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypat
     t0 = time.time()
     f = Fleet(t0)
     plan = _plan_mode(home, f, "on", monkeypatch)
-    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: local)
+    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: local)
     released = []
     monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
         host="ci-box", reservation_id="r_allocd_1", reason="", source="allocd", detail=detail))
@@ -555,7 +555,7 @@ def test_remote_plain_allocd_grants_cannot_overrun_the_class_rule(home, monkeypa
     f = Fleet(t0)
     f.busy = {"ci-box": 0.880, "ace-ai": 0.5, "ace-media": 0.5}
     plan = _plan_mode(home, f, "on", monkeypatch)
-    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: False)
+    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: False)
     n = iter(range(10))
     released = []
     monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
@@ -578,7 +578,7 @@ def remote_allocd(home, monkeypatch):
     def make(fleet, *, legacy=False):
         plan = _plan_mode(home, fleet, "on", monkeypatch)
         (home / "var" / "alloc" / "router-off").unlink()
-        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: False)
+        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: False)
         monkeypatch.setattr(kh, "unified_filter", lambda plan, names, job: (list(names), {}))
         fake = FakeAllocd()
         if legacy:                      # an allocd that predates the ask: runs placement.admit() only

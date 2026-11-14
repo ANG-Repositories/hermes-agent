@@ -49,7 +49,7 @@ class Estimate:
     cpus: float = 0.0          # CPUs the job keeps busy at its p90 (1.0 = one CPU fully busy)
     ram_gb: float = 0.0
     gpu_mib: float = 0.0
-    source: str = "prior"      # work_estimate: "p75:<class>@<host> n=<k>" | "p75:<class>@fleet n=<k>" | "seed"
+    source: str = "prior"      # work_estimate: "p90:<class>@<host> n=<k>" | "p90:<class>@fleet n=<k>" | "seed"
     cpu_s: Optional[float] = None    # expected cpu-seconds per run (work_estimate; not an admit() axis)
     wall_s: Optional[float] = None   # expected wall seconds per run (work_estimate; not an admit() axis)
 
@@ -116,6 +116,18 @@ def live_leases(leases: Iterable[Lease], host: str, sample_at: Optional[float], 
     return tot
 
 
+def ceilings(sample: Mapping, limits: Limits = Limits()) -> dict:
+    """The most admit() can EVER accept for one job on this host: the host fully idle (mem_available <= mem_total,
+    cpu_busy 0, nothing held). A need above it on an axis is static impossibility (unschedulable:resource-fit), not a
+    wait. placement.choose() names a class refused by every host from this same function (t_d0c8e8f0)."""
+    out = {}
+    if _num(sample.get("mem_total_gb")):
+        out["ram_gb"] = float(sample["mem_total_gb"]) - limits.mem_reserve_gb
+    if _num(sample.get("ncpu")) and sample["ncpu"] > 0 and not limits.cpu_saturable:
+        out["cpus"] = float(sample["ncpu"]) * limits.cpu_busy_max
+    return out
+
+
 def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host: Optional[str] = None,
           limits: Limits = Limits(), settle_s: float = DEFAULT_SETTLE_S,
           slice_mem: Optional[SliceMem] = None) -> Verdict:
@@ -123,6 +135,12 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
     if not host:                           # no host: no lease can match, so every in-flight lease would be ignored
         return Verdict(False, "host", "unmeasured:host", {})      # fail closed (Prism 5702b20dda6c)
     unmeasurable = set(limits.unmeasurable) | (set(DARWIN_UNMEASURABLE) if sample.get("os") == "darwin" else set())
+    # Static impossibility is distinct from a transient busy-host wait. Never underbook
+    # a measured estimate to make it fit; name both the need and this host's ceiling.
+    for ax, ceiling in ceilings(sample, limits).items():
+        if getattr(need, ax) > ceiling:
+            return Verdict(False, ax, f"unschedulable:resource-fit {host} need {ax}={getattr(need, ax):g} "
+                           f"ceiling={ceiling:g}", {ax: ceiling - getattr(need, ax)})
     leases = list(leases)
     held = live_leases(leases, host, sample.get("at"), settle_s=settle_s)
     free: dict = {}
@@ -388,13 +406,19 @@ def holdback(workload: str, demand: Iterable[Demand], priority: Priority, host: 
 def admit_class(sample: Mapping, workload: str, need: Estimate, leases: Iterable[Lease] = (), *,
                 demand: Iterable[Demand] = (), priority: Priority = Priority(), limits: Limits = Limits(),
                 host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S,
-                slice_mem: Optional[SliceMem] = None) -> Verdict:
+                slice_mem: Optional[SliceMem] = None, class_line: Optional[float] = None) -> Verdict:
     """THE admission decision for any workload class on any host. ``limits`` supplies the host's own facts
     (mem_reserve_gb, unmeasurable axes); the CPU line is ``priority.line`` and the CPU / PSI cpu axes always refuse
     (cpu_saturable is ignored: a class that can run past the line is how one decider starves the others).
+    ``class_line`` (t_71471192): this class's own CPU line on this host, a fraction of ALL the host's CPUs (the CI
+    lane's hosts.<h>.ci_allocator.admit_ci_cpu_pct / 100). It can only LOWER the fleet line, never raise it; None or
+    an unusable value = the fleet line alone.
     A refusal caused only by higher-priority demand reads ``held_back:<class> ...`` with binding ``priority``."""
     host = host or str(sample.get("host") or "")
-    lim = dataclasses.replace(limits, cpu_busy_max=priority.line, cpu_saturable=False)
+    line = priority.line
+    if _num(class_line) and 0 < class_line < line:
+        line = float(class_line)
+    lim = dataclasses.replace(limits, cpu_busy_max=line, cpu_saturable=False)
     leases = list(leases)
     demand = list(demand)
     held = holdback(workload, demand, priority, host)
@@ -407,6 +431,29 @@ def admit_class(sample: Mapping, workload: str, need: Estimate, leases: Iterable
     who = ", ".join(f"{d.workload} {d.queued} queued" for d in demand
                     if d.queued > 0 and priority.rank(d.workload) < priority.rank(workload))
     return Verdict(False, "priority", f"held_back:{workload} for {who} ({v.reason})", v.free)
+
+
+def preempt(workload: str, sample: Mapping, demand: Iterable[Demand], priority: Priority, leases: Iterable[Lease] = (),
+            *, limits: Limits = Limits(), host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S,
+            class_lines: Optional[Mapping[str, float]] = None) -> int:
+    """``priority.preempt_budget_per_tick`` (t_71471192): how many of ``workload``'s units on ``host`` its scheduler
+    stops REFILLING this tick, because a class that outranks it has queued units that admit_class refuses here (e.g.
+    queued kanban cards on a host that CI keeps at the line). Never a kill: a running unit finishes; only the next
+    refill of an exited unit is withheld, at most the budget per tick and at most the refused queue. 0 = today's
+    behaviour (the shipped value). Pure; ``class_lines`` = {class: its admit_class class_line on this host}."""
+    budget = priority.preempt_budget_per_tick
+    if type(budget) is not int or budget <= 0:
+        return 0
+    host = host or str(sample.get("host") or "")
+    mine, refused, leases, demand = priority.rank(workload), 0, list(leases), list(demand)
+    for d in demand:
+        if d.queued <= 0 or priority.rank(d.workload) >= mine:
+            continue
+        v = admit_class(sample, d.workload, d.unit, leases, demand=demand, priority=priority, limits=limits,
+                        host=host, settle_s=settle_s, class_line=(class_lines or {}).get(d.workload))
+        if not v.ok and v.binding != "priority" and not v.reason.startswith("unmeasured"):
+            refused += int(d.queued)
+    return min(budget, refused)
 
 
 _GB = float(1 << 30)

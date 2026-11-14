@@ -238,11 +238,11 @@ def _inputs(plan, names):
         samples[canon[n]] = s
         if plan.slots.get(n, 0) <= 0 and (s is None or s.status == "fresh"):
             exclusions[canon[n]] = str(d.get("pressure") or "no free slot")
-    root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
+    # No exclusions_path: hermes-home #11416 (FWA B5-P3) retired var/placement/exclusions.json; a fleet pause closes a
+    # host through its fwa fence hold, which kanban_pause_hold reads for this dispatcher.
     kw = dict(candidates=[canon[n] for n in names],
               previous=table.resolve(plan.last_pick) if plan.last_pick else None,
-              exclusions=exclusions, require_axes=PROBE_AXES, stale_after_s=sig.policy.stale_after_s,
-              exclusions_path=None if root is None else root / placement.EXCLUSIONS_REL)
+              exclusions=exclusions, require_axes=PROBE_AXES, stale_after_s=sig.policy.stale_after_s)
     return table, samples, kw
 
 

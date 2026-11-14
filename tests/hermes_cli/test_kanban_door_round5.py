@@ -212,7 +212,10 @@ def test_a_card_that_moves_host_after_a_real_restart_is_withdrawn_from_the_old_h
     the pool enqueue got 409 invalid and the door latched."""
     tid = _card()
     door_fleet.allocd.hold = True
-    proc = subprocess.run([sys.executable, "-c", _HELD_TICK], env=dict(os.environ), timeout=120,
+    # a subprocess has no conftest: hand it this test's provisioned root receipt (hermes-home #9789)
+    from hermes_cli import fleet_placement
+    receipt = fleet_placement.admission_demand._receipt_path(Path(os.environ["PLACEMENT_HOME"]).absolute())
+    proc = subprocess.run([sys.executable, "-c", _HELD_TICK], env=dict(os.environ, PLACEMENT_ROOT_RECEIPT=str(receipt)), timeout=120,
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert _uid(tid) in door_fleet.allocd.waiting("mac-studio")
