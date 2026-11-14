@@ -4338,6 +4338,7 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
+    _async_ok = False  # set below for a background call: can a detached result reach this session?
     if background:
         # Finite sessions cannot route a detached subagent result back to the
         # agent after their turn/process ends. This includes stateless HTTP
@@ -4538,6 +4539,9 @@ def delegate_task(
     # Scoped board-signing grants (t_19c567a8): minted only now, bound to each built
     # child's session and model, and revoked when the children's run ends.
     sign_grants: List[Dict[str, Any]] = []
+    # Batch-owned only when the batch really runs detached from this turn; a background call that falls back to a
+    # synchronous join (no async delivery) keeps the foreground, turn-bound lifetime.
+    _batch_owned = bool(background) and _async_ok
     if any(isinstance(t, dict) and t.get("sign_grant") for _i, t, _c in children):
         from tools.delegate_tool_sign_grant import (
             SignGrantError, mint_for_children, register_turn_grants, revoke_batch_grants, track_batch_grants,
@@ -4546,10 +4550,10 @@ def delegate_task(
         try:
             # All or nothing: any exception revokes what was already minted.
             sign_grants = mint_for_children(children, parent_agent, inherit_context=inherit_context,
-                                            inherit_mode=inherit_mode, batch_bound=bool(background))
+                                            inherit_mode=inherit_mode, batch_bound=_batch_owned)
         except SignGrantError as exc:
             return tool_error(f"sign_grant refused: {exc}")
-        if background:
+        if _batch_owned:
             # Background (t_4548202f): the grant belongs to the BATCH, not the parent turn. The batch's own exit
             # revokes it (runner finally, cancel, refused admission); the owner record lets a gateway start revoke
             # it if this process dies first. No owner record, no grant.
@@ -4567,7 +4571,7 @@ def delegate_task(
 
     def _end_batch_grants() -> None:
         # Background grants end with their batch; a no-op for foreground (turn-bound) grants. Idempotent.
-        if background and sign_grants:
+        if _batch_owned and sign_grants:
             from tools.delegate_tool_sign_grant import revoke_batch_grants as _revoke_batch
 
             _revoke_batch(sign_grants)
@@ -4819,10 +4823,7 @@ def delegate_task(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
             )
-            try:
-                _sync_result = _execute_and_aggregate()
-            finally:
-                _end_batch_grants()
+            _sync_result = _execute_and_aggregate()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "

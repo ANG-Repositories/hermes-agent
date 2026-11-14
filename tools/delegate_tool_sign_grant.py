@@ -232,9 +232,12 @@ def revoke_turn_grants(agent: Any) -> None:
 # ── Background batches (t_4548202f) ─────────────────────────────────────────────────────────────────────
 # A background grant outlives the parent turn but never its batch. The batch runs in THIS process (delegate_tool keeps
 # a granted unit off the kanban and detached runtimes, whose children have other sessions), so the owner of record is
-# this process: one JSON file per process under the shared kanban root, written only by its owner. A gateway start
-# revokes the grants of every file whose process is gone; a relaunched generation is rebuilt without its grant.
+# this process: one JSON file per process under the shared kanban root, named by its pid AND its epoch creation time
+# (psutil, so a reused pid, also after a host reboot, never names the same file) and written only by that process.
+# A gateway start revokes the grants of every file whose process is gone; a dead process never comes back, so the
+# sweeper is the only writer left for its file. A relaunched generation is rebuilt without its grant.
 _BATCH_LOCK = threading.Lock()
+_CREATE_TIME_TOLERANCE_S = 2.0
 
 
 def _batch_dir():
@@ -243,17 +246,29 @@ def _batch_dir():
     return kanban_home() / "sign_grants" / "batches"
 
 
-def _process_started(pid: int) -> Any:
-    from gateway.status import get_process_start_time
+def _process_created(pid: int) -> Optional[float]:
+    """Epoch creation time of ``pid`` (None when it does not exist)."""
+    import psutil
 
-    return get_process_start_time(int(pid))
+    try:
+        return float(psutil.Process(int(pid)).create_time())
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, ProcessLookupError):
+        return None
 
 
-def _owner_alive(pid: Any, started: Any) -> bool:
-    from gateway.status import _pid_exists, get_process_start_time, start_time_fingerprints_match
+def _owner_alive(pid: Any, created: Any) -> bool:
+    if not pid or created is None:
+        return False
+    now = _process_created(int(pid))
+    return now is not None and abs(now - float(created)) <= _CREATE_TIME_TOLERANCE_S
 
-    return bool(pid) and _pid_exists(int(pid)) and (
-        started is None or start_time_fingerprints_match(started, get_process_start_time(int(pid)) or 0))
+
+def _own_path():
+    pid = os.getpid()
+    created = _process_created(pid)
+    if created is None:
+        raise RuntimeError("this process's creation time is unreadable")
+    return _batch_dir() / f"{pid}-{int(created)}.json", pid, created
 
 
 def _read_owner(path) -> Optional[Dict[str, Any]]:
@@ -285,28 +300,21 @@ def track_batch_grants(grants: List[Dict[str, Any]], *, delegation_id: Optional[
     a grant the restart sweep cannot find would outlive a dead batch, so the caller revokes and refuses."""
     if not grants:
         return
-    pid = os.getpid()
-    started = _process_started(pid)
+    path, pid, created = _own_path()
     with _BATCH_LOCK:
-        path = _batch_dir() / f"{pid}.json"
-        data = _read_owner(path) or {}
-        if data.get("pid") != pid or data.get("started") != started:
-            stale = [g for g in data.get("grants") or () if isinstance(g, dict)]
-            if stale:
-                # A reused pid's file: its owner is dead, so its grants go now, not at the next gateway start.
-                revoke(stale)
-            data = {"pid": pid, "started": started, "grants": []}
-        data["grants"].extend({"grant_id": g["grant_id"], "board": g["board"], "delegation_id": delegation_id,
-                               "expires_at": g.get("expires_at")} for g in grants)
+        data = _read_owner(path) or {"pid": pid, "created": created, "grants": []}
+        data["grants"] = list(data.get("grants") or ()) + [
+            {"grant_id": g["grant_id"], "board": g["board"], "delegation_id": delegation_id,
+             "expires_at": g.get("expires_at")} for g in grants]
         _write_owner(path, data)
 
 
-def _untrack(grant_ids: set) -> None:
-    pid = os.getpid()
+def untrack_batch_grants(grant_ids: set) -> None:
+    """Drop ``grant_ids`` from this process's owner record (they are revoked, or the turn owns them now)."""
+    path, _pid, _created = _own_path()
     with _BATCH_LOCK:
-        path = _batch_dir() / f"{pid}.json"
         data = _read_owner(path)
-        if not data or data.get("pid") != pid:
+        if not data:
             return
         data["grants"] = [g for g in data.get("grants") or () if str(g.get("grant_id")) not in grant_ids]
         _write_owner(path, data)
@@ -322,7 +330,7 @@ def revoke_batch_grants(grants: List[Dict[str, Any]]) -> None:
         failed = set(revoke(grants))
         if failed:
             failed = set(revoke([g for g in grants if str(g.get("grant_id")) in failed]))
-        _untrack({str(g.get("grant_id")) for g in grants} - failed)
+        untrack_batch_grants({str(g.get("grant_id")) for g in grants} - failed)
         if failed:
             logger.error("sign grant(s) %s could not be revoked at batch end; the next gateway start retries them "
                          "and they lapse at their expiry at the latest", sorted(failed))
@@ -346,8 +354,8 @@ def sweep_orphaned_batch_grants() -> int:
                 data = _read_owner(path)
                 if data is None:
                     continue
-                pid, started = data.get("pid"), data.get("started")
-                if _owner_alive(pid, started):
+                pid, created = data.get("pid"), data.get("created")
+                if _owner_alive(pid, created):
                     continue
                 grants = [g for g in data.get("grants") or () if isinstance(g, dict) and g.get("grant_id")]
                 failed = set(revoke(grants))

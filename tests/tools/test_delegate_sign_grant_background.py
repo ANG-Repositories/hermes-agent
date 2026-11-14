@@ -59,6 +59,7 @@ def _parent():
     parent._active_children_lock = threading.Lock()
     parent.api_mode = "chat_completions"
     parent.quiet_mode = True
+    parent._oneshot_children_spawned = 0
     parent.__dict__.pop("_sign_grants", None)
     return parent
 
@@ -115,7 +116,7 @@ def _grant_rows():
 
 
 def _owner_file():
-    return dsg._batch_dir() / f"{os.getpid()}.json"
+    return dsg._own_path()[0]
 
 
 def _ok(task_index, goal, *_a, **_kw):
@@ -249,6 +250,27 @@ def test_a_granted_batch_stays_in_process_and_its_restart_intent_carries_no_gran
     assert "sign_grant" not in tasks[0] and dsg.GOAL_BEFORE_GRANT not in tasks[0]
 
 
+def test_a_background_call_that_runs_synchronously_keeps_the_turn_bound_grant(board, monkeypatch):
+    """Finite session: background=true joins inline, so the grant stays the parent TURN's (the parent may gate on the
+    child's stamp in this turn) and is never batch-tracked (Prism f9c6de2f594f)."""
+    seen = {}
+
+    def body(task_index, goal, *a, **kw):
+        seen["goal"] = goal
+        return _ok(task_index, goal)
+
+    dt, _child = _patch(monkeypatch, body)
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    parent = _parent()
+    out = json.loads(dt.delegate_task(tasks=[_task(board)], background=True, parent_agent=parent))
+    assert out["results"][0]["status"] == "completed", out
+    assert "your parent's turn" in seen["goal"]
+    assert [r["revoked_at"] for r in _grant_rows()] == [None]  # live after the batch: the turn owns it
+    assert not _owner_file().exists()
+    dsg.revoke_turn_grants(parent)
+    assert _grant_rows()[0]["revoked_at"] is not None
+
+
 def test_a_relaunched_generation_mints_no_grant(board, monkeypatch):
     """Recovery re-enters delegate_task with the persisted tasks; even a task that still names a grant mints none."""
     import tools.delegate_tool as dt
@@ -288,8 +310,17 @@ def test_gateway_start_sweep_revokes_grants_of_a_dead_owner_only(board, monkeypa
     root = dsg._batch_dir()
     root.mkdir(parents=True, exist_ok=True)
     pid = _dead_pid()
-    (root / f"{pid}.json").write_text(json.dumps({"pid": pid, "started": 1, "grants": [
+    dead_file = root / f"{pid}-1.json"
+    dead_file.write_text(json.dumps({"pid": pid, "created": 1.0, "grants": [
         {"grant_id": dead[0]["grant_id"], "board": dead[0]["board"], "delegation_id": "d-dead"}]}), encoding="utf-8")
+    # A previous process that had THIS pid (pid reuse, or the same pid after a host reboot): another creation
+    # time, so another file, never shared with ours (Prism 88dc83b1800a, f22d85a50ff7, c711413b466e).
+    prior = SimpleNamespace(model=MODEL, session_id="prior-child", _subagent_id="sa-p", _context_inherited="summary")
+    gp = dsg.mint_for_child(_task(board), prior, parent, batch_bound=True)
+    gp["board"] = gp.get("board") or "default"
+    prior_file = root / f"{os.getpid()}-1.json"
+    prior_file.write_text(json.dumps({"pid": os.getpid(), "created": 1.0, "grants": [
+        {"grant_id": gp["grant_id"], "board": gp["board"], "delegation_id": "d-prior"}]}), encoding="utf-8")
     dsg.track_batch_grants(live, delegation_id="d-live")  # this live process owns it
 
     from gateway.run import GatewayRunner
@@ -300,8 +331,9 @@ def test_gateway_start_sweep_revokes_grants_of_a_dead_owner_only(board, monkeypa
 
     state = {r["grant_id"]: r["revoked_at"] for r in _grant_rows()}
     assert state[dead[0]["grant_id"]] is not None
+    assert state[gp["grant_id"]] is not None
     assert state[live[0]["grant_id"]] is None
-    assert not (root / f"{pid}.json").exists()
+    assert not dead_file.exists() and not prior_file.exists()
     assert _owner_file().exists()
     dsg.revoke_batch_grants(live)
     assert not _owner_file().exists()
