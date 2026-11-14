@@ -1120,15 +1120,31 @@ class ReconcileMixin:
         matched_ids: set[str] = set()
         for idx, msg in enumerate(messages):
             pos = idx + offset
+            identity = self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
+            role = str(msg.get("role") or "")
+            # The store can hold one user turn twice in a row, once per
+            # rendering, where the host holds it once (t_ca2c9470, session
+            # 20261023_031240_9df89e67: "[ts] <text>" then "<text>"). Step over
+            # the stored copy unless the host row is that user row itself;
+            # every host row still has to match.
+            while (
+                0 < pos < len(stored_rows)
+                and identity != stored_ids[pos]
+                and role != "user"
+                and str(stored_rows[pos].get("role") or "") == "user"
+                and str(stored_rows[pos - 1].get("role") or "") == "user"
+                and self._user_row_rerenders_stored(stored_ids[pos][1], stored_ids[pos - 1][1])
+            ):
+                offset += 1
+                pos += 1
             if pos >= len(stored_rows):
                 break
-            role = str(msg.get("role") or "")
             if role != str(stored_rows[pos].get("role") or ""):
                 break
-            identity = self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg))
             if identity != stored_ids[pos]:
-                if role == "user" and self._user_row_rerender_key(identity[1]) in (
-                    "", self._user_row_rerender_key(stored_ids[pos][1]),
+                if role == "user" and (
+                    self._user_row_rerender_key(identity[1]) == ""
+                    or self._user_row_rerenders_stored(identity[1], stored_ids[pos][1])
                 ):
                     # Provisional: the cursor passes it only when a later row
                     # in the run matches by full identity.
@@ -1187,8 +1203,48 @@ class ReconcileMixin:
         leading whitespace of the text itself is kept (indentation is content).
         Anything else is a different row. An empty key means the host emptied
         the row: skipping it drops no content, so the caller accepts it.
+
         """
-        text = str(content or "").rstrip()
+        return ReconcileMixin._strip_user_row_wrappers(str(content or "").rstrip())
+
+    @staticmethod
+    def _user_row_rerenders_stored(host: Any, stored: Any) -> bool:
+        """Whether a host user row is a re-render of a stored user row.
+
+        Equal under ``_user_row_rerender_key``, or a merged turn re-rendered
+        part by part (t_ca2c9470, session 20261113_202135_169c983f at the 21:22
+        boot): the host joins consecutive user rows with "\\n\\n"
+        (agent_runtime_helpers._merge_consecutive_users), the live row was
+        stored as ``[ts] <a>\\n\\n[ts] [Triggering ...]\\n\\n<b>``, and the
+        restarted gateway rebuilds it from the clean parts as ``<a>\\n\\n<b>``.
+        Parts are compared in order. A later stored part equal to the host part
+        matches as is; otherwise it matches only after losing one gateway
+        timestamp opening it and the triggering note after that. So a stamp
+        both rows carry (a pasted log line) matches, a stamp only the host row
+        carries or a changed one does not, and any other added or changed
+        paragraph, a ``[System note: ...]`` one included, ends the match.
+        """
+        host_part, host_sep, host_rest = ReconcileMixin._user_row_rerender_key(host).partition("\n\n")
+        part, sep, rest = ReconcileMixin._user_row_rerender_key(stored).partition("\n\n")
+        if part != host_part:
+            return False
+        while sep:
+            if not host_sep:
+                return False
+            host_part, host_sep, host_rest = host_rest.partition("\n\n")
+            part, next_sep, next_rest = rest.partition("\n\n")
+            if part != host_part:
+                stamped = _USER_ROW_TIMESTAMP_PREFIX.sub("", rest, count=1)
+                if stamped == rest:
+                    return False
+                part, next_sep, next_rest = _USER_ROW_DISCORD_NOTE_PREFIX.sub("", stamped, count=1).partition("\n\n")
+                if part != host_part:
+                    return False
+            sep, rest = next_sep, next_rest
+        return not host_sep
+
+    @staticmethod
+    def _strip_user_row_wrappers(text: str) -> str:
         left = {wrapper: 1 for wrapper in _USER_ROW_WRAPPER_PREFIXES}
         while True:
             for wrapper in _USER_ROW_WRAPPER_PREFIXES:

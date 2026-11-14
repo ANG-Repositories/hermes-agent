@@ -720,6 +720,22 @@ def _isolate_wall_budget_registry():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_relay_capacity(monkeypatch):
+    """No test reads a LIVE relay's /health or /eligibility through the wait-notice
+    capacity probe (the fleet's relays listen on the same loopback ports the tests
+    use). Tests that want an answer set ``relay_capacity.fetch_json`` themselves."""
+    try:
+        from agent.fork_ext import relay_capacity as _rc
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _rc.clear_cache()
+    monkeypatch.setattr(_rc, "fetch_json", lambda url, timeout: None)
+    yield
+    _rc.clear_cache()
+
+
+@pytest.fixture(autouse=True)
 def _refuse_real_detached_delegation_child(request, monkeypatch):
     """A background delegate_task in a gateway-bound session spawns a REAL ``python -m
     tools.delegate_detached`` process by default (``delegation.detached_background``). It never runs

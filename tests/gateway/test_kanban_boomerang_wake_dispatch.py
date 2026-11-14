@@ -183,7 +183,13 @@ def _writes(tid) -> tuple:
 @pytest.mark.parametrize("author", ["apollo", "human:apollo"])
 @pytest.mark.parametrize("phase", ["verdict", "delivery", "legacy_delivery"])
 @pytest.mark.parametrize("arm", ["newer_comment", "release", "hold", "merged", "open", "disabled"])
-def test_stale_surface_timeline(env, arm, phase, author):
+@pytest.mark.parametrize("cursor", ["handback", "trigger"])
+def test_stale_surface_timeline(env, arm, phase, author, cursor):
+    """cursor=handback: BOOMERANG_DEADMAN_TRIGGER_CURSOR=0 (the deadman row on the handback cursor). cursor=trigger
+    (t_a6da8394, the default): the owner's comment must come AFTER the deadman event, and a merged PR does not answer
+    the deadman."""
+    if cursor == "handback":
+        env["monkeypatch"].setenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", "0")
     tid = _card(env)
     _handback(tid, 71)
     with kb.connect_closing() as conn, kb.write_txn(conn):
@@ -205,12 +211,13 @@ def test_stale_surface_timeline(env, arm, phase, author):
     env["health"][(REPO, 71)] = {"state": "merged" if arm == "merged" else "open"}
     if arm in {"newer_comment", "release", "hold", "disabled"}:
         body = {"release": "close-on: released", "hold": "deadman-hold: waiting"}.get(arm, "owner acted")
+        at = 1793844766 if arm in {"newer_comment", "disabled"} else 1793839413
         with kb.connect_closing() as conn, kb.write_txn(conn):
             conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-                         (tid, author, body, 1793844766 if arm in {"newer_comment", "disabled"} else 1793839413))
+                         (tid, author, body, at if cursor == "handback" else 1793845100))
     if arm == "disabled":
         env["monkeypatch"].setenv("BOOMERANG_STALE_GUARD", "0")
-    blocked = arm not in {"open", "disabled"}
+    blocked = arm not in {"open", "disabled"} and not (cursor == "trigger" and arm == "merged")
     if phase != "verdict":
         sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
         assert sent == (0 if blocked else 2)
@@ -240,7 +247,7 @@ def test_stale_guard_spares_write_receipts(env, action, turn, delivered):
     env["health"][(REPO, 71)] = {"state": "merged"}
     with kb.connect_closing() as conn, kb.write_txn(conn):
         conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-                     (tid, "apollo", "owner acted", 1793844766))
+                     (tid, "apollo", "owner acted", 1793845100))
     sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
     lines = [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
     assert (sent, bool(lines)) == ((1, True) if delivered else (0, False))
@@ -271,12 +278,17 @@ def test_stale_surface_ignores_non_owner_comments(env, author, body):
 @pytest.mark.parametrize("row,comment_at,stale", [
     ("mechanical_wake", 1793844766, None),                                   # hold BEFORE the event: deliver
     ("mechanical_wake", 1793846000, "owner comment newer than handback"),     # owner acted AFTER the event
-    ("review_deadman", 1793844766, "owner comment newer than handback"),      # deadman stays on the handback cursor
+    ("review_deadman", 1793844766, None),                                    # t_a6da8394: before the deadman fired
+    ("review_deadman", 1793846000, "owner comment newer than handback"),      # owner acted AFTER the deadman
+    ("review_deadman-off", 1793844766, "owner comment newer than handback"),  # kill switch: handback cursor
 ])
 def test_stale_surface_event_cursor_for_own_event_rows(env, row, comment_at, stale):
     """t_df97e311 (t_707d4196, 2026-11-13 03:01-03:10): the operator posted a hold comment after the handback and
     queued a detached job; the job's mechanical_wake surface was refused as "owner comment newer than handback" though
     the event came AFTER the comment. RED on 5eee3813fa for the first case."""
+    if row.endswith("-off"):
+        row = row.removesuffix("-off")
+        env["monkeypatch"].setenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", "0")
     tid = _card(env)
     _handback(tid, 71)
     with kb.connect_closing() as conn, kb.write_txn(conn):
@@ -295,12 +307,16 @@ def test_stale_surface_event_cursor_for_own_event_rows(env, row, comment_at, sta
     ("mechanical_wake", None),                                  # a job failed after the merge: deliver
     ("blocked_assess", None),
     ("crash_first_occurrence", None),
-    ("review_deadman", f"summarized PR merged: {REPO}#71"),     # about the handback: moot once merged
+    ("review_deadman", None),                                   # t_a6da8394: still in review after the merge
+    ("review_deadman-off", f"summarized PR merged: {REPO}#71"),  # kill switch: about the handback, moot once merged
 ])
 def test_stale_surface_merged_pr_rule_spares_own_event_rows(env, row, stale):
     """t_59d62680 (t_df97e311, 2026-11-13 09:04-09:06): PR merged 06:15, a deploy probe the operator queued after the
     merge ended rc=7; its mechanical_wake surface was refused as "summarized PR merged". RED on 1c7bcf4c4a for the
     three own-event rows."""
+    if row.endswith("-off"):
+        row = row.removesuffix("-off")
+        env["monkeypatch"].setenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", "0")
     tid = _card(env)
     _handback(tid, 71)
     with kb.connect_closing() as conn, kb.write_txn(conn):
@@ -319,11 +335,16 @@ def test_stale_surface_merged_pr_rule_spares_own_event_rows(env, row, stale):
 @pytest.mark.parametrize("row,hold_at,stale", [
     ("mechanical_wake", 1793844766, None),                        # hold posted BEFORE the job's event: deliver
     ("mechanical_wake", 1793845100, "owner release/hold line"),   # hold posted AFTER the event: operator acted
-    ("review_deadman", 1793844766, "owner release/hold line"),    # handback row: unchanged
+    ("review_deadman", 1793844766, None),                         # t_a6da8394: hold before the deadman fired
+    ("review_deadman", 1793845100, "owner release/hold line"),    # hold posted AFTER the deadman
+    ("review_deadman-off", 1793844766, "owner release/hold line"),  # kill switch: handback cursor
 ])
 def test_stale_surface_hold_line_uses_the_own_event_cursor(env, row, hold_at, stale):
     """t_59d62680 (Apollo send-back): the release/hold-line rule had no cursor, so a deadman-hold the operator posted
     and THEN queued a probe refused the probe's failure wake. RED on 56c32023b3 for the first case."""
+    if row.endswith("-off"):
+        row = row.removesuffix("-off")
+        env["monkeypatch"].setenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", "0")
     tid = _card(env)
     _handback(tid, 71)
     with kb.connect_closing() as conn, kb.write_txn(conn):

@@ -672,3 +672,130 @@ class TestFirstIngestLogLineOnEveryCaller:
         self._assert_one_line(tmp_path, caplog, history, n0)
         fresh.ingest([dict(m) for m in history] + [{"role": "assistant", "content": "ok"}])
         assert len(_first_ingest_lines(caplog)) == 1
+
+
+def _stored_into(tmp_path, stored):
+    eng = LCMEngine(config=_cfg(tmp_path), hermes_home=str(tmp_path))
+    eng.on_session_start(SESSION, platform="discord")
+    eng._store.append_batch(SESSION, [dict(r) for r in stored])
+    return _rows(tmp_path)
+
+
+class TestRestartResumeOfMergedUserTurn:
+    """t_ca2c9470: session 20261113_202135_169c983f at the 21:22:26 boot stored all
+    103 resumed rows again (persisted ambiguous delta, cursor 0). Its first stored
+    row is a merged user turn, "[ts] <a>\\n\\n[ts] [Triggering ...]\\n\\n<b>"; the
+    restarted gateway rebuilds it from the clean parts as "<a>\\n\\n<b>", so the
+    walk ended at host row 0."""
+
+    def _shape(self):
+        stored, history = _restart_resume_shape()
+        a = "[Ace] why does this happen when we have plenty of subscriptions available?"
+        b = "[Ace] continue"
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user" and _NOTE[:20] in r["content"])
+        assert history[0]["role"] == "user"
+        stored[s_idx] = {"role": "user", "content": (
+            "[Fri 2026-11-13 20:21:33 PST] " + a + "\n\n"
+            "[Fri 2026-11-13 20:32:07 PST] " + _NOTE.format(1571019880512356353) + b)}
+        history[0] = {"role": "user", "content": a + "\n\n" + b}
+        return stored, history
+
+    def test_merged_user_turn_rebuilt_from_clean_parts_appends_only_the_new_row(self, tmp_path):
+        stored, history = self._shape()
+        n0 = _stored_into(tmp_path, stored)
+        fresh = _rebuilt_agent_ingest(tmp_path, history)
+        assert fresh._last_ingest_reconciliation["reason"] == "replayed history anchored on stored tool calls"
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_merged_user_turn_with_a_part_the_store_lacks_is_stored(self, tmp_path):
+        stored, history = self._shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        history[idx] = {"role": "user", "content": history[idx]["content"] + "\n\n[Ace] and one more thing"}
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
+
+    def test_interior_wrapper_led_paragraph_the_store_lacks_is_stored(self, tmp_path):
+        """Prism 33e6e68e02a5: only a gateway timestamp proves a merge boundary, so
+        an interior "[System note: ...]" paragraph is content, not a wrapper."""
+        stored, history = self._shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user"
+                     and r["content"].endswith(history[idx]["content"].split("] ", 1)[1]))
+        stored[s_idx] = dict(stored[s_idx], content=stored[s_idx]["content"] + "\n\n[Ace] B")
+        history[idx] = {"role": "user", "content": (
+            history[idx]["content"] + "\n\n[System note: payment failed]\n\n[Ace] B")}
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
+
+    def test_interior_timestamp_the_host_row_carries_is_content(self, tmp_path):
+        """Prism 33e6e68e02a5 round 2: a pasted log line's timestamp in the host row
+        is content, so a changed one is stored, not keyed equal to the old one."""
+        stored, history = self._shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user"
+                     and r["content"].endswith(history[idx]["content"].split("] ", 1)[1]))
+        stored[s_idx] = dict(stored[s_idx], content=(
+            stored[s_idx]["content"] + "\n\n[Fri 2026-11-13 20:21:33 PST] failure"))
+        history[idx] = {"role": "user", "content": (
+            history[idx]["content"] + "\n\n[Fri 2026-11-13 20:32:07 PST] failure")}
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, history[idx]["content"]) == 1
+
+    def test_unchanged_pasted_timestamp_in_a_merged_turn_is_not_stored_again(self, tmp_path):
+        """Prism 0db0d2f7a252: a pasted stamp both rows carry, after the stored row's
+        own merge stamps, still matches, so the resumed rows are not stored again."""
+        stored, history = self._shape()
+        pasted = "\n\n[Fri 2026-11-13 20:21:33 PST] failure"
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user" and _NOTE[:20] in r["content"])
+        stored[s_idx] = dict(stored[s_idx], content=stored[s_idx]["content"] + pasted)
+        history[0] = {"role": "user", "content": history[0]["content"] + pasted}
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_unchanged_pasted_timestamp_in_a_rewrapped_row_is_not_stored_again(self, tmp_path):
+        """Prism 2efa6eb1a00c: the same pasted stamp in a row whose leading wrappers
+        differ still matches."""
+        stored, history = self._shape()
+        pasted = "\n\n[Fri 2026-11-13 20:21:33 PST] failure"
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user"
+                     and r["content"].endswith(history[idx]["content"].split("] ", 1)[1]))
+        stored[s_idx] = dict(stored[s_idx], content=stored[s_idx]["content"] + pasted)
+        history[idx] = {"role": "user", "content": history[idx]["content"] + pasted}
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+
+class TestRestartResumeOfTwiceStoredUserTurn:
+    """t_ca2c9470: session 20261023_031240_9df89e67 at the 21:22:26 boot stored 89
+    rows again. The store holds one user turn twice in a row, "[ts] <text>"
+    (13429799) then "<text>" (13431618); the resumed history holds it once, so
+    the walk ended at the assistant row after it."""
+
+    def _shape(self):
+        stored, history = _restart_resume_shape()
+        idx = next(i for i, m in enumerate(history) if m["role"] == "user" and i > 40)
+        s_idx = next(i for i, r in enumerate(stored) if r["role"] == "user"
+                     and r["content"].endswith(history[idx]["content"].split("] ", 1)[1]))
+        stored.insert(s_idx + 1, {"role": "user", "content": history[idx]["content"].split("] ", 1)[1]})
+        assert history[idx + 1]["role"] != "user"
+        return stored, history, idx
+
+    def test_twice_stored_user_turn_appends_only_the_new_row(self, tmp_path):
+        stored, history, _ = self._shape()
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+
+    def test_row_after_twice_stored_user_turn_that_the_store_lacks_is_stored(self, tmp_path):
+        stored, history, idx = self._shape()
+        history[idx + 1] = dict(history[idx + 1], content="A reply the store never got.", tool_calls=None)
+        history[idx + 1].pop("tool_calls")
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, "A reply the store never got.") == 1

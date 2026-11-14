@@ -69,7 +69,7 @@ the same order but were not measured from it. Scripts are attached to the card (
 
 ### 3.1 Latency per tool call (`t599_envbench.py`, the runtime's own environment classes, n=20 per row)
 
-| path | first use | `true` p50 / p90 | `ls /tmp` p50 / p90 |
+| path | first use | `true` p50 / p90 | ls of a small dir p50 / p90 |
 |---|---|---|---|
 | `LocalEnvironment` | 156 ms | 9.5 / 9.9 ms | 45.7 / 70.3 ms |
 | `SSHEnvironment` -> ACE-AI | 200 ms | 13.2 / 13.3 ms | 67.1 / 67.6 ms |

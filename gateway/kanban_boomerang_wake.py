@@ -24,6 +24,7 @@ to the file without a migration.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,16 @@ def _clears_blocked(entry: dict, outcome: object) -> bool:
     """t_5701751b: a handled terminal outcome clears ``blocked_spent``, except the blocked assessment's
     own ``retry`` (block, retry, re-block with no handled wake between must still reach the owner)."""
     return outcome in HANDLED_OUTCOMES and not (entry.get("row") == "blocked_assess" and outcome == "retry")
+
+
+def _card_digest(card_text: object) -> Optional[str]:
+    """t_2f7fd11c: a claim keeps the digest of its dispatch-time ``[title, body]``, not the text
+    (61% of a 26 MB state file); None when ``card_text`` is not that pair."""
+    if not isinstance(card_text, (list, tuple)) or len(card_text) != 2:
+        return None
+    from hermes_cli.kanban_db import card_text_digest
+
+    return card_text_digest(card_text[0], card_text[1])
 
 
 def _claimed_at(entry: dict) -> float:
@@ -99,15 +110,37 @@ class BoomerangWakeState:
 
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = Path(path) if path is not None else state_path()
+        # sha256 of the bytes last read from / written to ``path`` (t_2f7fd11c: skip a no-op rewrite)
+        self._disk_sha: Optional[str] = None
 
     # --- file I/O (caller holds _LOCK) ---------------------------------------
 
     def _read(self) -> dict:
+        self._disk_sha = None
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            blob = self.path.read_bytes()
+            raw = json.loads(blob.decode("utf-8-sig"))
         except (OSError, ValueError):
             return {}
-        return self._migrate_blocked(self._migrate(raw)) if isinstance(raw, dict) else {}
+        self._disk_sha = hashlib.sha256(blob).hexdigest()
+        if not isinstance(raw, dict):
+            return {}
+        return self._migrate_card_text(self._migrate_blocked(self._migrate(raw)))
+
+    @staticmethod
+    def _migrate_card_text(data: dict) -> dict:
+        """t_2f7fd11c: a claim written before the digest carries ``assessed_card_text``; replace it
+        with ``assessed_card_digest`` (persisted by the next write, like the other migrations)."""
+        claims = data.get("claims")
+        if not isinstance(claims, dict):
+            return data
+        for entry in claims.values():
+            if isinstance(entry, dict) and "assessed_card_text" in entry:
+                text = entry.pop("assessed_card_text")
+                digest = _card_digest(text)
+                if digest is not None and "assessed_card_digest" not in entry:
+                    entry["assessed_card_digest"] = digest
+        return data
 
     @classmethod
     def _migrate(cls, data: dict) -> dict:
@@ -180,14 +213,20 @@ class BoomerangWakeState:
         return data
 
     def _write(self, data: dict) -> None:
+        """Replace the file with ``data``; no write when the bytes equal what ``_read`` just saw."""
+        blob = json.dumps(data, sort_keys=True).encode("utf-8")
+        sha = hashlib.sha256(blob).hexdigest()
+        if sha == self._disk_sha:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".boomerang-wake-", dir=str(self.path.parent))
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, sort_keys=True)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(blob)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            self._disk_sha = sha
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1137,10 +1176,10 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                     raise RuntimeError("restricted card requires owner assessment")
                 # Bind evidence to the dispatch snapshot, not freshly edited text.
                 # The DB checks it under its writer lock with the block-event CAS.
-                assessed_text = entry.get("assessed_card_text")
-                if not isinstance(assessed_text, list) or len(assessed_text) != 2:
+                digest = entry.get("assessed_card_digest") or _card_digest(entry.get("assessed_card_text"))
+                if not isinstance(digest, str):
                     raise RuntimeError("assessed card text unavailable")
-                kwargs["expect_card_text"] = tuple(assessed_text)
+                kwargs["expect_card_digest"] = digest
                 last_comment = entry.get("assessed_last_comment")
                 if not isinstance(last_comment, int):
                     raise RuntimeError("assessed comment revision unavailable")
@@ -1213,6 +1252,57 @@ _OWNER_COMMENT_NEWER = "owner comment newer than handback"
 #: changes_requested (the event is the owner's own send-back; its comment is that act).
 EVENT_CURSOR_ROWS = frozenset({"mechanical_wake", "blocked_assess", "crash_first_occurrence"})
 
+#: t_a6da8394: review_deadman is on its OWN event cursor too (kill switch BOOMERANG_DEADMAN_TRIGGER_CURSOR=0 puts it
+#: back on the handback cursor above). The deadman fired because the owner went quiet past the threshold or a hold
+#: expired, so a comment posted before that event (the hold itself, a status note) is what the deadman already
+#: weighed, not an answer to it: t_9854b4b7 sat 141 min after two wakes were dismissed on the owner's own 08:10 hold
+#: comment. The owner acted only by a disposition after the review began (DEADMAN_ACTION_KINDS) or by a comment newer
+#: than the event that is not an expired `deadman: hold <ISO>`. A merged PR does not answer it either (the card is
+#: still in review, usually for an operator readback).
+DEADMAN_ACTION_KINDS = frozenset({"changes_requested", "completed", "blocked", "archived"})
+_DEADMAN_HOLD_RE = re.compile(r"^\s*deadman:\s*hold\s+(\S+)", re.I | re.M)
+
+
+def deadman_trigger_cursor_enabled() -> bool:
+    return os.environ.get("BOOMERANG_DEADMAN_TRIGGER_CURSOR") != "0"
+
+
+def _hold_until(iso: str) -> float:
+    """Epoch of a hold's ISO-8601 stamp ('Z' = UTC, naive = local), else 0 (an unreadable hold holds nothing)."""
+    s = (iso or "").strip().rstrip(".,;)")
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return 0.0
+
+
+def _hold_expired(body: Any, now: float) -> bool:
+    """True when ``body`` carries a `deadman: hold <ISO>` line and no such hold is still in force at ``now``."""
+    holds = _DEADMAN_HOLD_RE.findall(str(body or ""))
+    return bool(holds) and all(_hold_until(iso) <= now for iso in holds)
+
+
+def _expired_hold_comment(conn: Any, task_id: str, event: Any, now: float) -> bool:
+    """The ``commented`` event's comment row is an expired hold. The event carries no comment id, so its row is found by
+    author + second (the event may tick a second after its row) + the payload's ``len`` (Prism d93e70e178e9: two owner
+    comments in one second). Every remaining candidate must be an expired hold; no candidate: False, so the comment
+    still counts as the owner acting."""
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except ValueError:
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    author = str(payload.get("author") or "").strip()
+    ts = int(event["created_at"] or 0)
+    bodies = [r[0] or "" for r in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND author = ? AND created_at BETWEEN ? AND ?",
+        (task_id, author, ts - 1, ts))]
+    sized = [b for b in bodies if len(b) == payload.get("len")]
+    bodies = sized or bodies
+    return bool(bodies) and all(_hold_expired(b, now) for b in bodies)
+
 
 def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
@@ -1230,7 +1320,10 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_open_pr as _op
 
-    own_event = (entry.get("row") or entry.get("kind")) in EVENT_CURSOR_ROWS
+    row = entry.get("row") or entry.get("kind")
+    deadman_cursor = row == ROW_REVIEW_DEADMAN and deadman_trigger_cursor_enabled()
+    own_event = row in EVENT_CURSOR_ROWS or deadman_cursor
+    now = _time.time()
     conn = _readonly(kb, entry.get("board"))
     try:
         task = kb.get_task(conn, entry["task_id"])
@@ -1255,7 +1348,8 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         comments = [c for c in kb.list_comments(conn, entry["task_id"])
                     if str(c.author) not in {"boomerang-wake", "kanban-dispatcher"}
                     and not str(c.author).startswith("unverified:")
-                    and c.author in owners]
+                    and c.author in owners
+                    and not (deadman_cursor and _hold_expired(c.body, now))]
         if comments:
             newest = max(comments, key=lambda c: (c.created_at, c.id))
             if (re.search(r"^\s*(?:close-on|release|deadman[- ]hold)\s*:", newest.body, re.I | re.M)
@@ -1400,8 +1494,34 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
 
 # --- delivery (event loop) ----------------------------------------------------------------
 
+def _review_entry_id(kb: Any, conn: Any, task_id: str, trigger: int) -> Optional[int]:
+    """Id of the event that last put the card into review at or before ``trigger``: a ``review_requested``, or a
+    resume into review with no new one (kanban_db._REVIEW_RESUME_KINDS: ``unblocked``/``promoted`` with ``status:
+    review``, ``reopened`` with ``to_status: review``). None when there is none."""
+    resume = kb._REVIEW_RESUME_KINDS  # noqa: SLF001
+    marks = ",".join("?" for _ in resume)
+    for r in conn.execute(
+            f"SELECT id, kind, payload FROM task_events WHERE task_id = ? AND id <= ? "
+            f"AND kind IN ('review_requested', {marks}) ORDER BY id DESC", (task_id, trigger, *resume)):
+        if r["kind"] == "review_requested":
+            return int(r["id"])
+        try:
+            payload = json.loads(r["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        if isinstance(payload, dict) and payload.get(resume[r["kind"]]) == "review":
+            return int(r["id"])
+    return None
+
+
 def deadman_owner_acted(entry: dict) -> bool:
-    """Check operator provenance since review began, not merely since child dispatch."""
+    """Check operator provenance since review began, not merely since child dispatch.
+
+    t_a6da8394: a comment counts only when newer than the deadman event itself and not an expired hold; any other
+    owner event counts only when it is a disposition (DEADMAN_ACTION_KINDS) newer than the event that last put the
+    card into review (:func:`_review_entry_id`; a park the review has since resumed from does not answer the wake).
+    BOOMERANG_DEADMAN_TRIGGER_CURSOR=0: any owner event since the latest review_requested counts (the rule that
+    dismissed t_9854b4b7's two wakes)."""
     if entry.get("row") != ROW_REVIEW_DEADMAN:
         return False
     from hermes_cli import kanban_db as kb
@@ -1414,10 +1534,22 @@ def deadman_owner_acted(entry: dict) -> bool:
             "SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
             "AND id <= ? ORDER BY id DESC LIMIT 1",
             (entry["task_id"], entry.get("event_id") or 0)).fetchone()
+        skip = None
+        if deadman_trigger_cursor_enabled():
+            trigger, now = int(entry.get("event_id") or 0), _time.time()
+            entered = _review_entry_id(kb, conn, entry["task_id"], trigger)
+            if entered is not None:
+                review = (entered,)
+
+            def skip(ev: Any) -> bool:
+                if ev["kind"] != "commented":
+                    return ev["kind"] not in DEADMAN_ACTION_KINDS
+                return ev["id"] <= trigger or _expired_hold_comment(conn, entry["task_id"], ev, now)
         return bool(owner_acted(conn, {"task_id": entry["task_id"],
                                      "owner": _field(task, "assignee"),
                                      "home_sid": entry.get("home_sid"),
-                                     "cursor": review[0] if review else entry.get("event_id", 0)}))
+                                     "cursor": review[0] if review else entry.get("event_id", 0)},
+                                skip=skip))
     finally:
         conn.close()
 
@@ -2193,7 +2325,7 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         "event_ts": event_ts, "row": disposition.row, "mode": disposition.mode or "fork",
         "status": snap["status"], "assignee": snap["assignee"], "pr": snap["pr"], "head": snap["head"],
         "cursor_event_id": max(int(event_id), snap["top_event_id"]),
-        "assessed_card_text": snap["card_text"],
+        "assessed_card_digest": _card_digest(snap["card_text"]),
         "assessed_last_comment": snap["last_comment"],
         "home_sid": home_sid or "", "route": dict(route or {}), "path": path,
         "title": str(_field(task, "title") or "")[:160], "wake_text": wake_text,
