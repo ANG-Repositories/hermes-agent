@@ -5317,7 +5317,7 @@ DELEGATE_TASK_SCHEMA = {
                             "pool host (ci-box, ace-ai, ...) leased from the allocator, as the pool worker account "
                             "with that host's own credentials; its model loop and the web/browser/kanban/memory "
                             "tools stay here. Use it only for a child that needs nothing but a repo at a ref it can "
-                            "fetch itself: it must not read live state here (~/.hermes, state.db, logs, the vault, "
+                            "fetch itself: it must not read live state here (the agent home, state.db, logs, the vault, "
                             "macOS tools) and must not edit your checkout (its edits stay on that host unless it "
                             "pushes). Honoured only when delegation.pool_placement is opt_in; otherwise, or when no "
                             "host can be leased, the child runs here as usual and its goal says so.",

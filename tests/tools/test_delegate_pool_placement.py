@@ -46,6 +46,7 @@ def pool(monkeypatch):
     monkeypatch.setattr(ttl, "cleanup_vm", lambda key, **_kw: rec["cleanup"].append(key))
     monkeypatch.setattr(dpp, "_remove_workspace", lambda lease: rec["rm"].append(lease.workspace))
     monkeypatch.setattr(dpp, "_renew_loop", lambda lease: None)
+    monkeypatch.setattr(dpp, "_start_cleanup", dpp._remove_then_release)  # inline: assertions see rm + release
     dpp.COUNTERS.clear()
     return rec
 

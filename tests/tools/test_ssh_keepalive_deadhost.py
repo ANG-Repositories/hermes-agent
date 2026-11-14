@@ -9,6 +9,7 @@ returns rc 255 in about 10-15 s, without them it hangs until the tool timeout.
 """
 
 import contextlib
+import getpass
 import os
 import shutil
 import signal
@@ -104,7 +105,8 @@ def relayed_sshd(tmp_path):
 def _env(tmp_path, port) -> SSHEnvironment:
     """The real _build_ssh_command on a bare instance (the constructor would connect and sync)."""
     env = object.__new__(SSHEnvironment)
-    env.host, env.user, env.port = "127.0.0.1", os.environ.get("USER") or os.getlogin(), port
+    # getpass, not os.getlogin(): hosted CI runners have no USER and no login session (getlogin -> OSError).
+    env.host, env.user, env.port = "127.0.0.1", getpass.getuser(), port
     env.key_path, env.log_file = str(tmp_path / "client"), ""
     env.control_socket = Path((tmp_path / "sock_dir").read_text()) / "cm.sock"
     return env
