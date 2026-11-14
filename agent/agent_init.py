@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import suppress
 from datetime import datetime
@@ -2204,6 +2205,9 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
+    # The tail walk asks the preflight's predicate on this agent (Prism e401e23b1d4b).
+    with suppress(Exception):
+        _cc._route_owner = weakref.ref(agent)
     # Micro-compaction has no pre-compress checkpoint hook; suppress it while the gate is
     # armed (mirrors native_compaction.py).
     if cs.checkpoint_required and cs.micro_compact:
